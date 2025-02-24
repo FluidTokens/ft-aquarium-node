@@ -81,7 +81,25 @@ AQUARIUM_STAKING_AUTO=false
 is set to true.
 
 > [!NOTE]  
-> When launching for the first time the node, 
+> When launching for the very first time, the node will need to scan Cardano history from [Aquarium genesis block](https://cexplorer.io/block/8d55468951b4a8ee9f074e21fbe52574155665585887d002fce00b06a13d3de1)
+> which was minted on the 12h of February 2025. Although the process is extremely fast, depending on your hardware, 
+> on where your Cardano node is (local in your network, or remote) it might take a few hours for the node to index all needed utxos.
+> During sync, if you have enabled automatic staking, you will see errors popping from time to time as the node won't be available to 
+> execute the auto staking transactions.
+> Should this be the case, once indexing is complete (see below to understand how to detect this), you will need to restart your node,
+> which will promptly check for your staking, and if missing, it will executed it.
+
+### How to understand if my node is synced?
+
+Very simple, issue a `docker logs aquarium --tail 50`
+
+If you see this line:
+```bash
+2025-02-24T11:05:00.500Z INFO 1 --- [ntLoopGroup-4-1] c.b.c.y.s.c.service.CursorServiceImpl : # of blocks written: 1
+2025-02-24T11:05:00.500Z INFO 1 --- [ntLoopGroup-4-1] c.b.c.y.s.c.service.CursorServiceImpl : Block No: 11525533
+```
+
+if means your node is up to tip and is processing 1 block at the time (i.e. the latest blocks.).
 
 ## Development Notes
 
