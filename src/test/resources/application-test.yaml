@@ -1,0 +1,3 @@
+blockfrost:
+  url: ${BLOCKFROST_URL:https://cardano-preprod.blockfrost.io/api/v0/}
+  key: ${BLOCKFROST_KEY:preprod9v5e2dLyUa88oRBNQctiIX469J204eeO}

@@ -1,0 +1,83 @@
+spring:
+  flyway:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/aquarium}
+    user: ${DB_USERNAME:fluidtokens}
+    password: ${DB_PASSWORD:password}
+    schemas: ${DB_SCHEMA:public}
+    locations:
+      - classpath:db/store/{vendor}
+    out-of-order: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/aquarium}
+    username: ${DB_USERNAME:fluidtokens}
+    password: ${DB_PASSWORD:password}
+
+network: mainnet
+
+wallet:
+  mnemonic: ""
+
+aquarium:
+  staking:
+    auto: false
+    token:
+      policy: 577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e
+      name: 0014df10464c4454
+  tank:
+    ref-input:
+      txHash: e016e3db3db27e167906df22b8a6c7879911c089bd2d9f3ec4be061e2690173b
+      outputIndex: 0
+
+blockfrost:
+  url: https://cardano-mainnet.blockfrost.io/api/v0/
+  key: ""
+
+store:
+  cardano:
+    host: ""
+    port: ""
+    protocol-magic: 764824073
+    # Start from the block that minted the ref input for the contract
+    sync-start-slot: 147744276
+    sync-start-blockhash: 8d55468951b4a8ee9f074e21fbe52574155665585887d002fce00b06a13d3de1
+  blocks:
+    epoch-calculation-interval=14400:  # 14400 = 4 hours
+
+apiPrefix: /api/v1
+
+---
+spring:
+  config:
+    activate:
+      on-profile: preview
+
+network: preview
+
+wallet:
+  mnemonic: ""
+
+aquarium:
+  staking:
+    auto: true
+    token:
+      policy: 0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62
+      name: 0014df1074464c4454
+  tank:
+    ref-input:
+      txHash: fc9579059f844d8e3b5eaf6e4db665b04866af3a16e05b14ed26c55c2a41c534
+      outputIndex: 0
+
+blockfrost:
+  url: https://cardano-preview.blockfrost.io/api/v0/
+  key: ""
+
+store:
+  cardano:
+    host: ryzen
+    port: 30020
+    protocol-magic: 2
+    # Start from the block that minted the ref input for the contract
+    sync-start-blockhash: 0e459daa0813334b79da2bac23d3324b604ee04209679bed08b6f49cac82cb4e
+    sync-start-slot: 71971209
+  blocks:
+    epoch-calculation-interval=14400:  # 14400 = 4 hours
