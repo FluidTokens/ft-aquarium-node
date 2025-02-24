@@ -24,7 +24,7 @@ services:
       options:
         max-size: "200k"
         max-file: "10"
-  aquarium-offchain:
+  aquarium-node:
     container_name: aquarium
     image: "${AQUARIUM_DOCKER_IMAGE_NAME}:${AQUARIUM_DOCKER_IMAGE_VERSION}"
     restart: on-failure
