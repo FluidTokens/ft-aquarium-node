@@ -9,6 +9,16 @@ Node operators will be required to stake a certain amount of FLDT tokens in orde
 
 Operators will periodically receive compensation for the work executed.
 
+## TLDR
+
+Steps to run the aquarium validator are simple:
+1. rename the file docker/.env.example in .env
+2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only the 30k FLDT and 10 ADA
+3. run `docker compose build` inside the docker folder
+4. run ` docker compose up`
+5. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer 
+
+
 ## How does it work
 
 As mentioned, the Aquarium Node is a Java App, which leverages BloxBean Yaci Store indexer to find and persist on a local
@@ -62,10 +72,10 @@ Copy the `.env.example` into `.env` file.
 Set the following two env properties:
 
 ```bash
-## Blockfrost Key
+## Blockfrost Key, the free account plan is ok
 BLOCKFROST_KEY=
 
-## Wallet Seed (mnemonic)
+## Wallet Seed (mnemonic), this wallet should contain 30k FLDT and 10 ADA to start, create a dedicated wallet and never share the mnemonic with anyone
 WALLET_MNEMONIC=lorem ipsum
 ```
 
