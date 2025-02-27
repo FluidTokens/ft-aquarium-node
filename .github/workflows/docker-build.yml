@@ -30,7 +30,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # Step 4: Generate version using year.month.day format
+      # Step 4: Build the JAR file with Gradle
+      - name: Build JAR file
+        run: |
+          ./gradlew bootJar  # Assuming you're using bootJar to build the JAR
+
+      # Step 5: Generate version using year.month.day format
       - name: Generate version
         id: version  # This step has an ID to be referenced in the next step
         run: |
@@ -42,7 +47,7 @@ jobs:
           fi
           echo "::set-output name=version::${VERSION}"  # Set VERSION as output for the next step
 
-      # Step 5: Build and Push Docker image
+      # Step 6: Build and Push Docker image
       - name: Build and Push Docker image
         run: |
           VERSION=${{ steps.version.outputs.version }}  # Reference the output from Step 4
