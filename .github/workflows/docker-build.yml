@@ -30,18 +30,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # Step 4: Run Gradle build
+      # Step 4: Generate version using current date in reverse format
       - name: Build version
         run: |
-          VERSION=$(git describe --tags)
+          VERSION=$(date +'%Y%m%d' | rev)  # Reversed date format
           echo "Building version: ${VERSION}"
           ./gradlew bootJar
 
       # Step 5: Build and Push Docker image
       - name: Build and Push Docker image
         run: |
-          VERSION=$(git describe --tags)
-          DOCKER_IMAGE_NAME=fluidtokens/ft-aquarium-node
+          DOCKER_IMAGE_NAME=speedwing/ft-aquarium-node
           DOCKER_IMAGE="${DOCKER_IMAGE_NAME}:${VERSION}"
           DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest"
           docker build -t "${DOCKER_IMAGE}" -t "${DOCKER_IMAGE_LATEST}" --push .
