@@ -47,12 +47,19 @@ jobs:
           fi
           echo "::set-output name=version::${VERSION}"  # Set VERSION as output for the next step
 
-      # Step 6: Build and Push Docker image
+      # Step 6: Log in to Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}  # Docker Hub Username
+          password: ${{ secrets.DOCKER_PASSWORD }}  # Docker Hub Personal Access Token
+
+      # Step 7: Build and Push Docker image
       - name: Build and Push Docker image
         run: |
-          VERSION=${{ steps.version.outputs.version }}  # Reference the output from Step 4
-          DOCKER_IMAGE_NAME=fluidtokens/ft-aquarium-node 
-          echo "this is the image name ${DOCKER_IMAGE_NAME}"
+          VERSION=${{ steps.version.outputs.version }}  # Reference the output from Step 5
+          DOCKER_IMAGE_NAME=fluidtokens/ft-aquarium-node
+          echo "This is the image name: ${DOCKER_IMAGE_NAME}"
           DOCKER_IMAGE="${DOCKER_IMAGE_NAME}:${VERSION}"
           DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest"
           echo "Building Docker image with tag: ${DOCKER_IMAGE}"
