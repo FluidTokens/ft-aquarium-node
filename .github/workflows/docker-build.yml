@@ -9,9 +9,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    env:
-      VERSION: ${{ steps.version.outputs.version }}  # Set VERSION as environment variable for all steps
-
     steps:
       # Step 1: Checkout code
       - name: Checkout repository
@@ -48,8 +45,9 @@ jobs:
       # Step 5: Build and Push Docker image
       - name: Build and Push Docker image
         run: |
+          VERSION=${{ steps.version.outputs.version }}  # Reference the output from Step 4
           DOCKER_IMAGE_NAME=speedwing/ft-aquarium-node
-          DOCKER_IMAGE="${DOCKER_IMAGE_NAME}:${VERSION}"  # Use the environment variable VERSION
+          DOCKER_IMAGE="${DOCKER_IMAGE_NAME}:${VERSION}"
           DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest"
           echo "Building Docker image with tag: ${DOCKER_IMAGE}"
           docker build -t "${DOCKER_IMAGE}" -t "${DOCKER_IMAGE_LATEST}" --push .
