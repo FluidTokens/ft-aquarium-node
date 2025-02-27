@@ -155,43 +155,50 @@ public class StakerService {
     @PostConstruct
     public void init() {
 
-        var autoStake = aquariumConfiguration.getAutoStake();
-        log.info("INIT Auto Stake? {}", autoStake);
+        var autoStakerThread = new Thread(() -> {
+            var autoStake = aquariumConfiguration.getAutoStake();
+            log.info("INIT Auto Stake? {}", autoStake);
 
-        var stakerRefInputs = this.findStakerRefInput();
-        log.info("INIT Found {} staker inputs", stakerRefInputs.size());
-        stakerRefInputs.forEach(stakerRefInput -> log.info("INFO Staker Ref Input: {}:{}", stakerRefInput.getTransactionId(), stakerRefInput.getIndex()));
+            var stakerRefInputs = findStakerRefInput();
+            log.info("INIT Found {} staker inputs", stakerRefInputs.size());
+            stakerRefInputs.forEach(stakerRefInput -> log.info("INFO Staker Ref Input: {}:{}", stakerRefInput.getTransactionId(), stakerRefInput.getIndex()));
 
-        if (stakerRefInputs.isEmpty() && autoStake) {
-            log.info("INIT Attempting to stake tokens");
+            if (stakerRefInputs.isEmpty() && autoStake) {
+                log.info("INIT Attempting to stake tokens");
 
-            var attempts = 3;
-            boolean autoStakeSucceeded = false;
+                var attempts = 3;
+                boolean autoStakeSucceeded = false;
 
-            while (!autoStakeSucceeded && attempts >= 0) {
-                var stakeTxOpt = this.executeStakeTransaction();
-                if (stakeTxOpt.isPresent()) {
-                    autoStakeSucceeded = true;
-                    log.info("INIT Successfully staked your tokens. You can now process Scheduled Transactions");
-                } else {
-                    log.warn("INIT It was not possible to complete auto-staking transaction. Reasons: (1) you might not have enough FLDT Tokens or ada " +
-                            "in the wallet you want to stake, (2) Yaci syncing process is still ongoing and Parameters utxo could not be found. Retrying shortly...");
-                    attempts -= 1;
-                    try {
-                        Thread.sleep(60_000L);
-                    } catch (InterruptedException e) {
-                        log.warn("Shutting down auto-staking process", e);
+                while (stakerRefInputs.isEmpty() && !autoStakeSucceeded && attempts >= 0) {
+                    var stakeTxOpt = executeStakeTransaction();
+                    if (stakeTxOpt.isPresent()) {
+                        autoStakeSucceeded = true;
+                        log.info("INIT Successfully staked your tokens. You can now process Scheduled Transactions");
+                    } else {
+                        log.warn("INIT It was not possible to complete auto-staking transaction. Reasons: (1) you might not have enough FLDT Tokens or ada " +
+                                "in the wallet you want to stake, (2) Yaci syncing process is still ongoing and Parameters utxo could not be found. Retrying shortly...");
+                        attempts -= 1;
+                        try {
+                            Thread.sleep(60_000L);
+                            stakerRefInputs = findStakerRefInput();
+                        } catch (InterruptedException e) {
+                            log.warn("Shutting down auto-staking process", e);
+                        }
                     }
                 }
-            }
 
-            if (!autoStakeSucceeded) {
-                log.warn("It was not possible to complete auto-staking transaction. Please wait for the node to be completely synced, than restart. Thank you.");
-            }
+                if (!stakerRefInputs.isEmpty()) {
+                    log.info("INIT Found {} staker inputs", stakerRefInputs.size());
+                } else if (!autoStakeSucceeded) {
+                    log.warn("It was not possible to complete auto-staking transaction. Please wait for the node to be completely synced, than restart. Thank you.");
+                }
 
-        } else {
-            log.info("INIT AutoStake disabled or you've already staked your tokens");
-        }
+            } else {
+                log.info("INIT AutoStake disabled or you've already staked your tokens");
+            }
+        });
+
+        autoStakerThread.start();
 
     }
 
