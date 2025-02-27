@@ -23,7 +23,7 @@ In order to validate and submit the transaction, a valid BlockFrost API Key is r
 ## How to build
 
 The Aquarium node is a Java Spring Boot App, and you can build a standalone, self-contained _fat jar_ by executing in the root 
-of the project the command
+of the project the command 
 
 ```bash
 ./gradlew bootJar
