@@ -29,6 +29,12 @@ public class ParametersService {
                 .flatMap(Collection::stream)
                 .toList();
 
+        if (settings.isEmpty()) {
+            throw new RuntimeException("Could not find Parameters utxo. This is usually a temporary issue that can happen during initial syncing, " +
+                    "but if problem persist ensure the Yaci store syncing process is correctly configured: i.e. that starting block is before " +
+                    "protocol bootstrap transaction. Alternatively your syncing might either be stuck or very slow.");
+        }
+
         if (settings.size() != 1) {
             throw new RuntimeException(String.format("unexpected number of utxo. it should be only one, but %d found", settings.size()));
         }
