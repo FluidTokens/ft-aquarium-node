@@ -13,9 +13,9 @@ Operators will periodically receive compensation for the work executed.
 
 Steps to run the aquarium validator are simple:
 1. rename the file docker/.env.example in .env
-2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only the 30k FLDT and 10 ADA
+2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only the 30k FLDT and 10 ADA inside the .env file
 3. run `docker compose build` inside the docker folder
-4. run ` docker compose up`
+4. run ` docker compose up` inside the docker folder
 5. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer 
 
 
