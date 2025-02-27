@@ -19,7 +19,7 @@ jobs:
         uses: actions/setup-java@v2
         with:
           java-version: '11'
-          distribution: 'adoptopenjdk'  # Specify the distribution here
+          distribution: 'temurin'  # Correct distribution
 
       # Step 3: Cache Gradle dependencies
       - name: Cache Gradle dependencies
@@ -41,7 +41,7 @@ jobs:
       - name: Build and Push Docker image
         run: |
           VERSION=$(git describe --tags)
-          DOCKER_IMAGE_NAME=speedwing/ft-aquarium-node
+          DOCKER_IMAGE_NAME=fluidtokens/ft-aquarium-node
           DOCKER_IMAGE="${DOCKER_IMAGE_NAME}:${VERSION}"
           DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest"
           docker build -t "${DOCKER_IMAGE}" -t "${DOCKER_IMAGE_LATEST}" --push .
