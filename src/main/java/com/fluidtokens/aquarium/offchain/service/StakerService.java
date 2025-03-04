@@ -3,7 +3,9 @@ package com.fluidtokens.aquarium.offchain.service;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
+import com.bloxbean.cardano.client.api.exception.ApiException;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
@@ -29,6 +31,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 @Service
 @RequiredArgsConstructor
@@ -40,6 +43,8 @@ public class StakerService {
     private final AppConfig.AquariumConfiguration aquariumConfiguration;
 
     private final Account account;
+
+    private final BFBackendService bfBackendService;
 
     private final QuickTxBuilder quickTxBuilder;
 
@@ -72,6 +77,79 @@ public class StakerService {
                 .toList();
 
     }
+
+    @PostConstruct
+    public void init() {
+
+        var autoStake = aquariumConfiguration.getAutoStake();
+        log.info("INIT Auto Stake? {}", autoStake);
+
+        var autoUnstake = aquariumConfiguration.getAutoUnstake();
+        log.info("INIT Auto Unstake? {}", autoUnstake);
+
+        var autoStakerThread = new Thread(() -> {
+
+            var stakerRefInputs = findStakerRefInput();
+            log.info("INIT Found {} staker inputs", stakerRefInputs.size());
+            stakerRefInputs.forEach(stakerRefInput -> log.info("INFO Staker Ref Input: {}:{}", stakerRefInput.getTransactionId(), stakerRefInput.getIndex()));
+
+            if (stakerRefInputs.isEmpty() && autoStake) {
+                log.info("INIT Attempting to stake tokens");
+
+                var attempts = 3;
+                boolean autoStakeSucceeded = false;
+
+                while (stakerRefInputs.isEmpty() && !autoStakeSucceeded && attempts >= 0) {
+                    var stakeTxOpt = executeStakeTransaction();
+                    if (stakeTxOpt.isPresent()) {
+                        autoStakeSucceeded = true;
+                        log.info("INIT Successfully staked your tokens. You can now process Scheduled Transactions");
+                    } else {
+                        log.warn("INIT It was not possible to complete auto-staking transaction. Reasons: (1) you might not have enough FLDT Tokens or ada " +
+                                "in the wallet you want to stake, (2) Yaci syncing process is still ongoing and Parameters utxo could not be found. Retrying shortly...");
+                        attempts -= 1;
+                        try {
+                            Thread.sleep(60_000L);
+                            stakerRefInputs = findStakerRefInput();
+                        } catch (InterruptedException e) {
+                            log.warn("Shutting down auto-staking process", e);
+                        }
+                    }
+                }
+
+                if (!stakerRefInputs.isEmpty()) {
+                    log.info("INIT Found {} staker inputs", stakerRefInputs.size());
+                } else if (!autoStakeSucceeded) {
+                    log.warn("It was not possible to complete auto-staking transaction. Please wait for the node to be completely synced, than restart. Thank you.");
+                }
+
+            } else if (!stakerRefInputs.isEmpty() && autoUnstake) {
+
+                log.info("about to attempt auto unstake transaction");
+                var autoUnstakeTxHashOpt = executeUnstakeTransaction();
+
+                var attempts = 3;
+                while (autoUnstakeTxHashOpt.isEmpty() && attempts >= 0) {
+                    attempts -= 1;
+                    try {
+                        Thread.sleep(60_000L);
+                        autoUnstakeTxHashOpt = executeUnstakeTransaction();
+                    } catch (InterruptedException e) {
+                        log.warn("Shutting down auto-staking process", e);
+                    }
+
+                }
+
+
+            } else {
+                log.info("INIT AutoStake disabled or you've already staked your tokens");
+            }
+        });
+
+        autoStakerThread.start();
+
+    }
+
 
     private Optional<String> executeStakeTransaction() {
 
@@ -152,55 +230,70 @@ public class StakerService {
 
     }
 
-    @PostConstruct
-    public void init() {
+    private Optional<String> executeUnstakeTransaction() {
 
-        var autoStakerThread = new Thread(() -> {
-            var autoStake = aquariumConfiguration.getAutoStake();
-            log.info("INIT Auto Stake? {}", autoStake);
+        try {
 
-            var stakerRefInputs = findStakerRefInput();
-            log.info("INIT Found {} staker inputs", stakerRefInputs.size());
-            stakerRefInputs.forEach(stakerRefInput -> log.info("INFO Staker Ref Input: {}:{}", stakerRefInput.getTransactionId(), stakerRefInput.getIndex()));
+            var stakingUtxos = findStakerRefInput();
+            log.info("stakingUtxos size: {}", stakingUtxos.size());
 
-            if (stakerRefInputs.isEmpty() && autoStake) {
-                log.info("INIT Attempting to stake tokens");
-
-                var attempts = 3;
-                boolean autoStakeSucceeded = false;
-
-                while (stakerRefInputs.isEmpty() && !autoStakeSucceeded && attempts >= 0) {
-                    var stakeTxOpt = executeStakeTransaction();
-                    if (stakeTxOpt.isPresent()) {
-                        autoStakeSucceeded = true;
-                        log.info("INIT Successfully staked your tokens. You can now process Scheduled Transactions");
-                    } else {
-                        log.warn("INIT It was not possible to complete auto-staking transaction. Reasons: (1) you might not have enough FLDT Tokens or ada " +
-                                "in the wallet you want to stake, (2) Yaci syncing process is still ongoing and Parameters utxo could not be found. Retrying shortly...");
-                        attempts -= 1;
+            var stakingUtxoOpt = stakingUtxos.stream()
+                    .flatMap(transactionInput -> {
                         try {
-                            Thread.sleep(60_000L);
-                            stakerRefInputs = findStakerRefInput();
-                        } catch (InterruptedException e) {
-                            log.warn("Shutting down auto-staking process", e);
+                            var utxoResponse = bfBackendService.getUtxoService().getTxOutput(transactionInput.getTransactionId(), transactionInput.getIndex());
+                            if (utxoResponse.isSuccessful()) {
+                                return Stream.of(utxoResponse.getValue());
+                            } else {
+                                return Stream.empty();
+                            }
+                        } catch (ApiException e) {
+                            log.warn("Error while fetching staking utxo", e);
+                            return Stream.empty();
                         }
-                    }
-                }
+                    })
+                    .findFirst();
 
-                if (!stakerRefInputs.isEmpty()) {
-                    log.info("INIT Found {} staker inputs", stakerRefInputs.size());
-                } else if (!autoStakeSucceeded) {
-                    log.warn("It was not possible to complete auto-staking transaction. Please wait for the node to be completely synced, than restart. Thank you.");
-                }
-
-            } else {
-                log.info("INIT AutoStake disabled or you've already staked your tokens");
+            if (stakingUtxoOpt.isEmpty()) {
+                log.info("No FLDT staking utxos found, terminating...");
+                return Optional.empty();
             }
-        });
 
-        autoStakerThread.start();
+            var stakingUtxo = stakingUtxoOpt.get();
+            log.info("stakingUtxo: {}:{}", stakingUtxo.getTxHash(), stakingUtxo.getOutputIndex());
+
+            var stakingNft = Asset.builder()
+                    .name("0x" + HexUtil.encodeHexString(account.getBaseAddress().getDelegationCredentialHash().get()))
+                    .value(BigInteger.ONE.negate())
+                    .build();
+
+            var redeemer = new RedeemerStakerData();
+            redeemer.setSigner(AddressUtil.toOnchainAddress(account.getBaseAddress()));
+            redeemer.setReferenceIndex(BigInteger.ZERO);
+            redeemer.setOutputStaking(BigInteger.ZERO);
+
+            var tx = new ScriptTx()
+                    .collectFrom(stakingUtxo, redeemer.toPlutusData())
+                    .mintAsset(stakerContractService.getPlutusScript(), stakingNft, redeemer.toPlutusData())
+                    .readFrom(parametersService.loadParametersRefInput())
+                    .withChangeAddress(account.baseAddress());
+
+            var unstakingResult = quickTxBuilder.compose(tx)
+                    .feePayer(account.baseAddress())
+                    .collateralPayer(account.baseAddress())
+                    .withSigner(SignerProviders.signerFrom(account))
+                    .withSigner(SignerProviders.stakeKeySignerFrom(account))
+                    .withRequiredSigners(account.getBaseAddress().getDelegationCredentialHash().get())
+                    .completeAndWait();
+            if (unstakingResult.isSuccessful()) {
+                return Optional.of(unstakingResult.getValue());
+            } else {
+                return Optional.empty();
+            }
+        } catch (Exception e) {
+            log.warn("could not perform unstake", e);
+            return Optional.empty();
+        }
 
     }
-
 
 }

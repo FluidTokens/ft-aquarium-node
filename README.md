@@ -86,8 +86,8 @@ and the additional following property:
 ## Aquarium configuration
 # Whether the bot should attempt to stake tokens if required.
 AQUARIUM_STAKING_AUTO=false
+AQUARIUM_UNSTAKING_AUTO=false
 ```
-
 is set to true.
 
 > [!NOTE]  
