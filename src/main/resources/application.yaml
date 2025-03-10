@@ -19,12 +19,9 @@ wallet:
 
 aquarium:
   staking:
-    auto: false
     token:
       policy: 577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e
       name: 0014df10464c4454
-  unstaking:
-    auto: false
   tank:
     ref-input:
       txHash: e016e3db3db27e167906df22b8a6c7879911c089bd2d9f3ec4be061e2690173b

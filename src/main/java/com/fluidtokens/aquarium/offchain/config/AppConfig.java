@@ -2,7 +2,6 @@ package com.fluidtokens.aquarium.offchain.config;
 
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
-import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
@@ -40,12 +39,6 @@ public class AppConfig {
     @Getter
     public static class AquariumConfiguration {
 
-        @Value("${aquarium.staking.auto}")
-        private Boolean autoStake;
-
-        @Value("${aquarium.unstaking.auto}")
-        private Boolean autoUnstake;
-
         @Value("${aquarium.staking.token.policy}")
         private String stakingTokenPolicy;
 
@@ -57,15 +50,6 @@ public class AppConfig {
 
         @Value("${aquarium.tank.ref-input.outputIndex}")
         private Integer tankRefInputOutputIndex;
-
-        @PostConstruct
-        public void init(){
-            log.info("INIT - Starting ...");
-            if (autoStake && autoUnstake) {
-                log.error("You can't start aquarium node with both auto stake and auto unstake set to true.");
-                throw new RuntimeException("You can't start aquarium node with both auto stake and auto unstake set to true.");
-            }
-        }
 
         public TransactionInput getTankRefInput() {
             return TransactionInput.builder().transactionId(tankRefInputTxHash).index(tankRefInputOutputIndex).build();
