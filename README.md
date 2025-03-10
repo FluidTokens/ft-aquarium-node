@@ -79,25 +79,9 @@ BLOCKFROST_KEY=
 WALLET_MNEMONIC=lorem ipsum
 ```
 
-Ensure that the wallet has already staked the required FLDT tokens, or alternatively the wallet contains enough FLDT tokens
-and the additional following property:
+Ensure that the wallet has already completed the staking procedure or received BOT operator stake delegation. Please 
+check the fluidtokens website for further details on how to perform stake and unstake.
 
-```
-## Aquarium configuration
-# Whether the bot should attempt to stake tokens if required.
-AQUARIUM_STAKING_AUTO=false
-AQUARIUM_UNSTAKING_AUTO=false
-```
-is set to true.
-
-> [!NOTE]  
-> When launching for the very first time, the node will need to scan Cardano history from [Aquarium genesis block](https://cexplorer.io/block/8d55468951b4a8ee9f074e21fbe52574155665585887d002fce00b06a13d3de1)
-> which was minted on the 12h of February 2025. Although the process is extremely fast, depending on your hardware, 
-> on where your Cardano node is (local in your network, or remote) it might take a few hours for the node to index all required utxos.
-> During sync, if you have enabled automatic staking, you might see errors popping from time to time as the node might not be able to 
-> execute auto-staking or even trying to process transaction which were scheduled in the past and have been already processed since.
-> Should this be the case, once indexing is complete (see below to understand how to detect this), you will need to restart your node,
-> which will promptly check for your staking, and if missing, it will try to execute it.
 
 ### How to understand if my node is synced?
 
