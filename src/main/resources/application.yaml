@@ -65,7 +65,7 @@ aquarium:
     auto: true
   tank:
     ref-input:
-      txHash: e538a3a4da3c9516ac0f7533e945a497d7517e2e225bca42634a50c69faa96f8
+      txHash: 71c12121425b835ebad603c9632e0a439df6b5e8d63030417dd5af7405d494ac
       outputIndex: 0
 
 blockfrost:
