@@ -74,13 +74,13 @@ public class PreviewTankTest {
 
         DatumTankData datum = new DatumTankData();
 
-        var allowedToken = new CardanoTokenData();
-        allowedToken.setPolicyid(new byte[0]);
-        allowedToken.setAssetname(new byte[0]);
-        allowedToken.setAmount(BigInteger.ONE);
-        allowedToken.setDivider(BigInteger.ONE);
-        allowedToken.setOracle(Optional.empty());
-        allowedToken.toPlutusData();
+//        var allowedToken = new CardanoTokenData();
+//        allowedToken.setPolicyid(new byte[0]);
+//        allowedToken.setAssetname(new byte[0]);
+//        allowedToken.setAmount(BigInteger.ONE);
+//        allowedToken.setDivider(BigInteger.ONE);
+//        allowedToken.setOracle(Optional.empty());
+//        allowedToken.toPlutusData();
 
         var scheduledAmount = new CardanoTokenData();
         scheduledAmount.setPolicyid(new byte[0]);
@@ -96,7 +96,7 @@ public class PreviewTankTest {
         rewardAmount.setDivider(BigInteger.ONE);
         rewardAmount.setOracle(Optional.empty());
 
-        datum.setAllowedtokens(List.of(allowedToken));
+        datum.setAllowedtokens(List.of());
         datum.setTankowner(AddressUtil.toOnchainAddress(account.getBaseAddress()));
         datum.setWhitelistedaddresses(List.of());
         datum.setExecutiontime(BigInteger.valueOf(fiveMinutesAgoMs));
