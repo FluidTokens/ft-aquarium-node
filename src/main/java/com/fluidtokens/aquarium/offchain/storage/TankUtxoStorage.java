@@ -23,12 +23,6 @@ public class TankUtxoStorage extends UtxoStorageImpl {
 
     private final UtxoRepository utxoRepository;
 
-    private final ParametersContractService parametersContractService;
-
-    private final StakerContractService stakerContractService;
-
-    private final TankContractService tankContractService;
-
     private final List<String> contractPaymentPkh;
 
     public TankUtxoStorage(UtxoRepository utxoRepository,
@@ -41,9 +35,6 @@ public class TankUtxoStorage extends UtxoStorageImpl {
                            TankContractService tankContractService) {
         super(utxoRepository, spentOutputRepository, dsl, utxoCache, platformTransactionManager);
         this.utxoRepository = utxoRepository;
-        this.parametersContractService = parametersContractService;
-        this.stakerContractService = stakerContractService;
-        this.tankContractService = tankContractService;
         contractPaymentPkh = List.of(
                 parametersContractService.getScriptHashHex(),
                 stakerContractService.getScriptHashHex(),
