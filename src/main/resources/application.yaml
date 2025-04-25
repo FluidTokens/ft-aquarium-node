@@ -19,12 +19,9 @@ wallet:
 
 aquarium:
   staking:
-    auto: false
     token:
       policy: 577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e
       name: 0014df10464c4454
-  unstaking:
-    auto: true
   tank:
     ref-input:
       txHash: e016e3db3db27e167906df22b8a6c7879911c089bd2d9f3ec4be061e2690173b
@@ -60,15 +57,12 @@ wallet:
 
 aquarium:
   staking:
-    auto: true
     token:
       policy: 0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62
       name: 0014df1074464c4454
-  unstaking:
-    auto: true
   tank:
     ref-input:
-      txHash: fc9579059f844d8e3b5eaf6e4db665b04866af3a16e05b14ed26c55c2a41c534
+      txHash: 95e613789534d0a6d4dcee6c2a2fe9a09f67acb1510b5c2886208d7977580dd0
       outputIndex: 0
 
 blockfrost:
