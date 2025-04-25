@@ -9,14 +9,17 @@ Node operators will be required to stake a certain amount of FLDT tokens in orde
 
 Operators will periodically receive compensation for the work executed.
 
-## TLDR
+## TLDR (cardano testnet preview)
 
 Steps to run the aquarium validator are simple:
 1. rename the file docker/.env.example in .env
-2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only the 30k FLDT and 10 ADA inside the .env file
+2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only and 10 tADA inside the .env file
 3. run `docker compose build` inside the docker folder
 4. run ` docker compose up` inside the docker folder
-5. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer 
+5. Get 30k tFLDT on a preview testnet hot wallet - you can get them by opening a [discord](https://discord.gg/nNmBhMUGtj) ticket
+6. Delegate your 30k tFLDT from your wallet to your node address [here](https://aquarium-dev.fluidtokens.com/validator)
+7. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer
+8. Every month 50% of all the generated fees are split across the nodes that performed transactions
 
 
 ## How does it work
