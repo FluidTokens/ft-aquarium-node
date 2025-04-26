@@ -17,7 +17,7 @@ Steps to run the aquarium validator are simple:
 3. run `docker compose build` inside the docker folder
 4. run ` docker compose up` inside the docker folder
 5. Get 30k tFLDT on a preview testnet hot wallet - you can get them by opening a [discord](https://discord.gg/nNmBhMUGtj) ticket
-6. Delegate your 30k tFLDT from your wallet to your node address [here](https://aquarium-dev.fluidtokens.com/validator)
+6. Delegate your 30k tFLDT from the wallet containing the 30k FLDT to your node address generated at point 2. [here](https://aquarium-dev.fluidtokens.com/validator)
 7. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer
 8. Every month 50% of all the generated fees are split across the nodes that performed transactions
 
