@@ -21,7 +21,7 @@ public class AccountConfig {
         };
 
         var account = new Account(actualNetwork, mnemonic);
-        log.info("INIT - Aquarium Node Address (base): {}", account.baseAddress());
+        log.info("INIT - Aquarium Node base address: {}", account.baseAddress());
         return account;
 
     }
