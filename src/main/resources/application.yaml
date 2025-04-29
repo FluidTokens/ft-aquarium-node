@@ -39,6 +39,7 @@ store:
     # Start from the block that minted the ref input for the contract
     sync-start-slot: 147744276
     sync-start-blockhash: 8d55468951b4a8ee9f074e21fbe52574155665585887d002fce00b06a13d3de1
+    keep-alive-interval: 3000
   blocks:
     epoch-calculation-interval=14400:  # 14400 = 4 hours
 
