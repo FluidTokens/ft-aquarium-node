@@ -43,10 +43,8 @@ jobs:
           
           ## Append -pv for preview images
           
-          echo " ${ env.GITHUB_REF_NAME }"
-          echo " ${{ env.GITHUB_REF_NAME }}"
-#          echo " ${ GITHUB_REF_NAME }"
-#          echo " ${{ GITHUB_REF_NAME }}"
+          echo "Foo: ${ env.GITHUB_REF_NAME }"
+          echo "Foo: ${{ env.GITHUB_REF_NAME }}"
           
           if [ ${{ env.GITHUB_REF_NAME }} == "preview" ]
           then
