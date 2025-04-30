@@ -63,7 +63,7 @@ aquarium:
       name: 0014df1074464c4454
   tank:
     ref-input:
-      txHash: 95e613789534d0a6d4dcee6c2a2fe9a09f67acb1510b5c2886208d7977580dd0
+      txHash: 782106250a8327d54bcd52d608e72bfa92d5263e8d009a53c1570a1aee1d2662
       outputIndex: 0
 
 blockfrost:

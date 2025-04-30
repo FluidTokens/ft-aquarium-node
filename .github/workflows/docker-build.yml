@@ -73,16 +73,16 @@ jobs:
           DOCKER_IMAGE_NAME=fluidtokens/ft-aquarium-node
           echo "This is the image name: ${DOCKER_IMAGE_NAME}"
           DOCKER_IMAGE="${DOCKER_IMAGE_NAME}:${VERSION}"
-          DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest"
           echo "Building Docker image with tag: ${DOCKER_IMAGE}"
 
           ## Don't push latest for preview
           if [ $GITHUB_REF_NAME == "preview" ]
           then
-            docker build -t "${DOCKER_IMAGE}" --push .
+            DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest-pv"
           else
-            docker build -t "${DOCKER_IMAGE}" -t "${DOCKER_IMAGE_LATEST}" --push .
+            DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest"
           fi
+          docker build -t "${DOCKER_IMAGE}" -t "${DOCKER_IMAGE_LATEST}" --push .
 
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}  # Access secret from GitHub Secrets
