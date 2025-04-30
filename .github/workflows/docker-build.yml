@@ -45,8 +45,8 @@ jobs:
           
           echo " ${ env.GITHUB_REF_NAME }"
           echo " ${{ env.GITHUB_REF_NAME }}"
-          echo " ${ GITHUB_REF_NAME }"
-          echo " ${{ GITHUB_REF_NAME }}"
+#          echo " ${ GITHUB_REF_NAME }"
+#          echo " ${{ GITHUB_REF_NAME }}"
           
           if [ ${{ env.GITHUB_REF_NAME }} == "preview" ]
           then
