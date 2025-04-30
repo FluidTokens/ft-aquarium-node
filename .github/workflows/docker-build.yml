@@ -41,7 +41,13 @@ jobs:
         id: version  # This step has an ID to be referenced in the next step
         run: |
           
-          ## Append `-pv` for preview images
+          ## Append -pv for preview images
+          
+          echo " ${ env.GITHUB_REF_NAME }"
+          echo " ${{ env.GITHUB_REF_NAME }}"
+          echo " ${ GITHUB_REF_NAME }"
+          echo " ${{ GITHUB_REF_NAME }}"
+          
           if [ ${{ env.GITHUB_REF_NAME }} == "preview" ]
           then
             VERSION=$(date +'%Y.%m.%d')-pv
@@ -76,7 +82,7 @@ jobs:
           ## Don't push latest for preview
           if [ ${{ env.GITHUB_REF_NAME }} == "preview" ]
           then
-            docker build -t "${DOCKER_IMAGE}"--push .
+            docker build -t "${DOCKER_IMAGE}" --push .
           else
             docker build -t "${DOCKER_IMAGE}" -t "${DOCKER_IMAGE_LATEST}" --push .
           fi
