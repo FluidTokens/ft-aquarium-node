@@ -21,9 +21,7 @@ public class AccountConfig {
         };
 
         var account = new Account(actualNetwork, mnemonic);
-        log.info("INIT - Using account with enterprise address: {}", account.enterpriseAddress());
-        log.info("INIT - Using account with base address: {}", account.baseAddress());
-        log.info("INIT - Using account with stake address: {}", account.stakeAddress());
+        log.info("INIT - Aquarium Node base address: {}", account.baseAddress());
         return account;
 
     }

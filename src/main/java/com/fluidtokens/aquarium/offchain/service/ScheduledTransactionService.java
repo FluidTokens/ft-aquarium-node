@@ -157,6 +157,7 @@ public class ScheduledTransactionService {
                 scheduledTransactionData.setBatcher(batcher);
                 scheduledTransactionData.setReferenceParamsIndex(refInputIndexes.paramsIndex());
                 scheduledTransactionData.setReferenceStakingIndex(refInputIndexes.stakingIndex());
+                scheduledTransactionData.setWhitelistIndex(ZERO);
 
                 var redeemer = scheduledTransactionData.toPlutusData();
 
