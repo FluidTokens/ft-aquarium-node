@@ -24,7 +24,7 @@ aquarium:
       name: 0014df10464c4454
   tank:
     ref-input:
-      txHash: e016e3db3db27e167906df22b8a6c7879911c089bd2d9f3ec4be061e2690173b
+      txHash: 354ffe7958d62a8a2bf0b0bd97a06694d59dc49b6d02f1ab40165a3955257168
       outputIndex: 0
 
 blockfrost:
@@ -33,13 +33,13 @@ blockfrost:
 
 store:
   cardano:
-    host: ""
-    port: ""
+    host: backbone.mainnet.cardanofoundation.org
+    port: 3001
     protocol-magic: 764824073
     # Start from the block that minted the ref input for the contract
-    sync-start-slot: 147744276
-    sync-start-blockhash: 8d55468951b4a8ee9f074e21fbe52574155665585887d002fce00b06a13d3de1
-    keep-alive-interval: 3000
+    sync-start-blockhash: 586ead1770fc2a59021b824bc0d65bf1d6060585384f257971204d5925f054c2
+    sync-start-slot: 154984561
+    keep-alive-interval: 1000
   blocks:
     epoch-calculation-interval=14400:  # 14400 = 4 hours
 
@@ -72,11 +72,12 @@ blockfrost:
 
 store:
   cardano:
-    host: ryzen
-    port: 30020
+    host: ""
+    port: 0
     protocol-magic: 2
     # Start from the block that minted the ref input for the contract
     sync-start-blockhash: 0e459daa0813334b79da2bac23d3324b604ee04209679bed08b6f49cac82cb4e
     sync-start-slot: 71971209
+    keep-alive-interval: 1000
   blocks:
     epoch-calculation-interval=14400:  # 14400 = 4 hours
