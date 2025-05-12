@@ -13,10 +13,10 @@ Operators will periodically receive compensation for the work executed.
 
 Steps to run the aquarium validator are simple:
 1. rename the file docker/.env.example in .env
-2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only and 10 tADA inside the .env file (THIS SHOULD BE A DEDICATED SEEDPRHASE, DO NOT USE ANY ACTIVE SEEDPHRASE)
+2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only and 10 ADA inside the .env file (THIS SHOULD BE A DEDICATED SEEDPRHASE, DO NOT USE ANY ACTIVE SEEDPHRASE) this will be the aquarium node 
 3. run `docker compose build` inside the docker folder
 4. run ` docker compose up` inside the docker folder
-5. Get 30k tFLDT on a preview testnet hot wallet - you can get them by opening a [discord](https://discord.gg/nNmBhMUGtj) ticket
+5. Get 30k FLDT on a hot or cold wallet - you can get them on [minswap](https://minswap.org/tokens/fldt) 
 6. Delegate your 30k tFLDT from the wallet containing the 30k FLDT to your node address generated at point 2. [here](https://aquarium-dev.fluidtokens.com/validator)
 7. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer
 8. Every month 50% of all the generated fees are split across the nodes that performed transactions
