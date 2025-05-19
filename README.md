@@ -119,6 +119,48 @@ WALLET_MNEMONIC=lorem ipsum
 Ensure that the wallet has already completed the staking procedure or received BOT operator stake delegation. Please 
 check the fluidtokens website for further details on how to perform stake and unstake.
 
+### Aquarium Node Health Check
+
+The Aquarium node runs in two modes: syncing and normal.
+
+Syncing mode happens when a new node is started, or the db is cleared and last usually few minutes to a few hours depending on
+network connection and hardware.
+
+If your node is correctly syncing, you will find something like this in the logs:
+
+```bash
+2025-05-19T21:33:06.286Z  INFO 1 --- [nio-8080-exec-2] c.f.a.offchain.controller.Healthcheck    : [HEALTH] Aquarium Node is correctly syncing the blockchain.
+```
+
+Once the syncing is complete, some health checks are ran every few minutes, and you should see something like:
+
+```bash
+2025-05-19T22:31:06.286Z  INFO 1 --- [nio-8080-exec-2] c.f.a.offchain.controller.Healthcheck    : [HEALTH] Aquarium Node is healthy
+```
+
+You can manually check the status of your node running `curl http://localhost:8080/__internal__/healthcheck | jq .`. 
+You will either see a message telling your what the node is doing, or a health check report which will look like:
+
+```json
+{
+  "dbOkay": true,
+  "parametersOk": true,
+  "parametersRefInputOk": true
+}
+```
+
+Last but not the least, the Node also runs some non-critical checks like wallet balance and staking status.
+
+Grep for `HEALTH` in your logs and check if you get any of:
+```bash
+[HEALTH] No utxo found for wallet. Ensure you have at least one UTXO with only ada in it.
+```
+or 
+```bash
+[HEALTH] The current wallet does not have any FLDT delegated. Ensure you're staking FLDT to the Node's wallet.
+```
+
+and act accordingly
 
 ### How to understand if my node is synced?
 

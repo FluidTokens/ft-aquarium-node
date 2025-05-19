@@ -11,7 +11,6 @@ import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.blueprint.types.datum.model.DatumTank;
 import com.fluidtokens.aquarium.offchain.blueprint.types.datum.model.converter.DatumTankConverter;
 import com.fluidtokens.aquarium.offchain.blueprint.types.redeemer.model.impl.ScheduledTransactionData;
@@ -29,7 +28,6 @@ import java.math.BigInteger;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
-import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -126,7 +124,6 @@ public class ScheduledTransactionService {
 
         var processableScheduledTransactions = scheduledTank.stream()
                 .filter(isScheduledTxTimeValid())
-                .sorted(Comparator.comparing(foo -> foo.datumTank().))
                 .toList();
 
         log.info("Found {} Tank Utxos of which {} Scheduled Transactions and {} Processable Scheduled Transactions",
