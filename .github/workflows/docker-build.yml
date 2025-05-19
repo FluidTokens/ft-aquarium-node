@@ -5,6 +5,7 @@ on:
     branches:
       - main  # or any branch you want to trigger the action for
       - preview
+  workflow_dispatch:
 
 jobs:
   build:
