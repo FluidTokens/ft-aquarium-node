@@ -29,6 +29,7 @@ import java.math.BigInteger;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -49,11 +50,9 @@ public class ScheduledTransactionService {
 
     }
 
-    private final ObjectMapper objectMapper = new ObjectMapper();
-
     private final AppConfig.Network network;
 
-    private final AppConfig.AquariumConfiguration acquariumConfiguration;
+    private final AppConfig.AquariumConfiguration aquariumConfiguration;
 
     private final Account account;
 
@@ -74,7 +73,7 @@ public class ScheduledTransactionService {
     private final DatumTankConverter datumConverter = new DatumTankConverter();
 
     private RefInputIndexes resolveRefIndexes(TransactionInput parametersRefInput, TransactionInput stakingRefInput) {
-        var sortedRefInputs = Stream.of(parametersRefInput, stakingRefInput, acquariumConfiguration.getTankRefInput())
+        var sortedRefInputs = Stream.of(parametersRefInput, stakingRefInput, aquariumConfiguration.getTankRefInput())
                 .sorted(new TransactionInputComparator())
                 .toList();
         var parametersRefInputIndex = sortedRefInputs.indexOf(parametersRefInput);
@@ -106,11 +105,11 @@ public class ScheduledTransactionService {
                 .toList();
 
 
-        final var tankContractRefInput = acquariumConfiguration.getTankRefInput();
+        final var tankContractRefInput = aquariumConfiguration.getTankRefInput();
 
         var refInputIndexes = resolveRefIndexes(parametersRefInput, stakerRefInput);
 
-        var scheduledTankUtxos = tankUtxos
+        var scheduledTank = tankUtxos
                 .stream()
                 .flatMap(addressUtxoEntity -> {
                     try {
@@ -123,12 +122,19 @@ public class ScheduledTransactionService {
                     }
                 })
                 .filter(isScheduledTankTransaction())
-                .filter(isScheduledTxTimeValid())
                 .toList();
 
-        log.info("Found {} Tank Utxos of which {} Scheduled Transations  ", tankUtxos.size(), scheduledTankUtxos.size());
+        var processableScheduledTransactions = scheduledTank.stream()
+                .filter(isScheduledTxTimeValid())
+                .sorted(Comparator.comparing(foo -> foo.datumTank().))
+                .toList();
 
-        scheduledTankUtxos.forEach(datumTankUtxo -> {
+        log.info("Found {} Tank Utxos of which {} Scheduled Transactions and {} Processable Scheduled Transactions",
+                tankUtxos.size(),
+                scheduledTank.size(),
+                processableScheduledTransactions.size());
+
+        processableScheduledTransactions.forEach(datumTankUtxo -> {
 
             var utxoEntity = datumTankUtxo.addressUtxoEntity();
             var tankDatum = datumTankUtxo.datumTank();
@@ -144,11 +150,16 @@ public class ScheduledTransactionService {
                 }
 
                 // Ensure to use utxo with just ada
-                var walletUtxo = walletUtxos
+                var walletUtxoOpt = walletUtxos
                         .stream()
                         .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
-                        .findFirst()
-                        .get();
+                        .findFirst();
+
+                if (walletUtxoOpt.isEmpty()) {
+                    log.warn("no valid utxos found. please ensure wallet has at least one utxo which contains ONLY ADA");
+                }
+
+                var walletUtxo = walletUtxoOpt.get();
 
                 var batcher = AddressUtil.toOnchainAddress(account.getBaseAddress());
 
@@ -220,7 +231,6 @@ public class ScheduledTransactionService {
             var tankDatum = datumTankUtxo.datumTank();
             var timestamp = tankDatum.getExecutiontime();
             var startTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(timestamp.longValue()), ZoneOffset.UTC);
-            log.info("startTime: {}", startTime);
             return LocalDateTime.now(ZoneOffset.UTC).isAfter(startTime);
         };
     }
