@@ -32,14 +32,21 @@ Steps to run the aquarium validator are simple:
 
 ## How does it work
 
-As mentioned, the Aquarium Node is a Java App, which leverages BloxBean Yaci Store indexer to find and persist on a local
-Postgres Database, relevant utxos.
+The Aquarium Node is a Java App which requires two additional components to work:
+1. A Cardano Node (which can either be local or remote)
+2. A local Postgres Database
 
-Periodically, the node checks if any of the _Scheduled Transaction_ can be executed by querying the local database.
+The Aquarium Node leverages [BloxBean Yaci Store](https://github.com/bloxbean/yaci-store) to index the Cardano blockchain and 
+save to a local database relevant data such as the UTxOs of Aquarium Scheduled transactions, Aquarium Parameters UTxO and 
+Aquarium Staker UTxOs.
 
-_Scheduled Transactions_ which are ready to be processed are filtered out, assembled and submitted to the Cardano network.
+Periodically, the node loads all the UTxOs of the `Scheduled Transaction` contract, deserialise the attached data (if any),
+checks if any of the _Scheduled Transaction_ can be executed and eventually prepares, signs and submits the transaction to a Node via [Blockfrost](https://blockfrost.io/).
 
-In order to validate and submit the transaction, a valid BlockFrost API Key is required.
+Here below a high level design of the Acquarium Node.
+
+![Aquarium Node High Level Design](https://github.com/adam-p/markdown-here/raw/master/src/common/images/icon48.png "Logo Title Text 1")
+
 
 ## How to build
 
