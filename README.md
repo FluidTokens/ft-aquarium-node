@@ -29,7 +29,7 @@ Steps to run the aquarium validator are simple:
 7. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer
 8. Every month 50% of all the generated fees are split across the nodes that performed transactions
 
-## How does it work
+## How it works
 
 The Aquarium Node requires two additional components to work:
 
