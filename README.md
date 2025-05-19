@@ -29,24 +29,43 @@ Steps to run the aquarium validator are simple:
 7. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer
 8. Every month 50% of all the generated fees are split across the nodes that performed transactions
 
-
 ## How does it work
 
-The Aquarium Node is a Java App which requires two additional components to work:
+The Aquarium Node requires two additional components to work:
+
 1. A Cardano Node (which can either be local or remote)
 2. A local Postgres Database
 
 The Aquarium Node leverages [BloxBean Yaci Store](https://github.com/bloxbean/yaci-store) to index the Cardano blockchain and 
-save to a local database relevant data such as the UTxOs of Aquarium Scheduled transactions, Aquarium Parameters UTxO and 
-Aquarium Staker UTxOs.
+saves to a local database relevant data such as:
+
+* the UTxOs of Aquarium Scheduled transactions
+* Aquarium Parameters UTxO 
+* Aquarium Staker UTxOs
 
 Periodically, the node loads all the UTxOs of the `Scheduled Transaction` contract, deserialise the attached data (if any),
 checks if any of the _Scheduled Transaction_ can be executed and eventually prepares, signs and submits the transaction to a Node via [Blockfrost](https://blockfrost.io/).
 
-Here below a high level design of the Acquarium Node.
+Here below a high level design of the Acquarium Node:
 
-![Aquarium Node High Level Design](https://github.com/adam-p/markdown-here/raw/master/src/common/images/icon48.png "Logo Title Text 1")
+![Aquarium Node High Level Design](AQUARIUM_DESIGN.jpg)
 
+### Alternative solutions
+
+When designing the Aquarium node, alternative solutions were considered and after careful considerations it was agreed to proceed with using 
+Java and Yaci Store.
+
+The most common approach adopted in the Cardano ecosystem is to used Kupo and Ogmios as services to scan the blockchain and query utxos.
+Although these two services offer all the apis required to the Aquarium Node, it also means an operator requires to locally run a Cardano Node
+along Kupo and Ogmios, significantly increasing complexity and costs of running an Aquarium Node.
+
+By leveraging Yaci, while some additional configuration is required, the Aquarium Node is able to both traverse the chain and locally store relevant utxo.
+
+Using Yaci Store also gives the following benefits:
+1. Simple, concise and fast code to access data via SQL queries
+2. Straightforward horizontal scaling: by replicating the DB and launching Yaci in read only mode, is very simple to linearly scale
+the Aquarium Node
+3. Blockfrost api: Yaci can serve blockfrost compatible APIs out of the box
 
 ## How to build
 
