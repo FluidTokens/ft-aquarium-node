@@ -1,5 +1,7 @@
 package com.fluidtokens.aquarium.offchain.storage;
 
+import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.util.HexUtil;
 import com.bloxbean.cardano.yaci.store.common.domain.AddressUtxo;
 import com.bloxbean.cardano.yaci.store.common.domain.TxInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.UtxoCache;
@@ -30,12 +32,14 @@ public class TankUtxoStorage extends UtxoStorageImpl {
                            DSLContext dsl,
                            UtxoCache utxoCache,
                            PlatformTransactionManager platformTransactionManager,
+                           Account account,
                            ParametersContractService parametersContractService,
                            StakerContractService stakerContractService,
                            TankContractService tankContractService) {
         super(utxoRepository, spentOutputRepository, dsl, utxoCache, platformTransactionManager);
         this.utxoRepository = utxoRepository;
         contractPaymentPkh = List.of(
+                account.getBaseAddress().getPaymentCredentialHash().map(HexUtil::encodeHexString).get(),
                 parametersContractService.getScriptHashHex(),
                 stakerContractService.getScriptHashHex(),
                 tankContractService.getScriptHashHex()

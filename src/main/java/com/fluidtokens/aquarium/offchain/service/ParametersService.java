@@ -41,8 +41,6 @@ public class ParametersService {
 
         var utxoEntity = settings.getFirst();
 
-        log.info("found settings: {}:{}", utxoEntity.getTxHash(), utxoEntity.getOutputIndex());
-
         return datumParametersConverter.deserialize(utxoEntity.getInlineDatum());
 
     }
@@ -59,9 +57,6 @@ public class ParametersService {
         }
 
         var utxoEntity = settings.getFirst();
-
-        log.info("found settings: {}:{}", utxoEntity.getTxHash(), utxoEntity.getOutputIndex());
-
 
         return TransactionInput.builder().transactionId(utxoEntity.getTxHash()).index(utxoEntity.getOutputIndex()).build();
 

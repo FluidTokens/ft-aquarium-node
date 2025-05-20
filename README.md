@@ -19,7 +19,8 @@ Operators will periodically receive compensation for the work executed.
 
 ## TLDR (cardano mainnet)
 
-Steps to run the aquarium validator are simple:
+Steps to run an Aquarium Node are simple:
+
 1. rename the file docker/.env.example in .env
 2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only and 10 ADA inside the .env file (THIS SHOULD BE A DEDICATED SEEDPRHASE, DO NOT USE ANY ACTIVE SEEDPHRASE) this will be the aquarium node 
 3. run `docker compose build` inside the docker folder
@@ -29,17 +30,43 @@ Steps to run the aquarium validator are simple:
 7. That's it! First time will take a bit to sync with the genesis of Aquarium tx but then will be super fast indexer
 8. Every month 50% of all the generated fees are split across the nodes that performed transactions
 
+## How it works
 
-## How does it work
+The Aquarium Node requires two additional components to work:
 
-As mentioned, the Aquarium Node is a Java App, which leverages BloxBean Yaci Store indexer to find and persist on a local
-Postgres Database, relevant utxos.
+1. A Cardano Node (which can either be local or remote)
+2. A local Postgres Database
 
-Periodically, the node checks if any of the _Scheduled Transaction_ can be executed by querying the local database.
+The Aquarium Node leverages [BloxBean Yaci Store](https://github.com/bloxbean/yaci-store) to index the Cardano blockchain and 
+saves to a local database relevant data such as:
 
-_Scheduled Transactions_ which are ready to be processed are filtered out, assembled and submitted to the Cardano network.
+* the UTxOs of Aquarium Scheduled transactions
+* Aquarium Parameters UTxO 
+* Aquarium Staker UTxOs
 
-In order to validate and submit the transaction, a valid BlockFrost API Key is required.
+Periodically, the node loads all the UTxOs of the `Scheduled Transaction` contract, deserialise the attached data (if any),
+checks if any of the _Scheduled Transaction_ can be executed and eventually prepares, signs and submits the transaction to a Node via [Blockfrost](https://blockfrost.io/).
+
+Here below a high level design of the Acquarium Node:
+
+![Aquarium Node High Level Design](AQUARIUM_DESIGN.jpg)
+
+### Alternative solutions
+
+When designing the Aquarium node, alternative solutions were considered and after careful considerations it was agreed to proceed with using 
+Java and Yaci Store.
+
+The most common approach adopted in the Cardano ecosystem is to used Kupo and Ogmios as services to scan the blockchain and query utxos.
+Although these two services offer all the apis required to the Aquarium Node, it also means an operator requires to locally run a Cardano Node
+along Kupo and Ogmios, significantly increasing complexity and costs of running an Aquarium Node.
+
+By leveraging Yaci, while some additional configuration is required, the Aquarium Node is able to both traverse the chain and locally store relevant utxo.
+
+Using Yaci Store also gives the following benefits:
+1. Simple, concise and fast code to access data via SQL queries
+2. Straightforward horizontal scaling: by replicating the DB and launching Yaci in read only mode, is very simple to linearly scale
+the Aquarium Node
+3. Blockfrost api: Yaci can serve blockfrost compatible APIs out of the box
 
 ## How to build
 
@@ -93,6 +120,48 @@ WALLET_MNEMONIC=lorem ipsum
 Ensure that the wallet has already completed the staking procedure or received BOT operator stake delegation. Please 
 check the fluidtokens website for further details on how to perform stake and unstake.
 
+### Aquarium Node Health Check
+
+The Aquarium node runs in two modes: syncing and normal.
+
+Syncing mode happens when a new node is started, or the db is cleared and last usually few minutes to a few hours depending on
+network connection and hardware.
+
+If your node is correctly syncing, you will find something like this in the logs:
+
+```bash
+2025-05-19T21:33:06.286Z  INFO 1 --- [nio-8080-exec-2] c.f.a.offchain.controller.Healthcheck    : [HEALTH] Aquarium Node is correctly syncing the blockchain.
+```
+
+Once the syncing is complete, some health checks are ran every few minutes, and you should see something like:
+
+```bash
+2025-05-19T22:31:06.286Z  INFO 1 --- [nio-8080-exec-2] c.f.a.offchain.controller.Healthcheck    : [HEALTH] Aquarium Node is healthy
+```
+
+You can manually check the status of your node running `curl http://localhost:8080/__internal__/healthcheck | jq .`. 
+You will either see a message telling your what the node is doing, or a health check report which will look like:
+
+```json
+{
+  "dbOkay": true,
+  "parametersOk": true,
+  "parametersRefInputOk": true
+}
+```
+
+Last but not the least, the Node also runs some non-critical checks like wallet balance and staking status.
+
+Grep for `HEALTH` in your logs and check if you get any of:
+```bash
+[HEALTH] No utxo found for wallet. Ensure you have at least one UTXO with only ada in it.
+```
+or 
+```bash
+[HEALTH] The current wallet does not have any FLDT delegated. Ensure you're staking FLDT to the Node's wallet.
+```
+
+and act accordingly
 
 ### How to understand if my node is synced?
 
