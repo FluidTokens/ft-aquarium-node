@@ -19,7 +19,8 @@ Operators will periodically receive compensation for the work executed.
 
 ## TLDR (cardano mainnet)
 
-Steps to run the aquarium validator are simple:
+Steps to run an Aquarium Node are simple:
+
 1. rename the file docker/.env.example in .env
 2. set blockfrost APIKEY and the mnemonic phrase of a dedicated wallet containing only and 10 ADA inside the .env file (THIS SHOULD BE A DEDICATED SEEDPRHASE, DO NOT USE ANY ACTIVE SEEDPHRASE) this will be the aquarium node 
 3. run `docker compose build` inside the docker folder
