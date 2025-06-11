@@ -190,9 +190,8 @@ public class ScheduledTransactionService {
 
                 var tx = new ScriptTx()
                         .collectFrom(walletUtxo)
-                        .collectFrom(tankPaymentUtxo, redeemer);
-
-                tx.payToAddress(payeeAddress.getAddress(), ValueUtil.toAmountList(amountToSend))
+                        .collectFrom(tankPaymentUtxo, redeemer)
+                        .payToAddress(payeeAddress.getAddress(), ValueUtil.toAmountList(amountToSend))
                         .payToAddress(rewardsAddress.getAddress(), ValueUtil.toAmountList(reward))
                         .withChangeAddress(account.baseAddress())
                         .readFrom(parametersRefInput)
@@ -208,6 +207,7 @@ public class ScheduledTransactionService {
                         .feePayer(account.baseAddress())
                         .collateralPayer(account.baseAddress())
                         .mergeOutputs(false)
+                        .ignoreScriptCostEvaluationError(false)
                         .completeAndWait();
 
             } catch (Exception e) {
