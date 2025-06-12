@@ -1,10 +1,8 @@
 package com.fluidtokens.aquarium.offchain.service;
 
 import com.bloxbean.cardano.client.account.Account;
-import com.bloxbean.cardano.client.api.exception.ApiException;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
-import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
@@ -29,10 +27,12 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Vector;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
+import static com.fluidtokens.aquarium.offchain.util.UtxoUtil.toUtxo;
 import static java.math.BigInteger.ZERO;
 
 @Service
@@ -44,7 +44,7 @@ public class ScheduledTransactionService {
 
     }
 
-    private record DatumTankUtxo(DatumTank datumTank, AddressUtxoEntity addressUtxoEntity) {
+    private record DatumTankUtxo(DatumTank datumTank, Utxo utxo) {
 
     }
 
@@ -53,8 +53,6 @@ public class ScheduledTransactionService {
     private final AppConfig.AquariumConfiguration aquariumConfiguration;
 
     private final Account account;
-
-    private final BFBackendService bfBackendService;
 
     private final QuickTxBuilder quickTxBuilder;
 
@@ -68,6 +66,10 @@ public class ScheduledTransactionService {
 
     private final TankContractService tankContractService;
 
+    private final AppUtxoService appUtxoService;
+
+    private final Vector<TransactionInput> unprocessableScheduledTransactions = new Vector<>();
+
     private final DatumTankConverter datumConverter = new DatumTankConverter();
 
     private RefInputIndexes resolveRefIndexes(TransactionInput parametersRefInput, TransactionInput stakingRefInput) {
@@ -80,7 +82,7 @@ public class ScheduledTransactionService {
     }
 
 
-    @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelay = 5)
+    @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelay = 1, initialDelay = 1)
     public void processPayments() {
 
         log.info("Starting Process Payments RUN");
@@ -109,11 +111,12 @@ public class ScheduledTransactionService {
 
         var scheduledTank = tankUtxos
                 .stream()
+                .filter(filterUnprocessableScheduledTransactions(unprocessableScheduledTransactions))
                 .flatMap(addressUtxoEntity -> {
                     try {
                         var inlineDatum = addressUtxoEntity.getInlineDatum();
                         var tankDatum = datumConverter.deserialize(inlineDatum);
-                        return Stream.of(new DatumTankUtxo(tankDatum, addressUtxoEntity));
+                        return Stream.of(new DatumTankUtxo(tankDatum, toUtxo(addressUtxoEntity)));
                     } catch (Exception e) {
                         log.warn("could not deserialise datum for: {}", addressUtxoEntity);
                         return Stream.empty();
@@ -133,16 +136,14 @@ public class ScheduledTransactionService {
 
         processableScheduledTransactions.forEach(datumTankUtxo -> {
 
-            var utxoEntity = datumTankUtxo.addressUtxoEntity();
+            var tankPaymentUtxo = datumTankUtxo.utxo();
             var tankDatum = datumTankUtxo.datumTank();
 
             try {
 
-                List<Utxo> walletUtxos;
-                try {
-                    walletUtxos = bfBackendService.getUtxoService().getUtxos(account.baseAddress(), 10, 1).getValue();
-                } catch (ApiException e) {
-                    log.warn("error: ", e);
+                List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
+                if (walletUtxos.isEmpty()) {
+                    log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
                     return;
                 }
 
@@ -154,6 +155,7 @@ public class ScheduledTransactionService {
 
                 if (walletUtxoOpt.isEmpty()) {
                     log.warn("no valid utxos found. please ensure wallet has at least one utxo which contains ONLY ADA");
+                    return;
                 }
 
                 var walletUtxo = walletUtxoOpt.get();
@@ -177,14 +179,6 @@ public class ScheduledTransactionService {
                 var slot = cardanoConverters.time().toSlot(now);
 
                 var reward = AssetAmountUtil.toValue(List.of(tankDatum.getReward()));
-
-                var tankUtxoResponse = bfBackendService.getUtxoService().getTxOutput(utxoEntity.getTxHash(), utxoEntity.getOutputIndex());
-                if (!tankUtxoResponse.isSuccessful()) {
-                    log.warn("could not resolve tank utxo {}:{}, skipping...", utxoEntity.getTxHash(), utxoEntity.getOutputIndex());
-                    return;
-                }
-
-                var tankPaymentUtxo = tankUtxoResponse.getValue();
 
                 var rewardsAddress = AddressUtil.toAddress(parameters.getAddressRewards(), network.getCardanoNetwork());
 
@@ -211,7 +205,11 @@ public class ScheduledTransactionService {
                         .completeAndWait();
 
             } catch (Exception e) {
-                log.warn("Could not process Tank utxo: {}:{}", utxoEntity.getTxHash(), utxoEntity.getOutputIndex());
+                unprocessableScheduledTransactions.add(TransactionInput.builder()
+                        .transactionId(tankPaymentUtxo.getTxHash())
+                        .index(tankPaymentUtxo.getOutputIndex())
+                        .build());
+                log.warn("Could not process Tank utxo: {}:{}", tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex());
                 log.warn("Error", e);
             }
 
@@ -230,6 +228,18 @@ public class ScheduledTransactionService {
             var startTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(timestamp.longValue()), ZoneOffset.UTC);
             return LocalDateTime.now(ZoneOffset.UTC).isAfter(startTime);
         };
+    }
+
+    /**
+     * Checks whether the current Scheduled Tx schedule time has been reached.
+     *
+     * @return
+     */
+    private static Predicate<AddressUtxoEntity> filterUnprocessableScheduledTransactions(Vector<TransactionInput> unprocessableScheduledTransactions) {
+        return addressUtxoEntity -> !unprocessableScheduledTransactions.contains(TransactionInput.builder()
+                        .transactionId(addressUtxoEntity.getTxHash())
+                        .index(addressUtxoEntity.getOutputIndex())
+                .build());
     }
 
     /**
