@@ -2,18 +2,19 @@ package com.fluidtokens.aquarium.offchain.controller;
 
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.fasterxml.jackson.databind.annotation.JsonNaming;
+import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.ParametersService;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.Pageable;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.util.Collection;
 import java.util.stream.Stream;
 
 @RestController
@@ -22,9 +23,12 @@ import java.util.stream.Stream;
 @RequiredArgsConstructor
 public class Healthcheck {
 
-    public record HealthCheck(Boolean dbOkay,
+    @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+    public record HealthCheck(Boolean dbOk,
                               Boolean parametersOk,
-                              Boolean parametersRefInputOk) {
+                              Boolean parametersRefInputOk,
+                              Boolean walletOk,
+                              Boolean stakingOk) {
 
     }
 
@@ -38,6 +42,8 @@ public class Healthcheck {
 
     private final BlockEventListener blockEventListener;
 
+    private final AppUtxoService utxoService;
+
     @GetMapping
     public ResponseEntity<?> healthCheck() {
 
@@ -46,21 +52,20 @@ public class Healthcheck {
             return ResponseEntity.ok("...syncing...");
         }
 
-        boolean dbOkay = false;
         boolean walletOk = false;
         try {
-            var walletUtxos = utxoRepository.findUnspentByOwnerAddr(account.baseAddress(), Pageable.unpaged());
-            dbOkay = true;
+            var walletUtxos = utxoService.listWalletUtxo();
             walletOk = walletUtxos.stream()
-                    .flatMap(Collection::stream)
-                    .anyMatch(addressUtxoEntity -> addressUtxoEntity.getAmounts().size() == 1);
+                    .anyMatch(utxo -> utxo.getAmount().size() == 1);
         } catch (Exception e) {
-            log.warn("[HEALTH] possible db connection issues", e);
+            log.warn("[HEALTH] unable to find wallet's utxos", e);
         }
 
+        boolean dbOkay = false;
         boolean parametersOk = false;
         try {
             parametersService.loadParameters();
+            dbOkay = true;
             parametersOk = true;
         } catch (Exception e) {
             log.warn("[HEALTH] could not load parameters", e);
@@ -90,7 +95,9 @@ public class Healthcheck {
 
         var healthCheckStatus = new HealthCheck(dbOkay,
                 parametersOk,
-                parametersRefInputOk);
+                parametersRefInputOk,
+                walletOk,
+                stakingFound);
 
         if (!walletOk) {
             log.warn("[HEALTH] No utxo found for wallet. Ensure you have at least one UTXO with only ada in it.");
@@ -101,7 +108,11 @@ public class Healthcheck {
         }
 
         if (healthCheck) {
-            log.info("[HEALTH] Aquarium Node is healthy");
+            if (walletOk && stakingFound) {
+                log.info("[HEALTH] Aquarium Node is healthy and ready to process transactions.");
+            } else {
+                log.warn("[HEALTH] Aquarium Node is healthy but wallet or staking issues detected. Check logs above for details.");
+            }
             return ResponseEntity.ok(healthCheckStatus);
         } else {
             return ResponseEntity.internalServerError().body(healthCheckStatus);
