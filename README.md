@@ -144,9 +144,11 @@ You will either see a message telling your what the node is doing, or a health c
 
 ```json
 {
-  "dbOkay": true,
-  "parametersOk": true,
-  "parametersRefInputOk": true
+  "db_ok": true,
+  "parameters_ok": true,
+  "parameters_ref_input_ok": true,
+  "wallet_ok": true,
+  "staking_ok": true
 }
 ```
 

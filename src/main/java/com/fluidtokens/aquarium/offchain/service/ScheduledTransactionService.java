@@ -29,6 +29,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Vector;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
@@ -112,16 +113,7 @@ public class ScheduledTransactionService {
         var scheduledTank = tankUtxos
                 .stream()
                 .filter(filterUnprocessableScheduledTransactions(unprocessableScheduledTransactions))
-                .flatMap(addressUtxoEntity -> {
-                    try {
-                        var inlineDatum = addressUtxoEntity.getInlineDatum();
-                        var tankDatum = datumConverter.deserialize(inlineDatum);
-                        return Stream.of(new DatumTankUtxo(tankDatum, toUtxo(addressUtxoEntity)));
-                    } catch (Exception e) {
-                        log.warn("could not deserialise datum for: {}", addressUtxoEntity);
-                        return Stream.empty();
-                    }
-                })
+                .flatMap(getAddressUtxoEntityStreamFunction())
                 .filter(isScheduledTankTransaction())
                 .toList();
 
@@ -217,6 +209,23 @@ public class ScheduledTransactionService {
     }
 
     /**
+     * transform a AddressUtxoEntity into an "optional" DatumTankUtxo stream.
+     * @return an utxo object and the Tank Datum if it can be deserialized, otherwise an empty stream.
+     */
+    private Function<AddressUtxoEntity, Stream<DatumTankUtxo>> getAddressUtxoEntityStreamFunction() {
+        return addressUtxoEntity -> {
+            try {
+                var inlineDatum = addressUtxoEntity.getInlineDatum();
+                var tankDatum = datumConverter.deserialize(inlineDatum);
+                return Stream.of(new DatumTankUtxo(tankDatum, toUtxo(addressUtxoEntity)));
+            } catch (Exception e) {
+                log.warn("could not deserialise datum for: {}", addressUtxoEntity);
+                return Stream.empty();
+            }
+        };
+    }
+
+    /**
      * Checks whether the current Scheduled Tx schedule time has been reached.
      *
      * @return
@@ -255,5 +264,7 @@ public class ScheduledTransactionService {
             return datumTank.getAllowedtokens().isEmpty() && !reward.isZero() && reward.isPositive();
         };
     }
+
+
 
 }
