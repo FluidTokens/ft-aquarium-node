@@ -1,0 +1,40 @@
+FROM ghcr.io/graalvm/graalvm-community:21.0.2-ol9-20240116 AS builder
+
+WORKDIR /app
+
+# Copy gradle wrapper and build files
+COPY gradle/ gradle/
+COPY gradlew build.gradle settings.gradle ./
+COPY gradle.properties ./
+
+# Make gradlew executable
+RUN chmod +x gradlew
+
+# Copy source code
+COPY src/ src/
+
+# Build the application (skip tests)
+RUN ./gradlew build -x test
+
+# Build native image with static compilation
+RUN ./gradlew nativeCompile
+
+# Runtime stage - use minimal Alpine for static binary
+FROM ghcr.io/graalvm/graalvm-community:21.0.2-ol9-20240116
+
+WORKDIR /app
+
+# Create non-root user
+RUN groupadd -r -g 1001 app && useradd -r -u 1001 -g app app
+
+# Copy the statically compiled native executable from builder stage
+COPY --from=builder /app/build/native/nativeCompile/ft-aquarium-node app
+
+# Change ownership to app user
+RUN chown -R app:app /app
+
+USER app
+
+EXPOSE 8080
+
+ENTRYPOINT ["./app"]

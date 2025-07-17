@@ -1,4 +1,5 @@
 # Authors
 
-- Giovanni Gargiulo (TODO)
-- Mateusz Czeladka (mateusz.szczap@gmail.com)
+- Raul Antonio Rosa Padilla
+- Giovanni Gargiulo
+- Mateusz Czeladka
