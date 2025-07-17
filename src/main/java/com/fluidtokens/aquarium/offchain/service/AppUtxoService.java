@@ -26,7 +26,6 @@ public class AppUtxoService {
     private final BFBackendService bfBackendService;
 
     public List<Utxo> listWalletUtxo() {
-
         var walletUtxosOpt = utxoRepository.findUnspentByOwnerAddr(account.baseAddress(), Pageable.unpaged());
         var walletUtxos = walletUtxosOpt.stream()
                 .flatMap(Collection::stream)
