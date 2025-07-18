@@ -24,7 +24,6 @@ import java.util.List;
 public class TankUtxoStorage extends UtxoStorageImpl {
 
     private final UtxoRepository utxoRepository;
-
     private final List<String> contractPaymentPkh;
 
     public TankUtxoStorage(UtxoRepository utxoRepository,

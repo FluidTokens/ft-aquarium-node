@@ -9,8 +9,9 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.time.ZoneOffset;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import static java.time.ZoneOffset.UTC;
 
 @Service
 @RequiredArgsConstructor
@@ -18,22 +19,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class BlockEventListener {
 
     private final CardanoConverters cardanoConverters;
+    private final MetricsService metricsService;
 
     @Getter
     private final AtomicBoolean isSyncing = new AtomicBoolean(true);
 
     @EventListener
     public void processBlock(CommitEvent<?> commitEvent) {
+        // Update metrics
+        metricsService.incrementBlocksProcessed();
+        metricsService.updateCurrentSlot(commitEvent.getMetadata().getSlot());
 
-        var currentRealSlot = cardanoConverters.time().toSlot(LocalDateTime.now(ZoneOffset.UTC));
+        var currentRealSlot = cardanoConverters.time().toSlot(LocalDateTime.now(UTC));
 
-        if (commitEvent.getMetadata().getSlot() < currentRealSlot - 60 * 10) {
-            isSyncing.set(true);
-        } else {
-            isSyncing.set(false);
-        }
+        boolean syncing = commitEvent.getMetadata().getSlot() < currentRealSlot - 60 * 10;
+        isSyncing.set(syncing);
 
+        metricsService.updateSyncStatus(syncing);
     }
-
 
 }

@@ -42,11 +42,9 @@ import static java.math.BigInteger.ZERO;
 public class ScheduledTransactionService {
 
     record RefInputIndexes(BigInteger paramsIndex, BigInteger stakingIndex) {
-
     }
 
     private record DatumTankUtxo(DatumTank datumTank, Utxo utxo) {
-
     }
 
     private final AppConfig.Network network;
@@ -68,6 +66,8 @@ public class ScheduledTransactionService {
     private final TankContractService tankContractService;
 
     private final AppUtxoService appUtxoService;
+    
+    private final MetricsService metricsService;
 
     private final Vector<TransactionInput> unprocessableScheduledTransactions = new Vector<>();
 
@@ -79,9 +79,9 @@ public class ScheduledTransactionService {
                 .toList();
         var parametersRefInputIndex = sortedRefInputs.indexOf(parametersRefInput);
         var stakingRefInputIndex = sortedRefInputs.indexOf(stakingRefInput);
+
         return new RefInputIndexes(BigInteger.valueOf(parametersRefInputIndex), BigInteger.valueOf(stakingRefInputIndex));
     }
-
 
     @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelay = 5)
     public void processPayments() {
@@ -195,12 +195,15 @@ public class ScheduledTransactionService {
                         .mergeOutputs(false)
                         .ignoreScriptCostEvaluationError(false)
                         .completeAndWait();
-
+                        
+                // Transaction successfully processed
+                metricsService.incrementTransactionsProcessed();
             } catch (Exception e) {
                 unprocessableScheduledTransactions.add(TransactionInput.builder()
                         .transactionId(tankPaymentUtxo.getTxHash())
                         .index(tankPaymentUtxo.getOutputIndex())
                         .build());
+
                 log.warn("Could not process Tank utxo: {}:{}", tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex());
                 log.warn("Error", e);
             }

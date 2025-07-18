@@ -21,13 +21,23 @@ public class StakerContractService {
 
     public StakerContractService(AppConfig.Network network) {
         try {
+            log.debug("Initializing StakerContractService for network: {}", network.getCardanoNetwork());
+            
             SpendValidator spendValidator = new SpendValidator(network.getCardanoNetwork());
             plutusScript = spendValidator.getPlutusScript();
             paymentCredentials = Credential.fromScript(plutusScript.getScriptHash());
+            
+            log.info("INIT staker contract hash: {}", HexUtil.encodeHexString(paymentCredentials.getBytes()));
+            
         } catch (CborSerializationException e) {
-            throw new RuntimeException(e);
+            log.error("Failed to initialize StakerContractService: CBOR serialization error while creating staker spend validator for network {}", 
+                    network.getCardanoNetwork(), e);
+            throw new RuntimeException("Failed to initialize Staker contract service due to CBOR serialization error", e);
+        } catch (Exception e) {
+            log.error("Failed to initialize StakerContractService: Unexpected error while creating staker spend validator for network {}", 
+                    network.getCardanoNetwork(), e);
+            throw new RuntimeException("Failed to initialize Staker contract service due to unexpected error", e);
         }
-        log.info("INIT contract hash: {}", HexUtil.encodeHexString(paymentCredentials.getBytes()));
     }
 
     public byte[] getScriptHash() {

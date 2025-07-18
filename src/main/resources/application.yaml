@@ -12,6 +12,27 @@ spring:
     username: ${DB_USERNAME:fluidtokens}
     password: ${DB_PASSWORD:password}
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+      show-components: always
+    metrics:
+      enabled: true
+    prometheus:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: aquarium-node
+      environment: ${ENVIRONMENT:local}
+
 network: mainnet
 
 wallet:
