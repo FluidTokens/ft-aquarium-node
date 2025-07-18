@@ -32,16 +32,9 @@ public class Healthcheck {
 
     }
 
-    private final Account account;
-
-    private final UtxoRepository utxoRepository;
-
     private final ParametersService parametersService;
-
     private final StakerService stakerService;
-
     private final BlockEventListener blockEventListener;
-
     private final AppUtxoService utxoService;
 
     @GetMapping
