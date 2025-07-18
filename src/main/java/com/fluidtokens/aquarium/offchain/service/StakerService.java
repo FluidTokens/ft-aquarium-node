@@ -23,6 +23,8 @@ public class StakerService {
     private final UtxoRepository utxoRepository;
 
     private final StakerContractService stakerContractService;
+    
+    private final MetricsService metricsService;
 
     @PostConstruct
     public void init() {
@@ -38,22 +40,25 @@ public class StakerService {
     }
 
     public List<TransactionInput> findStakerRefInput() {
+        return metricsService.timeStakingCheck(() -> {
+            var stakingToken = AssetType.fromPlutusData(stakerContractService.getScriptHash(), account.getBaseAddress().getDelegationCredentialHash().get());
 
-        var stakingToken = AssetType.fromPlutusData(stakerContractService.getScriptHash(), account.getBaseAddress().getDelegationCredentialHash().get());
+            var fldtStakes = utxoRepository.findUnspentByOwnerPaymentCredential(stakerContractService.getScriptHashHex(), Pageable.unpaged());
+            var stakes = fldtStakes.stream().flatMap(Collection::stream)
+                    .filter(addressUtxoEntity -> addressUtxoEntity.getAmounts().stream().anyMatch(amount -> stakingToken.toUnit().equals(amount.getUnit())))
+                    .toList();
 
-        var fldtStakes = utxoRepository.findUnspentByOwnerPaymentCredential(stakerContractService.getScriptHashHex(), Pageable.unpaged());
-        var stakes = fldtStakes.stream().flatMap(Collection::stream)
-                .filter(addressUtxoEntity -> addressUtxoEntity.getAmounts().stream().anyMatch(amount -> stakingToken.toUnit().equals(amount.getUnit())))
-                .toList();
+            boolean hasStaking = !stakes.isEmpty();
+            metricsService.updateStakingActive(hasStaking);
 
-        if (stakes.isEmpty()) {
-            log.warn("It was not possible to find staked tokens.");
-        }
+            if (!hasStaking) {
+                log.warn("It was not possible to find staked tokens.");
+            }
 
-        return stakes.stream()
-                .map(utxo -> TransactionInput.builder().transactionId(utxo.getTxHash()).index(utxo.getOutputIndex()).build())
-                .toList();
-
+            return stakes.stream()
+                    .map(utxo -> TransactionInput.builder().transactionId(utxo.getTxHash()).index(utxo.getOutputIndex()).build())
+                    .toList();
+        });
     }
 
 }

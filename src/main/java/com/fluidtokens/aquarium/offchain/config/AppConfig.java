@@ -57,7 +57,6 @@ public class AppConfig {
 
     }
 
-
     @Bean
     public CardanoConverters cardanoConverters(@Value("${network}") String network) {
         var networkType = switch (network) {
@@ -65,7 +64,9 @@ public class AppConfig {
             case "preview" -> NetworkType.PREVIEW;
             default -> NetworkType.MAINNET;
         };
+
         log.info("INIT Converters network: {}, network type: {}", network, networkType);
+
         return ClasspathConversionsFactory.createConverters(networkType);
     }
 

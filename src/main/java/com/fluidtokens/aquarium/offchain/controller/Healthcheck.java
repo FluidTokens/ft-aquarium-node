@@ -32,22 +32,16 @@ public class Healthcheck {
 
     }
 
-    private final Account account;
-
-    private final UtxoRepository utxoRepository;
-
     private final ParametersService parametersService;
-
     private final StakerService stakerService;
-
     private final BlockEventListener blockEventListener;
-
     private final AppUtxoService utxoService;
-
+    
     @GetMapping
     public ResponseEntity<?> healthCheck() {
+        boolean isSyncing = blockEventListener.getIsSyncing().get();
 
-        if (blockEventListener.getIsSyncing().get()) {
+        if (isSyncing) {
             log.info("[HEALTH] Aquarium Node is correctly syncing the blockchain.");
             return ResponseEntity.ok("...syncing...");
         }

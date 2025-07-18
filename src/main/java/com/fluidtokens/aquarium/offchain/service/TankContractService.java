@@ -21,13 +21,23 @@ public class TankContractService {
 
     public TankContractService(AppConfig.Network network) {
         try {
+            log.debug("Initializing TankContractService for network: {}", network.getCardanoNetwork());
+            
             spendValidator = new SpendValidator(network.getCardanoNetwork());
             PlutusScript plutusScript = spendValidator.getPlutusScript();
             paymentCredentials = Credential.fromScript(plutusScript.getScriptHash());
+            
+            log.info("INIT tank contract hash: {}", HexUtil.encodeHexString(paymentCredentials.getBytes()));
+            
         } catch (CborSerializationException e) {
-            throw new RuntimeException(e);
+            log.error("Failed to initialize TankContractService: CBOR serialization error while creating tank spend validator for network {}", 
+                    network.getCardanoNetwork(), e);
+            throw new RuntimeException("Failed to initialize Tank contract service due to CBOR serialization error", e);
+        } catch (Exception e) {
+            log.error("Failed to initialize TankContractService: Unexpected error while creating tank spend validator for network {}", 
+                    network.getCardanoNetwork(), e);
+            throw new RuntimeException("Failed to initialize Tank contract service due to unexpected error", e);
         }
-        log.info("INIT contract hash: {}", HexUtil.encodeHexString(paymentCredentials.getBytes()));
     }
 
     public byte[] getScriptHash() {
