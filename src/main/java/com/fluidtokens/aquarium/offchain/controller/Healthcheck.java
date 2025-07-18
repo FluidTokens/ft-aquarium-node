@@ -31,11 +31,8 @@ public class Healthcheck {
     }
 
     private final ParametersService parametersService;
-
     private final StakerService stakerService;
-
     private final BlockEventListener blockEventListener;
-
     private final AppUtxoService utxoService;
 
     @GetMapping
