@@ -1,0 +1,38 @@
+# Build stage
+FROM eclipse-temurin:21-jdk-alpine AS builder
+
+WORKDIR /app
+
+# Copy gradle wrapper and build files
+COPY gradle/ gradle/
+COPY gradlew build.gradle settings.gradle ./
+COPY gradle.properties ./
+
+# Make gradlew executable
+RUN chmod +x gradlew
+
+# Copy source code
+COPY src/ src/
+
+# Build the application (skip tests)
+RUN ./gradlew build -x test
+
+# Runtime stage
+FROM eclipse-temurin:21-jre-alpine
+
+WORKDIR /app
+
+# Create non-root user
+RUN addgroup -g 1001 app && adduser -u 1001 -G app -s /bin/sh -D app
+
+# Copy the built JAR from builder stage
+COPY --from=builder /app/build/libs/ft-aquarium-node-0.0.2.jar app.jar
+
+# Change ownership to app user
+RUN chown -R app:app /app
+
+USER app
+
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-jar", "app.jar"]

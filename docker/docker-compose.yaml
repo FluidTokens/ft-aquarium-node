@@ -27,7 +27,7 @@ services:
   aquarium-node:
     container_name: aquarium
     image: "${AQUARIUM_DOCKER_IMAGE_NAME}:${AQUARIUM_DOCKER_IMAGE_VERSION}"
-    pull_policy: always
+    #pull_policy: always
     restart: on-failure
     healthcheck:
       test: ["CMD", "curl", "-f", "http://aquarium-node:8080/__internal__/healthcheck"]
@@ -50,4 +50,5 @@ services:
       - BLOCKFROST_KEY=${BLOCKFROST_KEY}
       - WALLET_MNEMONIC=${WALLET_MNEMONIC}
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy

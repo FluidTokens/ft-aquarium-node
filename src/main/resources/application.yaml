@@ -11,6 +11,10 @@ spring:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/aquarium}
     username: ${DB_USERNAME:fluidtokens}
     password: ${DB_PASSWORD:password}
+  aot:
+    processing:
+      bean-validation:
+        enabled: false
 
 network: mainnet
 
