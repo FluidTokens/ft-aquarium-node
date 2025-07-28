@@ -83,7 +83,7 @@ public class ScheduledTransactionService {
     }
 
 
-    @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelay = 5)
+    @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelayString = "${scheduling.transaction-processor.delay-minutes}")
     public void processPayments() {
 
         log.info("Starting Process Payments RUN");
