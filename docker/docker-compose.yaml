@@ -30,7 +30,7 @@ services:
     pull_policy: always
     restart: on-failure
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://aquarium-node:8080/__internal__/healthcheck"]
+      test: ["CMD", "curl", "-f", "http://aquarium-node:8080/healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 5
