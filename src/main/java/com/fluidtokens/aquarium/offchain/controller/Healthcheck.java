@@ -1,7 +1,5 @@
 package com.fluidtokens.aquarium.offchain.controller;
 
-import com.bloxbean.cardano.client.account.Account;
-import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.annotation.JsonNaming;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
@@ -18,7 +16,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.stream.Stream;
 
 @RestController
-@RequestMapping("/__internal__/healthcheck")
+@RequestMapping("/healthcheck")
 @Slf4j
 @RequiredArgsConstructor
 public class Healthcheck {
@@ -31,10 +29,6 @@ public class Healthcheck {
                               Boolean stakingOk) {
 
     }
-
-    private final Account account;
-
-    private final UtxoRepository utxoRepository;
 
     private final ParametersService parametersService;
 

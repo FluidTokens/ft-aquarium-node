@@ -49,6 +49,12 @@ store:
 
 apiPrefix: /api/v1
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+
 ---
 spring:
   config:
