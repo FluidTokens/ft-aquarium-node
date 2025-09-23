@@ -69,6 +69,8 @@ public class ScheduledTransactionService {
 
     private final AppUtxoService appUtxoService;
 
+    private final BlockEventListener blockEventListener;
+
     private final Vector<TransactionInput> unprocessableScheduledTransactions = new Vector<>();
 
     private final DatumTankConverter datumConverter = new DatumTankConverter();
@@ -83,10 +85,15 @@ public class ScheduledTransactionService {
     }
 
 
-    @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelay = 5)
+    @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelayString = "${scheduling.transaction-processor.delay-minutes}")
     public void processPayments() {
 
         log.info("Starting Process Payments RUN");
+
+        if (blockEventListener.getIsSyncing().get()) {
+            log.info("node is syncing, skipping...");
+            return;
+        }
 
         var stakerRefInputOpt = service.findStakerRefInput();
         if (stakerRefInputOpt.isEmpty()) {

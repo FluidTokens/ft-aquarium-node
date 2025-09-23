@@ -27,6 +27,10 @@ aquarium:
       txHash: 354ffe7958d62a8a2bf0b0bd97a06694d59dc49b6d02f1ab40165a3955257168
       outputIndex: 0
 
+scheduling:
+  transaction-processor:
+    delay-minutes: ${SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES:5}
+
 blockfrost:
   url: https://cardano-mainnet.blockfrost.io/api/v0/
   key: ""
@@ -44,6 +48,12 @@ store:
     epoch-calculation-interval=14400:  # 14400 = 4 hours
 
 apiPrefix: /api/v1
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
 
 ---
 spring:
