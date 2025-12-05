@@ -35,6 +35,7 @@ services:
       timeout: 5s
       retries: 5
     environment:
+      - JAVA_OPTS="-Xms256m -Xmx512m"
       - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE}
       - DB_DRIVER=${DB_DRIVER}
       - DB_DIALECT=${DB_DIALECT}
