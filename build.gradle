@@ -35,6 +35,8 @@ dependencies {
 
 	implementation 'io.micrometer:micrometer-registry-prometheus:latest.release'
 
+	implementation 'org.scalus:scalus-bloxbean-cardano-client-lib_3:0.14.1'
+
 	implementation 'org.postgresql:postgresql:42.6.0'
 	testImplementation 'com.h2database:h2:2.1.214'
 

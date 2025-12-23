@@ -3,11 +3,15 @@ package com.fluidtokens.aquarium.offchain.service;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
+import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
+import scalus.bloxbean.ScalusTransactionEvaluator;
+import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.blueprint.types.datum.model.DatumTank;
 import com.fluidtokens.aquarium.offchain.blueprint.types.datum.model.converter.DatumTankConverter;
@@ -56,6 +60,8 @@ public class ScheduledTransactionService {
     private final Account account;
 
     private final QuickTxBuilder quickTxBuilder;
+
+    private final BFBackendService bfBackendService;
 
     private final UtxoRepository utxoRepository;
 
@@ -191,10 +197,15 @@ public class ScheduledTransactionService {
                         .readFrom(stakerRefInput)
                         .readFrom(tankContractRefInput);
 
+                var protocolParams = bfBackendService.getEpochService().getProtocolParameters().getValue();
+                var utxoSupplier = new DefaultUtxoSupplier(bfBackendService.getUtxoService());
+                var evaluator = new ScalusTransactionEvaluator(protocolParams, utxoSupplier);
+
                 quickTxBuilder.compose(tx)
                         .withSigner(SignerProviders.signerFrom(account))
                         .withSigner(SignerProviders.stakeKeySignerFrom(account))
                         .withRequiredSigners(account.getBaseAddress().getDelegationCredentialHash().get())
+                        .withTxEvaluator(evaluator)
                         .validFrom(slot - 30)
                         .validTo(slot + 180)
                         .feePayer(account.baseAddress())
