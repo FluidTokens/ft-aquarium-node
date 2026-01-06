@@ -1,4 +1,4 @@
-FROM openjdk:24-jdk-slim
+FROM eclipse-temurin:21-jdk-jammy
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl && \
     apt-get clean && \
