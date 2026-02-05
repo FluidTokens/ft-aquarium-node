@@ -11,7 +11,7 @@ import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import scalus.bloxbean.ScalusTransactionEvaluator;
-import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
+import scalus.bloxbean.ScriptServiceSupplier;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.blueprint.types.datum.model.DatumTank;
 import com.fluidtokens.aquarium.offchain.blueprint.types.datum.model.converter.DatumTankConverter;
@@ -199,7 +199,8 @@ public class ScheduledTransactionService {
 
                 var protocolParams = bfBackendService.getEpochService().getProtocolParameters().getValue();
                 var utxoSupplier = new DefaultUtxoSupplier(bfBackendService.getUtxoService());
-                var evaluator = new ScalusTransactionEvaluator(protocolParams, utxoSupplier);
+                var scriptSupplier = new ScriptServiceSupplier(bfBackendService.getScriptService());
+                var evaluator = new ScalusTransactionEvaluator(protocolParams, utxoSupplier, scriptSupplier);
 
                 quickTxBuilder.compose(tx)
                         .withSigner(SignerProviders.signerFrom(account))
