@@ -250,7 +250,44 @@ This first sketch was **wrong in three ways** — it missed the `general_spend`
 layer, the LM/main config asymmetry, and the `Credential` encoding. Kept only as a
 record of what the validator parameter lists look like; §4.1–4.2 is authoritative.
 
-## 5. What to index
+## 5. What to index ✅ VERIFIED AGAINST LIVE LOANS
+
+Index by **payment credential**, never by full address.
+
+Loan UTxOs carry a **stake credential** (`LenderManagerDatum.lenderStakeCredential`
+— *"stake credential of the lender, used for any utxo created by the bots"*), so the
+bech32 address varies per lender while the payment credential stays fixed:
+
+```
+derived script-only address : addr_test1w zu9d8t3uk533aum52mgn86nc56xx8mnmwfzqavz59wyzj s2hn0py
+a real live loan UTxO       : addr_test1z zu9d8t3uk533aum52mgn86nc56xx8mnmwfzqavz59wyzj 5788t0n…
+                                          ^^^^ same payment credential, stake part appended
+```
+
+`UtxoRepository.findUnspentByOwnerPaymentCredential` — the method the Tank indexer
+already uses — is exactly right, since it keys on the payment credential.
+
+**Live preview state** (confirmed via Blockfrost):
+
+| policy | assets minted |
+|---|---|
+| `loanPolicyId` | 24 |
+| `poolPolicyId` | 40 |
+| `borrowerBondPolicyId` | ≥100 (page cap) |
+| `lenderBondPolicyId` | ≥100 (page cap) |
+| `requestPolicyId` | none — never minted |
+
+So there is **real loan activity to index**, and `requestPolicyId` has no assets at
+all yet.
+
+**Reference scripts are self-hosted.** Each `general_spend` script is deployed as a
+reference script at its *own* address, e.g. the loan spend script sits at
+`5c10900c…69da#0` (block 4521414) and the LenderManager spend script at
+`13dd3329…2571#0`. Both UTxOs' `reference_script_hash` equals the hash we derived —
+an independent on-chain confirmation of §4, and it means we get the ref inputs for
+free without asking FT for deployment tx hashes.
+
+### 5.1 Superseded first take
 
 For loan discovery the target is the **loan spend script address**, built from
 `loanSpendScriptHash` = `b8569d71e5a918f79ba2b6899f53c534631f73db92207582a15c414a`
