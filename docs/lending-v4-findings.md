@@ -1,0 +1,223 @@
+# Lending v4 — On-Chain Findings & Integration Trace
+
+Living document. Everything here was **verified against chain or against the
+Aiken source**, not taken from docs. Where the upstream README disagrees with
+the `.ak` source, the source wins (per instruction: *"don't trust it, always
+cross check against the code"*).
+
+- Branch: `feat/lending-v4` (forked off `main` @ `f71e051`)
+- Network verified: **preview**
+- Aiken source: `github.com/FluidTokens/ft-cardano-loans-v4` (validators + `plutus.json`)
+- Verified on: 2026-08-05
+
+---
+
+## 1. Deployment coordinates (preview)
+
+Given by Giovanni, confirmed on-chain:
+
+```
+CONFIG_REF_UTXO     = 6de7b7ecc2c822526d08dc998731d9e133e13c80dea099fb87827336dca12094
+CONFIG_POLICY_ID    = f1a475ea8cccc1e0b7a59b10e79ad171452dc057ffb1cda0df92835c
+LM_CONFIG_POLICY_ID = d0998754ddc3e9cfe80356d7e12db163d03cecc5b6b438dad4f4a3e3
+CONFIG_ASSET_NAME   = 706172616d6574657273   ("parameters")
+```
+
+`CONFIG_ASSET_NAME` is not arbitrary — it is hardcoded in
+`lib/fluidtokens/constants.ak`: `pub const config_asset_name = "parameters"`.
+Both config NFTs use it.
+
+### ⚠️ These superseded the 14 Jul 2026 set
+
+v4 preview was **redeployed** between 14 Jul and now. The old values are dead:
+
+| | 14 Jul (dead) | current |
+|---|---|---|
+| `CONFIG_REF_UTXO` | `4cc33e2d…d96` | `6de7b7ec…094` |
+| `CONFIG_POLICY_ID` | `0e60ea5f…845` | `f1a475ea…83c` |
+| `LM_CONFIG_POLICY_ID` | `ec121978…4bf` | `d0998754…3e3` |
+
+Assume any other July-era v4 coordinate is also stale.
+
+## 2. Indexing start point
+
+Blockfrost `/assets/{policy+name}` for the config NFT:
+
+```
+initial_mint_tx_hash : 6de7b7ecc2c822526d08dc998731d9e133e13c80dea099fb87827336dca12094
+mint_or_burn_count   : 1
+```
+
+`/assets/{asset}/transactions?order=asc` returns **exactly one** tx. So the NFT
+was minted and **has never been moved or updated** — the mint tx *is* the live
+config UTxO. `CONFIG_REF_UTXO` == the mint tx; they are the same thing.
+
+Oldest tx → sync start:
+
+```
+block hash   : e24c9fc7b4f6bc5e2c313e55501c2d94817ecdb862fab69b5115c66f97d29018
+block height : 4514052
+slot         : 118496146
+epoch        : 1371
+time         : 1785152146
+```
+
+→ `store.cardano.sync-start-blockhash` / `sync-start-slot` for the preview profile.
+
+**Caveat:** this is the *config deployment* block. Loans can only exist at or
+after it, so it is a safe lower bound and nothing is missed. It is not
+necessarily the block of the first loan.
+
+## 3. The config UTxO (tx `6de7b7ec…`)
+
+One tx carries **both** config NFTs:
+
+| idx | address | holds | datum hash |
+|---|---|---|---|
+| 0 | `addr_test1wrc6ga023nxvrc9h5kd3peu669c52twq2llmrndqm7fgxhqvf6zh6` | main config NFT | `0750bb70…e5b1` |
+| 1 | `addr_test1wrgfnp65mhp7nnlgqdtd0cfdk93aq08vckmtgwx66n628ccmkhzs4` | LM config NFT | `17c9be65…bb30` |
+| 2,3 | wallet | change | — |
+
+Both datums are **inline**. Both are `constructor 0` records whose field counts
+match the Aiken types exactly (29 and 8) — decoding is unambiguous.
+
+### 3.1 `ConfigDatum` — decoded (`lib/fluidtokens/types/config.ak`)
+
+| # | field | value |
+|---|---|---|
+| 0 | `smartTokensSpendScriptHash` | `fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa` |
+| 1 | `adminCredential` | `VerificationKey(ea1bb1ccd33aeb9e02516c2eb50adbaa63d7b7538b03c96908bfc934)` |
+| 2 | `poolPolicyId` | `c02ec05d2806339fd752c1370a28ab613c8603f071fa077a03ea55a0` |
+| 3 | `requestPolicyId` | `4519ff8d1d17660b60ee98c80cd48dd1c81d720d1ea3280cecfc5b46` |
+| 4 | `borrowerBondPolicyId` | `eadc69a5d2d1357acc9b9d49ec5390fcdf6e080c7a40139917223dcb` |
+| 5 | `lenderBondPolicyId` | `bcd713bb7858d4b08738bed90ee7068d8f9b38d02e0cae0b45ac7a9b` |
+| 6 | **`loanPolicyId`** | `79d911c0beb40fae0a26ff802b1bc017d62b3bd07eca4766b6660dad` |
+| 7 | `repaymentPolicyId` | `e50a4db3a3b65fc9c317fc600c70aee76f3286e6af1dd2f7f289aaa3` |
+| 8 | `poolSpendScriptHash` | `9434006c1e8365c3afedc69332a3eee5d5779eb1a1d44ed37c7cb6f3` |
+| 9 | `requestSpendScriptHash` | `e8b4765ebe61377d3f32ea56f37974335ebfe0aa2417e19611cfeed1` |
+| 10 | **`loanSpendScriptHash`** | `b8569d71e5a918f79ba2b6899f53c534631f73db92207582a15c414a` |
+| 11 | `loanClaimActionScriptHash` | `2ec873803f7b44688edbbe98671bf1f79c921143bb39b10f274b9b79` |
+| 12 | `loanRepayActionScriptHash` | `7e36682e0366ecbc38e3875fdb4f44f33c2ce0bdcdc555a4f3015245` |
+| 13 | `loanChangeCollateralActionScriptHash` | `28dbdb0620901f7b43feb4d8cbbc8b9e4c6499ffbb5537e152546a47` |
+| 14 | `loanRecastActionScriptHash` | `66b3b28fea964bf0b15b42015cee2c09cca2347a640f30a4d7d43289` |
+| 15 | `assetManagerSpendScriptHash` | `3f9068ec82efa5c87537fe626a65037f868a86c0191e99a4decf56dd` |
+| 16 | `dutchAuctionSpendScriptHash` | **`""` (empty)** |
+| 17 | `dutchAuctionWithdrawScriptHash` | **`""` (empty)** |
+| 18 | `dutchAuctionStartingIncreasePerMille` | `0` |
+| 19 | `dutchAuctionLoweringAmount` | `0` |
+| 20 | `dutchAuctionLoweringFrequency` | `0` |
+| 21 | `dutchAuctionMinPriceToCancel` | `0` |
+| 22 | `poolCancelActionScriptHash` | `85ba63cdb595df5eb3ecbcb10620fd106b3af2e745308f18b01aaf66` |
+| 23 | `poolBorrowActionScriptHash` | `991a88e0bd9f0fd925e3e7f4b52c2da48e47474b055c1a5e1610980c` |
+| 24 | `poolSellLenderPositionActionScriptHash` | `dc8332cb9d29423f21ca0fa578860cb412d276747f0c486595e41d65` |
+| 25 | `poolCompoundActionScriptHash` | `0626cf5a62522eede017006c1144f29fa9446e11cb352f67c2910803` |
+| 26 | `poolManagerSpendScriptHash` | `e67abf27731ce422ab8918a1ef88dab0b25a2fe86cb3c8123b09fe49` |
+| 27 | `poolManagerPolicyId` | `e4aee9c6a86cfa3ed2bcdc9b2089a7f259167e0a10f866650d6ca296` |
+| 28 | `lockedBorrowerManagerSpendScriptHash` | `3b10fe08db2516218b2a1c6efe3ff6dd5008dd8898da408e1116274c` |
+
+> **Dutch auction is NOT deployed on this preview instance** — both hashes empty,
+> all four tuning params zero. Any liquidation path that routes through the
+> Dutch auction is untestable here until FT deploys it.
+
+### 3.2 `LMConfigDatum` — decoded (`lib/fluidtokens/types/lender_manager.ak`)
+
+| # | field | value |
+|---|---|---|
+| 0 | `adminCredential` | `VerificationKey(ea1bb1cc…fc934)` — same admin as main config |
+| 1 | `lmWithdrawBondsActionScriptHash` | `4aa7f99f9bd697071162cce2c8edb92e40a31edc48141db94ab74584` |
+| 2 | **`lmLiquidateActionScriptHash`** | `c67e53e2b8d9c9a305e8dc281ddb1b79a2741976fd5657e8eadf3bf9` |
+| 3 | `lmCompoundActionScriptHash` | `36835ebd9a76dc22595782be75da7fcec8560562462ea6e35e01efaa` |
+| 4 | `lmLiquidateAndPayInAdvanceActionScriptHash` | `25c2475d888702af5872dafa032fff7b5853686f48290cd3eee5f1fa` |
+| 5 | `lmLiquidateAndConvertActionScriptHash` | `b9d55fda0aed6ef9b7b75a1936125d77c0df227446dc48192767e400` |
+| 6 | `lmLiquidatePayInAdvanceAndCompoundActionScriptHash` | `732e7ef5745919b9b5e0ff5cb20aee09c199706fc54e45392bcac54a` |
+| 7 | `lmLiquidateConvertAndCompoundActionScriptHash` | `435b42cc200719c3868dfe01689ee07e2eeff5f5809f25408cbe4e7d` |
+
+Note field 7 has a **real hash despite being the stub validator**
+(`lm_liquidate_convert_and_compound_action.ak` is a ~170-byte no-op). A
+non-empty hash in the config is **not** evidence the action works. Already
+scoped out of our plan — this confirms the reason.
+
+The `withdraw` handler of `lenderManager` reads these **by index** off the LM
+config as a raw data list (`safe_list_at(lmConfig, 1..7)`) — so **field order is
+consensus-critical**. Never reorder.
+
+## 4. Parameterisation — how v4 hashes are derived
+
+`grep '^validator ' validators/` gives the parameter lists. The ones we need:
+
+```
+loan(configNFTPolicyId, configNFTAssetName)
+pool(configNFTPolicyId, configNFTAssetName)
+request(configNFTPolicyId, configNFTAssetName)
+lenderManager(lmConfigNFTPolicyId, lmConfigNFTAssetName)
+config(tx0, index0)          -- the one-shot
+lm_config(tx0, index0)       -- the LM one-shot
+bond(_bondType: Int)
+lm_withdraw_bonds_action(lenderManagerSpendScriptHash)
+```
+
+So the whole tree hangs off the two config NFT policies:
+
+```
+config(tx0, index0)                        → CONFIG_POLICY_ID    (f1a475ea…)
+lm_config(tx0', index0')                   → LM_CONFIG_POLICY_ID (d0998754…)
+loan(CONFIG_POLICY_ID, "parameters")       → loanSpendScriptHash
+pool(CONFIG_POLICY_ID, "parameters")       → poolSpendScriptHash
+request(CONFIG_POLICY_ID, "parameters")    → requestSpendScriptHash
+lenderManager(LM_CONFIG_POLICY_ID, "parameters") → LenderManager spend hash
+```
+
+**This is exactly the `ContractRegistry` pattern already built for Aquarium** —
+`AikenScriptUtil.applyParamToScript` over committed `compiledCode`, never
+`aiken build`.
+
+Two consequences:
+
+1. **Self-validating.** Deriving `loan`/`pool`/`request` must reproduce
+   `loanSpendScriptHash` / `poolSpendScriptHash` / `requestSpendScriptHash`
+   from §3.1. If it doesn't, our blueprint is the wrong commit. This is the v4
+   analogue of `ContractDerivationTest` — build it before trusting anything.
+2. **The LenderManager spend hash is absent from both datums** — it is *not*
+   stored anywhere on chain that we've found. It must be **derived**. Good news:
+   it's derivable from `LM_CONFIG_POLICY_ID` alone.
+
+We do **not** need `tx0/index0` for either one-shot: the resulting policy IDs
+were handed to us directly. They'd only be needed to re-derive the configs from
+scratch.
+
+## 5. What to index
+
+For loan discovery the target is the **loan spend script address**, built from
+`loanSpendScriptHash` = `b8569d71e5a918f79ba2b6899f53c534631f73db92207582a15c414a`
+(preview / network id 0, no stake part).
+
+Same `UtxoRepository.findUnspentByOwnerPaymentCredential` path the Tank indexer
+already uses — the payment credential is the script hash. `loanPolicyId`
+(`79d911c0…`) identifies genuine loan UTxOs and screens out junk sent to the
+address.
+
+## 6. Open items
+
+- [ ] Build `LoansContractRegistry` + derivation test (§4.1) — **do this first**
+- [ ] Confirm `plutus.json` in our clone is the *deployed* commit (derivation
+      test answers this definitively)
+- [ ] Decode `LoanDatum` (`lib/fluidtokens/types/loan.ak`) → Java
+- [ ] Port the health-factor math from `lib/fluidtokens/finance.ak`
+- [ ] Read upstream README §"Bots logic", diff it against the validators, and
+      record every discrepancy here
+- [ ] Mainnet coordinates — v4 mainnet deployment status still unconfirmed
+- [ ] Dutch auction absent on preview (§3.1) — decide if it's in scope
+
+## 7. Reproducing this
+
+```bash
+KEY=$(grep -E '^BLOCKFROST_KEY=' .env.preview | cut -d= -f2 | tr -d ' "')
+BASE=https://cardano-preview.blockfrost.io/api/v0
+ASSET=f1a475ea8cccc1e0b7a59b10e79ad171452dc057ffb1cda0df92835c706172616d6574657273
+
+curl -s -H "project_id: $KEY" "$BASE/assets/$ASSET"
+curl -s -H "project_id: $KEY" "$BASE/assets/$ASSET/transactions?order=asc"
+curl -s -H "project_id: $KEY" "$BASE/txs/6de7b7ec…094/utxos"
+curl -s -H "project_id: $KEY" "$BASE/scripts/datum/0750bb70…e5b1"
+curl -s -H "project_id: $KEY" "$BASE/scripts/datum/17c9be65…bb30"
+```
