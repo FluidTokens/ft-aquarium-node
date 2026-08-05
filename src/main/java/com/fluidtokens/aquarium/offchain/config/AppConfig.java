@@ -45,6 +45,15 @@ public class AppConfig {
         @Value("${aquarium.staking.token.name}")
         private String stakingTokenName;
 
+        // Genesis one-shot UTxO that parameterises the `parameters` validator.
+        // Together with the staking token (= FLDT policy/asset) this derives every
+        // Aquarium script hash at startup (see ContractRegistry).
+        @Value("${aquarium.genesis.tx-hash}")
+        private String genesisTxHash;
+
+        @Value("${aquarium.genesis.output-index}")
+        private Integer genesisOutputIndex;
+
         @Value("${aquarium.tank.ref-input.txHash}")
         private String tankRefInputTxHash;
 

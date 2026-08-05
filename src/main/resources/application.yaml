@@ -18,6 +18,13 @@ wallet:
   mnemonic: ""
 
 aquarium:
+  # Genesis one-shot UTxO that parameterises the `parameters` validator.
+  # With the staking token below (= FLDT policy/asset) this derives every
+  # Aquarium script hash at startup (see ContractRegistry). Network is chosen
+  # by the active Spring profile, so no per-network branch/blueprint is needed.
+  genesis:
+    tx-hash: 45f379b3436263146ab3a5423506ce11555113384d45655b50c77dab8a3473ff
+    output-index: 0
   staking:
     token:
       policy: 577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e
@@ -67,6 +74,9 @@ wallet:
   mnemonic: ""
 
 aquarium:
+  genesis:
+    tx-hash: d35f81f6bc88babe5dcf088e3a800ecbb4d75373df6b144f7561d393cb5d9b2f
+    output-index: 1
   staking:
     token:
       policy: 0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62

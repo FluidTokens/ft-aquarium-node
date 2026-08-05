@@ -33,6 +33,9 @@ dependencies {
 	implementation('com.bloxbean.cardano:cardano-client-backend-blockfrost:0.7.2')
 	implementation('com.bloxbean.cardano:cardano-client-backend-ogmios:0.7.2')
 
+	// Applies parameters to unapplied Aiken validators at runtime (multi-network parameterisation)
+	implementation('com.bloxbean.cardano:aiken-java-binding:0.1.0')
+
 	implementation 'io.micrometer:micrometer-registry-prometheus:latest.release'
 
 	implementation 'org.postgresql:postgresql:42.6.0'
