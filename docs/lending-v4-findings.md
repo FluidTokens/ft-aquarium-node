@@ -141,7 +141,82 @@ The `withdraw` handler of `lenderManager` reads these **by index** off the LM
 config as a raw data list (`safe_list_at(lmConfig, 1..7)`) — so **field order is
 consensus-critical**. Never reorder.
 
-## 4. Parameterisation — how v4 hashes are derived
+## 4. Parameterisation — how v4 hashes are derived ✅ PROVEN
+
+> **Status: settled.** `LoansContractDerivationTest` re-derives **every** derivable
+> field of both config datums from just the two config NFT policy ids and asserts
+> them against the live on-chain values. **26 assertions, all green.**
+>
+> This proves the bundled `loans-v4.plutus.json` **is the deployed commit**. It also
+> means we never hardcode a v4 address — we derive and self-check.
+>
+> Corroborating evidence: the loans repo has had **no commits since 2026-07-07**
+> (`plutus.json` untouched since 2026-07-02), so the preview redeploy that changed
+> the config policies was a fresh one-shot mint of *identical* contracts.
+
+### 4.1 The rules (all three were wrong on first guess — do not re-derive from intuition)
+
+**Rule 1 — UTxOs never sit at the logic validator.** There is no `loan.loan.spend`;
+`loan` only has `mint`/`withdraw`. Every `…SpendScriptHash` in the config datum is a
+**`general_spend`** wrapper that delegates spending to a withdraw validator:
+
+```
+generalSpend(withdrawScriptHash, configPolicy) = general_spend(withdrawScriptHash, configPolicy, "parameters")
+```
+
+A validator's own hash serves as **both** its minting policy id and its withdraw
+script hash — that is why `loanPolicyId` is also `loanWithdrawScriptHash`.
+
+**Rule 2 — the LenderManager subtree wraps with the LM config policy, everything else
+with the main one.** This asymmetry is real and silent: guessing wrong still yields a
+plausible 28-byte hash.
+
+```
+loan/pool/request/assetManager/lockedBorrowerManager/poolManager → general_spend(…, CONFIG_POLICY_ID)
+lenderManager                                                    → general_spend(…, LM_CONFIG_POLICY_ID)
+```
+
+**Rule 3 — `loanClaimCredential` / `loanClaimPaymentCredential` are `Credential`, not
+`ByteArray`.** They must be encoded as constructor **alternative 1** (`Script`), not
+raw bytes. Passing bytes produces a wrong-but-valid-looking hash.
+
+### 4.2 The derivation chain
+
+```
+config(tx0, index0)                         → CONFIG_POLICY_ID    f1a475ea…  (given)
+lm_config(tx0', index0')                    → LM_CONFIG_POLICY_ID d0998754…  (given)
+
+loan(CFG, "parameters")                     → loanPolicyId    = loanWithdrawScriptHash
+  general_spend(loanPolicyId, CFG)          → loanSpendScriptHash      ← the address to index
+pool(CFG, "parameters")                     → poolPolicyId
+  general_spend(poolPolicyId, CFG)          → poolSpendScriptHash
+request / assetManager / lockedBorrowerManager                  … same shape
+
+lenderManager(LM_CFG, "parameters")         → lenderManagerWithdrawScriptHash
+  general_spend(…, LM_CFG)                  → lenderManagerSpendScriptHash
+    lm_withdraw_bonds_action(lmSpend)       → lmWithdrawBondsActionScriptHash   ← confirms the two above
+    lm_liquidate_action(CFG,"parameters",lmSpend,amSpend,amWithdraw,Script(loanClaimAction))
+                                            → lmLiquidateActionScriptHash
+```
+
+**The LenderManager hashes are published nowhere on chain** — neither datum carries
+them. They must be derived. `lm_withdraw_bonds_action` is parameterised by
+`lenderManagerSpendScriptHash`, so the `LMConfigDatum` confirms the derivation
+indirectly:
+
+```
+lenderManagerWithdrawScriptHash = d628e1eb4f4c7ff6af341ae8d6af81c7477b1f12eb49978529e45cbb
+lenderManagerSpendScriptHash    = b2b99ad8c1e5c9f2c341d86a9b7268adf394dff27d20e2824e88ec64
+```
+
+We do **not** need `tx0/index0` for either one-shot — the resulting policy ids were
+handed to us directly.
+
+**Only underivable field:** `lmLiquidateAndConvertActionScriptHash`, which takes five
+Minswap parameters (pool policy, pool spend/withdraw, order spend/withdraw) we don't
+have. Everything else in both datums is reproduced.
+
+### 4.3 Previous version of this section (superseded)
 
 `grep '^validator ' validators/` gives the parameter lists. The ones we need:
 
@@ -171,19 +246,9 @@ lenderManager(LM_CONFIG_POLICY_ID, "parameters") → LenderManager spend hash
 `AikenScriptUtil.applyParamToScript` over committed `compiledCode`, never
 `aiken build`.
 
-Two consequences:
-
-1. **Self-validating.** Deriving `loan`/`pool`/`request` must reproduce
-   `loanSpendScriptHash` / `poolSpendScriptHash` / `requestSpendScriptHash`
-   from §3.1. If it doesn't, our blueprint is the wrong commit. This is the v4
-   analogue of `ContractDerivationTest` — build it before trusting anything.
-2. **The LenderManager spend hash is absent from both datums** — it is *not*
-   stored anywhere on chain that we've found. It must be **derived**. Good news:
-   it's derivable from `LM_CONFIG_POLICY_ID` alone.
-
-We do **not** need `tx0/index0` for either one-shot: the resulting policy IDs
-were handed to us directly. They'd only be needed to re-derive the configs from
-scratch.
+This first sketch was **wrong in three ways** — it missed the `general_spend`
+layer, the LM/main config asymmetry, and the `Credential` encoding. Kept only as a
+record of what the validator parameter lists look like; §4.1–4.2 is authoritative.
 
 ## 5. What to index
 
@@ -198,9 +263,10 @@ address.
 
 ## 6. Open items
 
-- [ ] Build `LoansContractRegistry` + derivation test (§4.1) — **do this first**
-- [ ] Confirm `plutus.json` in our clone is the *deployed* commit (derivation
-      test answers this definitively)
+- [x] ~~Derivation test~~ — `LoansContractDerivationTest`, 26 assertions, green
+- [x] ~~Confirm our `plutus.json` is the deployed commit~~ — **yes**, proven by §4
+- [ ] Promote the derivation from test into a runtime `LoansContractRegistry`
+      (same shape as `ContractRegistry`), reading the config UTxO at startup
 - [ ] Decode `LoanDatum` (`lib/fluidtokens/types/loan.ak`) → Java
 - [ ] Port the health-factor math from `lib/fluidtokens/finance.ak`
 - [ ] Read upstream README §"Bots logic", diff it against the validators, and
