@@ -9,6 +9,8 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The one test that actually talks to the chain: it runs the verifier's full path —
@@ -50,5 +52,24 @@ class LoansConfigVerifierLiveTest {
 
         assertEquals(SMART_TOKENS_SPEND, verifier.getOnChainSmartTokensSpendScriptHash(),
                 "smartTokensSpendScriptHash read live from the ConfigDatum");
+    }
+
+    /**
+     * A rejected key must not be swallowed as "backend unreachable" — that would silently
+     * skip verification on every boot, which is the exact failure this class exists to
+     * prevent. Runs with fail-on-unreachable left at its default {@code false}, so the only
+     * way this passes is if a 4xx is classified as an answer rather than an outage.
+     */
+    @Test
+    void aRejectedKeyIsAHardFailureNotADegradedBoot() {
+        var network = new AppConfig.Network();
+        ReflectionTestUtils.setField(network, "network", "preview");
+        var registry = new LoansContractRegistry(
+                CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
+        var verifier = new LoansConfigVerifier(registry, SMART_TOKENS_SPEND, network,
+                new BFBackendService(PREVIEW_URL, "not-a-real-project-id"), false);
+
+        var e = assertThrows(IllegalStateException.class, verifier::verify);
+        assertTrue(e.getMessage().contains("rejected"), "expected a rejection, got: " + e.getMessage());
     }
 }

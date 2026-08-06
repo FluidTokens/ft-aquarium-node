@@ -245,10 +245,19 @@ public class LoansConfigVerifier {
         try {
             var result = bfBackendService.getUtxoService().getUtxos(address, 100, 1);
             if (!result.isSuccessful()) {
-                throw new ConfigUnreachableException("backend returned: " + result.getResponse());
+                // A 4xx is an answer, not an outage: a bad key or an address with no history
+                // both mean the node is misconfigured, and degrading those to "unverified"
+                // would reopen exactly the silent-failure hole this class exists to close.
+                // Only 5xx / throttling / transport errors are treated as transient.
+                int code = result.code();
+                String detail = "HTTP " + code + " for " + datumName + " at " + address + ": " + result.getResponse();
+                if (code >= 400 && code < 500 && code != 429) {
+                    throw new IllegalStateException("Lending v4 config lookup rejected — " + detail);
+                }
+                throw new ConfigUnreachableException(detail);
             }
             utxos = result.getValue();
-        } catch (ConfigUnreachableException e) {
+        } catch (ConfigUnreachableException | IllegalStateException e) {
             throw e;
         } catch (Exception e) {
             throw new ConfigUnreachableException(e.getClass().getSimpleName() + ": " + e.getMessage());

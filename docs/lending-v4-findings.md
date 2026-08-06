@@ -354,10 +354,14 @@ Failure modes are deliberately distinct:
 | any derived hash ≠ chain | **hard fail**, listing every mismatching field |
 | config NFT not at its script address | **hard fail** — the policy id is stale |
 | datum field count ≠ 29 / 8 | **hard fail** — contract types changed, indices invalid |
-| Blockfrost unreachable | warn and continue (`loans.verify-config.fail-on-unreachable=true` to make it mandatory) |
+| Blockfrost 4xx (bad key, unknown address) | **hard fail** — that is an answer, not an outage |
+| Blockfrost 5xx / 429 / transport error | warn and continue (`loans.verify-config.fail-on-unreachable=true` to make it mandatory) |
 
-The unreachable case is soft on purpose: a Blockfrost blip must not take down the
-Aquarium scheduled-transaction path, which has nothing to do with loans.
+The transient case is soft on purpose: a Blockfrost blip must not take down the
+Aquarium scheduled-transaction path, which has nothing to do with loans. But 4xx is
+deliberately **not** in that bucket — a wrong or missing API key would otherwise skip
+verification on every single boot while logging a warning nobody reads, which is the
+same silent failure in a different costume.
 
 `smartTokensSpendScriptHash` is checked too even though it is configured rather than
 derived — a stale value there silently corrupts the whole pool-manager branch. If it
@@ -370,8 +374,9 @@ Three layers of test, because each covers what the others cannot:
   (`src/test/resources/loans-v4/*.hex`), no network. Pins the datum **field
   indices**, which are the fragile part; includes a negative test that feeds the
   pre-redeploy policy id `0e60ea5f…` and asserts the mismatch is caught
-- `LoansConfigVerifierLiveTest` — the full fetch path against live preview. Skipped
-  unless `BLOCKFROST_KEY` is set (`set -a; . ./.env.preview; set +a`). Doubles as the
+- `LoansConfigVerifierLiveTest` — the full fetch path against live preview, plus a
+  bad-key case asserting a 4xx aborts rather than degrading. Skipped unless
+  `BLOCKFROST_KEY` is set (`set -a; . ./.env.preview; set +a`). Doubles as the
   "has FT redeployed preview again?" check
 
 All green, including the live one.
