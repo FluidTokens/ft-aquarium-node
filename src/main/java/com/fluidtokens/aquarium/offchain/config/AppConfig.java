@@ -67,6 +67,49 @@ public class AppConfig {
     }
 
 
+    /**
+     * FluidTokens Lending v4 ("loans") derivation inputs. The whole v4 contract tree
+     * hangs off two one-shot config NFT policy ids, so these three values are enough
+     * to derive every script hash we need (see LoansContractRegistry).
+     */
+    @Component
+    @Getter
+    public static class LoansConfiguration {
+
+        @Value("${loans.enabled:false}")
+        private boolean enabled;
+
+        /** Main config NFT policy id = hash of the applied {@code config(tx0, index0)} validator. */
+        @Value("${loans.config.policy-id:}")
+        private String configPolicyId;
+
+        /** LenderManager config NFT policy id = hash of the applied {@code lm_config(tx0, index0)}. */
+        @Value("${loans.lm-config.policy-id:}")
+        private String lmConfigPolicyId;
+
+        /**
+         * Hex of "parameters". Hardcoded in lib/fluidtokens/constants.ak, so this is
+         * effectively a constant — exposed only so a future contract revision does not
+         * force a code change.
+         */
+        @Value("${loans.config.asset-name:706172616d6574657273}")
+        private String configAssetName;
+
+        /**
+         * Not derivable from the blueprint (no smart_tokens validator is bundled); it is
+         * published in the on-chain ConfigDatum. Optional: without it the pool-manager
+         * branch of the derivation is skipped, which the liquidation path does not need.
+         */
+        @Value("${loans.smart-tokens-spend-script-hash:}")
+        private String smartTokensSpendScriptHash;
+
+        /** The tx that minted both config NFTs; the point history has to be indexed from. */
+        @Value("${loans.config.ref-utxo-tx-hash:}")
+        private String configRefUtxoTxHash;
+
+    }
+
+
     @Bean
     public CardanoConverters cardanoConverters(@Value("${network}") String network) {
         var networkType = switch (network) {

@@ -298,12 +298,59 @@ already uses — the payment credential is the script hash. `loanPolicyId`
 (`79d911c0…`) identifies genuine loan UTxOs and screens out junk sent to the
 address.
 
-## 6. Open items
+### 5.2 Where the config NFTs live ✅ VERIFIED
 
-- [x] ~~Derivation test~~ — `LoansContractDerivationTest`, 26 assertions, green
+Each config NFT sits at **its own validator's script address** — the payment
+credential *is* the config policy id (both addresses decode to header `0x70`,
+script-only, no stake part):
+
+```
+f1a475ea…835c "parameters" → addr_test1wrc6ga023nxvrc9h5kd3peu669c52twq2llmrndqm7fgxhqvf6zh6
+d0998754…a3e3 "parameters" → addr_test1wrgfnp65mhp7nnlgqdtd0cfdk93aq08vckmtgwx66n628ccmkhzs4
+```
+
+So the two config UTxOs — needed as **reference inputs** on every v4 tx — are picked
+up by indexing the two policy ids as payment credentials. No extra lookup path.
+
+## 6. Runtime wiring ✅ IMPLEMENTED
+
+`LoansContractRegistry` (`service` package) is the runtime home of §4. It mirrors
+`ContractRegistry`: applies parameters to the committed `compiledCode` in
+`loans-v4.plutus.json` at startup, never recompiles.
+
+- **Inputs** (`application.yaml`, `loans.*`): `config.policy-id`,
+  `lm-config.policy-id`, `config.asset-name` (defaults to `"parameters"`),
+  `smart-tokens-spend-script-hash`, `config.ref-utxo-tx-hash`. Preview values are
+  committed; **mainnet has `loans.enabled: false`** until FT confirms a deployment.
+- **Gating:** `@ConditionalOnProperty(loans.enabled=true)`, so the bean simply does
+  not exist on mainnet and nothing else changes behaviour.
+- **`smartTokensSpendScriptHash` is not derivable** — the blueprint ships no
+  `smart_tokens` validator, the value only exists in the `ConfigDatum`. Without it
+  the pool-manager branch (`poolManager*`, `lmCompound`,
+  `lmLiquidatePayInAdvanceAndCompound`) is skipped and those getters return `null`;
+  the plain liquidation path does not need any of them. A second test asserts the
+  registry still comes up correctly in that degraded mode.
+- **Indexing:** `LoansContractRegistry.indexedPaymentCredentials()` returns the 9
+  credentials (both config policies + 7 `general_spend` wrappers) and
+  `TankUtxoStorage` adds them to its whitelist via an `ObjectProvider`, so
+  `saveUnspent` starts keeping v4 UTxOs. The set is logged at startup.
+
+`LoansContractDerivationTest` was rewritten to assert against the **registry's**
+getters rather than re-deriving in the test, so the proof now covers the code the
+node actually runs. Both tests green.
+
+> Preview sync start is slot `71971209` (the Aquarium preview ref input), which is
+> **older** than the v4 config mint at slot `118496146` / block `4514052`, so a
+> preview sync already covers the whole v4 history. No sync-start change needed.
+
+## 7. Open items
+
+- [x] ~~Derivation test~~ — `LoansContractDerivationTest`, green
 - [x] ~~Confirm our `plutus.json` is the deployed commit~~ — **yes**, proven by §4
-- [ ] Promote the derivation from test into a runtime `LoansContractRegistry`
-      (same shape as `ContractRegistry`), reading the config UTxO at startup
+- [x] ~~Promote the derivation from test into a runtime `LoansContractRegistry`~~ — §6
+- [x] ~~Wire loan UTxO indexing by payment credential~~ — §6
+- [ ] Cross-check the derived hashes against the live `ConfigDatum` at startup
+      (currently the config UTxO is indexed but not read back and compared)
 - [ ] Decode `LoanDatum` (`lib/fluidtokens/types/loan.ak`) → Java
 - [ ] Port the health-factor math from `lib/fluidtokens/finance.ak`
 - [ ] Read upstream README §"Bots logic", diff it against the validators, and
@@ -311,7 +358,7 @@ address.
 - [ ] Mainnet coordinates — v4 mainnet deployment status still unconfirmed
 - [ ] Dutch auction absent on preview (§3.1) — decide if it's in scope
 
-## 7. Reproducing this
+## 8. Reproducing this
 
 ```bash
 KEY=$(grep -E '^BLOCKFROST_KEY=' .env.preview | cut -d= -f2 | tr -d ' "')
