@@ -339,6 +339,43 @@ up by indexing the two policy ids as payment credentials. No extra lookup path.
 getters rather than re-deriving in the test, so the proof now covers the code the
 node actually runs. Both tests green.
 
+### 6.1 Startup verification — a redeploy now fails loudly
+
+`LoansConfigVerifier` runs in `@PostConstruct` and compares every derived hash
+against the live config datums, read from chain via Blockfrost. Preview was already
+redeployed once under us (2026-07-14 → 2026-08-05); without this check the next one
+is a **silent** failure — stale policy ids in yaml, derivation still succeeds, node
+indexes a deployment that no longer exists while looking healthy.
+
+Failure modes are deliberately distinct:
+
+| situation | behaviour |
+|---|---|
+| any derived hash ≠ chain | **hard fail**, listing every mismatching field |
+| config NFT not at its script address | **hard fail** — the policy id is stale |
+| datum field count ≠ 29 / 8 | **hard fail** — contract types changed, indices invalid |
+| Blockfrost unreachable | warn and continue (`loans.verify-config.fail-on-unreachable=true` to make it mandatory) |
+
+The unreachable case is soft on purpose: a Blockfrost blip must not take down the
+Aquarium scheduled-transaction path, which has nothing to do with loans.
+
+`smartTokensSpendScriptHash` is checked too even though it is configured rather than
+derived — a stale value there silently corrupts the whole pool-manager branch. If it
+is unset, the verifier logs the on-chain value so it can just be pasted in.
+
+Three layers of test, because each covers what the others cannot:
+
+- `LoansContractDerivationTest` — derivation vs. the hashes recorded in the docs
+- `LoansConfigVerifierTest` — comparison logic vs. **recorded** datum fixtures
+  (`src/test/resources/loans-v4/*.hex`), no network. Pins the datum **field
+  indices**, which are the fragile part; includes a negative test that feeds the
+  pre-redeploy policy id `0e60ea5f…` and asserts the mismatch is caught
+- `LoansConfigVerifierLiveTest` — the full fetch path against live preview. Skipped
+  unless `BLOCKFROST_KEY` is set (`set -a; . ./.env.preview; set +a`). Doubles as the
+  "has FT redeployed preview again?" check
+
+All green, including the live one.
+
 > Preview sync start is slot `71971209` (the Aquarium preview ref input), which is
 > **older** than the v4 config mint at slot `118496146` / block `4514052`, so a
 > preview sync already covers the whole v4 history. No sync-start change needed.
@@ -349,8 +386,7 @@ node actually runs. Both tests green.
 - [x] ~~Confirm our `plutus.json` is the deployed commit~~ — **yes**, proven by §4
 - [x] ~~Promote the derivation from test into a runtime `LoansContractRegistry`~~ — §6
 - [x] ~~Wire loan UTxO indexing by payment credential~~ — §6
-- [ ] Cross-check the derived hashes against the live `ConfigDatum` at startup
-      (currently the config UTxO is indexed but not read back and compared)
+- [x] ~~Cross-check the derived hashes against the live `ConfigDatum` at startup~~ — §6.1
 - [ ] Decode `LoanDatum` (`lib/fluidtokens/types/loan.ak`) → Java
 - [ ] Port the health-factor math from `lib/fluidtokens/finance.ak`
 - [ ] Read upstream README §"Bots logic", diff it against the validators, and
