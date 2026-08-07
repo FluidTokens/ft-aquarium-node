@@ -39,6 +39,13 @@ aquarium:
 # (see LoansContractRegistry / docs/lending-v4-findings.md).
 loans:
   enabled: ${LOANS_ENABLED:false}
+  # FluidTokens oracle registry. Same endpoint ada-watch polls for Lending v3. Read-only price
+  # feeds for the health-factor engine; it also carries the multisig signatures a liquidation tx
+  # needs, which we do not consume yet. NOTE: serves mainnet assets, so on preview most
+  # collaterals have no feed and health is reported as unavailable rather than guessed.
+  oracle:
+    enabled: ${LOANS_ORACLE_ENABLED:true}
+    url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
 
 scheduling:
   transaction-processor:
