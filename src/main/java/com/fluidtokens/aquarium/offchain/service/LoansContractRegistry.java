@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.service;
 import com.bloxbean.cardano.aiken.AikenScriptUtil;
 import com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil;
 import com.bloxbean.cardano.client.plutus.blueprint.model.PlutusVersion;
+import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.BytesPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
@@ -20,6 +21,7 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
 import java.io.InputStream;
+import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -62,6 +64,13 @@ public class LoansContractRegistry {
     private final String configPolicyId;
     private final String lmConfigPolicyId;
     private final String configAssetName;
+
+    // Tier 0 — bonds. `bond.ak` is parameterised only by an Int discriminator (borrower == 0,
+    // lender == 1) which the validator body never reads; it exists purely to fork one source
+    // into two policy ids. The lender bond policy is what identifies a lender position in the
+    // LenderManager, i.e. step 1 of the bot scan loop.
+    private final String borrowerBondPolicyId;
+    private final String lenderBondPolicyId;
 
     // Tier 1 — parameterised directly by the main config NFT. Each of these doubles as
     // the validator's minting policy id and its withdraw script hash.
@@ -125,6 +134,9 @@ public class LoansContractRegistry {
 
         PlutusData mainCfg = b(configPolicyId);
         PlutusData name = b(configAssetName);
+
+        this.borrowerBondPolicyId = derive("bond.bond", i(0));
+        this.lenderBondPolicyId = derive("bond.bond", i(1));
 
         this.loanPolicyId = derive("loan.loan", mainCfg, name);
         this.poolPolicyId = derive("pool.pool", mainCfg, name);
@@ -232,6 +244,8 @@ public class LoansContractRegistry {
         m.put("poolCompoundActionScriptHash", poolCompoundActionScriptHash);
         m.put("lenderManagerWithdrawScriptHash", lenderManagerWithdrawScriptHash);
         m.put("lenderManagerSpendScriptHash", lenderManagerSpendScriptHash);
+        m.put("borrowerBondPolicyId", borrowerBondPolicyId);
+        m.put("lenderBondPolicyId", lenderBondPolicyId);
         m.put("lmWithdrawBondsActionScriptHash", lmWithdrawBondsActionScriptHash);
         m.put("lmLiquidateActionScriptHash", lmLiquidateActionScriptHash);
         m.put("lmLiquidateAndPayInAdvanceActionScriptHash", lmLiquidateAndPayInAdvanceActionScriptHash);
@@ -305,6 +319,11 @@ public class LoansContractRegistry {
 
     private static BytesPlutusData b(String hex) {
         return BytesPlutusData.of(HexUtil.decodeHexString(hex));
+    }
+
+    /** Integer validator parameter — only {@code bond.ak}'s borrower/lender discriminator uses one. */
+    private static BigIntPlutusData i(long value) {
+        return BigIntPlutusData.of(BigInteger.valueOf(value));
     }
 
     /** A {@code cardano/address.Credential} holding a script hash — {@code Script} is its second constructor. */

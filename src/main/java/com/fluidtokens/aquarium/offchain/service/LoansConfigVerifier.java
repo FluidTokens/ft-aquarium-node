@@ -54,6 +54,8 @@ public class LoansConfigVerifier {
     private static final int CFG_SMART_TOKENS_SPEND = 0;
     private static final int CFG_POOL_POLICY_ID = 2;
     private static final int CFG_REQUEST_POLICY_ID = 3;
+    private static final int CFG_BORROWER_BOND_POLICY_ID = 4;
+    private static final int CFG_LENDER_BOND_POLICY_ID = 5;
     private static final int CFG_LOAN_POLICY_ID = 6;
     private static final int CFG_POOL_SPEND = 8;
     private static final int CFG_REQUEST_SPEND = 9;
@@ -177,6 +179,8 @@ public class LoansConfigVerifier {
         expected.put(CFG_POOL_SELL_LENDER_POSITION_ACTION, registry.getPoolSellLenderPositionActionScriptHash());
         expected.put(CFG_POOL_COMPOUND_ACTION, registry.getPoolCompoundActionScriptHash());
         expected.put(CFG_POOL_MANAGER_SPEND, registry.getPoolManagerSpendScriptHash());
+        expected.put(CFG_BORROWER_BOND_POLICY_ID, registry.getBorrowerBondPolicyId());
+        expected.put(CFG_LENDER_BOND_POLICY_ID, registry.getLenderBondPolicyId());
         expected.put(CFG_POOL_MANAGER_POLICY_ID, registry.getPoolManagerPolicyId());
         expected.put(CFG_LOCKED_BORROWER_MANAGER_SPEND, registry.getLockedBorrowerManagerSpendScriptHash());
 
