@@ -19,6 +19,7 @@ import com.fluidtokens.aquarium.offchain.blueprint.types.general.model.impl.Card
 import com.fluidtokens.aquarium.offchain.util.AddressUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.math.BigInteger;
 import java.time.LocalDateTime;
@@ -31,6 +32,9 @@ import static com.fluidtokens.aquarium.offchain.PreviewTestConstants.BF_PREVIEW_
 import static com.fluidtokens.aquarium.offchain.PreviewTestConstants.MNEMONIC_USER;
 
 @Slf4j
+@EnabledIfEnvironmentVariable(named = "WALLET_MNEMONIC", matches = ".+",
+        disabledReason = "manual deployment script: needs a funded wallet, "
+                + "run with `set -a; . ./.env.preview; set +a`")
 public class PreviewTankTest {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();

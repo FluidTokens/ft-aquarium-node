@@ -18,6 +18,7 @@ import com.fluidtokens.aquarium.offchain.blueprint.types.general.model.impl.Card
 import com.fluidtokens.aquarium.offchain.util.AddressUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.math.BigInteger;
 import java.time.LocalDateTime;
@@ -29,6 +30,9 @@ import static com.bloxbean.cardano.client.backend.blockfrost.common.Constants.BL
 import static com.bloxbean.cardano.client.common.model.Networks.mainnet;
 
 @Slf4j
+@EnabledIfEnvironmentVariable(named = "WALLET_MNEMONIC", matches = ".+",
+        disabledReason = "manual deployment script: needs a funded wallet, "
+                + "run with `set -a; . ./.env.preview; set +a`")
 public class MainnetTankTest {
 
     private final String blockfrostMainnetKey = System.getenv("BLOCKFROST_KEY");
