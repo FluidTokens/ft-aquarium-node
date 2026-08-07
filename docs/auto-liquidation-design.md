@@ -178,18 +178,50 @@ compute HF / lateness → if liquidatable, select variant from
 
 ---
 
-## 5. On-chain type generation
+## 5. On-chain type generation — ✗ NOT VIABLE, hand-decode instead (2026-08-07)
 
-Add the loans `plutus.json` to the project and a second `@Blueprint` interface
-(e.g. `LoansBlueprint`, distinct package) so the annotation processor generates:
-`LoanDatum`, `LenderManagerDatum`, `LMConfigDatum`, the config datum, the 5
-`OraclePriceFeed` variants + `OracleRedeemer`, `AssetManagerDatumWithToken`, and
-every redeemer (`LoanClaimActionWithdrawRedeemer`/`ClaimData`,
-`LMLiquidateWithdrawRedeemer`, `LMLiquidateAndPayInAdvance…`,
-`LMLiquidateAndConvert…`, `LMLiquidatePayInAdvanceAndCompound…`).
+The original plan was a second `@Blueprint` interface over the loans blueprint.
+It does not work, for three independent reasons, each of which alone is fatal:
 
-Note some list fields use tuples (`List<(Int, Int)>` for oracle ref-input index
-pairs) — verify the generator handles these or hand-write those converters.
+1. **The datum types are not in the deployed blueprint.** Only `ConfigDatum` and
+   `LMConfigDatum` are. Every other v4 UTxO sits at a `general_spend` address whose
+   handler takes `datumOpt: Option<Data>`, so Aiken never emits a schema for
+   `LoanDatum`, `LenderManagerDatum`, `PoolDatum` or `AssetManagerDatumWithToken`.
+2. **Tuples break the processor.** cardano-client-lib 0.7.2 types
+   `BlueprintSchema.items` as a single schema; Aiken emits an *array* for tuples
+   (`Tuple<<Int,Int>>` and friends). The processor dies with
+   `MismatchedInputException: … from Array value (START_ARRAY)`. Worse, **one failing
+   `@Blueprint` aborts the whole annotation-processing round**, so it silently takes
+   the Aquarium blueprint's generated types down with it and the build collapses
+   with ~20 unrelated "package does not exist" errors.
+3. **Even with 1 and 2 solved, generation still dies.** `aiken build -I` (below)
+   supplies the missing types, and culling the tuple/non-serialisable definitions
+   gets the JSON to parse — but the processor then emits only 4 classes and stops,
+   with no diagnostic. Confirmed with the loans blueprint as the *only* `@Blueprint`
+   in the module, so it is not a two-blueprint conflict.
+
+**Therefore:** `LoanDatum` and its component types are hand-written
+(`model/loans/*`, `service/loans/LoanDatumConverter`). Redeemers will be too.
+
+### 5.1 `aiken build --include-all-types` as a specification oracle
+
+`aiken build -I` emits every serialisable type rather than only those reachable from
+validator signatures — 102 → 139 definitions, and `LoanDatum`, `LenderManagerDatum`,
+`PoolDatum`, `CollateralAsset` and `RepaymentMode` all appear.
+
+It **cannot** be used for hashes: built with a different aiken version than the
+deployment (`aiken.toml` declares v1.1.21), its `compiledCode` differs for **68 of 74**
+validators. `loans-v4.plutus.json` remains the only valid derivation input.
+
+But it is an excellent oracle for the hand-written decoder, and
+`LoanDatumSchemaTest` uses it exactly that way — asserting field order and
+constructor indices straight from the contract's own schema, so a silent
+mis-decode becomes a red test. Regenerate with:
+
+```bash
+cd ../ft-cardano-loans-v4 && aiken build -I -o loans-v4-alltypes.plutus.json
+cp loans-v4-alltypes.plutus.json ../ft-aquarium-node/src/test/resources/loans-v4/
+```
 
 ---
 
@@ -205,10 +237,78 @@ constraints the node must satisfy:
 - `valid_to − valid_from ≤ max_oracle_validity_range`;
 - feed token matches the loan's collateral / principal oracle asset.
 
-**Component:** `OracleClient` calls the **FluidTokens oracle API** (confirmed
-source; endpoint/spec TBD) to fetch a signed feed per needed token, then
-assembles the oracle withdrawal(s) and pins the tx validity interval tightly
-inside the feed window. The bot cannot generate prices itself.
+**Component:** `OracleClient` calls the **FluidTokens oracle API** to fetch a
+signed feed per needed token, then assembles the oracle withdrawal(s) and pins the
+tx validity interval tightly inside the feed window. The bot cannot generate
+prices itself.
+
+### 6.1 The oracle API — resolved, 2026-08-06
+
+**`GET https://api.fluidtokens.com/get-oracle-tokens`**, no auth. The same endpoint
+`ada-watch` already polls for Lending v3 alerts (`FluidConstants.ORACLE_TOKENS_URL`,
+`FluidOracleService`, 30s cadence) — but ada-watch only reads prices, so it parses
+away the half we need.
+
+Returns an array (19 entries on mainnet), one per supported token:
+
+```jsonc
+{
+  "token": { "policyId": "...", "assetName": "", "decimals": 6, "symbol": "OADA" },
+  "fluidOracle": {
+    "policyId": "...", "assetName": "6f7261636c654f414441",
+    "referenceScript": "25d1faae…#0",   // oracle withdraw script, deployed
+    "rewardAddress":   "stake17xf2uy8…", // <- the Withdraw purpose to attach
+    "referenceInput":  "61441d51…#0"     // oracle NFT utxo -> tx reference input
+  },
+  "governanceToken": { "governancePolicy": "...", "governanceAsset": "...", "treshold": 2 },
+  "preferredOracle": "multisig",         // 18 of 19; the other is "c3"
+  "active": true,
+  "supportedOracle": {
+    "multisig": {
+      "validFrom": 1785332220000, "validTo": 1785333600000,
+      "tokenPriceInLovelaces": 787376451, "tokenPriceDenominator": 1,
+      "multisigOracle": {
+        "requiredSignatures": 3,
+        "signatures": [ { "publicKey": "636A65…", "signature": "e12e43ab…" }, … ]
+      }
+    }
+  }
+}
+```
+
+**It ships the signatures.** `supportedOracle.multisig.multisigOracle.signatures[]`
+is exactly the input to `OracleRedeemer { data, signatures }`. The mapping is
+direct:
+
+| API | on-chain |
+|---|---|
+| `validFrom` / `validTo` / `token` | `CommonFeedData { valid_from, valid_to, token }` |
+| `tokenPriceInLovelaces` / `tokenPriceDenominator` | `Aggregated { token_price_in_lovelaces, token_price_denominator }` |
+| `multisigOracle.signatures[].signature` | `Signature.signature` |
+| `fluidOracle.rewardAddress` | the `Withdraw` script purpose carrying the redeemer |
+| `fluidOracle.referenceInput` | the reference input holding the oracle NFT |
+| `fluidOracle.referenceScript` | where to `readFrom` the oracle script itself |
+
+**Two providers, two mechanisms.** `preferredOracle: "multisig"` (18/19) is the
+signed path above, verified in `validators/oracle.ak:167-183` by
+`verify_ed25519_signature` over `verification_keys` with a threshold.
+`preferredOracle: "c3"` instead points at a **Charli3 reference input** and uses the
+`PriceDataCharlie { provider_ref_input_index, .. }` feed variant — no signatures
+involved. Phase 2 only needs the multisig path.
+
+Note `lib/fluidtokens/oracle.ak` `retrieve_oracle_data` does **not** check
+signatures — it only validates the window, the token match and the oracle NFT's
+presence. Signature verification happens because the oracle script's own withdrawal
+is in the tx. Both must be present or the feed is trusted-but-unverified.
+
+**Two things still unknown:**
+
+1. **Is there a preview instance of this API?** `api.fluidtokens.com` serves mainnet
+   data; our loans are on preview. Either FT hosts a preview equivalent or preview
+   liquidations need a stub feed.
+2. **`Signature.key_position`** is an index into the validator's `verification_keys`
+   list, but the API gives us `publicKey`. The mapping has to be recovered from the
+   on-chain oracle datum, then `publicKey` → position resolved per feed.
 
 ---
 
@@ -325,8 +425,10 @@ From the FluidTokens contract/oracle team:
    location & datum field list; LM config NFT + `LMConfigDatum` UTxO.
 3. **Loan/bond policy id** (applied `loan.ak`).
 4. **Reference-script tx hashes** for the ~6 validators the tx reads.
-5. **Oracle API spec** (endpoint, auth, response shape) + oracle NFT
-   policy+assetnames + which tokens have feeds.
+5. ~~**Oracle API spec**~~ — **resolved without them**, see §6.1:
+   `GET https://api.fluidtokens.com/get-oracle-tokens`, no auth, and it returns the
+   signatures, oracle NFT policy/assetname, reward address and reference
+   input/script per token. Still to ask: **is there a preview instance?**
 6. Confirmation on the **`lm_liquidate_convert_and_compound_action` stub** —
    will it be implemented, or is that combo permanently out?
 7. A **preprod test fixture** (a lender + liquidatable loan) for end-to-end runs.

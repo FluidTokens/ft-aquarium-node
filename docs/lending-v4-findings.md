@@ -385,21 +385,169 @@ All green, including the live one.
 > **older** than the v4 config mint at slot `118496146` / block `4514052`, so a
 > preview sync already covers the whole v4 history. No sync-start change needed.
 
-## 7. Open items
+## 7. README "Bots logic" vs the validators ✅ DIFFED
+
+Upstream repo cloned at `../ft-cardano-loans-v4`, HEAD `5cc99a4` (2026-07-07,
+"Update: readme"). Its `plutus.json` is **byte-identical** to our bundled
+`loans-v4.plutus.json` (`sha256 29712aa5169f6e09c13199f2e0d6b9eb0959a0ebdd2e56a463c99a1562c5f478`),
+and the last commit touching it is `bbe9c1a` (2026-07-02). So the contracts have
+not moved since we vendored them — an independent re-confirmation of §4.
+
+The README's 9-step "Bots logic" is a **sketch**. Everything below is enforced by
+the validators and absent from, or contradicted by, the prose. Ranked by how badly
+it bites the bot.
+
+### 7.1 Scope filters the README does not mention
+
+**D1 — bots can only liquidate `LiquidationMode::Liquidation`.** All four working
+LM actions open with `expect Liquidation { equityInPrincipalCurrency, .. } =
+loanInputAction.liquidationMode`:
+
+| validator | line |
+|---|---|
+| `lm_liquidate_action.ak` | 120 |
+| `lm_liquidate_and_pay_in_advance_action.ak` | 169 |
+| `lm_liquidate_and_convert_action.ak` | 184 |
+| `lm_liquidate_pay_in_advance_and_compound_action.ak` | 207 |
+
+`NoLiquidationFullCollateralClaim` and `NoLiquidationDutchAuctionClaim` are
+therefore **unreachable from the LenderManager path** — the lender claims those
+manually via `loan_claim_action`. README step 3's "check that it allows
+liquidation" hides a hard type filter. **This settles the dutch-auction open
+item: out of scope, the bot cannot build such a tx at all.**
+
+**D2 — `equityInPrincipalCurrency == True` loans are untouchable.** Same four
+sites, next line: `expect equityInPrincipalCurrency == False`. Nothing in the
+README hints at it. The bot's addressable set is exactly
+`Liquidation { equityInPrincipalCurrency: False, .. }`.
+
+**D3 — collateral shape restrictions** (`lm_liquidate_action.ak:108,116`):
+
+- `expect Some(collateralAssetName) = collateral.maybeAssetName` — NFT-*collection*
+  collateral cannot be liquidated
+- `expect loanCollateralAmount > 1` — single-NFT collateral cannot be liquidated
+
+Both must be scan filters. Without them the bot builds txs that die in script eval.
+
+### 7.2 The README names the wrong contract
+
+**D4 — liquidated collateral goes to `asset_manager`, not `lender_manager`.**
+README step 5 says *"send the collateral (minus fees) to the lender_manager.ak"*
+and step 9 says *"scan all the remaining lender_manager.ak utxos … with datum
+AssetManagerDatumWithToken"*. The validator writes to **`assetManagerSpendScriptHash`**
+(`lm_liquidate_action.ak:66-72`) with an `AssetManagerDatumWithToken`
+(`:147-157`). The whole "Automatic liquidations and compounding" prose section
+repeats the same mistake.
+
+No code change needed — `assetManagerSpendScriptHash` is already in
+`indexedPaymentCredentials()` — but the **compound-candidate scan must target the
+asset-manager credential**, and anyone following the README would point it at the
+wrong script.
+
+### 7.3 Transaction-shape constraints
+
+**D5 — every LenderManager input must be a bond being liquidated**
+(`lm_liquidate_action.ak:175-178`):
+
+```aiken
+list.length(list.unique(redeemer.lenderBondInputIndexes)) == list.length(lenderBondInputs)
+list.length(redeemer.lenderBondInputIndexes) == list.length(loanInputs)
+```
+
+`#LM inputs == #loan inputs`, indices unique. No unrelated LM UTxO may ride along
+in a liquidation tx.
+
+**D6 — the bond UTxO must be echoed byte-identically.**
+`builtin.equals_data(lenderBondInput.output, lenderBondOutput)` (`:145`) — same
+address *including stake part*, same value, same datum. Note the consequence:
+the bond output's stake credential comes from the **input**, not from
+`LenderManagerDatum.lenderStakeCredential`. That field's comment ("used for any
+utxo created by the bots") applies to the asset outputs only.
+
+**D7 — one output per loan, nothing merged.** `dosProtection` (`:213-218`) requires
+the asset output to flatten to exactly **1** entry for ADA collateral and exactly
+**2** otherwise.
+
+### 7.4 Where the health-factor math is actually enforced
+
+**D8 — `equity` and `remainingDebt` are bot-supplied inputs, checked elsewhere.**
+`lm_liquidate_action` pulls them from the *loan* claim redeemer
+(`parsedLoanRedeemer.actionsForEachInput[index]`, `:95-98`) and only does
+arithmetic with them. The authoritative validation lives in
+`loan_claim_action.ak` — `can_liquidate` at `:232`, `get_equity` /
+`get_equity_in_collateral_currency`. **Aim the HF parity tests at
+`loan_claim_action.ak`, not the LM actions.**
+
+**D9 — `can_liquidate` is strict-greater, and zero collateral always liquidates.**
+`finance.ak:174-195`:
+
+```aiken
+or {
+  collateralInLovelace == rational.zero,          // <- always liquidatable
+  rational.compare(liquidationLtv, currentLtv) == Less,   // <- strictly greater
+}
+```
+
+Liquidatable iff `currentLtv > liquidationLtv`; **equality is not**. Both sides
+run through `get_token_amount_in_lovelace`, so an LTV check **always** needs both
+oracle feeds — there is no oracle-free liquidation path.
+
+### 7.5 Agreements worth pinning down
+
+- **The loan↔bond join key is the asset name.** `quantity_of(loanInput.output.value,
+  loanPolicyId, lenderBondAssetName) == 1` (`:131-135`). Confirms design §4.
+- **`shouldLiquidationConvertToPrincipal == False` is enforced** for the plain
+  `Liquidate` action (`:143`), matching README step 5.
+- **Fee maths:** `liquidationFee = loanCollateralAmount * liquidationFeePerMille / 1000`
+  (floor), deducted from the lender's payout (`:118-124`). The validator never
+  checks *where* the fee goes, and the lender payout is `>=` (`:204-209`) — so the
+  bot keeps the fee as change. Confirms the "bot keeps the fee directly" decision.
+- **`LiquidateConvertAndCompound` is a hard-`False` stub**
+  (`lm_liquidate_convert_and_compound_action.ak`, 261 bytes — earlier noted as 170):
+  `withdraw(...) { False }`, comment *"We need to be DEX batchers to do this"*.
+  README step 8 correctly offers only the two viable options, so prose and contract
+  agree. The variant still exists in `LenderManagerAction` and its hash is still
+  published in `LMConfigDatum`.
+- **`ConfigDatum` field indices confirmed** against the reads in
+  `lm_liquidate_action.ak`: 0 `smartTokensSpendScriptHash`, 4 `borrowerBondPolicyId`,
+  5 `lenderBondPolicyId`, 6 `loanPolicyId`, 10 `loanSpendScriptHash`.
+
+### 7.6 Gap this exposed in our own code
+
+**Bond policy ids are not derived.** README step 1 — "scan LM utxos that contain a
+Lender bond nft" — needs `lenderBondPolicyId`, and `LoansContractRegistry` derives
+no bond policy at all. It is trivial: `validators/bond.ak` is
+`validator bond(_bondType: Int)`, the parameter is otherwise **unused** and exists
+only to fork the two policies (`//borrower == 0`, `//lender == 1`). So:
+
+- `lenderBondPolicyId   = hash(apply(bond.bond, [1]))` → `ConfigDatum[5]`
+- `borrowerBondPolicyId = hash(apply(bond.bond, [0]))` → `ConfigDatum[4]`
+
+Both are independently verifiable against the live config datum, so they belong in
+`LoansContractRegistry` + `LoansConfigVerifier` alongside everything else.
+
+## 8. Open items
 
 - [x] ~~Derivation test~~ — `LoansContractDerivationTest`, green
 - [x] ~~Confirm our `plutus.json` is the deployed commit~~ — **yes**, proven by §4
 - [x] ~~Promote the derivation from test into a runtime `LoansContractRegistry`~~ — §6
 - [x] ~~Wire loan UTxO indexing by payment credential~~ — §6
 - [x] ~~Cross-check the derived hashes against the live `ConfigDatum` at startup~~ — §6.1
-- [ ] Decode `LoanDatum` (`lib/fluidtokens/types/loan.ak`) → Java
-- [ ] Port the health-factor math from `lib/fluidtokens/finance.ak`
-- [ ] Read upstream README §"Bots logic", diff it against the validators, and
-      record every discrepancy here
+- [x] ~~Read upstream README §"Bots logic", diff it against the validators~~ — §7
+- [x] ~~Dutch auction — decide if it's in scope~~ — **out of scope**, D1: the LM
+      actions only accept `LiquidationMode::Liquidation`
+- [ ] Derive `lenderBondPolicyId` / `borrowerBondPolicyId` in `LoansContractRegistry`
+      and verify them against `ConfigDatum[5]` / `ConfigDatum[4]` (§7.6)
+- [x] ~~Decode `LoanDatum` (`lib/fluidtokens/types/loan.ak`) → Java~~ — hand-written
+      (`model/loans/*` + `LoanDatumConverter`); blueprint codegen is not viable, see
+      design §5. Pinned by `LoanDatumConverterTest` (56 live preview datums) and
+      `LoanDatumSchemaTest` (field order/constructor indices vs `aiken build -I`)
+- [x] ~~Expose the indexed loans over HTTP~~ — `GET ${apiPrefix}/loans`, `LoanController`
+- [ ] Port the health-factor math from `lib/fluidtokens/finance.ak`, with parity
+      tests aimed at `loan_claim_action.ak` (§7.4)
 - [ ] Mainnet coordinates — v4 mainnet deployment status still unconfirmed
-- [ ] Dutch auction absent on preview (§3.1) — decide if it's in scope
 
-## 8. Reproducing this
+## 9. Reproducing this
 
 ```bash
 KEY=$(grep -E '^BLOCKFROST_KEY=' .env.preview | cut -d= -f2 | tr -d ' "')
