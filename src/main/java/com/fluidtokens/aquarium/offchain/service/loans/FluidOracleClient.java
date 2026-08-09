@@ -1,8 +1,13 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.address.Address;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.client.util.HexUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
+import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.OracleSignature;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,7 +19,10 @@ import org.springframework.web.reactive.function.client.WebClient;
 import java.math.BigInteger;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
@@ -44,7 +52,10 @@ public class FluidOracleClient {
 
     private final WebClient webClient;
 
-    private final AtomicReference<Map<AssetType, OraclePriceFeed>> byAsset = new AtomicReference<>(Map.of());
+    private final AtomicReference<Map<AssetType, OracleEntry>> byToken = new AtomicReference<>(Map.of());
+
+    /** Same entries, keyed by the oracle's own NFT — the way a loan datum names its oracle. */
+    private final AtomicReference<Map<AssetType, OracleEntry>> byOracleToken = new AtomicReference<>(Map.of());
 
     private final AtomicReference<Instant> lastRefresh = new AtomicReference<>(Instant.EPOCH);
 
@@ -86,7 +97,28 @@ public class FluidOracleClient {
         if (asset.isAda()) {
             return Optional.of(OraclePriceFeed.unit());
         }
-        return Optional.ofNullable(byAsset.get().get(asset));
+        return findEntry(asset).map(OracleEntry::feed);
+    }
+
+    /** The full oracle deployment for a priced asset — reference input, keys, signatures. */
+    public Optional<OracleEntry> findEntry(AssetType token) {
+        return token == null ? Optional.empty() : Optional.ofNullable(byToken.get().get(token));
+    }
+
+    /**
+     * The oracle a loan datum actually names. {@code retrieve_oracle_data} requires the reference
+     * input to hold this NFT, so for building a transaction this is the correct lookup — matching
+     * on the priced asset instead would silently pick a different oracle if one asset ever gained
+     * a second feed.
+     */
+    public Optional<OracleEntry> findEntryByOracleToken(AssetType oracleToken) {
+        return oracleToken == null ? Optional.empty()
+                : Optional.ofNullable(byOracleToken.get().get(oracleToken));
+    }
+
+    /** Every oracle currently known, for reporting and for tests. */
+    public Collection<OracleEntry> entries() {
+        return byToken.get().values();
     }
 
     public Instant lastRefresh() {
@@ -94,7 +126,7 @@ public class FluidOracleClient {
     }
 
     public int trackedAssets() {
-        return byAsset.get().size();
+        return byToken.get().size();
     }
 
     /**
@@ -120,19 +152,21 @@ public class FluidOracleClient {
         }
     }
 
-    /** Replaces the held prices with whatever parses out of a registry payload. */
+    /** Replaces the held entries with whatever parses out of a registry payload. */
     int load(JsonNode array) {
-        var next = new HashMap<AssetType, OraclePriceFeed>();
-        array.forEach(entry -> parse(entry).ifPresent(p -> next.put(p.asset(), p.feed())));
-        byAsset.set(Map.copyOf(next));
+        var tokens = new HashMap<AssetType, OracleEntry>();
+        var oracleTokens = new HashMap<AssetType, OracleEntry>();
+        array.forEach(node -> parse(node).ifPresent(entry -> {
+            tokens.put(entry.token(), entry);
+            oracleTokens.put(entry.oracleToken(), entry);
+        }));
+        byToken.set(Map.copyOf(tokens));
+        byOracleToken.set(Map.copyOf(oracleTokens));
         lastRefresh.set(Instant.now());
-        return next.size();
+        return tokens.size();
     }
 
-    private record Priced(AssetType asset, OraclePriceFeed feed) {
-    }
-
-    private Optional<Priced> parse(JsonNode entry) {
+    private Optional<OracleEntry> parse(JsonNode entry) {
         try {
             if (!entry.path("active").asBoolean(false)) {
                 return Optional.empty();
@@ -150,18 +184,108 @@ public class FluidOracleClient {
             var token = entry.path("token");
             var asset = AssetType.fromUnit(token.path("policyId").asText("") + token.path("assetName").asText(""));
             // The token travels inside the signed feed and is checked by is_feed_token_correct,
-            // so it is carried verbatim rather than reconstructed later.
-            var feed = OraclePriceFeed.aggregated(
+            // so it is carried verbatim rather than reconstructed later. The provider decides the
+            // on-chain variant: "multisig" feeds are signed and verified as Aggregated, "c3" feeds
+            // are verified structurally against a Charli3 reference input instead.
+            var price = supported.path("tokenPriceInLovelaces").bigIntegerValue();
+            long validFrom = supported.path("validFrom").asLong();
+            long validTo = supported.path("validTo").asLong();
+            OraclePriceFeed feed = switch (preferred) {
+                case "multisig" -> OraclePriceFeed.aggregated(asset, price, denominator, validFrom, validTo);
+                case "c3" -> OraclePriceFeed.priceDataCharlie(asset, price, denominator, validFrom, validTo);
+                default -> null;
+            };
+            if (feed == null) {
+                log.warn("oracle {} uses unknown provider '{}'; skipping it rather than guessing a variant",
+                        asset.toUnit(), preferred);
+                return Optional.empty();
+            }
+
+            var oracle = entry.path("fluidOracle");
+            var oracleToken = new AssetType(oracle.path("policyId").asText(""),
+                    oracle.path("assetName").asText(""));
+            var rewardAddress = oracle.path("rewardAddress").asText("");
+            var keys = textList(entry.path("multisigOracle").path("publicKeys"));
+
+            return Optional.of(new OracleEntry(
                     asset,
-                    supported.path("tokenPriceInLovelaces").bigIntegerValue(),
-                    denominator,
-                    supported.path("validFrom").asLong(),
-                    supported.path("validTo").asLong());
-            return Optional.of(new Priced(asset, feed));
+                    oracleToken,
+                    rewardAddress,
+                    withdrawCredentialHash(rewardAddress),
+                    utxoRef(oracle.path("referenceInput").asText("")),
+                    utxoRef(oracle.path("referenceScript").asText("")),
+                    keys,
+                    entry.path("multisigOracle").path("requiredSignatures").asInt(0),
+                    feed,
+                    signatures(supported, keys, asset)));
         } catch (Exception e) {
             log.warn("could not parse a FluidTokens oracle entry: {}", e.toString());
             return Optional.empty();
         }
+    }
+
+    /**
+     * Resolves each published signature to the {@code key_position} the validator expects.
+     * <p>
+     * A signature whose key is not in the list is dropped rather than guessed at: the validator
+     * {@code expect}s every supplied signature to verify against the key at its position, so one
+     * wrong position fails the entire transaction instead of merely being ignored.
+     */
+    private List<OracleSignature> signatures(JsonNode supported, List<String> keys, AssetType asset) {
+        var out = new ArrayList<OracleSignature>();
+        for (JsonNode signature : supported.path("multisigOracle").path("signatures")) {
+            var publicKey = signature.path("publicKey").asText("");
+            int position = indexOfIgnoringCase(keys, publicKey);
+            if (position < 0) {
+                log.warn("oracle {} published a signature from key {} that is not in its publicKeys; dropping it",
+                        asset.toUnit(), publicKey);
+                continue;
+            }
+            out.add(new OracleSignature(position, signature.path("signature").asText("")));
+        }
+        return out;
+    }
+
+    private static int indexOfIgnoringCase(List<String> keys, String key) {
+        for (int i = 0; i < keys.size(); i++) {
+            if (keys.get(i).equalsIgnoreCase(key)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static List<String> textList(JsonNode array) {
+        var out = new ArrayList<String>();
+        array.forEach(node -> out.add(node.asText()));
+        return out;
+    }
+
+    /** {@code "txhash#index"} as the registry publishes reference UTxOs. */
+    static TransactionInput utxoRef(String ref) {
+        int hash = ref.indexOf('#');
+        if (hash < 0) {
+            return null;
+        }
+        return TransactionInput.builder()
+                .transactionId(ref.substring(0, hash))
+                .index(Integer.parseInt(ref.substring(hash + 1)))
+                .build();
+    }
+
+    /**
+     * The oracle's withdrawal credential, which is what {@code Withdraw(credential)} in the
+     * redeemer map is keyed by. These are always script stake addresses.
+     */
+    static String withdrawCredentialHash(String rewardAddress) {
+        if (rewardAddress == null || rewardAddress.isBlank()) {
+            return null;
+        }
+        var address = new Address(rewardAddress);
+        return address.getDelegationCredentialHash()
+                .or(address::getPaymentCredentialHash)
+                .map(HexUtil::encodeHexString)
+                .orElse(null);
     }
 
     /** Convenience for callers that only have the raw numbers. */

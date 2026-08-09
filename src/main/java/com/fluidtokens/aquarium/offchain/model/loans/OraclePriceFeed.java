@@ -44,6 +44,20 @@ public record OraclePriceFeed(Variant variant,
                 validFrom, validTo);
     }
 
+    /**
+     * A Charli3-backed price. Numerically identical to {@link #aggregated}, but a different thing
+     * on chain: {@code validators/oracle.ak} validates it against a Charli3 reference input rather
+     * than against oracle signatures, and the redeemer carries a {@code provider_ref_input_index}
+     * that only means anything relative to a specific transaction. It is priceable for reporting
+     * and not yet buildable into a redeemer — hence the separate variant rather than pretending
+     * it is {@code Aggregated}.
+     */
+    public static OraclePriceFeed priceDataCharlie(AssetType token, BigInteger priceInLovelaces,
+                                                   BigInteger priceDenominator, long validFrom, long validTo) {
+        return new OraclePriceFeed(Variant.PRICE_DATA_CHARLIE, token, priceInLovelaces, priceDenominator,
+                validFrom, validTo);
+    }
+
     /** Lovelace per smallest unit of the token, as {@code rational.new(price, denominator)}. */
     public Rational price() {
         if (variant == Variant.POOLED) {

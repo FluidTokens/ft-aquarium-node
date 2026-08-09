@@ -1,0 +1,72 @@
+package com.fluidtokens.aquarium.offchain.model.loans;
+
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
+
+import java.util.List;
+
+/**
+ * Everything the registry knows about one asset's oracle — the price, and the deployment a
+ * liquidation transaction has to reference.
+ * <p>
+ * There is one of these per priced asset, not one per protocol: the registry publishes 19 entries
+ * with 19 distinct reward addresses. That is forced by the validator, because
+ * {@code retrieve_oracle_data} resolves its feed with
+ * {@code pairs.get_first(redeemers, Withdraw(oraclePaymentCredential))} — one redeemer per
+ * credential. A loan with a token principal <em>and</em> token collateral therefore needs two
+ * separate oracle withdrawals, one per leg, each with its own reference input.
+ *
+ * @param token           the asset being priced, as it appears inside the signed feed
+ * @param oracleToken     the oracle's own NFT. This is what a loan datum points at
+ *                        ({@code collateral.oracleTokenAsset}), and what
+ *                        {@code retrieve_oracle_data} requires the reference input to hold, so it
+ *                        — not {@link #token} — is the authoritative way to find the right oracle
+ *                        for a given loan.
+ * @param referenceInput  the UTxO holding {@link #oracleToken}, included as a reference input
+ * @param referenceScript the UTxO the oracle script is published at
+ * @param verificationKeys the keys {@link OracleSignature#keyPosition()} indexes into. Believed to
+ *                        match the validator's {@code verification_keys} parameter in order; see
+ *                        docs/auto-liquidation-design.md §6.3 for why that is not yet proven.
+ * @param threshold       how many valid signatures the validator requires. Taken from the entry
+ *                        level; the registry sometimes reports a different number alongside the
+ *                        feed, which is why {@link #signatures()} carries every published
+ *                        signature rather than a threshold-sized subset.
+ */
+public record OracleEntry(AssetType token,
+                          AssetType oracleToken,
+                          String rewardAddress,
+                          String withdrawCredentialHash,
+                          TransactionInput referenceInput,
+                          TransactionInput referenceScript,
+                          List<String> verificationKeys,
+                          int threshold,
+                          OraclePriceFeed feed,
+                          List<OracleSignature> signatures) {
+
+    public OracleEntry {
+        verificationKeys = List.copyOf(verificationKeys);
+        signatures = List.copyOf(signatures);
+    }
+
+    /**
+     * Whether this entry could satisfy the validator as it stands. Signatures whose key could not
+     * be located are dropped during parsing, so a short list here means the redeemer would fail.
+     */
+    public boolean hasEnoughSignatures() {
+        return threshold > 0 && signatures.size() >= threshold;
+    }
+
+    /**
+     * Whether a liquidation could actually be built against this oracle today.
+     * <p>
+     * A price is not sufficient. Charli3-backed feeds are validated against a reference input and
+     * carry a {@code provider_ref_input_index} we do not model, so they are reportable but not yet
+     * buildable — and saying so here is better than discovering it when a transaction is rejected.
+     */
+    public boolean usableForLiquidation() {
+        return switch (feed.variant()) {
+            case AGGREGATED, DEDICATED -> hasEnoughSignatures();
+            case PRICE_DATA_CHARLIE, PRICE_DATA_ORCFAX, POOLED -> false;
+        };
+    }
+}

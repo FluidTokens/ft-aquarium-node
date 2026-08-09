@@ -361,6 +361,30 @@ every available signature satisfies either, and is what we should do: the valida
 `expect`s each supplied signature to verify, so a wrong `key_position` on any one of
 them fails the whole transaction.
 
+### 6.4 Not every oracle is signed — Charli3
+
+The registry serves two provider kinds, and they are not interchangeable:
+
+| `preferredOracle` | assets | on-chain variant | how it is validated |
+|---|---|---|---|
+| `multisig` | 18 | `Aggregated` | ed25519 signatures over the serialised feed |
+| `c3` | OADA | `PriceDataCharlie` | structurally, against a Charli3 reference input |
+
+A `c3` entry carries **no `multisigOracle` and no signatures at all**, and its redeemer
+needs a `provider_ref_input_index` that only means anything relative to a specific
+transaction. Encoding one as `Aggregated` — which is what we did before this was
+noticed — produces a redeemer that fails for want of signatures.
+
+So a c3 feed is **priceable for reporting and not buildable for liquidation**.
+`OracleEntry.usableForLiquidation()` says so explicitly rather than letting it be
+discovered when a transaction is rejected. Supporting c3 properly means modelling
+`PriceDataCharlie` and locating the Charli3 provider UTxO, which the registry does
+publish under `supportedOracle.c3.referenceInput`.
+
+Note this is a *reporting* distinction, not a health one: `liquidatable` still answers
+"would the chain permit this", which is true regardless of whether we can currently
+build the transaction. Phase 3 filters on `usableForLiquidation()`.
+
 ---
 
 ## 7. Variant selection (decision tree)
