@@ -310,6 +310,57 @@ is in the tx. Both must be present or the feed is trusted-but-unverified.
    list, but the API gives us `publicKey`. The mapping has to be recovered from the
    on-chain oracle datum, then `publicKey` → position resolved per feed.
 
+### 6.2 The signed feed encoding — proven, 2026-08-09
+
+`validators/oracle.ak` verifies a feed with
+
+```aiken
+let serialise_data = builtin.serialise_data(redeemer.data)
+verify_ed25519_signature(verification_key, serialise_data, redem.signature)
+```
+
+so the redeemer's bytes must match the oracle's to the byte. Rather than assert an
+encoding from reading the type, we took the signatures FluidTokens publishes and
+searched for the encoding they verify under. Of 24 candidates (definite vs
+indefinite CBOR lists × constructor index 0/1/2 × `Asset` field order × with/without
+the token), **exactly one verified, and it verified all 20 signatures across 18
+feeds**:
+
+```
+Aggregated = Constr 0 [ CommonFeedData, price_in_lovelaces, price_denominator ]
+CommonFeedData = Constr 0 [ valid_from, valid_to, Asset ]
+Asset = Constr 0 [ policyId, assetName ]      -- policy id first
+```
+
+with **indefinite-length lists** (`d8799f…ff`), which is what Plutus `serialiseData`
+emits and what cardano-client-lib produces. An ed25519 signature is a total function
+of its message, so this is a proof of the encoding, not evidence for it. Pinned by
+`OracleFeedSignatureTest` against a captured payload — signatures stay valid over
+their message forever, so the fixture does not rot.
+
+### 6.3 One oracle script per asset
+
+`retrieve_oracle_data` does `pairs.get_first(redeemers, Withdraw(oraclePaymentCredential))`
+— a single redeemer per credential. A token/token loan needs two prices, which only
+works because **each asset has its own oracle script**: the registry returns 19
+entries with 19 distinct `fluidOracle.rewardAddress` values. A liquidation therefore
+carries one withdrawal per priced leg, each with its own reference input.
+
+`verification_keys` and `threshold` are **validator parameters**, not datum fields —
+`validator oracle(verification_keys: List<ByteArray>, threshold: Int, …)` — so they
+are baked into each per-asset script. `key_position` indexes that parameter list.
+Every published signature's `publicKey` appears in the entry's `multisigOracle.publicKeys`
+at an ascending index, so position = index in that list. **Caveat:** 17 of 18 entries
+have a single key, so only fGLD (3 keys → `[0,1,2]`) carries any information. This is
+consistent with the published data but does not prove `publicKeys` shares the order of
+the on-chain parameter; confirming that needs the applied oracle script.
+
+The registry also reports **two different thresholds** for the same asset — fGLD has
+entry-level `requiredSignatures: 2` but feed-level `requiredSignatures: 3`. Sending
+every available signature satisfies either, and is what we should do: the validator
+`expect`s each supplied signature to verify, so a wrong `key_position` on any one of
+them fails the whole transaction.
+
 ---
 
 ## 7. Variant selection (decision tree)

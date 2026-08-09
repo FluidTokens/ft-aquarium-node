@@ -23,8 +23,10 @@ import java.util.List;
 /**
  * Read-only view over the indexed Lending v4 loans.
  * <p>
- * v1 exposes only what is on chain today. Health factor, remaining debt and equity are
- * deliberately absent: they need the {@code finance.ak} port and live oracle prices, and a
+ * Every field outside {@code health} comes straight off the indexed UTxO. The {@code health}
+ * block is derived by {@link LoanHealthService}, and is split by what it depends on: debt and
+ * lateness need only the datum and the clock, everything else needs a live oracle price for both
+ * legs. When a price is missing those fields are null with an {@code unavailable_reason} — a
  * wrong health factor is worse than no health factor.
  */
 @RestController

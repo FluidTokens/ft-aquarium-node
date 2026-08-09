@@ -123,7 +123,10 @@ public class FluidOracleClient {
             }
             var token = entry.path("token");
             var asset = AssetType.fromUnit(token.path("policyId").asText("") + token.path("assetName").asText(""));
+            // The token travels inside the signed feed and is checked by is_feed_token_correct,
+            // so it is carried verbatim rather than reconstructed later.
             var feed = OraclePriceFeed.aggregated(
+                    asset,
                     supported.path("tokenPriceInLovelaces").bigIntegerValue(),
                     denominator,
                     supported.path("validFrom").asLong(),
@@ -136,7 +139,8 @@ public class FluidOracleClient {
     }
 
     /** Convenience for callers that only have the raw numbers. */
-    static OraclePriceFeed feedOf(BigInteger price, BigInteger denominator, long validFrom, long validTo) {
-        return OraclePriceFeed.aggregated(price, denominator, validFrom, validTo);
+    static OraclePriceFeed feedOf(AssetType token, BigInteger price, BigInteger denominator,
+                                  long validFrom, long validTo) {
+        return OraclePriceFeed.aggregated(token, price, denominator, validFrom, validTo);
     }
 }

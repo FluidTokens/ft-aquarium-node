@@ -1,5 +1,6 @@
 package com.fluidtokens.aquarium.offchain;
 
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
@@ -39,8 +40,10 @@ class LoanFinanceTest {
 
     private static final BigInteger ZERO = BigInteger.ZERO;
 
+    /** The token and window are irrelevant here — these vectors exercise the price arithmetic only. */
     private static OraclePriceFeed feed(long price, long denominator) {
-        return OraclePriceFeed.aggregated(BigInteger.valueOf(price), BigInteger.valueOf(denominator), 0L, 0L);
+        return OraclePriceFeed.aggregated(AssetType.ada(), BigInteger.valueOf(price),
+                BigInteger.valueOf(denominator), 0L, 0L);
     }
 
     private static Rational rate(long bps) {

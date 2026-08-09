@@ -41,6 +41,10 @@ dependencies {
 	implementation 'org.postgresql:postgresql:42.6.0'
 	testImplementation 'com.h2database:h2:2.1.214'
 
+	// Already on the runtime classpath via cardano-client-lib; declared here only so
+	// OracleFeedSignatureTest can verify the oracle's ed25519 signatures at compile time.
+	testImplementation 'org.bouncycastle:bcprov-jdk18on:1.78'
+
 	compileOnly 'com.bloxbean.cardano:cardano-client-annotation-processor:0.7.2'
 	annotationProcessor 'com.bloxbean.cardano:cardano-client-annotation-processor:0.7.2'
 
