@@ -59,10 +59,27 @@ public class FluidOracleClient {
     }
 
     /**
-     * Ada always prices 1:1 and needs no oracle — {@code retrieve_oracle_data} synthesises exactly
-     * that feed when the asset's policy id is empty. Any other asset needs a live entry.
+     * The price for an asset, or empty if there is none <em>or the one we hold is not usable at
+     * {@code atMillis}</em>.
+     * <p>
+     * Fail-closed on purpose. A liquidation decision taken on an expired price is worse than no
+     * decision: the validator would reject the transaction, and in the meantime we would have
+     * reported a loan as liquidatable on a price nobody stands behind. Expiry is real and routine
+     * — 3 of the 19 registry entries were expired the day this was written.
+     * <p>
+     * Ada always prices 1:1 and needs no oracle: {@code retrieve_oracle_data} synthesises exactly
+     * that feed when the asset's policy id is empty.
      */
-    public Optional<OraclePriceFeed> findFeed(AssetType asset) {
+    public Optional<OraclePriceFeed> findFeed(AssetType asset, long atMillis) {
+        return findFeedIgnoringValidity(asset).filter(feed -> feed.usableAt(atMillis));
+    }
+
+    /**
+     * The held feed whether or not it is still valid. Only for telling "we have no feed for this
+     * asset" apart from "the feed we have has expired" when explaining an unavailable health —
+     * never for pricing. Use {@link #findFeed(AssetType, long)} to price.
+     */
+    public Optional<OraclePriceFeed> findFeedIgnoringValidity(AssetType asset) {
         if (asset == null) {
             return Optional.empty();
         }
@@ -80,7 +97,10 @@ public class FluidOracleClient {
         return byAsset.get().size();
     }
 
-    /** The oracle validity window is ~10 minutes, so a 30s cadence is fresh enough and polite. */
+    /**
+     * Feeds carry a 50-minute window (10 for the Charli3-backed one) against a 60-minute protocol
+     * maximum, so a 30s cadence is fresh enough and polite.
+     */
     @Scheduled(fixedDelay = 30_000L, initialDelay = 30_000L)
     public void refresh() {
         try {
@@ -91,16 +111,22 @@ public class FluidOracleClient {
                 log.warn("FluidTokens oracle response was null or not an array");
                 return;
             }
-            var next = new HashMap<AssetType, OraclePriceFeed>();
-            body.forEach(entry -> parse(entry).ifPresent(p -> next.put(p.asset(), p.feed())));
-            byAsset.set(Map.copyOf(next));
-            lastRefresh.set(Instant.now());
-            log.debug("FluidTokens oracle refreshed: {} priced assets", next.size());
+            int count = load(body);
+            log.debug("FluidTokens oracle refreshed: {} priced assets", count);
         } catch (Exception e) {
             // transient failures self-heal on the next tick; one line, no stack trace
             log.warn("could not refresh the FluidTokens oracle ({}); retrying in 30s", e.toString());
             log.debug("oracle refresh failure", e);
         }
+    }
+
+    /** Replaces the held prices with whatever parses out of a registry payload. */
+    int load(JsonNode array) {
+        var next = new HashMap<AssetType, OraclePriceFeed>();
+        array.forEach(entry -> parse(entry).ifPresent(p -> next.put(p.asset(), p.feed())));
+        byAsset.set(Map.copyOf(next));
+        lastRefresh.set(Instant.now());
+        return next.size();
     }
 
     private record Priced(AssetType asset, OraclePriceFeed feed) {

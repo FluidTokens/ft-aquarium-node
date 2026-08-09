@@ -13,6 +13,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
+import java.time.Instant;
 import java.util.Optional;
 
 /**
@@ -54,11 +55,11 @@ public class LoanHealthService {
         }
 
         AssetType collateralAsset = collateralAsset(loan);
-        Optional<OraclePriceFeed> principalFeed = client.findFeed(datum.principalAsset());
-        Optional<OraclePriceFeed> collateralFeed = client.findFeed(collateralAsset);
+        Optional<OraclePriceFeed> principalFeed = client.findFeed(datum.principalAsset(), atTimeMillis);
+        Optional<OraclePriceFeed> collateralFeed = client.findFeed(collateralAsset, atTimeMillis);
         if (principalFeed.isEmpty() || collateralFeed.isEmpty()) {
             var missing = principalFeed.isEmpty() ? datum.principalAsset() : collateralAsset;
-            return LoanHealth.debtOnly(remainingDebt, late, "no oracle price for " + missing.toUnit());
+            return LoanHealth.debtOnly(remainingDebt, late, unpriceableReason(client, missing));
         }
 
         try {
@@ -76,6 +77,18 @@ public class LoanHealthService {
             log.debug("could not price {}: {}", loan.utxoRef(), e.getMessage());
             return LoanHealth.debtOnly(remainingDebt, late, e.getMessage());
         }
+    }
+
+    /**
+     * "We have never heard of this asset" and "our price for it went stale" are different
+     * operational problems — the first is a coverage gap to raise with FluidTokens, the second
+     * usually fixes itself on the next refresh — so they must not read the same in the API.
+     */
+    private static String unpriceableReason(FluidOracleClient client, AssetType asset) {
+        return client.findFeedIgnoringValidity(asset)
+                .map(feed -> "oracle price for %s expired at %s"
+                        .formatted(asset.toUnit(), Instant.ofEpochMilli(feed.validTo())))
+                .orElseGet(() -> "no oracle price for " + asset.toUnit());
     }
 
     /**
