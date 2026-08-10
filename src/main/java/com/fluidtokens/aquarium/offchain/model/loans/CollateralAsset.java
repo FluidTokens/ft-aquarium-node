@@ -27,6 +27,26 @@ public record CollateralAsset(String policyId,
         return assetName.map(name -> policyId + name);
     }
 
+    /**
+     * The collateral as an {@link AssetType}, for pricing and for reading quantities out of a UTxO.
+     * <p>
+     * An empty policy id means <b>ada</b>, and that is not a special case we invented: it is the
+     * {@code expectedTokenPolicyId == ""} branch of {@code retrieve_oracle_data}, which returns a
+     * synthesised 1:1 feed without consulting any oracle. Building
+     * {@code new AssetType(policyId, name)} directly instead yields {@code ("", "")}, which is not
+     * the ada this codebase spells {@code ("lovelace", "")} — so the loan silently loses its price.
+     * <p>
+     * A collection (no asset name) keeps the empty name: the oracle prices the policy.
+     */
+    public AssetType assetType() {
+        return policyId.isEmpty() ? AssetType.ada() : new AssetType(policyId, assetName.orElse(""));
+    }
+
+    /** Whether the collateral is ada rather than a token. */
+    public boolean isAda() {
+        return policyId.isEmpty();
+    }
+
     public boolean usesOracle() {
         return !(NO_ORACLE_SENTINEL_HEX.equalsIgnoreCase(oracleTokenAsset.policyId())
                 && NO_ORACLE_SENTINEL_HEX.equalsIgnoreCase(oracleTokenAsset.assetName()));

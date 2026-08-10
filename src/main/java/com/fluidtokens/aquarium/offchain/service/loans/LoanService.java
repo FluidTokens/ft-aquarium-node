@@ -107,8 +107,16 @@ public class LoanService {
     /**
      * {@code finance.get_collateral_amount}: a named collateral is that one asset's quantity,
      * while a collection (no asset name) is the sum across the whole policy.
+     * <p>
+     * Ada collateral is the empty policy id, and on chain
+     * {@code quantity_of(value, "", "")} is the <em>lovelace</em> quantity. Matching a unit
+     * literally named {@code ""} instead finds nothing and reports zero collateral, which reads
+     * as a fully undercollateralised loan.
      */
     private static BigInteger collateralAmount(Utxo utxo, CollateralAsset collateral) {
+        if (collateral.isAda()) {
+            return quantityOf(utxo, AssetType.LOVELACE);
+        }
         return collateral.assetName()
                 .map(name -> quantityOf(utxo, collateral.policyId() + name))
                 .orElseGet(() -> utxo.getAmount().stream()

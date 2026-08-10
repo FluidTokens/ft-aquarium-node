@@ -54,7 +54,7 @@ public class LoanHealthService {
             return LoanHealth.debtOnly(remainingDebt, late, "oracle client disabled");
         }
 
-        AssetType collateralAsset = collateralAsset(loan);
+        AssetType collateralAsset = loan.datum().collateral().assetType();
         Optional<OraclePriceFeed> principalFeed = client.findFeed(datum.principalAsset(), atTimeMillis);
         Optional<OraclePriceFeed> collateralFeed = client.findFeed(collateralAsset, atTimeMillis);
         if (principalFeed.isEmpty() || collateralFeed.isEmpty()) {
@@ -91,15 +91,4 @@ public class LoanHealthService {
                 .orElseGet(() -> "no oracle price for " + asset.toUnit());
     }
 
-    /**
-     * {@code get_collateral_amount} treats a collection (no asset name) as the sum across the
-     * policy; the named case is a single asset. {@link Loan#collateralAmount()} already carries
-     * the quantity, so this only resolves which asset to price.
-     */
-    private static AssetType collateralAsset(Loan loan) {
-        var collateral = loan.datum().collateral();
-        return collateral.assetName()
-                .map(name -> new AssetType(collateral.policyId(), name))
-                .orElseGet(() -> new AssetType(collateral.policyId(), ""));
-    }
 }
