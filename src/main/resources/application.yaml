@@ -1,4 +1,13 @@
 spring:
+  task:
+    scheduling:
+      # Spring's default is a single scheduler thread, shared by the transaction processor and the
+      # oracle refresh. The processor builds and submits transactions, so it can occupy that thread
+      # for minutes — during which the 30s oracle refresh never runs and every price silently ages
+      # past its validity window. Observed: feeds lagging several minutes past expiry, blanking the
+      # health of every loan exactly while transactions were being processed.
+      pool:
+        size: ${SPRING_TASK_SCHEDULING_POOL_SIZE:4}
   flyway:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/aquarium}
     user: ${DB_USERNAME:fluidtokens}

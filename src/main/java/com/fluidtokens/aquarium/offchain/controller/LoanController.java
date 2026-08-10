@@ -6,10 +6,13 @@ import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
 import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanHealth;
+import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
+import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -17,7 +20,9 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -39,6 +44,77 @@ public class LoanController {
     private final LoanService loanService;
 
     private final LoanHealthService loanHealthService;
+
+    private final ObjectProvider<FluidOracleClient> oracleClient;
+
+    /**
+     * One oracle's freshness. {@code usable_now} is the question that matters: a feed can be
+     * present and recently fetched and still be unusable, because the validity window it carries
+     * has passed.
+     */
+    @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+    public record OracleFeedView(String token,
+                                 String oracleToken,
+                                 String variant,
+                                 BigInteger priceInLovelaces,
+                                 BigInteger priceDenominator,
+                                 String validFrom,
+                                 String validTo,
+                                 boolean usableNow,
+                                 int signatures,
+                                 int threshold,
+                                 boolean usableForLiquidation) {
+    }
+
+    @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+    public record OracleStatusView(String lastRefresh,
+                                   long secondsSinceRefresh,
+                                   int trackedAssets,
+                                   int usableNow,
+                                   List<OracleFeedView> feeds) {
+    }
+
+    /**
+     * Why health is or is not available, without having to infer it from null LTVs.
+     * <p>
+     * A stale oracle looks exactly like a healthy one from {@code /loans} — every priced field
+     * simply turns null — so the difference between "no feed for this asset" and "the scheduler
+     * has not refreshed in four minutes" needs somewhere to show.
+     */
+    @GetMapping("/oracle")
+    public OracleStatusView oracle() {
+        var client = oracleClient.getIfAvailable();
+        if (client == null) {
+            return new OracleStatusView(null, -1, 0, 0, List.of());
+        }
+        long now = System.currentTimeMillis();
+        var feeds = client.entries().stream()
+                .map(entry -> toView(entry, now))
+                .sorted(Comparator.comparing(OracleFeedView::token))
+                .toList();
+        return new OracleStatusView(
+                client.lastRefresh().toString(),
+                Duration.between(client.lastRefresh(), Instant.now()).toSeconds(),
+                client.trackedAssets(),
+                (int) feeds.stream().filter(OracleFeedView::usableNow).count(),
+                feeds);
+    }
+
+    private static OracleFeedView toView(OracleEntry entry, long now) {
+        var feed = entry.feed();
+        return new OracleFeedView(
+                entry.token().toUnit(),
+                entry.oracleToken().toUnit(),
+                feed.variant().name(),
+                feed.priceInLovelaces(),
+                feed.priceDenominator(),
+                Instant.ofEpochMilli(feed.validFrom()).toString(),
+                Instant.ofEpochMilli(feed.validTo()).toString(),
+                feed.usableAt(now),
+                entry.signatures().size(),
+                entry.threshold(),
+                entry.usableForLiquidation());
+    }
 
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record AssetAmount(String unit, BigInteger amount) {
