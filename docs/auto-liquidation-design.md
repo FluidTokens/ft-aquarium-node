@@ -458,6 +458,38 @@ sign.** That is the Phase 3 blocker on preview, and it has exactly two exits:
 
 (1) is worth asking for before committing to (2).
 
+### 6.8 There is a price blackout every 5 minutes, and it is upstream
+
+Measured over two full cycles with `GET /loans/oracle`:
+
+```
+21:19:26  refresh age 28s   usable 0/5   <- window expired 21:19:24
+21:20:26  refresh age 58s   usable 0/5
+21:20:46  refresh age  8s   usable 3/5   <- recovered, ~80s dark
+21:24:28  refresh age 13s   usable 0/5   <- window expired 21:24:24
+21:24:48  refresh age  3s   usable 0/5
+```
+
+**The `age 3s` line is the one that matters.** We had refreshed three seconds earlier
+and still held no valid feed, so the registry itself was serving an already-expired
+window 21 seconds after its own `validTo`. The next window is published roughly a minute
+*after* the previous one lapses, leaving a real hole in which no valid price exists
+anywhere — not one we can close by polling harder.
+
+This **falsifies the scheduler-starvation theory** that motivated the thread-pool change.
+Refresh age sat between 1s and 29s for the whole run, exactly as a 30s `fixedDelay`
+predicts. The pool change remains reasonable hygiene — one scheduler thread shared with
+the transaction processor is still a latent hazard — but it did not fix this and was not
+the cause. One 70s stretch showed no successful refresh (age climbing 28→38→58), which is
+most likely a failed call at the boundary, since `refresh()` only advances `lastRefresh`
+on success. That single stretch is unexplained.
+
+**Consequence for Phase 3.** Roughly 20% of the time there is no usable price, so the bot
+must expect to find nothing and retry rather than treat it as an outage. More sharply: a
+transaction built close to a boundary can have its validity range fall outside the feed's
+window and be rejected, so the builder should check the remaining window before
+submitting rather than only at decision time.
+
 ---
 
 ## 7. Variant selection (decision tree)
