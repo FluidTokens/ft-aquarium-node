@@ -430,10 +430,33 @@ oracle NFT `9a2ec5c9…000de1406f766f3633` that those loan datums name. Preview 
 therefore fully computable, where the mainnet registry left LTV permanently unavailable.
 
 The sting: **tFLDT is Charli3-backed**, so those loans are priceable but not liquidatable
-by us until `PriceDataCharlie` is modelled. The only preview oracle that could sign a
-liquidation today is the `FLDTmultisig` test token, which publishes one key and one
-signature. Testing Phase 3 on preview therefore needs either a loan collateralised in
-that test token, or Charli3 support.
+by us until `PriceDataCharlie` is modelled.
+
+### 6.7 The signable preview feeds are dead (2026-08-10)
+
+The obvious workaround — get a loan collateralised in the `FLDTmultisig` test token,
+which is signed and resolves its key position cleanly — **does not work**. Only the three
+c3 feeds are actually being published:
+
+| feed | provider | last valid | state |
+|---|---|---|---|
+| tFLDT, NIGHT, OADA | c3 | rolling, 10 min window reissued every 5 min | live |
+| FLDTmultisig | multisig | 2026-06-08 | 63 days stale |
+| fGold | multisig | 2026-02-24 | 167 days stale |
+
+The validator requires the feed's window to contain the transaction's validity range, so
+a months-old feed cannot be used no matter how well-formed its signatures are. **Every
+oracle we could sign a redeemer with is stale, and every live oracle is one we cannot
+sign.** That is the Phase 3 blocker on preview, and it has exactly two exits:
+
+1. **Ask FluidTokens to resume publishing fresh multisig feeds on preview.** No new
+   contract modelling, and it makes end-to-end liquidation testable immediately.
+2. **Implement `PriceDataCharlie`.** Larger: the redeemer carries a
+   `provider_ref_input_index` into the transaction's own `reference_inputs`, so it can
+   only be set while building the transaction, and the validator checks the price against
+   the Charli3 datum rather than against signatures.
+
+(1) is worth asking for before committing to (2).
 
 ---
 
