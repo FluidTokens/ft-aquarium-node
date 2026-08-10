@@ -101,6 +101,10 @@ aquarium:
 
 loans:
   enabled: ${LOANS_ENABLED:true}
+  # FluidTokens runs a separate registry for preview. Unlike mainnet it prices tFLDT — the
+  # collateral on the loans we index — so health is fully computable here.
+  oracle:
+    url: ${LOANS_ORACLE_URL:https://testapi.fluidtokens.com/get-oracle-tokens}
   config:
     # Both config NFTs were minted in this single tx (block 4514052, slot 118496146).
     ref-utxo-tx-hash: 6de7b7ecc2c822526d08dc998731d9e133e13c80dea099fb87827336dca12094

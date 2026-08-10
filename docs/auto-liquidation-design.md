@@ -385,6 +385,56 @@ Note this is a *reporting* distinction, not a health one: `liquidatable` still a
 "would the chain permit this", which is true regardless of whether we can currently
 build the transaction. Phase 3 filters on `usableForLiquidation()`.
 
+### 6.5 `key_position` — resolved from the deployed script, 2026-08-10
+
+**`key_position` is the index of the signing key in the registry's published
+`publicKeys` order.** Read directly out of the deployed oracle script rather than
+inferred.
+
+The chain of evidence:
+
+1. The registry's `fluidOracle.rewardAddress` decodes to a script stake credential,
+   and that credential equals the `reference_script_hash` on the UTxO named by
+   `fluidOracle.referenceScript`. So the withdraw credential *is* the applied oracle
+   script.
+2. Fetching that script's CBOR (preview fGold,
+   `ca8bbb0abbc25278a27c6d5dba950cb33ce700c10a9a753b7a586e91`) shows the applied
+   parameters embedded verbatim. The `verification_keys` parameter appears as
+   `9f 5820 <k0> 5820 <k1> 5820 <k2> ff` — an indefinite-length list of three 32-byte
+   keys at uniform 34-byte spacing — **in exactly the order the API publishes them**.
+
+fGold is the useful case precisely because it has three keys; every other entry has one,
+where position 0 is true by construction.
+
+**Deriving the script hash does not work, and the reason is instructive.** 132 parameter
+combinations across both bundled blueprints all missed. Reading the deployed script
+showed why: `_oracle_asset_policy_id` / `_oracle_asset_asset_name` are the **priced
+token**, not the oracle NFT — the oracle NFT's policy id does not appear in the script
+at all. Even with that corrected, derivation still misses, because `charlie_specs` and
+`orcfax_specs` are not empty and their contents are not published. So the script hash
+cannot currently be reproduced offline; reading the deployed script is the only route.
+
+**Consequence for the parser.** Preview omits `multisigOracle.publicKeys` on some
+entries while still publishing signatures (fGold). The signature array order is *not* a
+safe substitute for the key list — a partial signer set would shift every index — so
+those entries stay priceable and report `usableForLiquidation() = false` rather than
+guessing a position. Guessing wrong fails the entire transaction, since the validator
+`expect`s every supplied signature to verify at its stated position.
+
+### 6.6 The preview registry — it exists
+
+`https://testapi.fluidtokens.com/get-oracle-tokens`, wired in under the `preview`
+profile. Five entries, and crucially it **prices tFLDT**
+(`0b77d150…0014df1074464c4454`) — the collateral on every loan we index — with the
+oracle NFT `9a2ec5c9…000de1406f766f3633` that those loan datums name. Preview health is
+therefore fully computable, where the mainnet registry left LTV permanently unavailable.
+
+The sting: **tFLDT is Charli3-backed**, so those loans are priceable but not liquidatable
+by us until `PriceDataCharlie` is modelled. The only preview oracle that could sign a
+liquidation today is the `FLDTmultisig` test token, which publishes one key and one
+signature. Testing Phase 3 on preview therefore needs either a loan collateralised in
+that test token, or Charli3 support.
+
 ---
 
 ## 7. Variant selection (decision tree)

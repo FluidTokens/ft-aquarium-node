@@ -232,16 +232,33 @@ public class FluidOracleClient {
      * wrong position fails the entire transaction instead of merely being ignored.
      */
     private List<OracleSignature> signatures(JsonNode supported, List<String> keys, AssetType asset) {
+        JsonNode published = supported.path("multisigOracle").path("signatures");
+        if (!published.isArray() || published.isEmpty()) {
+            return List.of();
+        }
+        if (keys.isEmpty()) {
+            // The preview registry omits multisigOracle.publicKeys on some entries. Without it there
+            // is no way to say which position a key occupies, and the array order is not a safe
+            // substitute — a partial signer set would shift every index. Refuse rather than guess:
+            // the validator expects each supplied signature to verify at its stated position.
+            log.warn("oracle {} publishes {} signature(s) but no publicKeys; cannot resolve key positions, "
+                    + "so it stays priceable but not liquidatable", asset.toUnit(), published.size());
+            return List.of();
+        }
         var out = new ArrayList<OracleSignature>();
-        for (JsonNode signature : supported.path("multisigOracle").path("signatures")) {
+        var unresolved = new ArrayList<String>();
+        for (JsonNode signature : published) {
             var publicKey = signature.path("publicKey").asText("");
             int position = indexOfIgnoringCase(keys, publicKey);
             if (position < 0) {
-                log.warn("oracle {} published a signature from key {} that is not in its publicKeys; dropping it",
-                        asset.toUnit(), publicKey);
+                unresolved.add(publicKey);
                 continue;
             }
             out.add(new OracleSignature(position, signature.path("signature").asText("")));
+        }
+        if (!unresolved.isEmpty()) {
+            log.warn("oracle {} published signatures from keys outside its publicKeys {}; dropping them",
+                    asset.toUnit(), unresolved);
         }
         return out;
     }
