@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 /**
  * Polls the FluidTokens oracle registry for the prices the health-factor engine needs.
@@ -40,6 +41,9 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@code multisigOracle.signatures[]}, which is what a liquidation transaction needs for its
  * {@code OracleRedeemer}, and this client deliberately ignores it: reading a price is a
  * read-only concern, submitting a signed feed is not. Phase 2 adds a separate client for that.
+ * Charli3-backed ({@code c3}) entries are the exception: they carry no signature to defer, so this
+ * client captures their {@code supportedOracle.c3.referenceInput} directly, as
+ * {@link OracleEntry#charlieProviderReferenceInput()}.
  * <p>
  * <b>Network caveat:</b> this endpoint serves <em>mainnet</em> assets. On preview most loan
  * collaterals will simply have no feed, and callers must treat a missing feed as "health
@@ -207,6 +211,9 @@ public class FluidOracleClient {
             var rewardAddress = oracle.path("rewardAddress").asText("");
             var keys = textList(entry.path("multisigOracle").path("publicKeys"));
 
+            var charlieProviderReferenceInput = "c3".equals(preferred)
+                    ? utxoRef(supported.path("referenceInput").asText("")) : null;
+
             return Optional.of(new OracleEntry(
                     asset,
                     oracleToken,
@@ -217,7 +224,8 @@ public class FluidOracleClient {
                     keys,
                     entry.path("multisigOracle").path("requiredSignatures").asInt(0),
                     feed,
-                    signatures(supported, keys, asset)));
+                    signatures(supported, keys, asset),
+                    charlieProviderReferenceInput));
         } catch (Exception e) {
             log.warn("could not parse a FluidTokens oracle entry: {}", e.toString());
             return Optional.empty();
@@ -278,16 +286,35 @@ public class FluidOracleClient {
         return out;
     }
 
-    /** {@code "txhash#index"} as the registry publishes reference UTxOs. */
+    private static final Pattern TX_HASH = Pattern.compile("[0-9a-fA-F]{64}");
+
+    /**
+     * {@code "txhash#index"} as the registry publishes reference UTxOs.
+     * <p>
+     * Null on anything that is not a well-formed reference — a missing {@code #}, a transaction id
+     * that is not exactly 64 hex chars (32 bytes), or a non-numeric index — rather than throwing.
+     * {@code parse}'s single {@code catch} around a whole registry entry means a thrown exception
+     * here would discard every field of that entry, not just the malformed one, so callers rely on
+     * this returning null instead.
+     */
     static TransactionInput utxoRef(String ref) {
         int hash = ref.indexOf('#');
         if (hash < 0) {
             return null;
         }
-        return TransactionInput.builder()
-                .transactionId(ref.substring(0, hash))
-                .index(Integer.parseInt(ref.substring(hash + 1)))
-                .build();
+        String transactionId = ref.substring(0, hash);
+        if (!TX_HASH.matcher(transactionId).matches()) {
+            return null;
+        }
+        try {
+            int index = Integer.parseInt(ref.substring(hash + 1));
+            return TransactionInput.builder()
+                    .transactionId(transactionId)
+                    .index(index)
+                    .build();
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**

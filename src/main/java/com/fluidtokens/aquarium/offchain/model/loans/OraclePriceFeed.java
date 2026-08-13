@@ -48,9 +48,16 @@ public record OraclePriceFeed(Variant variant,
      * A Charli3-backed price. Numerically identical to {@link #aggregated}, but a different thing
      * on chain: {@code validators/oracle.ak} validates it against a Charli3 reference input rather
      * than against oracle signatures, and the redeemer carries a {@code provider_ref_input_index}
-     * that only means anything relative to a specific transaction. It is priceable for reporting
-     * and not yet buildable into a redeemer — hence the separate variant rather than pretending
-     * it is {@code Aggregated}.
+     * that only means anything relative to a specific transaction — hence the separate variant
+     * rather than pretending it is {@code Aggregated}.
+     * <p>
+     * c3 feeds are unsigned, and that has a real consequence for the window: {@code validFrom}/
+     * {@code validTo} on a signed feed come from a message someone actually signed, so no caller
+     * of this repo picks them freely — {@code FluidOracleClient} merely relays whatever the
+     * registry published. A c3 feed carries no such signature to relay, so at transaction-build
+     * time a builder (T-008) that needs a specific window is free to construct a fresh feed with
+     * one of its own choosing via this factory, rather than being bound to a previously observed
+     * window the way it would be for a signed variant.
      */
     public static OraclePriceFeed priceDataCharlie(AssetType token, BigInteger priceInLovelaces,
                                                    BigInteger priceDenominator, long validFrom, long validTo) {

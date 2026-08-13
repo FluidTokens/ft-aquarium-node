@@ -31,6 +31,12 @@ import java.util.List;
  *                        level; the registry sometimes reports a different number alongside the
  *                        feed, which is why {@link #signatures()} carries every published
  *                        signature rather than a threshold-sized subset.
+ * @param charlieProviderReferenceInput the Charli3 provider UTxO a {@code PRICE_DATA_CHARLIE}
+ *                        feed is validated against, from {@code supportedOracle.c3.referenceInput}.
+ *                        Null for every non-c3 entry, and null for a c3 entry whose registry node
+ *                        omits it. c3 feeds carry no signature over their own bytes — the validator
+ *                        checks them structurally against this reference input instead — so this,
+ *                        not a signature count, is what decides whether one is liquidatable.
  */
 public record OracleEntry(AssetType token,
                           AssetType oracleToken,
@@ -41,7 +47,8 @@ public record OracleEntry(AssetType token,
                           List<String> verificationKeys,
                           int threshold,
                           OraclePriceFeed feed,
-                          List<OracleSignature> signatures) {
+                          List<OracleSignature> signatures,
+                          TransactionInput charlieProviderReferenceInput) {
 
     public OracleEntry {
         verificationKeys = List.copyOf(verificationKeys);
@@ -59,14 +66,17 @@ public record OracleEntry(AssetType token,
     /**
      * Whether a liquidation could actually be built against this oracle today.
      * <p>
-     * A price is not sufficient. Charli3-backed feeds are validated against a reference input and
-     * carry a {@code provider_ref_input_index} we do not model, so they are reportable but not yet
-     * buildable — and saying so here is better than discovering it when a transaction is rejected.
+     * A price is not sufficient. {@code AGGREGATED}/{@code DEDICATED} feeds need enough resolved
+     * signatures; a {@code PRICE_DATA_CHARLIE} feed carries none at all — it is validated
+     * structurally against {@link #charlieProviderReferenceInput}, so it is usable exactly when
+     * that reference input is known. {@code PRICE_DATA_ORCFAX}/{@code POOLED} are not modelled and
+     * stay unusable.
      */
     public boolean usableForLiquidation() {
         return switch (feed.variant()) {
             case AGGREGATED, DEDICATED -> hasEnoughSignatures();
-            case PRICE_DATA_CHARLIE, PRICE_DATA_ORCFAX, POOLED -> false;
+            case PRICE_DATA_CHARLIE -> charlieProviderReferenceInput != null;
+            case PRICE_DATA_ORCFAX, POOLED -> false;
         };
     }
 }

@@ -8,6 +8,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;
+import java.math.BigInteger;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -156,13 +157,13 @@ class OracleEntryTest {
     /**
      * OADA is served by Charli3, and the difference is not cosmetic: there is no
      * {@code multisigOracle} to sign anything, and {@code validators/oracle.ak} checks a
-     * {@code PriceDataCharlie} redeemer against a Charli3 reference input using a
-     * {@code provider_ref_input_index} we do not model. It must be priceable for reporting and
-     * honestly unbuildable for liquidation — labelling it {@code Aggregated} would produce a
-     * redeemer that fails for want of signatures.
+     * {@code PriceDataCharlie} redeemer structurally against a Charli3 reference input instead —
+     * which the registry publishes at {@code supportedOracle.c3.referenceInput} and this entry
+     * captures as {@link OracleEntry#charlieProviderReferenceInput()}. That, not a signature count,
+     * is what makes it usable for liquidation.
      */
     @Test
-    void charli3BackedFeedsArePriceableButNotYetLiquidatable() throws Exception {
+    void charli3BackedFeedsAreUsableForLiquidationViaTheirReferenceInput() throws Exception {
         var oada = clientFromFixture()
                 .findEntry(new AssetType("f6099832f9563e4cf59602b3351c3c5a8a7dda2d44575ef69b82cf8d", ""))
                 .orElseThrow();
@@ -170,7 +171,202 @@ class OracleEntryTest {
         assertEquals(OraclePriceFeed.Variant.PRICE_DATA_CHARLIE, oada.feed().variant());
         assertTrue(oada.signatures().isEmpty(), "a c3 feed carries no signatures");
         assertFalse(oada.hasEnoughSignatures());
-        assertFalse(oada.usableForLiquidation(), "we cannot build a PriceDataCharlie redeemer yet");
-        assertNotNull(oada.feed().price(), "but it still has a usable price for reporting");
+        assertTrue(oada.usableForLiquidation(), "a c3 feed is validated against its reference input, not signatures");
+        assertNotNull(oada.feed().price(), "and it still has a usable price for reporting");
+
+        assertNotNull(oada.charlieProviderReferenceInput());
+        assertEquals("b9e73039012d9ce57ce92348e578b608d13a09aa6afd8c98cf7c4cf2d32f219f",
+                oada.charlieProviderReferenceInput().getTransactionId());
+        assertEquals(0, oada.charlieProviderReferenceInput().getIndex());
+    }
+
+    /**
+     * A c3 entry whose registry node omits {@code supportedOracle.c3.referenceInput} still parses
+     * and still prices — but must refuse to claim liquidatability, mirroring the missing-publicKeys
+     * rule for multisig feeds: guess and a real transaction is rejected with nothing to debug, so
+     * we say no here instead.
+     */
+    @Test
+    void aC3EntryWithoutAReferenceInputIsPriceableAndNotLiquidatable() throws Exception {
+        String json = """
+                [{
+                  "active": true,
+                  "preferredOracle": "c3",
+                  "token": { "policyId": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "assetName": "" },
+                  "fluidOracle": {
+                    "policyId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "assetName": "6f7261636c65",
+                    "rewardAddress": "stake1799y3huw4j0n4weehlx3t6xvst50ge0vuv32ghk50mm7hwg5ucz8p",
+                    "referenceInput": "aa00000000000000000000000000000000000000000000000000000000000000#0",
+                    "referenceScript": "bb00000000000000000000000000000000000000000000000000000000000000#0"
+                  },
+                  "supportedOracle": {
+                    "c3": {
+                      "validFrom": 1786000000000,
+                      "validTo": 1786000600000,
+                      "tokenPriceInLovelaces": 1,
+                      "tokenPriceDenominator": 1
+                    }
+                  }
+                }]
+                """;
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new ObjectMapper().readTree(json));
+        var entry = client.findEntry(
+                new AssetType("dddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "")).orElseThrow();
+
+        assertEquals(OraclePriceFeed.Variant.PRICE_DATA_CHARLIE, entry.feed().variant());
+        assertNotNull(entry.feed().price(), "still priceable without a reference input");
+        assertNull(entry.charlieProviderReferenceInput(), "the registry node omitted referenceInput");
+        assertFalse(entry.usableForLiquidation(), "refuse rather than guess at a missing reference input");
+    }
+
+    /**
+     * {@code parse} wraps the whole registry entry in one {@code catch(Exception)}, so a thrown
+     * exception from deep inside {@code utxoRef} would not just null the reference input — it would
+     * discard the entire entry, taking its price down with it. A malformed index (non-numeric) must
+     * therefore degrade to a null reference input, not vanish the asset.
+     */
+    @Test
+    void aC3EntryWithAMalformedIndexIsPriceableAndNotLiquidatable() throws Exception {
+        String json = """
+                [{
+                  "active": true,
+                  "preferredOracle": "c3",
+                  "token": { "policyId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "assetName": "" },
+                  "fluidOracle": {
+                    "policyId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "assetName": "6f7261636c65",
+                    "rewardAddress": "stake1799y3huw4j0n4weehlx3t6xvst50ge0vuv32ghk50mm7hwg5ucz8p",
+                    "referenceInput": "aa00000000000000000000000000000000000000000000000000000000000000#0",
+                    "referenceScript": "bb00000000000000000000000000000000000000000000000000000000000000#0"
+                  },
+                  "supportedOracle": {
+                    "c3": {
+                      "referenceInput": "aa00000000000000000000000000000000000000000000000000000000000000#abc",
+                      "validFrom": 1786000000000,
+                      "validTo": 1786000600000,
+                      "tokenPriceInLovelaces": 1,
+                      "tokenPriceDenominator": 1
+                    }
+                  }
+                }]
+                """;
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new ObjectMapper().readTree(json));
+        var entry = client.findEntry(
+                new AssetType("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", ""))
+                .orElseThrow(() -> new AssertionError(
+                        "a malformed c3 referenceInput must not discard the whole entry"));
+
+        assertEquals(OraclePriceFeed.Variant.PRICE_DATA_CHARLIE, entry.feed().variant());
+        assertNotNull(entry.feed().price(), "still priceable despite the malformed index");
+        assertNull(entry.charlieProviderReferenceInput(), "a non-numeric index cannot resolve to a UTxO");
+        assertFalse(entry.usableForLiquidation());
+    }
+
+    /**
+     * {@code "#0"} on its own has a well-formed index but an empty transaction id — not a real
+     * UTxO reference. Accepting it would make {@link OracleEntry#usableForLiquidation()} claim a
+     * reference input that resolves to nothing.
+     */
+    @Test
+    void aC3EntryWithAnEmptyTransactionIdIsPriceableAndNotLiquidatable() throws Exception {
+        String json = """
+                [{
+                  "active": true,
+                  "preferredOracle": "c3",
+                  "token": { "policyId": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "assetName": "" },
+                  "fluidOracle": {
+                    "policyId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "assetName": "6f7261636c65",
+                    "rewardAddress": "stake1799y3huw4j0n4weehlx3t6xvst50ge0vuv32ghk50mm7hwg5ucz8p",
+                    "referenceInput": "aa00000000000000000000000000000000000000000000000000000000000000#0",
+                    "referenceScript": "bb00000000000000000000000000000000000000000000000000000000000000#0"
+                  },
+                  "supportedOracle": {
+                    "c3": {
+                      "referenceInput": "#0",
+                      "validFrom": 1786000000000,
+                      "validTo": 1786000600000,
+                      "tokenPriceInLovelaces": 1,
+                      "tokenPriceDenominator": 1
+                    }
+                  }
+                }]
+                """;
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new ObjectMapper().readTree(json));
+        var entry = client.findEntry(
+                new AssetType("ffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "")).orElseThrow();
+
+        assertEquals(OraclePriceFeed.Variant.PRICE_DATA_CHARLIE, entry.feed().variant());
+        assertNotNull(entry.feed().price(), "still priceable despite the empty transaction id");
+        assertNull(entry.charlieProviderReferenceInput(), "an empty transaction id resolves to no UTxO");
+        assertFalse(entry.usableForLiquidation());
+    }
+
+    /**
+     * {@code POOLED} and {@code PRICE_DATA_ORCFAX} are not modelled at all — no converter, no
+     * signature scheme understood here — so they must stay unusable regardless of what else the
+     * entry carries. {@code POOLED.price()} throws, so this test must never call it.
+     */
+    @Test
+    void unmodelledVariantsAreNeverUsableForLiquidation() {
+        var token = new AssetType("11111111111111111111111111111111111111111111111111111111", "");
+        var pooled = new OracleEntry(token, token, "reward", "cred", null, null,
+                List.of(), 0,
+                new OraclePriceFeed(OraclePriceFeed.Variant.POOLED, token, BigInteger.ONE, BigInteger.ONE, 0L, 0L),
+                List.of(), null);
+        var orcfax = new OracleEntry(token, token, "reward", "cred", null, null,
+                List.of(), 0,
+                new OraclePriceFeed(OraclePriceFeed.Variant.PRICE_DATA_ORCFAX, token, BigInteger.ONE,
+                        BigInteger.ONE, 0L, 0L),
+                List.of(), null);
+
+        assertFalse(pooled.usableForLiquidation(), "Pooled feeds are not modelled and must stay unusable");
+        assertFalse(orcfax.usableForLiquidation(), "Orcfax feeds are not modelled and must stay unusable");
+    }
+
+    /**
+     * The {@code "c3".equals(preferred)} guard must be exact: a multisig-preferred entry that
+     * happens to also carry a {@code supportedOracle.multisig.referenceInput} field (not a real
+     * registry shape, but worth guarding against) must not have it picked up as a Charli3 reference
+     * input.
+     */
+    @Test
+    void aMultisigEntryNeverCapturesAReferenceInputAsCharlieS() throws Exception {
+        String json = """
+                [{
+                  "active": true,
+                  "preferredOracle": "multisig",
+                  "token": { "policyId": "22222222222222222222222222222222222222222222222222222222", "assetName": "" },
+                  "fluidOracle": {
+                    "policyId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "assetName": "6f7261636c65",
+                    "rewardAddress": "stake1799y3huw4j0n4weehlx3t6xvst50ge0vuv32ghk50mm7hwg5ucz8p",
+                    "referenceInput": "aa00000000000000000000000000000000000000000000000000000000000000#0",
+                    "referenceScript": "bb00000000000000000000000000000000000000000000000000000000000000#0"
+                  },
+                  "multisigOracle": { "publicKeys": [], "requiredSignatures": 1 },
+                  "supportedOracle": {
+                    "multisig": {
+                      "referenceInput": "cc00000000000000000000000000000000000000000000000000000000000000#0",
+                      "validFrom": 1786000000000,
+                      "validTo": 1786000600000,
+                      "tokenPriceInLovelaces": 1,
+                      "tokenPriceDenominator": 1
+                    }
+                  }
+                }]
+                """;
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new ObjectMapper().readTree(json));
+        var entry = client.findEntry(
+                new AssetType("22222222222222222222222222222222222222222222222222222222", "")).orElseThrow();
+
+        assertEquals(OraclePriceFeed.Variant.AGGREGATED, entry.feed().variant());
+        assertNull(entry.charlieProviderReferenceInput(),
+                "only a c3-preferred entry may capture a Charli3 reference input");
     }
 }

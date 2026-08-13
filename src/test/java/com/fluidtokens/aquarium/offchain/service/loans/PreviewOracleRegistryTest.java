@@ -57,17 +57,23 @@ class PreviewOracleRegistryTest {
     }
 
     /**
-     * And the sting: tFLDT is served by Charli3, so those loans are priceable but <em>not</em>
-     * liquidatable by us until {@code PriceDataCharlie} is modelled. Worth failing loudly if that
-     * ever changes, because it decides whether Phase 3 can be tested on preview at all.
+     * tFLDT is served by Charli3: a {@code PriceDataCharlie} feed carries no signature and is
+     * validated structurally against a Charli3 reference input instead — which the registry
+     * publishes and this entry captures, making it liquidation material despite having zero
+     * signatures. Worth failing loudly if that reference input ever stops resolving, because it
+     * decides whether Phase 3 can be tested on preview at all.
      */
     @Test
-    void theCollateralOurLoansUseIsCharli3BackedAndSoNotYetLiquidatable() throws Exception {
+    void theCollateralOurLoansUseIsCharli3BackedAndUsableForLiquidation() throws Exception {
         var entry = client().findEntry(TFLDT).orElseThrow();
 
         assertEquals(OraclePriceFeed.Variant.PRICE_DATA_CHARLIE, entry.feed().variant());
-        assertFalse(entry.usableForLiquidation(),
-                "if this starts passing, preview end-to-end liquidation just became possible");
+        assertTrue(entry.usableForLiquidation(),
+                "a c3 feed is validated against its reference input, not signatures");
+        assertNotNull(entry.charlieProviderReferenceInput());
+        assertEquals("a17501465ed79dbc6cb25e2e99edbc421b1baa9d100b6780da89770702b235a5",
+                entry.charlieProviderReferenceInput().getTransactionId());
+        assertEquals(0, entry.charlieProviderReferenceInput().getIndex());
     }
 
     /**

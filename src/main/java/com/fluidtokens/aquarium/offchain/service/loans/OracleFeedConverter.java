@@ -44,10 +44,45 @@ public final class OracleFeedConverter {
             case DEDICATED -> 2;
             // Pooled carries pool reserves and fees, Charlie/Orcfax carry reference-input indices
             // that only make sense against a specific transaction. None can be built from a price.
+            // PriceDataCharlie has its own overload below that takes the missing index; the others
+            // still have no way to be built from what we model.
             case POOLED, PRICE_DATA_CHARLIE, PRICE_DATA_ORCFAX -> throw new UnsupportedOperationException(
-                    "cannot encode a " + feed.variant() + " feed: its fields are not a plain price");
+                    "cannot encode a " + feed.variant() + " feed: its fields are not a plain price"
+                            + (feed.variant() == OraclePriceFeed.Variant.PRICE_DATA_CHARLIE
+                                    ? " — use toPlutusData(feed, providerRefInputIndex)" : ""));
         };
         return constr(alternative,
+                commonFeedData(feed),
+                BigIntPlutusData.of(feed.priceInLovelaces()),
+                BigIntPlutusData.of(feed.priceDenominator()));
+    }
+
+    /**
+     * {@code PriceDataCharlie { provider_ref_input_index: Int, common: CommonFeedData,
+     * price_in_lovelaces: Int, price_denominator: Int }} — constructor index 3.
+     * <p>
+     * Unlike the {@link #toPlutusData(OraclePriceFeed) signed variants}, a Charli3-backed feed
+     * carries no signature over its own bytes: {@code validators/oracle.ak} checks it structurally
+     * against the Charli3 provider UTxO named by {@code provider_ref_input_index}, so there is
+     * nothing here to sign and nothing this method validates about that index. It only encodes what
+     * it is given.
+     * <p>
+     * {@code provider_ref_input_index} is therefore the caller's responsibility, not this feed's:
+     * it only means something relative to a specific transaction's reference inputs, which this
+     * class has no view of. Resolving the real index is T-008's job.
+     * <p>
+     * Because there is no signature, there is also no oracle-imposed validity window: the caller
+     * (T-008's transaction builder) picks {@code validFrom}/{@code validTo} itself by constructing
+     * the feed with {@link OraclePriceFeed#priceDataCharlie}; nothing extra is needed here.
+     */
+    public static PlutusData toPlutusData(OraclePriceFeed feed, long providerRefInputIndex) {
+        if (feed.variant() != OraclePriceFeed.Variant.PRICE_DATA_CHARLIE) {
+            throw new UnsupportedOperationException(
+                    "toPlutusData(feed, providerRefInputIndex) only encodes PRICE_DATA_CHARLIE, not "
+                            + feed.variant());
+        }
+        return constr(3,
+                BigIntPlutusData.of(BigInteger.valueOf(providerRefInputIndex)),
                 commonFeedData(feed),
                 BigIntPlutusData.of(feed.priceInLovelaces()),
                 BigIntPlutusData.of(feed.priceDenominator()));

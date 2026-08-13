@@ -69,20 +69,37 @@ class OracleStatusEndpointTest {
                 "windows must be reported even when they have passed — that is the diagnosis");
     }
 
-    /** Signature counts and liquidation-readiness travel with each feed, not just the price. */
+    /**
+     * Signature counts and liquidation-readiness travel with each feed, not just the price.
+     * <p>
+     * On preview that is now the FLDTmultisig {@code AGGREGATED} feed (a resolvable signature) plus
+     * the three {@code PRICE_DATA_CHARLIE} feeds (tFLDT, NIGHT, OADA — each carrying a Charli3
+     * reference input); fGold stays unusable because its signatures cannot be resolved to key
+     * positions.
+     */
     @Test
-    void reportsWhichFeedsCouldActuallySignALiquidation() throws Exception {
+    void reportsWhichFeedsAreUsableForLiquidation() throws Exception {
         var status = controllerWith(OracleClients.preview()).oracle();
 
         var signable = status.feeds().stream().filter(LoanController.OracleFeedView::usableForLiquidation).toList();
-        assertEquals(1, signable.size(), "only the FLDTmultisig test token publishes a resolvable key");
-        assertEquals(1, signable.getFirst().signatures());
-        assertEquals("AGGREGATED", signable.getFirst().variant());
+        assertEquals(4, signable.size(),
+                "FLDTmultisig (AGGREGATED) plus the three c3 feeds carrying a reference input");
 
-        assertTrue(status.feeds().stream()
-                        .filter(f -> "PRICE_DATA_CHARLIE".equals(f.variant()))
-                        .noneMatch(LoanController.OracleFeedView::usableForLiquidation),
-                "Charli3-backed feeds cannot be built into a redeemer yet");
+        var aggregated = signable.stream().filter(f -> "AGGREGATED".equals(f.variant())).toList();
+        assertEquals(1, aggregated.size(), "only the FLDTmultisig test token publishes a resolvable key");
+        assertEquals(1, aggregated.getFirst().signatures());
+
+        var charlie = signable.stream().filter(f -> "PRICE_DATA_CHARLIE".equals(f.variant())).toList();
+        assertEquals(3, charlie.size(), "tFLDT, NIGHT and OADA are all Charli3-backed on preview");
+        assertTrue(charlie.stream().allMatch(f -> f.signatures() == 0),
+                "c3 feeds are usable for liquidation with zero signatures");
+
+        var fgold = status.feeds().stream()
+                .filter(f -> f.token().startsWith("4f4e7bb17c0e7201cc82f0177ab22695fbcee2d99735d1c3fdc44eac")
+                        && f.token().endsWith("66476f6c64"))
+                .findFirst().orElseThrow();
+        assertFalse(fgold.usableForLiquidation(),
+                "fGold publishes signatures with no publicKeys to resolve them against");
     }
 
     /** With the oracle disabled the endpoint must degrade, not throw. */
