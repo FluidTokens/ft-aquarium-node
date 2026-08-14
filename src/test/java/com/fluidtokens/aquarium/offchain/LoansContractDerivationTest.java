@@ -1,6 +1,10 @@
 package com.fluidtokens.aquarium.offchain;
 
+import com.bloxbean.cardano.client.plutus.spec.Language;
+import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
+import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import lombok.SneakyThrows;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -143,5 +147,49 @@ class LoansContractDerivationTest {
 
         assertNull(r.getPoolManagerPolicyId(), "poolManagerPolicyId without smart tokens");
         assertNull(r.getLmCompoundActionScriptHash(), "lmCompoundActionScriptHash without smart tokens");
+    }
+
+    /**
+     * The registry hands out applied {@code PlutusScript} objects for the seven validators a T-008
+     * {@code Liquidate} transaction invokes, so the bot can put the script bytes in the witness set
+     * when no reference script is published.
+     * <p>
+     * A script whose hash is not the one derived above would be attached to a transaction that
+     * spends real collateral and fail — or worse, be the <em>wrong</em> validator. The two are
+     * built from the same applied compiled code, and this is what proves it: every exposed script
+     * hashes back to its own published hash, and all of them are PlutusV3.
+     */
+    @Test
+    void everyExposedScriptHashesToItsDerivedHash() {
+        LoansContractRegistry r = registry(SMART_TOKENS_SPEND);
+
+        assertScript(r.getLoanScript(), r.getLoanPolicyId(), "loan.loan");
+        assertScript(r.getLoanSpendScript(), r.getLoanSpendScriptHash(), "loan general_spend");
+        assertScript(r.getLenderManagerScript(), r.getLenderManagerWithdrawScriptHash(),
+                "lender_manager.lenderManager");
+        assertScript(r.getLenderManagerSpendScript(), r.getLenderManagerSpendScriptHash(),
+                "lender_manager general_spend");
+        assertScript(r.getLoanClaimActionScript(), r.getLoanClaimActionScriptHash(),
+                "loan/loan_claim_action");
+        assertScript(r.getLmLiquidateActionScript(), r.getLmLiquidateActionScriptHash(),
+                "lender_manager/lm_liquidate_action");
+        assertScript(r.getAssetManagerScript(), r.getAssetManagerWithdrawScriptHash(),
+                "asset_manager.assetManager");
+    }
+
+    /** The scripts must also come up without smartTokensSpendScriptHash, like the hashes do. */
+    @Test
+    void exposesScriptsWithoutSmartTokens() {
+        LoansContractRegistry r = registry(null);
+
+        assertScript(r.getLoanScript(), r.getLoanPolicyId(), "loan.loan");
+        assertScript(r.getLmLiquidateActionScript(), r.getLmLiquidateActionScriptHash(),
+                "lender_manager/lm_liquidate_action");
+    }
+
+    @SneakyThrows
+    private static void assertScript(PlutusScript script, String expectedHash, String what) {
+        assertEquals(Language.PLUTUS_V3, script.getLanguage(), what + " plutus version");
+        assertEquals(expectedHash, HexUtil.encodeHexString(script.getScriptHash()), what + " script hash");
     }
 }

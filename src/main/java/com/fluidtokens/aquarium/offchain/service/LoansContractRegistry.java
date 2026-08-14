@@ -8,10 +8,12 @@ import com.bloxbean.cardano.client.plutus.spec.BytesPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
@@ -27,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 /**
@@ -115,6 +118,17 @@ public class LoansContractRegistry {
     private final String lmLiquidatePayInAdvanceAndCompoundActionScriptHash;
 
     private final Map<String, String> code;
+
+    /**
+     * The <em>applied</em> compiled code of every validator this registry derives, keyed by its
+     * script hash. Filled by {@link #derive}, so a script is retained exactly when its hash was
+     * derived — the two can never disagree.
+     */
+    @Getter(AccessLevel.NONE)
+    private final Map<String, String> appliedCompiledCode = new LinkedHashMap<>();
+
+    @Getter(AccessLevel.NONE)
+    private final Map<String, PlutusScript> scriptCache = new ConcurrentHashMap<>();
 
     @Autowired
     public LoansContractRegistry(AppConfig.LoansConfiguration cfg) {
@@ -285,6 +299,67 @@ public class LoansContractRegistry {
                 .toList();
     }
 
+    // ---- Applied scripts (witness attachment) --------------------------------------------
+    //
+    // A liquidation transaction has to put the actual script bytes somewhere: either the caller
+    // points at a published reference-script UTxO, or the script travels in the witness set. The
+    // getters below serve the second path. They are exactly the seven validators a T-008
+    // `Liquidate` transaction invokes — nothing else is exposed, because a script that is not
+    // invoked and still ends up in the witness set is an ExtraneousScriptWitness error.
+    //
+    // Every one of them is the same applied compiled code the hash above was taken from, so
+    // `script.getScriptHash()` is the matching `…ScriptHash`/`…PolicyId` by construction rather
+    // than by coincidence (asserted in LoansContractDerivationTest).
+
+    /** {@code loan.loan} — simultaneously the loan minting policy and the loan withdraw script. */
+    public PlutusScript getLoanScript() {
+        return scriptOf(loanPolicyId);
+    }
+
+    /** The loan {@code general_spend} wrapper — the spending validator loan UTxOs sit at. */
+    public PlutusScript getLoanSpendScript() {
+        return scriptOf(loanSpendScriptHash);
+    }
+
+    /** {@code lender_manager.lenderManager} — the LenderManager withdraw script. */
+    public PlutusScript getLenderManagerScript() {
+        return scriptOf(lenderManagerWithdrawScriptHash);
+    }
+
+    /** The LenderManager {@code general_spend} wrapper — where lender-bond UTxOs sit. */
+    public PlutusScript getLenderManagerSpendScript() {
+        return scriptOf(lenderManagerSpendScriptHash);
+    }
+
+    /** {@code loan/loan_claim_action} — the withdraw script that validates the claim numbers. */
+    public PlutusScript getLoanClaimActionScript() {
+        return scriptOf(loanClaimActionScriptHash);
+    }
+
+    /** {@code lender_manager/lm_liquidate_action} — the withdraw script for a plain liquidation. */
+    public PlutusScript getLmLiquidateActionScript() {
+        return scriptOf(lmLiquidateActionScriptHash);
+    }
+
+    /** {@code asset_manager.assetManager} — the withdraw script guarding the collateral outputs. */
+    public PlutusScript getAssetManagerScript() {
+        return scriptOf(assetManagerWithdrawScriptHash);
+    }
+
+    private PlutusScript scriptOf(String scriptHash) {
+        return scriptCache.computeIfAbsent(scriptHash, hash -> {
+            String applied = appliedCompiledCode.get(hash);
+            if (applied == null) {
+                throw new IllegalStateException("no applied compiled code retained for script hash " + hash);
+            }
+            try {
+                return PlutusBlueprintUtil.getPlutusScriptFromCompiledCode(applied, PlutusVersion.v3);
+            } catch (Exception e) {
+                throw new IllegalStateException("cannot build PlutusScript for " + hash, e);
+            }
+        });
+    }
+
     // ---- Derivation primitives ----------------------------------------------------------
 
     /**
@@ -305,7 +380,10 @@ public class LoansContractRegistry {
         for (PlutusData p : params) {
             list.add(p);
         }
-        return hashOf(AikenScriptUtil.applyParamToScript(list, unapplied));
+        String applied = AikenScriptUtil.applyParamToScript(list, unapplied);
+        String hash = hashOf(applied);
+        appliedCompiledCode.put(hash, applied);
+        return hash;
     }
 
     private static String hashOf(String compiledCode) {

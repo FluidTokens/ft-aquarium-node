@@ -1,0 +1,1384 @@
+package com.fluidtokens.aquarium.offchain.service.loans;
+
+import com.bloxbean.cardano.client.address.Address;
+import com.bloxbean.cardano.client.address.AddressProvider;
+import com.bloxbean.cardano.client.address.Credential;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.api.util.ValueUtil;
+import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
+import com.bloxbean.cardano.client.common.model.Network;
+import com.bloxbean.cardano.client.plutus.spec.BytesPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
+import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
+import com.bloxbean.cardano.client.quicktx.ScriptTx;
+import com.bloxbean.cardano.client.transaction.spec.Asset;
+import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.util.HexUtil;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
+import com.fluidtokens.aquarium.offchain.model.loans.AssetManagerDatumWithToken;
+import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
+import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
+import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
+import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
+import com.fluidtokens.aquarium.offchain.model.loans.Loan;
+import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
+import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.Rational;
+import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import org.cardanofoundation.conversions.CardanoConverters;
+
+import java.math.BigInteger;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
+import java.util.stream.Stream;
+
+/**
+ * Assembles the T-008 Phase-1 {@code Liquidate} transaction (design §8) from N already-assessed
+ * loans and the UTxOs the caller has resolved for them.
+ *
+ * <h2>What this class is, and is not</h2>
+ * It is <b>deterministic and network-free</b>: every input, output, reference input and index is
+ * computed from the arguments, the {@link LoansContractRegistry} derivation, and the caller's
+ * {@link UtxoSupplier}/{@link ProtocolParamsSupplier}. It never takes a {@code BackendService},
+ * never submits, and never signs.
+ * <p>
+ * It is <b>not</b> a health-factor engine. Every number that reaches a redeemer —
+ * {@code remainingDebt}, {@code equity}, {@code liquidationFee} — is copied verbatim from the
+ * {@link LiquidationAssessment} (findings §7 D8: those are bot-supplied inputs the validator
+ * checks, so recomputing them here and using the new value would be a silent divergence from what
+ * the scanner decided). {@link LoanFinance} is re-run only as a <em>guard</em> (V4 below): if the
+ * recomputation disagrees with the assessment, the batch is refused, never rewritten.
+ *
+ * <h2>Refusal is the default</h2>
+ * A wrongly built liquidation moves real value and burns an NFT. Every ambiguous case therefore
+ * throws {@link RefusedException} rather than producing a transaction. The named pre-flight
+ * checks are:
+ * <ul>
+ *   <li><b>V1</b> — the assessment must be {@link LiquidationAssessment#buildable()}.</li>
+ *   <li><b>V2</b> — {@code remainingDebt > 0}, {@code equity >= 0}, and
+ *       {@code collateralAmount - equity - liquidationFee >= 0}; a negative payout is
+ *       chain-unsatisfiable.</li>
+ *   <li><b>V3</b> — every non-unit feed must satisfy {@link OraclePriceFeed#usableOver} for the
+ *       <em>whole</em> transaction window (never {@code usableAt}: the chain checks containment of
+ *       the interval, not of an instant), with at least the caller's margin of window left after
+ *       {@code validTo}.</li>
+ *   <li><b>V4</b> — {@code LoanFinance.remainingDebt} must equal the assessment's number at both
+ *       ends of the window, and {@code late || can_liquidate} must hold at both ends. The chain's
+ *       evaluation bound is not knowable off chain, so invariance across the interval is demanded
+ *       rather than agreement at one point.</li>
+ *   <li><b>V5</b> — structural assertions re-read off the <em>built</em> transaction body: index
+ *       uniqueness and counts (D5), byte-identical bond echo (D6), asset-manager output shape
+ *       (D7), and that every index in every redeemer points at what it claims.</li>
+ *   <li><b>V6</b> — modelling gaps that must never be guessed at: a Charli3 feed with no provider
+ *       reference input, a {@code Pooled}/{@code Orcfax} feed, a pointer stake credential, and
+ *       {@code repaymentReceipts} together with a non-zero equity (the receipt NFT mint is not
+ *       modelled anywhere in this repo).</li>
+ * </ul>
+ *
+ * <h2>Index resolution</h2>
+ * Cardano orders transaction inputs and reference inputs canonically by {@code (txHash, index)}
+ * before a script ever sees them, so every index is computed from the canonically sorted sets
+ * (the {@link TransactionInputComparator} / {@code resolveRefIndexes} pattern
+ * {@code ScheduledTransactionService} already uses), never from the order things were added.
+ * <p>
+ * Outputs keep body order, but the body is not only this builder's: cardano-client-lib prepends a
+ * dummy output whenever a transaction has withdrawals and appends the change output. So
+ * {@code lenderBondOutputIndex} is not predicted at all — the transaction is assembled twice, the
+ * first time only to observe where the bond echoes landed. V5 re-derives all of it from the
+ * finished body, and finds the asset-manager outputs by their datum rather than by an offset.
+ *
+ * <h2>Left for slice C (on-chain evaluation)</h2>
+ * Claims made here are structural, not validator-correctness. Three specific things are
+ * arbitrated by evaluating a real transaction, and are called out again at their use sites:
+ * {@code LoanMintRedeemer.isPoolOrigin}/{@code originWithdrawRedeemerIndex}, the two opaque
+ * asset-manager action byte strings, and the output layout above.
+ */
+@Slf4j
+public final class LiquidateTransactionBuilder {
+
+    /** The reason a batch was refused. Every value is produced by exactly one named check. */
+    public enum Refusal {
+        /** V1 — the scanner excluded this bond; only a buildable assessment may be built. */
+        NOT_BUILDABLE,
+        /** The caller handed an empty batch. */
+        EMPTY_BATCH,
+        /** Two entries in the batch share a loan id; the loan↔bond pairing would be ambiguous. */
+        DUPLICATE_LOAN,
+        /** The supplied UTxO is not the one the assessment was made against. */
+        UTXO_DOES_NOT_MATCH_ASSESSMENT,
+        /** The fee/collateral wallet UTxO must hold ada only and carry no datum or script. */
+        WALLET_UTXO_NOT_ADA_ONLY,
+        /** V2 — a loan with no debt left cannot be liquidated. */
+        NON_POSITIVE_REMAINING_DEBT,
+        /** V2 — negative equity would be an underpayment to the borrower, not a refund. */
+        NEGATIVE_EQUITY,
+        /** V2 — collateral cannot cover equity plus the liquidation fee. */
+        COLLATERAL_CANNOT_COVER_EQUITY_AND_FEE,
+        /** V2 — a negative fee is not a discount, it inflates the payout past the collateral. */
+        NEGATIVE_LIQUIDATION_FEE,
+        /** V4 — the fee in the assessment is not the one the bond's per-mille rate produces. */
+        LIQUIDATION_FEE_NOT_REPRODUCIBLE,
+        /** V4 — the equity in the assessment is not the one the loan and the feeds produce. */
+        EQUITY_NOT_REPRODUCIBLE,
+        /** No oracle entry was supplied for a non-ada leg. */
+        ORACLE_ENTRY_MISSING,
+        /**
+         * The oracle validator <em>is</em> in the bundled blueprint
+         * ({@code oracle.oracle}, unapplied hash {@code 642597518a03f07dabc45af7bd6658622fc6c27254ec67c18984c7c0}),
+         * but it takes eight parameters — {@code verification_keys}, {@code threshold},
+         * {@code charlie_specs}, {@code orcfax_specs} and the asset identifiers — whose deployed
+         * values FluidTokens does not publish. Without them the applied script cannot be
+         * reconstructed, and the unapplied one hashes to a different credential than the withdrawal
+         * is made from. So there is no witness fallback for an oracle, only its published reference
+         * script.
+         */
+        ORACLE_REFERENCE_SCRIPT_MISSING,
+        /** The registry's reward address is not the one this network derives from its credential. */
+        ORACLE_REWARD_ADDRESS_MISMATCH,
+        /** V6 — a Charli3 feed is validated against a provider UTxO the registry did not publish. */
+        CHARLIE_PROVIDER_REFERENCE_INPUT_MISSING,
+        /** V6 — {@code Pooled} and {@code PriceDataOrcfax} feeds are not modelled. */
+        UNSUPPORTED_ORACLE_VARIANT,
+        /** V3 — the feed does not cover the whole transaction validity interval. */
+        ORACLE_FEED_NOT_USABLE_OVER_WINDOW,
+        /** V3 — too little of the feed's window is left after {@code validTo}. */
+        ORACLE_WINDOW_MARGIN_TOO_SMALL,
+        /** V4 — the debt is not the same at both ends of the window, or differs from the assessment. */
+        REMAINING_DEBT_NOT_INVARIANT,
+        /** V4 — D9's {@code late || can_liquidate} does not hold across the whole window. */
+        NOT_LIQUIDATABLE_OVER_WINDOW,
+        /** V4 — the finance re-computation raised an arithmetic failure the chain would too. */
+        HEALTH_NOT_COMPUTABLE,
+        /** V6 — a pointer stake credential cannot be turned into an output address here. */
+        POINTER_STAKE_CREDENTIAL,
+        /** The stake credential field is not an {@code Option<StakeCredential>}. */
+        UNDECODABLE_STAKE_CREDENTIAL,
+        /** V6 — a repayment-receipt NFT would have to be minted, and that mint is not modelled. */
+        REPAYMENT_RECEIPTS_WITH_EQUITY,
+        /** D6 needs the bond datum echoed byte for byte; this one does not survive a round trip. */
+        BOND_DATUM_NOT_BYTE_IDENTICAL,
+        /** The requested window does not contain at least one whole slot. */
+        VALIDITY_WINDOW_INVALID,
+        /** V5 — the finished body does not match what the redeemers claim about it. */
+        STRUCTURAL_ASSERTION_FAILED,
+        /** cardano-client-lib could not balance or assemble the transaction. */
+        TRANSACTION_NOT_BUILDABLE
+    }
+
+    /** Thrown instead of returning a transaction whose correctness is not certain. */
+    @Getter
+    public static final class RefusedException extends RuntimeException {
+
+        private final Refusal reason;
+
+        RefusedException(Refusal reason, String detail) {
+            super(reason + ": " + detail);
+            this.reason = reason;
+        }
+
+        RefusedException(Refusal reason, String detail, Throwable cause) {
+            super(reason + ": " + detail, cause);
+            this.reason = reason;
+        }
+    }
+
+    /**
+     * One loan to liquidate: the scanner's verdict plus the two UTxOs that will be spent for it.
+     *
+     * @param assessment must be {@link LiquidationAssessment#buildable()}; its numbers are what the
+     *                   redeemers carry
+     * @param loanUtxo   the loan UTxO named by {@code assessment.loan()}
+     * @param bondUtxo   the lender-bond UTxO named by {@code assessment.bond()}
+     */
+    public record LoanLiquidation(LiquidationAssessment assessment, Utxo loanUtxo, Utxo bondUtxo) {
+    }
+
+    /**
+     * Published reference-script UTxOs, one per invoked validator. A {@code null} field means "not
+     * published — carry this script in the witness set instead". Both paths are supported because
+     * FluidTokens has not confirmed the v4 reference-script coordinates (design §10) and a bot that
+     * can only do one of the two cannot run until they do.
+     *
+     * @param assetManager the asset-manager script is <em>not</em> invoked by a plain
+     *                     {@code Liquidate} — it only guards the outputs — so this is accepted (it
+     *                     is listed in design §8) and referenced for fee accuracy, never attached
+     */
+    public record ReferenceScripts(TransactionInput loan,
+                                   TransactionInput loanSpend,
+                                   TransactionInput lenderManager,
+                                   TransactionInput lenderManagerSpend,
+                                   TransactionInput loanClaimAction,
+                                   TransactionInput lmLiquidateAction,
+                                   TransactionInput assetManager) {
+
+        /** Nothing published: every script travels in the witness set. */
+        public static ReferenceScripts none() {
+            return new ReferenceScripts(null, null, null, null, null, null, null);
+        }
+    }
+
+    /**
+     * Everything one {@code Liquidate} transaction needs. Nothing here is looked up: the caller
+     * (T-009's scheduler) resolves it all, which is what keeps this class deterministic.
+     *
+     * @param oraclesByOracleTokenUnit  keyed by {@link OracleEntry#oracleToken()}{@code .toUnit()},
+     *                                  because that — not the priced asset — is what a loan datum
+     *                                  points at and what {@code retrieve_oracle_data} matches the
+     *                                  reference input against
+     * @param walletUtxo                an ada-only bot UTxO, for fees and to carry the fee slice of
+     *                                  the collateral out as change
+     * @param oracleWindowMarginMillis  how much of each feed's window must still be unused after
+     *                                  {@code validToMillis}; the caller owns this policy, this
+     *                                  class only enforces it
+     */
+    public record Request(List<LoanLiquidation> liquidations,
+                          Utxo configUtxo,
+                          Utxo lmConfigUtxo,
+                          Map<String, OracleEntry> oraclesByOracleTokenUnit,
+                          Utxo walletUtxo,
+                          String changeAddress,
+                          long validFromMillis,
+                          long validToMillis,
+                          long oracleWindowMarginMillis,
+                          ReferenceScripts referenceScripts) {
+    }
+
+    /** The unit redeemer {@code Constr 0 []} the {@code general_spend} handlers take. */
+    static final PlutusData GENERAL_SPEND_REDEEMER =
+            ConstrPlutusData.builder().alternative(0).data(ListPlutusData.of()).build();
+
+    private final LoansContractRegistry registry;
+    private final Network network;
+    private final CardanoConverters converters;
+    private final UtxoSupplier utxoSupplier;
+    private final ProtocolParamsSupplier protocolParamsSupplier;
+
+    public LiquidateTransactionBuilder(LoansContractRegistry registry,
+                                       Network network,
+                                       CardanoConverters converters,
+                                       UtxoSupplier utxoSupplier,
+                                       ProtocolParamsSupplier protocolParamsSupplier) {
+        this.registry = Objects.requireNonNull(registry, "registry");
+        this.network = Objects.requireNonNull(network, "network");
+        this.converters = Objects.requireNonNull(converters, "converters");
+        this.utxoSupplier = Objects.requireNonNull(utxoSupplier, "utxoSupplier");
+        this.protocolParamsSupplier = Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
+    }
+
+    // ---- the one entry point ---------------------------------------------------------------
+
+    /**
+     * Builds the unsigned {@code Liquidate} transaction for this batch, or refuses.
+     *
+     * @throws RefusedException whenever anything about the batch is not certain
+     */
+    public Transaction build(Request request) {
+        checkRequestShape(request);
+
+        long validFrom = request.validFromMillis();
+        long validTo = request.validToMillis();
+
+        // Pass 1 — vet every loan on its own. Nothing about the transaction shape yet.
+        List<VettedLoan> vetted = new ArrayList<>();
+        for (LoanLiquidation liquidation : request.liquidations()) {
+            vetted.add(vet(liquidation, request, validFrom, validTo));
+        }
+
+        // Pass 2 — canonical ordering. The loan inputs sorted alone are in the same relative order
+        // as they will be inside the ledger's sorted input list, so filtering that list by the loan
+        // credential yields exactly this sequence.
+        List<VettedLoan> loanOrder = vetted.stream()
+                .sorted(Comparator.comparing(v -> inputOf(v.loanUtxo()), new TransactionInputComparator()))
+                .toList();
+        List<VettedLoan> bondOrder = vetted.stream()
+                .sorted(Comparator.comparing(v -> inputOf(v.bondUtxo()), new TransactionInputComparator()))
+                .toList();
+        List<Long> lenderBondInputIndexes = loanOrder.stream()
+                .map(v -> (long) bondOrder.indexOf(v))
+                .toList();
+
+        // Pass 3 — reference inputs, again canonically ordered before any index is read off them.
+        List<OracleEntry> oracles = distinctOracles(loanOrder);
+        List<TransactionInput> refInputs = referenceInputs(request, oracles);
+
+        int configRefIndex = refIndex(refInputs, inputOf(request.configUtxo()), "main config");
+        int lmConfigRefIndex = refIndex(refInputs, inputOf(request.lmConfigUtxo()), "lm config");
+
+        // Pass 4 — the output indexes, taken off a finished body rather than predicted.
+        //
+        // This builder controls the order it adds outputs in, but not where they end up:
+        // cardano-client-lib prepends a dummy output of its own whenever a transaction has
+        // withdrawals (to trigger input selection) and appends the change output. Rather than
+        // encode that offset — a library implementation detail that could move under us and would
+        // silently mis-aim `lenderBondOutputIndex` at real money if it did — the transaction is
+        // assembled once with placeholder indexes purely to observe the layout, the real indexes
+        // are read off that body, and it is assembled again. Redeemer integers do not change the
+        // number or order of outputs, so the second body has the layout the first one showed.
+        List<Long> placeholders = LongStream.range(0, loanOrder.size()).boxed().toList();
+        Transaction probe = complete(request, assemble(request, loanOrder, bondOrder,
+                claims(loanOrder, refInputs, placeholders), lenderBondInputIndexes, oracles, refInputs,
+                configRefIndex, lmConfigRefIndex));
+
+        List<Long> bondOutputIndexes = locateBondOutputs(probe, loanOrder);
+        List<ClaimData> claims = claims(loanOrder, refInputs, bondOutputIndexes);
+
+        Transaction transaction = complete(request, assemble(request, loanOrder, bondOrder, claims,
+                lenderBondInputIndexes, oracles, refInputs, configRefIndex, lmConfigRefIndex));
+
+        // V5 — everything above is re-derived from the finished body and compared.
+        assertStructure(transaction, request, loanOrder, bondOrder, claims, lenderBondInputIndexes,
+                refInputs, configRefIndex, lmConfigRefIndex, oracles);
+
+        return transaction;
+    }
+
+    /** One {@link ClaimData} per loan, in final loan-input order. */
+    private static List<ClaimData> claims(List<VettedLoan> loanOrder, List<TransactionInput> refInputs,
+                                          List<Long> bondOutputIndexes) {
+        List<ClaimData> claims = new ArrayList<>();
+        for (int i = 0; i < loanOrder.size(); i++) {
+            VettedLoan v = loanOrder.get(i);
+            claims.add(new ClaimData(
+                    v.liquidation(),
+                    BigInteger.valueOf(bondOutputIndexes.get(i)),
+                    BigInteger.valueOf(oracleRefIndex(refInputs, v.collateral())),
+                    BigInteger.valueOf(oracleRefIndex(refInputs, v.principal())),
+                    v.bond().datum().lenderAuth(),
+                    v.assessment().equity(),
+                    v.loan().loanId(),
+                    v.assessment().remainingDebt()));
+        }
+        return claims;
+    }
+
+    /**
+     * Where each loan's bond echo actually landed, matched on the three things D6 makes identical —
+     * address, datum bytes and value — with the bond NFT inside that value making the match unique
+     * even between two otherwise identical bonds.
+     */
+    private static List<Long> locateBondOutputs(Transaction probe, List<VettedLoan> loanOrder) {
+        List<TransactionOutput> outputs = probe.getBody().getOutputs();
+        List<Long> indexes = new ArrayList<>();
+        for (VettedLoan loan : loanOrder) {
+            List<Integer> matches = new ArrayList<>();
+            for (int i = 0; i < outputs.size(); i++) {
+                TransactionOutput output = outputs.get(i);
+                if (output.getAddress().equals(loan.bondUtxo().getAddress())
+                        && output.getInlineDatum() != null
+                        && output.getInlineDatum().serializeToHex()
+                        .equalsIgnoreCase(loan.bondUtxo().getInlineDatum())
+                        && sameValue(output, loan.bondUtxo())) {
+                    matches.add(i);
+                }
+            }
+            if (matches.size() != 1) {
+                throw refuse(Refusal.STRUCTURAL_ASSERTION_FAILED,
+                        "bond %s matches %d outputs, expected exactly one"
+                                .formatted(loan.bond().loanId(), matches.size()));
+            }
+            indexes.add(matches.getFirst().longValue());
+        }
+        return indexes;
+    }
+
+    // ---- request shape ---------------------------------------------------------------------
+
+    private static void checkRequestShape(Request request) {
+        Objects.requireNonNull(request, "request");
+        if (request.liquidations() == null || request.liquidations().isEmpty()) {
+            throw refuse(Refusal.EMPTY_BATCH, "no liquidations supplied");
+        }
+        Objects.requireNonNull(request.configUtxo(), "configUtxo");
+        Objects.requireNonNull(request.lmConfigUtxo(), "lmConfigUtxo");
+        Objects.requireNonNull(request.referenceScripts(), "referenceScripts");
+        if (request.changeAddress() == null || request.changeAddress().isBlank()) {
+            throw refuse(Refusal.TRANSACTION_NOT_BUILDABLE, "no change address");
+        }
+        if (request.oracleWindowMarginMillis() < 0) {
+            throw refuse(Refusal.ORACLE_WINDOW_MARGIN_TOO_SMALL,
+                    "a negative margin is not a policy: " + request.oracleWindowMarginMillis());
+        }
+        if (request.validToMillis() <= request.validFromMillis()) {
+            throw refuse(Refusal.VALIDITY_WINDOW_INVALID,
+                    "validTo %d must be after validFrom %d"
+                            .formatted(request.validToMillis(), request.validFromMillis()));
+        }
+
+        Utxo wallet = Objects.requireNonNull(request.walletUtxo(), "walletUtxo");
+        boolean adaOnly = wallet.getAmount() != null
+                && wallet.getAmount().size() == 1
+                && AssetType.LOVELACE.equals(wallet.getAmount().getFirst().getUnit());
+        if (!adaOnly || wallet.getInlineDatum() != null || wallet.getDataHash() != null
+                || wallet.getReferenceScriptHash() != null) {
+            throw refuse(Refusal.WALLET_UTXO_NOT_ADA_ONLY,
+                    "wallet utxo " + utxoRef(wallet) + " must hold ada only, with no datum or script");
+        }
+
+        Set<String> loanIds = new HashSet<>();
+        for (LoanLiquidation liquidation : request.liquidations()) {
+            LiquidationAssessment assessment = Objects.requireNonNull(liquidation, "liquidation").assessment();
+            Objects.requireNonNull(assessment, "assessment");
+            String loanId = assessment.bond().loanId();
+            if (!loanIds.add(loanId)) {
+                throw refuse(Refusal.DUPLICATE_LOAN, "loan id " + loanId + " appears twice in one batch");
+            }
+        }
+    }
+
+    // ---- V1..V4, V6: vetting one loan ------------------------------------------------------
+
+    /** What survives vetting: the assessment plus everything derived from it that is now fixed. */
+    private record VettedLoan(LiquidationAssessment assessment,
+                              Utxo loanUtxo,
+                              Utxo bondUtxo,
+                              Loan loan,
+                              LenderBond bond,
+                              LiquidationMode liquidation,
+                              Leg principal,
+                              Leg collateral,
+                              BigInteger collateralPayout,
+                              PlutusData bondDatum,
+                              String assetManagerAddress,
+                              BigInteger recomputedEquity,
+                              BigInteger recomputedFee) {
+    }
+
+    /** One priced leg: the feed that goes in a redeemer, and the oracle it came from (null for ada). */
+    private record Leg(OraclePriceFeed feed, OracleEntry entry) {
+
+        boolean isOracle() {
+            return entry != null;
+        }
+    }
+
+    private VettedLoan vet(LoanLiquidation liquidation, Request request, long validFrom, long validTo) {
+        LiquidationAssessment assessment = liquidation.assessment();
+
+        // V1 — the scanner's verdict is the only admission ticket.
+        if (!assessment.buildable()) {
+            throw refuse(Refusal.NOT_BUILDABLE,
+                    "bond %s excluded by the scanner: %s (%s)"
+                            .formatted(assessment.bond().loanId(), assessment.exclusion(), assessment.detail()));
+        }
+
+        Loan loan = assessment.loan();
+        LenderBond bond = assessment.bond();
+        LoanDatum datum = loan.datum();
+        Utxo loanUtxo = Objects.requireNonNull(liquidation.loanUtxo(), "loanUtxo");
+        Utxo bondUtxo = Objects.requireNonNull(liquidation.bondUtxo(), "bondUtxo");
+
+        // The assessment and the UTxOs must be about the same thing; a mismatch here is how a
+        // liquidation gets built against a UTxO nobody assessed.
+        requireSameUtxo(loanUtxo, loan.txHash(), loan.outputIndex(), loan.address(), "loan");
+        requireSameUtxo(bondUtxo, bond.txHash(), bond.outputIndex(), bond.address(), "lender bond");
+        requireQuantity(loanUtxo, registry.getLoanPolicyId() + loan.loanId(), BigInteger.ONE, "loan NFT");
+        requireQuantity(bondUtxo, registry.getLenderBondPolicyId() + bond.loanId(), BigInteger.ONE,
+                "lender bond NFT");
+        AssetType collateralAsset = datum.collateral().assetType();
+        requireQuantity(loanUtxo, unitOf(collateralAsset), loan.collateralAmount(), "collateral");
+
+        if (!(datum.liquidationMode() instanceof LiquidationMode.Liquidation)) {
+            // Unreachable through a buildable assessment, but the ClaimData below copies the mode
+            // straight into a redeemer, so it is asserted rather than assumed.
+            throw refuse(Refusal.NOT_BUILDABLE,
+                    "loan %s is %s, not Liquidation".formatted(loan.loanId(), datum.liquidationMode()));
+        }
+
+        BigInteger remainingDebt = assessment.remainingDebt();
+        BigInteger equity = assessment.equity();
+        BigInteger liquidationFee = assessment.liquidationFee();
+
+        // V2 — the arithmetic the chain will have to satisfy.
+        if (remainingDebt.signum() <= 0) {
+            throw refuse(Refusal.NON_POSITIVE_REMAINING_DEBT,
+                    "loan %s has remainingDebt %s".formatted(loan.loanId(), remainingDebt));
+        }
+        if (equity.signum() < 0) {
+            throw refuse(Refusal.NEGATIVE_EQUITY,
+                    "loan %s has equity %s".formatted(loan.loanId(), equity));
+        }
+        // A negative fee does not shrink the bot's take, it *inflates* the asset-manager payout past
+        // the collateral that is actually there. liquidationFeePerMille is a lender-authored bond
+        // field with no on-chain non-negativity constraint, so this is reachable from chain data.
+        if (liquidationFee.signum() < 0) {
+            throw refuse(Refusal.NEGATIVE_LIQUIDATION_FEE,
+                    "loan %s has liquidationFee %s".formatted(loan.loanId(), liquidationFee));
+        }
+        BigInteger collateralPayout = loan.collateralAmount().subtract(equity).subtract(liquidationFee);
+        if (collateralPayout.signum() < 0) {
+            throw refuse(Refusal.COLLATERAL_CANNOT_COVER_EQUITY_AND_FEE,
+                    "loan %s: collateral %s - equity %s - fee %s = %s".formatted(loan.loanId(),
+                            loan.collateralAmount(), equity, liquidationFee, collateralPayout));
+        }
+
+        // V4 — the fee the redeemer's arithmetic rests on must be the one the bond actually
+        // authorises. `liquidationFee` never reaches a redeemer field, but it decides the split
+        // between the asset-manager payout and the bot's change, and `lm_liquidate_action.ak:118-124`
+        // recomputes it on chain: an inflated fee underpays the lender and the transaction dies in
+        // script evaluation after the fee is already spent. §7.5's formula, floored through
+        // Rational exactly as LiquidationCandidateScanner does — the comparison is against the value
+        // this method is about to use, so nothing can quietly substitute a recomputed one for it.
+        BigInteger recomputedFee = Rational.required(
+                        loan.collateralAmount().multiply(bond.datum().liquidationFeePerMille()),
+                        BigInteger.valueOf(1000))
+                .floor();
+        if (!recomputedFee.equals(liquidationFee)) {
+            throw refuse(Refusal.LIQUIDATION_FEE_NOT_REPRODUCIBLE,
+                    "loan %s: collateral %s at %s per mille is a fee of %s, the assessment says %s"
+                            .formatted(loan.loanId(), loan.collateralAmount(),
+                                    bond.datum().liquidationFeePerMille(), recomputedFee, liquidationFee));
+        }
+
+        // V6 — the receipt NFT a repayment-receipt loan expects on the compensation output is not
+        // modelled anywhere in this repo, so a partial liquidation of one cannot be built.
+        if (datum.repaymentReceipts() && equity.signum() > 0) {
+            throw refuse(Refusal.REPAYMENT_RECEIPTS_WITH_EQUITY,
+                    "loan %s wants repayment receipts and has equity %s; the receipt mint is unmodelled"
+                            .formatted(loan.loanId(), equity));
+        }
+
+        Leg principal = leg(datum.principalAsset().isAda(), datum.principalOracleAsset(), request,
+                loan.loanId(), "principal", validFrom, validTo);
+        Leg collateral = leg(datum.collateral().isAda(), datum.collateral().oracleTokenAsset(), request,
+                loan.loanId(), "collateral", validFrom, validTo);
+
+        // V4 — the guards. These recomputations never replace the assessment's numbers (D8);
+        // disagreement refuses the batch.
+        BigInteger recomputedEquity = assertHealthInvariantOverWindow(loan, remainingDebt, equity,
+                principal, collateral, validFrom, validTo);
+
+        // V6 — the collateral outputs carry the lender's stake part, so it has to be decodable.
+        String assetManagerAddress = assetManagerAddress(bond);
+
+        PlutusData bondDatum = roundTrippableBondDatum(bond);
+
+        return new VettedLoan(assessment, loanUtxo, bondUtxo, loan, bond, datum.liquidationMode(),
+                principal, collateral, collateralPayout, bondDatum, assetManagerAddress,
+                recomputedEquity, recomputedFee);
+    }
+
+    /**
+     * Resolves one leg exactly as {@code retrieve_oracle_data} would: an empty policy id is the
+     * synthesised 1:1 feed with no oracle consulted, and anything else is looked up by the oracle
+     * NFT the datum names.
+     */
+    private Leg leg(boolean isAda, AssetType oracleToken, Request request, String loanId, String which,
+                    long validFrom, long validTo) {
+        if (isAda) {
+            return new Leg(OraclePriceFeed.unit(), null);
+        }
+        Map<String, OracleEntry> oracles = request.oraclesByOracleTokenUnit();
+        OracleEntry entry = oracles == null ? null : oracles.get(oracleToken.toUnit());
+        if (entry == null) {
+            throw refuse(Refusal.ORACLE_ENTRY_MISSING,
+                    "loan %s %s leg: no oracle entry for %s".formatted(loanId, which, oracleToken.toUnit()));
+        }
+
+        // V6 — variants whose redeemer this repo cannot build, and the c3 gap.
+        switch (entry.feed().variant()) {
+            case POOLED, PRICE_DATA_ORCFAX -> throw refuse(Refusal.UNSUPPORTED_ORACLE_VARIANT,
+                    "loan %s %s leg: %s feeds are not modelled".formatted(loanId, which,
+                            entry.feed().variant()));
+            case PRICE_DATA_CHARLIE -> {
+                if (entry.charlieProviderReferenceInput() == null) {
+                    throw refuse(Refusal.CHARLIE_PROVIDER_REFERENCE_INPUT_MISSING,
+                            "loan %s %s leg: a Charli3 feed is validated against a provider utxo the "
+                                    + "registry did not publish".formatted(loanId, which));
+                }
+            }
+            case AGGREGATED, DEDICATED -> {
+                // signed variants: the registry's own signatures travel in the redeemer
+            }
+        }
+        if (entry.referenceScript() == null) {
+            throw refuse(Refusal.ORACLE_REFERENCE_SCRIPT_MISSING,
+                    ("loan %s %s leg: the registry published no reference script for this oracle, and "
+                            + "there is no witness fallback — the bundled blueprint's oracle.oracle is "
+                            + "unapplied, and the eight parameter values the deployed one was applied "
+                            + "with are not published, so attaching it would witness a different "
+                            + "credential than the withdrawal is made from").formatted(loanId, which));
+        }
+
+        // The reward address decides which redeemer the validator picks up, so it is derived here
+        // on the app network and only accepted if the registry agrees.
+        String derived = rewardAddress(entry.withdrawCredentialHash());
+        if (!derived.equals(entry.rewardAddress())) {
+            throw refuse(Refusal.ORACLE_REWARD_ADDRESS_MISMATCH,
+                    "loan %s %s leg: registry publishes %s, credential %s derives %s on this network"
+                            .formatted(loanId, which, entry.rewardAddress(), entry.withdrawCredentialHash(),
+                                    derived));
+        }
+
+        // V3 — tx-grade window checks. usableOver, never usableAt.
+        OraclePriceFeed feed = entry.feed();
+        if (!feed.usableOver(validFrom, validTo)) {
+            throw refuse(Refusal.ORACLE_FEED_NOT_USABLE_OVER_WINDOW,
+                    "loan %s %s leg: feed window [%d,%d] does not cover tx window [%d,%d]"
+                            .formatted(loanId, which, feed.validFrom(), feed.validTo(), validFrom, validTo));
+        }
+        long remainingWindow = feed.validTo() - validTo;
+        if (remainingWindow < request.oracleWindowMarginMillis()) {
+            throw refuse(Refusal.ORACLE_WINDOW_MARGIN_TOO_SMALL,
+                    "loan %s %s leg: only %dms of feed window left after validTo, %dms required"
+                            .formatted(loanId, which, remainingWindow, request.oracleWindowMarginMillis()));
+        }
+        return new Leg(feed, entry);
+    }
+
+    /**
+     * V4. Recomputes the debt, the equity and D9's liquidatability from the loan datum and the
+     * redeemer's own feeds, and refuses if any of them disagrees with what the assessment carries.
+     * <p>
+     * Two separate reasons for demanding agreement at <em>both</em> ends of the window: the chain
+     * evaluates the loan's finance at some point of the validity interval and this side cannot know
+     * which, so a number that moves in between makes the assessment unusable; and an assessment that
+     * simply does not reproduce — a stale one, or one whose numbers were tampered with between the
+     * scan and the build — must never be turned into a transaction. {@code equity} and
+     * {@code remainingDebt} go into the redeemer <em>verbatim</em> either way (D8); this method
+     * never substitutes its own values for them, it only refuses. Both comparisons are against the
+     * values the caller is about to use, so nothing can quietly swap a recomputed number in.
+     *
+     * @return the recomputed equity, for the post-assembly assertions to compare against
+     */
+    private static BigInteger assertHealthInvariantOverWindow(Loan loan, BigInteger remainingDebt,
+                                                              BigInteger equity, Leg principal,
+                                                              Leg collateral, long validFrom, long validTo) {
+        BigInteger recomputedEquityAtValidFrom = null;
+        for (long at : new long[]{validFrom, validTo}) {
+            BigInteger recomputed;
+            BigInteger recomputedEquity;
+            boolean liquidatable;
+            try {
+                recomputed = LoanFinance.remainingDebt(loan.datum(), at);
+                boolean late = LoanFinance.isRepaymentLate(loan.datum(), at);
+                Rational debt = Rational.fromInt(recomputed);
+                Rational collateralAmount = Rational.fromInt(loan.collateralAmount());
+                // D9 / loan_claim_action.ak:230 — `or { isRepaymentLate, can_liquidate }`.
+                liquidatable = late || LoanFinance.canLiquidate(debt, collateralAmount,
+                        LoanFinance.liquidationLtv(liquidationOf(loan)), principal.feed(), collateral.feed());
+                recomputedEquity = LoanFinance.redeemerEquity(liquidationOf(loan), collateralAmount, debt,
+                        principal.feed(), collateral.feed());
+            } catch (ArithmeticException e) {
+                throw refuse(Refusal.HEALTH_NOT_COMPUTABLE,
+                        "loan %s at %d: %s".formatted(loan.loanId(), at, e.getMessage()), e);
+            }
+            if (!recomputed.equals(remainingDebt)) {
+                throw refuse(Refusal.REMAINING_DEBT_NOT_INVARIANT,
+                        "loan %s: remainingDebt is %s at %d but the redeemer carries %s"
+                                .formatted(loan.loanId(), recomputed, at, remainingDebt));
+            }
+            if (!recomputedEquity.equals(equity)) {
+                throw refuse(Refusal.EQUITY_NOT_REPRODUCIBLE,
+                        "loan %s: equity is %s at %d but the redeemer carries %s"
+                                .formatted(loan.loanId(), recomputedEquity, at, equity));
+            }
+            if (!liquidatable) {
+                throw refuse(Refusal.NOT_LIQUIDATABLE_OVER_WINDOW,
+                        "loan %s is neither late nor over its liquidation ltv at %d"
+                                .formatted(loan.loanId(), at));
+            }
+            if (recomputedEquityAtValidFrom == null) {
+                recomputedEquityAtValidFrom = recomputedEquity;
+            }
+        }
+        return recomputedEquityAtValidFrom;
+    }
+
+    private static LiquidationMode.Liquidation liquidationOf(Loan loan) {
+        return (LiquidationMode.Liquidation) loan.datum().liquidationMode();
+    }
+
+    // ---- addresses ---------------------------------------------------------------------------
+
+    /**
+     * The address the claimed collateral goes to: the asset-manager spend credential, carrying the
+     * lender's stake part from {@code LenderManagerDatum.lenderStakeCredential} (findings §7 D6 —
+     * that field is for the bot-created asset outputs, not for the bond echo).
+     */
+    private String assetManagerAddress(LenderBond bond) {
+        Credential payment = Credential.fromScript(registry.getAssetManagerSpendScriptHash());
+        Credential stake = stakeCredential(bond);
+        return stake == null
+                ? AddressProvider.getEntAddress(payment, network).getAddress()
+                : AddressProvider.getBaseAddress(payment, stake, network).getAddress();
+    }
+
+    /**
+     * Decodes {@code Option<StakeCredential>}: {@code None} means an enterprise address,
+     * {@code Some(Inline(credential))} contributes the stake part, and {@code Some(Pointer{..})}
+     * is refused — cardano-client-lib can build a pointer address, but nothing in this workstream
+     * has ever seen one and guessing its bytes onto an output that holds real collateral is not a
+     * trade this builder makes.
+     */
+    private static Credential stakeCredential(LenderBond bond) {
+        PlutusData data = bond.datum().lenderStakeCredential();
+        ConstrPlutusData option = asConstr(data, bond, "lenderStakeCredential");
+        if (option.getAlternative() == 1) {
+            return null;
+        }
+        if (option.getAlternative() != 0) {
+            throw refuse(Refusal.UNDECODABLE_STAKE_CREDENTIAL,
+                    "bond %s: Option constructor %d".formatted(bond.loanId(), option.getAlternative()));
+        }
+        ConstrPlutusData referenced = asConstr(first(option, bond), bond, "StakeCredential");
+        if (referenced.getAlternative() == 1) {
+            throw refuse(Refusal.POINTER_STAKE_CREDENTIAL,
+                    "bond %s carries a pointer stake credential".formatted(bond.loanId()));
+        }
+        if (referenced.getAlternative() != 0) {
+            throw refuse(Refusal.UNDECODABLE_STAKE_CREDENTIAL,
+                    "bond %s: StakeCredential constructor %d"
+                            .formatted(bond.loanId(), referenced.getAlternative()));
+        }
+        ConstrPlutusData credential = asConstr(first(referenced, bond), bond, "Credential");
+        PlutusData hashData = first(credential, bond);
+        if (!(hashData instanceof BytesPlutusData hash)) {
+            throw refuse(Refusal.UNDECODABLE_STAKE_CREDENTIAL,
+                    "bond %s: credential hash is not a ByteArray".formatted(bond.loanId()));
+        }
+        return switch ((int) credential.getAlternative()) {
+            case 0 -> Credential.fromKey(hash.getValue());
+            case 1 -> Credential.fromScript(hash.getValue());
+            default -> throw refuse(Refusal.UNDECODABLE_STAKE_CREDENTIAL,
+                    "bond %s: Credential constructor %d".formatted(bond.loanId(), credential.getAlternative()));
+        };
+    }
+
+    private static ConstrPlutusData asConstr(PlutusData data, LenderBond bond, String what) {
+        if (data instanceof ConstrPlutusData constr) {
+            return constr;
+        }
+        throw refuse(Refusal.UNDECODABLE_STAKE_CREDENTIAL,
+                "bond %s: %s is not a constructor".formatted(bond.loanId(), what));
+    }
+
+    private static PlutusData first(ConstrPlutusData constr, LenderBond bond) {
+        List<PlutusData> fields = constr.getData() == null ? List.of() : constr.getData().getPlutusDataList();
+        if (fields.isEmpty()) {
+            throw refuse(Refusal.UNDECODABLE_STAKE_CREDENTIAL,
+                    "bond %s: a stake credential constructor has no fields".formatted(bond.loanId()));
+        }
+        return fields.getFirst();
+    }
+
+    private String rewardAddress(String scriptHash) {
+        return AddressProvider.getRewardAddress(Credential.fromScript(scriptHash), network).getAddress();
+    }
+
+    /**
+     * D6 requires the bond output to be a byte-identical echo of its input, and cardano-client-lib
+     * re-serialises whatever {@code PlutusData} it is handed. So the input's datum is decoded and
+     * re-encoded here, and the batch is refused unless the bytes come back identical — the failure
+     * {@code LenderManagerDatum#lenderStakeCredential}'s javadoc warns about, caught before it can
+     * cost a fee.
+     */
+    private static PlutusData roundTrippableBondDatum(LenderBond bond) {
+        String original = bond.inlineDatum();
+        try {
+            PlutusData decoded = ConstrPlutusData.deserialize(
+                    CborSerializationUtil.deserialize(HexUtil.decodeHexString(original)));
+            String reencoded = decoded.serializeToHex();
+            if (!original.equalsIgnoreCase(reencoded)) {
+                throw refuse(Refusal.BOND_DATUM_NOT_BYTE_IDENTICAL,
+                        "bond %s: datum re-encodes to different bytes".formatted(bond.loanId()));
+            }
+            return decoded;
+        } catch (RefusedException e) {
+            throw e;
+        } catch (Exception e) {
+            throw refuse(Refusal.BOND_DATUM_NOT_BYTE_IDENTICAL,
+                    "bond %s: datum could not be decoded".formatted(bond.loanId()), e);
+        }
+    }
+
+    // ---- reference inputs --------------------------------------------------------------------
+
+    /** One withdrawal per oracle credential — {@code pairs.get_first} finds exactly one (design §6.3). */
+    private static List<OracleEntry> distinctOracles(List<VettedLoan> loans) {
+        Map<String, OracleEntry> byCredential = new LinkedHashMap<>();
+        for (VettedLoan loan : loans) {
+            for (Leg leg : List.of(loan.principal(), loan.collateral())) {
+                if (leg.isOracle()) {
+                    byCredential.putIfAbsent(leg.entry().withdrawCredentialHash(), leg.entry());
+                }
+            }
+        }
+        return List.copyOf(byCredential.values());
+    }
+
+    /** Every reference input the finished body will hold, deduplicated and canonically sorted. */
+    private static List<TransactionInput> referenceInputs(Request request, List<OracleEntry> oracles) {
+        Set<TransactionInput> inputs = new LinkedHashSet<>();
+        inputs.add(inputOf(request.configUtxo()));
+        inputs.add(inputOf(request.lmConfigUtxo()));
+        for (OracleEntry oracle : oracles) {
+            inputs.add(oracle.referenceInput());
+            inputs.add(oracle.referenceScript());
+            if (oracle.charlieProviderReferenceInput() != null) {
+                inputs.add(oracle.charlieProviderReferenceInput());
+            }
+        }
+        ReferenceScripts scripts = request.referenceScripts();
+        Stream.of(scripts.loan(), scripts.loanSpend(), scripts.lenderManager(),
+                        scripts.lenderManagerSpend(), scripts.loanClaimAction(), scripts.lmLiquidateAction(),
+                        scripts.assetManager())
+                .filter(Objects::nonNull)
+                .forEach(inputs::add);
+        return inputs.stream().sorted(new TransactionInputComparator()).toList();
+    }
+
+    private static int refIndex(List<TransactionInput> refInputs, TransactionInput input, String what) {
+        if (input == null) {
+            // Reachable only if one of the vetoes above stopped guarding; refusing here keeps a
+            // missing coordinate a refusal rather than a NullPointerException out of indexOf.
+            throw refuse(Refusal.STRUCTURAL_ASSERTION_FAILED,
+                    "%s reference input is null — no coordinate to resolve an index against"
+                            .formatted(what));
+        }
+        int index = refInputs.indexOf(input);
+        if (index < 0) {
+            throw refuse(Refusal.STRUCTURAL_ASSERTION_FAILED,
+                    "%s reference input %s#%d is not in the reference input set"
+                            .formatted(what, input.getTransactionId(), input.getIndex()));
+        }
+        return index;
+    }
+
+    /**
+     * An ada leg has no oracle and no reference input: {@code retrieve_oracle_data} returns the
+     * synthesised 1:1 feed from its {@code expectedTokenPolicyId == ""} branch before it ever looks
+     * at the index, so zero is written and never read. Every other leg resolves against the final
+     * reference-input order.
+     */
+    private static int oracleRefIndex(List<TransactionInput> refInputs, Leg leg) {
+        return leg.isOracle() ? refIndex(refInputs, leg.entry().referenceInput(), "oracle") : 0;
+    }
+
+    // ---- assembly ------------------------------------------------------------------------------
+
+    private ScriptTx assemble(Request request,
+                              List<VettedLoan> loanOrder,
+                              List<VettedLoan> bondOrder,
+                              List<ClaimData> claims,
+                              List<Long> lenderBondInputIndexes,
+                              List<OracleEntry> oracles,
+                              List<TransactionInput> refInputs,
+                              int configRefIndex,
+                              int lmConfigRefIndex) {
+        ScriptTx tx = new ScriptTx();
+
+        // Inputs. The general_spend handlers take a unit redeemer; the real authorisation is the
+        // withdraw-0 invocation of the validator they wrap.
+        for (VettedLoan loan : loanOrder) {
+            tx.collectFrom(loan.loanUtxo(), GENERAL_SPEND_REDEEMER);
+        }
+        for (VettedLoan bond : bondOrder) {
+            tx.collectFrom(bond.bondUtxo(), GENERAL_SPEND_REDEEMER);
+        }
+        tx.collectFrom(request.walletUtxo());
+
+        // Burn every loan NFT under one mint redeemer: a policy id may appear only once in the
+        // mint field, so one policy means exactly one Mint redeemer.
+        //
+        // isPoolOrigin=false / originWithdrawRedeemerIndex=0 are the plain non-pool liquidation
+        // case as this workstream understands it; both are arbitrated by slice C's on-chain
+        // evaluation, not by anything provable off chain.
+        List<Asset> burns = loanOrder.stream()
+                .map(loan -> new Asset("0x" + loan.loan().loanId(), BigInteger.ONE.negate()))
+                .toList();
+        tx.mintAsset(registry.getLoanScript(), burns,
+                LiquidationTxEncoder.loanMintRedeemer(configRefIndex, false, 0));
+
+        // Outputs, in loan-input order: every bond echo, then every collateral output, then the
+        // equity outputs of the loans that have one.
+        for (VettedLoan loan : loanOrder) {
+            tx.payToContract(loan.bondUtxo().getAddress(), List.copyOf(loan.bondUtxo().getAmount()),
+                    loan.bondDatum());
+        }
+        for (VettedLoan loan : loanOrder) {
+            tx.payToContract(loan.assetManagerAddress(),
+                    assetManagerAmounts(loan, loan.collateralPayout()), collateralDatum(loan));
+        }
+        for (VettedLoan loan : loanOrder) {
+            if (loan.assessment().equity().signum() > 0) {
+                tx.payToContract(loan.assetManagerAddress(),
+                        assetManagerAmounts(loan, loan.assessment().equity()), equityDatum(loan));
+            }
+        }
+
+        // Withdraw-0 invocations. The main config authorises loan/claim/lm-liquidate; the
+        // LenderManager validator reads the LM config instead.
+        List<String> bondAssetNames = loanOrder.stream().map(loan -> loan.loan().loanId()).toList();
+        tx.withdraw(rewardAddress(registry.getLoanPolicyId()), BigInteger.ZERO,
+                LiquidationTxEncoder.loanWithdrawRedeemer(configRefIndex), request.changeAddress());
+        tx.withdraw(rewardAddress(registry.getLoanClaimActionScriptHash()), BigInteger.ZERO,
+                LiquidationTxEncoder.loanClaimActionWithdrawRedeemer(configRefIndex, claims),
+                request.changeAddress());
+        tx.withdraw(rewardAddress(registry.getLenderManagerWithdrawScriptHash()), BigInteger.ZERO,
+                LiquidationTxEncoder.lenderManagerWithdrawRedeemer(lmConfigRefIndex), request.changeAddress());
+        tx.withdraw(rewardAddress(registry.getLmLiquidateActionScriptHash()), BigInteger.ZERO,
+                LiquidationTxEncoder.lmLiquidateWithdrawRedeemer(configRefIndex, lenderBondInputIndexes,
+                        bondAssetNames),
+                request.changeAddress());
+        for (OracleEntry oracle : oracles) {
+            tx.withdraw(oracle.rewardAddress(), BigInteger.ZERO, oracleRedeemer(oracle, refInputs),
+                    request.changeAddress());
+        }
+
+        // Reference inputs. readFrom deduplicates, and the body's order is irrelevant because every
+        // index was taken off the canonically sorted list.
+        tx.readFrom(refInputs.toArray(TransactionInput[]::new));
+
+        attachValidators(tx);
+
+        return tx.withChangeAddress(request.changeAddress());
+    }
+
+    /** The claimed-collateral datum: owned by the lender bond, descending from the loan input. */
+    private PlutusData collateralDatum(VettedLoan loan) {
+        return LiquidationTxEncoder.assetManagerDatumWithToken(new AssetManagerDatumWithToken(
+                loan.loanUtxo().getTxHash(), loan.loanUtxo().getOutputIndex(),
+                LiquidationTxEncoder.CLAIMED_COLLATERAL_ACTION_HEX,
+                new AssetType(registry.getLenderBondPolicyId(), loan.loan().loanId())));
+    }
+
+    /** The partial-liquidation compensation datum: owned by the <em>borrower</em> bond. */
+    private PlutusData equityDatum(VettedLoan loan) {
+        return LiquidationTxEncoder.assetManagerDatumWithToken(new AssetManagerDatumWithToken(
+                loan.loanUtxo().getTxHash(), loan.loanUtxo().getOutputIndex(),
+                LiquidationTxEncoder.PARTIAL_LIQUIDATION_ACTION_HEX,
+                new AssetType(registry.getBorrowerBondPolicyId(), loan.loan().loanId())));
+    }
+
+    /**
+     * The redeemer for one oracle. A Charli3 feed is unsigned and carries the index of the provider
+     * UTxO instead, resolved — like every other index here — against the final reference-input
+     * order. The window is exactly the registry-published one for every variant, signed or not
+     * (see {@link OraclePriceFeed#priceDataCharlie}).
+     */
+    private static PlutusData oracleRedeemer(OracleEntry oracle, List<TransactionInput> refInputs) {
+        if (oracle.feed().variant() == OraclePriceFeed.Variant.PRICE_DATA_CHARLIE) {
+            int providerIndex = refIndex(refInputs, oracle.charlieProviderReferenceInput(),
+                    "charli3 provider");
+            return LiquidationTxEncoder.oracleRedeemer(oracle.feed(), providerIndex, List.of());
+        }
+        return LiquidationTxEncoder.oracleRedeemer(oracle.feed(), oracle.signatures());
+    }
+
+    /**
+     * The value of one asset-manager output. For token collateral the quantity is exact and the
+     * lovelace rider is left to cardano-client-lib's min-ada top-up, which uses the caller's
+     * protocol params rather than a second copy of the same formula here.
+     */
+    private static List<Amount> assetManagerAmounts(VettedLoan loan, BigInteger quantity) {
+        AssetType collateral = loan.loan().datum().collateral().assetType();
+        return collateral.isAda()
+                ? List.of(Amount.lovelace(quantity))
+                : List.of(Amount.asset(unitOf(collateral), quantity));
+    }
+
+    /**
+     * The six validators a plain {@code Liquidate} invokes, attached to the witness set — the
+     * asset-manager script is not among them, because this transaction only <em>creates</em>
+     * asset-manager outputs and never spends one.
+     * <p>
+     * They are attached unconditionally, including when the caller published reference scripts:
+     * those are read from in {@link #referenceInputs} and declared to {@code withReferenceScripts},
+     * and {@code removeDuplicateScriptWitnesses} then strips the witness copy of each one. Carrying
+     * a script that is also reachable by reference is {@code ExtraneousScriptWitnessesUTXOW}, so
+     * the strip is not an optimisation.
+     */
+    private void attachValidators(ScriptTx tx) {
+        tx.attachSpendingValidator(registry.getLoanSpendScript());
+        tx.attachSpendingValidator(registry.getLenderManagerSpendScript());
+        tx.attachRewardValidator(registry.getLoanScript());
+        tx.attachRewardValidator(registry.getLoanClaimActionScript());
+        tx.attachRewardValidator(registry.getLenderManagerScript());
+        tx.attachRewardValidator(registry.getLmLiquidateActionScript());
+    }
+
+    /** The scripts the caller says are published, paired with the registry object for each. */
+    private List<PlutusScript> publishedScripts(ReferenceScripts scripts) {
+        List<PlutusScript> published = new ArrayList<>();
+        if (scripts.loan() != null) {
+            published.add(registry.getLoanScript());
+        }
+        if (scripts.loanSpend() != null) {
+            published.add(registry.getLoanSpendScript());
+        }
+        if (scripts.lenderManager() != null) {
+            published.add(registry.getLenderManagerScript());
+        }
+        if (scripts.lenderManagerSpend() != null) {
+            published.add(registry.getLenderManagerSpendScript());
+        }
+        if (scripts.loanClaimAction() != null) {
+            published.add(registry.getLoanClaimActionScript());
+        }
+        if (scripts.lmLiquidateAction() != null) {
+            published.add(registry.getLmLiquidateActionScript());
+        }
+        if (scripts.assetManager() != null) {
+            published.add(registry.getAssetManagerScript());
+        }
+        return published;
+    }
+
+    private Transaction complete(Request request, ScriptTx tx) {
+        long[] slots = validitySlots(request);
+        QuickTxBuilder.TxContext context =
+                new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
+                        .compose(tx)
+                        .feePayer(request.changeAddress())
+                        .collateralPayer(request.changeAddress())
+                        .validFrom(slots[0])
+                        .validTo(slots[1])
+                        // A script supplier that resolves nothing. cardano-client-lib otherwise walks
+                        // every reference input looking for a script to fetch, and this builder has no
+                        // remote source to fetch one from — the caller either points at a published
+                        // reference script or the validator travels in the witness set.
+                        .withScriptSupplier(scriptHash -> Optional.empty())
+                        .mergeOutputs(false);
+
+        List<PlutusScript> published = publishedScripts(request.referenceScripts());
+        if (!published.isEmpty()) {
+            context = context.withReferenceScripts(published.toArray(PlutusScript[]::new))
+                    .removeDuplicateScriptWitnesses(true);
+        }
+
+        try {
+            return context.build();
+        } catch (RefusedException e) {
+            throw e;
+        } catch (Exception e) {
+            throw refuse(Refusal.TRANSACTION_NOT_BUILDABLE, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Slots for the requested millisecond window, clamped <em>inwards</em>. A slot boundary rarely
+     * lands on the requested instant, and rounding outwards would hand the chain a wider interval
+     * than the one V3 and V4 were checked against — the interval the guards proved safe must
+     * contain the interval the transaction actually claims, not the other way round.
+     */
+    private long[] validitySlots(Request request) {
+        long from = request.validFromMillis();
+        long to = request.validToMillis();
+        long slotFrom = converters.time().toSlot(utc(from));
+        if (millisOf(converters.slot().slotToTime(slotFrom)) < from) {
+            slotFrom += 1;
+        }
+        long slotTo = converters.time().toSlot(utc(to));
+        if (millisOf(converters.slot().slotToTime(slotTo)) > to) {
+            slotTo -= 1;
+        }
+        if (slotFrom > slotTo) {
+            throw refuse(Refusal.VALIDITY_WINDOW_INVALID,
+                    "window [%d,%d] does not contain a whole slot".formatted(from, to));
+        }
+        return new long[]{slotFrom, slotTo};
+    }
+
+    private static LocalDateTime utc(long millis) {
+        return LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneOffset.UTC);
+    }
+
+    private static long millisOf(LocalDateTime time) {
+        return time.toInstant(ZoneOffset.UTC).toEpochMilli();
+    }
+
+    // ---- V5: structural assertions on the finished body ----------------------------------------
+
+    private void assertStructure(Transaction transaction,
+                                 Request request,
+                                 List<VettedLoan> loanOrder,
+                                 List<VettedLoan> bondOrder,
+                                 List<ClaimData> claims,
+                                 List<Long> lenderBondInputIndexes,
+                                 List<TransactionInput> refInputs,
+                                 int configRefIndex,
+                                 int lmConfigRefIndex,
+                                 List<OracleEntry> oracles) {
+        List<TransactionInput> sortedInputs = transaction.getBody().getInputs().stream()
+                .sorted(new TransactionInputComparator())
+                .toList();
+        List<TransactionInput> sortedRefInputs = transaction.getBody().getReferenceInputs().stream()
+                .sorted(new TransactionInputComparator())
+                .toList();
+        List<TransactionOutput> outputs = transaction.getBody().getOutputs();
+
+        // The reference-input set every index above was computed from must be the one that ended up
+        // in the body — nothing may have been added or dropped along the way.
+        structural(sortedRefInputs.equals(refInputs),
+                "reference inputs in the body differ from the set the indexes were resolved against");
+        structural(refInputs.get(configRefIndex).equals(inputOf(request.configUtxo())),
+                "configRefInputIndex " + configRefIndex + " does not point at the main config utxo");
+        structural(refInputs.get(lmConfigRefIndex).equals(inputOf(request.lmConfigUtxo())),
+                "lenderManager configRefInputIndex " + lmConfigRefIndex
+                        + " does not point at the lm config utxo");
+        for (OracleEntry oracle : oracles) {
+            structural(sortedRefInputs.contains(oracle.referenceInput()),
+                    "oracle " + oracle.oracleToken().toUnit() + " reference input is missing");
+            if (oracle.charlieProviderReferenceInput() != null) {
+                structural(sortedRefInputs.contains(oracle.charlieProviderReferenceInput()),
+                        "charli3 provider reference input is missing for " + oracle.oracleToken().toUnit());
+            }
+        }
+
+        // D5 — one bond input per loan input, indexes unique.
+        structural(lenderBondInputIndexes.size() == loanOrder.size(),
+                "lenderBondInputIndexes has %d entries for %d loan inputs"
+                        .formatted(lenderBondInputIndexes.size(), loanOrder.size()));
+        structural(new HashSet<>(lenderBondInputIndexes).size() == lenderBondInputIndexes.size(),
+                "lenderBondInputIndexes are not unique: " + lenderBondInputIndexes);
+        for (int i = 0; i < loanOrder.size(); i++) {
+            VettedLoan loan = loanOrder.get(i);
+            VettedLoan pairedBond = bondOrder.get(lenderBondInputIndexes.get(i).intValue());
+            structural(pairedBond.loan().loanId().equals(loan.loan().loanId()),
+                    "lenderBondInputIndexes[%d] pairs loan %s with bond %s"
+                            .formatted(i, loan.loan().loanId(), pairedBond.bond().loanId()));
+            structural(sortedInputs.contains(inputOf(loan.loanUtxo())),
+                    "loan input " + utxoRef(loan.loanUtxo()) + " is not in the body");
+            structural(sortedInputs.contains(inputOf(loan.bondUtxo())),
+                    "bond input " + utxoRef(loan.bondUtxo()) + " is not in the body");
+        }
+        // The filtered orders must be the ones the ledger will see, i.e. the sorted body order.
+        structural(filteredOrderMatches(sortedInputs, loanOrder, VettedLoan::loanUtxo),
+                "loan inputs are not in canonical order in the body");
+        structural(filteredOrderMatches(sortedInputs, bondOrder, VettedLoan::bondUtxo),
+                "bond inputs are not in canonical order in the body");
+
+        for (int i = 0; i < loanOrder.size(); i++) {
+            VettedLoan loan = loanOrder.get(i);
+            ClaimData claim = claims.get(i);
+            structural(claim.loanId().equals(loan.loan().loanId()),
+                    "actionsForEachInput[%d] is loan %s, expected %s"
+                            .formatted(i, claim.loanId(), loan.loan().loanId()));
+            // D8 — the redeemer carries the assessment's numbers verbatim. The equality with the
+            // independently recomputed equity is what makes that meaningful rather than circular:
+            // V4 already refused every batch where the two disagree, so a number reaching a
+            // redeemer here has been produced twice, from two directions.
+            structural(claim.remainingDebt().equals(loan.assessment().remainingDebt())
+                            && claim.equity().equals(loan.assessment().equity()),
+                    "claim %d does not carry the assessment's numbers verbatim".formatted(i));
+            structural(claim.equity().equals(loan.recomputedEquity()),
+                    "claim %d carries equity %s, the loan recomputes %s"
+                            .formatted(i, claim.equity(), loan.recomputedEquity()));
+            structural(loan.collateralPayout().equals(loan.loan().collateralAmount()
+                            .subtract(loan.recomputedEquity()).subtract(loan.recomputedFee())),
+                    "claim %d: the collateral payout is not collateral - equity - fee at the "
+                            .formatted(i) + "recomputed numbers");
+
+            // D6 — the bond output is a byte-identical echo of the bond input.
+            int bondOutputIndex = claim.lenderBondOutputIndex().intValueExact();
+            structural(bondOutputIndex >= 0 && bondOutputIndex < outputs.size(),
+                    "lenderBondOutputIndex " + bondOutputIndex + " is out of range");
+            TransactionOutput bondOutput = outputs.get(bondOutputIndex);
+            structural(bondOutput.getAddress().equals(loan.bondUtxo().getAddress()),
+                    "bond output %d is at %s, expected %s"
+                            .formatted(bondOutputIndex, bondOutput.getAddress(), loan.bondUtxo().getAddress()));
+            structural(sameValue(bondOutput, loan.bondUtxo()),
+                    "bond output %d does not hold exactly the bond input's value".formatted(bondOutputIndex));
+            structural(bondOutput.getInlineDatum() != null
+                            && bondOutput.getInlineDatum().serializeToHex()
+                            .equalsIgnoreCase(loan.bondUtxo().getInlineDatum()),
+                    "bond output %d does not echo the bond input's datum bytes".formatted(bondOutputIndex));
+
+            // D7 — the asset outputs flatten to exactly one entry for ada collateral, two otherwise.
+            // The collateral output is found by its datum rather than by an offset: only the datum
+            // says which loan an asset-manager output descends from, so matching on it is what
+            // proves the right loan got the right payout.
+            boolean adaCollateral = loan.loan().datum().collateral().isAda();
+            TransactionOutput collateralOutput = onlyOutputWithDatum(outputs, loan.assetManagerAddress(),
+                    collateralDatum(loan), "collateral output for loan " + loan.loan().loanId());
+            assertAssetManagerOutput(collateralOutput, loan, adaCollateral,
+                    "collateral output for loan " + loan.loan().loanId());
+            structural(quantityIn(collateralOutput, loan).equals(loan.collateralPayout()),
+                    "collateral output for loan %s carries %s, expected collateral - equity - fee = %s"
+                            .formatted(loan.loan().loanId(), quantityIn(collateralOutput, loan),
+                                    loan.collateralPayout()));
+        }
+
+        // Equity outputs — one per loan with a positive equity, and none for the others.
+        long expectedEquityOutputs = 0;
+        for (VettedLoan loan : loanOrder) {
+            if (loan.assessment().equity().signum() <= 0) {
+                continue;
+            }
+            expectedEquityOutputs++;
+            String what = "equity output for loan " + loan.loan().loanId();
+            TransactionOutput equityOutput =
+                    onlyOutputWithDatum(outputs, loan.assetManagerAddress(), equityDatum(loan), what);
+            assertAssetManagerOutput(equityOutput, loan, loan.loan().datum().collateral().isAda(), what);
+            // loan_claim_action checks the compensation with `>=`, so a min-ada top-up is legal here
+            // where it would not be on the collateral output.
+            structural(quantityIn(equityOutput, loan).compareTo(loan.assessment().equity()) >= 0,
+                    "%s carries %s, less than the redeemer's equity %s".formatted(what,
+                            quantityIn(equityOutput, loan), loan.assessment().equity()));
+        }
+
+        // Nothing else may sit at an asset-manager address: exactly one collateral output per loan
+        // plus the equity outputs just accounted for.
+        Set<String> assetManagerAddresses = loanOrder.stream()
+                .map(VettedLoan::assetManagerAddress)
+                .collect(Collectors.toSet());
+        long assetManagerOutputs = outputs.stream()
+                .filter(output -> assetManagerAddresses.contains(output.getAddress()))
+                .count();
+        structural(assetManagerOutputs == loanOrder.size() + expectedEquityOutputs,
+                "%d asset-manager outputs for %d loans and %d equity refunds"
+                        .formatted(assetManagerOutputs, loanOrder.size(), expectedEquityOutputs));
+
+        // Every loan NFT, and only those, must be burned.
+        Map<String, BigInteger> burned = new LinkedHashMap<>();
+        if (transaction.getBody().getMint() != null) {
+            transaction.getBody().getMint().stream()
+                    .filter(multiAsset -> multiAsset.getPolicyId().equals(registry.getLoanPolicyId()))
+                    .flatMap(multiAsset -> multiAsset.getAssets().stream())
+                    .forEach(asset -> burned.put(stripHexPrefix(asset.getNameAsHex()), asset.getValue()));
+        }
+        structural(burned.size() == loanOrder.size(),
+                "%d loan NFTs burned for %d loans".formatted(burned.size(), loanOrder.size()));
+        for (VettedLoan loan : loanOrder) {
+            structural(BigInteger.ONE.negate().equals(burned.get(loan.loan().loanId())),
+                    "loan NFT " + loan.loan().loanId() + " is not burned exactly once");
+        }
+    }
+
+    private void assertAssetManagerOutput(TransactionOutput output, VettedLoan loan, boolean adaCollateral,
+                                          String what) {
+        structural(output.getAddress().equals(loan.assetManagerAddress()),
+                what + " is at " + output.getAddress() + ", expected " + loan.assetManagerAddress());
+        int flattened = ValueUtil.toAmountList(output.getValue()).size();
+        structural(flattened == (adaCollateral ? 1 : 2),
+                what + " flattens to " + flattened + " assets, expected " + (adaCollateral ? 1 : 2));
+    }
+
+    /** The single output at {@code address} carrying {@code datum}, or a refusal. */
+    private static TransactionOutput onlyOutputWithDatum(List<TransactionOutput> outputs, String address,
+                                                         PlutusData datum, String what) {
+        String expected = datum.serializeToHex();
+        List<TransactionOutput> matches = outputs.stream()
+                .filter(output -> output.getAddress().equals(address))
+                .filter(output -> output.getInlineDatum() != null
+                        && output.getInlineDatum().serializeToHex().equalsIgnoreCase(expected))
+                .toList();
+        if (matches.size() != 1) {
+            throw refuse(Refusal.STRUCTURAL_ASSERTION_FAILED,
+                    "%s matches %d outputs, expected exactly one".formatted(what, matches.size()));
+        }
+        return matches.getFirst();
+    }
+
+    private static BigInteger quantityIn(TransactionOutput output, VettedLoan loan) {
+        AssetType collateral = loan.loan().datum().collateral().assetType();
+        String unit = unitOf(collateral);
+        return ValueUtil.toAmountList(output.getValue()).stream()
+                .filter(amount -> unit.equals(amount.getUnit()))
+                .map(Amount::getQuantity)
+                .reduce(BigInteger.ZERO, BigInteger::add);
+    }
+
+    private static boolean filteredOrderMatches(List<TransactionInput> sortedInputs, List<VettedLoan> order,
+                                                Function<VettedLoan, Utxo> which) {
+        List<TransactionInput> expected = order.stream().map(which).map(LiquidateTransactionBuilder::inputOf)
+                .toList();
+        List<TransactionInput> actual = sortedInputs.stream().filter(expected::contains).toList();
+        return actual.equals(expected);
+    }
+
+    private static boolean sameValue(TransactionOutput output, Utxo utxo) {
+        return normalise(ValueUtil.toAmountList(output.getValue())).equals(normalise(utxo.getAmount()));
+    }
+
+    private static Map<String, BigInteger> normalise(List<Amount> amounts) {
+        Map<String, BigInteger> byUnit = new LinkedHashMap<>();
+        for (Amount amount : amounts) {
+            byUnit.merge(amount.getUnit(), amount.getQuantity(), BigInteger::add);
+        }
+        byUnit.values().removeIf(quantity -> quantity.signum() == 0);
+        return byUnit;
+    }
+
+    private static String stripHexPrefix(String hex) {
+        return hex != null && hex.startsWith("0x") ? hex.substring(2) : hex;
+    }
+
+    private static void structural(boolean condition, String detail) {
+        if (!condition) {
+            throw refuse(Refusal.STRUCTURAL_ASSERTION_FAILED, detail);
+        }
+    }
+
+    // ---- small helpers -------------------------------------------------------------------------
+
+    private static TransactionInput inputOf(Utxo utxo) {
+        return new TransactionInput(utxo.getTxHash(), utxo.getOutputIndex());
+    }
+
+    private static String utxoRef(Utxo utxo) {
+        return utxo.getTxHash() + "#" + utxo.getOutputIndex();
+    }
+
+    /** {@code quantity_of(value, "", "")} is the lovelace quantity on chain, and so is this. */
+    private static String unitOf(AssetType asset) {
+        return asset.isAda() ? AssetType.LOVELACE : asset.toUnit();
+    }
+
+    private static void requireSameUtxo(Utxo utxo, String txHash, int outputIndex, String address,
+                                        String what) {
+        if (!utxo.getTxHash().equals(txHash) || utxo.getOutputIndex() != outputIndex
+                || !utxo.getAddress().equals(address)) {
+            throw refuse(Refusal.UTXO_DOES_NOT_MATCH_ASSESSMENT,
+                    "%s utxo %s at %s is not the assessed %s#%d at %s"
+                            .formatted(what, utxoRef(utxo), utxo.getAddress(), txHash, outputIndex, address));
+        }
+    }
+
+    private static void requireQuantity(Utxo utxo, String unit, BigInteger expected, String what) {
+        BigInteger actual = utxo.getAmount().stream()
+                .filter(amount -> unit.equals(amount.getUnit()))
+                .map(Amount::getQuantity)
+                .reduce(BigInteger.ZERO, BigInteger::add);
+        if (!actual.equals(expected)) {
+            throw refuse(Refusal.UTXO_DOES_NOT_MATCH_ASSESSMENT,
+                    "%s in %s is %s, the assessment says %s".formatted(what, utxoRef(utxo), actual, expected));
+        }
+    }
+
+    private static RefusedException refuse(Refusal reason, String detail) {
+        log.debug("refusing to build a Liquidate transaction — {}: {}", reason, detail);
+        return new RefusedException(reason, detail);
+    }
+
+    private static RefusedException refuse(Refusal reason, String detail, Throwable cause) {
+        log.debug("refusing to build a Liquidate transaction — {}: {}", reason, detail, cause);
+        return new RefusedException(reason, detail, cause);
+    }
+}
