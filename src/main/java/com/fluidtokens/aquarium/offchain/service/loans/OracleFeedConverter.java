@@ -71,9 +71,13 @@ public final class OracleFeedConverter {
      * it only means something relative to a specific transaction's reference inputs, which this
      * class has no view of. Resolving the real index is T-008's job.
      * <p>
-     * Because there is no signature, there is also no oracle-imposed validity window: the caller
-     * (T-008's transaction builder) picks {@code validFrom}/{@code validTo} itself by constructing
-     * the feed with {@link OraclePriceFeed#priceDataCharlie}; nothing extra is needed here.
+     * Because there is no signature, there is no oracle-imposed validity window <em>enforced by a
+     * signed message</em> — but whether the validator imposes one anyway by checking against the
+     * Charli3 provider datum is unverifiable from this repo (no {@code validators/oracle.ak}, no
+     * provider datum). Until that is checked, the caller (T-008's transaction builder) must
+     * construct the feed with {@link OraclePriceFeed#priceDataCharlie} using exactly the
+     * registry-published {@code validFrom}/{@code validTo}, not a window of its own choosing;
+     * nothing extra is needed here.
      */
     public static PlutusData toPlutusData(OraclePriceFeed feed, long providerRefInputIndex) {
         if (feed.variant() != OraclePriceFeed.Variant.PRICE_DATA_CHARLIE) {

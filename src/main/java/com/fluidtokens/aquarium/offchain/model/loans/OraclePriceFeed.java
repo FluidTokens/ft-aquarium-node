@@ -54,10 +54,13 @@ public record OraclePriceFeed(Variant variant,
      * c3 feeds are unsigned, and that has a real consequence for the window: {@code validFrom}/
      * {@code validTo} on a signed feed come from a message someone actually signed, so no caller
      * of this repo picks them freely — {@code FluidOracleClient} merely relays whatever the
-     * registry published. A c3 feed carries no such signature to relay, so at transaction-build
-     * time a builder (T-008) that needs a specific window is free to construct a fresh feed with
-     * one of its own choosing via this factory, rather than being bound to a previously observed
-     * window the way it would be for a signed variant.
+     * registry published. A c3 feed carries no such signature to relay, but whether that also
+     * means a T-008 builder is free to pick its own window is <b>not something this repo can
+     * verify</b>: neither {@code validators/oracle.ak} nor the Charli3 provider datum it checks
+     * against are available here, and the validator may well bind the window to that provider
+     * datum rather than accepting anything the builder writes. Until that is checked against the
+     * real validator, a builder must use exactly the registry-published {@code validFrom}/
+     * {@code validTo} for this variant too, the same as for a signed one.
      */
     public static OraclePriceFeed priceDataCharlie(AssetType token, BigInteger priceInLovelaces,
                                                    BigInteger priceDenominator, long validFrom, long validTo) {
