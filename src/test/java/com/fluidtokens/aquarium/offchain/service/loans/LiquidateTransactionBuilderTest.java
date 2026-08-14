@@ -326,21 +326,27 @@ class LiquidateTransactionBuilderTest {
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))));
 
-        // ClaimData is in final loan-input order, each pointing at its own bond output.
-        ClaimData claimA = new ClaimData(LoanFixtures.liquidation(), BigInteger.ONE, BigInteger.ZERO,
+        // ClaimData is in final loan-input order, each pointing at its own bond output. Loan A's
+        // echo is at 2 and loan B's at 1, because the echoes go out in *bond*-input order — see the
+        // output assertions below.
+        ClaimData claimA = new ClaimData(LoanFixtures.liquidation(), BigInteger.TWO, BigInteger.ZERO,
                 BigInteger.ZERO, a.bond().bond().datum().lenderAuth(), a.assessment().equity(), LOAN_ID_A,
                 a.assessment().remainingDebt());
-        ClaimData claimB = new ClaimData(LoanFixtures.liquidation(), BigInteger.TWO, BigInteger.ZERO,
+        ClaimData claimB = new ClaimData(LoanFixtures.liquidation(), BigInteger.ONE, BigInteger.ZERO,
                 BigInteger.ZERO, b.bond().bond().datum().lenderAuth(), b.assessment().equity(), LOAN_ID_B,
                 b.assessment().remainingDebt());
         assertEquals(hex(LiquidationTxEncoder.loanClaimActionWithdrawRedeemer(0, List.of(claimA, claimB))),
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))));
 
-        // Outputs 1 and 2 are loan A's and loan B's bond echoes, matching lenderBondOutputIndex.
-        assertEquals(a.bond().utxo().getInlineDatum().toLowerCase(),
-                tx.getBody().getOutputs().get(1).getInlineDatum().serializeToHex().toLowerCase());
+        // Outputs 1 and 2 are the bond echoes in *bond-input* order — B's (bb) then A's (dd), not
+        // the loan order the claims are in. lm_liquidate_action reads the echo as
+        // `lenderBondOutputs[lenderBondIndex]` with the index it used on the identically filtered
+        // input list, so the k-th bond output must echo the k-th bond input. Emitting them in loan
+        // order instead is rejected on chain (proved by LiquidateDryEvalTest).
         assertEquals(b.bond().utxo().getInlineDatum().toLowerCase(),
+                tx.getBody().getOutputs().get(1).getInlineDatum().serializeToHex().toLowerCase());
+        assertEquals(a.bond().utxo().getInlineDatum().toLowerCase(),
                 tx.getBody().getOutputs().get(2).getInlineDatum().serializeToHex().toLowerCase());
 
         assertEquals(2, tx.getBody().getMint().getFirst().getAssets().size(), "both loan NFTs burn");

@@ -37,8 +37,11 @@ import org.cardanofoundation.conversions.CardanoConverters;
 import org.cardanofoundation.conversions.ClasspathConversionsFactory;
 import org.cardanofoundation.conversions.domain.NetworkType;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -348,6 +351,45 @@ public final class LoanFixtures {
     public static Utxo adaUtxo(String txHash, int outputIndex, String address, long lovelace) {
         return utxo(txHash, outputIndex, address,
                 List.of(Amount.lovelace(BigInteger.valueOf(lovelace))), null);
+    }
+
+    // ---- the two config reference inputs, with the datums the chain really carries ------------
+
+    /**
+     * A committed fixture under {@code src/test/resources/loans-v4}, read as a trimmed string.
+     */
+    public static String fixture(String name) {
+        try (InputStream is = LoanFixtures.class.getResourceAsStream("/loans-v4/" + name)) {
+            if (is == null) {
+                throw new IllegalStateException("missing fixture /loans-v4/" + name);
+            }
+            return new String(is.readAllBytes(), StandardCharsets.UTF_8).trim();
+        } catch (IOException e) {
+            throw new IllegalStateException("cannot read fixture " + name, e);
+        }
+    }
+
+    /**
+     * The main config reference input as {@code utils.get_config_as_data_list} needs to see it: the
+     * config NFT in the value (the {@code quantity_of(..) > 0} expectation) and the
+     * <em>real</em> preview {@code ConfigDatum} inline
+     * ({@code src/test/resources/loans-v4/preview-config-datum.hex}, the same bytes
+     * {@code LoansConfigVerifierTest} verifies the derivation against).
+     */
+    public static Utxo configUtxo(String txHash, int outputIndex) {
+        return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, fixture("preview-config-datum.hex"));
+    }
+
+    /** The LenderManager config reference input, carrying the real preview {@code LMConfigDatum}. */
+    public static Utxo lmConfigUtxo(String txHash, int outputIndex) {
+        return configUtxo(txHash, outputIndex, LM_CONFIG_POLICY_ID, fixture("preview-lm-config-datum.hex"));
+    }
+
+    private static Utxo configUtxo(String txHash, int outputIndex, String policyId, String datumHex) {
+        return utxo(txHash, outputIndex, entAddress(policyId),
+                List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)),
+                        Amount.asset(policyId + CONFIG_ASSET_NAME, BigInteger.ONE)),
+                datumHex);
     }
 
     /**

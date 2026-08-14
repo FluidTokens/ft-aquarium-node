@@ -113,11 +113,27 @@ import java.util.stream.Stream;
  * first time only to observe where the bond echoes landed. V5 re-derives all of it from the
  * finished body, and finds the asset-manager outputs by their datum rather than by an offset.
  *
- * <h2>Left for slice C (on-chain evaluation)</h2>
- * Claims made here are structural, not validator-correctness. Three specific things are
- * arbitrated by evaluating a real transaction, and are called out again at their use sites:
- * {@code LoanMintRedeemer.isPoolOrigin}/{@code originWithdrawRedeemerIndex}, the two opaque
- * asset-manager action byte strings, and the output layout above.
+ * <h2>What on-chain evaluation settled</h2>
+ * Claims made here are structural, not validator-correctness. {@code LiquidateDryEvalTest} runs the
+ * transaction this class builds through the real PlutusV3 machine against the deployed validators,
+ * and that is what settled the four things this javadoc used to leave open:
+ * <ul>
+ *   <li>{@code LoanMintRedeemer.isPoolOrigin}/{@code originWithdrawRedeemerIndex} — accepted.
+ *       {@code loan.ak}'s {@code check_mint} only reads them when something is <em>minted</em>
+ *       ({@code quantity > 0}); a burn-only mint field short-circuits to {@code True}.</li>
+ *   <li>The two asset-manager action byte strings — accepted (see {@link LiquidationTxEncoder}).</li>
+ *   <li>Writing zero for an ada leg's oracle reference index — accepted:
+ *       {@code retrieve_oracle_data} returns the synthesised 1:1 feed from its
+ *       {@code expectedTokenPolicyId == ""} branch without reading the index.</li>
+ *   <li>The output layout — <b>corrected</b>. The bond echoes have to go out in bond-input order,
+ *       not loan-input order; see the comment at their emission site.</li>
+ * </ul>
+ * One thing evaluation settled the other way: a batch containing a loan with a <em>positive
+ * equity</em> is not satisfiable by the deployed validators in any output order, because
+ * {@code lm_liquidate_action} and {@code loan_claim_action} both demand the index-th asset-manager
+ * output and want different datums in it. This class still builds one — refusing would need a new
+ * {@link Refusal} constant, and that decision is not this class's to take unilaterally — so the
+ * caller is responsible for not scheduling one until FluidTokens redeploys.
  */
 @Slf4j
 public final class LiquidateTransactionBuilder {
@@ -907,19 +923,28 @@ public final class LiquidateTransactionBuilder {
         // mint field, so one policy means exactly one Mint redeemer.
         //
         // isPoolOrigin=false / originWithdrawRedeemerIndex=0 are the plain non-pool liquidation
-        // case as this workstream understands it; both are arbitrated by slice C's on-chain
-        // evaluation, not by anything provable off chain.
+        // case. On-chain evaluation accepts them, and loan.ak's check_mint explains why they are
+        // inert here: it only reads either field once something is minted (quantity > 0), and a
+        // Liquidate mints nothing — the mint field holds burns only.
         List<Asset> burns = loanOrder.stream()
                 .map(loan -> new Asset("0x" + loan.loan().loanId(), BigInteger.ONE.negate()))
                 .toList();
         tx.mintAsset(registry.getLoanScript(), burns,
                 LiquidationTxEncoder.loanMintRedeemer(configRefIndex, false, 0));
 
-        // Outputs, in loan-input order: every bond echo, then every collateral output, then the
-        // equity outputs of the loans that have one.
-        for (VettedLoan loan : loanOrder) {
-            tx.payToContract(loan.bondUtxo().getAddress(), List.copyOf(loan.bondUtxo().getAmount()),
-                    loan.bondDatum());
+        // Outputs: every bond echo, then every collateral output, then the equity outputs of the
+        // loans that have one.
+        //
+        // The bond echoes go out in *bond-input* order, not loan-input order. lm_liquidate_action
+        // reads the echo as `safe_list_at(lenderBondOutputs, lenderBondIndex)` where
+        // lenderBondOutputs is the outputs filtered by the LenderManager spend credential and
+        // lenderBondIndex is the index into the identically filtered *inputs* — so the k-th bond
+        // output must be the echo of the k-th bond input. Emitting them in loan order passes every
+        // off-chain structural check and is rejected on chain the moment the two orders differ
+        // (slice C, N=2: Withdraw redeemer 2 / lm_liquidate_action, EvaluationFailure).
+        for (VettedLoan bond : bondOrder) {
+            tx.payToContract(bond.bondUtxo().getAddress(), List.copyOf(bond.bondUtxo().getAmount()),
+                    bond.bondDatum());
         }
         for (VettedLoan loan : loanOrder) {
             tx.payToContract(loan.assetManagerAddress(),
@@ -1132,6 +1157,7 @@ public final class LiquidateTransactionBuilder {
                 .sorted(new TransactionInputComparator())
                 .toList();
         List<TransactionOutput> outputs = transaction.getBody().getOutputs();
+        String lenderManagerCredential = registry.getLenderManagerSpendScriptHash();
 
         // The reference-input set every index above was computed from must be the one that ended up
         // in the body — nothing may have been added or dropped along the way.
@@ -1173,6 +1199,27 @@ public final class LiquidateTransactionBuilder {
                 "loan inputs are not in canonical order in the body");
         structural(filteredOrderMatches(sortedInputs, bondOrder, VettedLoan::bondUtxo),
                 "bond inputs are not in canonical order in the body");
+
+        // lm_liquidate_action pairs the two LenderManager-credential lists positionally: the echo it
+        // reads for a loan is `lenderBondOutputs[lenderBondIndex]`, with the same index it used to
+        // pick `lenderBondInputs[lenderBondIndex]`. So the k-th bond output in body order must be
+        // the echo of the k-th bond input in canonical order, for every k.
+        List<TransactionOutput> bondOutputs = outputs.stream()
+                .filter(output -> lenderManagerCredential.equals(paymentCredentialOf(output.getAddress())))
+                .toList();
+        structural(bondOutputs.size() == bondOrder.size(),
+                "%d outputs at the LenderManager credential for %d bond inputs"
+                        .formatted(bondOutputs.size(), bondOrder.size()));
+        for (int i = 0; i < bondOrder.size(); i++) {
+            Utxo bondInput = bondOrder.get(i).bondUtxo();
+            TransactionOutput bondOutput = bondOutputs.get(i);
+            structural(bondOutput.getAddress().equals(bondInput.getAddress())
+                            && sameValue(bondOutput, bondInput)
+                            && bondOutput.getInlineDatum() != null
+                            && bondOutput.getInlineDatum().serializeToHex()
+                            .equalsIgnoreCase(bondInput.getInlineDatum()),
+                    "bond output %d is not the echo of bond input %s".formatted(i, utxoRef(bondInput)));
+        }
 
         for (int i = 0; i < loanOrder.size(); i++) {
             VettedLoan loan = loanOrder.get(i);
@@ -1337,6 +1384,11 @@ public final class LiquidateTransactionBuilder {
     }
 
     // ---- small helpers -------------------------------------------------------------------------
+
+    /** The payment credential of a bech32 address, as the hex hash the registry speaks in. */
+    private static String paymentCredentialOf(String address) {
+        return new Address(address).getPaymentCredentialHash().map(HexUtil::encodeHexString).orElse(null);
+    }
 
     private static TransactionInput inputOf(Utxo utxo) {
         return new TransactionInput(utxo.getTxHash(), utxo.getOutputIndex());

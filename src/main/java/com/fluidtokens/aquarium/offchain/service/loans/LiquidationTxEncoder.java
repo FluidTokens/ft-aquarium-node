@@ -38,16 +38,28 @@ public final class LiquidationTxEncoder {
      * ASCII {@code "claimed_collateral"} — the asset-manager action for the collateral an
      * unaffected liquidation claims outright. Extracted from the deployed {@code compiledCode}:
      * {@code asset_manager.ak} actions are opaque {@code ByteArray}s, not an enum with a schema,
-     * so there is nothing here for {@code LiquidationTxEncoderSchemaTest} to pin. Slice C's
-     * on-chain evaluation of a real {@code Liquidate} transaction is the final arbiter that this
-     * is the exact byte string the validator expects.
+     * so there is nothing here for {@code LiquidationTxEncoderSchemaTest} to pin.
+     * <p>
+     * <b>Arbitrated.</b> {@code LiquidateDryEvalTest} runs a real {@code Liquidate} through the
+     * PlutusV3 machine and {@code lm_liquidate_action}'s {@code validate_repayment_output} accepts
+     * the datum, which it does by {@code builtin.equals_data} against a datum carrying
+     * {@code constants.action_claimed_collateral} — so this is the exact byte string.
      */
     public static final String CLAIMED_COLLATERAL_ACTION_HEX = "636c61696d65645f636f6c6c61746572616c";
 
     /**
      * ASCII {@code "partial_liquidation"} — the asset-manager action for the compensation a
-     * lender owes back on a partial liquidation. Same provenance and caveat as
+     * lender owes back on a partial liquidation. Same provenance as
      * {@link #CLAIMED_COLLATERAL_ACTION_HEX}.
+     * <p>
+     * <b>Arbitrated, indirectly.</b> A positive-equity {@code Liquidate} is not satisfiable at the
+     * deployed pin at all (two validators claim the same asset-manager output slot — see
+     * {@code LiquidateDryEvalTest#positiveEquityIsUnsatisfiableBecauseTwoValidatorsClaimTheSameAssetManagerOutputSlot}),
+     * so it cannot be arbitrated by a passing transaction. It is arbitrated by which validator
+     * refuses: with the compensation output in the slot {@code loan_claim_action} reads,
+     * {@code loan_claim_action} — whose {@code equity_sent_to_borrower} compares the datum against
+     * one carrying {@code constants.action_partial_liquidation_compensation} — accepts it, and the
+     * refusal moves to {@code lm_liquidate_action}.
      */
     public static final String PARTIAL_LIQUIDATION_ACTION_HEX = "7061727469616c5f6c69717569646174696f6e";
 
