@@ -1,26 +1,34 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationDecision;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationExclusion;
+import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
@@ -33,19 +41,37 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The shadow liquidation loop: every cycle it scans every indexed lender bond, builds one real
- * {@code Liquidate} transaction per buildable candidate, prices it, and writes down what it would
- * have done.
+ * The liquidation loop: every cycle it scans every indexed lender bond, builds one real
+ * {@code Liquidate} transaction per buildable candidate, prices it, and either writes down what it
+ * would have done or — when every one of eight vetoes passes — signs it and submits it.
  *
- * <h2>It cannot submit</h2>
- * Not "does not" — <em>cannot</em>. This class holds no {@code BackendService}, nothing that
- * processes or transmits a transaction, and no {@code QuickTxBuilder}; the only thing it can do
- * with a {@link Transaction} is read it. {@link LiquidateTransactionBuilder} likewise takes a
- * {@link com.bloxbean.cardano.client.api.UtxoSupplier} and a
- * {@link com.bloxbean.cardano.client.api.ProtocolParamsSupplier} and nothing that can reach the
- * network for writing. Arming the bot is a later slice and will have to <em>add</em> a submission
- * path, which is exactly the property worth having: no reviewer has to check that such a call is
- * guarded correctly, because there is no such call anywhere on this path.
+ * <h2>The veto chain is the whole safety story</h2>
+ * Submitting is the irreversible act: it burns the loan NFT and moves someone's collateral. Failing
+ * to submit costs a cycle. So the eight checks in {@link #verdict} are enumerated explicitly,
+ * evaluated in order, and every one of them resolves to <em>not submitting</em> when it cannot be
+ * established — a Blockfrost timeout fetching protocol parameters is not evidence that the
+ * transaction fits, and an oracle client that is not there is not evidence that its feed is fresh.
+ * <p>
+ * They are independent by construction: none is inferred from another's arithmetic. In particular
+ * {@code TX_TOO_LARGE} measures the serialised transaction against the live {@code maxTxSize} and
+ * has nothing to do with {@code NOT_PROFITABLE}'s fee arithmetic, even though an oversized
+ * transaction usually also carries a large fee.
+ *
+ * <h2>What is submitted is what was vetted</h2>
+ * The transaction handed to {@link #submit} is the same {@link Transaction} object
+ * {@link LiquidateTransactionBuilder} returned and every veto ran against. The one transformation
+ * applied to it is {@code account.sign(transaction)}, which adds exactly one vkey witness and leaves
+ * the body bytes untouched (cardano-client-lib's {@code TransactionSigner} splices the witness into
+ * the original serialisation), so the submitted transaction has the hash the decision records.
+ * <p>
+ * This class <em>does</em> hold a {@link LiquidateTransactionBuilder} — it is what produced the
+ * transaction in the first place — so the guarantee is not "nothing here could rebuild". It is
+ * narrower and checkable: {@link #verdict} and {@link #submit} never receive the
+ * {@link LiquidateTransactionBuilder.Request}, so neither has the inputs a rebuild would need, and
+ * the only thing this class can reach the network with is a {@link TransactionSubmitter}, whose
+ * single method takes bytes. The property is enforced where properties of this kind have to be:
+ * by a test. {@code LiquidationSubmitVetoTest} signs the recorded CBOR independently and compares
+ * the result byte for byte with what reached the submitter.
  *
  * <h2>Shaped like {@code ScheduledTransactionService}, not shared with it</h2>
  * The syncing guard, the ada-only wallet UTxO selection and the per-item try/catch mirror
@@ -70,7 +96,6 @@ import java.util.concurrent.TimeUnit;
  * failure model exists that can, N stays 1.
  */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class LiquidationExecutor {
@@ -91,6 +116,59 @@ public class LiquidationExecutor {
      */
     private static final long VALID_FROM_BACKDATE_MILLIS = 30_000L;
 
+    /** The one network this epic is allowed to submit on. */
+    static final String SUBMITTABLE_NETWORK = "preview";
+
+    /**
+     * The eight submit vetoes, in the order they are evaluated. Each is a separate, named reason
+     * this candidate was not submitted; a decision carries exactly the first one that fired.
+     */
+    public enum SubmitVeto {
+        /** S1 — {@code loans.liquidation.mode} is not {@code live}. */
+        MODE_NOT_LIVE,
+        /** S2 — {@code loans.liquidation.enabled} is false. */
+        NOT_ARMED,
+        /** S3 — the node is not on preview. */
+        NETWORK_NOT_PREVIEW,
+        /** S4 — expected profit is not strictly positive. */
+        NOT_PROFITABLE,
+        /** S5 — the serialised transaction is over the live {@code maxTxSize}, or it could not be read. */
+        TX_TOO_LARGE,
+        /** S6 — a feed this candidate prices against has less than the margin of window left, now. */
+        ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT,
+        /** S7 — the loan or bond UTxO is no longer unspent, or that could not be established. */
+        STALE_UTXO,
+        /**
+         * S8 — the built transaction's own validity interval has already ended, or its end could not
+         * be read.
+         * <p>
+         * Not a duplicate of S6, and the gap it closes is a real one. S6 can only speak about loans
+         * that have an oracle feed; <b>an ada/ada loan has no feed at all</b>, so before S8 there was
+         * no submit-time staleness check whatsoever on exactly the shape that actually builds today.
+         * The direction was already safe — an expired transaction is refused in phase 1 and costs
+         * nothing — but "we submitted a transaction we knew had expired" is not a thing this loop
+         * should do, and the contract's intent was staleness protection at submit time.
+         * <p>
+         * Evaluated last on purpose. Where a feed exists, S6's firing region is contained in this
+         * one (the builder demands {@code feed.validTo >= tx.validTo + margin}, so a feed can only
+         * run short after the transaction has expired), and the more specific reason is the more
+         * useful one to report.
+         */
+        TRANSACTION_WINDOW_ELAPSED
+    }
+
+    /**
+     * Everything this class can do to the network: hand over bytes. Deliberately not a
+     * {@code BackendService} — a submitter cannot build, balance, evaluate or re-fetch anything, so
+     * "the bytes submitted are the bytes vetted" is a property of the wiring rather than of care.
+     */
+    @FunctionalInterface
+    public interface TransactionSubmitter {
+
+        /** @return the backend's verdict; the value on success is the transaction hash */
+        Result<String> submit(byte[] signedTransactionBytes) throws Exception;
+    }
+
     private final AppConfig.LiquidationConfiguration configuration;
 
     private final BlockEventListener blockEventListener;
@@ -109,8 +187,92 @@ public class LiquidationExecutor {
 
     private final ObjectProvider<FluidOracleClient> oracleClient;
 
+    private final AppConfig.Network network;
+
+    private final ProtocolParamsSupplier protocolParamsSupplier;
+
+    private final TransactionSubmitter submitter;
+
+    /**
+     * Slot-to-wall-clock conversion, so S8 can read the validity end off the transaction body rather
+     * than trusting the millisecond window that was <em>requested</em>. The builder clamps that
+     * window inwards to whole slots, so the requested end is always at or after the real one — using
+     * it would let a transaction that has genuinely expired through by up to one slot.
+     */
+    private final CardanoConverters converters;
+
     /** Loan UTxO ref to the epoch-millis at which its quarantine lapses. */
     private final Map<String, Long> quarantine = new ConcurrentHashMap<>();
+
+    /**
+     * The clock the submit-time checks read, as opposed to the cycle's own {@code now}.
+     * <p>
+     * The two are genuinely different instants and the difference is the whole point of S6. A cycle
+     * scans, resolves UTxOs, fetches protocol parameters and evaluates scripts before it gets
+     * anywhere near submitting, and every one of those is a Blockfrost round trip; re-checking the
+     * oracle windows against the instant the cycle <em>started</em> would be re-checking nothing.
+     * Package-private and settable so a test can advance it without waiting.
+     */
+    private java.util.function.LongSupplier submitClock = System::currentTimeMillis;
+
+    void setSubmitClock(java.util.function.LongSupplier submitClock) {
+        this.submitClock = submitClock;
+    }
+
+    /**
+     * The wiring Spring uses. The {@link BFBackendService} is narrowed to a
+     * {@link TransactionSubmitter} here and nowhere else, so the only field of this class that
+     * can reach the network is that one-method submitter. (The class does hold a
+     * {@link LiquidateTransactionBuilder}; see the class javadoc for what is and is not
+     * guaranteed by that.)
+     */
+    @Autowired
+    public LiquidationExecutor(AppConfig.LiquidationConfiguration configuration,
+                               BlockEventListener blockEventListener,
+                               AppUtxoService appUtxoService,
+                               Account account,
+                               LiquidationCandidateScanner scanner,
+                               LiquidationUtxoResolver utxoResolver,
+                               LiquidateTransactionBuilder builder,
+                               LiquidationDecisionLog decisionLog,
+                               ObjectProvider<FluidOracleClient> oracleClient,
+                               AppConfig.Network network,
+                               ProtocolParamsSupplier protocolParamsSupplier,
+                               CardanoConverters converters,
+                               BFBackendService backendService) {
+        this(configuration, blockEventListener, appUtxoService, account, scanner, utxoResolver, builder,
+                decisionLog, oracleClient, network, protocolParamsSupplier, converters,
+                bytes -> backendService.getTransactionService().submitTransaction(bytes));
+    }
+
+    /** The same loop with the submitter stated, so a test can watch exactly what reaches the wire. */
+    public LiquidationExecutor(AppConfig.LiquidationConfiguration configuration,
+                               BlockEventListener blockEventListener,
+                               AppUtxoService appUtxoService,
+                               Account account,
+                               LiquidationCandidateScanner scanner,
+                               LiquidationUtxoResolver utxoResolver,
+                               LiquidateTransactionBuilder builder,
+                               LiquidationDecisionLog decisionLog,
+                               ObjectProvider<FluidOracleClient> oracleClient,
+                               AppConfig.Network network,
+                               ProtocolParamsSupplier protocolParamsSupplier,
+                               CardanoConverters converters,
+                               TransactionSubmitter submitter) {
+        this.configuration = configuration;
+        this.blockEventListener = blockEventListener;
+        this.appUtxoService = appUtxoService;
+        this.account = account;
+        this.scanner = scanner;
+        this.utxoResolver = utxoResolver;
+        this.builder = builder;
+        this.decisionLog = decisionLog;
+        this.oracleClient = oracleClient;
+        this.network = network;
+        this.protocolParamsSupplier = protocolParamsSupplier;
+        this.converters = converters;
+        this.submitter = submitter;
+    }
 
     @Scheduled(timeUnit = TimeUnit.SECONDS, fixedDelayString = "${loans.liquidation.delay-seconds}")
     public void runCycle() {
@@ -231,9 +393,11 @@ public class LiquidationExecutor {
                 now - VALID_FROM_BACKDATE_MILLIS,
                 now + configuration.getValidityWindowSeconds() * 1000L,
                 configuration.getOracleWindowMarginSeconds() * 1000L,
-                // Reference scripts are a later slice. With none published every validator travels
-                // in the witness set, which is what makes tx_size_bytes worth reporting.
-                LiquidateTransactionBuilder.ReferenceScripts.none());
+                // Whatever loans.liquidation.reference-scripts.* names. Every unset one means that
+                // validator travels in the witness set instead, which is legal and much larger —
+                // with none set at all the transaction cannot fit under maxTxSize, and the
+                // TX_TOO_LARGE veto below is what says so.
+                configuration.getReferenceScripts());
 
         Transaction transaction;
         try {
@@ -260,7 +424,8 @@ public class LiquidationExecutor {
     }
 
     /**
-     * Prices the built transaction and files the verdict.
+     * Prices the built transaction, runs the submit vetoes, and either submits it or files the
+     * verdict saying why it did not.
      * <p>
      * The bot's whole take is the liquidation fee slice, denominated in the <em>collateral</em>
      * asset, so it has to be priced through the collateral leg's feed before it can be compared with
@@ -278,11 +443,6 @@ public class LiquidationExecutor {
         BigInteger margin = configuration.getProfitMarginLovelace();
         BigInteger expectedProfit = expectedFee.subtract(txFee).subtract(margin);
 
-        boolean profitable = expectedProfit.signum() > 0;
-        LiquidationDecision.Outcome outcome = profitable
-                ? LiquidationDecision.Outcome.WOULD_SUBMIT
-                : LiquidationDecision.Outcome.UNPROFITABLE;
-
         String detail = "fee slice %s lovelace - tx fee %s - margin %s = %s"
                 .formatted(expectedFee, txFee, margin, expectedProfit);
 
@@ -293,13 +453,21 @@ public class LiquidationExecutor {
             size = bytes.length;
             cborHex = transaction.serializeToHex();
         } catch (Exception e) {
-            // The transaction exists but cannot be measured; the verdict still stands, so it is
-            // recorded without the fields that could not be produced.
+            // The transaction exists but cannot be measured — which is also the S5 evidence, so
+            // there is nothing here that could ever be submitted. The pricing verdict still stands
+            // and is recorded without the fields that could not be produced.
             log.warn("could not serialise the built liquidation of {}: {}",
                     assessment.loan().utxoRef(), e.toString());
-            decisionLog.record(decision(assessment, now, outcome, outcome.name(), detail));
+            LiquidationDecision.Outcome unmeasured = expectedProfit.signum() > 0
+                    ? LiquidationDecision.Outcome.WOULD_SUBMIT
+                    : LiquidationDecision.Outcome.UNPROFITABLE;
+            decisionLog.record(decision(assessment, now, unmeasured, unmeasured.name(), detail,
+                    SubmitVeto.TX_TOO_LARGE));
             return;
         }
+
+        Verdict verdict = verdict(assessment, now, transaction, oraclesByUnit, expectedProfit, size,
+                detail);
 
         decisionLog.record(new LiquidationDecision(
                 now,
@@ -307,9 +475,9 @@ public class LiquidationExecutor {
                 assessment.loan().utxoRef(),
                 assessment.bond().utxoRef(),
                 LiquidationDecision.VARIANT,
-                outcome,
-                outcome.name(),
-                detail,
+                verdict.outcome(),
+                verdict.outcome().name(),
+                verdict.detail(),
                 assessment.late(),
                 assessment.remainingDebt(),
                 assessment.equity(),
@@ -327,10 +495,256 @@ public class LiquidationExecutor {
                 transaction.getBody().getReferenceInputs().size(),
                 transaction.getWitnessSet() == null || transaction.getWitnessSet().getRedeemers() == null
                         ? 0
-                        : transaction.getWitnessSet().getRedeemers().size()));
+                        : transaction.getWitnessSet().getRedeemers().size(),
+                verdict.veto() == null ? null : verdict.veto().name()));
 
-        log.info("liquidation of {} would {}: {} ({} bytes)", assessment.loan().utxoRef(),
-                outcome, detail, size);
+        log.info("liquidation of {}: {} ({}), {} ({} bytes)", assessment.loan().utxoRef(),
+                verdict.outcome(), verdict.veto(), verdict.detail(), size);
+    }
+
+    // ---- the submit vetoes --------------------------------------------------------------------
+
+    /** What this candidate's row says, and which veto — if any — produced it. */
+    private record Verdict(LiquidationDecision.Outcome outcome, SubmitVeto veto, String detail) {
+    }
+
+    /**
+     * Runs the veto chain and, only if all eight pass, signs and submits.
+     * <p>
+     * The mapping from veto to outcome is deliberate rather than uniform. S1–S3 are standing
+     * configuration — the bot is simply not armed for this node — so the row keeps saying what the
+     * <em>candidate</em> deserved ({@code WOULD_SUBMIT} / {@code UNPROFITABLE}) and names the veto
+     * alongside; that is exactly what shadow mode is for, and what makes "WOULD_SUBMIT next to
+     * armed:false" readable. S5–S8 are statements about this candidate at this instant on an
+     * otherwise armed node, and they get {@link LiquidationDecision.Outcome#SUBMIT_VETOED}.
+     */
+    private Verdict verdict(LiquidationAssessment assessment, long now, Transaction transaction,
+                            Map<String, OracleEntry> oraclesByUnit, BigInteger expectedProfit,
+                            int size, String detail) {
+        LiquidationDecision.Outcome shadowOutcome = expectedProfit.signum() > 0
+                ? LiquidationDecision.Outcome.WOULD_SUBMIT
+                : LiquidationDecision.Outcome.UNPROFITABLE;
+
+        // S1 — the mode.
+        if (configuration.getMode() != AppConfig.LiquidationConfiguration.Mode.LIVE) {
+            return new Verdict(shadowOutcome, SubmitVeto.MODE_NOT_LIVE, detail);
+        }
+        // S2 — the arming flag. Independent of S1 on purpose: two switches, so one flipped by
+        // accident does not arm the bot.
+        if (!configuration.isEnabled()) {
+            return new Verdict(shadowOutcome, SubmitVeto.NOT_ARMED, detail);
+        }
+        // S3 — the network. A second line behind loans.enabled=false on mainnet, not a restatement
+        // of it: this one is enforced here, in the code that would do the submitting.
+        String networkName = network == null ? null : network.getNetwork();
+        if (!SUBMITTABLE_NETWORK.equalsIgnoreCase(networkName)) {
+            return new Verdict(shadowOutcome, SubmitVeto.NETWORK_NOT_PREVIEW,
+                    "%s; network is %s, this epic submits only on %s"
+                            .formatted(detail, networkName, SUBMITTABLE_NETWORK));
+        }
+        // S4 — strictly positive. Breaking even is not a reason to move someone's collateral.
+        if (expectedProfit.signum() <= 0) {
+            return new Verdict(LiquidationDecision.Outcome.UNPROFITABLE, SubmitVeto.NOT_PROFITABLE,
+                    detail);
+        }
+        // S5 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
+        // from S4's arithmetic: a transaction can be handsomely profitable and still not fit.
+        Integer maxTxSize;
+        try {
+            maxTxSize = protocolParamsSupplier.getProtocolParams().getMaxTxSize();
+        } catch (Exception e) {
+            // Not knowing the limit is not evidence of being under it.
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, SubmitVeto.TX_TOO_LARGE,
+                    "%s; maxTxSize could not be fetched (%s), so the %d-byte transaction cannot be "
+                            .formatted(detail, e, size) + "cleared for submission");
+        }
+        if (maxTxSize == null) {
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, SubmitVeto.TX_TOO_LARGE,
+                    "%s; the protocol parameters carry no maxTxSize, so the %d-byte transaction "
+                            .formatted(detail, size) + "cannot be cleared for submission");
+        }
+        if (size > maxTxSize) {
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, SubmitVeto.TX_TOO_LARGE,
+                    "%s; %d bytes over the live maxTxSize of %d — publish the reference scripts"
+                            .formatted(detail, size, maxTxSize));
+        }
+        // S6 — the oracle windows, re-read against the clock NOW rather than against the window the
+        // transaction was built for. A build that started a minute ago proves nothing about the feed
+        // that is going to be evaluated when this lands in a block.
+        String oracleVeto = oracleWindowShortfall(assessment, submitClock.getAsLong(), oraclesByUnit);
+        if (oracleVeto != null) {
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED,
+                    SubmitVeto.ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT, detail + "; " + oracleVeto);
+        }
+        // S7 — the two UTxOs, re-read immediately before the wire. They were unspent when the build
+        // started; a block may have arrived since.
+        String staleVeto = staleUtxo(assessment);
+        if (staleVeto != null) {
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, SubmitVeto.STALE_UTXO,
+                    detail + "; " + staleVeto);
+        }
+
+        // S8 — the transaction's own validity interval. Last, so that where a feed exists S6 reports
+        // the more specific reason; but reached on every candidate, including the ada/ada ones S6
+        // has nothing to say about.
+        String elapsed = transactionWindowElapsed(transaction, submitClock.getAsLong());
+        if (elapsed != null) {
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED,
+                    SubmitVeto.TRANSACTION_WINDOW_ELAPSED, detail + "; " + elapsed);
+        }
+
+        return submit(assessment, now, transaction, detail);
+    }
+
+    /**
+     * S8. The end of the built body's validity interval, converted from its slot and compared with
+     * the clock now.
+     * <p>
+     * A body with no ttl is treated as a veto rather than as "never expires": this builder always
+     * sets one, so its absence means the transaction is not the one the vetoes were reasoning about.
+     * A conversion that throws is a veto for the standing reason — being unable to establish the
+     * check is failing it.
+     *
+     * @return null when the window is still open, otherwise why it is not
+     */
+    private String transactionWindowElapsed(Transaction transaction, long submitTime) {
+        Long ttlSlot = transaction.getBody().getTtl();
+        if (ttlSlot == null || ttlSlot <= 0) {
+            return "the built transaction carries no validity end, so it cannot be shown unexpired";
+        }
+        long validToMillis;
+        try {
+            LocalDateTime endsAt = converters.slot().slotToTime(ttlSlot);
+            validToMillis = endsAt.toInstant(ZoneOffset.UTC).toEpochMilli();
+        } catch (Exception e) {
+            return "slot %d could not be converted to a time (%s), so the validity end is unknown"
+                    .formatted(ttlSlot, e);
+        }
+        if (submitTime > validToMillis) {
+            return "the transaction's validity interval ended at %d (slot %d), %dms before submit time"
+                    .formatted(validToMillis, ttlSlot, submitTime - validToMillis);
+        }
+        return null;
+    }
+
+    /**
+     * S6. Every leg this loan prices against must still have at least the configured margin of feed
+     * window ahead of it at {@code now}. Ada legs are exempt for the reason
+     * {@link OraclePriceFeed#isSynthesisedUnitFeed()} gives: {@code retrieve_oracle_data} returns
+     * their 1:1 feed before it reaches any window check.
+     *
+     * @param submitTime the clock at the moment of submitting, not the cycle's {@code now}
+     * @return null when the windows are fine, otherwise why they are not
+     */
+    private String oracleWindowShortfall(LiquidationAssessment assessment, long submitTime,
+                                         Map<String, OracleEntry> oraclesByUnit) {
+        // An oracle registry we cannot consult is not a fresh one.
+        if (oracleClient.getIfAvailable() == null) {
+            return "the oracle registry client is unavailable, so no feed window can be re-checked";
+        }
+        long marginMillis = configuration.getOracleWindowMarginSeconds() * 1000L;
+        LoanDatum datum = assessment.loan().datum();
+        String principal = shortfall(datum.principalAsset().isAda(), datum.principalOracleAsset(),
+                "principal", submitTime, marginMillis, oraclesByUnit);
+        if (principal != null) {
+            return principal;
+        }
+        return shortfall(datum.collateral().isAda(), datum.collateral().oracleTokenAsset(),
+                "collateral", submitTime, marginMillis, oraclesByUnit);
+    }
+
+    private static String shortfall(boolean isAda, AssetType oracleToken, String which, long submitTime,
+                                    long marginMillis, Map<String, OracleEntry> oraclesByUnit) {
+        if (isAda) {
+            return null;
+        }
+        OracleEntry entry = oraclesByUnit == null ? null : oraclesByUnit.get(oracleToken.toUnit());
+        if (entry == null) {
+            // Unreachable through a successful build — the builder refuses ORACLE_ENTRY_MISSING for
+            // a non-ada leg with no entry in this very map, so by here it is present. Kept because
+            // the alternative on the submit path is a NullPointerException, and the rule for this
+            // chain is that not being able to check is failing the check.
+            return "the %s leg has no oracle entry to re-check".formatted(which);
+        }
+        long remaining = entry.feed().validTo() - submitTime;
+        if (remaining < marginMillis) {
+            return "the %s feed has %dms of window left at submit time, %dms required"
+                    .formatted(which, remaining, marginMillis);
+        }
+        return null;
+    }
+
+    /**
+     * S7. Both UTxOs, re-resolved against the local index immediately before signing. A resolver
+     * that throws is treated exactly like a spent UTxO: it did not say the output is still there.
+     *
+     * @return null when both are still unspent, otherwise why they are not
+     */
+    private String staleUtxo(LiquidationAssessment assessment) {
+        try {
+            if (utxoResolver.resolveLoanUtxo(assessment.loan()).isEmpty()) {
+                return "the loan utxo is no longer unspent";
+            }
+            if (utxoResolver.resolveBondUtxo(assessment.bond()).isEmpty()) {
+                return "the bond utxo is no longer unspent";
+            }
+            return null;
+        } catch (Exception e) {
+            return "the utxo re-check threw (" + e + "), so neither utxo could be confirmed unspent";
+        }
+    }
+
+    /**
+     * Signs the vetted transaction and hands it over. The only place in this codebase that transmits
+     * a liquidation.
+     * <p>
+     * {@code transaction} is the object every veto ran against, and {@code account.sign} splices one
+     * vkey witness into its own serialisation without touching the body — the fee the builder
+     * computed already accounts for exactly that one witness, and the payment key is the only one a
+     * {@code Liquidate} needs. Nothing is rebuilt, re-balanced or re-priced here; there is no
+     * builder on this class to do it with.
+     * <p>
+     * The loan UTxO is quarantined either way. That is what stops the next cycle re-deriving the
+     * same candidate from an index that has not yet seen the spend and submitting a second time: the
+     * quarantine is keyed on the loan UTxO ref, so it holds for that <em>output</em> until either
+     * the quarantine lapses or the output is genuinely gone from the index — at which point the
+     * scanner stops producing it anyway.
+     */
+    private Verdict submit(LiquidationAssessment assessment, long now, Transaction transaction,
+                           String detail) {
+        String loanUtxoRef = assessment.loan().utxoRef();
+        quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
+
+        byte[] signed;
+        try {
+            signed = account.sign(transaction).serialize();
+        } catch (Exception e) {
+            // Not one of the seven — those are all about whether submitting is *allowed*, and this
+            // is the machinery failing after they all said yes. It carries no veto name for exactly
+            // that reason, and it still transmits nothing.
+            log.warn("could not sign the liquidation of {}: {}", loanUtxoRef, e.toString());
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, null,
+                    detail + "; signing threw (" + e + "), nothing was transmitted");
+        }
+
+        try {
+            Result<String> result = submitter.submit(signed);
+            if (result != null && result.isSuccessful()) {
+                log.info("SUBMITTED liquidation of {}: tx {}", loanUtxoRef, result.getValue());
+                return new Verdict(LiquidationDecision.Outcome.SUBMITTED, null,
+                        detail + "; submitted as " + result.getValue());
+            }
+            String response = result == null ? "no response" : result.getResponse();
+            log.warn("submitting the liquidation of {} was rejected: {}", loanUtxoRef, response);
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
+                    detail + "; backend rejected it: " + response);
+        } catch (Exception e) {
+            // Transmitted or not — we do not know, which is exactly why the quarantine above was
+            // taken before the attempt rather than after it.
+            log.warn("submitting the liquidation of {} threw: {}", loanUtxoRef, e.toString());
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
+                    detail + "; submission threw: " + e);
+        }
     }
 
     private static OraclePriceFeed collateralFeed(LiquidationAssessment assessment,
@@ -352,6 +766,12 @@ public class LiquidationExecutor {
     private LiquidationDecision decision(LiquidationAssessment assessment, long now,
                                          LiquidationDecision.Outcome outcome, String reason,
                                          String detail) {
+        return decision(assessment, now, outcome, reason, detail, null);
+    }
+
+    private LiquidationDecision decision(LiquidationAssessment assessment, long now,
+                                         LiquidationDecision.Outcome outcome, String reason,
+                                         String detail, SubmitVeto veto) {
         return new LiquidationDecision(
                 now,
                 assessment.loan().loanId(),
@@ -368,7 +788,8 @@ public class LiquidationExecutor {
                 assessment.loan().datum().collateral().assetType().toUnit(),
                 null, null, null, null,
                 null, null, null,
-                null, null, null, null);
+                null, null, null, null,
+                veto == null ? null : veto.name());
     }
 
     // ---- cycle plumbing -----------------------------------------------------------------------

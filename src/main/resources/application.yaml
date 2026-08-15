@@ -81,6 +81,26 @@ loans:
     profit-margin-lovelace: ${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:1500000}
     decision-log-size: ${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}
     quarantine-minutes: ${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}
+    # Published reference-script UTxOs, one `txHash#index` per validator a Liquidate invokes. Empty
+    # means "not published" and that validator travels in the witness set instead.
+    #
+    # This is not a tuning knob, it is the difference between a buildable and an unbuildable
+    # transaction. Measured: the six applied validators total 18_584 bytes against a maxTxSize of
+    # 16_384, and a real single-loan liquidation measured in shadow mode came to 19_838 bytes with no
+    # reference scripts at all. Referencing them costs fee instead of size: at
+    # minFeeRefScriptCostPerByte 15, all six cost ~0.28 ADA per liquidation, which
+    # profit-margin-lovelace has to cover.
+    #
+    # No coordinates on mainnet: lending is disabled there, and a stale coordinate is worse than an
+    # absent one — LoansReferenceScriptVerifier hard-fails on a hash that does not match.
+    reference-scripts:
+      loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}
+      loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:}
+      lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:}
+      lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:}
+      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
+      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
+      asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:}
 
 scheduling:
   transaction-processor:
@@ -145,6 +165,24 @@ loans:
   # key keeps its base-document value.
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
+    # Six of the seven, verified on chain: each of these UTxOs publishes a reference_script_hash
+    # equal to the hash this repo derives for that validator, and LoansReferenceScriptVerifier
+    # re-checks that at every startup — a redeploy turns these into a hard startup failure, which is
+    # an answer and not an outage. asset-manager is deliberately left empty: a plain Liquidate only
+    # *creates* asset-manager outputs and never spends one, so its script is neither attached nor
+    # needed; publishing a coordinate for it would only add a reference input and its fee.
+    #
+    # Without these the transaction cannot fit: 18_584 bytes of validators against a 16_384-byte
+    # maxTxSize, and a measured 19_838-byte single-loan liquidation with none of them referenced.
+    # With them, the size moves into the fee — ~0.28 ADA per liquidation at
+    # minFeeRefScriptCostPerByte 15, which profit-margin-lovelace must cover.
+    reference-scripts:
+      loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:00a4e9f69c6ce80b8cb4fe7008a40a2f007aa53b25ec52ae30f11e701f7aa693#0}
+      loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:5c10900c23d16538bc518fa982f0d59a15908f0bb821860ddbef086346b669da#0}
+      lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:fe791b232b8ffcd31c72001a0a6345bc36101eac4d87133b0cf1a101024ffc07#0}
+      lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:13dd33290f62fe42dbbe7afc1d28505c025955bc55bd9b0a0ddff438663c2571#0}
+      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:b09e23dc5639642a4cbf112d39753c96ed0528115a8468b688b0e8cb19f243fe#0}
+      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:549b438c3a579a31cc4b7595f43c3af75bd02b237026583b834fc64349a47fe0#0}
   config:
     # Both config NFTs were minted in this single tx (block 4514052, slot 118496146).
     ref-utxo-tx-hash: 6de7b7ecc2c822526d08dc998731d9e133e13c80dea099fb87827336dca12094

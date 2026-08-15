@@ -10,9 +10,10 @@ import java.math.BigInteger;
  * watching a few hundred healthy loans would otherwise fill the whole log with
  * {@code NOT_LIQUIDATABLE} every cycle and evict the handful of rows an operator actually needs.
  * <p>
- * A decision is a <em>record of a judgement</em>, never a promise: {@link Outcome#WOULD_SUBMIT}
- * means the transaction was built, priced and found profitable, and then deliberately dropped.
- * Nothing in this workstream signs or submits one.
+ * A decision is a <em>record of a judgement</em>, and only ever a promise when it says
+ * {@link Outcome#SUBMITTED}: {@link Outcome#WOULD_SUBMIT} means the transaction was built, priced
+ * and found profitable, and then deliberately dropped because one of the submit vetoes fired —
+ * which one is in {@link #submitVeto}.
  *
  * @param decidedAt              epoch millis at which the decision was taken
  * @param loanUtxoRef            {@code txHash#index} of the loan UTxO
@@ -23,6 +24,10 @@ import java.math.BigInteger;
  * @param reason                 the machine-readable half: a {@code Refusal} name, an exception
  *                               class name, or the outcome's own name
  * @param detail                 the human half
+ * @param submitVeto             which of the seven submit vetoes stopped this candidate being
+ *                               submitted, or null — either because the candidate never reached the
+ *                               veto chain, or because every veto passed and a submission was
+ *                               attempted
  * @param expectedFeeLovelace    the liquidation fee slice priced through the collateral oracle;
  *                               null unless the transaction was built
  * @param txFeeLovelace          the fee the built body actually carries; null unless the
@@ -62,14 +67,43 @@ public record LiquidationDecision(long decidedAt,
                                   Integer inputs,
                                   Integer outputs,
                                   Integer referenceInputs,
-                                  Integer redeemers) {
+                                  Integer redeemers,
+                                  String submitVeto) {
 
     /** The only action this bot builds: the plain {@code Liquidate} of design §8. */
     public static final String VARIANT = "Liquidate";
 
     /**
-     * How far a candidate got. Deliberately has no {@code SUBMITTED}: this workstream cannot reach
-     * such a state, and a value nothing can produce is an invitation to write code that does.
+     * <b>Temporary back-compatibility. Remove at T-010.</b>
+     * <p>
+     * The 24-argument shape this record had before {@link #submitVeto} existed. It is here for one
+     * reason only: {@code LiquidationDecisionsEndpointTest} constructs decisions positionally and was
+     * outside the file allowlist of the slice that added the field, so changing the canonical
+     * constructor's arity would have meant editing a file that slice was not permitted to touch.
+     * <p>
+     * It has no production caller. When T-010 opens that test file, delete this constructor and let
+     * every caller state its veto — {@code null} included — explicitly.
+     */
+    public LiquidationDecision(long decidedAt, String loanId, String loanUtxoRef, String bondUtxoRef,
+                               String variant, Outcome outcome, String reason, String detail,
+                               Boolean late, BigInteger remainingDebt, BigInteger equity,
+                               BigInteger liquidationFee, String collateralUnit,
+                               BigInteger expectedFeeLovelace, BigInteger txFeeLovelace,
+                               BigInteger marginLovelace, BigInteger expectedProfitLovelace,
+                               String txHash, Integer txSizeBytes, String txCborHex, Integer inputs,
+                               Integer outputs, Integer referenceInputs, Integer redeemers) {
+        this(decidedAt, loanId, loanUtxoRef, bondUtxoRef, variant, outcome, reason, detail, late,
+                remainingDebt, equity, liquidationFee, collateralUnit, expectedFeeLovelace,
+                txFeeLovelace, marginLovelace, expectedProfitLovelace, txHash, txSizeBytes, txCborHex,
+                inputs, outputs, referenceInputs, redeemers, null);
+    }
+
+    /**
+     * How far a candidate got.
+     * <p>
+     * {@link #SUBMITTED} and {@link #SUBMIT_FAILED} are the only two states that imply the node
+     * transmitted anything, and reaching either takes all seven vetoes of
+     * {@code LiquidationExecutor} passing. Everything else is a record of a judgement.
      */
     public enum Outcome {
         /** One of the two UTxOs was no longer unspent; nothing was built. */
@@ -79,7 +113,22 @@ public record LiquidationDecision(long decidedAt,
         REFUSED,
         /** Built, but the fee slice does not cover the transaction's own fee plus the margin. */
         UNPROFITABLE,
-        /** Built and profitable. An armed bot would have submitted this one. */
-        WOULD_SUBMIT
+        /**
+         * Built and profitable, and not submitted because the bot is not armed for it — the mode is
+         * not live, the arming flag is off, or the network is not preview. {@link #submitVeto} names
+         * which. This is the shadow verdict: what an armed bot would have done.
+         */
+        WOULD_SUBMIT,
+        /**
+         * Built, profitable, armed — and still not submitted, because a veto about <em>this
+         * candidate at this instant</em> fired: the transaction is over maxTxSize, an oracle window
+         * is about to close, a UTxO moved, or one of those could not be established at all.
+         * {@link #submitVeto} names which. Every ambiguous case lands here.
+         */
+        SUBMIT_VETOED,
+        /** Signed and accepted by the backend. {@code txHash} is the hash that was submitted. */
+        SUBMITTED,
+        /** Signed and transmitted, and the backend rejected it. {@code detail} is its response. */
+        SUBMIT_FAILED
     }
 }

@@ -26,9 +26,9 @@ import java.util.Map;
  * it decided about each candidate it acted on.
  * <p>
  * This endpoint exists so the bot can be judged before it is armed. {@code armed} is the field that
- * matters — it is {@code false} for the whole shadow workstream, and a decision of
- * {@code WOULD_SUBMIT} next to {@code armed: false} is precisely the claim being made: the
- * transaction was built and priced, and then dropped.
+ * matters — with the shipped defaults it is {@code false}, and a decision of {@code WOULD_SUBMIT}
+ * next to {@code armed: false} is precisely the claim being made: the transaction was built and
+ * priced, and then dropped. {@code submit_veto} says which check dropped it.
  * <p>
  * The exclusion histogram and the decision list are complementary, not overlapping: every scanned
  * bond is either counted in {@code exclusions} or eligible to appear in {@code decisions}, so
@@ -79,7 +79,13 @@ public class LiquidationController {
                                Integer inputs,
                                Integer outputs,
                                Integer referenceInputs,
-                               Integer redeemers) {
+                               Integer redeemers,
+                               // Which of the seven submit vetoes stopped this candidate, or null:
+                               // either it never reached the veto chain, or every veto passed and a
+                               // submission was attempted. Read next to `outcome`: WOULD_SUBMIT with
+                               // MODE_NOT_LIVE is shadow working, SUBMIT_VETOED with TX_TOO_LARGE is
+                               // an armed bot declining.
+                               String submitVeto) {
     }
 
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
@@ -150,6 +156,7 @@ public class LiquidationController {
                 decision.inputs(),
                 decision.outputs(),
                 decision.referenceInputs(),
-                decision.redeemers());
+                decision.redeemers(),
+                decision.submitVeto());
     }
 }

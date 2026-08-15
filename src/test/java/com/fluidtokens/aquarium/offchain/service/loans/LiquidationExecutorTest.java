@@ -34,6 +34,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -48,10 +49,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * No Spring context and no Spring Boot test harness: every wire is visible in {@link #wiring}.
  *
  * <h2>The claim these tests exist to support</h2>
- * The loop can decide a liquidation is worth doing and still be incapable of doing it.
+ * The loop can decide a liquidation is worth doing and still not do it. Every wiring here is a
+ * <em>shadow</em> configuration on a preview node with real protocol parameters, so the mode is the
+ * only thing standing between these cycles and the wire — and the submitter they are given throws
+ * an {@link AssertionError} on contact.
  * {@link #aBuiltTransactionCarriesNoSignatureAndTheOutcomeIsOnlyEverWouldSubmit()} is the falsifiable
  * form of that: it takes the transaction the loop actually produced, parses it back out of the
  * recorded CBOR, and shows the witness set holds zero vkey witnesses.
+ * <p>
+ * The armed half — the seven submit vetoes and the submission itself — lives in
+ * {@link LiquidationSubmitVetoTest}.
  */
 class LiquidationExecutorTest {
 
@@ -397,9 +404,34 @@ class LiquidationExecutorTest {
         LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder, log, oracles);
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder, log, oracles,
+                previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
+                EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles);
     }
+
+    /**
+     * The node is on preview and the protocol parameters are real, so <em>nothing</em> about this
+     * wiring is what stops these cycles submitting — only the shadow mode is. Every test in this
+     * class therefore runs against a submitter that fails the test on contact.
+     */
+    private static AppConfig.Network previewNetwork() {
+        return new AppConfig.Network() {
+            @Override
+            public String getNetwork() {
+                return "preview";
+            }
+        };
+    }
+
+    /**
+     * The falsifiable form of "shadow mode cannot submit". Every wiring in this class gets this
+     * submitter; if any code path on the shadow tail ever reached the wire, the test that reached it
+     * would fail here rather than pass quietly.
+     */
+    private static final LiquidationExecutor.TransactionSubmitter EXPLODING_SUBMITTER = bytes -> {
+        throw new AssertionError("a shadow-mode cycle submitted " + bytes.length + " bytes");
+    };
 
     /** Both UTxOs of each scenario, as the resolver would report them when nothing has moved. */
     private static Map<String, Utxo> allUnspent(List<Scenario> scenarios) {
@@ -705,10 +737,15 @@ class LiquidationExecutorTest {
                         || built.getWitnessSet().getBootstrapWitnesses().isEmpty(),
                 "no bootstrap witness either");
 
-        // And there is no state this workstream could record that would claim a submission happened.
+        // A SUBMITTED state now exists, so the claim has to be made about this cycle rather than
+        // about the enum: the recorded outcome is not it, and the veto that stopped it is named.
+        assertNotEquals(LiquidationDecision.Outcome.SUBMITTED, decision.outcome());
+        assertNotEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, decision.outcome());
+        assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(), decision.submitVeto(),
+                "shadow mode is what stopped it — not the wallet, the network or the size");
         assertTrue(Arrays.stream(LiquidationDecision.Outcome.values())
-                        .noneMatch(outcome -> outcome.name().equals("SUBMITTED")),
-                "LiquidationDecision.Outcome must not offer a SUBMITTED state for this workstream");
+                        .anyMatch(outcome -> outcome.name().equals("SUBMITTED")),
+                "the SUBMITTED state is what slice 3 added; a workstream without it cannot arm");
 
         int size = decision.txSizeBytes();
         System.out.printf("OBSERVED tx_size_bytes for one ada/ada liquidation with "
@@ -955,6 +992,6 @@ class LiquidationExecutorTest {
         return new LiquidationDecision(NOW + i, String.valueOf(i), TX_LOAN + "#" + i, TX_BOND + "#" + i,
                 LiquidationDecision.VARIANT, LiquidationDecision.Outcome.NO_UTXO, "NO_UTXO", "detail",
                 null, null, null, null, AssetType.LOVELACE,
-                null, null, null, null, null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null, null, null, null);
     }
 }

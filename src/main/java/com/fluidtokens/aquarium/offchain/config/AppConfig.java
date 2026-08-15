@@ -2,6 +2,7 @@ package com.fluidtokens.aquarium.offchain.config;
 
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -194,15 +195,63 @@ public class AppConfig {
         @Value("${loans.liquidation.quarantine-minutes:30}")
         private long quarantineMinutes;
 
+        // ---- published reference scripts -----------------------------------------------------
+        //
+        // One `txHash#index` per validator a Liquidate transaction invokes. Empty means "not
+        // published": that validator travels in the witness set instead, which is a legal
+        // transaction and simply a much larger one. With none of them published the six applied
+        // validators (18_584 bytes, measured) blow straight past maxTxSize, so on any network where
+        // the bot is meant to actually submit, these have to be filled in.
+
+        @Value("${loans.liquidation.reference-scripts.loan:}")
+        private String referenceScriptLoan;
+
+        @Value("${loans.liquidation.reference-scripts.loan-spend:}")
+        private String referenceScriptLoanSpend;
+
+        @Value("${loans.liquidation.reference-scripts.lender-manager:}")
+        private String referenceScriptLenderManager;
+
+        @Value("${loans.liquidation.reference-scripts.lender-manager-spend:}")
+        private String referenceScriptLenderManagerSpend;
+
+        @Value("${loans.liquidation.reference-scripts.loan-claim-action:}")
+        private String referenceScriptLoanClaimAction;
+
+        @Value("${loans.liquidation.reference-scripts.lm-liquidate-action:}")
+        private String referenceScriptLmLiquidateAction;
+
+        @Value("${loans.liquidation.reference-scripts.asset-manager:}")
+        private String referenceScriptAssetManager;
+
+        /**
+         * The parsed form of the seven keys above, as {@link LiquidateTransactionBuilder} wants
+         * them: a {@code null} field per validator that is not published.
+         */
+        private LiquidateTransactionBuilder.ReferenceScripts referenceScripts =
+                LiquidateTransactionBuilder.ReferenceScripts.none();
+
         /**
          * A fully specified configuration, for callers that have no Spring context to bind from —
          * the liquidation tests build their collaborators by hand. The mode arrives already typed,
-         * so {@link #parseMode()} has nothing to validate and is not run.
+         * so {@link #parseMode()} has nothing to validate and is not run, and no reference script is
+         * published (which is what {@code ReferenceScripts.none()} means).
          */
         public LiquidationConfiguration(Mode mode, boolean enabled, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
                                         BigInteger profitMarginLovelace, int decisionLogSize,
                                         long quarantineMinutes) {
+            this(mode, enabled, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
+                    profitMarginLovelace, decisionLogSize, quarantineMinutes,
+                    LiquidateTransactionBuilder.ReferenceScripts.none());
+        }
+
+        /** As above, with the published reference scripts stated. */
+        public LiquidationConfiguration(Mode mode, boolean enabled, long delaySeconds,
+                                        long validityWindowSeconds, long oracleWindowMarginSeconds,
+                                        BigInteger profitMarginLovelace, int decisionLogSize,
+                                        long quarantineMinutes,
+                                        LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
             this.mode = mode;
             this.modeName = mode.name();
             this.enabled = enabled;
@@ -212,13 +261,24 @@ public class AppConfig {
             this.profitMarginLovelace = profitMarginLovelace;
             this.decisionLogSize = decisionLogSize;
             this.quarantineMinutes = quarantineMinutes;
+            this.referenceScripts = referenceScripts;
+        }
+
+        /**
+         * The single startup hook. Both halves fail the context rather than defaulting, and both are
+         * separately invokable so their rules can be driven from a test; this method exists only so
+         * there is exactly one {@code @PostConstruct} on the bean.
+         */
+        @PostConstruct
+        void init() {
+            parseMode();
+            parseReferenceScripts();
         }
 
         /**
          * Fails the context rather than defaulting: a typo in the mode must not silently leave the
          * bot in whatever state the author of the typo did not intend — in either direction.
          */
-        @PostConstruct
         void parseMode() {
             String configured = modeName == null ? "" : modeName.trim();
             mode = Arrays.stream(Mode.values())
@@ -235,6 +295,84 @@ public class AppConfig {
             return mode == Mode.LIVE && enabled;
         }
 
+        // ---- reference-script parsing --------------------------------------------------------
+
+        /**
+         * Package-private so the parse rules can be driven without a Spring context, exactly like
+         * {@link #setModeName(String)}. {@code @Value} owns these fields in production.
+         */
+        void setReferenceScriptCoordinates(String loan, String loanSpend, String lenderManager,
+                                           String lenderManagerSpend, String loanClaimAction,
+                                           String lmLiquidateAction, String assetManager) {
+            this.referenceScriptLoan = loan;
+            this.referenceScriptLoanSpend = loanSpend;
+            this.referenceScriptLenderManager = lenderManager;
+            this.referenceScriptLenderManagerSpend = lenderManagerSpend;
+            this.referenceScriptLoanClaimAction = loanClaimAction;
+            this.referenceScriptLmLiquidateAction = lmLiquidateAction;
+            this.referenceScriptAssetManager = assetManager;
+        }
+
+        /**
+         * Fails the context on a malformed coordinate rather than dropping it, and for the same
+         * reason {@link #parseMode()} does: a typo that silently became "not published" would move
+         * the validator back into the witness set, and the only symptom would be every candidate
+         * refusing on a size the operator believed they had already fixed.
+         */
+        void parseReferenceScripts() {
+            referenceScripts = new LiquidateTransactionBuilder.ReferenceScripts(
+                    referenceInput("loans.liquidation.reference-scripts.loan", referenceScriptLoan),
+                    referenceInput("loans.liquidation.reference-scripts.loan-spend", referenceScriptLoanSpend),
+                    referenceInput("loans.liquidation.reference-scripts.lender-manager",
+                            referenceScriptLenderManager),
+                    referenceInput("loans.liquidation.reference-scripts.lender-manager-spend",
+                            referenceScriptLenderManagerSpend),
+                    referenceInput("loans.liquidation.reference-scripts.loan-claim-action",
+                            referenceScriptLoanClaimAction),
+                    referenceInput("loans.liquidation.reference-scripts.lm-liquidate-action",
+                            referenceScriptLmLiquidateAction),
+                    referenceInput("loans.liquidation.reference-scripts.asset-manager",
+                            referenceScriptAssetManager));
+            log.info("INIT - liquidation reference scripts: {}", referenceScripts);
+        }
+
+        /**
+         * {@code txHash#index}, or empty for "not published". Every rejection names the key, because
+         * the value alone does not tell an operator which of seven near-identical lines to fix.
+         */
+        static TransactionInput referenceInput(String key, String value) {
+            String coordinate = value == null ? "" : value.trim();
+            if (coordinate.isEmpty()) {
+                return null;
+            }
+            String[] parts = coordinate.split("#", -1);
+            if (parts.length != 2) {
+                throw new IllegalStateException("%s is '%s'; the expected form is txHash#index"
+                        .formatted(key, value));
+            }
+            if (parts[0].length() != 64 || !parts[0].chars().allMatch(AppConfig::isHexDigit)) {
+                throw new IllegalStateException(
+                        "%s is '%s'; '%s' is not a 64-character hex transaction hash"
+                                .formatted(key, value, parts[0]));
+            }
+            int index;
+            try {
+                index = Integer.parseInt(parts[1]);
+            } catch (NumberFormatException e) {
+                throw new IllegalStateException("%s is '%s'; '%s' is not an output index"
+                        .formatted(key, value, parts[1]));
+            }
+            if (index < 0) {
+                throw new IllegalStateException("%s is '%s'; an output index cannot be negative"
+                        .formatted(key, value));
+            }
+            return TransactionInput.builder().transactionId(parts[0]).index(index).build();
+        }
+
+    }
+
+    private static boolean isHexDigit(int c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
     }
 
 
