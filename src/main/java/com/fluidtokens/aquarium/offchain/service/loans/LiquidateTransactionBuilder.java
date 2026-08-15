@@ -99,6 +99,17 @@ import java.util.stream.Stream;
  *       reference input, a {@code Pooled}/{@code Orcfax} feed, a pointer stake credential, and
  *       {@code repaymentReceipts} together with a non-zero equity (the receipt NFT mint is not
  *       modelled anywhere in this repo).</li>
+ *   <li><b>V7</b> — action scope: the two datum fields the plain {@code Liquidate} path
+ *       <em>requires</em> to be false. {@code lm_liquidate_action.ak:122} is a hard
+ *       {@code expect equityInPrincipalCurrency == False}, and {@code :143} makes
+ *       {@code shouldLiquidationConvertToPrincipal == False} a conjunct of the same check. The
+ *       scanner already excludes both (D2 and §7.5), so this is the builder's own last line rather
+ *       than the only one.</li>
+ *   <li><b>V8</b> — deployment scope: {@code equity > 0} is refused, because the deployed validators
+ *       cannot satisfy it in any output order (see {@link Refusal#POSITIVE_EQUITY_UNSUPPORTED}).
+ *       This is the only veto here that is a statement about <em>this deployment</em> rather than
+ *       about the design, so it is checked last of the per-loan vetoes: a batch that is wrong for a
+ *       permanent reason reports that permanent reason.</li>
  * </ul>
  *
  * <h2>Index resolution</h2>
@@ -131,9 +142,10 @@ import java.util.stream.Stream;
  * One thing evaluation settled the other way: a batch containing a loan with a <em>positive
  * equity</em> is not satisfiable by the deployed validators in any output order, because
  * {@code lm_liquidate_action} and {@code loan_claim_action} both demand the index-th asset-manager
- * output and want different datums in it. This class still builds one — refusing would need a new
- * {@link Refusal} constant, and that decision is not this class's to take unilaterally — so the
- * caller is responsible for not scheduling one until FluidTokens redeploys.
+ * output and want different datums in it. That is now V8 above: such a batch is refused rather than
+ * built, and the caller no longer has to remember not to schedule one. The refusal is
+ * <em>deployment-specific</em> — when FluidTokens redeploys with separate output indexes for the two
+ * asset-manager outputs, V8 is the veto to lift, and nothing else here changes.
  */
 @Slf4j
 public final class LiquidateTransactionBuilder {
@@ -197,6 +209,36 @@ public final class LiquidateTransactionBuilder {
         UNDECODABLE_STAKE_CREDENTIAL,
         /** V6 — a repayment-receipt NFT would have to be minted, and that mint is not modelled. */
         REPAYMENT_RECEIPTS_WITH_EQUITY,
+        /**
+         * V7 — findings §7.1 D2: the loan's {@code Liquidation.equityInPrincipalCurrency} is true, and
+         * {@code lm_liquidate_action.ak:122} is a hard {@code expect equityInPrincipalCurrency == False}.
+         * Nothing this builder can emit satisfies it.
+         */
+        EQUITY_IN_PRINCIPAL_CURRENCY,
+        /**
+         * V7 — findings §7.5: the lender bond's {@code shouldLiquidationConvertToPrincipal} is true, and
+         * {@code lm_liquidate_action.ak:143} makes {@code shouldLiquidationConvertToPrincipal == False}
+         * a conjunct of the check the plain {@code Liquidate} path runs. Converting proceeds to the
+         * principal currency is a different action, not this one.
+         */
+        CONVERSION_TO_PRINCIPAL_REQUIRED,
+        /**
+         * V8 — the assessment's {@code equity} is positive, and the <em>currently deployed</em>
+         * validators cannot satisfy that in any output order:
+         * {@code lm_liquidate_action.ak:87} reads {@code safe_list_at(assetOutputs, index)} and
+         * requires {@code constants.action_claimed_collateral} in it ({@code :156}), while
+         * {@code loan_claim_action.ak:275-284} reads the same position of the same
+         * {@code get_outputs_to_smart_credential(..)} list and requires
+         * {@code constants.action_partial_liquidation_compensation}. One slot, two mutually exclusive
+         * datums; {@code loan_claim_action.ak:273}'s {@code or { inputAction.equity == 0, .. }} is the
+         * only way through. Pinned by {@code LiquidateDryEvalTest}'s
+         * {@code positiveEquityIsUnsatisfiableBecauseTwoValidatorsClaimTheSameAssetManagerOutputSlot},
+         * which runs both layouts against the deployed scripts at the pin {@code bbe9c1a}.
+         * <p>
+         * Deployment-specific rather than eternal: a redeploy that gives the two asset-manager outputs
+         * separate indexes makes positive equity buildable again, and this is the veto to lift.
+         */
+        POSITIVE_EQUITY_UNSUPPORTED,
         /** D6 needs the bond datum echoed byte for byte; this one does not survive a round trip. */
         BOND_DATUM_NOT_BYTE_IDENTICAL,
         /** The requested window does not contain at least one whole slot. */
@@ -315,6 +357,30 @@ public final class LiquidateTransactionBuilder {
      * @throws RefusedException whenever anything about the batch is not certain
      */
     public Transaction build(Request request) {
+        return build(request, true);
+    }
+
+    /**
+     * The same build with V8 — and only V8 — disabled. Package-private, no production caller, and
+     * deliberately not part of the public surface.
+     * <p>
+     * V8 refuses a positive equity because the <em>deployed</em> validators cannot satisfy one
+     * ({@link Refusal#POSITIVE_EQUITY_UNSUPPORTED}); the transaction it would have built is still the
+     * structurally correct one, and becomes submittable the day FluidTokens redeploys. Two kinds of
+     * test need that transaction to exist: {@code LiquidateDryEvalTest}, which is the <em>evidence</em>
+     * for V8 — it runs both output layouts through the real PlutusV3 machine and shows each validator
+     * refusing the other's — and the structural anatomy tests in
+     * {@code LiquidateTransactionBuilderTest}, which pin the equity output's datum, value and place in
+     * the body. Routing those through this seam keeps them proving what they proved before V8 existed.
+     * <p>
+     * Every other veto still applies. In particular V7's two {@code expect}-backed refusals are
+     * permanent facts about the validators rather than about this deployment, so nothing bypasses them.
+     */
+    Transaction buildIgnoringPositiveEquityVeto(Request request) {
+        return build(request, false);
+    }
+
+    private Transaction build(Request request, boolean vetoPositiveEquity) {
         checkRequestShape(request);
 
         long validFrom = request.validFromMillis();
@@ -323,7 +389,7 @@ public final class LiquidateTransactionBuilder {
         // Pass 1 — vet every loan on its own. Nothing about the transaction shape yet.
         List<VettedLoan> vetted = new ArrayList<>();
         for (LoanLiquidation liquidation : request.liquidations()) {
-            vetted.add(vet(liquidation, request, validFrom, validTo));
+            vetted.add(vet(liquidation, request, validFrom, validTo, vetoPositiveEquity));
         }
 
         // Pass 2 — canonical ordering. The loan inputs sorted alone are in the same relative order
@@ -493,7 +559,8 @@ public final class LiquidateTransactionBuilder {
         }
     }
 
-    private VettedLoan vet(LoanLiquidation liquidation, Request request, long validFrom, long validTo) {
+    private VettedLoan vet(LoanLiquidation liquidation, Request request, long validFrom, long validTo,
+                           boolean vetoPositiveEquity) {
         LiquidationAssessment assessment = liquidation.assessment();
 
         // V1 — the scanner's verdict is the only admission ticket.
@@ -519,11 +586,27 @@ public final class LiquidateTransactionBuilder {
         AssetType collateralAsset = datum.collateral().assetType();
         requireQuantity(loanUtxo, unitOf(collateralAsset), loan.collateralAmount(), "collateral");
 
-        if (!(datum.liquidationMode() instanceof LiquidationMode.Liquidation)) {
+        if (!(datum.liquidationMode() instanceof LiquidationMode.Liquidation liquidationMode)) {
             // Unreachable through a buildable assessment, but the ClaimData below copies the mode
             // straight into a redeemer, so it is asserted rather than assumed.
             throw refuse(Refusal.NOT_BUILDABLE,
                     "loan %s is %s, not Liquidation".formatted(loan.loanId(), datum.liquidationMode()));
+        }
+
+        // V7 — the two datum fields the plain Liquidate path requires to be false. The scanner
+        // excludes both already (D2 and §7.5), so reaching either of these means the assessment did
+        // not come from a scan of the UTxOs actually being spent; that is precisely when the builder
+        // must not take the scanner's word for it.
+        if (liquidationMode.equityInPrincipalCurrency()) {
+            throw refuse(Refusal.EQUITY_IN_PRINCIPAL_CURRENCY,
+                    ("loan %s denominates equity in the principal currency; lm_liquidate_action "
+                            + "expects equityInPrincipalCurrency == False").formatted(loan.loanId()));
+        }
+        if (bond.datum().shouldLiquidationConvertToPrincipal()) {
+            throw refuse(Refusal.CONVERSION_TO_PRINCIPAL_REQUIRED,
+                    ("bond %s requires converting liquidation proceeds to principal; the plain "
+                            + "Liquidate path requires shouldLiquidationConvertToPrincipal == False")
+                            .formatted(bond.loanId()));
         }
 
         BigInteger remainingDebt = assessment.remainingDebt();
@@ -593,6 +676,19 @@ public final class LiquidateTransactionBuilder {
         String assetManagerAddress = assetManagerAddress(bond);
 
         PlutusData bondDatum = roundTrippableBondDatum(bond);
+
+        // V8 — last of the per-loan vetoes, and the only one that is a statement about *this
+        // deployment* rather than about the design: lm_liquidate_action and loan_claim_action both
+        // claim the loan-index slot of the same asset-manager-filtered output list and want mutually
+        // exclusive datums in it, so nothing this builder emits can carry a positive equity through
+        // both. See Refusal.POSITIVE_EQUITY_UNSUPPORTED for the file:line references and the dry-eval
+        // test that pins it. Kept last so a batch that is wrong for a permanent reason reports that
+        // permanent reason instead of this transient one.
+        if (vetoPositiveEquity && equity.signum() > 0) {
+            throw refuse(Refusal.POSITIVE_EQUITY_UNSUPPORTED,
+                    ("loan %s has equity %s; the deployed validators can only satisfy equity == 0, "
+                            + "in any output order").formatted(loan.loanId(), equity));
+        }
 
         return new VettedLoan(assessment, loanUtxo, bondUtxo, loan, bond, datum.liquidationMode(),
                 principal, collateral, collateralPayout, bondDatum, assetManagerAddress,

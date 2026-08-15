@@ -191,9 +191,16 @@ class LiquidateDryEvalTest {
      * moving the expectation, and this test fails.
      * <p>
      * Consequence for the bot: until FluidTokens redeploys, only {@code equity == 0} liquidations are
-     * submittable through {@code lm_liquidate_action}. The builder is left able to build a positive
-     * equity batch on purpose — refusing one would need a new {@code Refusal} constant, which is a
-     * public API change and belongs to whoever owns that decision, not to this slice.
+     * submittable through {@code lm_liquidate_action}. That consequence is now enforced rather than
+     * merely documented — {@link LiquidateTransactionBuilder}'s V8 refuses a positive-equity batch
+     * with {@code POSITIVE_EQUITY_UNSUPPORTED}, and {@code LiquidationCandidateScanner} excludes one
+     * with {@code POSITIVE_EQUITY_UNSUPPORTED} before it can ever reach the builder.
+     * <p>
+     * <b>Which is why this test builds through the package-private
+     * {@link LiquidateTransactionBuilder#buildIgnoringPositiveEquityVeto} seam.</b> V8 exists
+     * <em>because</em> of what is proven below; running the evidence through the veto it justifies
+     * would leave the veto resting on nothing. The seam disables V8 and only V8 — every other guard,
+     * including the two permanent V7 {@code expect}s, still applies to the transaction evaluated here.
      */
     @Test
     void positiveEquityIsUnsatisfiableBecauseTwoValidatorsClaimTheSameAssetManagerOutputSlot() {
@@ -208,7 +215,7 @@ class LiquidateDryEvalTest {
         // cannot be confused with "our output is malformed". The two action strings are spelled as
         // ASCII literals here: deriving them from LiquidationTxEncoder's constants would move the
         // expectation in lockstep with any mutation of them and pin nothing.
-        Transaction tx = build(List.of(scenario));
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario));
         List<Integer> assetManagerOutputs = assetManagerOutputIndexes(tx);
         assertEquals(2, assetManagerOutputs.size(), "a claimed-collateral and a compensation output");
 
@@ -369,14 +376,30 @@ class LiquidateDryEvalTest {
     }
 
     private static Transaction build(List<Scenario> scenarios) {
-        LiquidateTransactionBuilder builder = new LiquidateTransactionBuilder(REGISTRY,
-                LoanFixtures.NETWORK, LoanFixtures.converters(),
+        return builder(scenarios).build(request(scenarios));
+    }
+
+    /**
+     * The same build with {@link LiquidateTransactionBuilder}'s V8 positive-equity veto disabled, and
+     * nothing else. Used by exactly one test — the one whose evaluation runs are <em>the evidence for
+     * V8</em>. Building that transaction through the veto it justifies would make the veto
+     * self-certifying; see the seam's own javadoc.
+     */
+    private static Transaction buildIgnoringPositiveEquityVeto(List<Scenario> scenarios) {
+        return builder(scenarios).buildIgnoringPositiveEquityVeto(request(scenarios));
+    }
+
+    private static LiquidateTransactionBuilder builder(List<Scenario> scenarios) {
+        return new LiquidateTransactionBuilder(REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(),
                 LoanFixtures.utxoSupplier(universe(scenarios)), EvalFixtures.protocolParams());
+    }
+
+    private static LiquidateTransactionBuilder.Request request(List<Scenario> scenarios) {
         Map<String, OracleEntry> noOracles = Map.of();
-        return builder.build(new LiquidateTransactionBuilder.Request(
+        return new LiquidateTransactionBuilder.Request(
                 scenarios.stream().map(Scenario::toLiquidation).toList(),
                 CONFIG_UTXO, LM_CONFIG_UTXO, noOracles, WALLET_UTXO, LoanFixtures.botAddress(),
-                VALID_FROM, VALID_TO, MARGIN, LiquidateTransactionBuilder.ReferenceScripts.none()));
+                VALID_FROM, VALID_TO, MARGIN, LiquidateTransactionBuilder.ReferenceScripts.none());
     }
 
     // ---- reading the results back ---------------------------------------------------------

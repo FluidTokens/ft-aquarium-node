@@ -306,6 +306,16 @@ public final class LoanFixtures {
                 BigInteger.valueOf(50), false);
     }
 
+    /**
+     * {@link #liquidation()} with D2's flag set. {@code lm_liquidate_action.ak:122} is a hard
+     * {@code expect equityInPrincipalCurrency == False}, so this mode exists only so the refusal can
+     * be proven.
+     */
+    public static LiquidationMode.Liquidation liquidationInPrincipalCurrency() {
+        return new LiquidationMode.Liquidation(BigInteger.valueOf(750), BigInteger.valueOf(1000),
+                BigInteger.valueOf(50), true);
+    }
+
     public static CollateralAsset adaCollateral() {
         return new CollateralAsset("", Optional.of(""), NO_ORACLE);
     }
@@ -333,6 +343,20 @@ public final class LoanFixtures {
                 liquidationFeePerMille,
                 poolIdHex,
                 principalAsset);
+    }
+
+    /**
+     * A bond demanding the liquidation proceeds be converted to the principal currency.
+     * {@code lm_liquidate_action.ak:143} makes {@code shouldLiquidationConvertToPrincipal == False} a
+     * conjunct of the plain {@code Liquidate} check, so this bond exists only so the refusal can be
+     * proven. Identical to {@link #bondDatum(BigInteger, PlutusData, AssetType)} in every other field.
+     */
+    public static LenderManagerDatum convertToPrincipalBondDatum(BigInteger liquidationFeePerMille,
+                                                                 PlutusData stakeCredential,
+                                                                 AssetType principalAsset) {
+        LenderManagerDatum plain = bondDatum(liquidationFeePerMille, stakeCredential, principalAsset);
+        return new LenderManagerDatum(plain.lenderAuth(), plain.lenderStakeCredential(), true,
+                plain.liquidationFeePerMille(), plain.poolId(), plain.principalAsset());
     }
 
     // ---- utxos -------------------------------------------------------------------------------

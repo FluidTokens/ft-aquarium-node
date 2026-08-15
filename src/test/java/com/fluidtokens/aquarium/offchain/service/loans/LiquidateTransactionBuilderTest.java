@@ -185,7 +185,8 @@ class LiquidateTransactionBuilderTest {
         assertEquals(BigInteger.valueOf(2_000_000), scenario.assessment().liquidationFee());
         assertTrue(scenario.assessment().late());
 
-        Transaction tx = build(List.of(scenario), Map.of(), LiquidateTransactionBuilder.ReferenceScripts.none());
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
 
         // Inputs: the loan, its bond, and the bot's ada.
         List<TransactionInput> inputs = sortedInputs(tx);
@@ -278,7 +279,8 @@ class LiquidateTransactionBuilderTest {
     void burnsWithTheNonPoolMintRedeemer() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
-        Transaction tx = build(List.of(scenario), Map.of(), LiquidateTransactionBuilder.ReferenceScripts.none());
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
 
         assertEquals(hex(LiquidationTxEncoder.loanMintRedeemer(0, false, 0)),
                 hex(redeemers(tx, RedeemerTag.Mint).getFirst().getData()));
@@ -289,7 +291,8 @@ class LiquidateTransactionBuilderTest {
     void anAbsentStakeCredentialProducesAnEnterpriseAssetManagerAddress() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.noStakeCredential());
-        Transaction tx = build(List.of(scenario), Map.of(), LiquidateTransactionBuilder.ReferenceScripts.none());
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
 
         assertEquals(LoanFixtures.entAddress(REGISTRY.getAssetManagerSpendScriptHash()),
                 tx.getBody().getOutputs().get(2).getAddress());
@@ -312,7 +315,8 @@ class LiquidateTransactionBuilderTest {
         AdaScenario b = adaScenario(LOAN_ID_B, TX_LOAN_B, TX_BOND_B, 100_000_000L, 1000L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
 
-        Transaction tx = build(List.of(a, b), Map.of(), LiquidateTransactionBuilder.ReferenceScripts.none());
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(a, b), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
 
         List<TransactionInput> inputs = sortedInputs(tx);
         assertEquals(List.of(new TransactionInput(TX_LOAN_A, 0), new TransactionInput(TX_BOND_B, 0),
@@ -370,7 +374,7 @@ class LiquidateTransactionBuilderTest {
         assertEquals(BigInteger.valueOf(422_500), scenario.assessment().equity());
         assertEquals(BigInteger.valueOf(10_000), scenario.assessment().liquidationFee());
 
-        Transaction tx = build(List.of(scenario.scenario()),
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario.scenario()),
                 Map.of(ORACLE_TOKEN.toUnit(), scenario.oracle()),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
@@ -443,7 +447,7 @@ class LiquidateTransactionBuilderTest {
                         new TransactionInput(TX_REF_SCRIPTS, 5),
                         null);
 
-        Transaction tx = build(List.of(scenario), Map.of(), published);
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario), Map.of(), published);
 
         assertTrue(tx.getWitnessSet().getPlutusV3Scripts().isEmpty(),
                 "a published script must not also travel in the witness set");
@@ -660,7 +664,8 @@ class LiquidateTransactionBuilderTest {
         assertEquals(BigInteger.valueOf(199_999_895), scenario.assessment().equity());
         assertEquals(BigInteger.ZERO, scenario.assessment().liquidationFee());
 
-        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED, refusal(scenario));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                refusalIgnoringPositiveEquityVeto(scenario));
     }
 
     // ======================================================================================
@@ -734,6 +739,117 @@ class LiquidateTransactionBuilderTest {
     }
 
     // ======================================================================================
+    // V7 — the two datum fields the plain Liquidate path requires to be false
+    // ======================================================================================
+
+    /**
+     * Why all three fixtures below are 100 ADA against 100 ADA rather than the 200 ADA the rest of
+     * this file uses: at 100 ADA the collateral is worth less than the 110 ADA of debt plus its 5%
+     * partial-liquidation penalty, so {@code equity} clamps to zero and V8 is not in the way. With V7
+     * disabled such a batch builds all the way through, and the test fails because nothing was thrown
+     * — on the missing refusal itself, not on V8 firing in V7's place.
+     */
+    private static final String ZERO_EQUITY_FIXTURE =
+            "the fixture must have zero equity, or V8 masks the veto under test";
+
+    /**
+     * Findings §7.1 D2. {@code lm_liquidate_action.ak:122} is a hard
+     * {@code expect equityInPrincipalCurrency == False}: no output layout satisfies a loan whose
+     * {@code Liquidation} sets it. The scanner excludes these already
+     * ({@code LiquidationExclusion.EQUITY_IN_PRINCIPAL_CURRENCY}); this is the builder refusing to
+     * take the scanner's word for it.
+     */
+    @Test
+    void v7RefusesEquityDenominatedInThePrincipalCurrency() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidationInPrincipalCurrency(),
+                new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L,
+                BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        assertEquals(BigInteger.ZERO, scenario.assessment().equity(), ZERO_EQUITY_FIXTURE);
+        assertEquals(LiquidateTransactionBuilder.Refusal.EQUITY_IN_PRINCIPAL_CURRENCY, refusal(scenario));
+    }
+
+    /**
+     * Findings §7.5. {@code lm_liquidate_action.ak:143} makes
+     * {@code shouldLiquidationConvertToPrincipal == False} a conjunct of the check the plain
+     * {@code Liquidate} path runs, so a bond that demands conversion belongs to a different action
+     * entirely. The bond datum is identical to every other fixture's except for that one flag.
+     */
+    @Test
+    void v7RefusesABondThatRequiresConvertingProceedsToPrincipal() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L,
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.TEN,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()));
+
+        assertTrue(scenario.bond().bond().datum().shouldLiquidationConvertToPrincipal(),
+                "the fixture bond must really demand conversion");
+        assertEquals(BigInteger.ZERO, scenario.assessment().equity(), ZERO_EQUITY_FIXTURE);
+        assertEquals(LiquidateTransactionBuilder.Refusal.CONVERSION_TO_PRINCIPAL_REQUIRED,
+                refusal(scenario));
+    }
+
+    // ======================================================================================
+    // V8 — positive equity is unsatisfiable on the deployed validators
+    // ======================================================================================
+
+    /**
+     * The 200-ADA-collateral scenario the anatomy tests above build — 84.5 ADA of borrower equity —
+     * is refused outright on the public entry point.
+     * <p>
+     * {@code lm_liquidate_action.ak:87} and {@code loan_claim_action.ak:275-284} index the same
+     * {@code get_outputs_to_smart_credential(..)} list at the same position, the loan's index, and
+     * demand mutually exclusive datums there ({@code action_claimed_collateral} against
+     * {@code action_partial_liquidation_compensation}); {@code LiquidateDryEvalTest} runs both layouts
+     * against the deployed scripts and watches each validator refuse the other's. Nothing here
+     * re-derives that — this test only pins that the builder now refuses instead of building.
+     * <p>
+     * The refusal is <em>deployment-specific</em>: the same batch built through the seam is still a
+     * well-formed transaction, which is why the anatomy tests keep asserting on it.
+     */
+    @Test
+    void v8RefusesAPositiveEquityTheDeployedValidatorsCannotSatisfy() {
+        AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
+                200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        assertEquals(BigInteger.valueOf(84_500_000), scenario.assessment().equity(),
+                "the fixture must really carry a borrower compensation");
+        assertEquals(LiquidateTransactionBuilder.Refusal.POSITIVE_EQUITY_UNSUPPORTED, refusal(scenario));
+    }
+
+    /**
+     * The boundary partner: the identical loan against 100 ADA of collateral instead of 200 owes more
+     * than it holds, so the equity clamps to zero and the batch builds. Without this, V8 would be
+     * indistinguishable from a veto that refuses every ada liquidation.
+     */
+    @Test
+    void v8LetsAZeroEquityLiquidationThrough() {
+        AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
+                100_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        assertEquals(BigInteger.ZERO, scenario.assessment().equity(),
+                "100 ADA of collateral against 110 ADA of debt plus a 5% penalty clamps to zero");
+
+        Transaction tx = build(List.of(scenario), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
+
+        // Four outputs, not five: dummy, bond echo, collateral, change — and no equity output, which
+        // is exactly the shape that stays submittable on the deployed validators.
+        List<TransactionOutput> outputs = tx.getBody().getOutputs();
+        assertEquals(4, outputs.size(), "dummy, bond, collateral, change");
+        assertEquals(BigInteger.valueOf(99_000_000), outputs.get(2).getValue().getCoin(),
+                "collateral - equity - fee = 100_000_000 - 0 - 1_000_000");
+        assertEquals(expectedAssetManagerDatum(scenario, LiquidationTxEncoder.CLAIMED_COLLATERAL_ACTION_HEX,
+                        REGISTRY.getLenderBondPolicyId()),
+                outputs.get(2).getInlineDatum().serializeToHex());
+    }
+
+    // ======================================================================================
     // oracle wiring guards
     // ======================================================================================
 
@@ -799,7 +915,7 @@ class LiquidateTransactionBuilderTest {
     void collapsesTwoLegsBehindOneOracleIntoASingleWithdrawal() {
         TokenScenario scenario = sameOracleBothLegsScenario();
 
-        Transaction tx = build(List.of(scenario.scenario()),
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario.scenario()),
                 Map.of(ORACLE_TOKEN.toUnit(), scenario.oracle()),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
@@ -967,9 +1083,16 @@ class LiquidateTransactionBuilderTest {
     private static AdaScenario adaScenarioFrom(LoanDatum datum, String loanId, String loanTx,
                                                String bondTx, long collateral, BigInteger feePerMille,
                                                PlutusData stakeCredential) {
+        return adaScenarioFrom(datum, loanId, loanTx, bondTx, collateral,
+                LoanFixtures.bondDatum(feePerMille, stakeCredential, AssetType.ada()));
+    }
+
+    /** As above, with the bond datum supplied whole — for the fields {@code bondDatum} pins to false. */
+    private static AdaScenario adaScenarioFrom(LoanDatum datum, String loanId, String loanTx,
+                                               String bondTx, long collateral,
+                                               LenderManagerDatum bondDatum) {
         LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(loanTx, 0, loanId, datum, collateral, List.of());
-        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(bondTx, 0, loanId,
-                LoanFixtures.bondDatum(feePerMille, stakeCredential, AssetType.ada()), 2_000_000L);
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(bondTx, 0, loanId, bondDatum, 2_000_000L);
         LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(),
                 OraclePriceFeed.unit(), OraclePriceFeed.unit(), VALID_FROM);
         return new AdaScenario(loan, bond, assessment, null);
@@ -1074,6 +1197,39 @@ class LiquidateTransactionBuilderTest {
                 request(scenarios, oracles, WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO, refs));
         assertNotNull(transaction);
         return transaction;
+    }
+
+    /**
+     * Builds through {@link LiquidateTransactionBuilder}'s package-private V8 seam, for the anatomy
+     * tests whose scenarios have a positive equity.
+     * <p>
+     * V8 refuses those outright, because the <em>deployed</em> validators cannot satisfy a positive
+     * equity in any output order ({@code LiquidateDryEvalTest} is the evidence). The transaction is
+     * still the structurally correct one and becomes submittable the day FluidTokens redeploys, so
+     * every claim these tests make about its anatomy — the equity output's datum, its value, its place
+     * in the body, the indexes that point at it — is worth keeping exactly as it was. Routing them
+     * through the seam preserves them without weakening a single assertion; V8 itself is proven by
+     * {@link #v8RefusesAPositiveEquityTheDeployedValidatorsCannotSatisfy()} on the public entry point.
+     */
+    private static Transaction buildIgnoringPositiveEquityVeto(
+            List<AdaScenario> scenarios, Map<String, OracleEntry> oracles,
+            LiquidateTransactionBuilder.ReferenceScripts refs) {
+        Transaction transaction = builder(scenarios, oracles).buildIgnoringPositiveEquityVeto(
+                request(scenarios, oracles, WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO, refs));
+        assertNotNull(transaction);
+        return transaction;
+    }
+
+    /** {@link #refusal(AdaScenario)} through the same seam, for a refusal V8 would otherwise mask. */
+    private static LiquidateTransactionBuilder.Refusal refusalIgnoringPositiveEquityVeto(
+            AdaScenario scenario) {
+        List<AdaScenario> scenarios = List.of(scenario);
+        LiquidateTransactionBuilder.RefusedException refused =
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> builder(scenarios, Map.of()).buildIgnoringPositiveEquityVeto(
+                                request(scenarios, Map.of(), WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO,
+                                        LiquidateTransactionBuilder.ReferenceScripts.none())));
+        return refused.getReason();
     }
 
     private static LiquidateTransactionBuilder.Refusal refusal(AdaScenario scenario) {

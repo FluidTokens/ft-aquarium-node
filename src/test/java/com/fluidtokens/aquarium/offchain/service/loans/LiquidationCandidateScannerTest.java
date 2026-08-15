@@ -490,8 +490,16 @@ class LiquidationCandidateScannerTest {
 
     // ---- lateness is an independent trigger --------------------------------------------------
 
-    private static LoanDatum lateDatum(long collateralPrice) {
-        return datum(liquidation(100, 125, 100, false),
+    /**
+     * The lateness fixture. {@code partialLiquidationPenaltyPerMille} is a parameter because it is the
+     * only knob that decides whether a wealthy-collateral loan ends up with a positive equity: a
+     * negative value makes {@code redeemerEquity} short-circuit to zero (same idiom as
+     * {@link #zeroValuedCollateralIsAlwaysLiquidatable()}), a positive one lets the surplus through.
+     * Nothing else in this datum reacts to it — lateness and LTV are both computed without it — so the
+     * two tests below differ in exactly that one number.
+     */
+    private static LoanDatum lateDatum(long partialLiquidationPenaltyPerMille) {
+        return datum(liquidation(100, 125, partialLiquidationPenaltyPerMille, false),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(),
                 BigInteger.valueOf(12), BigInteger.ZERO, BigInteger.valueOf(24), BigInteger.ZERO, BigInteger.ZERO,
                 LEND_DATE, BigInteger.valueOf(1_000_000), PRINCIPAL, oracleTokenFor(PRINCIPAL),
@@ -500,7 +508,7 @@ class LiquidationCandidateScannerTest {
 
     @Test
     void lateButLtvHealthyLoanIsBuildableViaLateness() throws Exception {
-        var datum = lateDatum(2);
+        var datum = lateDatum(-1); // no partial-liquidation penalty: equity short-circuits to zero
         // wealthy collateral: LTV alone would say healthy
         var loan = loan(datum, BigInteger.valueOf(1_000_000_000));
         var client = oracleClientWith(entry(PRINCIPAL, 5), entry(COLLATERAL, 2));
@@ -511,9 +519,40 @@ class LiquidationCandidateScannerTest {
         assertTrue(assessment.late(), "30 days elapsed against a 24h installment period");
     }
 
+    // ---- POSITIVE_EQUITY_UNSUPPORTED (deployment scope) --------------------------------------
+
+    /**
+     * Boundary partner to {@link #lateButLtvHealthyLoanIsBuildableViaLateness()}: the identical loan,
+     * identical collateral, identical feeds, with the partial-liquidation penalty flipped from
+     * negative to positive so the borrower's surplus is actually computed instead of short-circuited.
+     * 1,000,000,000 units of collateral at 2 lovelace is 2 ADA-orders more than the 1,000,000-unit
+     * debt at 5 lovelace, so the equity is large and positive — and the loan is still liquidatable,
+     * by lateness, which is what makes this a deployment-scope exclusion rather than a health one.
+     * <p>
+     * The deployed {@code lm_liquidate_action} and {@code loan_claim_action} both claim the loan-index
+     * slot of the same asset-manager-filtered output list and want mutually exclusive datums in it, so
+     * no such liquidation is submittable; {@code LiquidateDryEvalTest} is the evidence. The scanner
+     * excludes it here so it never reaches {@code LiquidateTransactionBuilder}.
+     */
+    @Test
+    void aLiquidatableLoanWithPositiveEquityIsExcludedAsUnsupported() throws Exception {
+        var datum = lateDatum(100);
+        var loan = loan(datum, BigInteger.valueOf(1_000_000_000));
+        var client = oracleClientWith(entry(PRINCIPAL, 5), entry(COLLATERAL, 2));
+
+        var assessment = scanOne(List.of(loan), List.of(permissiveBond()), client);
+
+        // The exclusion first, so that removing the filter fails this test by name rather than on a
+        // generic "expected false but was true" from buildable().
+        assertEquals(LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED, assessment.exclusion());
+        assertFalse(assessment.buildable());
+        assertTrue(assessment.detail().contains("> 0"),
+                "the detail must name the equity that blocked it: " + assessment.detail());
+    }
+
     @Test
     void lateLoanWithUnusableFeedIsStillExcludedOnTheOracleLeg() throws Exception {
-        var datum = lateDatum(2);
+        var datum = lateDatum(100);
         var loan = loan(datum, BigInteger.valueOf(1_000_000_000));
         var client = oracleClientWith(entry(PRINCIPAL, 5)); // no COLLATERAL entry — D9: no oracle-free path
 

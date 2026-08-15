@@ -73,5 +73,35 @@ public enum LiquidationExclusion {
      * D9 — not late and {@code currentLtv <= liquidationLtv}. {@code can_liquidate} is
      * strict-greater ({@code finance.ak:174-195}); equality does not liquidate.
      */
-    NOT_LIQUIDATABLE
+    NOT_LIQUIDATABLE,
+
+    /**
+     * The loan is liquidatable, but its {@code equity} is positive and the <em>currently deployed</em>
+     * validators cannot satisfy a plain {@code Liquidate} that pays one out — in any output order.
+     * <p>
+     * Both validators index the <em>same</em> list, the outputs filtered by
+     * {@code get_outputs_to_smart_credential(..)}, at the <em>same</em> position — the loan's index —
+     * and demand a different output there:
+     * <ul>
+     *   <li>{@code lm_liquidate_action.ak:87} takes {@code safe_list_at(assetOutputs, index)} and
+     *       feeds it to {@code validate_repayment_output(.., action: constants.action_claimed_collateral)}
+     *       ({@code :156}), so that slot must be the lender's claimed-collateral output;</li>
+     *   <li>{@code loan_claim_action.ak:275-284} takes {@code safe_list_at(get_outputs_to_smart_credential(..), index)}
+     *       and feeds it to {@code equity_sent_to_borrower(..)}, whose datum carries
+     *       {@code constants.action_partial_liquidation_compensation}, so that same slot must be the
+     *       borrower's compensation output.</li>
+     * </ul>
+     * One slot, two mutually exclusive datums. {@code loan_claim_action.ak:273}'s
+     * {@code or { inputAction.equity == 0, .. }} is the branch that keeps every other case alive, so
+     * {@code equity == 0} is exactly the submittable set. Established at the deployed pin
+     * {@code bbe9c1a} and pinned empirically by {@code LiquidateDryEvalTest}'s
+     * {@code positiveEquityIsUnsatisfiableBecauseTwoValidatorsClaimTheSameAssetManagerOutputSlot},
+     * which runs both layouts through the real PlutusV3 machine.
+     * <p>
+     * <b>Deployment-specific, not eternal.</b> Unlike every other value here this one describes the
+     * contracts as currently deployed rather than a rule of the design: when FluidTokens redeploys
+     * with separate output indexes for the two asset-manager outputs, positive equity becomes
+     * buildable again and this exclusion should be revisited.
+     */
+    POSITIVE_EQUITY_UNSUPPORTED
 }

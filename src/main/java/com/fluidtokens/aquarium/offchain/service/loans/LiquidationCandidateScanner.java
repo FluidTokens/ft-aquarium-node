@@ -55,8 +55,21 @@ import java.util.stream.Collectors;
  *       {@link LiquidationExclusion#HEALTH_NOT_COMPUTABLE}</li>
  *   <li>D9 — the loan must actually be late or over its liquidation LTV →
  *       {@link LiquidationExclusion#NOT_LIQUIDATABLE}</li>
+ *   <li>deployment scope — the equity must be zero →
+ *       {@link LiquidationExclusion#POSITIVE_EQUITY_UNSUPPORTED}</li>
  * </ol>
- * Anything that survives all ten steps is {@link LiquidationAssessment#buildable()}.
+ * Anything that survives all eleven steps is {@link LiquidationAssessment#buildable()}.
+ * <p>
+ * <b>Why the positive-equity filter is step 11 and not up with D1-D3.</b> It reads as a scope filter
+ * and its D-family cousins sit at steps 2-5, but it cannot join them: {@code equity} is not a datum
+ * field, it is {@link LoanFinance#redeemerEquity} of the loan, the debt and <em>both</em> priced
+ * legs, so nothing before step 9 knows it. Given that it has to come after the finance math, it goes
+ * after D9 rather than before it for a diagnostic reason: {@link LiquidationExclusion#NOT_LIQUIDATABLE}
+ * is a fact about the <em>loan</em> (it is healthy, nobody may liquidate it), while
+ * {@link LiquidationExclusion#POSITIVE_EQUITY_UNSUPPORTED} is a fact about the <em>deployment</em>
+ * (this shape is unsatisfiable until FluidTokens redeploys). Reporting the loan-level truth first
+ * keeps the operator-visible reason stable across that redeploy: a healthy loan reads
+ * {@code NOT_LIQUIDATABLE} before and after, and only the genuinely blocked candidates change verdict.
  * <p>
  * <b>Ports no arithmetic.</b> Every number in a buildable assessment comes straight out of
  * {@link LoanFinance}; every oracle-usability call defers to {@link OracleEntry#usableForLiquidation()}
@@ -166,6 +179,16 @@ public class LiquidationCandidateScanner {
         if (!liquidatable) {
             return LiquidationAssessment.excluded(bond, loan, LiquidationExclusion.NOT_LIQUIDATABLE,
                     "not late and currentLtv <= liquidationLtv");
+        }
+
+        // The deployed lm_liquidate_action and loan_claim_action both claim the loan-index slot of
+        // the same asset-manager-filtered output list and want mutually exclusive datums in it, so a
+        // positive equity is unsatisfiable in any output order — see POSITIVE_EQUITY_UNSUPPORTED for
+        // the two file:line references and the dry-eval test that pins it. Excluded here so such a
+        // candidate never reaches LiquidateTransactionBuilder in the first place.
+        if (equity.signum() > 0) {
+            return LiquidationAssessment.excluded(bond, loan, LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED,
+                    "equity " + equity + " > 0; the deployed validators can only satisfy equity == 0");
         }
 
         // §7.5 fee maths: liquidationFee = loanCollateralAmount * liquidationFeePerMille / 1000, floored.
