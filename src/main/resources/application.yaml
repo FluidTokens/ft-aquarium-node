@@ -55,6 +55,32 @@ loans:
   oracle:
     enabled: ${LOANS_ORACLE_ENABLED:true}
     url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
+  # The auto-liquidation bot. `mode` is disabled / shadow / live; `enabled` is the separate arming
+  # flag, and BOTH must be set before anything could ever be submitted. Nothing in this codebase
+  # submits a liquidation yet, so today live behaves exactly like shadow.
+  liquidation:
+    mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
+    enabled: ${AQUARIUM_LIQUIDATION_ENABLED:false}
+    delay-seconds: ${AQUARIUM_LIQUIDATION_DELAY_SECONDS:60}
+    # The two window values are one piece of arithmetic, so read them together. A preview Charli3
+    # feed publishes a 600 s window (measured, design §6.7), and the builder's V3 demands
+    #     feed.validTo - tx.validTo >= oracle-window-margin-seconds
+    # so a candidate is only buildable while at least (validity-window + margin) of the feed's
+    # window is still ahead of it: 120 + 30 = 150 s of the 600 s, leaving 450 s usable. Raising the
+    # margin shortens that usable stretch one second for one; a margin near 600 silently disables
+    # the bot for most of every window while every candidate simply reports
+    # ORACLE_WINDOW_MARGIN_TOO_SMALL.
+    validity-window-seconds: ${AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS:120}
+    oracle-window-margin-seconds: ${AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS:30}
+    # Expected profit = fee value - tx fee - this. The reference-script surcharge is the dominant
+    # term and depends on how much gets published: at minFeeRefScriptCostPerByte 15, referencing
+    # only the two large validators (12_749 B) costs ~0.19 ADA, and referencing all six (18_584 B)
+    # costs ~0.28 ADA. On top of that come the size and execution-unit components of the ordinary
+    # fee. 1.5 ADA leaves headroom for either shape and still refuses dust liquidations, whose fee
+    # slice would not repay the transaction that claims it.
+    profit-margin-lovelace: ${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:1500000}
+    decision-log-size: ${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}
+    quarantine-minutes: ${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}
 
 scheduling:
   transaction-processor:
@@ -114,6 +140,11 @@ loans:
   # collateral on the loans we index — so health is fully computable here.
   oracle:
     url: ${LOANS_ORACLE_URL:https://testapi.fluidtokens.com/get-oracle-tokens}
+  # Preview is where the bot is exercised, so the loop runs by default here — in shadow, which
+  # scans, builds, prices and records without ever signing or submitting. Every other liquidation
+  # key keeps its base-document value.
+  liquidation:
+    mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
   config:
     # Both config NFTs were minted in this single tx (block 4514052, slot 118496146).
     ref-utxo-tx-hash: 6de7b7ecc2c822526d08dc998731d9e133e13c80dea099fb87827336dca12094
