@@ -1,6 +1,7 @@
 package com.fluidtokens.aquarium.offchain.config;
 
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
@@ -44,15 +45,35 @@ public class YaciConfig {
         return new DefaultProtocolParamsSupplier(bfBackendService.getEpochService());
     }
 
+    /**
+     * The production builder, with a real script-cost evaluator.
+     * <p>
+     * Without one, cardano-client-lib leaves every redeemer holding placeholder ex-units — 10000 mem
+     * against a measured 2.26M for one ada/ada liquidation — and a transaction that under-declares is
+     * not rejected by the mempool: it lands and then fails on chain, forfeiting the collateral. So the
+     * armed path has to be given an evaluator, and Blockfrost's {@code /utils/txs/evaluate} is the one
+     * to give it: it evaluates against the chain's own protocol parameters and cost models, so the
+     * question "is our pinned cost model still the chain's?" cannot arise, and it resolves the
+     * transaction's inputs itself because in production they are real on-chain UTxOs.
+     * <p>
+     * The lambda is the narrowing, exactly as {@code LiquidationExecutor}'s {@code TransactionSubmitter}
+     * is: {@link TransactionEvaluator} declares one operation and no submit method, so what the builder
+     * holds can price a transaction and nothing else. Handing it the {@code BFBackendService}, or the
+     * {@code DefaultTransactionProcessor} that also implements this interface, would hand it a
+     * submission path through the back door.
+     */
     @Bean
     @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public LiquidateTransactionBuilder liquidateTransactionBuilder(LoansContractRegistry registry,
                                                                    AppConfig.Network network,
                                                                    CardanoConverters cardanoConverters,
                                                                    UtxoSupplier utxoSupplier,
-                                                                   ProtocolParamsSupplier protocolParamsSupplier) {
+                                                                   ProtocolParamsSupplier protocolParamsSupplier,
+                                                                   BFBackendService bfBackendService) {
+        TransactionEvaluator scriptCostEvaluator =
+                (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
         return new LiquidateTransactionBuilder(registry, network.getCardanoNetwork(), cardanoConverters,
-                utxoSupplier, protocolParamsSupplier);
+                utxoSupplier, protocolParamsSupplier, scriptCostEvaluator);
     }
 
 }

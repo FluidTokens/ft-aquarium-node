@@ -1,8 +1,12 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.common.model.SlotConfigs;
+import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.util.HexUtil;
@@ -22,11 +26,14 @@ import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -100,10 +107,15 @@ class LiquidationExecutorTest {
      */
     private static final Account ACCOUNT = new Account(LoanFixtures.NETWORK);
 
-    private static final Utxo CONFIG_UTXO = LoanFixtures.adaUtxo(TX_CONFIG, 0,
-            LoanFixtures.entAddress(LoanFixtures.CONFIG_POLICY_ID), 5_000_000L);
-    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.adaUtxo(TX_LM_CONFIG, 0,
-            LoanFixtures.entAddress(LoanFixtures.LM_CONFIG_POLICY_ID), 5_000_000L);
+    /**
+     * The real preview config reference inputs, datum and config NFT included — the same fixtures
+     * {@code LiquidateDryEvalTest} uses. They are only ever read as reference inputs, so nothing about
+     * the transaction's own bytes depends on them; what does depend on them is whether the deployed
+     * validators can be run against the result at all, which
+     * {@link #honestExUnitsCostMoreThanPlaceholdersAndStillFitInsideHalfTheLiveBudget()} needs.
+     */
+    private static final Utxo CONFIG_UTXO = LoanFixtures.configUtxo(TX_CONFIG, 0);
+    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.lmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             ACCOUNT.baseAddress(), 200_000_000L);
 
@@ -384,6 +396,24 @@ class LiquidationExecutorTest {
                                  List<Utxo> walletUtxos,
                                  CountingOracleProvider oracles,
                                  boolean syncing) {
+        return wiring(configuration, scanned, inUniverse, stillUnspent, walletUtxos, oracles, syncing,
+                false);
+    }
+
+    /**
+     * @param honestExUnits when true the builder is given a real PlutusV3 script-cost evaluator, so the
+     *                      redeemers carry measured ex-units instead of cardano-client-lib's
+     *                      placeholders — which is what the production wiring does and what the
+     *                      transaction fee is therefore really made of
+     */
+    private static Wiring wiring(AppConfig.LiquidationConfiguration configuration,
+                                 List<LiquidationAssessment> scanned,
+                                 List<Scenario> inUniverse,
+                                 Map<String, Utxo> stillUnspent,
+                                 List<Utxo> walletUtxos,
+                                 CountingOracleProvider oracles,
+                                 boolean syncing,
+                                 boolean honestExUnits) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
         universe.addAll(walletUtxos);
         for (Scenario scenario : inUniverse) {
@@ -394,7 +424,7 @@ class LiquidationExecutorTest {
 
         LiquidateTransactionBuilder builder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
                 LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
-                LoanFixtures.protocolParams());
+                LoanFixtures.protocolParams(), honestExUnits ? realExUnitsEvaluator(universe) : null);
 
         BlockEventListener blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(syncing);
@@ -456,6 +486,24 @@ class LiquidationExecutorTest {
                                  boolean syncing) {
         return wiring(configuration, scanned, onChain, allUnspent(onChain), List.of(WALLET_UTXO),
                 noOracle(), syncing);
+    }
+
+    /**
+     * A real script-cost evaluator, offline: the same UPLC machine and the same applied {@code loans-v4}
+     * scripts {@link LiquidateDryEvalTest} runs against, wired where production wires Blockfrost's
+     * {@code /utils/txs/evaluate}. Blockfrost resolves the transaction's inputs itself because on chain
+     * they are real UTxOs; here the synthetic universe is handed over explicitly instead, which is the
+     * only difference and the reason the adapter exists.
+     * <p>
+     * Narrowed to {@link TransactionEvaluator} at this point, exactly as the production wiring is: what
+     * the builder ends up holding can price a transaction and has no way to transmit one.
+     */
+    private static TransactionEvaluator realExUnitsEvaluator(List<Utxo> universe) {
+        AikenTransactionEvaluator aiken = new AikenTransactionEvaluator(
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
+                EvalFixtures.scriptSupplier(LoanFixtures.registry()), SlotConfigs.preview());
+        Set<Utxo> resolvable = new LinkedHashSet<>(universe);
+        return (cbor, inputUtxos) -> aiken.evaluateTx(cbor, resolvable);
     }
 
     /** One candidate, still on chain, with the wallet contents chosen by the test. */
@@ -754,6 +802,137 @@ class LiquidationExecutorTest {
                 ("the transaction is %d bytes, at or under the 16_384 maxTxSize — that contradicts "
                         + "the measured 18_584 bytes of validators this plan rests on, so the "
                         + "measurement has to be redone before slice 3").formatted(size));
+    }
+
+    // ======================================================================================
+    // honest ex-units: what the transaction really costs, and what that does to the verdict
+    // ======================================================================================
+
+    /**
+     * The live budget, measured from preview via Blockfrost {@code /epochs/latest/parameters} on
+     * 2026-08-15 (alongside {@code protocol_major_ver} 11): {@code maxTxExMem} 17_500_000 and
+     * {@code maxTxExSteps} 10_000_000_000. Half of it is the headroom this workstream is willing to
+     * run on.
+     * <p>
+     * Deliberately <em>not</em> read from {@code LoanFixtures.protocolParams()}: the 14_000_000
+     * {@code maxTxExMem} pinned there and in {@code EvalFixtures} is stale, the same pinned-fixture
+     * problem this ticket is about one layer up. Refreshing those fixtures is backlog, together with
+     * the cost model; a guard that took its threshold from the stale pin would be measuring the pin.
+     */
+    private static final BigInteger BUDGET_MEM = BigInteger.valueOf(17_500_000L);
+    private static final BigInteger BUDGET_STEPS = BigInteger.valueOf(10_000_000_000L);
+
+    /**
+     * The same candidate, priced twice: once with cardano-client-lib's placeholder ex-units and once
+     * with ex-units measured by the real PlutusV3 machine against the deployed validators.
+     *
+     * <h2>Why this test exists</h2>
+     * Ex-units are priced into the fee ({@code priceMem} 0.0577, {@code priceStep} 0.0000721), so
+     * placeholders do not merely mis-declare the budget — they under-state the fee, and the fee is what
+     * {@code expectedProfitLovelace} is computed from. A candidate can therefore be reported as
+     * profitable on arithmetic that no real transaction would ever satisfy. Both numbers are printed
+     * rather than only asserted, because deciding whether the margin is still the right one is an
+     * operator's call and needs the figures.
+     *
+     * <h2>What is asserted</h2>
+     * That the honest run is honest (no redeemer left at a placeholder), that pricing it costs more
+     * than pretending (so the placeholder fee really was an under-statement, in the direction that
+     * flatters the bot), and that the measured cost sits inside half the live budget. The last one is a
+     * guard rather than a measurement: at ~13% of mem and ~8% of steps it has an order of magnitude of
+     * slack, so it will not flap, but a change that doubles the cost of a liquidation stops being
+     * invisible.
+     */
+    @Test
+    void honestExUnitsCostMoreThanPlaceholdersAndStillFitInsideHalfTheLiveBudget() throws Exception {
+        Scenario scenario = scenario(FAT_FEE_PER_MILLE);
+
+        Wiring guessing = wiring(shadow(SMALL_MARGIN), scenario, false);
+        guessing.executor().cycle(NOW);
+        LiquidationDecision guessed = onlyDecision(guessing);
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, guessed.outcome(), guessed.detail());
+
+        Wiring measuring = wiringWithHonestExUnits(shadow(SMALL_MARGIN), scenario);
+        measuring.executor().cycle(NOW);
+        LiquidationDecision measured = onlyDecision(measuring);
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, measured.outcome(), measured.detail());
+
+        // Every redeemer of the honest transaction carries a real costing, read off the transaction
+        // rather than off the evaluator's report.
+        Transaction honest = Transaction.deserialize(HexUtil.decodeHexString(measured.txCborHex()));
+        BigInteger totalMem = BigInteger.ZERO;
+        BigInteger totalSteps = BigInteger.ZERO;
+        for (Redeemer redeemer : honest.getWitnessSet().getRedeemers()) {
+            assertTrue(redeemer.getExUnits().getMem().compareTo(BigInteger.valueOf(10_000)) > 0,
+                    "redeemer " + redeemer.getTag() + "#" + redeemer.getIndex()
+                            + " still carries a placeholder mem of " + redeemer.getExUnits().getMem());
+            totalMem = totalMem.add(redeemer.getExUnits().getMem());
+            totalSteps = totalSteps.add(redeemer.getExUnits().getSteps());
+        }
+
+        // The placeholder transaction, for contrast: 10000 mem everywhere.
+        Transaction placeheld = Transaction.deserialize(HexUtil.decodeHexString(guessed.txCborHex()));
+        BigInteger placeholderMem = BigInteger.ZERO;
+        for (Redeemer redeemer : placeheld.getWitnessSet().getRedeemers()) {
+            placeholderMem = placeholderMem.add(redeemer.getExUnits().getMem());
+        }
+        assertTrue(totalMem.compareTo(placeholderMem) > 0,
+                "the placeholders were not an under-statement, which contradicts the whole defect");
+
+        System.out.printf("OBSERVED honest ex-units for one ada/ada liquidation: mem=%s (%.1f%% of "
+                        + "%s), steps=%s (%.1f%% of %s)%n",
+                totalMem, percent(totalMem, BUDGET_MEM), BUDGET_MEM,
+                totalSteps, percent(totalSteps, BUDGET_STEPS), BUDGET_STEPS);
+        System.out.printf("OBSERVED placeholder vs honest: tx_fee %s -> %s lovelace, "
+                        + "expected_profit %s -> %s lovelace, tx_size %d -> %d bytes%n",
+                guessed.txFeeLovelace(), measured.txFeeLovelace(),
+                guessed.expectedProfitLovelace(), measured.expectedProfitLovelace(),
+                guessed.txSizeBytes(), measured.txSizeBytes());
+
+        // Task 5's two numbers, asserted so they cannot drift silently past a reader.
+        assertTrue(measured.txFeeLovelace().compareTo(guessed.txFeeLovelace()) > 0,
+                "an honestly priced transaction costs more than a placeholder-priced one");
+        assertEquals(measured.txFeeLovelace().subtract(guessed.txFeeLovelace()),
+                guessed.expectedProfitLovelace().subtract(measured.expectedProfitLovelace()),
+                "every lovelace the honest fee adds comes straight off the expected profit");
+        assertTrue(measured.txSizeBytes() >= guessed.txSizeBytes(),
+                "real ex-unit integers encode no smaller than the placeholders");
+
+        // Task 6: the headroom guard.
+        assertTrue(totalMem.multiply(BigInteger.TWO).compareTo(BUDGET_MEM) <= 0,
+                "consumed mem " + totalMem + " is over half of the live maxTxExMem " + BUDGET_MEM);
+        assertTrue(totalSteps.multiply(BigInteger.TWO).compareTo(BUDGET_STEPS) <= 0,
+                "consumed steps " + totalSteps + " is over half of the live maxTxExSteps " + BUDGET_STEPS);
+    }
+
+    /**
+     * The verdict itself, stated as a claim an operator can act on: with the default 1.5 ADA margin the
+     * honest fee does <em>not</em> turn this candidate unprofitable. If it ever does, this test fails
+     * with the numbers in the message, and that failure is the finding — not something to fix by
+     * choosing a friendlier fixture.
+     */
+    @Test
+    void theHonestFeeDoesNotTurnTheAdaAdaCandidateUnprofitable() {
+        Wiring measuring = wiringWithHonestExUnits(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE));
+        measuring.executor().cycle(NOW);
+
+        LiquidationDecision measured = onlyDecision(measuring);
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, measured.outcome(),
+                ("the honest fee turned a previously profitable ada/ada candidate unprofitable: "
+                        + "fee=%s margin=%s profit=%s — this is a finding for T-010, not a fixture "
+                        + "problem").formatted(measured.txFeeLovelace(), measured.marginLovelace(),
+                        measured.expectedProfitLovelace()));
+        assertTrue(measured.expectedProfitLovelace().signum() > 0, measured.detail());
+    }
+
+    private static Wiring wiringWithHonestExUnits(AppConfig.LiquidationConfiguration configuration,
+                                                  Scenario scenario) {
+        return wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
+                allUnspent(List.of(scenario)), List.of(WALLET_UTXO), noOracle(), false, true);
+    }
+
+    private static double percent(BigInteger part, BigInteger whole) {
+        return new BigDecimal(part).multiply(BigDecimal.valueOf(100))
+                .divide(new BigDecimal(whole), 1, RoundingMode.HALF_UP).doubleValue();
     }
 
     // ======================================================================================

@@ -4,8 +4,11 @@ import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.model.EvaluationResult;
+import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
@@ -15,6 +18,8 @@ import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
+import com.bloxbean.cardano.client.plutus.spec.Redeemer;
+import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.Asset;
@@ -63,10 +68,17 @@ import java.util.stream.Stream;
  * loans and the UTxOs the caller has resolved for them.
  *
  * <h2>What this class is, and is not</h2>
- * It is <b>deterministic and network-free</b>: every input, output, reference input and index is
- * computed from the arguments, the {@link LoansContractRegistry} derivation, and the caller's
+ * It is <b>deterministic</b>: every input, output, reference input and index is computed from the
+ * arguments, the {@link LoansContractRegistry} derivation, and the caller's
  * {@link UtxoSupplier}/{@link ProtocolParamsSupplier}. It never takes a {@code BackendService},
  * never submits, and never signs.
+ * <p>
+ * The one thing it may reach the network for is <em>script cost evaluation</em>: the optional
+ * {@link TransactionEvaluator} described under "Ex-units are measured, not guessed" below. That
+ * interface has a single operation, {@code evaluateTx(cbor, inputUtxos)}, and no submit method of any
+ * kind, so granting it does not grant a submission path — {@code transactionProcessor} stays
+ * {@code null} in {@link #complete}, which is what makes this class structurally incapable of
+ * submitting rather than merely disinclined to.
  * <p>
  * It is <b>not</b> a health-factor engine. Every number that reaches a redeemer —
  * {@code remainingDebt}, {@code equity}, {@code liquidationFee} — is copied verbatim from the
@@ -110,6 +122,31 @@ import java.util.stream.Stream;
  *       This is the only veto here that is a statement about <em>this deployment</em> rather than
  *       about the design, so it is checked last of the per-loan vetoes: a batch that is wrong for a
  *       permanent reason reports that permanent reason.</li>
+ * </ul>
+ *
+ * <h2>Ex-units are measured, not guessed</h2>
+ * A redeemer's declared ex-units are not checked by the mempool: a transaction that under-declares is
+ * accepted, lands on chain, and then exhausts its budget during on-chain evaluation — phase 2, fee and
+ * collateral forfeit. cardano-client-lib fills every redeemer with a placeholder (10000 mem, and
+ * 10000 or 1000 steps) and only overwrites it from a {@link TransactionEvaluator}; with no evaluator
+ * set, {@code ScriptCostEvaluators} throws "Transaction evaluator is not set" and {@code QuickTxBuilder}
+ * swallows it, because {@code ignoreScriptCostEvaluationError} defaults to {@code true}. The measured
+ * cost of one ada/ada liquidation is ~2.26M mem / ~778M steps, so the placeholders under-declare by
+ * two to five orders of magnitude.
+ * <p>
+ * So the evaluator is <em>optional but load-bearing</em>:
+ * <ul>
+ *   <li><b>Supplied</b> (the production wiring in {@code YaciConfig}) — it is set with
+ *       {@code withTxEvaluator}, and {@code ignoreScriptCostEvaluationError(false)} makes a failed
+ *       evaluation a {@link Refusal#SCRIPT_COST_EVALUATION_FAILED} instead of a {@code log.warn}
+ *       followed by a transaction that would burn collateral. Refusing is the safe direction: this
+ *       class already refuses everything it is not certain about, and the scheduled loop catches
+ *       {@link RefusedException} per candidate.</li>
+ *   <li><b>Absent</b> — the offline test rigs, which have no network and evaluate separately against
+ *       the real PlutusV3 machine ({@code LiquidateDryEvalTest}). Behaviour is then exactly as it was:
+ *       placeholder ex-units, no throw. Nothing built this way may be submitted, which is a property of
+ *       the wiring: the only caller that submits is {@code LiquidationExecutor}, and the only builder
+ *       Spring gives it is the one with the evaluator.</li>
  * </ul>
  *
  * <h2>Index resolution</h2>
@@ -266,6 +303,21 @@ public final class LiquidateTransactionBuilder {
         VALIDITY_WINDOW_INVALID,
         /** V5 — the finished body does not match what the redeemers claim about it. */
         STRUCTURAL_ASSERTION_FAILED,
+        /**
+         * The script-cost evaluator could not price the transaction, so its redeemers would have kept
+         * placeholder ex-units. Distinct from {@link #TRANSACTION_NOT_BUILDABLE} because the two mean
+         * opposite things to an operator: this one says the <em>evaluator</em> failed — Blockfrost down,
+         * rate-limited, or rejecting the request — and is usually transient and affects every candidate
+         * at once, while {@code TRANSACTION_NOT_BUILDABLE} says <em>this candidate</em> could not be
+         * assembled. The detail carries the evaluator's own root-cause text, which cardano-client-lib
+         * otherwise flattens into a bare "Error while evaluating script cost".
+         * <p>
+         * Refusals are deliberately not quarantined, so during an evaluator outage every candidate
+         * re-attempts a remote evaluation every cycle with no backoff. That is a T-010 question, not
+         * this one's: the direction is already safe (nothing is built, nothing is submitted), it is only
+         * wasteful.
+         */
+        SCRIPT_COST_EVALUATION_FAILED,
         /** cardano-client-lib could not balance or assemble the transaction. */
         TRANSACTION_NOT_BUILDABLE
     }
@@ -358,16 +410,47 @@ public final class LiquidateTransactionBuilder {
     private final UtxoSupplier utxoSupplier;
     private final ProtocolParamsSupplier protocolParamsSupplier;
 
+    /**
+     * Where the redeemers' ex-units come from, or {@code null} for "nowhere" — see "Ex-units are
+     * measured, not guessed" in the class javadoc. Nullable rather than optional because the two
+     * states are not a preference: with it, the transaction is priced and a failed evaluation refuses;
+     * without it, the transaction carries placeholders and must not be submitted.
+     */
+    private final TransactionEvaluator scriptCostEvaluator;
+
+    /**
+     * The offline builder: no evaluator, so redeemers keep cardano-client-lib's placeholder ex-units.
+     * For the test rigs, which evaluate separately. Production goes through the six-argument
+     * constructor.
+     */
     public LiquidateTransactionBuilder(LoansContractRegistry registry,
                                        Network network,
                                        CardanoConverters converters,
                                        UtxoSupplier utxoSupplier,
                                        ProtocolParamsSupplier protocolParamsSupplier) {
+        this(registry, network, converters, utxoSupplier, protocolParamsSupplier, null);
+    }
+
+    /**
+     * @param scriptCostEvaluator may be {@code null}; when it is not, every redeemer's ex-units are
+     *                            the evaluator's numbers and a failed evaluation is a
+     *                            {@link Refusal#SCRIPT_COST_EVALUATION_FAILED}. A
+     *                            {@link TransactionEvaluator} cannot submit — that is the whole reason
+     *                            this parameter is that type and not a {@code TransactionProcessor} or
+     *                            a {@code BackendService}.
+     */
+    public LiquidateTransactionBuilder(LoansContractRegistry registry,
+                                       Network network,
+                                       CardanoConverters converters,
+                                       UtxoSupplier utxoSupplier,
+                                       ProtocolParamsSupplier protocolParamsSupplier,
+                                       TransactionEvaluator scriptCostEvaluator) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.network = Objects.requireNonNull(network, "network");
         this.converters = Objects.requireNonNull(converters, "converters");
         this.utxoSupplier = Objects.requireNonNull(utxoSupplier, "utxoSupplier");
         this.protocolParamsSupplier = Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
+        this.scriptCostEvaluator = scriptCostEvaluator;
     }
 
     // ---- the one entry point ---------------------------------------------------------------
@@ -441,18 +524,26 @@ public final class LiquidateTransactionBuilder {
         // encode that offset — a library implementation detail that could move under us and would
         // silently mis-aim `lenderBondOutputIndex` at real money if it did — the transaction is
         // assembled once with placeholder indexes purely to observe the layout, the real indexes
-        // are read off that body, and it is assembled again. Redeemer integers do not change the
-        // number or order of outputs, so the second body has the layout the first one showed.
+        // are read off that body, and it is assembled again.
+        //
+        // The two bodies are not identical — only the probe's redeemers hold placeholder indexes, and
+        // only the second one is script-costed, so they differ in ex-units, fee and size. So the
+        // reason the indexes read off the first are safe to use in the second is NOT that the two
+        // bodies are the same: it is V5, which re-derives every index from the FINISHED body and
+        // refuses (STRUCTURAL_ASSERTION_FAILED) if any of them points at something other than what
+        // its redeemer claims. The probe is a hint; assertStructure is the guarantee.
         List<Long> placeholders = LongStream.range(0, loanOrder.size()).boxed().toList();
+        // The probe is deliberately not script-costed: its claim redeemers name output indexes that
+        // are not the real ones yet, so it is a transaction the validators refuse. See complete().
         Transaction probe = complete(request, assemble(request, loanOrder, bondOrder,
                 claims(loanOrder, refInputs, placeholders), lenderBondInputIndexes, oracles, refInputs,
-                configRefIndex, lmConfigRefIndex));
+                configRefIndex, lmConfigRefIndex), false);
 
         List<Long> bondOutputIndexes = locateBondOutputs(probe, loanOrder);
         List<ClaimData> claims = claims(loanOrder, refInputs, bondOutputIndexes);
 
         Transaction transaction = complete(request, assemble(request, loanOrder, bondOrder, claims,
-                lenderBondInputIndexes, oracles, refInputs, configRefIndex, lmConfigRefIndex));
+                lenderBondInputIndexes, oracles, refInputs, configRefIndex, lmConfigRefIndex), true);
 
         // V5 — everything above is re-derived from the finished body and compared.
         assertStructure(transaction, request, loanOrder, bondOrder, claims, lenderBondInputIndexes,
@@ -1192,9 +1283,29 @@ public final class LiquidateTransactionBuilder {
         return published;
     }
 
-    private Transaction complete(Request request, ScriptTx tx) {
+    /**
+     * Assembles and balances one body.
+     *
+     * @param priceScripts whether this assembly is the one whose redeemers must carry measured
+     *                     ex-units. Only the second one is: the first is the layout probe, and its
+     *                     claim redeemers hold placeholder {@code lenderBondOutputIndex} values that
+     *                     no validator can accept, so a real evaluator run against it fails by
+     *                     construction — measured, by costing the probe on purpose:
+     *                     {@code RedeemerError { tag: "Withdraw", index: 0 }}, the withdrawal whose
+     *                     validator reads the claim's output index. Evaluating it would refuse every
+     *                     batch; not evaluating it costs nothing, because the probe is thrown away
+     *                     after {@code locateBondOutputs} reads the output layout off it, and V5
+     *                     re-derives that layout from the finished body anyway. It also means exactly
+     *                     one evaluation — one remote round trip in production — per build.
+     */
+    private Transaction complete(Request request, ScriptTx tx, boolean priceScripts) {
+        TransactionEvaluator evaluator =
+                priceScripts && scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
         long[] slots = validitySlots(request);
         QuickTxBuilder.TxContext context =
+                // The third argument is the TransactionProcessor, and it stays null: a processor can
+                // submit, and nothing in this class may be able to. Script cost evaluation is granted
+                // separately below through withTxEvaluator, whose interface has no submit method.
                 new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
                         .compose(tx)
                         .feePayer(request.changeAddress())
@@ -1206,7 +1317,17 @@ public final class LiquidateTransactionBuilder {
                         // remote source to fetch one from — the caller either points at a published
                         // reference script or the validator travels in the witness set.
                         .withScriptSupplier(scriptHash -> Optional.empty())
-                        .mergeOutputs(false);
+                        .mergeOutputs(false)
+                        // With an evaluator, a failed evaluation must stop the build: the default
+                        // (true) turns it into a log.warn and hands back a transaction whose redeemers
+                        // still carry placeholder ex-units, which is a phase-2 failure waiting to be
+                        // submitted. Without one, the flag stays true because there is nothing to
+                        // evaluate with and the offline rigs price the transaction themselves.
+                        .ignoreScriptCostEvaluationError(evaluator == null);
+
+        if (evaluator != null) {
+            context = context.withTxEvaluator(evaluator);
+        }
 
         List<PlutusScript> published = publishedScripts(request.referenceScripts());
         if (!published.isEmpty()) {
@@ -1219,8 +1340,131 @@ public final class LiquidateTransactionBuilder {
         } catch (RefusedException e) {
             throw e;
         } catch (Exception e) {
+            // Everything cardano-client-lib can fail with arrives here as a named refusal — the
+            // scheduled loop catches RefusedException per candidate, so nothing thrown in here can
+            // take a cycle down. An evaluator failure is told apart from an unbuildable candidate by
+            // the marker reporting() plants in the cause chain, rather than by matching on
+            // cardano-client-lib's "Error while evaluating script cost" wording.
+            ScriptCostEvaluationException evaluation = evaluationFailureIn(e);
+            if (evaluation != null) {
+                throw refuse(Refusal.SCRIPT_COST_EVALUATION_FAILED, evaluation.getMessage(), e);
+            }
             throw refuse(Refusal.TRANSACTION_NOT_BUILDABLE, e.getMessage(), e);
         }
+    }
+
+    /**
+     * Thrown by {@link #reporting} when the evaluator itself fails, so that
+     * {@link Refusal#SCRIPT_COST_EVALUATION_FAILED} is decided by a type rather than by a string, and
+     * so the operator-facing detail is the evaluator's root cause rather than cardano-client-lib's
+     * two-layer wrapping of it.
+     */
+    private static final class ScriptCostEvaluationException extends RuntimeException {
+
+        ScriptCostEvaluationException(String detail, Throwable cause) {
+            super(detail, cause);
+        }
+    }
+
+    /**
+     * The caller's evaluator, with every way it can fail to price the transaction turned into one
+     * {@link ScriptCostEvaluationException}. Unchecked on purpose: {@code ScriptCostEvaluators} only
+     * catches {@code CborSerializationException} and {@code ApiException}, so a {@link RuntimeException}
+     * reaches {@link #complete}'s catch with the marker still at the head of the chain.
+     * <p>
+     * Three failure shapes, not two. A thrown exception and an unsuccessful {@link Result} are the
+     * obvious ones; the third is a <b>successful result that does not cost every redeemer</b>, and it is
+     * the dangerous one precisely because it looks like success. Blockfrost answering HTTP 200 with an
+     * incomplete array — an upstream bug, an API shape change, a proxy in the way — would otherwise pass
+     * straight through: {@code ScriptCostEvaluators} writes back only the costings it was given, the
+     * redeemers it was not given keep their 10000-mem placeholders, the build succeeds, and in live mode
+     * that transaction is submitted and forfeits collateral in phase 2. Checking the envelope and not
+     * the payload would leave exactly the defect this class exists to close, one layer in.
+     */
+    private static TransactionEvaluator reporting(TransactionEvaluator delegate) {
+        return (cbor, inputUtxos) -> {
+            Result<List<EvaluationResult>> result;
+            try {
+                result = delegate.evaluateTx(cbor, inputUtxos);
+            } catch (Exception e) {
+                throw new ScriptCostEvaluationException(causeChain(e), e);
+            }
+            if (result == null) {
+                throw new ScriptCostEvaluationException("the evaluator returned no result", null);
+            }
+            if (!result.isSuccessful()) {
+                throw new ScriptCostEvaluationException(String.valueOf(result.getResponse()), null);
+            }
+            requireEveryRedeemerCosted(cbor, result.getValue());
+            return result;
+        };
+    }
+
+    /**
+     * Every redeemer in the transaction that was sent for evaluation must come back with a costing of
+     * its own. Coverage is checked per {@code (tag, index)} pair — the same key
+     * {@code ScriptCostEvaluators} writes back on — rather than by count, because N results for N
+     * redeemers can still leave one redeemer uncosted and one costing unused.
+     */
+    private static void requireEveryRedeemerCosted(byte[] cbor, List<EvaluationResult> results) {
+        List<Redeemer> redeemers;
+        try {
+            redeemers = Transaction.deserialize(cbor).getWitnessSet().getRedeemers();
+        } catch (Exception e) {
+            throw new ScriptCostEvaluationException(
+                    "the transaction sent for evaluation could not be read back", e);
+        }
+        if (redeemers == null || redeemers.isEmpty()) {
+            // No redeemers means cardano-client-lib skipped evaluation entirely; nothing to cover.
+            return;
+        }
+        Set<String> costed = new HashSet<>();
+        if (results != null) {
+            for (EvaluationResult costing : results) {
+                costed.add(redeemerKey(costing.getRedeemerTag(), costing.getIndex()));
+            }
+        }
+        List<String> uncosted = redeemers.stream()
+                .map(redeemer -> redeemerKey(redeemer.getTag(), redeemer.getIndex().intValue()))
+                .filter(key -> !costed.contains(key))
+                .toList();
+        if (!uncosted.isEmpty()) {
+            throw new ScriptCostEvaluationException(
+                    ("the evaluator costed %d of %d redeemers; %s would have kept placeholder ex-units")
+                            .formatted(redeemers.size() - uncosted.size(), redeemers.size(), uncosted),
+                    null);
+        }
+    }
+
+    private static String redeemerKey(RedeemerTag tag, int index) {
+        return tag + "#" + index;
+    }
+
+    private static ScriptCostEvaluationException evaluationFailureIn(Throwable thrown) {
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            if (t instanceof ScriptCostEvaluationException marker) {
+                return marker;
+            }
+            if (t.getCause() == t) {
+                break;
+            }
+        }
+        return null;
+    }
+
+    /** Every link of the chain, so the reason a remote evaluator refused is not lost to wrapping. */
+    private static String causeChain(Throwable thrown) {
+        StringBuilder detail = new StringBuilder();
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            if (!detail.isEmpty()) {
+                detail.append(" <- ");
+            }
+            detail.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage());
+            if (t.getCause() == t) {
+                break;
+            }
+        }
+        return detail.toString();
     }
 
     /**

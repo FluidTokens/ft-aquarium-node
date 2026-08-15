@@ -1,8 +1,14 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.api.TransactionProcessor;
+import com.bloxbean.cardano.client.api.exception.ApiException;
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.model.EvaluationResult;
+import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
+import com.bloxbean.cardano.client.plutus.spec.ExUnits;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
@@ -25,11 +31,16 @@ import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -1037,6 +1048,340 @@ class LiquidateTransactionBuilderTest {
     }
 
     // ======================================================================================
+    // the redeemers' ex-units: read off the built transaction, not off the evaluator's report
+    // ======================================================================================
+
+    /**
+     * Every other ex-units assertion in this repo reads {@code EvaluationResult.getExUnits()} — what
+     * the evaluator <em>said</em>. That is not the number the chain charges: the chain reads the
+     * redeemers of the transaction, and if nothing copied the evaluation into them they still hold
+     * cardano-client-lib's placeholders (10000 mem, 10000 or 1000 steps) against a measured 2.26M mem
+     * / 778M steps. Under-declared ex-units are not rejected by the mempool; the transaction lands and
+     * fails during on-chain evaluation, forfeiting the collateral.
+     * <p>
+     * So this test deserialises the finished transaction and compares each redeemer's declared
+     * ex-units with what the evaluator was made to return for that exact {@code (tag, index)} pair.
+     * The stub's numbers are a function of the pair rather than one constant, so a build that wrote
+     * <em>an</em> evaluation into <em>every</em> redeemer without matching them up would fail here too.
+     */
+    @Test
+    void theBuiltTransactionCarriesTheEvaluatedExUnitsAndNotThePlaceholders() throws Exception {
+        AdaScenario scenario = zeroEquityAdaScenario();
+        StubEvaluator evaluator = new StubEvaluator();
+
+        Transaction built = builder(List.of(scenario), Map.of(), evaluator)
+                .build(request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO,
+                        LiquidateTransactionBuilder.ReferenceScripts.none()));
+
+        // Once, though the builder assembles twice. The first assembly is the layout probe, whose
+        // claim redeemers carry placeholder output indexes no validator accepts; costing it would
+        // fail by construction and refuse every batch. Pinned in both directions: it must happen (or
+        // the redeemers keep their placeholders) and it must not happen twice (in production each
+        // call is a round trip to Blockfrost's evaluate endpoint).
+        assertEquals(1, evaluator.calls,
+                "only the final assembly may be script-costed — never the throwaway layout probe");
+
+        // Re-read from the bytes, not from the object the builder happens to hold.
+        Transaction reread = Transaction.deserialize(built.serialize());
+        List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
+        assertFalse(redeemers.isEmpty(), "a Liquidate has redeemers");
+
+        for (Redeemer redeemer : redeemers) {
+            int index = redeemer.getIndex().intValue();
+            assertEquals(stubMem(redeemer.getTag(), index), redeemer.getExUnits().getMem(),
+                    "declared mem for " + redeemer.getTag() + "#" + index
+                            + " is not the evaluated one — a placeholder would be 10000");
+            assertEquals(stubSteps(redeemer.getTag(), index), redeemer.getExUnits().getSteps(),
+                    "declared steps for " + redeemer.getTag() + "#" + index
+                            + " is not the evaluated one — a placeholder would be 10000 or 1000");
+        }
+    }
+
+    /**
+     * The same build with no evaluator: exactly today's behaviour, placeholders and all. Pinned rather
+     * than merely allowed, because it is the state the offline rigs build in and the state nothing may
+     * ever be submitted from — {@code YaciConfig} is what makes sure the armed path never sees it.
+     * <p>
+     * The placeholder values are also the measurement this whole defect rests on: they are constants
+     * cardano-client-lib writes when it creates a {@link Redeemer}, three to five orders of magnitude
+     * under what the scripts really cost.
+     */
+    @Test
+    void withNoEvaluatorTheRedeemersStillCarryPlaceholdersAndNothingIsThrown() throws Exception {
+        AdaScenario scenario = zeroEquityAdaScenario();
+
+        Transaction built = builder(List.of(scenario), Map.of())
+                .build(request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO,
+                        LiquidateTransactionBuilder.ReferenceScripts.none()));
+
+        Transaction reread = Transaction.deserialize(built.serialize());
+        for (Redeemer redeemer : reread.getWitnessSet().getRedeemers()) {
+            assertEquals(BigInteger.valueOf(10_000), redeemer.getExUnits().getMem(),
+                    "the placeholder mem changed; the defect's measurement has to be redone");
+            assertTrue(redeemer.getExUnits().getSteps().compareTo(BigInteger.valueOf(10_000)) <= 0,
+                    "the placeholder steps changed: " + redeemer.getExUnits().getSteps());
+        }
+    }
+
+    /**
+     * The loud half. {@code ignoreScriptCostEvaluationError} defaults to {@code true}, which is what
+     * turned "there is no evaluator" into a {@code log.warn} and a transaction full of placeholders in
+     * the first place. With an evaluator wired, the builder sets it to {@code false}, so an evaluator
+     * that fails — Blockfrost down, the transaction rejected by the evaluation endpoint — refuses the
+     * batch under a named reason instead of producing an unsubmittable-but-submitted transaction.
+     * <p>
+     * The reason has to be its own, and it has to carry the evaluator's own words. "Blockfrost is down"
+     * and "this candidate cannot be assembled" call for opposite responses from an operator, and
+     * cardano-client-lib flattens both into {@code TxBuildException("Error while evaluating script
+     * cost")} with the real message two wrappers down.
+     */
+    @Test
+    void anEvaluatorThatThrowsRefusesTheBatchRatherThanFallingBackToPlaceholders() {
+        AdaScenario scenario = zeroEquityAdaScenario();
+        TransactionEvaluator exploding = (cbor, inputUtxos) -> {
+            throw new ApiException("blockfrost says no");
+        };
+
+        LiquidateTransactionBuilder.RefusedException refused =
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> builder(List.of(scenario), Map.of(), exploding).build(
+                                request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM,
+                                        VALID_TO, LiquidateTransactionBuilder.ReferenceScripts.none())));
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.SCRIPT_COST_EVALUATION_FAILED,
+                refused.getReason());
+        assertTrue(refused.getMessage().contains("blockfrost says no"),
+                "the evaluator's own reason must survive to the operator: " + refused.getMessage());
+    }
+
+    /** And the other failure shape: the endpoint answered, but with an error rather than a costing. */
+    @Test
+    void anEvaluatorThatReturnsAnErrorAlsoRefusesTheBatch() {
+        AdaScenario scenario = zeroEquityAdaScenario();
+        TransactionEvaluator rejecting = (cbor, inputUtxos) -> Result.error("ValidationFailure");
+
+        LiquidateTransactionBuilder.RefusedException refused =
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> builder(List.of(scenario), Map.of(), rejecting).build(
+                                request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM,
+                                        VALID_TO, LiquidateTransactionBuilder.ReferenceScripts.none())));
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.SCRIPT_COST_EVALUATION_FAILED,
+                refused.getReason());
+        assertTrue(refused.getMessage().contains("ValidationFailure"),
+                "the endpoint's response must survive to the operator: " + refused.getMessage());
+    }
+
+    /**
+     * The third failure shape, and the one that looks like success: HTTP 200 with an <em>empty</em>
+     * costing array. Checking only {@code isSuccessful()} would pass this straight through —
+     * {@code ScriptCostEvaluators} would write back nothing, every redeemer would keep its 10000-mem
+     * placeholder, the build would succeed, and in live mode that transaction goes out and forfeits
+     * collateral in phase 2. Exactly the defect this class exists to close, one layer in.
+     */
+    @Test
+    void anEvaluatorThatSucceedsWithNoCostingsAtAllRefusesRatherThanBuilding() {
+        AdaScenario scenario = zeroEquityAdaScenario();
+        TransactionEvaluator emptySuccess =
+                (cbor, inputUtxos) -> Result.success("ok").withValue(List.<EvaluationResult>of());
+
+        LiquidateTransactionBuilder.RefusedException refused =
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> builder(List.of(scenario), Map.of(), emptySuccess).build(
+                                request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM,
+                                        VALID_TO, LiquidateTransactionBuilder.ReferenceScripts.none())));
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.SCRIPT_COST_EVALUATION_FAILED,
+                refused.getReason());
+        assertTrue(refused.getMessage().contains("costed 0 of "),
+                "the refusal must say how many of how many were costed: " + refused.getMessage());
+    }
+
+    /**
+     * The subtler half: a costing array that is non-empty but incomplete. A check that only asked
+     * "did we get anything back?" would pass this, and every redeemer the evaluator skipped would
+     * still be submitted at 10000 mem. Coverage is therefore asserted per {@code (tag, index)} pair,
+     * which is also the key cardano-client-lib writes back on.
+     */
+    @Test
+    void anEvaluatorThatCostsOnlySomeRedeemersRefusesRatherThanBuilding() {
+        AdaScenario scenario = zeroEquityAdaScenario();
+        StubEvaluator complete = new StubEvaluator();
+        TransactionEvaluator partial = (cbor, inputUtxos) -> {
+            List<EvaluationResult> all = complete.evaluateTx(cbor, inputUtxos).getValue();
+            // Cover exactly one redeemer and omit the rest.
+            return Result.success("ok").withValue(all.subList(0, 1));
+        };
+
+        LiquidateTransactionBuilder.RefusedException refused =
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> builder(List.of(scenario), Map.of(), partial).build(
+                                request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM,
+                                        VALID_TO, LiquidateTransactionBuilder.ReferenceScripts.none())));
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.SCRIPT_COST_EVALUATION_FAILED,
+                refused.getReason());
+        assertTrue(refused.getMessage().contains("costed 1 of "),
+                "the refusal must name the shortfall: " + refused.getMessage());
+    }
+
+    /**
+     * The negative control the two tests above need to mean anything: the new reason must fire for
+     * evaluator failures and <em>only</em> for them, or it is just a rename of
+     * {@code TRANSACTION_NOT_BUILDABLE}.
+     * <p>
+     * The evaluator here <b>succeeds</b> — it simply reports a cost nobody can pay. Priced at
+     * {@code priceMem} 0.0577 that is hundreds of ADA of fee against a wallet holding sixty, so the
+     * build fails during balancing, strictly <em>after</em> a successful evaluation. That is the case
+     * a string match on cardano-client-lib's wrapper message would get wrong, and the typed marker
+     * gets right.
+     */
+    @Test
+    void aBuildThatFailsAfterASuccessfulEvaluationIsNotReportedAsAnEvaluatorFailure() {
+        AdaScenario scenario = zeroEquityAdaScenario();
+        TransactionEvaluator unaffordable = (cbor, inputUtxos) -> {
+            List<EvaluationResult> results = new ArrayList<>();
+            try {
+                for (Redeemer redeemer : Transaction.deserialize(cbor).getWitnessSet().getRedeemers()) {
+                    results.add(EvaluationResult.builder()
+                            .redeemerTag(redeemer.getTag())
+                            .index(redeemer.getIndex().intValue())
+                            .exUnits(ExUnits.builder()
+                                    .mem(BigInteger.valueOf(9_000_000_000L))
+                                    .steps(BigInteger.valueOf(9_000_000_000_000L))
+                                    .build())
+                            .build());
+                }
+            } catch (Exception e) {
+                throw new AssertionError("undeserialisable bytes reached the evaluator", e);
+            }
+            return Result.success("ok").withValue(results);
+        };
+
+        LiquidateTransactionBuilder.RefusedException refused =
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> builder(List.of(scenario), Map.of(), unaffordable).build(
+                                request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM,
+                                        VALID_TO, LiquidateTransactionBuilder.ReferenceScripts.none())));
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.TRANSACTION_NOT_BUILDABLE, refused.getReason(),
+                "a build that failed after the evaluator answered is not an evaluator outage: "
+                        + refused.getMessage());
+    }
+
+    /**
+     * Closing the evaluation hole must not open the submission one. A {@code TransactionEvaluator} is
+     * the narrowest thing that can price a transaction: one method, taking bytes and returning
+     * costings, and no way to transmit anything. This is the falsifiable form — the interface the
+     * builder now accepts declares exactly one abstract method, and that method is not a submit.
+     * <p>
+     * The sibling half of the claim is that the builder never receives or holds anything
+     * <em>wider</em>. A constructor is not the only way in — a setter or a mutable field would do just
+     * as well — so the sweep is over every declared constructor, method and field, not only the
+     * constructors: nothing reachable from outside this class may accept or hold a
+     * {@code TransactionProcessor}, a {@code *BackendService} or a {@code TransactionSubmitter}.
+     * Private members are swept too, because a private field is what a package-private setter would
+     * write into.
+     */
+    @Test
+    void theBuilderNeitherAcceptsNorHoldsAnythingThatCanSubmit() {
+        List<Method> abstractMethods = Arrays.stream(TransactionEvaluator.class.getDeclaredMethods())
+                .filter(method -> Modifier.isAbstract(method.getModifiers()))
+                .toList();
+        assertEquals(1, abstractMethods.size(),
+                "TransactionEvaluator grew a second operation: " + abstractMethods);
+        assertEquals("evaluateTx", abstractMethods.getFirst().getName());
+        assertFalse(TransactionProcessor.class.isAssignableFrom(TransactionEvaluator.class),
+                "an evaluator must not be a processor — a processor can submit");
+
+        for (Constructor<?> constructor : LiquidateTransactionBuilder.class.getDeclaredConstructors()) {
+            for (Class<?> parameter : constructor.getParameterTypes()) {
+                assertCannotSubmit(parameter, "constructor " + constructor);
+            }
+        }
+        for (Method method : LiquidateTransactionBuilder.class.getDeclaredMethods()) {
+            for (Class<?> parameter : method.getParameterTypes()) {
+                assertCannotSubmit(parameter, "method " + method.getName());
+            }
+            assertCannotSubmit(method.getReturnType(), "the return type of " + method.getName());
+        }
+        for (Field field : LiquidateTransactionBuilder.class.getDeclaredFields()) {
+            assertCannotSubmit(field.getType(), "field " + field.getName());
+        }
+    }
+
+    /**
+     * One member of the builder's surface, checked against the three shapes that can reach the wire.
+     * The {@code BackendService} check is by name rather than by type because the point is to catch
+     * <em>any</em> backend — Blockfrost's, Ogmios', Koios' — not the one that happens to be on the
+     * classpath here.
+     */
+    private static void assertCannotSubmit(Class<?> type, String where) {
+        assertFalse(TransactionProcessor.class.isAssignableFrom(type),
+                where + " involves " + type.getName() + ", which can submit");
+        assertFalse(type.getName().contains("BackendService"),
+                where + " involves " + type.getName() + ", which can submit");
+        assertFalse(LiquidationExecutor.TransactionSubmitter.class.isAssignableFrom(type),
+                where + " involves a submitter");
+    }
+
+    /** 100 ADA of collateral against 110 ADA of debt: under water, so V8 has nothing to refuse. */
+    private static AdaScenario zeroEquityAdaScenario() {
+        AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
+                100_000_000L, BigInteger.valueOf(500), LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+        assertEquals(BigInteger.ZERO, scenario.assessment().equity(),
+                "the fixture must have zero equity, or V8 refuses it before any evaluation happens");
+        return scenario;
+    }
+
+    /**
+     * Ex-units keyed on the redeemer they belong to, so "every redeemer got its own answer" is
+     * checkable. Well inside {@code maxTxExMem}/{@code maxTxExSteps} for the six redeemers a
+     * {@code Liquidate} carries, and nowhere near any placeholder.
+     */
+    private static BigInteger stubMem(RedeemerTag tag, int index) {
+        return BigInteger.valueOf(1_000_000L + tag.ordinal() * 100_000L + index * 1_000L);
+    }
+
+    private static BigInteger stubSteps(RedeemerTag tag, int index) {
+        return BigInteger.valueOf(500_000_000L + tag.ordinal() * 10_000_000L + index * 100_000L);
+    }
+
+    /**
+     * A {@link TransactionEvaluator} that costs whatever it is shown, at {@link #stubMem}/
+     * {@link #stubSteps} per redeemer. It reads the redeemers out of the CBOR it was handed rather
+     * than out of the builder, which is also how it proves the builder really serialised the
+     * transaction for evaluation.
+     */
+    private static final class StubEvaluator implements TransactionEvaluator {
+
+        private int calls;
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public Result<List<EvaluationResult>> evaluateTx(byte[] cbor, java.util.Set<Utxo> inputUtxos) {
+            calls++;
+            List<EvaluationResult> results = new ArrayList<>();
+            try {
+                for (Redeemer redeemer : Transaction.deserialize(cbor).getWitnessSet().getRedeemers()) {
+                    int index = redeemer.getIndex().intValue();
+                    results.add(EvaluationResult.builder()
+                            .redeemerTag(redeemer.getTag())
+                            .index(index)
+                            .exUnits(ExUnits.builder()
+                                    .mem(stubMem(redeemer.getTag(), index))
+                                    .steps(stubSteps(redeemer.getTag(), index))
+                                    .build())
+                            .build());
+                }
+            } catch (Exception e) {
+                throw new AssertionError("the builder handed the evaluator undeserialisable bytes", e);
+            }
+            return Result.success("ok").withValue(results);
+        }
+    }
+
+    // ======================================================================================
     // scenario plumbing
     // ======================================================================================
 
@@ -1170,6 +1515,13 @@ class LiquidateTransactionBuilderTest {
 
     private static LiquidateTransactionBuilder builder(List<AdaScenario> scenarios,
                                                        Map<String, OracleEntry> oracles) {
+        return builder(scenarios, oracles, null);
+    }
+
+    /** The same builder with a script-cost evaluator, for the ex-units section above. */
+    private static LiquidateTransactionBuilder builder(List<AdaScenario> scenarios,
+                                                       Map<String, OracleEntry> oracles,
+                                                       TransactionEvaluator evaluator) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
                 BOT_SPARE_UTXO));
         scenarios.forEach(scenario -> {
@@ -1177,7 +1529,7 @@ class LiquidateTransactionBuilderTest {
             universe.add(scenario.bond().utxo());
         });
         return new LiquidateTransactionBuilder(REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(),
-                LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams());
+                LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams(), evaluator);
     }
 
     private static LiquidateTransactionBuilder.Request request(List<AdaScenario> scenarios,
