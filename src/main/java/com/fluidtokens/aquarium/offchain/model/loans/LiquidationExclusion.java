@@ -28,6 +28,8 @@ public enum LiquidationExclusion {
      * D2 — {@code equityInPrincipalCurrency == True}. Every working LenderManager liquidation
      * action also {@code expect}s this to be false; the bot's addressable set is exactly
      * {@code Liquidation { equityInPrincipalCurrency: False, .. }}.
+     * <p>
+     * Backed by {@code LiquidateTransactionBuilder.Refusal#EQUITY_IN_PRINCIPAL_CURRENCY}.
      */
     EQUITY_IN_PRINCIPAL_CURRENCY,
 
@@ -48,6 +50,8 @@ public enum LiquidationExclusion {
      * {@code Liquidate} action this scanner targets enforces
      * {@code shouldLiquidationConvertToPrincipal == False} (§7.5, {@code :143}); the convert
      * variant is a different action, out of scope here.
+     * <p>
+     * Backed by {@code LiquidateTransactionBuilder.Refusal#CONVERSION_TO_PRINCIPAL_REQUIRED}.
      */
     CONVERSION_TO_PRINCIPAL_REQUIRED,
 
@@ -102,6 +106,8 @@ public enum LiquidationExclusion {
      * contracts as currently deployed rather than a rule of the design: when FluidTokens redeploys
      * with separate output indexes for the two asset-manager outputs, positive equity becomes
      * buildable again and this exclusion should be revisited.
+     * <p>
+     * Backed by {@code LiquidateTransactionBuilder.Refusal#POSITIVE_EQUITY_UNSUPPORTED}.
      */
     POSITIVE_EQUITY_UNSUPPORTED
 }

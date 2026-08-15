@@ -190,8 +190,15 @@ public final class LiquidateTransactionBuilder {
         /** The registry's reward address is not the one this network derives from its credential. */
         ORACLE_REWARD_ADDRESS_MISMATCH,
         /** V6 — a Charli3 feed is validated against a provider UTxO the registry did not publish. */
+        @UnreachableFromScannedBatch(
+                scannerFilter = "OracleEntry.usableForLiquidation",
+                reason = "usableForLiquidation() requires charlieProviderReferenceInput != null for a "
+                        + "PRICE_DATA_CHARLIE feed")
         CHARLIE_PROVIDER_REFERENCE_INPUT_MISSING,
         /** V6 — {@code Pooled} and {@code PriceDataOrcfax} feeds are not modelled. */
+        @UnreachableFromScannedBatch(
+                scannerFilter = "OracleEntry.usableForLiquidation",
+                reason = "usableForLiquidation() is false for POOLED and PRICE_DATA_ORCFAX")
         UNSUPPORTED_ORACLE_VARIANT,
         /** V3 — the feed does not cover the whole transaction validity interval. */
         ORACLE_FEED_NOT_USABLE_OVER_WINDOW,
@@ -208,12 +215,20 @@ public final class LiquidateTransactionBuilder {
         /** The stake credential field is not an {@code Option<StakeCredential>}. */
         UNDECODABLE_STAKE_CREDENTIAL,
         /** V6 — a repayment-receipt NFT would have to be minted, and that mint is not modelled. */
+        @UnreachableFromScannedBatch(
+                scannerFilter = "LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED",
+                reason = "reachable only with equity > 0, which the scanner already excludes on; "
+                        + "checked BEFORE V8 in vet(), so V8's own POSITIVE_EQUITY_UNSUPPORTED veto "
+                        + "does not mask it")
         REPAYMENT_RECEIPTS_WITH_EQUITY,
         /**
          * V7 — findings §7.1 D2: the loan's {@code Liquidation.equityInPrincipalCurrency} is true, and
          * {@code lm_liquidate_action.ak:122} is a hard {@code expect equityInPrincipalCurrency == False}.
          * Nothing this builder can emit satisfies it.
          */
+        @UnreachableFromScannedBatch(
+                scannerFilter = "LiquidationExclusion.EQUITY_IN_PRINCIPAL_CURRENCY",
+                reason = "the scanner already excludes on D2 (LiquidationExclusion.EQUITY_IN_PRINCIPAL_CURRENCY)")
         EQUITY_IN_PRINCIPAL_CURRENCY,
         /**
          * V7 — findings §7.5: the lender bond's {@code shouldLiquidationConvertToPrincipal} is true, and
@@ -221,6 +236,9 @@ public final class LiquidateTransactionBuilder {
          * a conjunct of the check the plain {@code Liquidate} path runs. Converting proceeds to the
          * principal currency is a different action, not this one.
          */
+        @UnreachableFromScannedBatch(
+                scannerFilter = "LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED",
+                reason = "the scanner already excludes on §7.5 (LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED)")
         CONVERSION_TO_PRINCIPAL_REQUIRED,
         /**
          * V8 — the assessment's {@code equity} is positive, and the <em>currently deployed</em>
@@ -238,6 +256,9 @@ public final class LiquidateTransactionBuilder {
          * Deployment-specific rather than eternal: a redeploy that gives the two asset-manager outputs
          * separate indexes makes positive equity buildable again, and this is the veto to lift.
          */
+        @UnreachableFromScannedBatch(
+                scannerFilter = "LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED",
+                reason = "the scanner already excludes on positive equity (LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED)")
         POSITIVE_EQUITY_UNSUPPORTED,
         /** D6 needs the bond datum echoed byte for byte; this one does not survive a round trip. */
         BOND_DATUM_NOT_BYTE_IDENTICAL,
