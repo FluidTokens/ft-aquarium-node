@@ -28,6 +28,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
+import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -62,6 +63,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * These are <b>structural</b> claims. Whether the deployed validators accept the transaction is
  * slice C's question; nothing here asserts on-chain acceptance.
  */
+@Slf4j
 class LiquidateTransactionBuilderTest {
 
     private static final LoansContractRegistry REGISTRY = LoanFixtures.registry();
@@ -90,6 +92,33 @@ class LiquidateTransactionBuilderTest {
     private static final String TX_CONFIG = repeat("f1");
     private static final String TX_LM_CONFIG = repeat("f2");
     private static final String TX_REF_SCRIPTS = repeat("70");
+
+    /** The real ledger limit — the one the transactions measured below have to fit under. */
+    private static final int MAX_TX_SIZE = 16_384;
+
+    /**
+     * The six reference-script UTxOs FluidTokens published on preview, copied verbatim from the
+     * {@code preview} profile of {@code src/main/resources/application.yaml}
+     * ({@code loans.liquidation.reference-scripts.*}). {@code assetManager} is null there and null
+     * here: a plain {@code Liquidate} never spends an asset-manager output, so that validator is
+     * never invoked. {@link #TX_REF_SCRIPTS} stays the synthetic placeholder for the structural
+     * reference-script test, which cares only that a coordinate is present, not which one.
+     */
+    private static final LiquidateTransactionBuilder.ReferenceScripts PUBLISHED_PREVIEW =
+            new LiquidateTransactionBuilder.ReferenceScripts(
+                    new TransactionInput(
+                            "00a4e9f69c6ce80b8cb4fe7008a40a2f007aa53b25ec52ae30f11e701f7aa693", 0),
+                    new TransactionInput(
+                            "5c10900c23d16538bc518fa982f0d59a15908f0bb821860ddbef086346b669da", 0),
+                    new TransactionInput(
+                            "fe791b232b8ffcd31c72001a0a6345bc36101eac4d87133b0cf1a101024ffc07", 0),
+                    new TransactionInput(
+                            "13dd33290f62fe42dbbe7afc1d28505c025955bc55bd9b0a0ddff438663c2571", 0),
+                    new TransactionInput(
+                            "b09e23dc5639642a4cbf112d39753c96ed0528115a8468b688b0e8cb19f243fe", 0),
+                    new TransactionInput(
+                            "549b438c3a579a31cc4b7595f43c3af75bd02b237026583b834fc64349a47fe0", 0),
+                    null);
 
     private static final Utxo CONFIG_UTXO = LoanFixtures.adaUtxo(TX_CONFIG, 0,
             LoanFixtures.entAddress(LoanFixtures.CONFIG_POLICY_ID), 5_000_000L);
@@ -466,6 +495,76 @@ class LiquidateTransactionBuilderTest {
         IntStream.range(0, 6).forEach(index ->
                 assertTrue(refInputs.contains(new TransactionInput(TX_REF_SCRIPTS, index)),
                         "reference script " + index + " is missing"));
+    }
+
+    /**
+     * <b>The honest size bound for a liquidation, measured on the heaviest shape the bot builds.</b>
+     * <p>
+     * {@code LiquidateDryEvalTest} measures the ada/ada shape, which is the cheapest one: no oracle.
+     * A token-collateral liquidation is what the bound has to be read off, because it carries
+     * strictly more than the ada one — the oracle NFT, the oracle reference script and the Charli3
+     * provider as three extra reference inputs, a fifth withdrawal for the oracle, its extra
+     * redeemer, and two-asset outputs instead of ada-only ones.
+     * <p>
+     * The scripts travel by reference, using the six coordinates FluidTokens really published on
+     * preview ({@link #PUBLISHED_PREVIEW}); the size is
+     * {@link Transaction#serialize()}{@code .length} on the built transaction, so it is the CBOR the
+     * ledger would count rather than an estimate or a figure carried over from an earlier run. The
+     * empty-witness-set assertion is what makes it a measurement of the reference-script shape at
+     * all.
+     * <p>
+     * The scenario has a positive equity, so it is built through the V8 seam for the reason
+     * {@link #buildIgnoringPositiveEquityVeto} gives: the transaction is the structurally correct
+     * one, and its size is the size a submittable liquidation of this shape would have.
+     */
+    @Test
+    void aTokenCollateralLiquidationFitsUnderMaxTxSizeWithThePublishedReferenceScripts() {
+        TokenScenario scenario = tokenScenario(LoanFixtures.inlineKeyStakeCredential(STAKE_KEY),
+                VALID_FROM - 60_000L, VALID_FROM + 600_000L);
+
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario.scenario()),
+                Map.of(ORACLE_TOKEN.toUnit(), scenario.oracle()), PUBLISHED_PREVIEW);
+
+        assertTrue(tx.getWitnessSet().getPlutusV3Scripts().isEmpty(),
+                "a published script must be read from its reference input, not carried");
+        List<TransactionInput> refInputs = sortedRefInputs(tx);
+        for (TransactionInput coordinate : publishedCoordinates()) {
+            assertTrue(refInputs.contains(coordinate),
+                    "reference script " + coordinate.getTransactionId() + "#" + coordinate.getIndex()
+                            + " is missing from the reference inputs");
+        }
+        // The extra weight this shape carries over the ada/ada one, asserted rather than assumed.
+        // What this pin actually defends is OVER-inclusion: an extra reference input is caught here
+        // and nowhere else. It does NOT catch a fixture that quietly loses its oracle — dropping the
+        // charli3 provider trips the CHARLIE_PROVIDER_REFERENCE_INPUT_MISSING veto inside the builder
+        // long before this line is reached. Both directions are covered; they are just covered by
+        // different layers, and the comment used to claim the wrong one.
+        assertEquals(11, refInputs.size(),
+                "the six v4 reference scripts, the oracle NFT, the oracle's own reference script, the "
+                        + "charli3 provider, and the two configs");
+        assertEquals(5, tx.getBody().getWithdrawals().size(), "the four v4 scripts plus the oracle");
+
+        int size = serializedSize(tx);
+        log.info("Liquidate N=1 token collateral + charli3 oracle with published reference scripts: "
+                + "{} bytes (maxTxSize {})", size, MAX_TX_SIZE);
+        assertTrue(size < MAX_TX_SIZE,
+                "the oracle-bearing liquidation is " + size + " bytes, maxTxSize is " + MAX_TX_SIZE);
+    }
+
+    /** The six coordinates of {@link #PUBLISHED_PREVIEW}, in the record's own order. */
+    private static List<TransactionInput> publishedCoordinates() {
+        return List.of(PUBLISHED_PREVIEW.loan(), PUBLISHED_PREVIEW.loanSpend(),
+                PUBLISHED_PREVIEW.lenderManager(), PUBLISHED_PREVIEW.lenderManagerSpend(),
+                PUBLISHED_PREVIEW.loanClaimAction(), PUBLISHED_PREVIEW.lmLiquidateAction());
+    }
+
+    /** The CBOR the ledger would count, measured rather than estimated. */
+    private static int serializedSize(Transaction tx) {
+        try {
+            return tx.serialize().length;
+        } catch (Exception e) {
+            throw new AssertionError("cannot serialize the built transaction", e);
+        }
     }
 
     // ======================================================================================

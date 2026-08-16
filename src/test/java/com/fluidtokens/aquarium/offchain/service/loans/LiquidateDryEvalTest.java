@@ -1,9 +1,11 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.address.Address;
+import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
@@ -21,6 +23,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
+import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
@@ -71,6 +74,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * assertion below that reasons from a failure states which redeemer index it depends on and why
  * the inference is sound.
  */
+@Slf4j
 class LiquidateDryEvalTest {
 
     private static final LoansContractRegistry REGISTRY = LoanFixtures.registry();
@@ -102,6 +106,36 @@ class LiquidateDryEvalTest {
             LoanFixtures.botAddress(), 50_000_000L);
     private static final Utxo BOT_SPARE_UTXO = LoanFixtures.adaUtxo(TX_BOT_SPARE, 0,
             LoanFixtures.botAddress(), 10_000_000L);
+
+    /** The real ledger limit. Not the rig's {@link EvalFixtures#protocolParams()} ceiling. */
+    private static final int MAX_TX_SIZE = 16_384;
+
+    /**
+     * The six reference-script UTxOs FluidTokens published on preview, copied verbatim from the
+     * {@code preview} profile of {@code src/main/resources/application.yaml}
+     * ({@code loans.liquidation.reference-scripts.*}) — pinned here the way
+     * {@code LoansContractDerivationTest} pins the derived hashes, so a redeploy that moves them
+     * shows up as a diff between this file and that yaml rather than as a silent re-measurement.
+     * <p>
+     * {@code assetManager} stays null because there is nothing to publish for: a plain
+     * {@code Liquidate} only <em>creates</em> asset-manager outputs and never spends one, so that
+     * validator is never invoked and the preview profile carries no coordinate for it either.
+     */
+    private static final LiquidateTransactionBuilder.ReferenceScripts PUBLISHED =
+            new LiquidateTransactionBuilder.ReferenceScripts(
+                    new TransactionInput(
+                            "00a4e9f69c6ce80b8cb4fe7008a40a2f007aa53b25ec52ae30f11e701f7aa693", 0),
+                    new TransactionInput(
+                            "5c10900c23d16538bc518fa982f0d59a15908f0bb821860ddbef086346b669da", 0),
+                    new TransactionInput(
+                            "fe791b232b8ffcd31c72001a0a6345bc36101eac4d87133b0cf1a101024ffc07", 0),
+                    new TransactionInput(
+                            "13dd33290f62fe42dbbe7afc1d28505c025955bc55bd9b0a0ddff438663c2571", 0),
+                    new TransactionInput(
+                            "b09e23dc5639642a4cbf112d39753c96ed0528115a8468b688b0e8cb19f243fe", 0),
+                    new TransactionInput(
+                            "549b438c3a579a31cc4b7595f43c3af75bd02b237026583b834fc64349a47fe0", 0),
+                    null);
 
     private static String repeat(String pair) {
         return pair.repeat(32);
@@ -268,6 +302,89 @@ class LiquidateDryEvalTest {
     }
 
     // ======================================================================================
+    // Size, with the published reference scripts resolved
+    // ======================================================================================
+
+    /**
+     * <b>The gate: does a {@code Liquidate} fit in a block once the six validators travel by
+     * reference instead of in the witness set?</b>
+     * <p>
+     * Every other test in this file builds with {@code ReferenceScripts.none()}, which puts all six
+     * applied scripts — 18,584 bytes of them — in the witness set and lands at 19,862 bytes against
+     * a real {@code maxTxSize} of {@value #MAX_TX_SIZE}. That number says nothing about
+     * submittability, because on chain the scripts would be read from the UTxOs FluidTokens
+     * published on preview. This test builds the very same N=1 ada/ada scenario with those
+     * coordinates and measures the result.
+     * <p>
+     * The size is taken from {@link Transaction#serialize()} on the built transaction — the actual
+     * CBOR the ledger would count — never estimated and never compared against a figure copied from
+     * an earlier run. The witness-set assertion is what makes the measurement honest: a transaction
+     * that still carried the scripts would also be a transaction whose size means nothing here.
+     * <p>
+     * <b>What this number is not.</b> The 19,862 figure above is <i>priced</i>; this test builds with
+     * no {@link com.bloxbean.cardano.client.api.TransactionEvaluator}, so every redeemer still carries
+     * cardano-client-lib's placeholder ex-units, and nothing is signed. Quoting the two side by side
+     * as if they were the same measurement is apples-to-oranges. The gap was measured rather than
+     * waved at: substituting the real cost (2,255,013 mem / 777,825,970 steps) into every redeemer
+     * and adding one vkey witness takes the oracle-bearing shape from 1,986 to <b>2,124 bytes</b> —
+     * 138 bytes, against 14,260 of remaining headroom. The verdict does not move, which is precisely
+     * why the honest framing costs nothing.
+     */
+    @Test
+    void oneAdaLiquidationFitsUnderMaxTxSizeOnceTheReferenceScriptsAreResolved() {
+        Scenario scenario = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+
+        Transaction tx = build(List.of(scenario), PUBLISHED);
+
+        assertTrue(tx.getWitnessSet().getPlutusV3Scripts().isEmpty(),
+                "a published script must be read from its reference input, not carried");
+        List<TransactionInput> refInputs = tx.getBody().getReferenceInputs();
+        for (TransactionInput coordinate : publishedCoordinates()) {
+            assertTrue(refInputs.contains(coordinate),
+                    "reference script " + coordinate.getTransactionId() + "#" + coordinate.getIndex()
+                            + " is missing from the reference inputs");
+        }
+
+        int size = serializedSize(tx);
+        log.info("Liquidate N=1 ada/ada with published reference scripts: {} bytes (maxTxSize {})",
+                size, MAX_TX_SIZE);
+        assertTrue(size < MAX_TX_SIZE,
+                "the no-oracle liquidation is " + size + " bytes, maxTxSize is " + MAX_TX_SIZE);
+    }
+
+    /**
+     * The same transaction handed to the UPLC machine with the six published reference-script UTxOs
+     * in the universe, so the scripts have to be resolved through {@link EvalFixtures#scriptSupplier}
+     * rather than read out of the witness set — the path the class javadoc of {@link EvalFixtures}
+     * describes as "currently never consulted".
+     * <p>
+     * The ex-units are not re-litigated here; what is being proven is only that the reference-script
+     * path evaluates at all, so that the size measured above belongs to a transaction the validators
+     * still accept.
+     * <p>
+     * That the six UTxOs are load-bearing rather than decorative was measured, not assumed: dropping
+     * them from the universe and leaving everything else alone turns this test red with
+     * {@code ApiException: Error evaluating transaction / NoSuchElementException: No value present} —
+     * the evaluator finding a reference input it cannot resolve a script from.
+     */
+    @Test
+    void theReferenceScriptShapeStillEvaluatesAgainstTheDeployedValidators() {
+        Scenario scenario = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+
+        Transaction tx = build(List.of(scenario), PUBLISHED);
+        List<Utxo> universe = new ArrayList<>(universe(List.of(scenario)));
+        universe.addAll(referenceScriptUtxos());
+
+        List<EvaluationResult> results = EvalFixtures.evaluate(tx, universe, REGISTRY);
+
+        assertRedeemerCoverage(tx, results);
+        assertEquals(2, count(results, RedeemerTag.Spend));
+        assertEquals(1, count(results, RedeemerTag.Mint));
+        assertEquals(4, count(results, RedeemerTag.Reward));
+        assertWithinBudget(results);
+    }
+
+    // ======================================================================================
     // N = 2
     // ======================================================================================
 
@@ -376,7 +493,12 @@ class LiquidateDryEvalTest {
     }
 
     private static Transaction build(List<Scenario> scenarios) {
-        return builder(scenarios).build(request(scenarios));
+        return build(scenarios, LiquidateTransactionBuilder.ReferenceScripts.none());
+    }
+
+    private static Transaction build(List<Scenario> scenarios,
+                                     LiquidateTransactionBuilder.ReferenceScripts refs) {
+        return builder(scenarios).build(request(scenarios, refs));
     }
 
     /**
@@ -386,7 +508,8 @@ class LiquidateDryEvalTest {
      * self-certifying; see the seam's own javadoc.
      */
     private static Transaction buildIgnoringPositiveEquityVeto(List<Scenario> scenarios) {
-        return builder(scenarios).buildIgnoringPositiveEquityVeto(request(scenarios));
+        return builder(scenarios).buildIgnoringPositiveEquityVeto(
+                request(scenarios, LiquidateTransactionBuilder.ReferenceScripts.none()));
     }
 
     private static LiquidateTransactionBuilder builder(List<Scenario> scenarios) {
@@ -394,12 +517,64 @@ class LiquidateDryEvalTest {
                 LoanFixtures.utxoSupplier(universe(scenarios)), EvalFixtures.protocolParams());
     }
 
-    private static LiquidateTransactionBuilder.Request request(List<Scenario> scenarios) {
+    private static LiquidateTransactionBuilder.Request request(
+            List<Scenario> scenarios, LiquidateTransactionBuilder.ReferenceScripts refs) {
         Map<String, OracleEntry> noOracles = Map.of();
         return new LiquidateTransactionBuilder.Request(
                 scenarios.stream().map(Scenario::toLiquidation).toList(),
                 CONFIG_UTXO, LM_CONFIG_UTXO, noOracles, WALLET_UTXO, LoanFixtures.botAddress(),
-                VALID_FROM, VALID_TO, MARGIN, LiquidateTransactionBuilder.ReferenceScripts.none());
+                VALID_FROM, VALID_TO, MARGIN, refs);
+    }
+
+    // ---- the published reference scripts ---------------------------------------------------
+
+    /** The six coordinates of {@link #PUBLISHED}, in the record's own order. */
+    private static List<TransactionInput> publishedCoordinates() {
+        return List.of(PUBLISHED.loan(), PUBLISHED.loanSpend(), PUBLISHED.lenderManager(),
+                PUBLISHED.lenderManagerSpend(), PUBLISHED.loanClaimAction(),
+                PUBLISHED.lmLiquidateAction());
+    }
+
+    /**
+     * A UTxO per published coordinate, each carrying the hash of the script that really sits there,
+     * which is what {@link EvalFixtures#scriptSupplier} is keyed by. Nothing spends these — they are
+     * only ever reference inputs — so they are parked at their own script's enterprise address,
+     * where no coin selection can reach them.
+     */
+    private static List<Utxo> referenceScriptUtxos() {
+        List<TransactionInput> coordinates = publishedCoordinates();
+        List<PlutusScript> scripts = List.of(REGISTRY.getLoanScript(), REGISTRY.getLoanSpendScript(),
+                REGISTRY.getLenderManagerScript(), REGISTRY.getLenderManagerSpendScript(),
+                REGISTRY.getLoanClaimActionScript(), REGISTRY.getLmLiquidateActionScript());
+        List<Utxo> utxos = new ArrayList<>();
+        for (int i = 0; i < coordinates.size(); i++) {
+            String scriptHash = scriptHash(scripts.get(i));
+            utxos.add(Utxo.builder()
+                    .txHash(coordinates.get(i).getTransactionId())
+                    .outputIndex(coordinates.get(i).getIndex())
+                    .address(LoanFixtures.entAddress(scriptHash))
+                    .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                    .referenceScriptHash(scriptHash)
+                    .build());
+        }
+        return utxos;
+    }
+
+    private static String scriptHash(PlutusScript script) {
+        try {
+            return HexUtil.encodeHexString(script.getScriptHash());
+        } catch (Exception e) {
+            throw new AssertionError("cannot hash an applied loans-v4 script", e);
+        }
+    }
+
+    /** The CBOR the ledger would count, measured rather than estimated. */
+    private static int serializedSize(Transaction tx) {
+        try {
+            return tx.serialize().length;
+        } catch (Exception e) {
+            throw new AssertionError("cannot serialize the built transaction", e);
+        }
     }
 
     // ---- reading the results back ---------------------------------------------------------

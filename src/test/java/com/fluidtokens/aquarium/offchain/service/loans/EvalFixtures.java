@@ -39,11 +39,17 @@ import java.util.Set;
  * <h2>Why the protocol params here are not {@link LoanFixtures#protocolParams()}</h2>
  * They are the same params with one deliberate change: {@code maxTxSize} is raised far past the
  * real 16384. A {@code Liquidate} that carries all six validators in its witness set is well over
- * the real limit, and on chain it would travel by reference script instead — but reference scripts
- * would need a published UTxO holding them, which is exactly what FluidTokens has not published
- * (design §10). Raising the ceiling is a <b>sanctioned throwaway</b>: it changes nothing the
- * scripts see, because a script's {@code ScriptContext} contains no transaction size. It is not a
- * claim that the real transaction fits, and T-011's fee/size work is where that question belongs.
+ * the real limit, and on chain it travels by reference script instead. Raising the ceiling is a
+ * <b>sanctioned throwaway</b>: it changes nothing the scripts see, because a script's
+ * {@code ScriptContext} contains no transaction size.
+ * <p>
+ * <b>Superseded in part, 2026-08-16 (T-016 S1).</b> This paragraph used to add that reference
+ * scripts "would need a published UTxO holding them, which is exactly what FluidTokens has not
+ * published" — that is now false, and was quietly falsified some time ago: the preview profile
+ * carries six verified coordinates and the reference-script shape both builds and evaluates in this
+ * rig. The size question it deferred is answered too — 1,451 bytes ada/ada and 1,986 oracle-bearing
+ * against the real 16,384. Those two measurements pin {@code maxTxSize} themselves rather than
+ * reading it from these params, so this raised ceiling cannot flatter them.
  * The PlutusV3 cost model is the real one bundled with cardano-client-lib
  * ({@link CostModelUtil#PlutusV3CostModel}), so the ex-units the evaluator reports are real budget
  * numbers rather than made-up ones.
@@ -108,13 +114,16 @@ final class EvalFixtures {
      * own hash — the fallback the evaluator uses for a script that is neither in the witness set nor
      * carried by a reference input.
      * <p>
-     * <b>Currently never consulted.</b> Every test in {@link LiquidateDryEvalTest} builds with
-     * {@code ReferenceScripts.none()}, so all six invoked validators travel in the witness set and
-     * the evaluator resolves them from there. This supplier exists for the reference-script path
-     * (design §10), which needs published reference-script UTxOs this rig has none of; it will start
-     * carrying weight when T-010 gets real coordinates. The keying is by
-     * {@link PlutusScript#getScriptHash()} rather than by the registry's field names so that, when
-     * it does, a mis-derived script cannot be served under the hash the transaction asked for.
+     * <b>Consulted, as of 2026-08-16 (T-016 S1) — this javadoc used to say it never was.</b> Most
+     * tests here build with {@code ReferenceScripts.none()} and resolve the six validators from the
+     * witness set, but the reference-script test builds with the published preview coordinates and an
+     * empty witness set, so every script reaches the evaluator through this supplier. Both claims are
+     * mutation-proven rather than asserted: emptying this supplier turns that one test red
+     * ({@code RequiredRedeemersMismatch}) and leaves the other five green, so the two resolution paths
+     * are genuinely independent. The keying is by {@link PlutusScript#getScriptHash()} rather than by
+     * the registry's field names, which is load-bearing: serving the asset-manager script under the
+     * loan coordinate fails with {@code RequiredRedeemersMismatch {missing, extra}} instead of
+     * silently evaluating the wrong validator.
      */
     static ScriptSupplier scriptSupplier(LoansContractRegistry registry) {
         Map<String, PlutusScript> byHash = new LinkedHashMap<>();
