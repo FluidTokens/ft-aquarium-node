@@ -54,6 +54,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@link #everySameTypedSentinelTranspositionChangesTheEncodedBytes} proves the sentinel really has
  * that property rather than asserting it in a comment. The production fixture is deliberately
  * <b>not</b> "improved" to be more distinguishable — its values are load-bearing.
+ * <p>
+ * <b>DO NOT DELETE EITHER FIXTURE AS REDUNDANT. They defend different things, and that is measured,
+ * not argued.</b> This was not hypothetical: two transpositions
+ * ({@code principalAsset}/{@code principalOracleAsset} with {@code interestRate}/
+ * {@code installmentPeriod}, and {@code extraData} with {@code dynamicCollateralPrice}) survived the
+ * entire 353-test suite before the sentinel existed. When the second was re-run afterwards, the
+ * <em>production</em> golden stayed green and only the sentinel went red. The production golden
+ * proves the bytes we will actually post are right; the sentinel proves the field mapping that
+ * produced them is right. Delete the sentinel and the hole reopens silently, because a green
+ * production golden is exactly what it looked like the first time.
+ * <p>
+ * The general property is <b>fixture discrimination</b> — can this fixture tell field <i>i</i> from
+ * field <i>j</i> at all? — and it defeats more than transpositions: an omitted zero or a duplicated
+ * neighbour is equally invisible in a uniform fixture. A test can be correct, its golden
+ * hand-derived, its intent documented, and its discriminating power zero.
  *
  * <h2>The three cross-checks</h2>
  * The bottom of this file compares {@link RequestTxEncoder}'s output against the two encoders in
