@@ -139,6 +139,40 @@ class RequestTxEncoderSchemaTest {
     }
 
     @Test
+    void requestWithdrawRedeemerFieldOrderMatchesTheContract() {
+        var withdraw = constructor("fluidtokens/types/request/RequestWithdrawRedeemer", 0);
+        assertEquals(List.of("configRefInputIndex", "actionsForEachInput"), fieldTitles(withdraw));
+    }
+
+    /**
+     * {@code RequestAction}'s constructor indices — the one pin that cannot be inferred from field
+     * shapes, because {@code Cancel} and {@code CancelAfterExpiration} have <em>identical</em> ones:
+     * a single {@code ByteArray} named {@code requestId}. Nothing in the encoded bytes distinguishes
+     * them but the constructor tag, so a swap of the two indices inside
+     * {@link RequestTxEncoder#cancelAction} / {@link RequestTxEncoder#cancelAfterExpirationAction}
+     * would produce a perfectly well-typed redeemer that asks the validator for the wrong thing —
+     * and {@code CancelAfterExpiration} is the branch that can pay a penalty to a stranger. Hence the
+     * explicit index assertions with their own messages.
+     */
+    @Test
+    void requestActionConstructorIndicesMatchTheContract() {
+        var cancel = constructor("fluidtokens/types/request/RequestAction", 0);
+        assertEquals("Cancel", cancel.get("title").asText(),
+                "Cancel must be constructor index 0 — it and CancelAfterExpiration have identical "
+                        + "field shapes, so the tag is the only thing telling them apart");
+        assertEquals(List.of("requestId"), fieldTitles(cancel));
+
+        var afterExpiration = constructor("fluidtokens/types/request/RequestAction", 1);
+        assertEquals("CancelAfterExpiration", afterExpiration.get("title").asText(),
+                "CancelAfterExpiration must be constructor index 1 — swapping it with Cancel is "
+                        + "invisible in the encoded bytes except for the tag");
+        assertEquals(List.of("requestId"), fieldTitles(afterExpiration));
+
+        assertEquals("Lend", constructor("fluidtokens/types/request/RequestAction", 2)
+                .get("title").asText());
+    }
+
+    @Test
     void addressFieldOrderAndCredentialIndicesMatchTheContract() {
         var address = constructor("cardano/address/Address", 0);
         assertEquals(List.of("payment_credential", "stake_credential"), fieldTitles(address));

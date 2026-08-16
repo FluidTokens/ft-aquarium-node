@@ -613,6 +613,146 @@ class RequestTxEncoderTest {
                 new TransactionInput("ab".repeat(32), 7))));
     }
 
+    // ---- RequestWithdrawRedeemer (the Cancel path) ----------------------------------------------------
+
+    /**
+     * The production Cancel redeemer: {@code RequestWithdrawRedeemer { configRefInputIndex: 0,
+     * actionsForEachInput: [Cancel { requestId: <the 29-byte request NFT name for the fixture's
+     * seed> }] }}.
+     * <pre>
+     * d879 9f                                       RequestWithdrawRedeemer constr 0, 2 fields
+     *   00                                             uint 0 = configRefInputIndex
+     *   9f                                             indefinite list = actionsForEachInput
+     *     d879 9f                                        Cancel: tag 121 = constr 0, 1 field
+     *       581d &lt;29 bytes&gt;                                 bytestring(29): 29 &gt; 23, so the
+     *                                                        1-byte-follows header 0x58 then 0x1d
+     *                                                        = requestId
+     *     ff
+     *   ff
+     * ff
+     * </pre>
+     * The 29 bytes are the same {@code 00 ‖ blake2b_224(serialise_data(seed))} pinned by
+     * {@link #theRequestAssetNameIsTheIndexPrefixFollowedByTheHashedOutputReference}, spelled out
+     * again here so the literal is readable end to end rather than assembled from a helper.
+     */
+    private static final String CANCEL_REQUEST_ID =
+            "000b2065981fcdef5983ae50c83e759d75d912bc35468d62be3b1aa534";
+
+    private static final String REQUEST_WITHDRAW_REDEEMER_HEX =
+            "d8799f"
+                    + "00"
+                    + "9f"
+                    + "d8799f581d" + CANCEL_REQUEST_ID + "ff"
+                    + "ff"
+                    + "ff";
+
+    @Test
+    void requestWithdrawRedeemerWithASingleCancelEncodesToTheExactPinnedBytes() {
+        assertEquals(CANCEL_REQUEST_ID, RequestFixtures.requestAssetName(RequestFixtures.seed()),
+                "the golden above spells out the request NFT name for RequestFixtures' seed");
+
+        assertEquals(REQUEST_WITHDRAW_REDEEMER_HEX,
+                hex(RequestTxEncoder.requestWithdrawRedeemer(0,
+                        List.of(RequestTxEncoder.cancelAction(CANCEL_REQUEST_ID)))));
+    }
+
+    // ---- the action-discrimination sentinel ------------------------------------------------------
+
+    /** 29 bytes, {@code 0a} then {@code a1}×28 — same length as {@link #SENTINEL_ID_B}, different bytes. */
+    private static final String SENTINEL_ID_A = "0a" + "a1".repeat(28);
+
+    /** 29 bytes, {@code 0b} then {@code b2}×28. */
+    private static final String SENTINEL_ID_B = "0b" + "b2".repeat(28);
+
+    /**
+     * <b>The discrimination sentinel for the one new positional encoding in this slice.</b>
+     * {@code RequestWithdrawRedeemer { configRefInputIndex: 7, actionsForEachInput: [Cancel(idA),
+     * CancelAfterExpiration(idB)] }}:
+     * <pre>
+     * d879 9f                                       RequestWithdrawRedeemer constr 0, 2 fields
+     *   07                                             uint 7 = configRefInputIndex (immediate form,
+     *                                                  7 &lt;= 23) — NOT the production 0, so a hardcoded
+     *                                                  zero cannot pass
+     *   9f                                             indefinite list = actionsForEachInput
+     *     d879 9f 581d &lt;0a a1×28&gt; ff                     [0] Cancel: tag 121 = constr 0
+     *     d87a 9f 581d &lt;0b b2×28&gt; ff                     [1] CancelAfterExpiration: tag 122 = constr 1
+     *   ff
+     * ff
+     * </pre>
+     *
+     * <p><b>DO NOT DELETE THIS FIXTURE AS REDUNDANT with the production golden above.</b> It is the
+     * only fixture in this slice that can catch three distinct faults, and the production golden —
+     * a single {@code Cancel} at constructor 0 with {@code configRefInputIndex} 0 — is blind to
+     * every one of them:
+     * <ul>
+     *   <li>a <b>swapped constructor index</b> between {@code Cancel} and
+     *       {@code CancelAfterExpiration}. The two carry identical field shapes, so the production
+     *       golden would stay green under an encoder that emitted {@code d87a} for {@code Cancel},
+     *       and the transaction would ask the validator for the expiration branch instead;</li>
+     *   <li>a <b>reversed action list</b>. With one element a reversal is the identity;</li>
+     *   <li>a <b>transposition inside the list</b> — an action attached to the wrong request input.
+     *       {@code actionsForEachInput} is positional against the filtered request-input list, so
+     *       this is a real fault class the moment a Cancel batches two requests.</li>
+     * </ul>
+     * The two ids are deliberately the <em>same length</em> (29 bytes each), so the length header
+     * cannot do the discriminating for us; only the content and the tags can.
+     * {@link #theSentinelReallyDiscriminatesBothConstructorsAndListPositions} proves the fixture has
+     * that property rather than asserting it in this comment.
+     */
+    private static final String SENTINEL_WITHDRAW_REDEEMER_HEX =
+            "d8799f"
+                    + "07"
+                    + "9f"
+                    + "d8799f581d" + SENTINEL_ID_A + "ff"
+                    + "d87a9f581d" + SENTINEL_ID_B + "ff"
+                    + "ff"
+                    + "ff";
+
+    @Test
+    void sentinelRequestWithdrawRedeemerEncodesToTheExactPinnedBytes() {
+        assertEquals(SENTINEL_WITHDRAW_REDEEMER_HEX,
+                hex(RequestTxEncoder.requestWithdrawRedeemer(7,
+                        List.of(RequestTxEncoder.cancelAction(SENTINEL_ID_A),
+                                RequestTxEncoder.cancelAfterExpirationAction(SENTINEL_ID_B)))));
+    }
+
+    /**
+     * Proves the sentinel is actually a sentinel: each of the three faults it claims to catch really
+     * does change the encoded bytes, and — the other half of the claim — the production golden really
+     * is blind to the constructor swap.
+     */
+    @Test
+    void theSentinelReallyDiscriminatesBothConstructorsAndListPositions() {
+        // A swapped constructor index.
+        assertNotEquals(SENTINEL_WITHDRAW_REDEEMER_HEX,
+                hex(RequestTxEncoder.requestWithdrawRedeemer(7,
+                        List.of(RequestTxEncoder.cancelAfterExpirationAction(SENTINEL_ID_A),
+                                RequestTxEncoder.cancelAction(SENTINEL_ID_B)))),
+                "swapping the two constructors must change the bytes");
+
+        // A reversed action list.
+        assertNotEquals(SENTINEL_WITHDRAW_REDEEMER_HEX,
+                hex(RequestTxEncoder.requestWithdrawRedeemer(7,
+                        List.of(RequestTxEncoder.cancelAfterExpirationAction(SENTINEL_ID_B),
+                                RequestTxEncoder.cancelAction(SENTINEL_ID_A)))),
+                "reversing actionsForEachInput must change the bytes");
+
+        // A transposition of the two request ids, constructors left alone.
+        assertNotEquals(SENTINEL_WITHDRAW_REDEEMER_HEX,
+                hex(RequestTxEncoder.requestWithdrawRedeemer(7,
+                        List.of(RequestTxEncoder.cancelAction(SENTINEL_ID_B),
+                                RequestTxEncoder.cancelAfterExpirationAction(SENTINEL_ID_A)))),
+                "transposing the two requestIds must change the bytes");
+
+        // And why the production golden cannot stand in: with one Cancel, only the tag differs, and
+        // a single-element list is its own reverse.
+        assertEquals(
+                hex(RequestTxEncoder.cancelAction(SENTINEL_ID_A)).substring(6),
+                hex(RequestTxEncoder.cancelAfterExpirationAction(SENTINEL_ID_A)).substring(6),
+                "Cancel and CancelAfterExpiration differ in nothing but their 3-byte constructor tag "
+                        + "— which is exactly why the sentinel has to carry both");
+    }
+
     // ---- the 29-byte asset name ------------------------------------------------------------------
 
     /**

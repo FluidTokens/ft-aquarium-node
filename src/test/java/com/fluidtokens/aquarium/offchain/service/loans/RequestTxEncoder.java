@@ -18,6 +18,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 
 import java.math.BigInteger;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -51,6 +52,32 @@ import java.util.Optional;
  * <h2>Consequence C — no validity interval</h2>
  * {@code check_mint} reads no validity range, no signature and no withdrawal, so TX A is built with
  * none. See {@link RequestMintTransactionBuilder}.
+ *
+ * <h2>Consequence D — a Cancel runs three script purposes, and the burn still needs a spent seed</h2>
+ * {@code request.request} has {@code mint} and {@code withdraw} handlers only ({@code
+ * validators/request.ak:48-130}, {@code else(_) { fail }} at {@code :132-134}), so the {@code Cancel}
+ * path is a <b>withdraw</b> purpose — never a spend one. The request UTxO itself sits at the request
+ * {@code general_spend} wrapper, whose only check when an inline datum is present is
+ * {@code list.any(self.withdrawals, ..)} matching {@code Script(withdrawScriptHash)} — the request
+ * policy id ({@code general_spend.ak:31-41}). So a Cancel carries <b>three</b> redeemers:
+ * <ol>
+ *   <li><b>Spend</b> at {@code requestSpendScriptHash} — {@code general_spend}, any {@code Data} as
+ *       redeemer (the handler signature is {@code _redeemer: Data});</li>
+ *   <li><b>Withdraw</b> (reward, amount 0) at the reward address of the request policy id —
+ *       {@code request.request} with a {@link #requestWithdrawRedeemer};</li>
+ *   <li><b>Mint</b> (burn, −1) under the request policy id — the same {@code request.request} script
+ *       again, with a {@link #requestMintRedeemer}.</li>
+ * </ol>
+ * Purposes 2 and 3 are the same compiled script and travel as one witness copy.
+ * <p>
+ * The burn is not a free ride: {@code check_cancel} requires
+ * {@code quantity_of(self.mint, requestPolicyId, requestId) == -1}, which invokes the policy, and
+ * {@code check_mint}'s token accounting degenerates to {@code indexed_all([], _)} because it filters
+ * the minted tokens to {@code quantity > 0} ({@code request.ak:164-168}) — but
+ * {@code isInputRefSpent} sits <em>outside</em> that filter ({@code request.ak:161-162}) and is
+ * conjoined at {@code :191-194}. <b>A burn therefore still has to name a genuinely spent
+ * {@code inputRef}.</b> The Cancel builder names the request UTxO's own output reference, which is
+ * spent by construction and so cannot drift from the body.
  *
  * <h2>Duplicated primitives</h2>
  * The private {@code constr}/{@code bool}/{@code bytes}/{@code bigInt}/{@code asset} helpers below
@@ -180,6 +207,60 @@ public final class RequestTxEncoder {
      */
     public static PlutusData requestMintRedeemer(long configRefInputIndex, TransactionInput inputRef) {
         return constr(0, BigIntPlutusData.of(configRefInputIndex), outputReference(inputRef));
+    }
+
+    // ---- RequestWithdrawRedeemer --------------------------------------------------------------------
+
+    /**
+     * {@code RequestWithdrawRedeemer { configRefInputIndex, actionsForEachInput } } — constructor 0.
+     * <p>
+     * {@code actionsForEachInput} is indexed by position within the <b>filtered</b> request-input
+     * list that {@code get_inputs_from_smart_credential} produces ({@code request.ak:68-74} then
+     * {@code :77-82}) — <em>not</em> by absolute input index. Too few actions is an <b>abort</b>,
+     * not a {@code False}: {@code utils.indexed_all} ({@code utils.ak:203-209}) calls the predicate
+     * at every index of that filtered list and the predicate's first move is
+     * {@code safe_list_at(redeemer.actionsForEachInput, index)} ({@code request.ak:82}), which is
+     * {@code do_list_at} → {@code builtin.head_list} on an emptied list ({@code utils.ak:113-124}).
+     * The upstream comment at {@code request.ak:76} claims the opposite — "we DO NOT need to ensure
+     * that the number of actions is equal to the number of inputs" — and it holds only in the
+     * direction of <em>more</em> actions than inputs. So the list length must be at least the count
+     * of inputs at the request spend credential, and this epic keeps the two equal.
+     * <p>
+     * The {@code configRefInputIndex} here is a <b>second, independent</b> index from the one the
+     * mint redeemer of the same transaction carries: both the withdraw handler ({@code
+     * request.ak:54-59}) and {@code check_mint} ({@code :144-149}) resolve the config themselves.
+     */
+    public static PlutusData requestWithdrawRedeemer(long configRefInputIndex,
+                                                     List<PlutusData> actionsForEachInput) {
+        return constr(0, BigIntPlutusData.of(configRefInputIndex),
+                ListPlutusData.of(actionsForEachInput.toArray(PlutusData[]::new)));
+    }
+
+    /**
+     * {@code RequestAction.Cancel { requestId } } — constructor <b>0</b>. {@code requestId} is the
+     * 29-byte request NFT asset name; {@code check_cancel} ({@code request.ak:197-217}) uses it for
+     * both of its {@code quantity_of} conjuncts — one against the spent input's value, one against
+     * the transaction's mint field.
+     */
+    public static PlutusData cancelAction(String requestIdHex) {
+        return constr(0, bytes(requestIdHex));
+    }
+
+    /**
+     * {@code RequestAction.CancelAfterExpiration { requestId } } — constructor <b>1</b>.
+     * <p>
+     * <b>This exists solely so the discrimination sentinel in {@link RequestTxEncoderTest} can tell
+     * the two constructors apart. It is not a supported path in this epic.</b>
+     * {@code CancelAfterExpiration} is out of scope: {@code check_cancel_after_expiration}
+     * ({@code request.ak:219-245}) needs {@code validFrom > requestExpiration}, and this repo's
+     * fixture pins {@code requestExpiration} at the year 2100. {@code Cancel} and
+     * {@code CancelAfterExpiration} carry <em>identical field shapes</em> — one {@code ByteArray}
+     * named {@code requestId} apiece — so the constructor tag is the only thing that distinguishes
+     * them and a swap would otherwise be invisible in both the schema pins and the goldens. Nothing
+     * but the sentinel calls this.
+     */
+    public static PlutusData cancelAfterExpirationAction(String requestIdHex) {
+        return constr(1, bytes(requestIdHex));
     }
 
     /**

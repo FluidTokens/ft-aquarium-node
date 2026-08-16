@@ -5,7 +5,10 @@ import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.crypto.Blake2bUtil;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
+import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.AuthorizationMethod;
@@ -190,6 +193,9 @@ public final class RequestFixtures {
     /** The config reference input's transaction hash. */
     public static final String TX_CONFIG = "f1".repeat(32);
 
+    /** {@link #secondRequestUtxo()}'s transaction hash — a decoy, never part of a happy path. */
+    public static final String TX_SECOND_REQUEST = "a2".repeat(32);
+
     private static LoansContractRegistry registry() {
         return LoanFixtures.registry();
     }
@@ -328,5 +334,111 @@ public final class RequestFixtures {
     /** The seed as a {@link TransactionInput} — what the mint redeemer's {@code inputRef} names. */
     public static TransactionInput seed() {
         return new TransactionInput(TX_SEED, 0);
+    }
+
+    // ---- the post-TX-A world (S3, Cancel) ----------------------------------------------------------
+
+    /**
+     * The request UTxO <b>TX A actually produced</b>, read off a built TX A rather than hand-rolled:
+     * the single output at {@link #requestAddress()}, at that output's real index, carrying that
+     * output's real value, with {@code RequestTxEncoderTest.REQUEST_DATUM_HEX} as its inline datum.
+     * <p>
+     * <b>The transaction hash is derived at runtime and must NEVER be hardcoded.</b> TX A's hash is
+     * a hash of its whole body, so it moves the moment its ex-units or its fee change — and S6
+     * prices it against a real evaluator, which changes both. A pinned literal here would go on
+     * quietly building a Cancel for a UTxO TX A never produced: structurally perfect, unspendable,
+     * and the collateral stranded at the request spend script. Chaining off the real builder output
+     * is the only construction that cannot drift.
+     * <p>
+     * The datum is carried as the raw golden <b>hex</b>, never decoded and re-encoded: a round trip
+     * through {@code PlutusData} would make this fixture agree with the encoder by construction
+     * instead of pinning it.
+     */
+    public static Utxo requestUtxoFrom(Transaction txA) {
+        Transaction onChain = deserialise(txA);
+        List<TransactionOutput> outputs = onChain.getBody().getOutputs();
+        int index = -1;
+        for (int i = 0; i < outputs.size(); i++) {
+            if (requestAddress().equals(outputs.get(i).getAddress())) {
+                if (index >= 0) {
+                    throw new IllegalStateException(
+                            "TX A has more than one output at the request spend address");
+                }
+                index = i;
+            }
+        }
+        if (index < 0) {
+            throw new IllegalStateException("TX A has no output at the request spend address");
+        }
+        return LoanFixtures.utxo(TransactionUtil.getTxHash(onChain), index, requestAddress(),
+                amountsOf(outputs.get(index)), RequestTxEncoderTest.REQUEST_DATUM_HEX);
+    }
+
+    /**
+     * Everything a Cancel's rig may resolve: the config reference input, the request UTxO TX A
+     * produced, and the borrower's spare pure-ada UTxO for fee and collateral.
+     * <p>
+     * <b>{@link #seedUtxo} is deliberately absent.</b> This models the world <em>after</em> TX A, and
+     * TX A consumed the seed. Leaving it in the universe would let coin selection reach for a UTxO
+     * that no longer exists — the Cancel would balance offline against a ledger state that cannot
+     * happen.
+     * <p>
+     * <b>The spare does not carry the fee</b>, and saying so would be wrong. Measured on the finished
+     * Cancel, the body has exactly <em>one</em> input — the request UTxO — and its own 5,000,000
+     * lovelace pays for everything: 1,000,000 to the withdrawal-receiver output, 3,331,078 back as
+     * change and 668,922 as fee, which is 5,000,000 exactly. The spare is nonetheless <b>required</b>,
+     * as the <em>collateral</em> input: a Plutus transaction needs collateral, collateral must be a
+     * pure-ada key UTxO, and the only other UTxO available is the multi-asset one sitting at the
+     * request <em>script</em>. Drop the spare and the build has nothing it is allowed to pledge.
+     */
+    public static List<Utxo> cancelUniverse(String borrowerBech32, Utxo requestUtxo) {
+        List<Utxo> universe = new ArrayList<>();
+        universe.add(configUtxo());
+        universe.add(requestUtxo);
+        universe.add(spareUtxo(borrowerBech32));
+        return universe;
+    }
+
+    /**
+     * <b>A second UTxO at {@link #requestAddress()}</b>, and nothing else about it matters: it exists
+     * so a test can make the request-input <em>count</em> in
+     * {@code RequestCancelTransactionBuilder.assertStructure} come out as two rather than one, and
+     * therefore make that guard discriminate on the credential instead of agreeing with itself.
+     * <p>
+     * Deliberately <b>not</b> in {@link #cancelUniverse}. A Cancel with two request inputs and one
+     * {@code Cancel} action is refused on chain by an abort ({@code safe_list_at} running off
+     * {@code actionsForEachInput}), so this must never leak into a happy path. It is pure ada, so
+     * nothing about it resembles a real request UTxO beyond the one property under test — its
+     * address.
+     */
+    public static Utxo secondRequestUtxo() {
+        return LoanFixtures.adaUtxo(TX_SECOND_REQUEST, 0, requestAddress(), 5_000_000L);
+    }
+
+    /** An output's value as the {@code List<Amount>} shape {@link Utxo} wants. */
+    private static List<Amount> amountsOf(TransactionOutput output) {
+        List<Amount> amounts = new ArrayList<>();
+        amounts.add(Amount.lovelace(output.getValue().getCoin()));
+        for (var multiAsset : output.getValue().getMultiAssets()) {
+            for (var asset : multiAsset.getAssets()) {
+                // Concatenated by hand rather than through Amount.asset(policy, name, qty): that
+                // overload treats the name as literal UTF-8 and hex-encodes it again. See
+                // LoanFixtures.unit()'s javadoc.
+                String nameHex = asset.getNameAsHex();
+                amounts.add(Amount.asset(multiAsset.getPolicyId()
+                        + (nameHex.startsWith("0x") ? nameHex.substring(2) : nameHex),
+                        asset.getValue()));
+            }
+        }
+        return amounts;
+    }
+
+    /** Re-reads a transaction from its own bytes, so the outputs read are the ones a node would parse. */
+    private static Transaction deserialise(Transaction tx) {
+        try {
+            return Transaction.deserialize(tx.serialize());
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot round-trip TX A", e);
+        }
     }
 }

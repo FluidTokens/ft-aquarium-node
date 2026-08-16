@@ -310,7 +310,10 @@ public class LoansContractRegistry {
     //
     // Seven of them serve the T-008 `Liquidate` transaction. The eighth, `getRequestScript()`, is
     // exposed for the `src/test`-only loan-origination fixtures of T-016 and is never reached from
-    // a `src/main` code path — origination is not something the node does.
+    // a `src/main` code path — origination is not something the node does. The ninth,
+    // `getRequestSpendScript()`, is likewise `src/test`-only, reached from the T-016 Cancel fixture:
+    // a Cancel spends the request UTxO, so it needs the `general_spend` *wrapper* the UTxO sits at
+    // as well as the policy — three script purposes, two distinct scripts.
     //
     // Every one of them is the same applied compiled code the hash above was taken from, so
     // `script.getScriptHash()` is the matching `…ScriptHash`/`…PolicyId` by construction rather
@@ -354,6 +357,11 @@ public class LoansContractRegistry {
     /** {@code request.request} — the request minting policy, and the request withdraw script. */
     public PlutusScript getRequestScript() {
         return scriptOf(requestPolicyId);
+    }
+
+    /** The request {@code general_spend} wrapper — the spending validator request UTxOs sit at. */
+    public PlutusScript getRequestSpendScript() {
+        return scriptOf(requestSpendScriptHash);
     }
 
     private PlutusScript scriptOf(String scriptHash) {
