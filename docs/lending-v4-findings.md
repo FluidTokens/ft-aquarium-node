@@ -488,9 +488,37 @@ or {
 }
 ```
 
-Liquidatable iff `currentLtv > liquidationLtv`; **equality is not**. Both sides
-run through `get_token_amount_in_lovelace`, so an LTV check **always** needs both
-oracle feeds — there is no oracle-free liquidation path.
+Liquidatable iff `currentLtv > liquidationLtv`; **equality is not**. Both sides run through
+`get_token_amount_in_lovelace`.
+
+**Correction, 2026-08-16.** This paragraph used to end "so an LTV check **always** needs both
+oracle feeds — there is no oracle-free liquidation path." **That is wrong for an ada leg.**
+`lib/fluidtokens/oracle.ak:39-50` short-circuits on an empty policy id and returns a synthetic 1:1
+feed *before* touching the redeemers, the reference input or the oracle NFT:
+
+```aiken
+if expectedTokenPolicyId == "" {
+  Some(Aggregated { common: CommonFeedData { valid_from: 0, valid_to: 0,
+        token: Asset { policyId: "", assetName: "" } },
+       token_price_in_lovelaces: 1, token_price_denominator: 1 })
+}
+```
+
+So an ada-principal / ada-collateral loan needs **no oracle withdrawal, no oracle reference input,
+no signatures, no Charli3 provider UTxO**, and has no exposure to the 60–80s five-minutely price
+blackout (design §6.8). This is not inference: `LiquidateDryEvalTest` evaluates exactly that shape
+through the real PlutusV3 machine at the `bbe9c1a` pin with no oracle in the transaction, and a
+live preview loan already uses ada collateral (`bad3e0871c24…`, 40 ada, `AdaCollateralTest`). The
+authors wrote explicit ada branches throughout — `lm_liquidate_action.ak:213-218`,
+`request.ak:496-511`, `request.ak:552-562`, `loan_claim_action.ak:447-452` — so it is a
+first-class supported shape rather than an accident.
+
+Related, and the reason the wrong sentence survived: the "collateral needs an asset name" rule is
+`expect Some(collateralAssetName) = collateral.maybeAssetName` (`lm_liquidate_action.ak:108`),
+which demands `Some`, **not** a non-empty bytestring. Ada collateral is `Some("")` and passes.
+Our own filters read it correctly — `Loan.botLiquidatable()` and `LiquidationCandidateScanner`
+both test `Optional.isPresent`/`isEmpty` on an `Optional<String>`, which means *None*, not *empty*.
+Neither excludes ada collateral.
 
 ### 7.5 Agreements worth pinning down
 
