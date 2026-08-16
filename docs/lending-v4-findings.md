@@ -679,3 +679,47 @@ nothing whatsoever about the `RequestDatum`. The first evaluation-level arbitrat
 is `Cancel`, which does `expect datum: RequestDatum = inputDatum` before authorising. That is a
 second and stronger reason to build the escape hatch before anything is submitted: it is not only
 the way out, it is the first thing that tells us the datum was ever right.
+
+### 11.5 `check_cancel` constrains no output at all
+
+`request.ak:197-217` is three conjuncts and **not one of them is an output**:
+
+```aiken
+quantity_of(inputValue, requestPolicyId, requestId) == 1,
+quantity_of(self.mint, requestPolicyId, requestId) == -1,
+authorize_action(create_auth(borrowerAuth, .., self.extra_signatories, self.mint)),
+```
+
+The validator checks that the request NFT was held, that it is burnt, and that the borrower
+authorised. **It does not check where the collateral goes** — not by address, not by datum, not by
+value. "Cancelling returns the collateral to the borrower" is a property of the *off-chain*
+construction alone. A Cancel that sends 300,000,000 tFLDT base units to a stranger, or to an
+address nobody holds a key for, passes every on-chain check.
+
+This makes the escape hatch's safety entirely ours. Any Cancel builder must assert the collateral
+destination on the finished transaction body, and any operator-facing path that submits one needs a
+named veto on the change address. Note the asymmetry with the *expiration* path:
+`check_cancel_after_expiration` DOES constrain the output (`validate_collateral_less_penalty_output`,
+`:394-419`, requires `outputAda >= inputAda - penalty` and `borrowerOutput.address ==
+borrowerAddress`) — because there the canceller is a stranger. When it is the borrower, the contract
+reasonably assumes they will not rob themselves. An automated borrower is exactly the case that
+assumption does not cover.
+
+### 11.6 A Cancel is a three-script transaction
+
+`request` has only `mint` and `withdraw` handlers — `else(_) { fail }` at `request.ak:132-134`. The
+Cancel logic lives in the **withdraw** purpose, while the request UTxO itself sits at a
+`general_spend` wrapper with its own spend purpose. So one Cancel runs:
+
+| purpose | script | why |
+|---|---|---|
+| Spend | `general_spend` applied → `requestSpendScriptHash` | the UTxO's own validator; with an inline datum its only check is that a withdrawal from the request policy exists (`general_spend.ak:31-41`) |
+| Withdraw (amount 0) | `request.request` | where `check_cancel` actually lives |
+| Mint (−1) | `request.request` | the burn, which re-enters `check_mint` (see §11.3) |
+
+Two consequences. Anyone sizing or pricing a Cancel from the mint transaction's numbers will be
+wrong — both scripts travel in the witness set, neither has a published preview reference script,
+and `general_spend` adds ~1.1 KB on top of `request.request`'s 9,628. And the withdraw-0 coupling is
+load-bearing in a way that is easy to miss: **remove the withdrawal and the *spend* leg fails**,
+not the withdraw leg, because the spend wrapper's entire job is to check that the withdrawal is
+there.
