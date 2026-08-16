@@ -598,3 +598,56 @@ quantity.
 `liquidationFeePerMille = 0`; six also carry `shouldLiquidationConvertToPrincipal = true`.
 So no third-party liquidator can profit from any of them at any price. The open question this
 raises for the epic's value: **is zero also the default on mainnet?**
+
+## 11. Origination: three traps in the request path (verified at `bbe9c1a`, 2026-08-16)
+
+Found while scoping T-016. Nobody has ever exercised this path on preview — `requestPolicyId`
+never minted and both request scripts 404 from Blockfrost, so all ten live loans came through the
+pool path. That means there is no on-chain example to copy and no published reference script for
+the request validator (the largest, at 9,628 bytes). Everything below comes from source.
+
+### 11.1 `minPrincipal` is not a principal floor
+
+Despite the name, `minPrincipal / minPrincipalDivider` is **collateral units per single unit of
+principal**. The floor on the lent amount is `ceil(collateralAmount / (minPrincipal /
+minPrincipalDivider))` — `lib/fluidtokens/finance.ak:144-151`. So `minPrincipal = 3` against 300
+tFLDT (`300_000_000` units at 6 decimals) yields a floor of `100_000_000` lovelace, not a floor of
+3 anything.
+
+Read the field name and set `minPrincipal = 100_000_000` "because we want a 100 ADA floor" and you
+author a request that **can never be filled** — the floor becomes `ceil(300_000_000 / 100_000_000)`
+= 3 lovelace, and the check that was supposed to protect the borrower protects nothing. The failure
+is silent at origination and only shows up as a loan on terms nobody intended.
+
+### 11.2 The request NFT is 29 bytes; the other three are 28
+
+`check_mint` (`request.ak:137-195`) requires `bytearray.at(assetName, 0) == index` and
+`bytearray.drop(assetName, 1) == inputRefHash`, so the request NFT's name is a **1-byte index
+prefix** (`0x00` for a single token) followed by `blake2b_224(serialise_data(outputRef))`.
+
+The loan NFT, borrower bond and lender bond are **28 bytes with no prefix**, and they hash a
+*different* output reference — `hash_output_ref(input.output_reference)` of the request UTxO,
+computed in `check_lend` (`request.ak:271`), not the mint seed. Two hashes of two different
+`OutputReference`s, one prefixed and one bare. Getting this wrong strands the collateral: the mint
+succeeds only for the exact name the validator recomputes, and every later transaction that names
+the token must agree.
+
+### 11.3 A burn still needs a genuinely spent seed
+
+Both `Cancel` and `Lend` require `quantity_of(self.mint, requestPolicyId, requestId) == -1`, which
+**invokes the mint handler**. `check_mint` filters minted tokens to `quantity > 0`, so the
+token-accounting half degenerates to `True` on a pure burn — but **`isInputRefSpent` sits outside
+that filter and still applies.** Every burn must therefore supply a `RequestMintRedeemer` whose
+`inputRef` names a UTxO the transaction actually spends.
+
+The natural assumption — "a burn needs no seed" — is wrong, and produces a transaction that fails
+on chain for a reason nothing in the burn path suggests.
+
+### 11.4 The mint handler never reads the datum
+
+`check_mint` checks the seed and the token accounting. It does not look at the request output's
+datum — not its shape, not its type, not its presence. So a green evaluation of the mint proves
+nothing whatsoever about the `RequestDatum`. The first evaluation-level arbitration of that datum
+is `Cancel`, which does `expect datum: RequestDatum = inputDatum` before authorising. That is a
+second and stronger reason to build the escape hatch before anything is submitted: it is not only
+the way out, it is the first thing that tells us the datum was ever right.
