@@ -42,13 +42,19 @@ Single Gradle module, one package tree: `com.fluidtokens.aquarium.offchain`
 Proven 2026-08-14 (Java 21.0.11):
 
 - `./gradlew build -x test` — passes; fat jar at `build/libs/ft-aquarium-node-<version>.jar`
-- `./gradlew cleanTest test` — on `feat/lending-v4`: **passes cold** (211 tests, 0 failures,
+- `./gradlew cleanTest test` — on `feat/lending-v4`: **passes cold** (370 tests, 0 failures,
   8 skipped — manual deploy scripts and live tests are gated behind `WALLET_MNEMONIC*` /
-  `BLOCKFROST_KEY` and skip when unset). Always force execution (`cleanTest` or
-  `--rerun-tasks`): a bare `./gradlew test` on an unchanged tree serves a Gradle
-  UP-TO-DATE cache hit and proves nothing ran. On `main` the env gating does not exist
-  and bare `test` **fails cold** (5 of 7 tests are env-dependent manual scripts) — there,
-  verify with an explicit `--tests` selection instead.
+  `BLOCKFROST_KEY` and skip when unset). Always force execution with **`cleanTest`**: a bare
+  `./gradlew test` on an unchanged tree serves a Gradle UP-TO-DATE cache hit and proves
+  nothing ran. On `main` the env gating does not exist and bare `test` **fails cold** (5 of
+  7 tests are env-dependent manual scripts) — there, verify with an explicit `--tests`
+  selection instead.
+- **Read the count from `build/test-results/test/*.xml`, not from "BUILD SUCCESSFUL"**, and
+  `rm -rf build/test-results/test` first. Two separate sessions have now been served a
+  *stale* XML count: `--rerun-tasks` does **not** reliably purge that directory, which is why
+  it is no longer offered above as an equivalent to `cleanTest`. A suite of this size runs in
+  a few seconds with PlutusV3 evaluation included, so "too fast to have run" is not a
+  reliable instinct either — the XML is the only thing that settles it.
 - Live preview checks (optional): `set -a; . ./.env.preview; set +a` then run
   `LoansConfigVerifierLiveTest` — doubles as the "has FT redeployed preview?" probe.
 - No lint/format tooling configured. No CI (parked deliberately).
