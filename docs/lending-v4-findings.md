@@ -560,3 +560,41 @@ curl -s -H "project_id: $KEY" "$BASE/txs/6de7b7ec…094/utxos"
 curl -s -H "project_id: $KEY" "$BASE/scripts/datum/0750bb70…e5b1"
 curl -s -H "project_id: $KEY" "$BASE/scripts/datum/17c9be65…bb30"
 ```
+
+## 10. Liquidation economics — who receives what (verified at `bbe9c1a`, 2026-08-16)
+
+Settled because an intuition that the liquidator repays the debt and seizes the collateral
+(Aave/Compound shape) does **not** describe v4, and the difference decides whether the bot can
+ever be profitable.
+
+**Plain `Liquidate` (`lm_liquidate_action.ak`).** The liquidator pays nothing and receives
+nothing except the fee slice. `liquidationFee = loanCollateralAmount * liquidationFeePerMille
+/ 1000` (:118-119) is used **only** as a subtraction: `loanCollateralThatLenderShouldReceive =
+loanCollateralAmount - equity - liquidationFee` (:123-124). The collateral goes to an
+`asset_manager` output whose `ownerAsset` is the **lender's bond** (:147-157), checked with
+`>=` (:204-209). The validator never checks where the remainder goes, so the fee is simply the
+slice not required to reach the lender — the executor keeps it as change. **There is no
+FluidTokens treasury address in the action: the fee is the liquidator's reward, not a platform
+cut.**
+
+**`LiquidateAndPayInAdvance`.** The bot does front principal and keep the collateral, but the
+lender is made whole at the collateral's **oracle value**, not at the debt:
+`convertedLoanCollateralToPrincipalAmount = convert(collateralAmount - equity -
+liquidationFee)` (:172-179). The bot pays out approximately the collateral's full value and
+receives the collateral, so its gain is `equity + fee` in value terms — **not** the
+over-collateralisation spread.
+
+**Where the spread actually goes.** `equity` returns to the **borrower** (the excess above debt
+plus penalty); the penalty accrues to the **lender**. The liquidator's compensation in every
+variant is `liquidationFee` and nothing else.
+
+**Consequence.** With `equity == 0` — the only shape the deployed contracts can satisfy — and
+`liquidationFeePerMille == 0`, the liquidator's profit is exactly zero in **every** variant,
+including the parked ones. Building `LiquidateAndPayInAdvance` would not make such a loan
+profitable. Our profitability gate (fee value − tx fee − margin) therefore models the right
+quantity.
+
+**Measured population, preview, 2026-08-16.** All ten live loans carry
+`liquidationFeePerMille = 0`; six also carry `shouldLiquidationConvertToPrincipal = true`.
+So no third-party liquidator can profit from any of them at any price. The open question this
+raises for the epic's value: **is zero also the default on mainnet?**
