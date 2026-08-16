@@ -301,11 +301,16 @@ public class LoansContractRegistry {
 
     // ---- Applied scripts (witness attachment) --------------------------------------------
     //
-    // A liquidation transaction has to put the actual script bytes somewhere: either the caller
-    // points at a published reference-script UTxO, or the script travels in the witness set. The
-    // getters below serve the second path. They are exactly the seven validators a T-008
-    // `Liquidate` transaction invokes — nothing else is exposed, because a script that is not
-    // invoked and still ends up in the witness set is an ExtraneousScriptWitness error.
+    // A transaction has to put the actual script bytes somewhere: either the caller points at a
+    // published reference-script UTxO, or the script travels in the witness set. The getters below
+    // serve the second path, for the validators this repo builds transactions against. Nothing is
+    // exposed speculatively: a script that is not invoked and still ends up in the witness set is
+    // an ExtraneousScriptWitness error, so each accessor here exists because some transaction
+    // builder needs to attach that exact script.
+    //
+    // Seven of them serve the T-008 `Liquidate` transaction. The eighth, `getRequestScript()`, is
+    // exposed for the `src/test`-only loan-origination fixtures of T-016 and is never reached from
+    // a `src/main` code path — origination is not something the node does.
     //
     // Every one of them is the same applied compiled code the hash above was taken from, so
     // `script.getScriptHash()` is the matching `…ScriptHash`/`…PolicyId` by construction rather
@@ -344,6 +349,11 @@ public class LoansContractRegistry {
     /** {@code asset_manager.assetManager} — the withdraw script guarding the collateral outputs. */
     public PlutusScript getAssetManagerScript() {
         return scriptOf(assetManagerWithdrawScriptHash);
+    }
+
+    /** {@code request.request} — the request minting policy, and the request withdraw script. */
+    public PlutusScript getRequestScript() {
+        return scriptOf(requestPolicyId);
     }
 
     private PlutusScript scriptOf(String scriptHash) {
