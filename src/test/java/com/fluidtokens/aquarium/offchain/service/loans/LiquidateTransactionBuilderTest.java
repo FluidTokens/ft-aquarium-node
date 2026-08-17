@@ -1807,21 +1807,34 @@ class LiquidateTransactionBuilderTest {
     }
 
     /**
-     * Closing the evaluation hole must not open the submission one. A {@code TransactionEvaluator} is
-     * the narrowest thing that can price a transaction: one method, taking bytes and returning
-     * costings, and no way to transmit anything. This is the falsifiable form — the interface the
-     * builder now accepts declares exactly one abstract method, and that method is not a submit.
+     * <b>The builder can now reach a submitter, and does not submit. That is a stated decision and this
+     * test is what makes it falsifiable rather than a comment.</b>
      * <p>
-     * The sibling half of the claim is that the builder never receives or holds anything
-     * <em>wider</em>. A constructor is not the only way in — a setter or a mutable field would do just
-     * as well — so the sweep is over every declared constructor, method and field, not only the
-     * constructors: nothing reachable from outside this class may accept or hold a
-     * {@code TransactionProcessor}, a {@code *BackendService} or a {@code TransactionSubmitter}.
-     * Private members are swept too, because a private field is what a package-private setter would
-     * write into.
+     * This test used to assert the opposite: that no constructor, method or field of the builder
+     * involved anything able to submit — a {@code TransactionProcessor}, a {@code BackendService}, a
+     * submitter. That was the T-014 design, enforced by handing {@code QuickTxBuilder} a {@code null}
+     * processor. It cost twice. The same {@code null} nulled the evaluator (T-014's own defect,
+     * placeholder ex-units), and it hid the script supplier that a reference-script transaction needs
+     * to be priced at all — which surfaced on the first armed night, an hour before the first live
+     * liquidation, as a warning nobody could tell apart from the T-014 defect. A property enforced by a
+     * hole in the wiring is a property that gets violated by accident in the other direction.
+     * <p>
+     * So production now constructs {@code QuickTxBuilder} from the {@code BackendService} directly,
+     * as the library documents, and the guarantee moves to where it actually lives: <b>nothing in
+     * this class calls submit</b>, {@code build()} returns an unsigned {@link Transaction}, and arming
+     * is {@code LiquidationExecutor}'s behind two independent flags. What this test now proves:
+     * <ol>
+     *   <li>the evaluator the builder accepts is still the narrowest thing that can price — one
+     *       abstract method, not a processor;</li>
+     *   <li>no method the builder exposes <em>returns</em> anything able to submit, so nothing built
+     *       here can be handed a submission path by calling the builder;</li>
+     *   <li>the builder's own source contains no call to {@code submit}, {@code submitTransaction} or
+     *       {@code signAndSubmit} — the decision, checked against the bytes on disk rather than
+     *       against a comment.</li>
+     * </ol>
      */
     @Test
-    void theBuilderNeitherAcceptsNorHoldsAnythingThatCanSubmit() {
+    void theBuilderHoldsABackendAndNeverSubmitsThroughIt() throws Exception {
         List<Method> abstractMethods = Arrays.stream(TransactionEvaluator.class.getDeclaredMethods())
                 .filter(method -> Modifier.isAbstract(method.getModifiers()))
                 .toList();
@@ -1831,35 +1844,28 @@ class LiquidateTransactionBuilderTest {
         assertFalse(TransactionProcessor.class.isAssignableFrom(TransactionEvaluator.class),
                 "an evaluator must not be a processor — a processor can submit");
 
-        for (Constructor<?> constructor : LiquidateTransactionBuilder.class.getDeclaredConstructors()) {
-            for (Class<?> parameter : constructor.getParameterTypes()) {
-                assertCannotSubmit(parameter, "constructor " + constructor);
-            }
-        }
+        // Nothing the builder RETURNS can submit. Holding a backend is now allowed; leaking it is not.
         for (Method method : LiquidateTransactionBuilder.class.getDeclaredMethods()) {
-            for (Class<?> parameter : method.getParameterTypes()) {
-                assertCannotSubmit(parameter, "method " + method.getName());
-            }
-            assertCannotSubmit(method.getReturnType(), "the return type of " + method.getName());
+            Class<?> returned = method.getReturnType();
+            assertFalse(TransactionProcessor.class.isAssignableFrom(returned),
+                    "the return type of " + method.getName() + " can submit");
+            assertFalse(returned.getName().contains("BackendService"),
+                    "the return type of " + method.getName() + " is a backend");
+            assertFalse(LiquidationExecutor.TransactionSubmitter.class.isAssignableFrom(returned),
+                    "the return type of " + method.getName() + " is a submitter");
         }
-        for (Field field : LiquidateTransactionBuilder.class.getDeclaredFields()) {
-            assertCannotSubmit(field.getType(), "field " + field.getName());
-        }
-    }
 
-    /**
-     * One member of the builder's surface, checked against the three shapes that can reach the wire.
-     * The {@code BackendService} check is by name rather than by type because the point is to catch
-     * <em>any</em> backend — Blockfrost's, Ogmios', Koios' — not the one that happens to be on the
-     * classpath here.
-     */
-    private static void assertCannotSubmit(Class<?> type, String where) {
-        assertFalse(TransactionProcessor.class.isAssignableFrom(type),
-                where + " involves " + type.getName() + ", which can submit");
-        assertFalse(type.getName().contains("BackendService"),
-                where + " involves " + type.getName() + ", which can submit");
-        assertFalse(LiquidationExecutor.TransactionSubmitter.class.isAssignableFrom(type),
-                where + " involves a submitter");
+        // And the source itself contains no submit call. This is the decision, made checkable.
+        java.nio.file.Path source = java.nio.file.Path.of(
+                "src/main/java/com/fluidtokens/aquarium/offchain/service/loans/LiquidateTransactionBuilder.java");
+        String code = java.nio.file.Files.readString(source);
+        // Strip comments and javadoc so prose about "submit" does not count as a call.
+        String withoutComments = code.replaceAll("(?s)/\\*.*?\\*/", "").replaceAll("//.*", "");
+        for (String forbidden : List.of(".submit(", ".submitTransaction(", ".signAndSubmit(", "getTransactionService()")) {
+            assertFalse(withoutComments.contains(forbidden),
+                    "LiquidateTransactionBuilder's source calls " + forbidden
+                            + " — the builder must never submit; that is LiquidationExecutor's job");
+        }
     }
 
     /** 100 ADA of collateral against 110 ADA of debt: under water, so V8 has nothing to refuse. */

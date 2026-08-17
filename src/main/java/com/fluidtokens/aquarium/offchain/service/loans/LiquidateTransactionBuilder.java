@@ -469,8 +469,26 @@ public final class LiquidateTransactionBuilder {
     private final TransactionEvaluator scriptCostEvaluator;
 
     /**
+     * The backend cardano-client-lib builds against in production, or {@code null} for the offline
+     * rigs. When present, {@code QuickTxBuilder} is constructed from it directly — the one-argument
+     * constructor the library documents — which gives it the utxo supplier, protocol params,
+     * <b>script supplier</b> and transaction processor in one object.
+     * <p>
+     * <b>The safety property is now a stated decision, not a constructor trick.</b> For a long time
+     * this class handed {@code QuickTxBuilder} a {@code null} processor so that it was structurally
+     * incapable of submitting. That same {@code null} nulled the evaluator (T-014, placeholder
+     * ex-units), and later hid the script supplier that a reference-script transaction needs to be
+     * priced at all. It cost twice. So: <b>this builder can technically reach a submitter and does
+     * not use it — nothing in this class calls {@code submit}, {@code build()} returns an unsigned
+     * {@link Transaction}, and arming lives in {@code LiquidationExecutor} behind two independent
+     * flags.</b> A property enforced by a hole in the wiring was a property that could be violated by
+     * accident in the other direction, and was.
+     */
+    private final com.bloxbean.cardano.client.backend.api.BackendService backendService;
+
+    /**
      * The offline builder: no evaluator, so redeemers keep cardano-client-lib's placeholder ex-units.
-     * For the test rigs, which evaluate separately. Production goes through the six-argument
+     * For the test rigs, which evaluate separately. Production goes through the {@code BackendService}
      * constructor.
      */
     public LiquidateTransactionBuilder(LoansContractRegistry registry,
@@ -478,16 +496,12 @@ public final class LiquidateTransactionBuilder {
                                        CardanoConverters converters,
                                        UtxoSupplier utxoSupplier,
                                        ProtocolParamsSupplier protocolParamsSupplier) {
-        this(registry, network, converters, utxoSupplier, protocolParamsSupplier, null);
+        this(registry, network, converters, utxoSupplier, protocolParamsSupplier, null, null);
     }
 
     /**
-     * @param scriptCostEvaluator may be {@code null}; when it is not, every redeemer's ex-units are
-     *                            the evaluator's numbers and a failed evaluation is a
-     *                            {@link Refusal#SCRIPT_COST_EVALUATION_FAILED}. A
-     *                            {@link TransactionEvaluator} cannot submit — that is the whole reason
-     *                            this parameter is that type and not a {@code TransactionProcessor} or
-     *                            a {@code BackendService}.
+     * Offline builder with an evaluator — what the dry-eval rigs use to prove the priced path against
+     * the deployed validators without a network.
      */
     public LiquidateTransactionBuilder(LoansContractRegistry registry,
                                        Network network,
@@ -495,11 +509,41 @@ public final class LiquidateTransactionBuilder {
                                        UtxoSupplier utxoSupplier,
                                        ProtocolParamsSupplier protocolParamsSupplier,
                                        TransactionEvaluator scriptCostEvaluator) {
+        this(registry, network, converters, utxoSupplier, protocolParamsSupplier, null, scriptCostEvaluator);
+    }
+
+    /**
+     * The production constructor. {@code QuickTxBuilder} is built from the {@code BackendService}
+     * exactly as the library documents, so it has a utxo supplier, protocol params, a script supplier
+     * that can fetch a validator travelling as a reference script, and a transaction processor. The
+     * evaluator is passed separately because the processor's own evaluator would price against a
+     * remote node's view; Blockfrost's {@code /utils/txs/evaluate} is what we want, and it is what
+     * {@code YaciConfig} supplies. See the field javadoc for why the processor is no longer nulled.
+     */
+    public LiquidateTransactionBuilder(LoansContractRegistry registry,
+                                       Network network,
+                                       CardanoConverters converters,
+                                       com.bloxbean.cardano.client.backend.api.BackendService backendService,
+                                       TransactionEvaluator scriptCostEvaluator) {
+        this(registry, network, converters,
+                new com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier(backendService.getUtxoService()),
+                new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(backendService.getEpochService()),
+                Objects.requireNonNull(backendService, "backendService"), scriptCostEvaluator);
+    }
+
+    private LiquidateTransactionBuilder(LoansContractRegistry registry,
+                                        Network network,
+                                        CardanoConverters converters,
+                                        UtxoSupplier utxoSupplier,
+                                        ProtocolParamsSupplier protocolParamsSupplier,
+                                        com.bloxbean.cardano.client.backend.api.BackendService backendService,
+                                        TransactionEvaluator scriptCostEvaluator) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.network = Objects.requireNonNull(network, "network");
         this.converters = Objects.requireNonNull(converters, "converters");
         this.utxoSupplier = Objects.requireNonNull(utxoSupplier, "utxoSupplier");
         this.protocolParamsSupplier = Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
+        this.backendService = backendService;
         this.scriptCostEvaluator = scriptCostEvaluator;
     }
 
@@ -1460,21 +1504,21 @@ public final class LiquidateTransactionBuilder {
         TransactionEvaluator evaluator =
                 priceScripts && scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
         long[] slots = validitySlots(request);
-        QuickTxBuilder.TxContext context =
-                // The third argument is the TransactionProcessor, and it stays null: a processor can
-                // submit, and nothing in this class may be able to. Script cost evaluation is granted
-                // separately below through withTxEvaluator, whose interface has no submit method.
-                new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
+        // Production: the one-argument constructor the library documents, which wires the utxo
+        // supplier, protocol params, SCRIPT SUPPLIER and transaction processor from one backend.
+        // The script supplier is what lets it fetch a validator that only exists on chain as a
+        // reference script; without it a reference-script transaction cannot be priced. Offline:
+        // the three-argument form with no processor and no supplier, because the rigs hand every
+        // script in explicitly and evaluate for themselves.
+        QuickTxBuilder quickTxBuilder = backendService != null
+                ? new QuickTxBuilder(backendService)
+                : new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null);
+        QuickTxBuilder.TxContext context = quickTxBuilder
                         .compose(tx)
                         .feePayer(request.changeAddress())
                         .collateralPayer(request.changeAddress())
                         .validFrom(slots[0])
                         .validTo(slots[1])
-                        // A script supplier that resolves nothing. cardano-client-lib otherwise walks
-                        // every reference input looking for a script to fetch, and this builder has no
-                        // remote source to fetch one from — the caller either points at a published
-                        // reference script or the validator travels in the witness set.
-                        .withScriptSupplier(scriptHash -> Optional.empty())
                         .mergeOutputs(false)
                         // With an evaluator, a failed evaluation must stop the build: the default
                         // (true) turns it into a log.warn and hands back a transaction whose redeemers
@@ -1483,6 +1527,11 @@ public final class LiquidateTransactionBuilder {
                         // evaluate with and the offline rigs price the transaction themselves.
                         .ignoreScriptCostEvaluationError(evaluator == null);
 
+        if (backendService == null) {
+            // Offline: cardano-client-lib would otherwise walk every reference input looking for a
+            // script to fetch and NPE on the missing supplier. The rigs hand scripts in explicitly.
+            context = context.withScriptSupplier(scriptHash -> Optional.empty());
+        }
         if (evaluator != null) {
             context = context.withTxEvaluator(evaluator);
         }

@@ -72,8 +72,12 @@ public class YaciConfig {
                                                                    BFBackendService bfBackendService) {
         TransactionEvaluator scriptCostEvaluator =
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
+        // The whole BackendService, as the library documents: QuickTxBuilder wires its utxo
+        // supplier, protocol params, script supplier and transaction processor from it in one
+        // constructor. The script supplier is the part that matters now — a validator travelling
+        // as a reference script has to be fetchable by hash for the transaction to be priced.
         return new LiquidateTransactionBuilder(registry, network.getCardanoNetwork(), cardanoConverters,
-                utxoSupplier, protocolParamsSupplier, scriptCostEvaluator);
+                bfBackendService, scriptCostEvaluator);
     }
 
 }

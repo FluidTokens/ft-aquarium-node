@@ -134,8 +134,18 @@ class RealLoanDryEvalTest {
     private static final int LOAN_OUTPUT_INDEX = 1;
     private static final int BOND_OUTPUT_INDEX = 3;
 
-    /** Asset name of both the loan NFT and the lender-bond NFT — the join key between the two. */
-    private static final String LOAN_ID = "124e7c5db2b2a8905d889ffd";
+    /**
+     * Asset name of both the loan NFT and the lender-bond NFT — the join key between the two.
+     * <p>
+     * All 28 bytes. This constant used to be the 12-byte prefix {@code 124e7c5db2b2a8905d889ffd},
+     * and every offline test still passed, because the offline fixture <em>builds</em> the loan and
+     * bond UTxOs from this same constant — so both sides agreed with each other and nothing agreed
+     * with the chain. The live test against production's wiring is what surfaced it: the real UTxO
+     * carries the full name and the builder refused with
+     * {@code UTXO_DOES_NOT_MATCH_ASSESSMENT: loan NFT … is 0, the assessment says 1}. A fixture that
+     * manufactures both halves of a comparison can be wrong about the world and green forever.
+     */
+    private static final String LOAN_ID = "124e7c5db2b2a8905d889ffd90ae84e3a227dd271f999799d56b02ae";
 
     /**
      * Inline datum of {@code d2a85126…bfbc4f#1}, verbatim. Decoded by the production
@@ -1223,6 +1233,99 @@ class RealLoanDryEvalTest {
         Transaction tx = builder(fixture).build(request(fixture));
         assertNotNull(tx);
         return tx;
+    }
+
+    // ---- LIVE: production's exact wiring, against preview ---------------------------------------
+
+    /**
+     * <b>The one test that builds through PRODUCTION'S wiring against the REAL chain.</b> Every other
+     * test in this class hands the builder a synthetic universe and an offline evaluator. This one
+     * hands it exactly what {@code YaciConfig} hands it: Blockfrost's utxo supplier, protocol params,
+     * <em>script supplier</em> and {@code /utils/txs/evaluate} evaluator — and it references the
+     * reference script we actually published, {@code 48c102c0…#0}, whose bytes therefore have to be
+     * fetched from chain by hash rather than handed in.
+     * <p>
+     * That is the gap Giovanni named: the offline rig proved the transaction against the validators,
+     * but the offline rig resolves reference scripts through its own supplier, not through the one
+     * production runs. A builder that cannot fetch a reference script cannot price a transaction that
+     * depends on one, and until this test nothing exercised that path end to end. The assertion that
+     * matters is the last one: the redeemers on the <em>built</em> transaction carry Blockfrost's
+     * ex-units, not cardano-client-lib's placeholders.
+     * <p>
+     * Gated on {@code BLOCKFROST_KEY}; it makes network calls and is not part of the cold suite. It
+     * submits nothing: the builder has no {@code TransactionProcessor}, and there is no signer here.
+     */
+    @org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable(named = "BLOCKFROST_KEY", matches = ".+")
+    @Test
+    void productionWiringPricesTheRealLoanAgainstTheRealChainThroughThePublishedReferenceScript() throws Exception {
+        var bf = new com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService(
+                "https://cardano-preview.blockfrost.io/api/v0/", System.getenv("BLOCKFROST_KEY"));
+        var utxoSupplier = new com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier(bf.getUtxoService());
+        com.bloxbean.cardano.client.api.TransactionEvaluator evaluator =
+                (cbor, inputs) -> bf.getTransactionService().evaluateTx(cbor);
+
+        // Production's constructor: the whole BackendService, exactly as YaciConfig hands it over.
+        LiquidateTransactionBuilder production = new LiquidateTransactionBuilder(
+                REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(), bf, evaluator);
+
+        // Real chain state, fetched now rather than pinned: the loan, the bond, the two configs, a
+        // fee/collateral utxo, and the live oracle feed. If any of these has moved this test says so.
+        Utxo loanUtxo = utxoSupplier.getTxOutput(LOAN_TX, LOAN_OUTPUT_INDEX).orElseThrow(
+                () -> new AssertionError("loan utxo spent — the loan may have been liquidated"));
+        Utxo bondUtxo = utxoSupplier.getTxOutput(LOAN_TX, BOND_OUTPUT_INDEX).orElseThrow();
+        Utxo configUtxo = utxoSupplier.getTxOutput(
+                "7374a98596cf03c323a0dd1643178861301f1060646789ae4d385ec3e54be781", 0).orElseThrow();
+        Utxo lmConfigUtxo = utxoSupplier.getTxOutput(
+                "7374a98596cf03c323a0dd1643178861301f1060646789ae4d385ec3e54be781", 1).orElseThrow();
+        Utxo walletUtxo = utxoSupplier.getTxOutput(
+                "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd", 1).orElseThrow();
+        String changeAddress = walletUtxo.getAddress();
+
+        var registry = new FluidOracleClient("https://testapi.fluidtokens.com/get-oracle-tokens");
+        registry.refresh(); // outside Spring the scheduled refresh never runs; populate it once
+        OracleEntry oracle = registry.entries().stream()
+                .filter(e -> e.oracleToken() != null && e.oracleToken().toUnit().equals(ORACLE_NFT.toUnit()))
+                .findFirst().orElseThrow(() -> new AssertionError("tFLDT oracle entry not in registry"));
+
+        long now = System.currentTimeMillis();
+        long validFrom = now - 30_000L;
+        long validTo = now + 120_000L;
+
+        Loan loan = new Loan(LOAN_TX, LOAN_OUTPUT_INDEX, LOAN_ADDRESS, LOAN_ID,
+                BigInteger.valueOf(COLLATERAL_AMOUNT), BigInteger.valueOf(LOAN_LOVELACE), loanDatum());
+        LenderBond bond = new LenderBond(LOAN_TX, BOND_OUTPUT_INDEX, BOND_ADDRESS, LOAN_ID,
+                BOND_DATUM_HEX, bondDatum());
+        LiquidationAssessment assessment = LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(),
+                oracle.feed(), validFrom);
+        assertTrue(assessment.buildable(), "not buildable right now: " + assessment.detail());
+
+        var published = new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
+                new TransactionInput("48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd", 0),
+                null, null);
+        var request = new LiquidateTransactionBuilder.Request(
+                List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loanUtxo, bondUtxo)),
+                configUtxo, lmConfigUtxo, Map.of(ORACLE_NFT.toUnit(), oracle), walletUtxo, changeAddress,
+                validFrom, validTo, 30_000L, published);
+
+        Transaction tx = production.build(request);
+
+        // The claims that matter, all read off the built artefact.
+        Transaction round = deserialise(tx);
+        assertEquals(5, round.getWitnessSet().getPlutusV3Scripts().size(),
+                "five validators inline; loan_claim_action must have been dropped from the witness set");
+        assertTrue(round.getBody().getReferenceInputs().stream().anyMatch(i ->
+                        i.getTransactionId().equals("48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd")
+                                && i.getIndex() == 0),
+                "the published reference script must be a reference input");
+        for (Redeemer r : round.getWitnessSet().getRedeemers()) {
+            assertTrue(r.getExUnits().getMem().longValue() > 10_000L,
+                    "placeholder mem on " + r.getTag() + "#" + r.getIndex()
+                            + " — Blockfrost did not price this redeemer");
+        }
+        long size = tx.serialize().length;
+        assertTrue(size < 16_384, "size " + size);
+        log.info("LIVE priced build OK: {} bytes, fee {}, redeemers {}", size,
+                round.getBody().getFee(), round.getWitnessSet().getRedeemers().size());
     }
 
     // ---- reading the built transaction back ------------------------------------------------
