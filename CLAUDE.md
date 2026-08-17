@@ -86,9 +86,15 @@ Proven 2026-08-14 (Java 21.0.11):
   live relay, Postgres, a funded wallet mnemonic, and a Blockfrost key. Giovanni runs
   nodes himself.
 - Secrets flow via env (`docker/.env`, `.env.preview`); never commit mnemonics or keys.
-- Preview v4 was already **redeployed once** under this project (2026-07-14 → 2026-08-05
-  coordinates); `LoansConfigVerifier` hard-fails on the next one — that failure is an
-  answer, not an outage.
+- Preview v4 has been **redeployed twice** under this project (2026-07-14 → 2026-08-05 →
+  2026-08-17 coordinates). **`LoansConfigVerifier` does NOT detect this — that belief was
+  false and a real redeploy disproved it (findings §12).** It locates the config NFTs by the
+  policy id it is pinned to; a redeploy mints new NFTs under a new policy id and leaves the
+  old ones unburnt, so the pinned coordinates keep verifying cleanly forever. The live test
+  passes today, after the redeploy. Combined with stale `sync-start-*`, a node pinned to a
+  dead deployment boots clean, verifies clean, indexes nothing and reports zero candidates —
+  indistinguishable from a quiet market. **Treat a persistently empty world as a suspected
+  redeploy.**
 - Preview oracle: only the three Charli3 (`c3`) feeds are live; every multisig preview
   feed is months stale. There is a real ~60–80s price blackout every 5 minutes, upstream
   of us (design §6.7–6.8).

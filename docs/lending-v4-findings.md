@@ -723,3 +723,51 @@ and `general_spend` adds ~1.1 KB on top of `request.request`'s 9,628. And the wi
 load-bearing in a way that is easy to miss: **remove the withdrawal and the *spend* leg fails**,
 not the withdraw leg, because the spend wrapper's entire job is to check that the withdrawal is
 there.
+
+## 12. `LoansConfigVerifier` does NOT detect a redeploy (measured 2026-08-17, the first real test)
+
+**The epic believed, from day one, that this verifier was the redeploy detector.** CLAUDE.md said it
+"hard-fails on the next one — that failure is an answer, not an outage". `application.yaml` says a
+redeploy "turns these into a hard startup failure". The PR draft said it "hard-fails on a mismatch,
+which is how we detect a redeploy". **All of that is false, and a real redeploy has now proved it.**
+
+FluidTokens redeployed preview (third deployment: 14 Jul → 5 Aug → 17 Aug). Coordinates verified on
+chain:
+
+| | old (what we ship) | new |
+|---|---|---|
+| config ref UTxO | `6de7b7ec…dca12094` | `7374a985…e54be781` |
+| config policy id | `f1a475ea…df92835c` | `c45d5306…4032aaa9` |
+| LM config policy id | `d0998754…d4f4a3e3` | `de1b8b40…fc731484` |
+| config asset name | `706172616d6574657273` | **same** — hardcoded in `constants.ak` |
+
+Both new NFTs were minted in that one transaction, `mint_or_burn_count: 1`, sitting at outputs 0 and 1
+— structurally identical to the old deployment.
+
+**And `LoansConfigVerifierLiveTest` PASSES RIGHT NOW, against live preview, after the redeploy.** Two
+tests, both ran, both green.
+
+**Why, and it is obvious in hindsight.** The verifier locates the config NFTs **by the policy id it is
+pinned to**, reads their inline datums, and compares every derived hash. A redeploy **mints a fresh
+config NFT under a fresh policy id and leaves the old one alone** — measured: the old config NFT still
+has `quantity: 1`, unburnt. So the pinned coordinates still describe something real and self-consistent
+on chain. Every check passes. **The verifier detects MUTATION OF THE DEPLOYMENT IT IS PINNED TO. It has
+no way to notice that a different, newer deployment exists.** Those are different questions and only
+the weaker one was ever being asked.
+
+**The operational consequence is worse than a missing alarm.** Combined with `sync-start-*` still
+pointing at the block that minted the *old* config NFT, a node booted today against the new deployment
+will: start cleanly, verify cleanly, index nothing relevant, and report **zero liquidation candidates**
+— indistinguishable from a quiet market. **Nothing anywhere in the system says "you are pinned to a
+deployment nobody uses."**
+
+**What would actually detect it** (none of which exists): watching for a mint of asset name
+`706172616d6574657273` under *any* policy id; asking FluidTokens; or an aliveness check — the config
+UTxO being unspent is necessary but not sufficient, since a superseded one stays unspent forever. The
+cheapest honest version is probably the last: assert that the *loans* we index are non-empty and
+recent, and treat a persistently empty world as a suspected redeploy rather than as calm.
+
+**This is the same shape as every other defect in this epic**, and the most consequential instance of
+it: a guard that cannot fire, believed for weeks to be the thing that would fire. It was written to
+answer a question, it answers a narrower one, and **nobody asked which** — because the artefact and its
+test shared the assumption that a redeploy would move the thing being watched.
