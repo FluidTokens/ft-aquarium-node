@@ -16,6 +16,7 @@ import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.VkeyWitness;
 import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
@@ -31,15 +32,20 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.Validator;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -281,15 +287,37 @@ class RealLoanDryEvalTest {
      * {@link EvalFixtures#scriptSupplier} resolves on. The size figure is therefore exact, and the
      * evaluation is against the real applied code.
      */
+    private static final Map<Validator, TransactionInput> COORDINATES = new EnumMap<>(Map.of(
+            Validator.LOAN, new TransactionInput("a1".repeat(32), 0),
+            Validator.LOAN_SPEND, new TransactionInput("a2".repeat(32), 0),
+            Validator.LENDER_MANAGER, new TransactionInput("a3".repeat(32), 0),
+            Validator.LENDER_MANAGER_SPEND, new TransactionInput("a4".repeat(32), 0),
+            Validator.LOAN_CLAIM_ACTION, new TransactionInput("a5".repeat(32), 0),
+            Validator.LM_LIQUIDATE_ACTION, new TransactionInput("a6".repeat(32), 0)));
+
     private static final LiquidateTransactionBuilder.ReferenceScripts REFERENCE_SCRIPTS =
-            new LiquidateTransactionBuilder.ReferenceScripts(
-                    new TransactionInput("a1".repeat(32), 0),
-                    new TransactionInput("a2".repeat(32), 0),
-                    new TransactionInput("a3".repeat(32), 0),
-                    new TransactionInput("a4".repeat(32), 0),
-                    new TransactionInput("a5".repeat(32), 0),
-                    new TransactionInput("a6".repeat(32), 0),
-                    null);
+            referenceScripts(EnumSet.allOf(Validator.class));
+
+    /**
+     * The {@code ReferenceScripts} record for a chosen subset: a coordinate where the validator is
+     * published, {@code null} where it is not. {@code assetManager} is always {@code null} — a plain
+     * {@code Liquidate} never invokes it.
+     */
+    private static LiquidateTransactionBuilder.ReferenceScripts referenceScripts(
+            Set<Validator> published) {
+        return new LiquidateTransactionBuilder.ReferenceScripts(
+                coordinate(published, Validator.LOAN),
+                coordinate(published, Validator.LOAN_SPEND),
+                coordinate(published, Validator.LENDER_MANAGER),
+                coordinate(published, Validator.LENDER_MANAGER_SPEND),
+                coordinate(published, Validator.LOAN_CLAIM_ACTION),
+                coordinate(published, Validator.LM_LIQUIDATE_ACTION),
+                null);
+    }
+
+    private static TransactionInput coordinate(Set<Validator> published, Validator validator) {
+        return published.contains(validator) ? COORDINATES.get(validator) : null;
+    }
 
     // ======================================================================================
     // the fixtures themselves
@@ -602,6 +630,256 @@ class RealLoanDryEvalTest {
     }
 
     // ======================================================================================
+    // T-023 — how few reference scripts are enough
+    // ======================================================================================
+
+    /**
+     * One measured configuration: which validators travel by reference, what that costs to publish,
+     * and what the resulting transaction costs to serialise and to submit.
+     */
+    private record Config(String label, Set<Validator> published, int unsignedBytes, int signedBytes,
+                          long feeLovelace, long lockedLovelace) {
+
+        boolean fits() {
+            return signedBytes < MAX_TX_SIZE;
+        }
+
+        int headroom() {
+            return MAX_TX_SIZE - signedBytes;
+        }
+    }
+
+    /**
+     * The minimum ada a batch of one witness would need for a dummy Ed25519 signature: a
+     * {@code vkeywitness} is a 32-byte key and a 64-byte signature. Zeroed — nothing here verifies a
+     * signature, only counts its bytes.
+     */
+    private static final VkeyWitness DUMMY_WITNESS = VkeyWitness.builder()
+            .vkey(new byte[32])
+            .signature(new byte[64])
+            .build();
+
+    /**
+     * Only ever asked {@link ReferenceScriptPublisher#minAdaFor}, which needs the registry and the
+     * protocol params and nothing else — hence the empty UTxO supplier. Real preview params, so the
+     * locked-ada figures are the ones {@code ReferenceScriptPublisherTest} pins.
+     */
+    private static final ReferenceScriptPublisher PUBLISHER = new ReferenceScriptPublisher(
+            REGISTRY, LoanFixtures.utxoSupplier(List.of()), LoanFixtures.protocolParams());
+
+    /**
+     * <b>The T-023 deliverable.</b> Publishing reference scripts is not all-or-nothing: enough of them
+     * have to travel by reference to get the transaction under {@code maxTxSize}, and every one of the
+     * rest can stay in the witness set. This measures each candidate subset on the real loan.
+     *
+     * <h3>What is measured, and how</h3>
+     * For every configuration the same real-loan liquidation is built through the production builder.
+     * Sizes are {@code Transaction.serialize().length} of the deserialised body, twice: as built
+     * (unsigned) and with one dummy vkey witness appended, which is what the finished transaction will
+     * carry — the bot signs with one key. Nothing here is arithmetic standing in for a measurement.
+     * <p>
+     * Each configuration's universe holds a reference-script UTxO for <em>only</em> the validators it
+     * publishes, and {@link #measure} asserts both halves of the shape off the finished body: exactly
+     * {@code |published|} of the coordinates appear among the reference inputs, and exactly
+     * {@code 6 - |published|} PlutusV3 scripts remain in the witness set. So a partial configuration is
+     * genuinely partial — some referenced, the rest inline — rather than a set that silently dropped
+     * the unpublished ones.
+     *
+     * <h3>Measured (2026-08-17, real loan 124e7c5d…, batch of one, maxTxSize 16_384)</h3>
+     * <pre>
+     *   configuration                        unsigned   signed   fits   headroom    locked ada
+     *   all six referenced                      1_815    1_921    yes     14_463     86.837880
+     *   none referenced (all six inline)       20_342   20_448     NO     -4_064      0.000000
+     *   loanClaimAction only                   11_713   11_819    yes      4_565     38.359000
+     *   lmLiquidateAction only                 16_148   16_254    yes        130     19.244150
+     *   loanClaimAction + lmLiquidateAction     7_519    7_625    yes      8_759     57.603150
+     *   the three largest (+ loan)              5_005    5_111    yes     11_273     69.606500
+     *   everything but lenderManager            2_755    2_861    yes     13_523     81.640020
+     * </pre>
+     * The figures are re-measured on every run and logged; the assertions below pin the
+     * <em>conclusions</em> (which configurations fit, which clear the margin) rather than the byte
+     * counts, so an encoder change reports honestly instead of failing on an unrelated byte.
+     *
+     * <h3>The answer</h3>
+     * <b>One published script is enough, and {@code loanClaimAction} is the one.</b> It is 8_662 of the
+     * 18_720 validator bytes, and shedding it alone takes the transaction from 20_448 signed bytes to
+     * <b>11_819, with 4_565 bytes of headroom</b>, locking <b>38.359 ada instead of 86.838</b>. This is
+     * the configuration this repo ships.
+     * <p>
+     * {@code lmLiquidateAction} alone also fits — but at 16_254 bytes, <b>130 bytes under the limit</b>.
+     * That is not a margin, and it is the reason the question had to be measured: reasoning about it
+     * from the script table put the answer within a hundred bytes of the wrong side.
+     * <p>
+     * "Fits" is not "sensible". The margin rule {@link #sensible} adopts is <b>headroom ≥ 4_096 bytes</b>
+     * (a quarter of {@code maxTxSize}) <b>and ≥ the largest still-inline script</b>. The second clause is
+     * the load-bearing one: this transaction grows in units of whole scripts, so headroom smaller than a
+     * script it already carries is one change away from not fitting. The shipped one-script configuration
+     * <b>clears both clauses — but the second only by 338 bytes</b>: 4_565 of headroom against
+     * {@code lmLiquidateAction}'s 4_227 inline bytes. It passes, and it passes narrowly. Publishing
+     * {@code lmLiquidateAction} as well (57.60 ada) would give 8_759 bytes against a 2_547-byte largest
+     * inline script and clear both clauses threefold — that is the upgrade if the margin is ever wanted,
+     * not a correction of the shipped choice.
+     * <p>
+     * <b>The margin also has to absorb batching, and that is not measured here.</b> Every figure is for a
+     * batch of <em>one</em> loan; each additional loan adds two inputs, two outputs, a {@code ClaimData}
+     * and an {@code assetOutputIndex}. The real fixture is a single loan, so the per-loan marginal cost is
+     * the first thing to measure before relying on 4_565 bytes.
+     *
+     * <h3>What is deliberately <em>not</em> claimed here</h3>
+     * {@link Config#feeLovelace()} is captured and logged but <b>no conclusion is drawn from it, and no
+     * per-submission cost comparison is made</b>. Two things would have to be settled first, and neither
+     * is in this slice's scope: the builder used here has no script-cost evaluator, so every redeemer
+     * carries cardano-client-lib's placeholder ex-units and the execution term of the fee is a fiction;
+     * and the reference-script tier fee cardano-client-lib computes for the all-referenced case works out
+     * at ~59 lovelace per script byte against a {@code minFeeRefScriptCostPerByte} of 15, which this test
+     * has not explained and will not assert around. A fee table built on either would be a number that
+     * looks measured and is not.
+     */
+    @Test
+    void theCheapestReferenceScriptSubsetThatFitsIsMeasured() {
+        Fixture fixture = fixture();
+
+        Map<String, Set<Validator>> subsets = new LinkedHashMap<>();
+        subsets.put("all six referenced", EnumSet.allOf(Validator.class));
+        subsets.put("none referenced (all six inline)", EnumSet.noneOf(Validator.class));
+        subsets.put("loanClaimAction only", EnumSet.of(Validator.LOAN_CLAIM_ACTION));
+        subsets.put("lmLiquidateAction only", EnumSet.of(Validator.LM_LIQUIDATE_ACTION));
+        subsets.put("loanClaimAction + lmLiquidateAction",
+                EnumSet.of(Validator.LOAN_CLAIM_ACTION, Validator.LM_LIQUIDATE_ACTION));
+        subsets.put("the three largest (+ loan)",
+                EnumSet.of(Validator.LOAN_CLAIM_ACTION, Validator.LM_LIQUIDATE_ACTION, Validator.LOAN));
+        subsets.put("everything but lenderManager",
+                EnumSet.complementOf(EnumSet.of(Validator.LENDER_MANAGER)));
+
+        Map<String, Config> measured = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<Validator>> subset : subsets.entrySet()) {
+            measured.put(subset.getKey(), measure(fixture, subset.getKey(), subset.getValue()));
+        }
+
+        log.info("reference-script subsets, real loan {}, batch of one, maxTxSize {}:",
+                LOAN_ID, MAX_TX_SIZE);
+        for (Config config : measured.values()) {
+            log.info("  {}", "%-38s unsigned %6d  signed %6d  fits %-5s  headroom %7d  locked %11d  fee %9d"
+                    .formatted(config.label(), config.unsignedBytes(), config.signedBytes(),
+                            config.fits(), config.headroom(), config.lockedLovelace(),
+                            config.feeLovelace()));
+        }
+
+        Config all = measured.get("all six referenced");
+        Config none = measured.get("none referenced (all six inline)");
+        Config claimOnly = measured.get("loanClaimAction only");
+        Config lmOnly = measured.get("lmLiquidateAction only");
+        Config two = measured.get("loanClaimAction + lmLiquidateAction");
+
+        // The two ends of the question.
+        assertTrue(all.fits(), "the all-referenced baseline must fit: " + all.signedBytes());
+        assertFalse(none.fits(), "all six inline must not fit: " + none.signedBytes());
+
+        // Giovanni's hypothesis, tested rather than adopted: one published script is enough — but not
+        // just any one. loanClaimAction sheds 8_662 bytes and clears the limit; lmLiquidateAction sheds
+        // 4_227 and does not.
+        // THE SHIPPING CONFIGURATION. Five validators inline, loanClaimAction by reference.
+        assertTrue(claimOnly.fits(),
+                "loanClaimAction alone must be enough to fit: " + claimOnly.signedBytes());
+        assertTrue(claimOnly.lockedLovelace() < all.lockedLovelace(),
+                "the point of publishing fewer is locking less");
+
+        // lmLiquidateAction alone also fits — but by 130 bytes, which is not a margin. Asserted in the
+        // direction the measurement found rather than the direction it was predicted in: the brief
+        // reasoned it would clear the limit by ~76 bytes and it clears by 130, so "it fits" was the
+        // right call and the exact figure was not. Both are why this was measured.
+        assertTrue(lmOnly.fits(), "lmLiquidateAction alone fits, barely: " + lmOnly.signedBytes());
+        assertFalse(sensible(lmOnly),
+                "lmLiquidateAction alone must not clear the margin rule: headroom " + lmOnly.headroom());
+
+        // The margin rule this file adopts, applied. The shipped one-script configuration clears it —
+        // by 338 bytes on the binding clause, which is thin but is what the rule says, and the rule was
+        // written down before the numbers were in. Asserted rather than narrated so that a future
+        // encoder change which eats those 338 bytes turns this red instead of going unnoticed.
+        assertTrue(sensible(claimOnly),
+                "loanClaimAction alone must clear the margin rule: headroom " + claimOnly.headroom()
+                        + " against a largest inline script of "
+                        + largestInlineScriptBytes(claimOnly.published()));
+        assertTrue(claimOnly.headroom() - largestInlineScriptBytes(claimOnly.published()) < 1_000,
+                "and it clears the binding clause only narrowly — if this ever becomes comfortable, "
+                        + "the recommendation in the javadoc above is stale");
+        assertTrue(sensible(two),
+                "loanClaimAction + lmLiquidateAction must clear the margin rule: headroom "
+                        + two.headroom() + " against a largest inline script of "
+                        + largestInlineScriptBytes(two.published()));
+    }
+
+    /**
+     * Builds the real-loan liquidation with exactly {@code published} travelling by reference, and
+     * measures it. The unpublished validators travel in the witness set — the builder attaches all six
+     * unconditionally and {@code removeDuplicateScriptWitnesses} strips only the ones it was told are
+     * published, so a partial set is expressible without any change to the builder.
+     */
+    private static Config measure(Fixture fixture, String label, Set<Validator> published) {
+        Transaction built = builder(fixture, published)
+                .build(request(fixture, VALID_FROM, VALID_TO, referenceScripts(published)));
+        Transaction tx = deserialise(built);
+
+        assertEquals(published.size(), referencedScriptCount(tx),
+                label + ": the body must carry exactly the published scripts by reference");
+        List<PlutusScript> inline = tx.getWitnessSet().getPlutusV3Scripts() == null
+                ? List.of()
+                : List.copyOf(tx.getWitnessSet().getPlutusV3Scripts());
+        assertEquals(6 - published.size(), inline.size(),
+                label + ": every unpublished validator must travel in the witness set");
+
+        int unsigned = serializedSize(tx);
+        if (tx.getWitnessSet().getVkeyWitnesses() == null) {
+            tx.getWitnessSet().setVkeyWitnesses(new ArrayList<>());
+        }
+        tx.getWitnessSet().getVkeyWitnesses().add(DUMMY_WITNESS);
+        int signed = serializedSize(deserialise(tx));
+
+        long locked = 0L;
+        for (Validator validator : published) {
+            locked += PUBLISHER.minAdaFor(validator, LoanFixtures.botAddress());
+        }
+        return new Config(label, published, unsigned, signed,
+                built.getBody().getFee().longValueExact(), locked);
+    }
+
+    /** How many of the body's reference inputs resolve to a published loans-v4 script. */
+    private static int referencedScriptCount(Transaction tx) {
+        List<TransactionInput> refInputs = tx.getBody().getReferenceInputs();
+        return (int) COORDINATES.values().stream().filter(refInputs::contains).count();
+    }
+
+    /**
+     * The margin rule. "It fits" is not the bar: the transaction has to keep fitting when it carries a
+     * batch rather than one loan, and it grows in units of whole scripts, so the headroom must be at
+     * least a quarter of {@code maxTxSize} <em>and</em> at least as large as the biggest script still
+     * travelling inline.
+     */
+    private static boolean sensible(Config config) {
+        return config.fits()
+                && config.headroom() >= MAX_TX_SIZE / 4
+                && config.headroom() >= largestInlineScriptBytes(config.published());
+    }
+
+    /** Applied bytes of the largest validator this configuration still carries in the witness set. */
+    private static int largestInlineScriptBytes(Set<Validator> published) {
+        return EnumSet.allOf(Validator.class).stream()
+                .filter(validator -> !published.contains(validator))
+                .mapToInt(validator -> appliedBytes(scriptOf(validator)))
+                .max()
+                .orElse(0);
+    }
+
+    /** Applied script body bytes — the same measure {@code ReferenceScriptPublisherTest} pins. */
+    private static int appliedBytes(PlutusScript script) {
+        try {
+            return script.serializeScriptBody().length;
+        } catch (Exception e) {
+            throw new AssertionError("cannot size an applied loans-v4 script", e);
+        }
+    }
+
+    // ======================================================================================
     // fixture plumbing
     // ======================================================================================
 
@@ -659,6 +937,17 @@ class RealLoanDryEvalTest {
      * the reference script only its script hash, the Charli3 provider its NFT and its inline datum.
      */
     private static List<Utxo> universe(Fixture fixture) {
+        return universe(fixture, EnumSet.allOf(Validator.class));
+    }
+
+    /**
+     * As above, but publishing only {@code published}. Every other validator has no reference-script
+     * UTxO in the universe at all, so a build that referenced one anyway could not resolve it — which
+     * is what makes the partial configurations in
+     * {@link #theCheapestReferenceScriptSubsetThatFitsIsMeasured()} genuinely partial rather than
+     * six-published-but-only-some-declared.
+     */
+    private static List<Utxo> universe(Fixture fixture, Set<Validator> published) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
                 fixture.loanUtxo(), fixture.bondUtxo()));
 
@@ -677,31 +966,37 @@ class RealLoanDryEvalTest {
                         Amount.asset(LoanFixtures.unit(C3_FEED_NFT), BigInteger.ONE)),
                 C3_PROVIDER_DATUM_HEX));
 
-        universe.addAll(referenceScriptUtxos());
+        universe.addAll(referenceScriptUtxos(published));
         return universe;
     }
 
-    /** A UTxO per {@link #REFERENCE_SCRIPTS} coordinate, each carrying its real derived script hash. */
-    private static List<Utxo> referenceScriptUtxos() {
-        List<TransactionInput> coordinates = List.of(REFERENCE_SCRIPTS.loan(),
-                REFERENCE_SCRIPTS.loanSpend(), REFERENCE_SCRIPTS.lenderManager(),
-                REFERENCE_SCRIPTS.lenderManagerSpend(), REFERENCE_SCRIPTS.loanClaimAction(),
-                REFERENCE_SCRIPTS.lmLiquidateAction());
-        List<PlutusScript> scripts = List.of(REGISTRY.getLoanScript(), REGISTRY.getLoanSpendScript(),
-                REGISTRY.getLenderManagerScript(), REGISTRY.getLenderManagerSpendScript(),
-                REGISTRY.getLoanClaimActionScript(), REGISTRY.getLmLiquidateActionScript());
+    /** A UTxO per published coordinate, each carrying its real derived script hash. */
+    private static List<Utxo> referenceScriptUtxos(Set<Validator> published) {
         List<Utxo> utxos = new ArrayList<>();
-        for (int i = 0; i < coordinates.size(); i++) {
-            String scriptHash = scriptHash(scripts.get(i));
+        for (Validator validator : published) {
+            TransactionInput coordinate = COORDINATES.get(validator);
+            String scriptHash = scriptHash(scriptOf(validator));
             utxos.add(Utxo.builder()
-                    .txHash(coordinates.get(i).getTransactionId())
-                    .outputIndex(coordinates.get(i).getIndex())
+                    .txHash(coordinate.getTransactionId())
+                    .outputIndex(coordinate.getIndex())
                     .address(LoanFixtures.entAddress(scriptHash))
                     .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
                     .referenceScriptHash(scriptHash)
                     .build());
         }
         return utxos;
+    }
+
+    /** The applied script the registry derives for one publishable validator. */
+    private static PlutusScript scriptOf(Validator validator) {
+        return switch (validator) {
+            case LOAN -> REGISTRY.getLoanScript();
+            case LOAN_SPEND -> REGISTRY.getLoanSpendScript();
+            case LENDER_MANAGER -> REGISTRY.getLenderManagerScript();
+            case LENDER_MANAGER_SPEND -> REGISTRY.getLenderManagerSpendScript();
+            case LOAN_CLAIM_ACTION -> REGISTRY.getLoanClaimActionScript();
+            case LM_LIQUIDATE_ACTION -> REGISTRY.getLmLiquidateActionScript();
+        };
     }
 
     /**
@@ -737,10 +1032,25 @@ class RealLoanDryEvalTest {
 
     private static LiquidateTransactionBuilder.Request request(Fixture fixture, long validFrom,
                                                                long validTo) {
+        return request(fixture, validFrom, validTo, REFERENCE_SCRIPTS);
+    }
+
+    private static LiquidateTransactionBuilder.Request request(
+            Fixture fixture, long validFrom, long validTo,
+            LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
         return new LiquidateTransactionBuilder.Request(
                 List.of(fixture.toLiquidation()), CONFIG_UTXO, LM_CONFIG_UTXO,
                 Map.of(ORACLE_NFT.toUnit(), fixture.oracle()), WALLET_UTXO, LoanFixtures.botAddress(),
-                validFrom, validTo, MARGIN, REFERENCE_SCRIPTS);
+                validFrom, validTo, MARGIN, referenceScripts);
+    }
+
+    /**
+     * The same builder, resolving against a universe that publishes only {@code published} — so a
+     * configuration cannot accidentally reach a reference script it did not publish.
+     */
+    private static LiquidateTransactionBuilder builder(Fixture fixture, Set<Validator> published) {
+        return new LiquidateTransactionBuilder(REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(),
+                LoanFixtures.utxoSupplier(universe(fixture, published)), EvalFixtures.protocolParams());
     }
 
     private static Transaction build(Fixture fixture) {
