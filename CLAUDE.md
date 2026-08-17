@@ -94,10 +94,14 @@ Proven 2026-08-14 (Java 21.0.11):
   false and a real redeploy disproved it (findings §12).** It locates the config NFTs by the
   policy id it is pinned to; a redeploy mints new NFTs under a new policy id and leaves the
   old ones unburnt, so the pinned coordinates keep verifying cleanly forever. The live test
-  passes today, after the redeploy. Combined with stale `sync-start-*`, a node pinned to a
-  dead deployment boots clean, verifies clean, indexes nothing and reports zero candidates —
-  indistinguishable from a quiet market. **Treat a persistently empty world as a suspected
-  redeploy.**
+  passes today, after the redeploy. A node pinned to a dead deployment therefore boots clean,
+  verifies clean, and reports **zero candidates** — indistinguishable from a quiet market.
+  The cause is the **payment-credential filter**: `TankUtxoStorage` keeps only UTxOs at
+  `LoansContractRegistry.indexedPaymentCredentials()`, which are derived from the pinned config
+  policy ids, so the new deployment's UTxOs are indexed off the chain and then discarded.
+  **`sync-start-*` is NOT the problem** — it is a *lower bound* and indexing runs forward from
+  it, so an older value is strictly safer than a newer one (findings §2 always said so). **Treat
+  a persistently empty world as a suspected redeploy.**
 - Preview oracle: only the three Charli3 (`c3`) feeds are live; every multisig preview
   feed is months stale. There is a real ~60–80s price blackout every 5 minutes, upstream
   of us (design §6.7–6.8).

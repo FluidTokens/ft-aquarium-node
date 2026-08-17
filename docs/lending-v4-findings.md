@@ -755,11 +755,28 @@ on chain. Every check passes. **The verifier detects MUTATION OF THE DEPLOYMENT 
 no way to notice that a different, newer deployment exists.** Those are different questions and only
 the weaker one was ever being asked.
 
-**The operational consequence is worse than a missing alarm.** Combined with `sync-start-*` still
-pointing at the block that minted the *old* config NFT, a node booted today against the new deployment
-will: start cleanly, verify cleanly, index nothing relevant, and report **zero liquidation candidates**
-— indistinguishable from a quiet market. **Nothing anywhere in the system says "you are pinned to a
+**The operational consequence is worse than a missing alarm.** A node booted today against the new
+deployment will start cleanly, verify cleanly, and report **zero liquidation candidates** —
+indistinguishable from a quiet market. **Nothing anywhere in the system says "you are pinned to a
 deployment nobody uses."**
+
+**Correction, same day, and the mechanism matters more than the symptom.** This section first blamed
+stale `sync-start-*` values, claiming the node "will not index the new deployment's UTxOs at all."
+**That is false.** `sync-start-*` is a *start* point and indexing runs **forward** from it, so pinning
+an *earlier* block is inclusive of everything after — §2 of this document always said it was a safe
+lower bound where "nothing is missed", which is exactly the reasoning I failed to apply to my own
+claim. The dangerous direction would be a sync-start *after* the new deployment, which is the opposite
+of what we had.
+
+The real cause is the **payment-credential filter**: `TankUtxoStorage` keeps only UTxOs whose payment
+credential appears in `LoansContractRegistry.indexedPaymentCredentials()`, and those are derived from
+the pinned config policy ids. So the new deployment's transactions **are** indexed off the chain and
+then **discarded at the application layer**. Right symptom, wrong mechanism — and the remedy differs
+completely: nothing to fix in `sync-start-*`, everything to fix in the policy ids.
+
+Worth keeping the error visible rather than editing it away, because of its shape: **a correct
+conclusion reached through a wrong mechanism is more dangerous than a wrong conclusion**, since the
+conclusion survives scrutiny and carries the bad mechanism along with it.
 
 **What would actually detect it** (none of which exists): watching for a mint of asset name
 `706172616d6574657273` under *any* policy id; asking FluidTokens; or an aliveness check — the config
