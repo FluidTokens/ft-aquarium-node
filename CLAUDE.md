@@ -66,7 +66,10 @@ Proven 2026-08-14 (Java 21.0.11):
   check is worth re-running after any test-file rename:
   `ls build/test-results/test/*.xml | wc -l`, then map each basename back to a `src/test` file.
 - Live preview checks (optional): `set -a; . ./.env.preview; set +a` then run
-  `LoansConfigVerifierLiveTest` — doubles as the "has FT redeployed preview?" probe.
+  `LoansConfigVerifierLiveTest`. **It is NOT a "has FT redeployed?" probe** — it passed on the
+  day of a real redeploy (findings §12). It answers "is the deployment I am pinned to still
+  intact", which stays true forever once superseded. Read-only Blockfrost queries like this are
+  ordinary work; submitting a transaction is not.
 - No lint/format tooling configured. No CI (parked deliberately).
 
 ## Gotchas
