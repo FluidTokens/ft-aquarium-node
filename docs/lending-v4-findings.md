@@ -788,3 +788,45 @@ recent, and treat a persistently empty world as a suspected redeploy rather than
 it: a guard that cannot fire, believed for weeks to be the thing that would fire. It was written to
 answer a question, it answers a narrower one, and **nobody asked which** — because the artefact and its
 test shared the assumption that a redeploy would move the thing being watched.
+
+## 13. `equityInPrincipalCurrency = True` makes a loan un-liquidatable by any bot (CITED, verified here)
+
+**Provenance: found by the `ft-cardano-loans-v4-testing` suite (their F-12, execution-verified,
+graded medium). Verified independently in our clone before recording.** Confirmed at `ff005fb`: **all
+four** lender-manager liquidation actions carry `expect equityInPrincipalCurrency == False` —
+`lm_liquidate_action`, `lm_liquidate_and_convert_action`,
+`lm_liquidate_and_pay_in_advance_action`, `lm_liquidate_pay_in_advance_and_compound_action`. One
+occurrence each, grepped at that commit.
+
+Meanwhile `loan_claim_action` implements **both** branches, choosing the equity asset from the flag:
+```aiken
+equityAssetPolicyId: if equityInPrincipalCurrency {
+  datum.principalAsset.policyId
+} else {
+  datum.collateral.policyId
+},
+```
+
+**So a loan whose borrower chose equity in principal currency can only ever be liquidated MANUALLY, by
+the lender invoking `loan_claim_action` directly. The entire bot infrastructure is unavailable to it** —
+and the upstream README sells exactly that infrastructure as the point ("bots compete to execute these
+transactions and earn liquidation and compounding fees").
+
+**Why this is a finding rather than another entry on the constraint list**, and the distinction is worth
+keeping: the other abort sites in these validators are reached by **mistakes** — a wrong index, a
+missing name, a one-token collateral. **This one is reached by using the protocol as offered.** A
+borrower picks a documented option, `loan_claim_action` honours it, and every automated path refuses it
+by **raising rather than denying** — so a liquidator has no way to learn that this class of loan is
+simply not theirs to take. It looks identical to a bad index or a stale reference input.
+
+**Not a problem for our current target:** loan `124e7c5d…` carries `equityInPrincipalCurrency = false`
+(re-fetched from chain and re-decoded to be sure), so it is liquidatable by the bot path. **Recorded
+because it is the abort that would have been hardest to diagnose, and because it belongs in what we
+tell FluidTokens** — a documented borrower option that silently excludes the liquidation network they
+advertise is worth their attention regardless of our epic.
+
+**Complementarity worth stating once, since two suites now feed each other:** their tests are stronger
+on **individual constraints**, because they can vary one field at a time against a validator in
+isolation. Our dry-eval is stronger on the **two-validator interaction**, because it runs both against
+the real machine in one transaction. Neither supersedes the other, and this finding came from the half
+we do not cover.
