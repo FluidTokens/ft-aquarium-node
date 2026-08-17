@@ -750,37 +750,78 @@ class LiquidateTransactionBuilderTest {
     // V2 — the arithmetic the chain has to satisfy
     // ======================================================================================
 
+    /**
+     * The three V2 fixtures below are <b>real loans</b> rather than assessments with their numbers
+     * overwritten. Since T-025 the builder derives {@code remainingDebt} and {@code equity} at
+     * {@code validFrom} itself instead of copying the assessment's, so a tampered assessment number
+     * no longer reaches V2 at all — a test built that way would prove nothing about the veto.
+     * <p>
+     * A 600-per-mille liquidation fee on 200 ADA of collateral is 120 ADA, against 110 ADA of debt
+     * plus its 5.5 ADA penalty: the borrower's 84.5 ADA of equity plus the lender's 120 ADA of fee is
+     * more collateral than the loan holds. The fee reproduces from the bond, so V4's own fee guard is
+     * not what fires.
+     */
     @Test
     void v2RefusesWhenCollateralCannotCoverEquityAndFee() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
-                200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
-        AdaScenario broken = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
-                scenario.assessment().remainingDebt(), BigInteger.valueOf(199_000_000),
-                BigInteger.valueOf(2_000_000)));
+                200_000_000L, BigInteger.valueOf(600), LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
 
+        assertEquals(BigInteger.valueOf(110_000_000), scenario.assessment().remainingDebt());
+        assertEquals(BigInteger.valueOf(84_500_000), scenario.assessment().equity());
+        assertEquals(BigInteger.valueOf(120_000_000), scenario.assessment().liquidationFee(),
+                "the fee is the bond's own, so LIQUIDATION_FEE_NOT_REPRODUCIBLE cannot mask this");
         assertEquals(LiquidateTransactionBuilder.Refusal.COLLATERAL_CANNOT_COVER_EQUITY_AND_FEE,
-                refusal(broken));
+                refusal(scenario));
     }
 
+    /**
+     * {@code NEGATIVE_EQUITY} is <b>no longer reachable</b>, and this test pins why rather than
+     * deleting the veto.
+     * <p>
+     * The equity the redeemer carries now comes from {@link LoanFinance#redeemerEquity}, which mirrors
+     * {@code loan_claim_action.ak:241-268} and clamps at zero. So an underwater loan — 100 ADA of
+     * collateral against 110 ADA of debt and its penalty, an equity of −15.5 ADA before the clamp —
+     * produces a redeemer equity of exactly zero, and an <em>assessment</em> claiming a negative one
+     * is simply not consulted. The veto stays as defence in depth: the clamp is a property of
+     * {@code LoanFinance}, not of the builder, and an equity field the builder never checks is what a
+     * later edit there would break silently.
+     */
     @Test
-    void v2RefusesNegativeEquity() {
+    void v2sNegativeEquityVetoIsUnreachableBecauseTheDerivationClampsAtZero() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
-                200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
-        AdaScenario broken = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
+                100_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        // Unclamped, this loan's equity really is negative — the clamp is doing work, not nothing.
+        assertEquals(BigInteger.valueOf(-15_500_000), LoanFinance.equityInCollateralCurrency(
+                        Rational.fromInt(BigInteger.valueOf(100_000_000)),
+                        Rational.fromInt(BigInteger.valueOf(110_000_000)),
+                        OraclePriceFeed.unit(), OraclePriceFeed.unit(), BigInteger.valueOf(50)),
+                "the raw get_equity_in_collateral_currency figure");
+        assertEquals(BigInteger.ZERO, LoanFinance.redeemerEquity(LoanFixtures.liquidation(),
+                        Rational.fromInt(BigInteger.valueOf(100_000_000)),
+                        Rational.fromInt(BigInteger.valueOf(110_000_000)),
+                        OraclePriceFeed.unit(), OraclePriceFeed.unit()),
+                "and max(computed, 0) is what the redeemer carries");
+
+        AdaScenario lying = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
                 scenario.assessment().remainingDebt(), BigInteger.valueOf(-1),
                 scenario.assessment().liquidationFee()));
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(lying), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
 
-        assertEquals(LiquidateTransactionBuilder.Refusal.NEGATIVE_EQUITY, refusal(broken));
+        assertEquals(BigInteger.ZERO, emittedEquity(tx, 0),
+                "the assessment's -1 does not reach the redeemer; the derived, clamped zero does");
     }
 
+    /** A fully repaid loan: no principal and no interest is no debt, and no debt is not liquidatable. */
     @Test
     void v2RefusesANonPositiveRemainingDebt() {
-        AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
+        AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 0L, 0L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
-        AdaScenario broken = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
-                BigInteger.ZERO, scenario.assessment().equity(), scenario.assessment().liquidationFee()));
 
-        assertEquals(LiquidateTransactionBuilder.Refusal.NON_POSITIVE_REMAINING_DEBT, refusal(broken));
+        assertEquals(BigInteger.ZERO, LoanFinance.remainingDebt(scenario.loan().loan().datum(), VALID_FROM),
+                "the fixture's debt must really be zero at validFrom, or V2 is not what fires");
+        assertEquals(LiquidateTransactionBuilder.Refusal.NON_POSITIVE_REMAINING_DEBT, refusal(scenario));
     }
 
     /**
@@ -899,14 +940,25 @@ class LiquidateTransactionBuilderTest {
     }
 
     /**
-     * The narrowing is anchored at {@code validFrom}, not merely loosened: an assessment carrying the
-     * debt at {@code validTo} — the shape a scan taken one window later would produce — still
-     * refuses. Deleting the comparison altogether, or moving it to "any point in the window", would
-     * make this test pass silently.
+     * <b>T-025.</b> The redeemer's {@code remainingDebt} is <em>derived at {@code validFrom}</em>, not
+     * copied from the assessment — so an assessment taken at any other instant is ignored rather than
+     * refused.
+     *
+     * <h3>Why this replaced a refusal test, and what the refusal was costing</h3>
+     * This used to assert {@code REMAINING_DEBT_NOT_INVARIANT} for an assessment carrying the debt at
+     * {@code validTo}. The comparison it was pinning is the one that stopped an armed bot: an
+     * assessment is <em>always</em> taken at a different instant from {@code validFrom} in production
+     * — {@code LiquidationCandidateScanner} assesses at scan time and {@code LiquidationExecutor}
+     * backdates {@code validFrom} by 30 s — so on any interest-bearing loan the two figures differ by
+     * a few lovelace and every candidate was refused. Observed live at {@code interestRate = 459}:
+     * {@code remainingDebt is 50003104 at validFrom .. but the redeemer carries 50003106}.
+     * <p>
+     * The stale figure here is {@code validTo}'s, which is the same shape as a scan-time figure and
+     * differs in the same direction. What is asserted is that the emitted redeemer carries neither it
+     * nor anything else but the {@code validFrom} figure.
      */
     @Test
-    void v4RefusesADebtTakenAtValidToRatherThanAtValidFrom() {
-        long validTo = VALID_FROM + 3_000_000L;
+    void theRedeemersDebtIsDerivedAtValidFromAndNotTakenFromTheAssessment() {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
                 BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
                 LoanFixtures.liquidation(),
@@ -914,25 +966,34 @@ class LiquidateTransactionBuilderTest {
         AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L,
                 BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
 
-        AdaScenario stale = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
-                LoanFinance.remainingDebt(datum, validTo), scenario.assessment().equity(),
-                scenario.assessment().liquidationFee()));
+        BigInteger atValidFrom = LoanFinance.remainingDebt(datum, VALID_FROM);
+        BigInteger atValidTo = LoanFinance.remainingDebt(datum, VALID_TO);
+        assertNotEquals(atValidFrom, atValidTo,
+                "the fixture must really drift, or this test proves nothing about the instant");
 
-        assertEquals(LiquidateTransactionBuilder.Refusal.REMAINING_DEBT_NOT_INVARIANT,
-                refusal(List.of(stale), Map.of(), MARGIN, VALID_FROM, validTo));
+        AdaScenario stale = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
+                atValidTo, scenario.assessment().equity(), scenario.assessment().liquidationFee()));
+        Transaction tx = builder(List.of(stale), Map.of()).build(request(List.of(stale), Map.of(),
+                WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO,
+                LiquidateTransactionBuilder.ReferenceScripts.none()));
+
+        assertEquals(atValidFrom, emittedRemainingDebt(tx, 0),
+                "the redeemer carries the debt at validFrom");
+        assertNotEquals(atValidTo, emittedRemainingDebt(tx, 0),
+                "and not the assessment's, which was taken at another instant");
     }
 
     /**
-     * Same anchoring for {@code equity}: the equity the loan produces from the {@code validTo} debt is
-     * refused, even though it is a perfectly self-consistent number at the other end of the window.
+     * Same for {@code equity}, and from the same evidence rather than by assumed symmetry:
+     * {@code get_equity_in_collateral_currency} ({@code lib/fluidtokens/finance.ak:381}) takes no time
+     * argument, so its only time-varying input is the {@code validFrom} debt it is handed — and the
+     * builder hands it that one.
      * <p>
-     * The fixture has a positive equity so that the figure can drift at all, which means V8 would
-     * refuse it too — but V4 runs first, so the reason asserted here is V4's, and it is the reason
-     * that would disappear if the equity comparison were dropped rather than narrowed.
+     * The fixture has a positive equity so the figure can drift at all, which puts V8 in the way; the
+     * package-private seam that disables V8 and nothing else is what lets the redeemer be inspected.
      */
     @Test
-    void v4RefusesAnEquityTakenAtValidToRatherThanAtValidFrom() {
-        long validTo = VALID_FROM + 3_000_000L;
+    void theRedeemersEquityIsDerivedAtValidFromAndNotTakenFromTheAssessment() {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
                 BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
                 LoanFixtures.liquidation(),
@@ -940,19 +1001,65 @@ class LiquidateTransactionBuilderTest {
         AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 200_000_000L,
                 BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
 
-        BigInteger equityAtValidTo = LoanFinance.redeemerEquity(LoanFixtures.liquidation(),
-                Rational.fromInt(BigInteger.valueOf(200_000_000)),
-                Rational.fromInt(LoanFinance.remainingDebt(datum, validTo)),
-                OraclePriceFeed.unit(), OraclePriceFeed.unit());
-        assertNotEquals(scenario.assessment().equity(), equityAtValidTo,
+        BigInteger equityAtValidFrom = equityAt(datum, 200_000_000L, VALID_FROM);
+        BigInteger equityAtValidTo = equityAt(datum, 200_000_000L, VALID_TO);
+        assertNotEquals(equityAtValidFrom, equityAtValidTo,
                 "the fixture's equity must really drift across the window");
 
         AdaScenario stale = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
                 scenario.assessment().remainingDebt(), equityAtValidTo,
                 scenario.assessment().liquidationFee()));
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(stale), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
 
-        assertEquals(LiquidateTransactionBuilder.Refusal.EQUITY_NOT_REPRODUCIBLE,
-                refusal(List.of(stale), Map.of(), MARGIN, VALID_FROM, validTo));
+        assertEquals(equityAtValidFrom, emittedEquity(tx, 0));
+        assertNotEquals(equityAtValidTo, emittedEquity(tx, 0));
+    }
+
+    /**
+     * <b>T-025, the second half.</b> The instant everything is derived from is the one the
+     * <em>ledger</em> will read — {@code slotToTime(body.validityStartInterval)} — not the caller's
+     * millisecond.
+     * <p>
+     * {@code validitySlots} clamps the requested window inwards to whole slots, so a
+     * {@code validFromMillis} one millisecond past a slot boundary produces a body whose validity
+     * starts 999 ms later, and that later instant is what {@code loan_claim_action} destructures out
+     * of {@code self.validity_range}. Deriving the redeemer at the requested millisecond instead
+     * would be the same defect as deriving it at scan time, one second smaller — and one second is
+     * enough: at this fixture's rate it is 317 lovelace.
+     */
+    @Test
+    void theRedeemersDebtIsDerivedAtTheSlotTheBodyCarriesNotAtTheRequestedMillisecond() {
+        long requested = VALID_FROM + 1;
+        long clampedToSlot = VALID_FROM + 1000;
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1_000_000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(),
+                new RepaymentMode.PerpetualLoan(BigInteger.ZERO, BigInteger.ZERO), false);
+        AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L,
+                BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        BigInteger atRequested = LoanFinance.remainingDebt(datum, requested);
+        BigInteger atSlot = LoanFinance.remainingDebt(datum, clampedToSlot);
+        assertNotEquals(atRequested, atSlot,
+                "a sub-slot difference must move the debt, or this test proves nothing");
+
+        Transaction tx = builder(List.of(scenario), Map.of()).build(request(List.of(scenario), Map.of(),
+                WALLET_UTXO, MARGIN, requested, VALID_TO,
+                LiquidateTransactionBuilder.ReferenceScripts.none()));
+
+        assertEquals(atSlot, emittedRemainingDebt(tx, 0),
+                "the redeemer is computed at the body's validity-start slot");
+        assertNotEquals(atRequested, emittedRemainingDebt(tx, 0),
+                "and not at the requested millisecond, which the body does not carry");
+    }
+
+    /** {@code get_equity_in_collateral_currency} for the ada/ada fixtures, at the given instant. */
+    private static BigInteger equityAt(LoanDatum datum, long collateral, long at) {
+        return LoanFinance.redeemerEquity((LiquidationMode.Liquidation) datum.liquidationMode(),
+                Rational.fromInt(BigInteger.valueOf(collateral)),
+                Rational.fromInt(LoanFinance.remainingDebt(datum, at)),
+                OraclePriceFeed.unit(), OraclePriceFeed.unit());
     }
 
     /**
@@ -1049,20 +1156,28 @@ class LiquidateTransactionBuilderTest {
     }
 
     /**
-     * Same discipline for {@code equity}, which unlike the fee does reach a redeemer field: an
-     * equity that the loan datum and the two feeds do not reproduce is refused rather than
-     * corrected.
+     * The discipline for {@code equity} is different from the fee's, because since T-025 the equity is
+     * not an input the builder could disagree with: an assessment claiming one lovelace more than the
+     * loan produces is ignored, not refused, and the emitted redeemer carries the derived figure.
+     * <p>
+     * That is not a loosening of the guard, it is a relocation of it: the derived figure is checked
+     * against the artefact by {@code assertRedeemerFiguresMatchTheBodysValidFrom}, which decodes the
+     * emitted redeemer and recomputes from the emitted body's validity start.
      */
     @Test
-    void v4RefusesAnEquityThatTheLoanDoesNotProduce() {
+    void anEquityTheLoanDoesNotProduceIsIgnoredRatherThanCarried() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+        BigInteger derived = scenario.assessment().equity();
         AdaScenario wrong = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
-                scenario.assessment().remainingDebt(),
-                scenario.assessment().equity().add(BigInteger.ONE),
+                scenario.assessment().remainingDebt(), derived.add(BigInteger.ONE),
                 scenario.assessment().liquidationFee()));
 
-        assertEquals(LiquidateTransactionBuilder.Refusal.EQUITY_NOT_REPRODUCIBLE, refusal(wrong));
+        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(wrong), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
+
+        assertEquals(derived, emittedEquity(tx, 0),
+                "the derived equity, not the assessment's inflated one");
     }
 
     /** A healthy, on-time loan: D9's {@code late || can_liquidate} is false, so nothing may be built. */
@@ -2058,6 +2173,31 @@ class LiquidateTransactionBuilderTest {
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("no reward redeemer at index " + index))
                 .getData();
+    }
+
+    /**
+     * {@code actionsForEachInput[index]} as it sits in the <em>built</em> transaction's witness set.
+     * Reading the redeemer back rather than re-encoding an expectation is what makes the assertions
+     * on {@code remainingDebt} and {@code equity} below statements about the artefact.
+     */
+    private static List<PlutusData> emittedClaim(Transaction tx, int index) {
+        ConstrPlutusData redeemer = assertInstanceOf(ConstrPlutusData.class, withdrawRedeemer(tx,
+                LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash())));
+        ListPlutusData actions =
+                assertInstanceOf(ListPlutusData.class, redeemer.getData().getPlutusDataList().get(1));
+        ConstrPlutusData claim =
+                assertInstanceOf(ConstrPlutusData.class, actions.getPlutusDataList().get(index));
+        return claim.getData().getPlutusDataList();
+    }
+
+    /** {@code ClaimData.remainingDebt} — field 7 — off the built transaction. */
+    private static BigInteger emittedRemainingDebt(Transaction tx, int index) {
+        return ((BigIntPlutusData) emittedClaim(tx, index).get(7)).getValue();
+    }
+
+    /** {@code ClaimData.equity} — field 5 — off the built transaction. */
+    private static BigInteger emittedEquity(Transaction tx, int index) {
+        return ((BigIntPlutusData) emittedClaim(tx, index).get(5)).getValue();
     }
 
     private static String hex(PlutusData data) {
