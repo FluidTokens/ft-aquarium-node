@@ -208,8 +208,20 @@ class ShippedDefaultsTest {
      * rather than throwing. A coordinate reappearing here without this test being rewritten fails, and
      * so does a key going missing.
      */
+    /**
+     * The one reference script we published, on 2026-08-17, in preview block 4579719.
+     * <p>
+     * Its output holds 38.359 ADA of min-ada at a key address we control, and its on-chain
+     * {@code reference_script_hash} was read back and compared to the derived
+     * {@code loanClaimActionScriptHash} ({@code 9ae63b26c98d90024a45f9cdb57e4154f72144d44325f0a261b8bc1d})
+     * before this literal was written down — the coordinate is pinned because it was verified, not
+     * because a build printed it.
+     */
+    private static final String PUBLISHED_LOAN_CLAIM_ACTION =
+            "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0";
+
     @Test
-    void thePreviewProfileShipsSixBlankedReferenceScriptKeys() throws IOException {
+    void thePreviewProfileShipsOnePublishedCoordinateAndFiveBlankedKeys() throws IOException {
         Object block = at(preview(documents()), "loans.liquidation.reference-scripts");
         assertTrue(block instanceof Map, "reference-scripts is not a block");
         @SuppressWarnings("unchecked")
@@ -225,19 +237,30 @@ class ShippedDefaultsTest {
             String value = (String) entry.getValue();
             String key = "loans.liquidation.reference-scripts." + entry.getKey();
 
-            // Still ${VAR:default}, so an operator who discovers a coordinate can supply it by env.
+            // Still ${VAR:default}, so an operator can supply or override a coordinate by env.
             assertTrue(value.startsWith("${") && value.endsWith("}"), key + " is '" + value + "'");
             String shippedDefault = value.substring(value.indexOf(':') + 1, value.length() - 1);
 
-            assertEquals("", shippedDefault,
-                    key + " ships a coordinate again. The second deployment's coordinates are dead, "
-                            + "not stale — if these have been re-discovered against the deployment in "
-                            + "loans.config.policy-id, rewrite this test to pin them literally and "
-                            + "re-verify each utxo's reference_script_hash against the derived hash.");
+            if (entry.getKey().equals("loan-claim-action")) {
+                assertEquals(PUBLISHED_LOAN_CLAIM_ACTION, shippedDefault,
+                        key + " must ship exactly the coordinate we published. If this changed, either "
+                                + "the script was republished — in which case verify the new utxo's "
+                                + "reference_script_hash against the derived hash before pinning it — or "
+                                + "someone pasted a coordinate from a dead deployment.");
+                assertNotNull(AppConfig.LiquidationConfiguration.referenceInput(key, shippedDefault),
+                        key + " must parse to a real coordinate");
+            } else {
+                assertEquals("", shippedDefault,
+                        key + " ships a coordinate. Only loan-claim-action is published, and that is "
+                                + "deliberate: shedding its 8,662 bytes alone brings the liquidation "
+                                + "under maxTxSize, so the other five travel inline and lock nothing. "
+                                + "If a second script has genuinely been published, verify its on-chain "
+                                + "reference_script_hash against the derived hash and pin it here.");
 
-            // The empty case is the supported skip path: null, not an exception.
-            assertNull(AppConfig.LiquidationConfiguration.referenceInput(key, shippedDefault),
-                    key + " must resolve to 'nothing published' rather than a coordinate");
+                // The empty case is the supported skip path: null, not an exception.
+                assertNull(AppConfig.LiquidationConfiguration.referenceInput(key, shippedDefault),
+                        key + " must resolve to 'nothing published' rather than a coordinate");
+            }
         }
 
         // And blank is the *only* thing that skips silently: a malformed coordinate is still rejected

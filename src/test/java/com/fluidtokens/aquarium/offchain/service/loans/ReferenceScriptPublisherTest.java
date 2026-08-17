@@ -245,15 +245,28 @@ class ReferenceScriptPublisherTest {
                 "the two hashes must differ, or the mutation proves nothing");
     }
 
-    /** A plan that leaves one of the six out is refused before anything is built. */
+    /**
+     * A partial plan is <b>accepted</b>, and this test used to assert the opposite.
+     * <p>
+     * It was written when publishing all six was assumed necessary. Measurement showed it is not:
+     * only enough scripts have to travel by reference to bring the liquidation under
+     * {@code maxTxSize}, and five inline plus {@code LOAN_CLAIM_ACTION} referenced measures 11,713
+     * bytes against 16,384. So the completeness guard was enforcing an assumption already known to
+     * be false, and it would have forced an 86.84 ADA spend where 38.36 does the job.
+     * <p>
+     * The duplicate guard survives — see {@link #aDuplicatingPlanIsRefused()} — because that one
+     * defends against a real waste rather than against an assumption. Which subset is correct is a
+     * property of the transaction being built, not of the publisher, so the publisher reports what
+     * it published and the caller owns the choice.
+     */
     @Test
-    void anIncompletePlanIsRefused() {
-        Plan missingOne = new Plan(List.of(
-                List.of(Validator.LOAN_CLAIM_ACTION, Validator.LM_LIQUIDATE_ACTION),
-                List.of(Validator.LOAN, Validator.LOAN_SPEND, Validator.LENDER_MANAGER)));
-        IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> publisher(FUNDER).build(missingOne, DESTINATION, FUNDER));
-        assertTrue(e.getMessage().contains("LENDER_MANAGER_SPEND"), e.getMessage());
+    void aPartialPlanIsAcceptedBecauseNotEveryScriptHasToBePublished() {
+        Plan justTheBigOne = Plan.of(Validator.LOAN_CLAIM_ACTION);
+        List<BuiltTransaction> built = publisher(FUNDER).build(justTheBigOne, DESTINATION, FUNDER);
+        assertEquals(1, built.size(), "one group means one transaction");
+        assertEquals(List.of(Validator.LOAN_CLAIM_ACTION),
+                built.get(0).published().stream().map(PublishedScript::validator).toList(),
+                "the plan must publish exactly what it named and nothing else");
     }
 
     /** A plan publishing the same script twice is refused: it would lock its min-ada twice over. */

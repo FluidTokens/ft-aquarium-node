@@ -199,13 +199,26 @@ loans:
     #   lender-manager       fe791b23...024ffc07#0
     #   lender-manager-spend 13dd3329...663c2571#0
     #   loan-claim-action    b09e23dc...19f243fe#0
+    # ONE of the six is published, and that is deliberate rather than incomplete. Only enough
+    # validators have to travel by reference to bring the liquidation under maxTxSize; the rest stay
+    # in the witness set and lock nothing. loan_claim_action is 8,662 of the 18,720 validator bytes,
+    # so shedding that one alone suffices: measured on the real loan, five inline + this one
+    # referenced is 11,713 bytes unsigned / 11,819 signed against 16,384. All six inline is 20,342
+    # and does not fit; all six referenced would lock 86.84 ADA to buy bytes we do not need.
+    #
+    # Published by US, not by FluidTokens, who have not republished for this deployment:
+    #   tx 48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0, preview block 4579719.
+    # It sits at an ordinary key address we control and holds 38.359 ADA of min-ada, recoverable by
+    # spending it back when the bot no longer needs it. LoansReferenceScriptVerifier checks its
+    # on-chain reference_script_hash against the freshly derived hash at every boot, so the next
+    # redeploy turns it into a startup failure rather than a silent wrong-script.
     #   lm-liquidate-action  549b438c...49a47fe0#0
     reference-scripts:
       loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}
       loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:}
       lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:}
       lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:}
-      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
+      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0}
       lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
   config:
     # THIRD preview deployment (14 Jul -> 5 Aug -> 17 Aug 2026). Both config NFTs were minted in

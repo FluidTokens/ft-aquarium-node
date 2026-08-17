@@ -50,6 +50,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -542,6 +543,171 @@ class RealLoanDryEvalTest {
         assertTrue(size < MAX_TX_SIZE, "serialized size " + size + " against " + MAX_TX_SIZE);
         assertTrue(mem.compareTo(BigInteger.valueOf(14_000_000L)) <= 0, "total mem " + mem);
         assertTrue(steps.compareTo(BigInteger.valueOf(10_000_000_000L)) <= 0, "total steps " + steps);
+    }
+
+    /**
+     * <b>Production's priced path, on the real loan.</b> Everything else in this file builds through
+     * the five-argument constructor — no evaluator, placeholder ex-units — and evaluates the finished
+     * body separately. Production uses the six-argument one, so cardano-client-lib prices the
+     * transaction <em>during</em> {@code build()} and a failed evaluation refuses the candidate. This
+     * test is the only place that exercises that path, and it pins the three facts that decide whether
+     * the separately-evaluated proof carries over to what production would submit:
+     * <ol>
+     *   <li><b>The priced build succeeds</b> and costs every redeemer with real ex-units.</li>
+     *   <li><b>The body cardano-client-lib hands the evaluator has the same output layout as the body
+     *       it returns.</b> Evaluation is scheduled before {@code ScriptBalanceTxProviders.balanceTx}
+     *       (QuickTxBuilder:455 against :472), so the two bodies differ in fee and in the change
+     *       output's coin — but the change output already exists by then, created with the inputs in
+     *       {@code InputBuilders.createFromSender}, so no output is added, removed or reordered. That
+     *       is what makes the observe-then-rebuild indexes valid for the body actually evaluated.</li>
+     *   <li><b>Pricing the layout probe instead would fail</b>, at {@code loan_claim_action}: the probe
+     *       carries the placeholder {@code lenderBondOutputIndex}, which aims at the bot's change
+     *       output rather than at the bond echo. {@link LiquidateTransactionBuilder#complete} passes
+     *       {@code priceScripts=false} for the probe precisely for this reason, and this is the
+     *       measurement behind that decision — on this fixture, with five withdrawals, the refusal
+     *       lands at {@code Withdraw#3}.</li>
+     * </ol>
+     */
+    @Test
+    void thePricedPathEvaluatesTheSameLayoutItShips() throws Exception {
+        Fixture fixture = fixture();
+        List<Utxo> universe = universe(fixture);
+        List<PlutusScript> extra = List.of(oracleScript());
+
+        Transaction unpriced = build(fixture);
+        EvalFixtures.evaluate(unpriced, universe, REGISTRY, extra);
+
+        List<byte[]> seen = new ArrayList<>();
+        com.bloxbean.cardano.aiken.AikenTransactionEvaluator aiken =
+                new com.bloxbean.cardano.aiken.AikenTransactionEvaluator(
+                        LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
+                        EvalFixtures.scriptSupplier(REGISTRY, extra),
+                        com.bloxbean.cardano.client.common.model.SlotConfigs.preview());
+        com.bloxbean.cardano.client.api.TransactionEvaluator recording = (cbor, inputs) -> {
+            seen.add(cbor);
+            return aiken.evaluateTx(cbor, inputs);
+        };
+
+        LiquidateTransactionBuilder pricedBuilder = new LiquidateTransactionBuilder(
+                REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), recording);
+
+        Transaction priced = null;
+        String failure = null;
+        try {
+            priced = pricedBuilder.build(request(fixture));
+        } catch (Exception e) {
+            StringBuilder chain = new StringBuilder();
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                chain.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage()).append('\n');
+                if (t.getCause() == t) {
+                    break;
+                }
+            }
+            failure = chain.toString();
+        }
+
+        // (1) The priced build succeeds, and evaluates exactly once — one remote round trip in
+        //     production, because the probe is deliberately not priced.
+        assertNull(failure, "the priced path must build; it refused with:\n" + failure);
+        assertEquals(1, seen.size(), "exactly one evaluation per build");
+
+        Transaction evaluated = Transaction.deserialize(seen.getFirst());
+        log.info("T024 EVALUATED body\n{}", layout(evaluated));
+        log.info("T024 FINAL UNPRICED body\n{}", layout(unpriced));
+        log.info("T024 FINAL PRICED body\n{}", layout(priced));
+
+        // (2) Same outputs, in the same order, except for the change output's coin — which is the one
+        //     thing balancing is allowed to move. Compared on address + datum + assets, so a reorder,
+        //     an insertion or a removal all fail here.
+        assertEquals(layoutKeys(evaluated), layoutKeys(priced),
+                "the evaluated body's output layout must be the one that ships");
+        assertEquals(layoutKeys(unpriced), layoutKeys(priced),
+                "and the separately-evaluated proof must cover the same layout too");
+        assertEquals(BigInteger.ZERO, evaluated.getBody().getFee(),
+                "evaluation happens before balanceTx, so the fee is still unset");
+        assertTrue(priced.getBody().getFee().signum() > 0, "the shipped body is balanced");
+
+        // Every redeemer really carries measured ex-units rather than cardano-client-lib's placeholder.
+        for (Redeemer redeemer : priced.getWitnessSet().getRedeemers()) {
+            assertTrue(redeemer.getExUnits().getMem().compareTo(BigInteger.valueOf(10_000)) > 0,
+                    redeemer.getTag() + "#" + redeemer.getIndex() + " kept a placeholder ex-unit");
+        }
+
+        // (3) The probe's own shape — the placeholder lenderBondOutputIndex (0, the loan's ordinal)
+        //     instead of the observed one (1) — is what a build that priced the probe would send.
+        Transaction probeShaped = build(fixture);
+        List<PlutusData> fields = new ArrayList<>(claimFields(probeShaped));
+        fields.set(1, BigIntPlutusData.of(BigInteger.ZERO));
+        ConstrPlutusData original = (ConstrPlutusData) rewardRedeemer(probeShaped,
+                LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash())).getData();
+        rewardRedeemer(probeShaped, LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))
+                .setData(constr(0, original.getData().getPlutusDataList().getFirst(),
+                        ListPlutusData.of(constr(0, fields.toArray(PlutusData[]::new)))));
+
+        EvalFixtures.Outcome probeOutcome =
+                EvalFixtures.evaluateRaw(probeShaped, universe, REGISTRY, extra);
+        log.info("T024 PROBE-SHAPED (placeholder lenderBondOutputIndex=0) outcome:\n{}",
+                probeOutcome.detail());
+        assertFalse(probeOutcome.successful(), "the probe's redeemers name the wrong output");
+        assertTrue(probeOutcome.detail().contains(redeemerError(probeShaped,
+                        LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))),
+                "loan_claim_action must be the refuser, got: " + probeOutcome.detail());
+    }
+
+    /** One key per output — address, datum and assets, but not the coin, which balancing moves. */
+    private static List<String> layoutKeys(Transaction tx) {
+        return tx.getBody().getOutputs().stream()
+                .map(o -> o.getAddress() + "|" + flattenedCount(o) + "|"
+                        + (o.getInlineDatum() == null ? "-" : o.getInlineDatum().serializeToHex()))
+                .toList();
+    }
+
+    /** Output layout + the index-bearing redeemer fields, for the T-024 comparison. */
+    private static String layout(Transaction tx) {
+        StringBuilder out = new StringBuilder();
+        out.append("fee=").append(tx.getBody().getFee())
+                .append(" inputs=").append(tx.getBody().getInputs().size())
+                .append(" outputs=").append(tx.getBody().getOutputs().size()).append('\n');
+        List<TransactionOutput> outputs = tx.getBody().getOutputs();
+        for (int i = 0; i < outputs.size(); i++) {
+            TransactionOutput o = outputs.get(i);
+            String cred = paymentCredentialOf(o.getAddress());
+            String what = cred.equals(REGISTRY.getLenderManagerSpendScriptHash()) ? "BOND-ECHO"
+                    : cred.equals(REGISTRY.getAssetManagerSpendScriptHash()) ? "ASSET-MGR"
+                    : "other/change";
+            out.append("  [").append(i).append("] ").append(what)
+                    .append(" cred=").append(cred.isEmpty() ? "(pubkey)" : cred.substring(0, 8))
+                    .append(" coin=").append(o.getValue().getCoin())
+                    .append(" assets=").append(flattenedCount(o))
+                    .append(" datum=").append(o.getInlineDatum() == null ? "-"
+                            : o.getInlineDatum().serializeToHex().substring(0, 16))
+                    .append('\n');
+        }
+        try {
+            out.append("  lenderBondOutputIndex=")
+                    .append(((BigIntPlutusData) claimFields(tx).get(1)).getValue())
+                    .append(" assetOutputIndexes=").append(assetOutputIndexes(tx)).append('\n');
+        } catch (RuntimeException e) {
+            out.append("  (redeemer indexes unreadable: ").append(e).append(")\n");
+        }
+        List<Withdrawal> withdrawals = tx.getBody().getWithdrawals();
+        for (int i = 0; i < withdrawals.size(); i++) {
+            out.append("  withdraw#").append(i).append(' ')
+                    .append(Map.of(
+                            LoanFixtures.rewardAddress(REGISTRY.getLoanPolicyId()), "loan",
+                            LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()),
+                            "loan_claim_action",
+                            LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash()),
+                            "lenderManager",
+                            LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()),
+                            "lm_liquidate_action",
+                            ORACLE_REWARD_ADDRESS, "oracle")
+                            .getOrDefault(withdrawals.get(i).getRewardAddress(),
+                                    withdrawals.get(i).getRewardAddress()))
+                    .append('\n');
+        }
+        return out.toString();
     }
 
     // ======================================================================================

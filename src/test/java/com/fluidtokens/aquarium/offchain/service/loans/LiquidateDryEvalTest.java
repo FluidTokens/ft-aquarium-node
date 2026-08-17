@@ -37,6 +37,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -416,6 +417,137 @@ class LiquidateDryEvalTest {
         assertEquals(1, count(results, RedeemerTag.Mint), "one policy, one mint redeemer");
         assertEquals(4, count(results, RedeemerTag.Reward));
         assertWithinBudget(results);
+    }
+
+    /**
+     * <b>Production's priced path, across every shape this file builds.</b> Every other test here uses
+     * the five-argument constructor — no evaluator — and evaluates the finished body separately;
+     * production uses the six-argument one, so cardano-client-lib prices the transaction
+     * <em>during</em> {@code build()}. That evaluation is scheduled before
+     * {@code ScriptBalanceTxProviders.balanceTx} (QuickTxBuilder:455 against :472), so the body handed
+     * to the evaluator is the pre-balance one — but the change output already exists by then, created
+     * with the inputs in {@code InputBuilders.createFromSender}, so balancing moves its coin and the
+     * fee and nothing else. This test asserts that for N=1, for N=2 and for the reference-script
+     * shape: the priced build succeeds and the output layout it evaluates is the one it ships.
+     * <p>
+     * {@code RealLoanDryEvalTest} asserts the same on the real loan, which is the shape with an oracle
+     * withdrawal; keep both, because the withdrawal count differs and with it every redeemer index.
+     */
+    @Test
+    void thePricedPathEvaluatesTheSameLayoutItShips() throws Exception {
+        Scenario a = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+        Scenario b = scenario(LOAN_ID_B, TX_LOAN_B, TX_BOND_B, 100_000_000L, 100_000_000L);
+
+        pricedProbe("N=1 witness scripts", List.of(a),
+                LiquidateTransactionBuilder.ReferenceScripts.none(), universe(List.of(a)));
+        pricedProbe("N=2 witness scripts", List.of(a, b),
+                LiquidateTransactionBuilder.ReferenceScripts.none(), universe(List.of(a, b)));
+        List<Utxo> withRefs = new ArrayList<>(universe(List.of(a)));
+        withRefs.addAll(referenceScriptUtxos());
+        pricedProbe("N=1 reference scripts", List.of(a), PUBLISHED, withRefs);
+    }
+
+    private static void pricedProbe(String label, List<Scenario> scenarios,
+                                    LiquidateTransactionBuilder.ReferenceScripts refs,
+                                    List<Utxo> universe) throws Exception {
+        List<byte[]> seen = new ArrayList<>();
+        com.bloxbean.cardano.aiken.AikenTransactionEvaluator aiken =
+                new com.bloxbean.cardano.aiken.AikenTransactionEvaluator(
+                        LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
+                        EvalFixtures.scriptSupplier(REGISTRY),
+                        com.bloxbean.cardano.client.common.model.SlotConfigs.preview());
+        com.bloxbean.cardano.client.api.TransactionEvaluator recording = (cbor, inputs) -> {
+            seen.add(cbor);
+            return aiken.evaluateTx(cbor, inputs);
+        };
+
+        LiquidateTransactionBuilder pricedBuilder = new LiquidateTransactionBuilder(
+                REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), recording);
+
+        Transaction priced = null;
+        String failure = null;
+        try {
+            priced = pricedBuilder.build(request(scenarios, refs));
+        } catch (Exception e) {
+            StringBuilder chain = new StringBuilder();
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                chain.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage()).append('\n');
+                if (t.getCause() == t) {
+                    break;
+                }
+            }
+            failure = chain.toString();
+        }
+
+        assertNull(failure, label + ": the priced path must build; it refused with:\n" + failure);
+        assertEquals(1, seen.size(), label + ": exactly one evaluation per build");
+
+        Transaction evaluated = Transaction.deserialize(seen.getFirst());
+        Transaction unpriced = build(scenarios, refs);
+        log.info("T024 [{}] EVALUATED body\n{}", label, layout(evaluated));
+        log.info("T024 [{}] FINAL UNPRICED body\n{}", label, layout(unpriced));
+        log.info("T024 [{}] FINAL PRICED body\n{}", label, layout(priced));
+
+        assertEquals(layoutKeys(evaluated), layoutKeys(priced),
+                label + ": the evaluated body's output layout must be the one that ships");
+        assertEquals(layoutKeys(unpriced), layoutKeys(priced),
+                label + ": and the separately-evaluated proof must cover the same layout too");
+        assertEquals(BigInteger.ZERO, evaluated.getBody().getFee(),
+                label + ": evaluation happens before balanceTx, so the fee is still unset");
+        assertTrue(priced.getBody().getFee().signum() > 0, label + ": the shipped body is balanced");
+
+        for (Redeemer redeemer : priced.getWitnessSet().getRedeemers()) {
+            assertTrue(redeemer.getExUnits().getMem().compareTo(BigInteger.valueOf(10_000)) > 0,
+                    label + ": " + redeemer.getTag() + "#" + redeemer.getIndex()
+                            + " kept a placeholder ex-unit");
+        }
+    }
+
+    /** One key per output — address, datum and assets, but not the coin, which balancing moves. */
+    private static List<String> layoutKeys(Transaction tx) {
+        return tx.getBody().getOutputs().stream()
+                .map(o -> o.getAddress() + "|" + o.getValue().getMultiAssets().size() + "|"
+                        + (o.getInlineDatum() == null ? "-" : o.getInlineDatum().serializeToHex()))
+                .toList();
+    }
+
+    /** Output layout + the index-bearing redeemer fields, for the T-024 comparison. */
+    private static String layout(Transaction tx) {
+        StringBuilder out = new StringBuilder();
+        out.append("fee=").append(tx.getBody().getFee())
+                .append(" inputs=").append(tx.getBody().getInputs().size())
+                .append(" outputs=").append(tx.getBody().getOutputs().size()).append('\n');
+        List<TransactionOutput> outputs = tx.getBody().getOutputs();
+        for (int i = 0; i < outputs.size(); i++) {
+            TransactionOutput o = outputs.get(i);
+            String cred = new Address(o.getAddress()).getPaymentCredentialHash()
+                    .map(HexUtil::encodeHexString).orElse("");
+            String what = cred.equals(REGISTRY.getLenderManagerSpendScriptHash()) ? "BOND-ECHO"
+                    : cred.equals(REGISTRY.getAssetManagerSpendScriptHash()) ? "ASSET-MGR"
+                    : "other/change";
+            out.append("  [").append(i).append("] ").append(what)
+                    .append(" coin=").append(o.getValue().getCoin())
+                    .append(" datum=").append(o.getInlineDatum() == null ? "-"
+                            : o.getInlineDatum().serializeToHex().substring(0, 16))
+                    .append('\n');
+        }
+        List<Withdrawal> withdrawals = tx.getBody().getWithdrawals();
+        for (int i = 0; i < withdrawals.size(); i++) {
+            out.append("  withdraw#").append(i).append(' ')
+                    .append(Map.of(
+                            LoanFixtures.rewardAddress(REGISTRY.getLoanPolicyId()), "loan",
+                            LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()),
+                            "loan_claim_action",
+                            LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash()),
+                            "lenderManager",
+                            LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()),
+                            "lm_liquidate_action")
+                            .getOrDefault(withdrawals.get(i).getRewardAddress(),
+                                    withdrawals.get(i).getRewardAddress()))
+                    .append('\n');
+        }
+        return out.toString();
     }
 
     // ======================================================================================

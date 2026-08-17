@@ -132,6 +132,26 @@ public final class ReferenceScriptPublisher {
             return new Plan(List.of(List.of(Validator.values())));
         }
 
+        /**
+         * Publish exactly the named validators, in one transaction.
+         * <p>
+         * This exists because publishing all six is not what the size constraint actually requires.
+         * Only enough scripts have to travel by reference to bring the liquidation under
+         * {@code maxTxSize}; the rest stay in the witness set. Measured on the real loan:
+         * five inline plus {@code LOAN_CLAIM_ACTION} referenced is 11,713 bytes against 16,384.
+         * So the shipped plan is {@code of(LOAN_CLAIM_ACTION)} — one script, ~38.36 ADA locked,
+         * rather than six and ~86.84.
+         * <p>
+         * The duplicate guard still applies. The <em>completeness</em> guard deliberately does not:
+         * a partial plan is the point here, and which subset is correct is a property of the
+         * transaction being built, not of this class. Whoever calls this owns that choice, and
+         * {@link BuiltTransaction#published()} reports exactly what went out so the choice is
+         * checkable rather than assumed.
+         */
+        public static Plan of(Validator... validators) {
+            return new Plan(List.of(List.of(validators)));
+        }
+
         /** Every validator the plan publishes, in build order, duplicates included. */
         List<Validator> flattened() {
             List<Validator> all = new ArrayList<>();
@@ -243,7 +263,7 @@ public final class ReferenceScriptPublisher {
 
     List<BuiltTransaction> build(Plan plan, String destinationAddress, String funderAddress,
                                  String changeAddress, Mutation mutation) {
-        assertPlanCoversTheSixExactlyOnce(plan);
+        assertPlanHasNoDuplicates(plan);
 
         List<BuiltTransaction> built = new ArrayList<>();
         for (int i = 0; i < plan.groups().size(); i++) {
@@ -379,16 +399,21 @@ public final class ReferenceScriptPublisher {
      * over and a missing one leaves the liquidation unbuildable for a reason nothing else here
      * would report.
      */
-    private static void assertPlanCoversTheSixExactlyOnce(Plan plan) {
+    /**
+     * Refuses a plan that publishes the same script twice — which would lock its min-ada a second
+     * time for nothing, and leave two coordinates where the config expects one.
+     * <p>
+     * It deliberately does <em>not</em> require the plan to cover all six. It used to, from when
+     * publishing all six was assumed necessary; measurement showed it is not
+     * ({@link Plan#of(Validator...)}), and a guard that enforces an assumption after the assumption
+     * is known to be false is worse than no guard — it would have forced a 86.84 ADA spend where
+     * 38.36 does the job.
+     */
+    private static void assertPlanHasNoDuplicates(Plan plan) {
         List<Validator> flattened = plan.flattened();
         Set<Validator> distinct = new LinkedHashSet<>(flattened);
         if (distinct.size() != flattened.size()) {
             throw new IllegalStateException("the plan publishes a script more than once: " + flattened);
-        }
-        Set<Validator> missing = new LinkedHashSet<>(List.of(Validator.values()));
-        missing.removeAll(distinct);
-        if (!missing.isEmpty()) {
-            throw new IllegalStateException("the plan does not publish " + missing);
         }
     }
 
