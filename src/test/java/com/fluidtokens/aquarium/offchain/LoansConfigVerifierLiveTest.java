@@ -32,8 +32,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class LoansConfigVerifierLiveTest {
 
     private static final String PREVIEW_URL = "https://cardano-preview.blockfrost.io/api/v0/";
-    private static final String CONFIG_POLICY_ID = "f1a475ea8cccc1e0b7a59b10e79ad171452dc057ffb1cda0df92835c";
-    private static final String LM_CONFIG_POLICY_ID = "d0998754ddc3e9cfe80356d7e12db163d03cecc5b6b438dad4f4a3e3";
+    // THIRD preview deployment, config NFTs minted in tx 7374a985…e781.
+    private static final String CONFIG_POLICY_ID = "c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9";
+    private static final String LM_CONFIG_POLICY_ID = "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
 

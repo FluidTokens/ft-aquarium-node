@@ -75,9 +75,14 @@ public final class LoanFixtures {
     }
 
     // ---- preview derivation inputs (see LoansContractDerivationTest) -------------------------
+    //
+    // THIRD preview deployment, config NFTs minted in tx 7374a985…e781 (outputs 0 and 1). These
+    // must stay in step with the two recorded config datums under src/test/resources/loans-v4:
+    // the validators compare the hashes they derive from these policy ids against the ones the
+    // datum publishes, so a mismatched pair makes every dry-eval fixture unsatisfiable.
 
-    public static final String CONFIG_POLICY_ID = "f1a475ea8cccc1e0b7a59b10e79ad171452dc057ffb1cda0df92835c";
-    public static final String LM_CONFIG_POLICY_ID = "d0998754ddc3e9cfe80356d7e12db163d03cecc5b6b438dad4f4a3e3";
+    public static final String CONFIG_POLICY_ID = "c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9";
+    public static final String LM_CONFIG_POLICY_ID = "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
     public static final String CONFIG_ASSET_NAME = "706172616d6574657273";
 
     public static final Network NETWORK = Networks.preview();

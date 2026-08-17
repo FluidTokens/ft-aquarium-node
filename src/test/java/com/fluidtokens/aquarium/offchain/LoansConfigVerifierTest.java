@@ -15,8 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Exercises {@link LoansConfigVerifier}'s comparison against the two config datums as they
- * were actually recorded from preview tx {@code 6de7b7ec…094} (fixtures under
- * {@code src/test/resources/loans-v4}).
+ * were actually recorded from preview tx {@code 7374a985…e781} — the THIRD deployment (fixtures
+ * under {@code src/test/resources/loans-v4}, re-recorded from that transaction's inline datums).
  * <p>
  * The fragile part of the verifier is the set of hardcoded datum field indices — if one is
  * wrong, the verifier compares the wrong field and either passes vacuously or blocks startup
@@ -24,8 +24,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class LoansConfigVerifierTest {
 
-    private static final String CONFIG_POLICY_ID = "f1a475ea8cccc1e0b7a59b10e79ad171452dc057ffb1cda0df92835c";
-    private static final String LM_CONFIG_POLICY_ID = "d0998754ddc3e9cfe80356d7e12db163d03cecc5b6b438dad4f4a3e3";
+    private static final String CONFIG_POLICY_ID = "c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9";
+    private static final String LM_CONFIG_POLICY_ID = "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
 
@@ -63,8 +63,10 @@ class LoansConfigVerifierTest {
      */
     @Test
     void rejectsASupersededDeployment() {
-        // The real config policy id from before the 2026-08-05 preview redeploy.
-        String stale = "0e60ea5f8db9d62d5994e983f4901a737271908cd0f59033f154b845";
+        // The real config policy id of the SECOND deployment, superseded by the 2026-08-17 one the
+        // fixtures now carry. This is the exact staleness this class is meant to catch, and it is
+        // the value this test itself was pinned to until that redeploy.
+        String stale = "f1a475ea8cccc1e0b7a59b10e79ad171452dc057ffb1cda0df92835c";
 
         List<String> mismatches = verifier(stale, SMART_TOKENS_SPEND).verifyAgainst(CONFIG_DATUM, LM_CONFIG_DATUM);
 

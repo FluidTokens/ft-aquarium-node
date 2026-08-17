@@ -176,19 +176,49 @@ loans:
     # maxTxSize, and a measured 19_838-byte single-loan liquidation with none of them referenced.
     # With them, the size moves into the fee — ~0.28 ADA per liquidation at
     # minFeeRefScriptCostPerByte 15, which profit-margin-lovelace must cover.
+    # BLANKED 2026-08-17 for the third redeploy, deliberately and temporarily.
+    #
+    # The six coordinates below used to point at published reference-script UTxOs for the SECOND
+    # deployment. They are not stale -- they are DEAD. Script hashes are derived by applying the
+    # config NFT policy ids as parameters, so new policy ids move 25 of 28 hashes, which moves the
+    # script addresses, which means the old reference UTxOs hold scripts this deployment never uses.
+    #
+    # Left empty rather than wrong on purpose. LoansReferenceScriptVerifier compares each published
+    # coordinate's on-chain reference_script_hash against the freshly derived hash and hard-fails at
+    # boot on a mismatch -- so leaving the old values here would block startup entirely, whereas the
+    # empty case is a supported path that skips the check. The consequence is bounded and specific:
+    # indexing, health, the scanner and shadow mode all work; SUBMISSION does not, because six
+    # validators total ~18.6 KB against a 16,384-byte maxTxSize and cannot travel in the witness set.
+    #
+    # The new scripts ARE on chain (Blockfrost /scripts/<hash> resolves all of them), so the
+    # coordinates exist and need discovering, not creating. That is the next task.
+    #
+    # Old (second-deployment) values, kept only so the diff is legible:
+    #   loan                 00a4e9f6...1f7aa693#0
+    #   loan-spend           5c10900c...46b669da#0
+    #   lender-manager       fe791b23...024ffc07#0
+    #   lender-manager-spend 13dd3329...663c2571#0
+    #   loan-claim-action    b09e23dc...19f243fe#0
+    #   lm-liquidate-action  549b438c...49a47fe0#0
     reference-scripts:
-      loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:00a4e9f69c6ce80b8cb4fe7008a40a2f007aa53b25ec52ae30f11e701f7aa693#0}
-      loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:5c10900c23d16538bc518fa982f0d59a15908f0bb821860ddbef086346b669da#0}
-      lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:fe791b232b8ffcd31c72001a0a6345bc36101eac4d87133b0cf1a101024ffc07#0}
-      lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:13dd33290f62fe42dbbe7afc1d28505c025955bc55bd9b0a0ddff438663c2571#0}
-      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:b09e23dc5639642a4cbf112d39753c96ed0528115a8468b688b0e8cb19f243fe#0}
-      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:549b438c3a579a31cc4b7595f43c3af75bd02b237026583b834fc64349a47fe0#0}
+      loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}
+      loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:}
+      lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:}
+      lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:}
+      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
+      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
   config:
-    # Both config NFTs were minted in this single tx (block 4514052, slot 118496146).
-    ref-utxo-tx-hash: 6de7b7ecc2c822526d08dc998731d9e133e13c80dea099fb87827336dca12094
-    policy-id: f1a475ea8cccc1e0b7a59b10e79ad171452dc057ffb1cda0df92835c
+    # THIRD preview deployment (14 Jul -> 5 Aug -> 17 Aug 2026). Both config NFTs were minted in
+    # this single tx, block 4569990 / slot 120051516, at outputs 0 and 1.
+    #
+    # Verified on chain 2026-08-17, not taken on trust: both NFTs exist with quantity 1 and
+    # mint_or_burn_count 1, and deriving all 28 script hashes from these two policy ids against
+    # ff005fb's blueprint reproduces 19 of 19 comparable fields of the two live ConfigDatums.
+    # That is what establishes ff005fb as the deployed commit -- see findings 12.
+    ref-utxo-tx-hash: 7374a98596cf03c323a0dd1643178861301f1060646789ae4d385ec3e54be781
+    policy-id: c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9
   lm-config:
-    policy-id: d0998754ddc3e9cfe80356d7e12db163d03cecc5b6b438dad4f4a3e3
+    policy-id: de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484
   # Published in the ConfigDatum; the blueprint ships no smart_tokens validator so this
   # one cannot be derived. Only the pool-manager branch needs it.
   smart-tokens-spend-script-hash: fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa
@@ -202,7 +232,15 @@ store:
     host: ""
     port: 0
     protocol-magic: 2
-    # Start from the block that minted the ref input for the contract
+    # Start from the block that minted the ref input for the contract.
+    #
+    # DELIBERATELY NOT CHANGED for the 2026-08-17 v4 redeploy, and do not "fix" it. This is a
+    # START point and indexing runs FORWARD from it, so an earlier value is inclusive of every
+    # later deployment -- the dangerous direction is a sync-start AFTER the deployment you care
+    # about. The only cost of an early value is sync time. (A previous session claimed a stale
+    # sync-start would make the node blind to the new deployment; that was wrong. The empty world
+    # comes from the payment-credential filter in TankUtxoStorage, which derives from the config
+    # policy ids above -- findings 12.)
     sync-start-blockhash: 0e459daa0813334b79da2bac23d3324b604ee04209679bed08b6f49cac82cb4e
     sync-start-slot: 71971209
     keep-alive-interval: 1000

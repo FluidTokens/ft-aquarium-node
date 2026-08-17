@@ -14,6 +14,8 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -173,38 +175,41 @@ class ShippedDefaultsTest {
     }
 
     /**
-     * The exact preview reference-script coordinates, pinned literally.
+     * The six preview reference-script keys, each shipped <b>deliberately blank</b>, and the proof
+     * that blank is a supported path rather than a parse error.
+     *
+     * <h2>Why they are blank, and why that is not staleness</h2>
+     * The third preview deployment (2026-08-17, config NFTs in tx {@code 7374a985…e781}) moved the
+     * config NFT policy ids. Every v4 script hash is derived by applying those policy ids as
+     * parameters, so new policy ids move the hashes, moving hashes move the script <em>addresses</em>,
+     * and the reference-script UTxOs published for the second deployment therefore hold scripts this
+     * deployment never invokes. They are <b>dead, not stale</b>: there is no version of them that is
+     * merely out of date and still usable.
      * <p>
-     * Parseability is not enough. A coordinate can be perfectly well-formed and point at the wrong
-     * output — which is what a FluidTokens redeploy produces, and what a fat-fingered edit produces
-     * — and the only other thing that would catch it is
-     * {@code LoansReferenceScriptVerifier}, which needs a live chain. So the shipped values are
-     * pinned here the same way the config NFT policy ids are pinned elsewhere: as deployment
-     * coordinates that cannot change without someone deliberately changing this test too.
-     * <p>
-     * Each of these was verified on chain: the UTxO's {@code reference_script_hash} equals the hash
-     * this repo derives for that validator.
-     */
-    private static final Map<String, String> PREVIEW_REFERENCE_SCRIPTS = Map.of(
-            "loan", "00a4e9f69c6ce80b8cb4fe7008a40a2f007aa53b25ec52ae30f11e701f7aa693#0",
-            "loan-spend", "5c10900c23d16538bc518fa982f0d59a15908f0bb821860ddbef086346b669da#0",
-            "lender-manager", "fe791b232b8ffcd31c72001a0a6345bc36101eac4d87133b0cf1a101024ffc07#0",
-            "lender-manager-spend", "13dd33290f62fe42dbbe7afc1d28505c025955bc55bd9b0a0ddff438663c2571#0",
-            "loan-claim-action", "b09e23dc5639642a4cbf112d39753c96ed0528115a8468b688b0e8cb19f243fe#0",
-            "lm-liquidate-action", "549b438c3a579a31cc4b7595f43c3af75bd02b237026583b834fc64349a47fe0#0");
-
-    /**
-     * The six preview reference-script coordinates, taken from the shipped file, checked against the
-     * pinned values above and run through the real parser.
-     * <p>
-     * A YAML hazard worth pinning: these values contain a {@code #}, and a {@code #} that follows
-     * whitespace starts a comment. If one of them were ever reformatted or quoted differently, the
-     * index would be silently eaten and the coordinate would arrive as a bare 64-character hash —
-     * which {@link AppConfig.LiquidationConfiguration#referenceInput} rejects, so this test would
-     * fail rather than the node starting with six half-read coordinates.
+     * Leaving the old values in place would be strictly worse than leaving them empty.
+     * {@code LoansReferenceScriptVerifier} compares each coordinate's on-chain
+     * {@code reference_script_hash} against the freshly derived hash and hard-fails at boot on a
+     * mismatch — so the old coordinates would block startup outright, whereas an empty value is a
+     * supported path that skips the check. Hence blank, on purpose.
+     *
+     * <h2>What being blank costs</h2>
+     * <b>Submission is disabled until the coordinates are re-discovered.</b> Indexing, health, the
+     * scanner and shadow mode all work; a real {@code Liquidate} cannot be submitted, because the six
+     * applied validators total ~18.6 KB against a 16_384-byte {@code maxTxSize} and cannot travel in
+     * the witness set. The new scripts <em>are</em> on chain (Blockfrost {@code /scripts/<hash>}
+     * resolves them), so the coordinates exist and need discovering rather than creating — that is a
+     * separate ticket, and this test goes back to pinning literal coordinates when it lands.
+     *
+     * <h2>What is asserted</h2>
+     * This test guards a deliberate temporary state, so it asserts that state exactly: the same six
+     * keys are still present, in order, with {@code asset-manager} still absent; every one is still an
+     * env-overridable placeholder, so an operator can supply a coordinate without editing the jar; and
+     * every shipped default is empty and resolves through the real parser to "nothing published"
+     * rather than throwing. A coordinate reappearing here without this test being rewritten fails, and
+     * so does a key going missing.
      */
     @Test
-    void thePreviewProfileShipsSixParseableReferenceScriptCoordinates() throws IOException {
+    void thePreviewProfileShipsSixBlankedReferenceScriptKeys() throws IOException {
         Object block = at(preview(documents()), "loans.liquidation.reference-scripts");
         assertTrue(block instanceof Map, "reference-scripts is not a block");
         @SuppressWarnings("unchecked")
@@ -219,20 +224,35 @@ class ShippedDefaultsTest {
         for (Map.Entry<String, Object> entry : scripts.entrySet()) {
             String value = (String) entry.getValue();
             String key = "loans.liquidation.reference-scripts." + entry.getKey();
-            // The shipped form is ${VAR:txHash#index}; the default is what a stock node resolves to.
+
+            // Still ${VAR:default}, so an operator who discovers a coordinate can supply it by env.
             assertTrue(value.startsWith("${") && value.endsWith("}"), key + " is '" + value + "'");
             String shippedDefault = value.substring(value.indexOf(':') + 1, value.length() - 1);
 
-            assertEquals(PREVIEW_REFERENCE_SCRIPTS.get(entry.getKey()), shippedDefault,
-                    key + " no longer ships the coordinate that was verified on chain. If FluidTokens "
-                            + "redeployed, update both this test and application.yaml — and re-verify "
-                            + "the new utxo's reference_script_hash against the derived one.");
+            assertEquals("", shippedDefault,
+                    key + " ships a coordinate again. The second deployment's coordinates are dead, "
+                            + "not stale — if these have been re-discovered against the deployment in "
+                            + "loans.config.policy-id, rewrite this test to pin them literally and "
+                            + "re-verify each utxo's reference_script_hash against the derived hash.");
 
-            var input = AppConfig.LiquidationConfiguration.referenceInput(key, shippedDefault);
-            assertNotNull(input, key + " resolves to nothing published");
-            assertEquals(64, input.getTransactionId().length(), key);
-            assertEquals(0, input.getIndex(), key + " — every published script sits at output 0");
+            // The empty case is the supported skip path: null, not an exception.
+            assertNull(AppConfig.LiquidationConfiguration.referenceInput(key, shippedDefault),
+                    key + " must resolve to 'nothing published' rather than a coordinate");
         }
+
+        // And blank is the *only* thing that skips silently: a malformed coordinate is still rejected
+        // loudly. Without this, "empty means not published" could be satisfied by a parser that
+        // shrugged at everything, and the skip path would prove nothing.
+        String loan = "loans.liquidation.reference-scripts.loan";
+        assertNull(AppConfig.LiquidationConfiguration.referenceInput(loan, "   "),
+                "whitespace is also 'not published'");
+        assertNull(AppConfig.LiquidationConfiguration.referenceInput(loan, null),
+                "an unset value is also 'not published'");
+        // A bare hash with no #index — the YAML comment hazard that eats the index — must not pass.
+        assertThrows(IllegalStateException.class, () -> AppConfig.LiquidationConfiguration
+                        .referenceInput(loan,
+                                "00a4e9f69c6ce80b8cb4fe7008a40a2f007aa53b25ec52ae30f11e701f7aa693"),
+                "a coordinate with no output index must be rejected, not treated as unpublished");
     }
 
     private static Object liquidationBlockOf(Map<String, Object> document) {
