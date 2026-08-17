@@ -1,0 +1,361 @@
+package com.fluidtokens.aquarium.offchain.service.loans;
+
+import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
+import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.util.HexUtil;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.BuiltTransaction;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.Mutation;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.Plan;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.PublishedScript;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.Validator;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Cold, offline proof that the two reference-script publishing transactions are what they claim
+ * to be. No network, no wallet, no submission path: the publisher is constructed with a null
+ * {@code TransactionProcessor} and everything below reads transactions back out of their own
+ * CBOR.
+ *
+ * <h2>Measured, on preview protocol params (coinsPerUtxoSize 4310, maxTxSize 16_384)</h2>
+ * Min-ada is per output, for a base address (57 bytes) carrying that one script and no datum.
+ * <pre>
+ *   script                 body bytes    min-ada (lovelace)
+ *   loan                        2_547            12_003_350
+ *   loanSpend                   1_158             6_016_760
+ *   lenderManager                 968             5_197_860
+ *   lenderManagerSpend          1_158             6_016_760
+ *   loanClaimAction             8_662            38_359_000
+ *   lmLiquidateAction           4_227            19_244_150
+ *   total                      18_720            86_837_880   (86.83788 ada)
+ * </pre>
+ * The briefed estimate was ~86.55 ada; the measurement is 86.838 ada, 0.33% (0.288 ada) above it.
+ * That is rounding in the per-script estimate, not a disagreement — the measurement is the number
+ * to fund against. The 18_720-byte script total is what makes a single transaction impossible:
+ * {@link #aSingleTransactionForAllSixExceedsMaxTxSize()} measures that at 19_315 bytes against a
+ * 16_384 limit.
+ *
+ * <h2>Transaction sizes and fees, minimum split</h2>
+ * <pre>
+ *   TX1  loanClaimAction + lmLiquidateAction               13_136 bytes   fee   738_029
+ *   TX2  loan + loanSpend + lenderManager + lmSpend         6_234 bytes   fee   434_341
+ * </pre>
+ * The fees are for an unsigned body budgeted for one vkey witness, so they are what the eventual
+ * signed transaction pays rather than an understatement. Total outlay: 86_837_880 locked (all of
+ * it recoverable by spending the outputs) plus 1_172_370 in fees, i.e. ~88.01 ada.
+ * <p>
+ * Sizes move a little with the addresses involved: the funder and change addresses here are
+ * 29-byte enterprise addresses, and {@code ReferenceScriptPublishRunnerTest} — whose funder and
+ * change are 57-byte base addresses — measures 13_164 and 6_262 bytes for the same two
+ * transactions. The min-ada figures do not move: those depend only on the destination, which is a
+ * base address in both.
+ */
+class ReferenceScriptPublisherTest {
+
+    /** Where the reference-script outputs are paid. The runner uses wallet A's base address. */
+    private static final String DESTINATION = LoanFixtures.botAddress();
+
+    /**
+     * A funder distinct from the destination, so the "exactly N outputs at the destination
+     * address" check is exercised in its strict form.
+     * {@link #theRunnerShapeFundsFromTheSameWallet()} covers the shape the manual runner actually
+     * uses, where change lands at the destination too.
+     */
+    private static final String FUNDER = LoanFixtures.entAddress(
+            "99999999999999999999999999999999999999999999999999999999");
+
+    /** A second address of the same wallet, where the change goes in the runner's shape. */
+    private static final String CHANGE = LoanFixtures.entAddress(
+            "88888888888888888888888888888888888888888888888888888888");
+
+    private static ReferenceScriptPublisher publisher(String funderAddress) {
+        List<Utxo> wallet = List.of(
+                LoanFixtures.adaUtxo("aa".repeat(32), 0, funderAddress, 60_000_000L),
+                LoanFixtures.adaUtxo("bb".repeat(32), 0, funderAddress, 60_000_000L),
+                LoanFixtures.adaUtxo("cc".repeat(32), 0, funderAddress, 60_000_000L));
+        return new ReferenceScriptPublisher(LoanFixtures.registry(),
+                LoanFixtures.utxoSupplier(wallet), LoanFixtures.protocolParams());
+    }
+
+    @Test
+    void theMinimumSplitPublishesTheSixAndNothingElse() throws Exception {
+        List<BuiltTransaction> built = publisher(FUNDER).build(Plan.minimumSplit(), DESTINATION, FUNDER);
+        assertEquals(2, built.size(), "the minimum split is two transactions");
+
+        List<Validator> covered = new ArrayList<>();
+        long totalMinAda = 0L;
+        for (int i = 0; i < built.size(); i++) {
+            BuiltTransaction tx = built.get(i);
+            // Everything below reads the transaction back from its own bytes, never the builder's
+            // record of what it did.
+            Transaction decoded = Transaction.deserialize(tx.cbor());
+
+            assertTrue(tx.sizeBytes() < ReferenceScriptPublisher.MAX_TX_SIZE,
+                    "tx" + (i + 1) + " is " + tx.sizeBytes() + " bytes, over maxTxSize");
+
+            int scriptOutputs = 0;
+            for (TransactionOutput output : decoded.getBody().getOutputs()) {
+                assertNull(output.getInlineDatum(), "no reference-script output carries an inline datum");
+                assertNull(output.getDatumHash(), "no reference-script output carries a datum hash");
+                if (output.getScriptRef() == null) {
+                    assertEquals(FUNDER, output.getAddress(),
+                            "the only script-less output is the change to the funder");
+                    continue;
+                }
+                scriptOutputs++;
+                assertEquals(DESTINATION, output.getAddress(),
+                        "every reference-script output is paid to the destination");
+
+                PlutusScript attached = PlutusScript.deserializeScriptRef(output.getScriptRef());
+                assertNotNull(attached, "the script_ref field deserialises to a Plutus script");
+            }
+            assertEquals(Plan.minimumSplit().groups().get(i).size(), scriptOutputs,
+                    "tx" + (i + 1) + " carries exactly the planned number of reference scripts");
+
+            for (PublishedScript published : tx.published()) {
+                covered.add(published.validator());
+                totalMinAda += published.lovelace();
+                // The property that matters: the hash on chain must be the hash this repo derives,
+                // or the coordinate is 86 ada locked behind something no verifier will accept.
+                assertEquals(publisher(FUNDER).scriptHashOf(published.validator()),
+                        published.scriptHash(),
+                        published.validator() + " must be published under its derived hash");
+                assertEquals(hashOf(PlutusScript.deserializeScriptRef(
+                                scriptRefOf(decoded, published.scriptHash()))),
+                        published.scriptHash(),
+                        "the reported hash is the hash of the script actually in the body");
+            }
+
+            System.out.printf("tx%d  %d bytes, fee %d lovelace, locks %d lovelace, publishes %s%n",
+                    i + 1, tx.sizeBytes(), tx.feeLovelace(), tx.lockedLovelace(),
+                    tx.published().stream().map(p -> p.validator().configKey()).toList());
+            tx.published().forEach(p -> System.out.printf("      %-22s %6d body bytes  %10d lovelace"
+                            + " (estimate %10d)%n", p.validator().configKey(), p.scriptBodyBytes(),
+                    p.lovelace(), ReferenceScriptPublisher.estimatedMinAdaFor(p.validator())));
+        }
+
+        Set<Validator> distinct = new LinkedHashSet<>(covered);
+        assertEquals(covered.size(), distinct.size(), "no validator is published twice");
+        assertEquals(Set.of(Validator.values()), distinct, "exactly the six are published");
+
+        long totalFee = built.stream().mapToLong(BuiltTransaction::feeLovelace).sum();
+        System.out.printf("TOTAL min-ada %d lovelace (%.6f ada); fees %d lovelace; sizes %s%n",
+                totalMinAda, totalMinAda / 1_000_000d, totalFee,
+                built.stream().map(BuiltTransaction::sizeBytes).toList());
+
+        // Pinned: the measurement, not the estimate. The briefed ~86.55 ada estimate and this
+        // differ by 0.288 ada (0.33%), which is rounding in the per-script table rather than a
+        // disagreement — but it is the measurement that has to be funded.
+        assertEquals(86_837_880L, totalMinAda, "total min-ada across the six reference-script outputs");
+        assertTrue(Math.abs(totalMinAda - 86_550_000L) < 500_000L,
+                "the measured total must stay within half an ada of the briefed ~86.55 ada estimate");
+        assertEquals(13_136, built.get(0).sizeBytes(), "TX1 size");
+        assertEquals(6_234, built.get(1).sizeBytes(), "TX2 size");
+    }
+
+    /**
+     * The measured script bytes, pinned. This is the number the whole slice turns on: 18_720
+     * bytes of validator against a 16_384-byte maxTxSize is why a liquidation cannot carry its
+     * own scripts and why publishing them is not optional.
+     */
+    @Test
+    void theSixScriptsTotalMoreThanMaxTxSize() {
+        ReferenceScriptPublisher publisher = publisher(FUNDER);
+        // Pinned per script: bytes, then the min-ada cardano-client-lib computes for an output at
+        // a 57-byte base address carrying it. Both are in the class javadoc table.
+        Map<Validator, int[]> pinned = new EnumMap<>(Map.of(
+                Validator.LOAN, new int[]{2_547, 12_003_350},
+                Validator.LOAN_SPEND, new int[]{1_158, 6_016_760},
+                Validator.LENDER_MANAGER, new int[]{968, 5_197_860},
+                Validator.LENDER_MANAGER_SPEND, new int[]{1_158, 6_016_760},
+                Validator.LOAN_CLAIM_ACTION, new int[]{8_662, 38_359_000},
+                Validator.LM_LIQUIDATE_ACTION, new int[]{4_227, 19_244_150}));
+
+        int total = 0;
+        long totalMinAda = 0L;
+        for (Validator validator : Validator.values()) {
+            int bytes = bodyBytes(publisher.scriptOf(validator));
+            long minAda = publisher.minAdaFor(validator, DESTINATION);
+            total += bytes;
+            totalMinAda += minAda;
+            System.out.printf("%-22s %6d bytes  min-ada %10d lovelace%n",
+                    validator.configKey(), bytes, minAda);
+            assertEquals(pinned.get(validator)[0], bytes, validator + " applied script bytes");
+            assertEquals(pinned.get(validator)[1], minAda, validator + " min-ada");
+        }
+        assertEquals(18_720, total, "the six liquidation validators, in applied bytes");
+        assertEquals(86_837_880L, totalMinAda, "total min-ada, the number that has to be funded");
+        assertTrue(total > ReferenceScriptPublisher.MAX_TX_SIZE,
+                "the six do not fit in one transaction's worth of bytes at all");
+    }
+
+    /**
+     * The split is a measurement, not a preference: a plan carrying all six in one transaction is
+     * built far enough to be measured and then refused.
+     */
+    @Test
+    void aSingleTransactionForAllSixExceedsMaxTxSize() {
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> publisher(FUNDER).build(Plan.single(), DESTINATION, FUNDER));
+        System.out.println("single-transaction plan refused: " + e.getMessage());
+        assertTrue(e.getMessage().contains("maxTxSize " + ReferenceScriptPublisher.MAX_TX_SIZE),
+                "the refusal must name the limit it broke: " + e.getMessage());
+        assertTrue(e.getMessage().contains("19315"),
+                "the refusal must report the measured size: " + e.getMessage());
+    }
+
+    /**
+     * Falsifiability. Attach {@code lmLiquidateAction}'s script where the plan says
+     * {@code loanClaimAction} goes and the self-check must catch it by hash — a publisher whose
+     * hash check cannot fail is worthless, because the failure it is there to prevent (~86 ada
+     * locked behind a coordinate that will never verify) is silent on chain.
+     */
+    @Test
+    void aSubstitutedScriptIsCaughtByHash() {
+        ReferenceScriptPublisher publisher = publisher(FUNDER);
+        Mutation swap = new Mutation(0, 0, Validator.LM_LIQUIDATE_ACTION);
+
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> publisher.build(Plan.minimumSplit(), DESTINATION, FUNDER, FUNDER, swap));
+        System.out.println("substituted script rejected: " + e.getMessage());
+
+        assertTrue(e.getMessage().contains("LOAN_CLAIM_ACTION"),
+                "the rejection must name what was planned: " + e.getMessage());
+        assertTrue(e.getMessage().contains("LM_LIQUIDATE_ACTION"),
+                "the rejection must name what was found: " + e.getMessage());
+        assertTrue(e.getMessage().contains(publisher.scriptHashOf(Validator.LM_LIQUIDATE_ACTION)),
+                "the rejection must quote the hash actually attached: " + e.getMessage());
+        assertNotEquals(publisher.scriptHashOf(Validator.LOAN_CLAIM_ACTION),
+                publisher.scriptHashOf(Validator.LM_LIQUIDATE_ACTION),
+                "the two hashes must differ, or the mutation proves nothing");
+    }
+
+    /** A plan that leaves one of the six out is refused before anything is built. */
+    @Test
+    void anIncompletePlanIsRefused() {
+        Plan missingOne = new Plan(List.of(
+                List.of(Validator.LOAN_CLAIM_ACTION, Validator.LM_LIQUIDATE_ACTION),
+                List.of(Validator.LOAN, Validator.LOAN_SPEND, Validator.LENDER_MANAGER)));
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> publisher(FUNDER).build(missingOne, DESTINATION, FUNDER));
+        assertTrue(e.getMessage().contains("LENDER_MANAGER_SPEND"), e.getMessage());
+    }
+
+    /** A plan publishing the same script twice is refused: it would lock its min-ada twice over. */
+    @Test
+    void aDuplicatingPlanIsRefused() {
+        Plan duplicated = new Plan(List.of(
+                List.of(Validator.LOAN_CLAIM_ACTION, Validator.LM_LIQUIDATE_ACTION),
+                List.of(Validator.LOAN, Validator.LOAN, Validator.LOAN_SPEND,
+                        Validator.LENDER_MANAGER, Validator.LENDER_MANAGER_SPEND)));
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> publisher(FUNDER).build(duplicated, DESTINATION, FUNDER));
+        assertTrue(e.getMessage().contains("more than once"), e.getMessage());
+    }
+
+    /**
+     * The shape the manual runner uses: one wallet funds the transactions and receives the
+     * reference-script outputs, with the change sent to a second address of that same wallet. Six
+     * script outputs across the two transactions, each holding exactly its min-ada, plus one
+     * change output each.
+     */
+    @Test
+    void theRunnerShapeFundsFromTheSameWallet() throws Exception {
+        ReferenceScriptPublisher publisher = publisher(DESTINATION);
+        List<BuiltTransaction> built =
+                publisher.build(Plan.minimumSplit(), DESTINATION, DESTINATION, CHANGE);
+
+        int scriptOutputs = 0;
+        int plainOutputs = 0;
+        long locked = 0L;
+        for (BuiltTransaction tx : built) {
+            Transaction decoded = Transaction.deserialize(tx.cbor());
+            for (TransactionOutput output : decoded.getBody().getOutputs()) {
+                assertNull(output.getInlineDatum(), "no output carries an inline datum");
+                assertNull(output.getDatumHash(), "no output carries a datum hash");
+                if (output.getScriptRef() != null) {
+                    scriptOutputs++;
+                    locked += output.getValue().getCoin().longValueExact();
+                    assertEquals(DESTINATION, output.getAddress(),
+                            "reference scripts are paid to the destination");
+                } else {
+                    plainOutputs++;
+                    assertEquals(CHANGE, output.getAddress(), "change goes to the change address");
+                }
+            }
+        }
+        assertEquals(6, scriptOutputs, "six reference-script outputs across the two transactions");
+        assertEquals(2, plainOutputs, "one change output per transaction, carrying nothing");
+        assertEquals(86_837_880L, locked, "and each of the six holds exactly its own min-ada");
+    }
+
+    /**
+     * The reason the runner sends its change somewhere of its own, made into a measurement.
+     * <p>
+     * cardano-client-lib deducts the fee from the largest output at the fee payer's address; when
+     * that is also the destination, a reference-script output is a candidate. With 60-ada funding
+     * UTxOs and a 38.359-ada {@code loanClaimAction} output, the fee comes out of the script
+     * output, {@code ChangeOutputAdjustments} finds it short of min-ada and swallows a whole extra
+     * 60-ada UTxO into it. Output count, addresses, datums and every script hash stay correct —
+     * <b>only the value is wrong</b>, which is why the exact-min-ada check exists.
+     */
+    @Test
+    void changeAtTheDestinationAddressCorruptsAnOutputAndIsRefused() {
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> publisher(DESTINATION).build(Plan.minimumSplit(), DESTINATION, DESTINATION,
+                        DESTINATION));
+        System.out.println("change-at-destination refused: " + e.getMessage());
+        assertTrue(e.getMessage().contains("LOAN_CLAIM_ACTION"),
+                "the refusal must name the corrupted output: " + e.getMessage());
+        assertTrue(e.getMessage().contains("38359000"),
+                "the refusal must state what it should have held: " + e.getMessage());
+        assertTrue(e.getMessage().contains("97613711"),
+                "the refusal must state what it actually held: " + e.getMessage());
+    }
+
+    // ---- helpers ---------------------------------------------------------------------------------
+
+    private static int bodyBytes(PlutusScript script) {
+        try {
+            return script.serializeScriptBody().length;
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot serialise the script body", e);
+        }
+    }
+
+    private static String hashOf(PlutusScript script) {
+        try {
+            return HexUtil.encodeHexString(script.getScriptHash());
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot hash the script", e);
+        }
+    }
+
+    /** The raw {@code script_ref} bytes of the output whose attached script hashes to {@code hash}. */
+    private static byte[] scriptRefOf(Transaction decoded, String hash) {
+        for (TransactionOutput output : decoded.getBody().getOutputs()) {
+            if (output.getScriptRef() == null) {
+                continue;
+            }
+            if (hashOf(PlutusScript.deserializeScriptRef(output.getScriptRef())).equals(hash)) {
+                return output.getScriptRef();
+            }
+        }
+        throw new IllegalStateException("no output in the body carries a script hashing to " + hash);
+    }
+}
