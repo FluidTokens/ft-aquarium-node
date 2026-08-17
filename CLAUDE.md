@@ -55,6 +55,16 @@ Proven 2026-08-14 (Java 21.0.11):
   it is no longer offered above as an equivalent to `cleanTest`. A suite of this size runs in
   a few seconds with PlutusV3 evaluation included, so "too fast to have run" is not a
   reliable instinct either — the XML is the only thing that settles it.
+- **Assert the number of XML files too, not only the totals** (today: **41 files, 370 tests**).
+  A test total can only ever go up, and that is exactly the direction that hides a deletion: if
+  a class is deleted or renamed, a lingering results file keeps being counted, the total never
+  falls, and a rising total reads as progress. **A count that can only increase is not a
+  measurement.** `cleanTest` defends against staleness *within* a run; only counting artefacts
+  detects a class that quietly stopped existing, because a test that no longer runs produces no
+  failure — it produces silence that looks like a pass. Verified 2026-08-17: 41 files, zero
+  orphans (every results file maps to a class still present under `src/test/java`). The orphan
+  check is worth re-running after any test-file rename:
+  `ls build/test-results/test/*.xml | wc -l`, then map each basename back to a `src/test` file.
 - Live preview checks (optional): `set -a; . ./.env.preview; set +a` then run
   `LoansConfigVerifierLiveTest` — doubles as the "has FT redeployed preview?" probe.
 - No lint/format tooling configured. No CI (parked deliberately).
