@@ -10,12 +10,14 @@ import com.fluidtokens.aquarium.offchain.model.loans.AuthorizationMethod;
 import com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
+import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -103,11 +105,23 @@ public final class PoolFixtures {
     /**
      * The default factory pool: a 5 ADA principal floor, a 2/1 no-oracle collateral floor, a 4.59%
      * base rate ({@code interestRate 459}), an 80% liquidation LTV ({@code 100/125}), a positive
-     * partial-liquidation penalty of 100‰, a {@link #LIQUIDATION_FEE_PER_MILLE 100‰} bot fee, 52 ADA
-     * of pool liquidity and a 1.5 ADA loan output floor.
+     * partial-liquidation penalty of <b>90‰</b>, a {@link #LIQUIDATION_FEE_PER_MILLE 100‰} bot fee,
+     * 52 ADA of pool liquidity and a 1.5 ADA loan output floor.
+     *
+     * <h2>Why the penalty (90‰) and the fee (100‰) deliberately differ</h2>
+     * These are two positional {@link PoolParameters} args flowing to unrelated destinations — the
+     * penalty into the pool's {@code commonData} ({@link #commonData}), the fee into the lender-bond
+     * datum ({@link #templateBondDatum}). Were they both 100, a transposition of the two args would be
+     * value-invisible and {@link #assertBornLiquidatable}'s fee guard could be reading the wrong field
+     * with nobody able to tell (T-016 S1 audit finding, folded into S2). Splitting them makes the
+     * fee-100 invariant verifiable against the FEE field alone: 90 stays safe for born-liquidatable,
+     * because equity clamps to zero whenever origination LTV ≥ {@code 1000/(1000+90) ≈ 0.917} and this
+     * loan is born at LTV ≈ 1.48 (the {@code 1/2} price in {@link PoolCreateDryEvalTest}), so nothing
+     * about the epic's shape changes. The penalty is still {@code ≤ 1000}, which
+     * {@link #assertBornLiquidatable} requires for equity to floor at all.
      */
     public static PoolParameters defaults() {
-        return new PoolParameters(5_000_000L, 2L, 1L, 459L, 100L, 125L, 100L,
+        return new PoolParameters(5_000_000L, 2L, 1L, 459L, 100L, 125L, 90L,
                 LIQUIDATION_FEE_PER_MILLE, 52_000_000L, 1_500_000L);
     }
 
@@ -319,6 +333,56 @@ public final class PoolFixtures {
         universe.add(seedUtxo(funderBech32));
         universe.add(poolPolicyRefScriptUtxo());
         return universe;
+    }
+
+    // ---- the T-016 S2 pool-borrow fixtures -------------------------------------------------------
+
+    /** {@code POOL} in hex — the {@code bytearray.concat("POOL", poolId)} prefix of a pool-origin loan's originId. */
+    public static final String ORIGIN_POOL_PREFIX =
+            HexUtil.encodeHexString("POOL".getBytes(StandardCharsets.US_ASCII));
+
+    /**
+     * The collateral a borrower must post for {@code wantedPrincipalAmount} against {@code params}'
+     * no-oracle floor: {@code ceil(wantedPrincipalAmount × minCollateral / minCollateralDivider)}
+     * ({@code finance.ak get_needed_collateral_without_oracles}). The same {@link Rational} ceil
+     * {@link #assertBornLiquidatable} uses, so the two cannot drift.
+     */
+    public static BigInteger neededCollateral(PoolParameters params, long wantedPrincipalAmount) {
+        return Rational.required(
+                BigInteger.valueOf(wantedPrincipalAmount)
+                        .multiply(BigInteger.valueOf(params.collateralPerPrincipalNumerator())),
+                BigInteger.valueOf(params.collateralPerPrincipalDivider())).ceil();
+    }
+
+    /**
+     * The exact {@link LoanDatum} {@code pool_borrow_action}'s {@code validate_output_to_loan} builds
+     * and compares with {@code equals_data} — every field taken from the pool's {@link #commonData}, so
+     * the fixture cannot drift from the datum the pool actually stamps. The three fields the borrow
+     * sets rather than the pool: {@code originId = "POOL" ‖ poolId}, {@code principalAmount =
+     * wantedPrincipalAmount}, {@code lendDate = validTo} (the validity range's upper bound in POSIX
+     * millis); {@code repaidInstallments} and {@code doneRecasts} are zero at origination.
+     */
+    public static LoanDatum borrowLoanDatum(PoolParameters params, String poolIdHex,
+                                            long wantedPrincipalAmount, long lendDateMillis) {
+        RequestTxEncoder.CommonData cd = commonData(params);
+        return new LoanDatum(
+                BigInteger.ZERO,                                // doneRecasts
+                BigInteger.valueOf(wantedPrincipalAmount),      // principalAmount
+                BigInteger.valueOf(lendDateMillis),             // lendDate
+                BigInteger.ZERO,                                // repaidInstallments
+                cd.interestRate(),
+                cd.totalInstallments(),
+                cd.principalAsset(),
+                cd.principalOracleAsset(),
+                cd.installmentPeriod(),
+                cd.initialGracePeriod(),
+                cd.liquidationMode(),
+                cd.repaymentMode(),
+                cd.repaymentTimeWindow(),
+                cd.penaltyFeeForLateRepayment(),
+                cd.repaymentReceipts(),
+                ORIGIN_POOL_PREFIX + poolIdHex,
+                COLLATERAL);
     }
 
     // ---- the published preview reference scripts -------------------------------------------------
