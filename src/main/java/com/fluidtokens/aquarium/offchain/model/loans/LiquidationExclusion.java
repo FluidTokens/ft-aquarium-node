@@ -80,32 +80,38 @@ public enum LiquidationExclusion {
     NOT_LIQUIDATABLE,
 
     /**
-     * The loan is liquidatable, but its {@code equity} is positive and the <em>currently deployed</em>
-     * validators cannot satisfy a plain {@code Liquidate} that pays one out — in any output order.
+     * The loan is liquidatable, but its {@code equity} is positive and <b>no output layout
+     * {@code LiquidateTransactionBuilder} emits</b> satisfies both validators of the
+     * <em>currently deployed</em> pin {@code ff005fb}.
      * <p>
-     * Both validators index the <em>same</em> list, the outputs filtered by
-     * {@code get_outputs_to_smart_credential(..)}, at the <em>same</em> position — the loan's index —
-     * and demand a different output there:
+     * Both validators reach into the <em>same</em> list, the outputs filtered by
+     * {@code get_outputs_to_smart_credential(..)}, but no longer at the same position:
      * <ul>
-     *   <li>{@code lm_liquidate_action.ak:87} takes {@code safe_list_at(assetOutputs, index)} and
+     *   <li>{@code lm_liquidate_action.ak:87-91} takes
+     *       {@code safe_list_at(assetOutputs, safe_list_at(redeemer.assetOutputIndexes, index))} and
      *       feeds it to {@code validate_repayment_output(.., action: constants.action_claimed_collateral)}
-     *       ({@code :156}), so that slot must be the lender's claimed-collateral output;</li>
+     *       ({@code :160}), so <em>the slot the redeemer names</em> must be the lender's
+     *       claimed-collateral output;</li>
      *   <li>{@code loan_claim_action.ak:275-284} takes {@code safe_list_at(get_outputs_to_smart_credential(..), index)}
-     *       and feeds it to {@code equity_sent_to_borrower(..)}, whose datum carries
-     *       {@code constants.action_partial_liquidation_compensation}, so that same slot must be the
-     *       borrower's compensation output.</li>
+     *       — unchanged at {@code ff005fb}, still the bare loan index — and feeds it to
+     *       {@code equity_sent_to_borrower(..)}, whose datum carries
+     *       {@code constants.action_partial_liquidation_compensation}, so slot {@code index} must be
+     *       the borrower's compensation output.</li>
      * </ul>
-     * One slot, two mutually exclusive datums. {@code loan_claim_action.ak:273}'s
-     * {@code or { inputAction.equity == 0, .. }} is the branch that keeps every other case alive, so
-     * {@code equity == 0} is exactly the submittable set. Established at the deployed pin
-     * {@code bbe9c1a} and pinned empirically by {@code LiquidateDryEvalTest}'s
-     * {@code positiveEquityIsUnsatisfiableBecauseTwoValidatorsClaimTheSameAssetManagerOutputSlot},
-     * which runs both layouts through the real PlutusV3 machine.
+     * The redeemer indirection means these two no longer <em>structurally</em> name one slot. But the
+     * builder emits identity {@code assetOutputIndexes}, which collapses them back onto the same slot
+     * with two mutually exclusive datums, and {@code loan_claim_action.ak:273}'s
+     * {@code or { inputAction.equity == 0, .. }} is then the branch that keeps every other case alive.
+     * Pinned empirically by {@code LiquidateDryEvalTest}'s
+     * {@code positiveEquityIsRefusedInBothLayoutsThisBuilderCanEmit}, which runs both layouts the
+     * builder can emit through the real PlutusV3 machine.
      * <p>
-     * <b>Deployment-specific, not eternal.</b> Unlike every other value here this one describes the
-     * contracts as currently deployed rather than a rule of the design: when FluidTokens redeploys
-     * with separate output indexes for the two asset-manager outputs, positive equity becomes
-     * buildable again and this exclusion should be revisited.
+     * <b>Deployment-specific, not eternal — and not a proof of impossibility.</b> Unlike every other
+     * value here this one describes the contracts as currently deployed rather than a rule of the
+     * design, and it is scoped to the layouts the builder emits: whether a non-identity
+     * {@code assetOutputIndexes} over a reordered output list satisfies both validators is untested and
+     * deliberately left open. If it does, or if a redeploy removes the constraint another way, this
+     * exclusion should be revisited.
      * <p>
      * Backed by {@code LiquidateTransactionBuilder.Refusal#POSITIVE_EQUITY_UNSUPPORTED}.
      */

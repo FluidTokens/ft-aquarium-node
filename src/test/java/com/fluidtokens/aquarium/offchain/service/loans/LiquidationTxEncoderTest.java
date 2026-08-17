@@ -114,19 +114,25 @@ class LiquidationTxEncoderTest {
     /**
      * {@code LMLiquidateWithdrawRedeemer} with 2 lender-bond indexes:
      * <pre>
-     * d879 9f                    LMLiquidateWithdrawRedeemer constr 0, indefinite list, 3 fields
+     * d879 9f                    LMLiquidateWithdrawRedeemer constr 0, indefinite list, 4 fields
      *   05                          uint 5 = configRefInputIndex
      *   9f 00 01 ff                 indefinite list [0, 1] = lenderBondInputIndexes
      *   9f 44deadbeef 44cafef00d ff indefinite list [bytes(4)deadbeef, bytes(4)cafef00d] = lenderBondAssetNames
+     *   9f 03 02 ff                 indefinite list [3, 2] = assetOutputIndexes
      * ff
      * </pre>
+     * {@code assetOutputIndexes} is deliberately {@code [3, 2]} — neither equal to
+     * {@code lenderBondInputIndexes} nor ascending — so that three plausible defects are all visible
+     * here rather than only in the builder: a transposition of the two lists, an encoder that writes
+     * one field twice, and one that emits the identity because the fixture happened to be the
+     * identity.
      */
     @Test
     void lmLiquidateWithdrawRedeemerWithTwoIndexes() {
         var actual = LiquidationTxEncoder.lmLiquidateWithdrawRedeemer(
-                5, List.of(0L, 1L), List.of("deadbeef", "cafef00d"));
+                5, List.of(0L, 1L), List.of("deadbeef", "cafef00d"), List.of(3L, 2L));
 
-        var expected = "d8799f059f0001ff9f44deadbeef44cafef00dffff";
+        var expected = "d8799f059f0001ff9f44deadbeef44cafef00dff9f0302ffff";
 
         assertEquals(expected, hex(actual.serializeToBytes()));
     }

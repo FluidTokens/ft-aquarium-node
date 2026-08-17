@@ -4,6 +4,9 @@ import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
@@ -177,29 +180,33 @@ class LiquidateDryEvalTest {
     }
 
     /**
-     * <b>Blocker, found by this rig and confirmed against the pinned Aiken source: a plain
-     * {@code Liquidate} with a positive equity cannot be satisfied by the deployed validators, in
-     * any output order.</b>
+     * Positive equity is refused in <b>both output layouts this builder can emit</b>. Exactly three
+     * things are claimed here, and nothing beyond them.
      * <p>
-     * Both validators index the <em>same</em> filtered list — the outputs whose payment credential
-     * is the asset-manager spend script,
-     * {@code smart_tokens/utils.get_outputs_to_smart_credential(outputs, Script(assetManagerSpendScriptHash),
-     * Script(assetManagerWithdrawScriptHash), smartTokensSpendScriptHash)} — at the <em>same</em>
-     * position, the loan's index, and demand a different output there:
-     * <ul>
-     *   <li>{@code lm_liquidate_action.ak}: {@code let assetOutput = safe_list_at(assetOutputs, index)},
-     *       then {@code validate_repayment_output(.., action: constants.action_claimed_collateral)} —
-     *       so slot {@code index} must be the lender's claimed-collateral output.</li>
-     *   <li>{@code loan_claim_action.ak}: {@code let borrowerCompensationOutput =
-     *       safe_list_at(get_outputs_to_smart_credential(..), index)}, then
-     *       {@code equity_sent_to_borrower(..)} whose {@code newDatum} carries
-     *       {@code constants.action_partial_liquidation_compensation} — so slot {@code index} must
-     *       be the borrower's compensation output.</li>
-     * </ul>
-     * One slot, two mutually exclusive datums. The {@code equity == 0} branch of
-     * {@code or { inputAction.equity == 0, .. }} is what keeps every other case alive. The
-     * conclusion above is established <b>at the source</b>, at the deployed pin {@code bbe9c1a};
-     * upstream {@code HEAD} is seven post-audit commits ahead and is deliberately not consulted.
+     * <b>(a) The two validators no longer structurally collide.</b> At the deployed commit
+     * {@code ff005fb}, {@code lm_liquidate_action} reads its asset output as
+     * {@code safe_list_at(assetOutputs, safe_list_at(redeemer.assetOutputIndexes, index))} — through
+     * the redeemer — while {@code loan_claim_action} <em>still</em> reads
+     * {@code safe_list_at(get_outputs_to_smart_credential(..), index)}, the bare loan index,
+     * unchanged at {@code ff005fb}. Both filter the same list (the outputs whose payment credential
+     * is the asset-manager spend script) and want mutually exclusive datums
+     * ({@code action_claimed_collateral} against
+     * {@code action_partial_liquidation_compensation}), but the position each names is no longer
+     * forced to be the same one.
+     * <p>
+     * <b>(b) This builder emits identity {@code assetOutputIndexes}, so both layouts it can produce
+     * still fail.</b> At the identity the redeemer names slot {@code index}, which is where
+     * {@code loan_claim_action} looks too — so the collision is back, and the two evaluation runs
+     * below show it: as built, the claimed collateral is in the slot and {@code loan_claim_action}
+     * refuses; mirrored, the compensation output is in the slot, {@code loan_claim_action}
+     * <em>accepts</em> our compensation output and {@code lm_liquidate_action} refuses.
+     * <p>
+     * <b>(c) Whether some other layout satisfies both is an open question, deliberately not answered
+     * here.</b> A non-identity {@code assetOutputIndexes} over a reordered output list is not tested
+     * by this file and not claimed either way. What is enforced is only (b):
+     * {@link LiquidateTransactionBuilder}'s V8 refuses a positive-equity batch with
+     * {@code POSITIVE_EQUITY_UNSUPPORTED}, and {@code LiquidationCandidateScanner} excludes one before
+     * it can reach the builder.
      *
      * <h3>Exactly what the two evaluation runs below do and do not prove</h3>
      * The evaluator stops at the first failing redeemer ({@link EvalFixtures} — "Harness
@@ -224,12 +231,6 @@ class LiquidateDryEvalTest {
      * {@link LiquidationTxEncoder}'s constants — so a mutated constant moves the transaction without
      * moving the expectation, and this test fails.
      * <p>
-     * Consequence for the bot: until FluidTokens redeploys, only {@code equity == 0} liquidations are
-     * submittable through {@code lm_liquidate_action}. That consequence is now enforced rather than
-     * merely documented — {@link LiquidateTransactionBuilder}'s V8 refuses a positive-equity batch
-     * with {@code POSITIVE_EQUITY_UNSUPPORTED}, and {@code LiquidationCandidateScanner} excludes one
-     * with {@code POSITIVE_EQUITY_UNSUPPORTED} before it can ever reach the builder.
-     * <p>
      * <b>Which is why this test builds through the package-private
      * {@link LiquidateTransactionBuilder#buildIgnoringPositiveEquityVeto} seam.</b> V8 exists
      * <em>because</em> of what is proven below; running the evidence through the veto it justifies
@@ -237,7 +238,7 @@ class LiquidateDryEvalTest {
      * including the two permanent V7 {@code expect}s, still applies to the transaction evaluated here.
      */
     @Test
-    void positiveEquityIsUnsatisfiableBecauseTwoValidatorsClaimTheSameAssetManagerOutputSlot() {
+    void positiveEquityIsRefusedInBothLayoutsThisBuilderCanEmit() {
         Scenario scenario = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 200_000_000L);
         List<Utxo> universe = universe(List.of(scenario));
 
@@ -270,6 +271,12 @@ class LiquidateDryEvalTest {
                 "the compensation output must carry "
                         + "constants.action_partial_liquidation_compensation and be owned by the "
                         + "borrower bond");
+
+        // Claim (b): the layouts below are the ones the *identity* redeemer produces. Read off the
+        // deserialised lm redeemer rather than assumed, because the whole inference rests on
+        // lm_liquidate_action being pointed at slot 0 — the same slot loan_claim_action reads.
+        assertEquals(List.of(BigInteger.ZERO), emittedAssetOutputIndexes(tx),
+                "this builder emits identity assetOutputIndexes; that is what re-creates the collision");
 
         // Both inferences below rest on loan_claim_action being evaluated before lm_liquidate_action,
         // because the evaluator reports only the first failing redeemer. Asserted, not assumed.
@@ -448,6 +455,93 @@ class LiquidateDryEvalTest {
         assertTrue(outcome.detail().contains(redeemerError(mutated,
                         LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))),
                 "expected loan_claim_action to be the rejecting script, got: " + outcome.detail());
+    }
+
+    /**
+     * {@code list.unique(redeemer.assetOutputIndexes) == redeemer.assetOutputIndexes} is a top-level
+     * conjunct of {@code lm_liquidate_action}, and it is there for a reason: a repeated index lets two
+     * loans be settled against <em>one</em> asset-manager output, which is a double-satisfaction
+     * attack. This hands the machine {@code [0, 0]} on the N=2 zero-equity batch and requires the
+     * refusal, named at {@code lm_liquidate_action}'s own withdrawal index.
+     * <p>
+     * The honest build is evaluated first, clean, so that the failure below is attributable to the one
+     * field that was changed and not to the fixture.
+     */
+    @Test
+    void aDuplicateAssetOutputIndexIsRejectedByLmLiquidateAction() {
+        Scenario a = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+        Scenario b = scenario(LOAN_ID_B, TX_LOAN_B, TX_BOND_B, 100_000_000L, 100_000_000L);
+        List<Utxo> universe = universe(List.of(a, b));
+
+        EvalFixtures.evaluate(build(List.of(a, b)), universe, REGISTRY);
+
+        Transaction mutated = build(List.of(a, b));
+        replaceLmLiquidateRedeemer(mutated, List.of(0L, 0L));
+
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated, universe, REGISTRY);
+        assertFalse(outcome.successful(),
+                "list.unique must reject a repeated assetOutputIndex — it is the double-satisfaction guard");
+        assertTrue(outcome.detail().contains(redeemerError(mutated,
+                        LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))),
+                "expected lm_liquidate_action to be the rejecting script, got: " + outcome.detail());
+    }
+
+    /**
+     * The positional half of the field's meaning, which {@code list.unique} does not cover: {@code [1,
+     * 0]} is duplicate-free and in range, and points each loan at the <em>other</em> loan's collateral
+     * output. It has to be rejected anyway, because {@code validate_repayment_output} rebuilds the
+     * expected datum from {@code loanInput.output_reference} and compares it with
+     * {@code builtin.equals_data} — each collateral output carries its own loan's
+     * {@code inputOutputReference}, so a swap is a datum mismatch.
+     * <p>
+     * This is the test that distinguishes a correct derivation from one that emits some other
+     * permutation of the right numbers, which is precisely what a golden built on an identity fixture
+     * cannot do.
+     */
+    @Test
+    void anAssetOutputIndexPointingAtTheOtherLoansOutputIsRejectedByLmLiquidateAction() {
+        Scenario a = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+        Scenario b = scenario(LOAN_ID_B, TX_LOAN_B, TX_BOND_B, 100_000_000L, 100_000_000L);
+        List<Utxo> universe = universe(List.of(a, b));
+
+        EvalFixtures.evaluate(build(List.of(a, b)), universe, REGISTRY);
+
+        Transaction mutated = build(List.of(a, b));
+        // Duplicate-free and in range, so list.unique and safe_list_at are both satisfied; only the
+        // datum comparison can catch it.
+        replaceLmLiquidateRedeemer(mutated, List.of(1L, 0L));
+
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated, universe, REGISTRY);
+        assertFalse(outcome.successful(),
+                "each collateral output carries its own loan's inputOutputReference, so a swap must fail");
+        assertTrue(outcome.detail().contains(redeemerError(mutated,
+                        LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))),
+                "expected lm_liquidate_action to be the rejecting script, got: " + outcome.detail());
+    }
+
+    /**
+     * The out-of-range case, for the record: {@code safe_list_at} bottoms out in
+     * {@code builtin.head_list}, so an index past the end is not a graceful {@code None} — the machine
+     * dies with {@code EmptyList}. Same failure mode as a redeemer that is one field short, which is
+     * what makes it worth pinning: it is the shape of error an operator would see if this field were
+     * ever mis-derived upwards.
+     */
+    @Test
+    void anOutOfRangeAssetOutputIndexKillsTheMachineRatherThanFailingGracefully() {
+        Scenario a = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+        Scenario b = scenario(LOAN_ID_B, TX_LOAN_B, TX_BOND_B, 100_000_000L, 100_000_000L);
+        List<Utxo> universe = universe(List.of(a, b));
+
+        Transaction mutated = build(List.of(a, b));
+        replaceLmLiquidateRedeemer(mutated, List.of(0L, 2L));   // only two asset-manager outputs exist
+
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated, universe, REGISTRY);
+        assertFalse(outcome.successful(), "an index past the end of assetOutputs cannot be satisfied");
+        assertTrue(outcome.detail().contains(redeemerError(mutated,
+                        LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))),
+                "expected lm_liquidate_action to be the rejecting script, got: " + outcome.detail());
+        assertTrue(outcome.detail().contains("EmptyList"),
+                "safe_list_at bottoms out in head_list, so this is an EmptyList death: " + outcome.detail());
     }
 
     // ======================================================================================
@@ -710,6 +804,77 @@ class LiquidateDryEvalTest {
             throw new AssertionError("no main config reference input");
         }
         return index;
+    }
+
+    /**
+     * The {@code assetOutputIndexes} the builder actually emitted, read off the <b>deserialised</b>
+     * transaction — the bytes the machine will see — rather than off the in-memory redeemer object or
+     * off {@link LiquidationTxEncoder}.
+     */
+    private static List<BigInteger> emittedAssetOutputIndexes(Transaction tx) {
+        return lmLiquidateFields(deserialise(tx)).get(3) instanceof ListPlutusData list
+                ? list.getPlutusDataList().stream()
+                .map(item -> ((BigIntPlutusData) item).getValue())
+                .toList()
+                : List.of();
+    }
+
+    /**
+     * Replaces <b>only</b> {@code assetOutputIndexes} — field 3 — of the {@code lm_liquidate_action}
+     * withdrawal's redeemer, in the shape of {@link #replaceClaimRedeemer}.
+     * <p>
+     * Fields 0..2 are lifted verbatim off the deserialised transaction rather than rebuilt from the
+     * fixture, so the mutation really is one field: a rebuilt redeemer that happened to differ
+     * elsewhere would make the resulting refusal prove nothing about this field.
+     */
+    private static void replaceLmLiquidateRedeemer(Transaction tx, List<Long> assetOutputIndexes) {
+        List<PlutusData> fields = lmLiquidateFields(deserialise(tx));
+        List<PlutusData> mutated = new ArrayList<>(fields.subList(0, 3));
+        mutated.add(ListPlutusData.of(assetOutputIndexes.stream()
+                .map(BigIntPlutusData::of)
+                .toArray(PlutusData[]::new)));
+
+        int withdrawalIndex = withdrawalIndexOf(tx,
+                LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()));
+        for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
+            if (redeemer.getTag() == RedeemerTag.Reward
+                    && redeemer.getIndex().intValue() == withdrawalIndex) {
+                redeemer.setData(ConstrPlutusData.builder()
+                        .alternative(0)
+                        .data(ListPlutusData.of(mutated.toArray(PlutusData[]::new)))
+                        .build());
+                return;
+            }
+        }
+        throw new AssertionError("no reward redeemer for the lm_liquidate_action withdrawal");
+    }
+
+    /** The four fields of the {@code lm_liquidate_action} withdrawal's redeemer constructor. */
+    private static List<PlutusData> lmLiquidateFields(Transaction tx) {
+        int withdrawalIndex = withdrawalIndexOf(tx,
+                LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()));
+        for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
+            if (redeemer.getTag() == RedeemerTag.Reward
+                    && redeemer.getIndex().intValue() == withdrawalIndex) {
+                ConstrPlutusData constr = (ConstrPlutusData) redeemer.getData();
+                List<PlutusData> fields = constr.getData().getPlutusDataList();
+                if (constr.getAlternative() != 0 || fields.size() != 4) {
+                    throw new AssertionError("the lm_liquidate redeemer is constr "
+                            + constr.getAlternative() + " with " + fields.size()
+                            + " fields, expected constr 0 with 4");
+                }
+                return fields;
+            }
+        }
+        throw new AssertionError("no reward redeemer for the lm_liquidate_action withdrawal");
+    }
+
+    private static Transaction deserialise(Transaction tx) {
+        try {
+            return Transaction.deserialize(tx.serialize());
+        } catch (Exception e) {
+            throw new AssertionError("the built transaction does not round-trip through CBOR", e);
+        }
     }
 
     /** Swaps the {@code loan_claim_action} withdrawal's redeemer data in place. */

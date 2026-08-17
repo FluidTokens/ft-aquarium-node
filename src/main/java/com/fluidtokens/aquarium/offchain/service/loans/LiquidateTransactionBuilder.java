@@ -117,11 +117,12 @@ import java.util.stream.Stream;
  *       {@code shouldLiquidationConvertToPrincipal == False} a conjunct of the same check. The
  *       scanner already excludes both (D2 and §7.5), so this is the builder's own last line rather
  *       than the only one.</li>
- *   <li><b>V8</b> — deployment scope: {@code equity > 0} is refused, because the deployed validators
- *       cannot satisfy it in any output order (see {@link Refusal#POSITIVE_EQUITY_UNSUPPORTED}).
- *       This is the only veto here that is a statement about <em>this deployment</em> rather than
- *       about the design, so it is checked last of the per-loan vetoes: a batch that is wrong for a
- *       permanent reason reports that permanent reason.</li>
+ *   <li><b>V8</b> — deployment scope: {@code equity > 0} is refused, because no output layout
+ *       <em>this builder emits</em> satisfies both validators (see
+ *       {@link Refusal#POSITIVE_EQUITY_UNSUPPORTED}). This is the only veto here that is a statement
+ *       about <em>this deployment</em> rather than about the design, so it is checked last of the
+ *       per-loan vetoes: a batch that is wrong for a permanent reason reports that permanent
+ *       reason.</li>
  * </ul>
  *
  * <h2>Ex-units are measured, not guessed</h2>
@@ -177,12 +178,16 @@ import java.util.stream.Stream;
  *       not loan-input order; see the comment at their emission site.</li>
  * </ul>
  * One thing evaluation settled the other way: a batch containing a loan with a <em>positive
- * equity</em> is not satisfiable by the deployed validators in any output order, because
- * {@code lm_liquidate_action} and {@code loan_claim_action} both demand the index-th asset-manager
- * output and want different datums in it. That is now V8 above: such a batch is refused rather than
- * built, and the caller no longer has to remember not to schedule one. The refusal is
- * <em>deployment-specific</em> — when FluidTokens redeploys with separate output indexes for the two
- * asset-manager outputs, V8 is the veto to lift, and nothing else here changes.
+ * equity</em> is not satisfiable in <b>either output layout this builder can emit</b>.
+ * {@code loan_claim_action} still reads the index-th entry of the asset-manager-filtered output list
+ * directly, while {@code lm_liquidate_action} now reaches it through
+ * {@code assetOutputIndexes[index]} — so the two no longer <em>structurally</em> collide, but this
+ * builder emits identity indexes, and at the identity both layouts still fail. That is V8 above: such
+ * a batch is refused rather than built, and the caller no longer has to remember not to schedule one.
+ * <b>Whether some other layout — a non-identity {@code assetOutputIndexes} paired with a reordered
+ * output list — satisfies both validators is an open question that has not been tested.</b> V8 is
+ * therefore a statement about what this builder emits, not a proof of impossibility; it is the veto
+ * to lift if that question is ever answered yes.
  */
 @Slf4j
 public final class LiquidateTransactionBuilder {
@@ -278,20 +283,29 @@ public final class LiquidateTransactionBuilder {
                 reason = "the scanner already excludes on §7.5 (LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED)")
         CONVERSION_TO_PRINCIPAL_REQUIRED,
         /**
-         * V8 — the assessment's {@code equity} is positive, and the <em>currently deployed</em>
-         * validators cannot satisfy that in any output order:
-         * {@code lm_liquidate_action.ak:87} reads {@code safe_list_at(assetOutputs, index)} and
-         * requires {@code constants.action_claimed_collateral} in it ({@code :156}), while
-         * {@code loan_claim_action.ak:275-284} reads the same position of the same
-         * {@code get_outputs_to_smart_credential(..)} list and requires
-         * {@code constants.action_partial_liquidation_compensation}. One slot, two mutually exclusive
-         * datums; {@code loan_claim_action.ak:273}'s {@code or { inputAction.equity == 0, .. }} is the
-         * only way through. Pinned by {@code LiquidateDryEvalTest}'s
-         * {@code positiveEquityIsUnsatisfiableBecauseTwoValidatorsClaimTheSameAssetManagerOutputSlot},
-         * which runs both layouts against the deployed scripts at the pin {@code bbe9c1a}.
+         * V8 — the assessment's {@code equity} is positive, and <b>no output layout this builder
+         * emits</b> satisfies both validators of the <em>currently deployed</em> pin {@code ff005fb}.
          * <p>
-         * Deployment-specific rather than eternal: a redeploy that gives the two asset-manager outputs
-         * separate indexes makes positive equity buildable again, and this is the veto to lift.
+         * The two validators reach into the same list — the outputs filtered by
+         * {@code get_outputs_to_smart_credential(..)} — but no longer at the same position:
+         * {@code lm_liquidate_action.ak:87-91} reads
+         * {@code safe_list_at(assetOutputs, safe_list_at(redeemer.assetOutputIndexes, index))} and
+         * requires {@code constants.action_claimed_collateral} in it ({@code :160}), while
+         * {@code loan_claim_action.ak:275-284} still reads {@code index} of that list directly
+         * (unchanged at {@code ff005fb}) and requires
+         * {@code constants.action_partial_liquidation_compensation}. So the redeemer indirection means
+         * the collision is no longer structural. This builder, however, emits identity
+         * {@code assetOutputIndexes} — which puts both validators back on the same slot, wanting
+         * mutually exclusive datums, and {@code loan_claim_action.ak:273}'s
+         * {@code or { inputAction.equity == 0, .. }} is then the only way through. Pinned by
+         * {@code LiquidateDryEvalTest}'s
+         * {@code positiveEquityIsRefusedInBothLayoutsThisBuilderCanEmit}, which runs both layouts
+         * against the deployed scripts.
+         * <p>
+         * <b>Not a proof of impossibility.</b> Whether a non-identity {@code assetOutputIndexes} over
+         * a reordered output list satisfies both validators is untested and deliberately left open;
+         * this veto records what this builder emits. It is the veto to lift if that question is
+         * answered yes, or if a redeploy removes the constraint another way.
          */
         @UnreachableFromScannedBatch(
                 scannerFilter = "LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED",
@@ -468,12 +482,13 @@ public final class LiquidateTransactionBuilder {
      * The same build with V8 — and only V8 — disabled. Package-private, no production caller, and
      * deliberately not part of the public surface.
      * <p>
-     * V8 refuses a positive equity because the <em>deployed</em> validators cannot satisfy one
-     * ({@link Refusal#POSITIVE_EQUITY_UNSUPPORTED}); the transaction it would have built is still the
-     * structurally correct one, and becomes submittable the day FluidTokens redeploys. Two kinds of
-     * test need that transaction to exist: {@code LiquidateDryEvalTest}, which is the <em>evidence</em>
-     * for V8 — it runs both output layouts through the real PlutusV3 machine and shows each validator
-     * refusing the other's — and the structural anatomy tests in
+     * V8 refuses a positive equity because no output layout this builder emits satisfies both
+     * validators of the deployed pin ({@link Refusal#POSITIVE_EQUITY_UNSUPPORTED}); the transaction it
+     * would have built is still the structurally correct one, and becomes submittable the day the
+     * constraint lifts. Two kinds of test need that transaction to exist:
+     * {@code LiquidateDryEvalTest}, which is the <em>evidence</em> for V8 — it runs both output layouts
+     * this builder can emit through the real PlutusV3 machine and shows each validator refusing the
+     * other's — and the structural anatomy tests in
      * {@code LiquidateTransactionBuilderTest}, which pin the equity output's datum, value and place in
      * the body. Routing those through this seam keeps them proving what they proved before V8 existed.
      * <p>
@@ -526,28 +541,41 @@ public final class LiquidateTransactionBuilder {
         // assembled once with placeholder indexes purely to observe the layout, the real indexes
         // are read off that body, and it is assembled again.
         //
+        // The asset-output indexes are observed from the same probe, for the same reason: they too
+        // are positions in the finished body's output sequence (filtered by the asset-manager spend
+        // credential — see assetOutputIndexes), and nothing here may predict where cardano-client-lib
+        // put things. As it happens this builder emits every collateral output before every equity
+        // output, so the answer is currently the identity [0..n-1] — which is exactly why it is
+        // observed rather than written as a literal: an identity that is only true by today's
+        // emission order must not be encoded as if it were a rule.
+        //
         // The two bodies are not identical — only the probe's redeemers hold placeholder indexes, and
         // only the second one is script-costed, so they differ in ex-units, fee and size. So the
         // reason the indexes read off the first are safe to use in the second is NOT that the two
         // bodies are the same: it is V5, which re-derives every index from the FINISHED body and
         // refuses (STRUCTURAL_ASSERTION_FAILED) if any of them points at something other than what
-        // its redeemer claims. The probe is a hint; assertStructure is the guarantee.
+        // its redeemer claims. That holds for the asset-output indexes as much as for the bond-output
+        // ones: V5, not the probe, is the guarantee.
         List<Long> placeholders = LongStream.range(0, loanOrder.size()).boxed().toList();
         // The probe is deliberately not script-costed: its claim redeemers name output indexes that
         // are not the real ones yet, so it is a transaction the validators refuse. See complete().
         Transaction probe = complete(request, assemble(request, loanOrder, bondOrder,
-                claims(loanOrder, refInputs, placeholders), lenderBondInputIndexes, oracles, refInputs,
-                configRefIndex, lmConfigRefIndex), false);
+                claims(loanOrder, refInputs, placeholders), lenderBondInputIndexes, placeholders,
+                oracles, refInputs, configRefIndex, lmConfigRefIndex), false);
 
         List<Long> bondOutputIndexes = locateBondOutputs(probe, loanOrder);
         List<ClaimData> claims = claims(loanOrder, refInputs, bondOutputIndexes);
+        List<Long> assetOutputIndexes = assetOutputIndexes(probe.getBody().getOutputs(),
+                registry.getAssetManagerSpendScriptHash(),
+                loanOrder.stream().map(v -> collateralDatum(v).serializeToHex()).toList());
 
         Transaction transaction = complete(request, assemble(request, loanOrder, bondOrder, claims,
-                lenderBondInputIndexes, oracles, refInputs, configRefIndex, lmConfigRefIndex), true);
+                lenderBondInputIndexes, assetOutputIndexes, oracles, refInputs, configRefIndex,
+                lmConfigRefIndex), true);
 
         // V5 — everything above is re-derived from the finished body and compared.
         assertStructure(transaction, request, loanOrder, bondOrder, claims, lenderBondInputIndexes,
-                refInputs, configRefIndex, lmConfigRefIndex, oracles);
+                assetOutputIndexes, refInputs, configRefIndex, lmConfigRefIndex, oracles);
 
         return transaction;
     }
@@ -597,6 +625,67 @@ public final class LiquidateTransactionBuilder {
                                 .formatted(loan.bond().loanId(), matches.size()));
             }
             indexes.add(matches.getFirst().longValue());
+        }
+        return indexes;
+    }
+
+    /**
+     * Where each loan's claimed-collateral output landed <em>within the asset-manager-filtered
+     * output list</em>, in loan-input order — the fourth field of
+     * {@code LMLiquidateWithdrawRedeemer} at the deployed commit {@code ff005fb}.
+     * <p>
+     * <b>The index is into the filtered list, not into the body.</b> {@code lm_liquidate_action}
+     * reads the output for loan {@code index} as
+     * {@code safe_list_at(assetOutputs, safe_list_at(redeemer.assetOutputIndexes, index))}, where
+     * {@code assetOutputs} is {@code get_outputs_to_smart_credential(self.outputs, ..)} — a
+     * {@code list.filter} over the body that keeps the outputs whose payment credential is the
+     * asset-manager spend script, preserving body order. So this is a position in that filtered
+     * sequence. That is exactly what {@code ClaimData.lenderBondOutputIndex} is <em>not</em>: that one
+     * is an absolute body index. Confusing the two produces a plausible number that aims at the wrong
+     * output, which is why {@code LiquidateTransactionBuilderTest} unit-tests this method on a
+     * synthetic output list where the two answers differ.
+     * <p>
+     * Each loan is located by its collateral datum bytes and nothing else: only the datum says which
+     * loan an asset-manager output descends from, so a match on it is what proves the right loan got
+     * the right slot. Anything ambiguous refuses — a datum matching no filtered output or more than
+     * one, and a result carrying a duplicate. The duplicate case is refused rather than emitted on
+     * purpose: {@code list.unique(redeemer.assetOutputIndexes) == redeemer.assetOutputIndexes} is a
+     * top-level conjunct of the validator precisely because a repeated index is a
+     * double-satisfaction shape, so emitting one would hand the chain the attack it guards against.
+     * Refusing costs a skipped candidate; emitting costs a fee.
+     *
+     * @param collateralDatumHexInLoanOrder one serialized collateral datum per loan, in loan-input
+     *                                      order — the same ordering {@code lenderBondInputIndexes}
+     *                                      and {@code actionsForEachInput} use
+     */
+    static List<Long> assetOutputIndexes(List<TransactionOutput> outputs,
+                                         String assetManagerSpendScriptHash,
+                                         List<String> collateralDatumHexInLoanOrder) {
+        List<TransactionOutput> filtered = outputs.stream()
+                .filter(output -> assetManagerSpendScriptHash.equals(
+                        paymentCredentialOf(output.getAddress())))
+                .toList();
+        List<Long> indexes = new ArrayList<>();
+        for (String datumHex : collateralDatumHexInLoanOrder) {
+            List<Integer> matches = new ArrayList<>();
+            for (int i = 0; i < filtered.size(); i++) {
+                PlutusData datum = filtered.get(i).getInlineDatum();
+                if (datum != null && datum.serializeToHex().equalsIgnoreCase(datumHex)) {
+                    matches.add(i);
+                }
+            }
+            if (matches.size() != 1) {
+                throw refuse(Refusal.STRUCTURAL_ASSERTION_FAILED,
+                        ("collateral datum %s matches %d of the %d asset-manager outputs, expected "
+                                + "exactly one").formatted(datumHex, matches.size(), filtered.size()));
+            }
+            indexes.add(matches.getFirst().longValue());
+        }
+        if (new HashSet<>(indexes).size() != indexes.size()) {
+            throw refuse(Refusal.STRUCTURAL_ASSERTION_FAILED,
+                    ("assetOutputIndexes %s carry a duplicate; lm_liquidate_action's "
+                            + "list.unique(..) == .. conjunct rejects that as a double-satisfaction "
+                            + "shape, so it is refused here rather than emitted").formatted(indexes));
         }
         return indexes;
     }
@@ -790,16 +879,19 @@ public final class LiquidateTransactionBuilder {
         PlutusData bondDatum = roundTrippableBondDatum(bond);
 
         // V8 — last of the per-loan vetoes, and the only one that is a statement about *this
-        // deployment* rather than about the design: lm_liquidate_action and loan_claim_action both
-        // claim the loan-index slot of the same asset-manager-filtered output list and want mutually
-        // exclusive datums in it, so nothing this builder emits can carry a positive equity through
-        // both. See Refusal.POSITIVE_EQUITY_UNSUPPORTED for the file:line references and the dry-eval
-        // test that pins it. Kept last so a batch that is wrong for a permanent reason reports that
-        // permanent reason instead of this transient one.
+        // deployment* rather than about the design: loan_claim_action reads the loan-index slot of the
+        // asset-manager-filtered output list directly while lm_liquidate_action reaches it through
+        // assetOutputIndexes[index], and this builder emits identity indexes — which puts both on the
+        // same slot wanting mutually exclusive datums, so no layout this builder emits carries a
+        // positive equity through both. Whether some other layout would is untested. See
+        // Refusal.POSITIVE_EQUITY_UNSUPPORTED for the file:line references and the dry-eval test that
+        // pins it. Kept last so a batch that is wrong for a permanent reason reports that permanent
+        // reason instead of this transient one.
         if (vetoPositiveEquity && equity.signum() > 0) {
             throw refuse(Refusal.POSITIVE_EQUITY_UNSUPPORTED,
-                    ("loan %s has equity %s; the deployed validators can only satisfy equity == 0, "
-                            + "in any output order").formatted(loan.loanId(), equity));
+                    ("loan %s has equity %s; no output layout this builder emits satisfies both "
+                            + "lm_liquidate_action and loan_claim_action at a positive equity")
+                            .formatted(loan.loanId(), equity));
         }
 
         return new VettedLoan(assessment, loanUtxo, bondUtxo, loan, bond, datum.liquidationMode(),
@@ -1111,6 +1203,7 @@ public final class LiquidateTransactionBuilder {
                               List<VettedLoan> bondOrder,
                               List<ClaimData> claims,
                               List<Long> lenderBondInputIndexes,
+                              List<Long> assetOutputIndexes,
                               List<OracleEntry> oracles,
                               List<TransactionInput> refInputs,
                               int configRefIndex,
@@ -1177,7 +1270,7 @@ public final class LiquidateTransactionBuilder {
                 LiquidationTxEncoder.lenderManagerWithdrawRedeemer(lmConfigRefIndex), request.changeAddress());
         tx.withdraw(rewardAddress(registry.getLmLiquidateActionScriptHash()), BigInteger.ZERO,
                 LiquidationTxEncoder.lmLiquidateWithdrawRedeemer(configRefIndex, lenderBondInputIndexes,
-                        bondAssetNames),
+                        bondAssetNames, assetOutputIndexes),
                 request.changeAddress());
         for (OracleEntry oracle : oracles) {
             tx.withdraw(oracle.rewardAddress(), BigInteger.ZERO, oracleRedeemer(oracle, refInputs),
@@ -1507,6 +1600,7 @@ public final class LiquidateTransactionBuilder {
                                  List<VettedLoan> bondOrder,
                                  List<ClaimData> claims,
                                  List<Long> lenderBondInputIndexes,
+                                 List<Long> assetOutputIndexes,
                                  List<TransactionInput> refInputs,
                                  int configRefIndex,
                                  int lmConfigRefIndex,
@@ -1580,6 +1674,39 @@ public final class LiquidateTransactionBuilder {
                             && bondOutput.getInlineDatum().serializeToHex()
                             .equalsIgnoreCase(bondInput.getInlineDatum()),
                     "bond output %d is not the echo of bond input %s".formatted(i, utxoRef(bondInput)));
+        }
+
+        // ff005fb's fourth LMLiquidateWithdrawRedeemer field. lm_liquidate_action reads the collateral
+        // output for loan `index` as assetOutputs[assetOutputIndexes[index]], where assetOutputs is
+        // the body's outputs filtered by the asset-manager SPEND credential in body order. Everything
+        // below is re-derived from `outputs` — the finished body — and never from the list that was
+        // emitted: comparing the emitted list against itself would be an assertion structurally
+        // incapable of failing, which is the defect class this block exists to avoid.
+        List<TransactionOutput> assetManagerFilteredOutputs = outputs.stream()
+                .filter(output -> registry.getAssetManagerSpendScriptHash()
+                        .equals(paymentCredentialOf(output.getAddress())))
+                .toList();
+        structural(assetOutputIndexes.size() == loanOrder.size(),
+                "assetOutputIndexes has %d entries for %d loan inputs"
+                        .formatted(assetOutputIndexes.size(), loanOrder.size()));
+        structural(new HashSet<>(assetOutputIndexes).size() == assetOutputIndexes.size(),
+                "assetOutputIndexes are not unique: " + assetOutputIndexes);
+        for (int i = 0; i < loanOrder.size(); i++) {
+            VettedLoan loan = loanOrder.get(i);
+            long index = assetOutputIndexes.get(i);
+            structural(index >= 0 && index < assetManagerFilteredOutputs.size(),
+                    "assetOutputIndexes[%d] = %d is outside the %d asset-manager outputs"
+                            .formatted(i, index, assetManagerFilteredOutputs.size()));
+            // Matched on the datum bytes and nothing else: address and value are shared by every
+            // asset-manager output of the batch, so only the datum identifies which loan's collateral
+            // this slot really is.
+            PlutusData datum = assetManagerFilteredOutputs.get((int) index).getInlineDatum();
+            structural(datum != null
+                            && datum.serializeToHex()
+                            .equalsIgnoreCase(collateralDatum(loan).serializeToHex()),
+                    ("assetOutputIndexes[%d] = %d points at an asset-manager output that does not "
+                            + "carry loan %s's claimed-collateral datum")
+                            .formatted(i, index, loan.loan().loanId()));
         }
 
         for (int i = 0; i < loanOrder.size(); i++) {

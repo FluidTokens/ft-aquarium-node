@@ -26,12 +26,29 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * indices and field order. See {@code LoanDatumSchemaTest} for how to regenerate
  * {@code loans-v4-alltypes.plutus.json}; this test reads the exact same fixture rather than a
  * copy of it.
+ * <p>
+ * <b>One test here deliberately does not read that fixture:
+ * {@link #lmLiquidateWithdrawRedeemerFieldOrderMatchesTheContract()} reads the deployed blueprint
+ * {@code src/main/resources/loans-v4.plutus.json} instead.</b> The reason is that
+ * {@code loans-v4-alltypes.plutus.json} predates the deployed commit {@code ff005fb} and still
+ * describes the <em>previous</em> preview deployment: there,
+ * {@code LMLiquidateWithdrawRedeemer} had three fields, and at {@code ff005fb} it has four —
+ * {@code assetOutputIndexes} was added. Pinning the encoder against the stale fixture would pin it
+ * to a redeemer shape the deployed validator destructures as four fields and dies on. The deployed
+ * blueprint carries the four-field definition because {@code lender_manager.ak}'s own validators
+ * expose the type, so it is a schema oracle for this one redeemer without needing a regenerated
+ * all-types build. {@link #theAllTypesOracleIsStillThePreFf005fbOne()} is the tripwire that keeps
+ * this paragraph honest: it asserts the fixture is still the three-field one, so regenerating the
+ * fixture turns it red and forces whoever does it to read this.
  */
 class LiquidationTxEncoderSchemaTest {
 
     private static JsonNode definitions() {
-        try (InputStream is = LiquidationTxEncoderSchemaTest.class
-                .getResourceAsStream("/loans-v4/loans-v4-alltypes.plutus.json")) {
+        return definitions("/loans-v4/loans-v4-alltypes.plutus.json");
+    }
+
+    private static JsonNode definitions(String resource) {
+        try (InputStream is = LiquidationTxEncoderSchemaTest.class.getResourceAsStream(resource)) {
             return new ObjectMapper().readTree(Objects.requireNonNull(is)).get("definitions");
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -39,7 +56,11 @@ class LiquidationTxEncoderSchemaTest {
     }
 
     private static JsonNode constructor(String definition, int index) {
-        for (JsonNode c : definitions().get(definition).get("anyOf")) {
+        return constructor(definitions(), definition, index);
+    }
+
+    private static JsonNode constructor(JsonNode definitions, String definition, int index) {
+        for (JsonNode c : definitions.get(definition).get("anyOf")) {
             if (c.get("index").asInt() == index) {
                 return c;
             }
@@ -110,11 +131,39 @@ class LiquidationTxEncoderSchemaTest {
         assertEquals(1, AuthorizationMethod.CardanoMintScript.class.getRecordComponents().length);
     }
 
+    /**
+     * Read off the <b>deployed</b> blueprint, not the all-types fixture — see this class's javadoc
+     * for why. The fourth field is what a redeemer built at the three-field shape is missing, and
+     * {@code safe_list_at} bottoms out in {@code builtin.head_list}, so the validator does not
+     * report a shape error: it walks off the end of the field list and dies with
+     * {@code Machine(EmptyList(..))} before doing any work.
+     */
     @Test
     void lmLiquidateWithdrawRedeemerFieldOrderMatchesTheContract() {
+        var lm = constructor(definitions("/loans-v4.plutus.json"),
+                "fluidtokens/types/lender_manager/LMLiquidateWithdrawRedeemer", 0);
+        assertEquals(List.of("configRefInputIndex", "lenderBondInputIndexes", "lenderBondAssetNames",
+                        "assetOutputIndexes"),
+                fieldTitles(lm));
+    }
+
+    /**
+     * A staleness tripwire, not a claim about the contract: it asserts that
+     * {@code loans-v4-alltypes.plutus.json} still describes the <em>pre-{@code ff005fb}</em>
+     * deployment, where {@code LMLiquidateWithdrawRedeemer} had three fields.
+     * <p>
+     * It is here to go red. Regenerating the fixture makes it fail, and the failure is the prompt to
+     * read this class's javadoc and repoint
+     * {@link #lmLiquidateWithdrawRedeemerFieldOrderMatchesTheContract()} back at the fixture — and to
+     * re-examine every other test in this file that still reads it, all of which are pinned against a
+     * schema one deployment behind.
+     */
+    @Test
+    void theAllTypesOracleIsStillThePreFf005fbOne() {
         var lm = constructor("fluidtokens/types/lender_manager/LMLiquidateWithdrawRedeemer", 0);
         assertEquals(List.of("configRefInputIndex", "lenderBondInputIndexes", "lenderBondAssetNames"),
-                fieldTitles(lm));
+                fieldTitles(lm),
+                "the all-types fixture has been regenerated — read this class's javadoc");
     }
 
     @Test

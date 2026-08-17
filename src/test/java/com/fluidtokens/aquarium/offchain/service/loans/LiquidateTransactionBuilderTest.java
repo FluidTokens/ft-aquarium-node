@@ -8,13 +8,17 @@ import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
+import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ExUnits;
+import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.AssetManagerDatumWithToken;
@@ -49,6 +53,7 @@ import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -295,7 +300,8 @@ class LiquidateTransactionBuilderTest {
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash()))),
                 "the LenderManager validator is authorised by the LM config, not the main one");
-        assertEquals(hex(LiquidationTxEncoder.lmLiquidateWithdrawRedeemer(0, List.of(0L), List.of(LOAN_ID_A))),
+        assertEquals(hex(LiquidationTxEncoder.lmLiquidateWithdrawRedeemer(0, List.of(0L),
+                        List.of(LOAN_ID_A), List.of(0L))),
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))));
 
@@ -365,8 +371,15 @@ class LiquidateTransactionBuilderTest {
                 inputs, "the fixture must actually interleave loans and bonds");
 
         // loan order is [A, B]; bond order is [B(bb), A(dd)] — so A pairs with bond index 1.
+        //
+        // assetOutputIndexes is [0, 1] while lenderBondInputIndexes is [1, 0], and the difference is
+        // the point of this golden: the bond echoes go out in *bond*-input order, so pairing a loan
+        // with its echo needs the permutation, while the collateral outputs go out in *loan*-input
+        // order, so loan i's collateral is at filtered position i. An implementation that reused the
+        // bond ordering — or simply passed lenderBondInputIndexes twice — would emit [1, 0] here and
+        // this assertion is what catches it.
         assertEquals(hex(LiquidationTxEncoder.lmLiquidateWithdrawRedeemer(0, List.of(1L, 0L),
-                        List.of(LOAN_ID_A, LOAN_ID_B))),
+                        List.of(LOAN_ID_A, LOAN_ID_B), List.of(0L, 1L))),
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))));
 
@@ -394,6 +407,146 @@ class LiquidateTransactionBuilderTest {
                 tx.getBody().getOutputs().get(2).getInlineDatum().serializeToHex().toLowerCase());
 
         assertEquals(2, tx.getBody().getMint().getFirst().getAssets().size(), "both loan NFTs burn");
+    }
+
+    // ======================================================================================
+    // assetOutputIndexes — the fourth LMLiquidateWithdrawRedeemer field at ff005fb
+    // ======================================================================================
+
+    /**
+     * {@link LiquidateTransactionBuilder#assetOutputIndexes} unit-tested on a <b>synthetic</b> output
+     * list it did not build, arranged so that the three plausible wrong implementations each give a
+     * different, wrong answer.
+     * <p>
+     * Body order is {@code [botAddr, collateralB, botAddr, collateralA]} and loan order is
+     * {@code [A, B]}. The asset-manager-filtered list is therefore
+     * {@code [collateralB, collateralA]}, so loan A's collateral is at filtered position 1 and loan
+     * B's at 0 — the correct answer is <b>{@code [1, 0]}</b>:
+     * <ul>
+     *   <li>an implementation returning the identity would give {@code [0, 1]};</li>
+     *   <li>one returning <em>absolute body</em> indexes, the way
+     *       {@code ClaimData.lenderBondOutputIndex} legitimately does, would give {@code [3, 1]} —
+     *       this is the confusion the field is most exposed to, because both fields are "an output
+     *       index" and only one of them is into a filtered list;</li>
+     *   <li>one reusing the bond ordering, or filtering without preserving body order, would give
+     *       something else again.</li>
+     * </ul>
+     * The literal {@code [1, 0]} is asserted rather than a property, so all three fail.
+     */
+    @Test
+    void assetOutputIndexesAreFilteredListPositionsInLoanOrderNotBodyIndexes() {
+        String assetManager = LoanFixtures.entAddress(REGISTRY.getAssetManagerSpendScriptHash());
+        PlutusData collateralA = syntheticCollateralDatum(LOAN_ID_A);
+        PlutusData collateralB = syntheticCollateralDatum(LOAN_ID_B);
+
+        List<TransactionOutput> body = List.of(
+                syntheticOutput(LoanFixtures.botAddress(), null),
+                syntheticOutput(assetManager, collateralB),
+                syntheticOutput(LoanFixtures.botAddress(), null),
+                syntheticOutput(assetManager, collateralA));
+
+        assertEquals(List.of(1L, 0L),
+                LiquidateTransactionBuilder.assetOutputIndexes(body,
+                        REGISTRY.getAssetManagerSpendScriptHash(),
+                        List.of(hex(collateralA), hex(collateralB))),
+                "the index is a position in the asset-manager-filtered list, in loan-input order");
+    }
+
+    /**
+     * The two ambiguous shapes, and the duplicate. All three refuse rather than emit a number: an
+     * ambiguous or absent match means the builder cannot say which slot a loan's collateral is in, and
+     * a duplicate is the double-satisfaction shape {@code lm_liquidate_action}'s
+     * {@code list.unique(assetOutputIndexes) == assetOutputIndexes} conjunct exists to reject —
+     * refusing is recoverable, emitting costs a fee.
+     */
+    @Test
+    void assetOutputIndexesRefusesAnAmbiguousAbsentOrDuplicatedMatch() {
+        String assetManager = LoanFixtures.entAddress(REGISTRY.getAssetManagerSpendScriptHash());
+        PlutusData collateralA = syntheticCollateralDatum(LOAN_ID_A);
+        PlutusData collateralB = syntheticCollateralDatum(LOAN_ID_B);
+        String credential = REGISTRY.getAssetManagerSpendScriptHash();
+
+        // The same datum on two asset-manager outputs: which one is loan A's slot is unanswerable.
+        List<TransactionOutput> twice = List.of(
+                syntheticOutput(assetManager, collateralA),
+                syntheticOutput(assetManager, collateralA));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> LiquidateTransactionBuilder.assetOutputIndexes(twice, credential,
+                                List.of(hex(collateralA)))).getReason());
+
+        // Loan B has no collateral output at all — B's datum sits at the bot address, where the
+        // validator's filter would never look.
+        List<TransactionOutput> absent = List.of(
+                syntheticOutput(assetManager, collateralA),
+                syntheticOutput(LoanFixtures.botAddress(), collateralB));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> LiquidateTransactionBuilder.assetOutputIndexes(absent, credential,
+                                List.of(hex(collateralA), hex(collateralB)))).getReason());
+
+        // Two loans whose collateral datums coincide would resolve to one slot twice — refused, never
+        // emitted, because list.unique(..) == .. is what the validator would reject it with.
+        List<TransactionOutput> oneSlot = List.of(syntheticOutput(assetManager, collateralA));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> LiquidateTransactionBuilder.assetOutputIndexes(oneSlot, credential,
+                                List.of(hex(collateralA), hex(collateralA)))).getReason());
+    }
+
+    /**
+     * The arity pin, read off the <b>deserialised built transaction</b> rather than off the encoder:
+     * an encoder-side assertion would still pass if the builder called the three-argument overload, and
+     * a three-field {@code Constr} is what the deployed {@code lm_liquidate_action} destructures as
+     * four and dies on with {@code Machine(EmptyList(..))} before doing any work.
+     * <p>
+     * Deliberately blunt — constructor 0, exactly four fields, field 3 a list of integers — because it
+     * is meant to survive every change to what the indexes <em>are</em> and only fail if the redeemer
+     * stops having the shape the validator destructures.
+     */
+    @Test
+    void theLmLiquidateRedeemerCarriesFourFieldsEndingInAListOfIntegers() throws Exception {
+        AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
+                100_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+        assertEquals(BigInteger.ZERO, scenario.assessment().equity(), "a plain build, no V8 seam");
+
+        Transaction built = build(List.of(scenario), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
+        Transaction tx = Transaction.deserialize(built.serialize());
+
+        PlutusData data = withdrawRedeemer(tx,
+                LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()));
+        ConstrPlutusData constr = assertInstanceOf(ConstrPlutusData.class, data);
+        assertEquals(0, constr.getAlternative());
+
+        List<PlutusData> fields = constr.getData().getPlutusDataList();
+        assertEquals(4, fields.size(),
+                "LMLiquidateWithdrawRedeemer has four fields at ff005fb, assetOutputIndexes last");
+
+        ListPlutusData assetOutputIndexes = assertInstanceOf(ListPlutusData.class, fields.get(3));
+        List<PlutusData> items = assetOutputIndexes.getPlutusDataList();
+        assertEquals(1, items.size(), "one entry per loan input");
+        items.forEach(item -> assertInstanceOf(BigIntPlutusData.class, item));
+    }
+
+    /** An output the helper can read: only the address and the inline datum are load-bearing. */
+    private static TransactionOutput syntheticOutput(String address, PlutusData inlineDatum) {
+        return TransactionOutput.builder()
+                .address(address)
+                .value(Value.builder().coin(BigInteger.valueOf(2_000_000L)).build())
+                .inlineDatum(inlineDatum)
+                .build();
+    }
+
+    /**
+     * A claimed-collateral datum for {@code loanId}, distinct per loan because it carries the loan's
+     * own id. Built through {@link LiquidationTxEncoder} because the helper under test matches on
+     * exactly these bytes; nothing about the encoder is being pinned here.
+     */
+    private static PlutusData syntheticCollateralDatum(String loanId) {
+        return LiquidationTxEncoder.assetManagerDatumWithToken(new AssetManagerDatumWithToken(
+                TX_LOAN_A, 0, LiquidationTxEncoder.CLAIMED_COLLATERAL_ACTION_HEX,
+                new AssetType(REGISTRY.getLenderBondPolicyId(), loanId)));
     }
 
     // ======================================================================================
@@ -912,15 +1065,18 @@ class LiquidateTransactionBuilderTest {
      * The 200-ADA-collateral scenario the anatomy tests above build — 84.5 ADA of borrower equity —
      * is refused outright on the public entry point.
      * <p>
-     * {@code lm_liquidate_action.ak:87} and {@code loan_claim_action.ak:275-284} index the same
-     * {@code get_outputs_to_smart_credential(..)} list at the same position, the loan's index, and
-     * demand mutually exclusive datums there ({@code action_claimed_collateral} against
-     * {@code action_partial_liquidation_compensation}); {@code LiquidateDryEvalTest} runs both layouts
-     * against the deployed scripts and watches each validator refuse the other's. Nothing here
-     * re-derives that — this test only pins that the builder now refuses instead of building.
+     * {@code lm_liquidate_action.ak:87-91} reaches the {@code get_outputs_to_smart_credential(..)}
+     * list through {@code assetOutputIndexes[index]} while {@code loan_claim_action.ak:275-284} still
+     * indexes it with the bare loan index, and the two demand mutually exclusive datums
+     * ({@code action_claimed_collateral} against {@code action_partial_liquidation_compensation}). The
+     * builder emits identity {@code assetOutputIndexes}, which puts both on the same slot;
+     * {@code LiquidateDryEvalTest} runs both layouts <em>the builder can emit</em> against the deployed
+     * scripts and watches each validator refuse the other's. Nothing here re-derives that — this test
+     * only pins that the builder refuses instead of building.
      * <p>
-     * The refusal is <em>deployment-specific</em>: the same batch built through the seam is still a
-     * well-formed transaction, which is why the anatomy tests keep asserting on it.
+     * The refusal is <em>deployment-specific</em> and scoped to what this builder emits — whether some
+     * other layout satisfies both validators is untested. The same batch built through the seam is
+     * still a well-formed transaction, which is why the anatomy tests keep asserting on it.
      */
     @Test
     void v8RefusesAPositiveEquityTheDeployedValidatorsCannotSatisfy() {
@@ -1654,9 +1810,9 @@ class LiquidateTransactionBuilderTest {
      * Builds through {@link LiquidateTransactionBuilder}'s package-private V8 seam, for the anatomy
      * tests whose scenarios have a positive equity.
      * <p>
-     * V8 refuses those outright, because the <em>deployed</em> validators cannot satisfy a positive
-     * equity in any output order ({@code LiquidateDryEvalTest} is the evidence). The transaction is
-     * still the structurally correct one and becomes submittable the day FluidTokens redeploys, so
+     * V8 refuses those outright, because no output layout this builder emits satisfies a positive
+     * equity on the <em>deployed</em> validators ({@code LiquidateDryEvalTest} is the evidence). The
+     * transaction is still the structurally correct one and becomes submittable the day that lifts, so
      * every claim these tests make about its anatomy — the equity output's datum, its value, its place
      * in the body, the indexes that point at it — is worth keeping exactly as it was. Routing them
      * through the seam preserves them without weakening a single assertion; V8 itself is proven by

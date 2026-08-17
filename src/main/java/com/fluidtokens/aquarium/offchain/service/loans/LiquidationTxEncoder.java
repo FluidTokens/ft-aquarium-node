@@ -52,10 +52,10 @@ public final class LiquidationTxEncoder {
      * lender owes back on a partial liquidation. Same provenance as
      * {@link #CLAIMED_COLLATERAL_ACTION_HEX}.
      * <p>
-     * <b>Arbitrated, indirectly.</b> A positive-equity {@code Liquidate} is not satisfiable at the
-     * deployed pin at all (two validators claim the same asset-manager output slot — see
-     * {@code LiquidateDryEvalTest#positiveEquityIsUnsatisfiableBecauseTwoValidatorsClaimTheSameAssetManagerOutputSlot}),
-     * so it cannot be arbitrated by a passing transaction. It is arbitrated by which validator
+     * <b>Arbitrated, indirectly.</b> No output layout this builder emits carries a positive equity
+     * through both validators (see
+     * {@code LiquidateDryEvalTest#positiveEquityIsRefusedInBothLayoutsThisBuilderCanEmit}), so it
+     * cannot be arbitrated by a passing transaction. It is arbitrated by which validator
      * refuses: with the compensation output in the slot {@code loan_claim_action} reads,
      * {@code loan_claim_action} — whose {@code equity_sent_to_borrower} compares the datum against
      * one carrying {@code constants.action_partial_liquidation_compensation} — accepts it, and the
@@ -129,17 +129,28 @@ public final class LiquidationTxEncoder {
 
     /**
      * {@code LMLiquidateWithdrawRedeemer { configRefInputIndex, lenderBondInputIndexes,
-     * lenderBondAssetNames } } — constructor index 0.
+     * lenderBondAssetNames, assetOutputIndexes } } — constructor index 0.
+     * <p>
+     * {@code assetOutputIndexes} is the fourth and last field, one entry per loan input in
+     * loan-input order, and each entry indexes the outputs <em>filtered</em> by the asset-manager
+     * spend credential rather than the transaction body. Resolving it is
+     * {@code LiquidateTransactionBuilder}'s job, not this class's — see this class's javadoc on
+     * every {@code *Index} parameter being taken as given.
      */
     public static PlutusData lmLiquidateWithdrawRedeemer(long configRefInputIndex,
-            List<Long> lenderBondInputIndexes, List<String> lenderBondAssetNamesHex) {
+            List<Long> lenderBondInputIndexes, List<String> lenderBondAssetNamesHex,
+            List<Long> assetOutputIndexes) {
         var indexes = lenderBondInputIndexes.stream()
                 .map(BigIntPlutusData::of)
                 .toArray(PlutusData[]::new);
         var names = lenderBondAssetNamesHex.stream()
                 .map(LiquidationTxEncoder::hashBytes)
                 .toArray(PlutusData[]::new);
-        return constr(0, BigIntPlutusData.of(configRefInputIndex), list(indexes), list(names));
+        var assetOutputs = assetOutputIndexes.stream()
+                .map(BigIntPlutusData::of)
+                .toArray(PlutusData[]::new);
+        return constr(0, BigIntPlutusData.of(configRefInputIndex), list(indexes), list(names),
+                list(assetOutputs));
     }
 
     // ---- LoanWithdrawRedeemer (action fixed to Claim) ----------------------------------------

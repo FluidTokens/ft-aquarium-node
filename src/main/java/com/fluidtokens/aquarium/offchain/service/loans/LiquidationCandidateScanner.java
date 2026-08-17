@@ -67,8 +67,9 @@ import java.util.stream.Collectors;
  * after D9 rather than before it for a diagnostic reason: {@link LiquidationExclusion#NOT_LIQUIDATABLE}
  * is a fact about the <em>loan</em> (it is healthy, nobody may liquidate it), while
  * {@link LiquidationExclusion#POSITIVE_EQUITY_UNSUPPORTED} is a fact about the <em>deployment</em>
- * (this shape is unsatisfiable until FluidTokens redeploys). Reporting the loan-level truth first
- * keeps the operator-visible reason stable across that redeploy: a healthy loan reads
+ * and about what {@code LiquidateTransactionBuilder} emits against it (no layout it emits satisfies
+ * both validators at a positive equity; whether some other layout would is untested). Reporting the
+ * loan-level truth first keeps the operator-visible reason stable across a redeploy: a healthy loan reads
  * {@code NOT_LIQUIDATABLE} before and after, and only the genuinely blocked candidates change verdict.
  * <p>
  * <b>Ports no arithmetic.</b> Every number in a buildable assessment comes straight out of
@@ -181,14 +182,17 @@ public class LiquidationCandidateScanner {
                     "not late and currentLtv <= liquidationLtv");
         }
 
-        // The deployed lm_liquidate_action and loan_claim_action both claim the loan-index slot of
-        // the same asset-manager-filtered output list and want mutually exclusive datums in it, so a
-        // positive equity is unsatisfiable in any output order — see POSITIVE_EQUITY_UNSUPPORTED for
-        // the two file:line references and the dry-eval test that pins it. Excluded here so such a
-        // candidate never reaches LiquidateTransactionBuilder in the first place.
+        // At the deployed pin, loan_claim_action reads the loan-index slot of the asset-manager-filtered
+        // output list directly while lm_liquidate_action reaches it through assetOutputIndexes[index];
+        // LiquidateTransactionBuilder emits identity indexes, which collapses both onto the same slot
+        // wanting mutually exclusive datums, so no layout it emits carries a positive equity through
+        // both. Whether some other layout would is untested — see POSITIVE_EQUITY_UNSUPPORTED for the
+        // file:line references and the dry-eval test that pins it. Excluded here so such a candidate
+        // never reaches LiquidateTransactionBuilder in the first place.
         if (equity.signum() > 0) {
             return LiquidationAssessment.excluded(bond, loan, LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED,
-                    "equity " + equity + " > 0; the deployed validators can only satisfy equity == 0");
+                    "equity " + equity + " > 0; no output layout the builder emits satisfies both "
+                            + "lm_liquidate_action and loan_claim_action");
         }
 
         // §7.5 fee maths: liquidationFee = loanCollateralAmount * liquidationFeePerMille / 1000, floored.
