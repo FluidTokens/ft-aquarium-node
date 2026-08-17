@@ -16,6 +16,7 @@ import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -25,7 +26,8 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * The offline PlutusV3 dry-evaluation rig used by {@link LiquidateDryEvalTest}.
+ * The offline PlutusV3 dry-evaluation rig used by {@link LiquidateDryEvalTest} and by
+ * {@link RealLoanDryEvalTest}.
  *
  * <h2>What it is for</h2>
  * {@link LiquidateTransactionBuilderTest} proves the transaction has the shape <em>this repo
@@ -126,6 +128,21 @@ final class EvalFixtures {
      * silently evaluating the wrong validator.
      */
     static ScriptSupplier scriptSupplier(LoansContractRegistry registry) {
+        return scriptSupplier(registry, List.of());
+    }
+
+    /**
+     * As above, plus scripts the registry cannot derive — today only the deployed FluidTokens
+     * <b>oracle</b>, which is applied to eight parameter values (verification keys, threshold, the
+     * Charli3 and Orcfax token specs, …) that FluidTokens does not publish, so it cannot be built from
+     * the committed blueprint. {@link RealLoanDryEvalTest} supplies the real applied code instead,
+     * fetched from the reference-script UTxO the oracle registry publishes, and pins its hash.
+     * <p>
+     * Extras are keyed the same way as the registry's own — by {@link PlutusScript#getScriptHash()} —
+     * so an extra whose hash collides with a registry script would replace it rather than shadow it
+     * silently; nothing here relies on that, and the caller's hash assertion is what rules it out.
+     */
+    static ScriptSupplier scriptSupplier(LoansContractRegistry registry, List<PlutusScript> extra) {
         Map<String, PlutusScript> byHash = new LinkedHashMap<>();
         List<PlutusScript> scripts = List.of(
                 registry.getLoanScript(),
@@ -135,7 +152,9 @@ final class EvalFixtures {
                 registry.getLoanClaimActionScript(),
                 registry.getLmLiquidateActionScript(),
                 registry.getAssetManagerScript());
-        for (PlutusScript script : scripts) {
+        List<PlutusScript> all = new ArrayList<>(scripts);
+        all.addAll(extra);
+        for (PlutusScript script : all) {
             try {
                 byHash.put(HexUtil.encodeHexString(script.getScriptHash()), script);
             } catch (Exception e) {
@@ -163,7 +182,12 @@ final class EvalFixtures {
      */
     static List<EvaluationResult> evaluate(Transaction transaction, List<Utxo> universe,
                                            LoansContractRegistry registry) {
-        Outcome outcome = evaluateRaw(transaction, universe, registry);
+        return evaluate(transaction, universe, registry, List.of());
+    }
+
+    static List<EvaluationResult> evaluate(Transaction transaction, List<Utxo> universe,
+                                           LoansContractRegistry registry, List<PlutusScript> extra) {
+        Outcome outcome = evaluateRaw(transaction, universe, registry, extra);
         if (!outcome.successful()) {
             throw new AssertionError("script evaluation failed: " + outcome.detail());
         }
@@ -173,9 +197,14 @@ final class EvalFixtures {
     /** As above, but handing back the outcome — for the cases that must <em>not</em> pass. */
     static Outcome evaluateRaw(Transaction transaction, List<Utxo> universe,
                                LoansContractRegistry registry) {
+        return evaluateRaw(transaction, universe, registry, List.of());
+    }
+
+    static Outcome evaluateRaw(Transaction transaction, List<Utxo> universe,
+                               LoansContractRegistry registry, List<PlutusScript> extra) {
         UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(universe);
         AikenTransactionEvaluator evaluator = new AikenTransactionEvaluator(
-                utxoSupplier, protocolParams(), scriptSupplier(registry), SlotConfigs.preview());
+                utxoSupplier, protocolParams(), scriptSupplier(registry, extra), SlotConfigs.preview());
         Set<Utxo> inputUtxos = new LinkedHashSet<>(universe);
         try {
             Result<List<EvaluationResult>> result = evaluator.evaluateTx(transaction.serialize(), inputUtxos);

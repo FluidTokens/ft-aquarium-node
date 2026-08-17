@@ -47,10 +47,12 @@ import java.util.Optional;
  *       ({@code lib/fluidtokens/oracle.ak:39-50}); repo convention per
  *       {@code LoanFixtures.loanDatum}</td></tr>
  *   <tr><td>{@code commonData.interestRate}</td><td>{@code 0}</td>
- *       <td>with {@code apyIncreaseLinearCoefficient = 0} the remaining debt is time-independent —
- *       what the liquidation builder's V4 needs (the same number at both ends of the validity
- *       window). A non-zero rate makes {@code remainingDebt} a continuous function of wall-clock
- *       time and V4 refuses.</td></tr>
+ *       <td>with {@code apyIncreaseLinearCoefficient = 0} the remaining debt is time-independent,
+ *       which keeps the origination fixtures' arithmetic trivial. <b>Corrected T-021:</b> this used
+ *       to add that a non-zero rate "makes {@code remainingDebt} a continuous function of wall-clock
+ *       time and V4 refuses" — V4 no longer does. The validator derives the debt from
+ *       {@code validFrom - lendDate} alone, so a drifting rate is buildable; see
+ *       {@code LiquidateTransactionBuilder.assertHealthReproducesAndIsLiquidatableOverWindow}.</td></tr>
  *   <tr><td>{@code commonData.installmentPeriod}</td><td>{@code 0}</td>
  *       <td>perpetual, no installments; liquidation is LTV-driven</td></tr>
  *   <tr><td>{@code commonData.totalInstallments}</td><td>{@code 0}</td><td>ignored for perpetual</td></tr>

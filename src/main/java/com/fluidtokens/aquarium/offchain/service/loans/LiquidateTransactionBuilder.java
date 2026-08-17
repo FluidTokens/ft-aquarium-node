@@ -100,10 +100,14 @@ import java.util.stream.Stream;
  *       <em>whole</em> transaction window (never {@code usableAt}: the chain checks containment of
  *       the interval, not of an instant), with at least the caller's margin of window left after
  *       {@code validTo}.</li>
- *   <li><b>V4</b> — {@code LoanFinance.remainingDebt} must equal the assessment's number at both
- *       ends of the window, and {@code late || can_liquidate} must hold at both ends. The chain's
- *       evaluation bound is not knowable off chain, so invariance across the interval is demanded
- *       rather than agreement at one point.</li>
+ *   <li><b>V4</b> — {@code LoanFinance.remainingDebt} and the redeemer's {@code equity} must equal
+ *       the assessment's numbers at {@code validFrom}, the one instant the validator derives them
+ *       from ({@code validFrom - datum.lendDate}); {@code late || can_liquidate} must additionally
+ *       hold at both ends of the window, because that leg consumes the oracle feeds and the feeds
+ *       must span the interval. Both ends used to be demanded for the debt too, on a premise that
+ *       turned out to be false — see
+ *       {@code assertHealthReproducesAndIsLiquidatableOverWindow} for the correction and its
+ *       source evidence.</li>
  *   <li><b>V5</b> — structural assertions re-read off the <em>built</em> transaction body: index
  *       uniqueness and counts (D5), byte-identical bond echo (D6), asset-manager output shape
  *       (D7), and that every index in every redeemer points at what it claims.</li>
@@ -214,7 +218,13 @@ public final class LiquidateTransactionBuilder {
         NEGATIVE_LIQUIDATION_FEE,
         /** V4 — the fee in the assessment is not the one the bond's per-mille rate produces. */
         LIQUIDATION_FEE_NOT_REPRODUCIBLE,
-        /** V4 — the equity in the assessment is not the one the loan and the feeds produce. */
+        /**
+         * V4 — the equity in the assessment is not the one the loan and the feeds produce at
+         * {@code validFrom}. Same instant as {@link #REMAINING_DEBT_NOT_INVARIANT}, and for the same
+         * reason: {@code get_equity}/{@code get_equity_in_collateral_currency} take no time argument
+         * at all, so every bit of time dependence they have arrives through the {@code validFrom}
+         * debt they are handed.
+         */
         EQUITY_NOT_REPRODUCIBLE,
         /** No oracle entry was supplied for a non-ada leg. */
         ORACLE_ENTRY_MISSING,
@@ -246,7 +256,13 @@ public final class LiquidateTransactionBuilder {
         ORACLE_FEED_NOT_USABLE_OVER_WINDOW,
         /** V3 — too little of the feed's window is left after {@code validTo}. */
         ORACLE_WINDOW_MARGIN_TOO_SMALL,
-        /** V4 — the debt is not the same at both ends of the window, or differs from the assessment. */
+        /**
+         * V4 — the debt the assessment carries is not the one the loan datum produces at
+         * {@code validFrom}, which is the only instant the validator computes it at
+         * ({@code loan_claim_action.ak:212-222,229} at {@code ff005fb}). The name says
+         * "NOT_INVARIANT" for history's sake — this used to be a both-ends comparison; see
+         * {@code assertHealthReproducesAndIsLiquidatableOverWindow} for why that premise was wrong.
+         */
         REMAINING_DEBT_NOT_INVARIANT,
         /** V4 — D9's {@code late || can_liquidate} does not hold across the whole window. */
         NOT_LIQUIDATABLE_OVER_WINDOW,
@@ -870,8 +886,8 @@ public final class LiquidateTransactionBuilder {
 
         // V4 — the guards. These recomputations never replace the assessment's numbers (D8);
         // disagreement refuses the batch.
-        BigInteger recomputedEquity = assertHealthInvariantOverWindow(loan, remainingDebt, equity,
-                principal, collateral, validFrom, validTo);
+        BigInteger recomputedEquity = assertHealthReproducesAndIsLiquidatableOverWindow(loan,
+                remainingDebt, equity, principal, collateral, validFrom, validTo);
 
         // V6 — the collateral outputs carry the lender's stake part, so it has to be decodable.
         String assetManagerAddress = assetManagerAddress(bond);
@@ -970,60 +986,96 @@ public final class LiquidateTransactionBuilder {
     /**
      * V4. Recomputes the debt, the equity and D9's liquidatability from the loan datum and the
      * redeemer's own feeds, and refuses if any of them disagrees with what the assessment carries.
-     * <p>
-     * Two separate reasons for demanding agreement at <em>both</em> ends of the window: the chain
-     * evaluates the loan's finance at some point of the validity interval and this side cannot know
-     * which, so a number that moves in between makes the assessment unusable; and an assessment that
-     * simply does not reproduce — a stale one, or one whose numbers were tampered with between the
-     * scan and the build — must never be turned into a transaction. {@code equity} and
-     * {@code remainingDebt} go into the redeemer <em>verbatim</em> either way (D8); this method
-     * never substitutes its own values for them, it only refuses. Both comparisons are against the
-     * values the caller is about to use, so nothing can quietly swap a recomputed number in.
+     * {@code equity} and {@code remainingDebt} go into the redeemer <em>verbatim</em> (D8); this
+     * method never substitutes its own values for them, it only refuses. Every comparison is against
+     * the values the caller is about to use, so nothing can quietly swap a recomputed number in.
      *
-     * @return the recomputed equity, for the post-assembly assertions to compare against
+     * <h3>The debt and the equity are checked at {@code validFrom} only — and the old both-ends rule
+     * was resting on a false premise</h3>
+     * This method used to recompute the debt at both ends of the validity interval and refuse when
+     * the two differed, on the reasoning that "the chain evaluates the loan's finance at some point
+     * of the validity interval and this side cannot know which". <b>That reasoning is wrong for this
+     * field.</b> {@code loan_claim_action.ak:212-222} ({@code ff005fb}) computes
+     * <pre>
+     *   get_remaining_debt(.., validFrom - datum.lendDate)
+     * </pre>
+     * and {@code loan_claim_action.ak:229} then demands {@code remainingDebt == inputAction.remainingDebt}.
+     * {@code validFrom} is the <em>lower bound of the validity interval this transaction sets</em>
+     * ({@code loan_claim_action.ak:86} destructures it out of {@code self.validity_range}), not the
+     * chain's evaluation point: it is a number we choose and the ledger merely enforces. So the debt
+     * the validator computes is a deterministic function of an input we control, one figure matches
+     * exactly at any window length, and the old rule was refusing transactions the chain would have
+     * accepted — every loan with a non-zero perpetual {@code interestRate}, whose debt drifts by a
+     * few lovelace across a two-minute window.
+     * <p>
+     * The same narrowing applies to {@code equity}, and from the same evidence rather than by
+     * assumed symmetry: {@code get_equity} and {@code get_equity_in_collateral_currency}
+     * ({@code lib/fluidtokens/finance.ak:348,381}) take <em>no time argument at all</em>. Their
+     * inputs are the collateral amount, the two feed prices, the datum's penalty per mille — all
+     * time-independent — and the remaining debt, which {@code loan_claim_action.ak:212-222} hands
+     * them at {@code validFrom}. Every bit of time dependence they have arrives through that one
+     * figure.
+     * <p>
+     * This is a narrowing of <em>when</em> the two refusals fire, not a removal: a debt or an equity
+     * that does not reproduce at {@code validFrom} — a stale assessment, or one whose numbers were
+     * tampered with between the scan and the build — still refuses.
+     *
+     * <h3>D9's liquidatability stays checked at both ends</h3>
+     * Deliberately not narrowed. {@code late || can_liquidate} ({@code loan_claim_action.ak:230-239})
+     * consumes the two oracle price feeds, and {@code retrieve_oracle_data}
+     * ({@code lib/fluidtokens/oracle.ak}) is passed <em>both</em> {@code validFrom} and
+     * {@code validTo} and requires the feed's own window to span the interval — so a feed genuinely
+     * has to hold across the whole window for this leg, and being conservative about the interval it
+     * is read over costs nothing. That is V3's concern; this leg is left exactly as it was.
+     *
+     * @return the recomputed equity at {@code validFrom}, for the post-assembly assertions to
+     *         compare against
      */
-    private static BigInteger assertHealthInvariantOverWindow(Loan loan, BigInteger remainingDebt,
-                                                              BigInteger equity, Leg principal,
-                                                              Leg collateral, long validFrom, long validTo) {
-        BigInteger recomputedEquityAtValidFrom = null;
+    private static BigInteger assertHealthReproducesAndIsLiquidatableOverWindow(
+            Loan loan, BigInteger remainingDebt, BigInteger equity, Leg principal, Leg collateral,
+            long validFrom, long validTo) {
+        BigInteger recomputed;
+        BigInteger recomputedEquity;
+        try {
+            recomputed = LoanFinance.remainingDebt(loan.datum(), validFrom);
+            recomputedEquity = LoanFinance.redeemerEquity(liquidationOf(loan),
+                    Rational.fromInt(loan.collateralAmount()), Rational.fromInt(recomputed),
+                    principal.feed(), collateral.feed());
+        } catch (ArithmeticException e) {
+            throw refuse(Refusal.HEALTH_NOT_COMPUTABLE,
+                    "loan %s at %d: %s".formatted(loan.loanId(), validFrom, e.getMessage()), e);
+        }
+        if (!recomputed.equals(remainingDebt)) {
+            throw refuse(Refusal.REMAINING_DEBT_NOT_INVARIANT,
+                    "loan %s: remainingDebt is %s at validFrom %d but the redeemer carries %s"
+                            .formatted(loan.loanId(), recomputed, validFrom, remainingDebt));
+        }
+        if (!recomputedEquity.equals(equity)) {
+            throw refuse(Refusal.EQUITY_NOT_REPRODUCIBLE,
+                    "loan %s: equity is %s at validFrom %d but the redeemer carries %s"
+                            .formatted(loan.loanId(), recomputedEquity, validFrom, equity));
+        }
+
         for (long at : new long[]{validFrom, validTo}) {
-            BigInteger recomputed;
-            BigInteger recomputedEquity;
             boolean liquidatable;
             try {
-                recomputed = LoanFinance.remainingDebt(loan.datum(), at);
-                boolean late = LoanFinance.isRepaymentLate(loan.datum(), at);
-                Rational debt = Rational.fromInt(recomputed);
+                Rational debt = Rational.fromInt(LoanFinance.remainingDebt(loan.datum(), at));
                 Rational collateralAmount = Rational.fromInt(loan.collateralAmount());
+                boolean late = LoanFinance.isRepaymentLate(loan.datum(), at);
                 // D9 / loan_claim_action.ak:230 — `or { isRepaymentLate, can_liquidate }`.
                 liquidatable = late || LoanFinance.canLiquidate(debt, collateralAmount,
                         LoanFinance.liquidationLtv(liquidationOf(loan)), principal.feed(), collateral.feed());
-                recomputedEquity = LoanFinance.redeemerEquity(liquidationOf(loan), collateralAmount, debt,
-                        principal.feed(), collateral.feed());
             } catch (ArithmeticException e) {
                 throw refuse(Refusal.HEALTH_NOT_COMPUTABLE,
                         "loan %s at %d: %s".formatted(loan.loanId(), at, e.getMessage()), e);
-            }
-            if (!recomputed.equals(remainingDebt)) {
-                throw refuse(Refusal.REMAINING_DEBT_NOT_INVARIANT,
-                        "loan %s: remainingDebt is %s at %d but the redeemer carries %s"
-                                .formatted(loan.loanId(), recomputed, at, remainingDebt));
-            }
-            if (!recomputedEquity.equals(equity)) {
-                throw refuse(Refusal.EQUITY_NOT_REPRODUCIBLE,
-                        "loan %s: equity is %s at %d but the redeemer carries %s"
-                                .formatted(loan.loanId(), recomputedEquity, at, equity));
             }
             if (!liquidatable) {
                 throw refuse(Refusal.NOT_LIQUIDATABLE_OVER_WINDOW,
                         "loan %s is neither late nor over its liquidation ltv at %d"
                                 .formatted(loan.loanId(), at));
             }
-            if (recomputedEquityAtValidFrom == null) {
-                recomputedEquityAtValidFrom = recomputedEquity;
-            }
         }
-        return recomputedEquityAtValidFrom;
+        return recomputedEquity;
     }
 
     private static LiquidationMode.Liquidation liquidationOf(Loan loan) {

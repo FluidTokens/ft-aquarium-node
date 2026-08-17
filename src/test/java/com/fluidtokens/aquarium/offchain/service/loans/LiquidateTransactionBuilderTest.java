@@ -26,9 +26,11 @@ import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationExclusion;
+import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
@@ -824,16 +826,65 @@ class LiquidateTransactionBuilderTest {
     }
 
     // ======================================================================================
-    // V4 — the health guards, at both ends of the window
+    // V4 — the health guards: debt and equity at validFrom, liquidatability over the window
     // ======================================================================================
 
     /**
-     * A perpetual loan's debt grows with time, so an assessment taken at {@code validFrom} is already
-     * stale at {@code validTo}. The chain's evaluation point is unknown, so the batch is refused
-     * rather than gambled on.
+     * A drifting debt is <b>buildable</b>, and this test used to assert the opposite.
+     *
+     * <h3>What changed and why the old assertion was wrong</h3>
+     * V4 used to recompute the debt at both ends of the validity interval and refuse when the two
+     * differed, because "the chain's evaluation point is unknown". It is not unknown:
+     * {@code loan_claim_action.ak:212-222} ({@code ff005fb}) computes
+     * {@code get_remaining_debt(.., validFrom - datum.lendDate)}, and {@code validFrom} is the lower
+     * bound of the validity interval <em>this transaction sets</em> ({@code loan_claim_action.ak:86}).
+     * One figure, computed at an instant we choose, matches exactly at any window length. The old
+     * rule therefore refused transactions the chain would have accepted — every loan with a non-zero
+     * perpetual {@code interestRate}.
+     *
+     * <h3>The fixture drifts for real</h3>
+     * A perpetual loan at 10% over a 50-minute window. The drift is asserted rather than assumed: a
+     * fixture whose debt happened not to move would make this test vacuous, and would have passed
+     * under the old rule too.
      */
     @Test
-    void v4RefusesADebtThatMovesInsideTheValidityWindow() {
+    void v4AcceptsADebtThatDriftsInsideTheValidityWindowBecauseTheChainReadsItAtValidFrom() {
+        long validTo = VALID_FROM + 3_000_000L;
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(),
+                new RepaymentMode.PerpetualLoan(BigInteger.ZERO, BigInteger.ZERO), false);
+        AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L,
+                BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        assertNotEquals(LoanFinance.remainingDebt(datum, VALID_FROM),
+                LoanFinance.remainingDebt(datum, validTo),
+                "the fixture must really drift, or this test proves nothing about the narrowing");
+        assertEquals(LoanFinance.remainingDebt(datum, VALID_FROM), scenario.assessment().remainingDebt(),
+                "the assessment is the one the scanner would take, at validFrom");
+        assertEquals(BigInteger.ZERO, scenario.assessment().equity(),
+                "zero equity keeps V8 out of the way, so the outcome is V4's alone");
+
+        Transaction tx = builder(List.of(scenario), Map.of()).build(
+                request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM, validTo,
+                        LiquidateTransactionBuilder.ReferenceScripts.none()));
+        assertNotNull(tx, "a drifting debt assessed at validFrom is buildable");
+    }
+
+    /**
+     * The original fixture of the test above, kept verbatim — 200 ADA of collateral against 100 ADA
+     * of drifting perpetual principal — and re-pinned.
+     * <p>
+     * It used to refuse {@code REMAINING_DEBT_NOT_INVARIANT}. Now the debt reproduces at
+     * {@code validFrom}, and so does the equity: {@code get_equity_in_collateral_currency}
+     * ({@code lib/fluidtokens/finance.ak:381}) takes no time argument, so its only time-varying input
+     * is the {@code validFrom} debt it is handed. Both V4 legs pass, and what refuses instead is V8 —
+     * the positive-equity layout gap, which is a statement about the deployed validators and has
+     * nothing to do with the window. That the reason moved from a V4 refusal to a V8 one is the
+     * clearest single demonstration that <em>both</em> narrowings took effect on the same fixture.
+     */
+    @Test
+    void v4NoLongerRefusesTheDriftingDebtFixtureAndV8IsWhatStopsIt() {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
                 BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
                 LoanFixtures.liquidation(),
@@ -841,9 +892,125 @@ class LiquidateTransactionBuilderTest {
         AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 200_000_000L,
                 BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
 
-        // A 50-minute window is enough for the perpetual interest to move by more than a lovelace.
-        assertEquals(LiquidateTransactionBuilder.Refusal.REMAINING_DEBT_NOT_INVARIANT,
+        assertTrue(scenario.assessment().equity().signum() > 0,
+                "the fixture must carry a positive — and therefore drifting — equity");
+        assertEquals(LiquidateTransactionBuilder.Refusal.POSITIVE_EQUITY_UNSUPPORTED,
                 refusal(List.of(scenario), Map.of(), MARGIN, VALID_FROM, VALID_FROM + 3_000_000L));
+    }
+
+    /**
+     * The narrowing is anchored at {@code validFrom}, not merely loosened: an assessment carrying the
+     * debt at {@code validTo} — the shape a scan taken one window later would produce — still
+     * refuses. Deleting the comparison altogether, or moving it to "any point in the window", would
+     * make this test pass silently.
+     */
+    @Test
+    void v4RefusesADebtTakenAtValidToRatherThanAtValidFrom() {
+        long validTo = VALID_FROM + 3_000_000L;
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(),
+                new RepaymentMode.PerpetualLoan(BigInteger.ZERO, BigInteger.ZERO), false);
+        AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L,
+                BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        AdaScenario stale = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
+                LoanFinance.remainingDebt(datum, validTo), scenario.assessment().equity(),
+                scenario.assessment().liquidationFee()));
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.REMAINING_DEBT_NOT_INVARIANT,
+                refusal(List.of(stale), Map.of(), MARGIN, VALID_FROM, validTo));
+    }
+
+    /**
+     * Same anchoring for {@code equity}: the equity the loan produces from the {@code validTo} debt is
+     * refused, even though it is a perfectly self-consistent number at the other end of the window.
+     * <p>
+     * The fixture has a positive equity so that the figure can drift at all, which means V8 would
+     * refuse it too — but V4 runs first, so the reason asserted here is V4's, and it is the reason
+     * that would disappear if the equity comparison were dropped rather than narrowed.
+     */
+    @Test
+    void v4RefusesAnEquityTakenAtValidToRatherThanAtValidFrom() {
+        long validTo = VALID_FROM + 3_000_000L;
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(),
+                new RepaymentMode.PerpetualLoan(BigInteger.ZERO, BigInteger.ZERO), false);
+        AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 200_000_000L,
+                BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        BigInteger equityAtValidTo = LoanFinance.redeemerEquity(LoanFixtures.liquidation(),
+                Rational.fromInt(BigInteger.valueOf(200_000_000)),
+                Rational.fromInt(LoanFinance.remainingDebt(datum, validTo)),
+                OraclePriceFeed.unit(), OraclePriceFeed.unit());
+        assertNotEquals(scenario.assessment().equity(), equityAtValidTo,
+                "the fixture's equity must really drift across the window");
+
+        AdaScenario stale = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
+                scenario.assessment().remainingDebt(), equityAtValidTo,
+                scenario.assessment().liquidationFee()));
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.EQUITY_NOT_REPRODUCIBLE,
+                refusal(List.of(stale), Map.of(), MARGIN, VALID_FROM, validTo));
+    }
+
+    /**
+     * {@code NOT_LIQUIDATABLE_OVER_WINDOW} is <b>still checked at both ends</b>, and this is the only
+     * fixture shape under which that is observable.
+     *
+     * <h3>Why the fixture is strange, and why it has to be</h3>
+     * {@code late || can_liquidate} is monotone non-decreasing in time for every ordinary loan: a
+     * perpetual debt only grows ({@code lib/fluidtokens/finance.ak:209-247}), an installment debt does
+     * not move at all, and {@code is_repayment_late} only ever flips false-to-true. Under monotonicity
+     * "liquidatable at {@code validFrom}" implies "liquidatable at {@code validTo}", so the second
+     * iteration of the loop can never be the one that refuses, and a window check is
+     * indistinguishable from a {@code validFrom}-only check.
+     * <p>
+     * A <em>negative</em> {@code interestRate} breaks the monotonicity — the datum field is a plain
+     * {@code Int} and nothing on chain constrains its sign — so the debt shrinks with time and the
+     * loan heals during the window. That is the mutant: liquidatable at {@code validFrom}
+     * (ltv 1.30 against a 1.20 threshold), healthy at {@code validTo} (ltv 1.10). A narrowing of this
+     * leg to {@code validFrom} would build it; the unchanged window check refuses it.
+     * <pre>
+     *   principal 200 ADA, interestRate -10_512_000 (c = -1051.2), perpetual, m = 0
+     *   lendDate  NOW - 10_500_000 ms (2.9166 h)   collateral 100 ADA   ltv 1200/1000
+     *   debt at validFrom  200e6 * (1 - 0.35) = 130_000_000   -> ltv 1.30 > 1.20  liquidatable
+     *   debt at validTo    200e6 * (1 - 0.45) = 110_000_000   -> ltv 1.10 &lt; 1.20  healthy
+     * </pre>
+     */
+    @Test
+    void v4StillRefusesALoanThatHealsBeforeValidTo() {
+        long validTo = VALID_FROM + 3_000_000L;
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(200_000_000),
+                BigInteger.valueOf(-10_512_000), LoanFixtures.adaCollateral(), NOW - 10_500_000L,
+                new LiquidationMode.Liquidation(
+                        BigInteger.valueOf(1200), BigInteger.valueOf(1000), BigInteger.valueOf(50), false),
+                new RepaymentMode.PerpetualLoan(BigInteger.ZERO, BigInteger.ZERO), false);
+        AdaScenario scenario = adaScenarioFrom(datum, LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L,
+                BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        // The fixture is only a proof if the two ends really disagree — pinned here off LoanFinance,
+        // which is the same port the builder itself calls.
+        assertEquals(BigInteger.valueOf(130_000_000), LoanFinance.remainingDebt(datum, VALID_FROM));
+        assertEquals(BigInteger.valueOf(110_000_000), LoanFinance.remainingDebt(datum, validTo));
+        assertFalse(LoanFinance.isRepaymentLate(datum, validTo), "lateness would mask the ltv leg");
+        assertTrue(liquidatableAt(datum, VALID_FROM), "liquidatable at validFrom");
+        assertFalse(liquidatableAt(datum, validTo), "and healthy again by validTo");
+        assertEquals(BigInteger.ZERO, scenario.assessment().equity(),
+                "zero equity keeps V8 from masking the reason under test");
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.NOT_LIQUIDATABLE_OVER_WINDOW,
+                refusal(List.of(scenario), Map.of(), MARGIN, VALID_FROM, validTo));
+    }
+
+    /** D9's {@code late || can_liquidate} for the ada/ada fixtures, at 100 ADA of collateral. */
+    private static boolean liquidatableAt(LoanDatum datum, long at) {
+        var liquidation = (LiquidationMode.Liquidation) datum.liquidationMode();
+        return LoanFinance.isRepaymentLate(datum, at)
+                || LoanFinance.canLiquidate(Rational.fromInt(LoanFinance.remainingDebt(datum, at)),
+                Rational.fromInt(BigInteger.valueOf(100_000_000)),
+                LoanFinance.liquidationLtv(liquidation), OraclePriceFeed.unit(), OraclePriceFeed.unit());
     }
 
     /**

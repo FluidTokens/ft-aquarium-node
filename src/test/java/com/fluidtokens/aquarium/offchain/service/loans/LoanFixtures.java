@@ -258,9 +258,15 @@ public final class LoanFixtures {
     // ---- datums ------------------------------------------------------------------------------
 
     /**
-     * A late, installment-repaid loan: {@code PrincipalAndInterestOnInstallments} makes the
-     * remaining debt time-independent, which is what lets a fixture satisfy V4's demand that the
-     * number be the same at both ends of the validity window.
+     * A late, installment-repaid loan. {@code PrincipalAndInterestOnInstallments} makes the remaining
+     * debt time-independent, which keeps most fixtures' arithmetic easy to read.
+     * <p>
+     * <b>No longer a requirement, as of T-021.</b> This javadoc used to say time-independence was
+     * "what lets a fixture satisfy V4's demand that the number be the same at both ends of the
+     * validity window". V4 no longer demands that: the validator derives the debt from
+     * {@code validFrom - datum.lendDate} alone ({@code loan_claim_action.ak:212-222} at
+     * {@code ff005fb}), so a drifting perpetual debt is buildable. See
+     * {@code LiquidateTransactionBuilder.assertHealthReproducesAndIsLiquidatableOverWindow}.
      */
     public static LoanDatum loanDatum(AssetType principalAsset,
                                       BigInteger principalAmount,
