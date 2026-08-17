@@ -61,6 +61,16 @@ class LoansContractDerivationTest {
     private static final String POOL_MANAGER_POLICY_ID = "b2324fbdcace499f6f1a9599daaebd707eb0ca70edbd6676fa20520b";
     private static final String LOCKED_BORROWER_MANAGER_SPEND = "b0e010c5d8cf28b20d7dfb14e109d19632c2590b0057e40f6a7433fa";
 
+    /**
+     * Bond policy ids, read from the {@code ConfigDatum} (output 0 of {@code 7374a985…e781}): the
+     * borrower bond sits at datum index 4, the lender bond at index 5 (see
+     * {@code LoansConfigVerifier}'s {@code CFG_BORROWER_BOND_POLICY_ID} / {@code CFG_LENDER_BOND_POLICY_ID}).
+     * {@code bond.ak} is parameterised only by the borrower/lender discriminator Int, so neither hash
+     * moves across a config-NFT redeploy. Transcribed from the live datum, not from the derivation.
+     */
+    private static final String BORROWER_BOND_POLICY_ID = "eadc69a5d2d1357acc9b9d49ec5390fcdf6e080c7a40139917223dcb";
+    private static final String LENDER_BOND_POLICY_ID = "bcd713bb7858d4b08738bed90ee7068d8f9b38d02e0cae0b45ac7a9b";
+
     // ---- Ground truth: LMConfigDatum, output 1 of 7374a985…e781 --------------------------
 
     private static final String LM_WITHDRAW_BONDS_ACTION = "353c844023c794304d28cfe882848df514ef20a40edf12d96a0fcff6";
@@ -182,6 +192,26 @@ class LoansContractDerivationTest {
                 "lender_manager/lm_liquidate_action");
         assertScript(r.getAssetManagerScript(), r.getAssetManagerWithdrawScriptHash(),
                 "asset_manager.assetManager");
+    }
+
+    /**
+     * The six pool/bond accessors added for T-016 S1 hand out the applied {@code PlutusScript} the
+     * pool-origination fixtures attach to a transaction. Each is the same applied compiled code its
+     * pinned hash was taken from, so — exactly as {@link #everyExposedScriptHashesToItsDerivedHash} —
+     * the script must hash back to its own published hash, and all must be PlutusV3. The bond hashes
+     * come off the {@code ConfigDatum}, the four pool hashes off the same datum's pool fields; none is
+     * a new derivation.
+     */
+    @Test
+    void everyPoolAndBondScriptHashesToItsDerivedHash() {
+        LoansContractRegistry r = registry(SMART_TOKENS_SPEND);
+
+        assertScript(r.getPoolScript(), POOL_POLICY_ID, "pool.pool");
+        assertScript(r.getPoolSpendScript(), POOL_SPEND, "pool general_spend");
+        assertScript(r.getPoolBorrowActionScript(), POOL_BORROW_ACTION, "pool/pool_borrow_action");
+        assertScript(r.getPoolCancelActionScript(), POOL_CANCEL_ACTION, "pool/pool_cancel_action");
+        assertScript(r.getLenderBondScript(), LENDER_BOND_POLICY_ID, "bond.bond(1)");
+        assertScript(r.getBorrowerBondScript(), BORROWER_BOND_POLICY_ID, "bond.bond(0)");
     }
 
     /** The scripts must also come up without smartTokensSpendScriptHash, like the hashes do. */

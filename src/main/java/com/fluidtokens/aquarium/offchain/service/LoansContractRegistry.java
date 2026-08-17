@@ -315,6 +315,14 @@ public class LoansContractRegistry {
     // a Cancel spends the request UTxO, so it needs the `general_spend` *wrapper* the UTxO sits at
     // as well as the policy — three script purposes, two distinct scripts.
     //
+    // The last six — `getPoolScript()`, `getPoolSpendScript()`, `getPoolBorrowActionScript()`,
+    // `getPoolCancelActionScript()`, `getLenderBondScript()`, `getBorrowerBondScript()` — are
+    // `src/test`-only too, serving the T-016 S1 pool-origination fixtures. Each delegates to
+    // `scriptOf(<existing hash field>)`; none introduces a new derivation or a new field. Pool
+    // creation, borrowing and cancelling are not things the node does either — it indexes pools
+    // and liquidates loans — so these stay out of every `src/main` code path for the same reason
+    // the request accessors do.
+    //
     // Every one of them is the same applied compiled code the hash above was taken from, so
     // `script.getScriptHash()` is the matching `…ScriptHash`/`…PolicyId` by construction rather
     // than by coincidence (asserted in LoansContractDerivationTest).
@@ -362,6 +370,36 @@ public class LoansContractRegistry {
     /** The request {@code general_spend} wrapper — the spending validator request UTxOs sit at. */
     public PlutusScript getRequestSpendScript() {
         return scriptOf(requestSpendScriptHash);
+    }
+
+    /** {@code pool.pool} — simultaneously the pool minting policy and the pool withdraw script. */
+    public PlutusScript getPoolScript() {
+        return scriptOf(poolPolicyId);
+    }
+
+    /** The pool {@code general_spend} wrapper — the spending validator pool UTxOs sit at. */
+    public PlutusScript getPoolSpendScript() {
+        return scriptOf(poolSpendScriptHash);
+    }
+
+    /** {@code pool/pool_borrow_action} — the withdraw script that validates the Borrow action. */
+    public PlutusScript getPoolBorrowActionScript() {
+        return scriptOf(poolBorrowActionScriptHash);
+    }
+
+    /** {@code pool/pool_cancel_action} — the withdraw script that validates the Cancel action. */
+    public PlutusScript getPoolCancelActionScript() {
+        return scriptOf(poolCancelActionScriptHash);
+    }
+
+    /** {@code bond.bond} applied to {@code 1} — the lender-bond minting policy. */
+    public PlutusScript getLenderBondScript() {
+        return scriptOf(lenderBondPolicyId);
+    }
+
+    /** {@code bond.bond} applied to {@code 0} — the borrower-bond minting policy. */
+    public PlutusScript getBorrowerBondScript() {
+        return scriptOf(borrowerBondPolicyId);
     }
 
     private PlutusScript scriptOf(String scriptHash) {
