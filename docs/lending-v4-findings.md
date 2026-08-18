@@ -830,3 +830,55 @@ on **individual constraints**, because they can vary one field at a time against
 isolation. Our dry-eval is stronger on the **two-validator interaction**, because it runs both against
 the real machine in one transaction. Neither supersedes the other, and this finding came from the half
 we do not cover.
+
+## 14. `pool_cancel_action` constrains no output — the escape hatch has no on-chain destination (verified at `ff005fb`, 2026-08-18)
+
+**Provenance: found while building T-016-K (the pool-cancel builder, the recovery path for a pool we
+fund). Read from `git show ff005fb:validators/pool/pool_cancel_action.ak` and dry-eval-verified against
+the real PlutusV3 machine; audited independently from source.** Note the validator lives at
+`validators/pool/pool_cancel_action.ak` (the `pool/` subdirectory), not at the repo root.
+
+The entire withdraw handler is one `indexed_all` over the pool inputs with a **three-conjunct**
+predicate, and it reads `self.reference_inputs / inputs / mint / withdrawals / extra_signatories` —
+**never `self.outputs`**:
+
+```aiken
+utils.indexed_all(poolInputs, fn(index, input) {
+  expect InlineDatum(inputDatum) = input.output.datum
+  expect datum: PoolDatum = inputDatum
+  let redeemerAction = safe_list_at(redeemer.actionsForEachInput, index)
+  and {
+    quantity_of(input.output.value, poolPolicyId, redeemerAction.poolId) == 1,   // A: NFT held on input
+    quantity_of(self.mint, poolPolicyId, redeemerAction.poolId) == -1,           // B: NFT burnt
+    authorize_action(create_auth(datum.lenderAuth, self.inputs, self.withdrawals,
+                                 self.extra_signatories, self.mint)),            // C: lender authorised
+  }
+})
+```
+
+**Two consequences, both funding-relevant:**
+
+1. **No on-chain destination for the recovered ADA.** Nothing constrains any output by address, datum,
+   value, or position. The chain would accept a cancel that ships the pool's ADA to a stranger.
+   Recovery-to-the-lender is a **purely off-chain change-address property** (`withChangeAddress`), which
+   the builder sets and the dry-eval asserts on the finished body (no output at the pool address, every
+   output at the funder, `returned == pool + funder − fee`). **Any production recovery/liquidation path
+   that reuses this must enforce the destination off-chain — there is no on-chain backstop.** This mirrors
+   `request.ak`'s `check_cancel` (§11.5–11.6): the cancel family is output-free by design.
+
+2. **No emptiness / unlent gate.** The predicate decodes `PoolDatum` but reads only `datum.lenderAuth`;
+   no conjunct anywhere in the call chain gates cancel on pool state (active loans, lent amount). Cancel
+   recovers only the ADA physically in the pool UTxO — lent ADA lives in loan UTxOs — but that is a fact
+   of *where the value sits*, not an on-chain guard. There is no "pool must be unlent" check to rely on
+   or to violate.
+
+**Adjacent, same slice — `pool.pool`'s `check_mint` does not police burns.** It builds
+`mintedTokens = list.filter(tokens(self.mint, policy), quantity > 0)`, so a burn (`−1`) is filtered out
+and `check_mint` reduces to `isInputRefSpent`. The **sole** burn-correctness check for a pool cancel is
+`pool_cancel_action` conjunct B (`== -1`); a wrong-name or wrong-count burn passes the pool policy itself.
+A defense-in-depth boundary worth knowing for whoever builds the compound / sell-position actions.
+
+**Why recorded:** the funding decision for T-016-X rests on "we can get our ADA back out." We can — but
+the guarantee is *we build the tx correctly*, not *the chain protects us*. That distinction is exactly
+the kind that reads as safe until the day an off-chain bug sends recovery to the wrong address with no
+validator to catch it.
