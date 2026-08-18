@@ -153,7 +153,7 @@ recommending any library, tool, code pattern, or CIP behavior:
 1. **Check the `cardano-dev-skills:*` skill set.** These skills encode current
    best practices, decision criteria, and trade-offs. Bias toward invoking
    one even when you feel confident — confidence is not evidence of currency.
-2. **Search `/home/giovanni/.claude/plugins/cache/cardano-dev-skills/cardano-dev-skills/*/docs/sources/`** before relying on memory
+2. **Search `${CLAUDE_PLUGIN_ROOT}/docs/sources/`** before relying on memory
    or web search. The corpus is regularly refreshed from upstream and covers
    Aiken, Plutus, current SDKs, all CIPs, on-chain tooling, and ~50 other
    Cardano projects.
