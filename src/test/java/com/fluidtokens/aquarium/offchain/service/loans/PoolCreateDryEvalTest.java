@@ -59,6 +59,28 @@ class PoolCreateDryEvalTest {
 
     private static final String FUNDER = LoanFixtures.botAddress();
 
+    /**
+     * The one validator this rig must hand the machine explicitly. {@code pool.pool} travels by
+     * <b>reference input only</b>: {@link PoolCreateTransactionBuilder} declares it to
+     * {@code withReferenceScripts} and has {@code removeDuplicateScriptWitnesses} strip the witness copy
+     * {@code mintAsset} left behind, so the finished body carries no Plutus script at all. A
+     * reference-script UTxO publishes a script's <em>hash</em>, never its bytes, so nothing in the
+     * universe can give the evaluator the policy and it answers
+     * {@code RequiredRedeemersMismatch { missing: [65a0bc5e…] }}. Exactly the reason
+     * {@code LoanFactory#createExtraScripts} already gives for its own copy of this argument.
+     * <p>
+     * The bytes are only half of it — see {@link #resolvable}, which supplies the other half.
+     *
+     * <h2>This makes the six mutations below stronger, not weaker</h2>
+     * Until the policy resolved unconditionally, a mutation that happened to break script resolution
+     * would fail with {@code RequiredRedeemersMismatch} and still satisfy a bare "it was refused"
+     * expectation. With the policy always resolvable, a {@code RedeemerError { tag: "Mint", index: 0 }}
+     * is the deployed validator genuinely refusing the mutation rather than the rig failing to find a
+     * script — which is what {@link #assertRefusedByTheMint} has always claimed to be asserting.
+     */
+    private static final List<com.bloxbean.cardano.client.plutus.spec.PlutusScript> POOL_POLICY =
+            List.of(LoanFixtures.registry().getPoolScript());
+
     /** The pool liquidity leg, from the default pool parameters. */
     private static final long POOL_LOVELACE = PoolFixtures.defaults().poolLiquidityLovelace();
 
@@ -76,7 +98,8 @@ class PoolCreateDryEvalTest {
         Transaction tx = build();
         List<Utxo> universe = PoolFixtures.universe(FUNDER);
 
-        List<EvaluationResult> results = EvalFixtures.evaluate(tx, universe, REGISTRY);
+        List<EvaluationResult> results =
+                EvalFixtures.evaluate(tx, resolvable(universe), REGISTRY, POOL_POLICY);
 
         assertEquals(1, results.size(), "exactly one script runs: the pool minting policy");
         assertEquals(RedeemerTag.Mint, results.get(0).getRedeemerTag());
@@ -249,11 +272,60 @@ class PoolCreateDryEvalTest {
     }
 
     private static void assertRefusedByTheMint(Transaction mutated, List<Utxo> universe, String what) {
-        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated, universe, REGISTRY);
+        EvalFixtures.Outcome outcome =
+                EvalFixtures.evaluateRaw(mutated, resolvable(universe), REGISTRY, POOL_POLICY);
         log.info("MUTATION [{}] refusal: {}", what, outcome.detail().replace("\n", " | "));
         assertFalse(outcome.successful(), "the pool policy must reject " + what);
         assertTrue(outcome.detail().contains("RedeemerError { tag: \"Mint\", index: 0"),
                 "expected pool.pool's mint to be the rejecting script, got: " + outcome.detail());
+    }
+
+    /**
+     * The <b>evaluation</b> universe: {@code universe} with the pool-policy reference-script UTxO
+     * replaced by a copy that publishes {@code pool.pool}'s {@code reference_script_hash}, as the chain's
+     * own does.
+     *
+     * <h2>Why {@link #POOL_POLICY} alone is not enough</h2>
+     * The Aiken evaluator only consults its {@code ScriptSupplier} for a reference input that
+     * <em>declares</em> it publishes a script; a UTxO with a null {@code referenceScriptHash} is just a
+     * coordinate it reads and moves past. {@link PoolFixtures#poolPolicyRefScriptUtxo()} is a plain ada
+     * UTxO — correct while the policy travelled in the witness set, and the reason its own javadoc gives
+     * for being plain — so the extra script would never be asked for. The hash says <em>which</em> script
+     * is reachable by reference; {@link #POOL_POLICY} supplies its bytes. Both halves are needed and
+     * neither is sufficient.
+     *
+     * <h2>It does not perturb the transaction</h2>
+     * This rewrites only the set handed to the evaluator, never the builder's {@code UtxoSupplier}: a
+     * reference input contributes nothing but its coordinate to the body, and the coordinate is
+     * unchanged, so every transaction under test is byte-for-byte what it was.
+     * <p>
+     * Refuses if the substitution matched nothing — a fixture rename would otherwise turn this into a
+     * silent no-op and take all seven cases back to {@code RequiredRedeemersMismatch}.
+     */
+    private static List<Utxo> resolvable(List<Utxo> universe) {
+        Utxo refScript = PoolFixtures.poolPolicyRefScriptUtxo();
+        List<Utxo> resolved = new ArrayList<>();
+        int substituted = 0;
+        for (Utxo utxo : universe) {
+            if (utxo.getTxHash().equals(refScript.getTxHash())
+                    && utxo.getOutputIndex() == refScript.getOutputIndex()) {
+                resolved.add(Utxo.builder()
+                        .txHash(utxo.getTxHash())
+                        .outputIndex(utxo.getOutputIndex())
+                        .address(utxo.getAddress())
+                        .amount(utxo.getAmount())
+                        .inlineDatum(utxo.getInlineDatum())
+                        .referenceScriptHash(REGISTRY.getPoolPolicyId())
+                        .build());
+                substituted++;
+            } else {
+                resolved.add(utxo);
+            }
+        }
+        assertEquals(1, substituted,
+                "the evaluation universe must carry exactly one pool-policy reference-script UTxO to "
+                        + "make resolvable; found " + substituted);
+        return resolved;
     }
 
     private static PoolCreateTransactionBuilder builder() {

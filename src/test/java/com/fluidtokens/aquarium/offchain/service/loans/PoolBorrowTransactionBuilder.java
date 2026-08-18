@@ -4,6 +4,7 @@ import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
@@ -41,10 +42,18 @@ import java.util.Optional;
  * The {@link QuickTxBuilder} below is constructed with a <b>null</b> {@code TransactionProcessor} —
  * the only thing in cardano-client-lib that can put a transaction on a network — exactly as
  * {@link PoolCreateTransactionBuilder} is. A builder that never has a processor cannot submit,
- * whatever a caller asks of it. No evaluator is wired in either, so the transaction carries
- * placeholder ex-units and an understated fee: fine for an offline rig, not fine for submission.
- * The real ex-units are measured separately by {@link PoolBorrowDryEvalTest} through the UPLC
- * machine.
+ * whatever a caller asks of it.
+ *
+ * <h2>Ex-units: optional, and null means exactly what it always meant</h2>
+ * The {@code TransactionEvaluator} is a <b>constructor option</b>, as it is on
+ * {@link PoolCreateTransactionBuilder}. Left null — the four-argument constructor, which every offline
+ * test uses — the redeemers keep {@code ScriptTx}'s placeholder {@code mem 10000 / steps 10000} and the
+ * understated fee that follows; the real ex-units are then measured separately by
+ * {@link PoolBorrowDryEvalTest} through the UPLC machine. Handed a real evaluator, the redeemers carry
+ * the budget that evaluator measured, and {@code ignoreScriptCostEvaluationError(false)} is set so an
+ * evaluation failure surfaces instead of silently degrading to placeholders. Script-cost evaluation runs
+ * <em>before</em> {@code removeDuplicateScriptWitnesses}, so the six validators are still in the witness
+ * set when the evaluator resolves them.
  *
  * <h2>The withdraw-based shape (3 mints, 1 spend, 2 rewards, no oracle)</h2>
  * {@code pool.pool} has no {@code spend} handler ({@code validators/pool.ak} at {@code ff005fb}); the
@@ -120,14 +129,27 @@ public final class PoolBorrowTransactionBuilder {
     private final UtxoSupplier utxoSupplier;
     private final ProtocolParamsSupplier protocolParamsSupplier;
 
+    /** Null for the offline rig; a real evaluator when the transaction has to be submittable. */
+    private final TransactionEvaluator txEvaluator;
+
+    /** No evaluator: placeholder ex-units, understated fee, byte-for-byte the offline shape. */
     public PoolBorrowTransactionBuilder(LoansContractRegistry registry,
                                         Network network,
                                         UtxoSupplier utxoSupplier,
                                         ProtocolParamsSupplier protocolParamsSupplier) {
+        this(registry, network, utxoSupplier, protocolParamsSupplier, null);
+    }
+
+    public PoolBorrowTransactionBuilder(LoansContractRegistry registry,
+                                        Network network,
+                                        UtxoSupplier utxoSupplier,
+                                        ProtocolParamsSupplier protocolParamsSupplier,
+                                        TransactionEvaluator txEvaluator) {
         this.registry = registry;
         this.network = network;
         this.utxoSupplier = utxoSupplier;
         this.protocolParamsSupplier = protocolParamsSupplier;
+        this.txEvaluator = txEvaluator;
     }
 
     /**
@@ -211,10 +233,15 @@ public final class PoolBorrowTransactionBuilder {
 
         // Probe — placeholder output/withdraw indexes, purely to observe the finished layout. The
         // probe is a transaction the validators would refuse (its BorrowData names output 0 as the
-        // lender-token output), so it is never evaluated: it is thrown away after the indexes are read
-        // off it, and V5 re-derives them from the finished body anyway.
+        // lender-token output), so it is never evaluated — hence `evaluate = false`, which is
+        // load-bearing once an evaluator is wired: evaluating the probe would fail by construction
+        // (measured: `RedeemerError { tag: "Mint", index: 0, err: Machine(EvaluationFailure, ..) }`)
+        // and, with ignoreScriptCostEvaluationError(false), would abort the whole build. The probe is
+        // thrown away after the indexes are read off it, and V5 re-derives them from the finished body
+        // anyway — so a layout that shifted between the placeholder-budget probe and the real-budget
+        // build is caught there as a named refusal rather than assumed away.
         Transaction probe = complete(request,
-                assemble(request, configRefIndex, 0L, 0L, 0L), applySeam);
+                assemble(request, configRefIndex, 0L, 0L, 0L), applySeam, false);
 
         long lenderTokenIndex = locateOutput(probe, request.lenderBondAddress(),
                 registry.getLenderBondPolicyId(), request.bondAssetName(), "lender bond");
@@ -224,7 +251,7 @@ public final class PoolBorrowTransactionBuilder {
 
         Transaction transaction = complete(request,
                 assemble(request, configRefIndex, lenderTokenIndex, borrowerTokenIndex,
-                        originWithdrawRedeemerIndex), applySeam);
+                        originWithdrawRedeemerIndex), applySeam, true);
 
         if (applySeam) {
             assertStructure(transaction, request, configRefIndex, lenderTokenIndex, borrowerTokenIndex,
@@ -300,11 +327,10 @@ public final class PoolBorrowTransactionBuilder {
                 UNREAD_PERMISSIONED_WITHDRAW_INDEX);
     }
 
-    private Transaction complete(Request request, ScriptTx tx, boolean applySeam) {
+    private Transaction complete(Request request, ScriptTx tx, boolean applySeam, boolean evaluate) {
         try {
-            // Third argument (TransactionProcessor) stays null; see the class javadoc. No evaluator is
-            // wired in either, so the redeemers keep placeholder ex-units.
-            return new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
+            // Third argument (TransactionProcessor) stays null; see the class javadoc.
+            QuickTxBuilder.TxContext context = new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
                     .compose(tx)
                     .feePayer(request.funderAddress())
                     .collateralPayer(request.funderAddress())
@@ -321,15 +347,29 @@ public final class PoolBorrowTransactionBuilder {
                     .withScriptSupplier(scriptHash -> Optional.empty())
                     // The seam: force the pool continuation to absolute output 0 after the outputs
                     // exist but before script-cost evaluation and balancing. Disabled by buildNaive.
-                    .preBalanceTx((context, transaction) -> {
+                    .preBalanceTx((buildContext, transaction) -> {
                         if (applySeam) {
                             preBalanceOutputZeroSeam(request, transaction);
                         }
-                    })
-                    .build();
+                    });
+            return withExUnitsEvaluation(context, evaluate).build();
         } catch (Exception e) {
             throw new IllegalStateException("cannot build the pool-borrow transaction", e);
         }
+    }
+
+    /**
+     * Wires the evaluator when there is one and this build wants it, and leaves the context untouched
+     * otherwise — so the no-evaluator build is the same call sequence it has always been, and so is the
+     * probe. {@code ignoreScriptCostEvaluationError(false)} is set with the evaluator and only with it: a
+     * build that asked for real budgets must fail loudly rather than fall back to placeholders.
+     */
+    private QuickTxBuilder.TxContext withExUnitsEvaluation(QuickTxBuilder.TxContext context,
+                                                           boolean evaluate) {
+        if (txEvaluator == null || !evaluate) {
+            return context;
+        }
+        return context.withTxEvaluator(txEvaluator).ignoreScriptCostEvaluationError(false);
     }
 
     private PlutusScript[] referencedScripts() {

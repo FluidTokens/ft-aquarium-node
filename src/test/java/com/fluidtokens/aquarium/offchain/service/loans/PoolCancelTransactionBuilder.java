@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Network;
@@ -102,9 +103,18 @@ import java.util.Optional;
  * The {@link QuickTxBuilder} below is constructed with a <b>null</b> {@code TransactionProcessor} — the
  * only thing in cardano-client-lib that can put a transaction on a network — exactly as
  * {@link PoolBorrowTransactionBuilder} is. A builder that never has a processor cannot submit, whatever a
- * caller asks of it. No evaluator is wired in either, so the transaction carries placeholder ex-units and
- * an understated fee: fine for an offline rig, not fine for submission. The real ex-units are measured
- * separately by {@link PoolCancelDryEvalTest} through the UPLC machine.
+ * caller asks of it.
+ *
+ * <h2>Ex-units: optional, and null means exactly what it always meant</h2>
+ * The {@code TransactionEvaluator} is a <b>constructor option</b>, as it is on
+ * {@link PoolBorrowTransactionBuilder}. Left null — the four-argument constructor, which every offline
+ * test uses — the redeemers keep {@code ScriptTx}'s placeholder {@code mem 10000 / steps 10000} and the
+ * understated fee that follows; the real ex-units are then measured separately by
+ * {@link PoolCancelDryEvalTest} through the UPLC machine. Handed a real evaluator, the redeemers carry
+ * the budget that evaluator measured, and {@code ignoreScriptCostEvaluationError(false)} is set so an
+ * evaluation failure surfaces instead of silently degrading to placeholders. Script-cost evaluation runs
+ * <em>before</em> {@code removeDuplicateScriptWitnesses}, so the three validators are still in the
+ * witness set when the evaluator resolves them.
  */
 public final class PoolCancelTransactionBuilder {
 
@@ -125,14 +135,27 @@ public final class PoolCancelTransactionBuilder {
     private final UtxoSupplier utxoSupplier;
     private final ProtocolParamsSupplier protocolParamsSupplier;
 
+    /** Null for the offline rig; a real evaluator when the transaction has to be submittable. */
+    private final TransactionEvaluator txEvaluator;
+
+    /** No evaluator: placeholder ex-units, understated fee, byte-for-byte the offline shape. */
     public PoolCancelTransactionBuilder(LoansContractRegistry registry,
                                         Network network,
                                         UtxoSupplier utxoSupplier,
                                         ProtocolParamsSupplier protocolParamsSupplier) {
+        this(registry, network, utxoSupplier, protocolParamsSupplier, null);
+    }
+
+    public PoolCancelTransactionBuilder(LoansContractRegistry registry,
+                                        Network network,
+                                        UtxoSupplier utxoSupplier,
+                                        ProtocolParamsSupplier protocolParamsSupplier,
+                                        TransactionEvaluator txEvaluator) {
         this.registry = registry;
         this.network = network;
         this.utxoSupplier = utxoSupplier;
         this.protocolParamsSupplier = protocolParamsSupplier;
+        this.txEvaluator = txEvaluator;
     }
 
     /**
@@ -248,9 +271,8 @@ public final class PoolCancelTransactionBuilder {
 
     private Transaction complete(Request request, ScriptTx tx) {
         try {
-            // Third argument (TransactionProcessor) stays null; see the class javadoc. No evaluator is
-            // wired in either, so the redeemers keep placeholder ex-units.
-            return new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
+            // Third argument (TransactionProcessor) stays null; see the class javadoc.
+            QuickTxBuilder.TxContext context = new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
                     .compose(tx)
                     .feePayer(request.funderAddress())
                     .collateralPayer(request.funderAddress())
@@ -265,12 +287,25 @@ public final class PoolCancelTransactionBuilder {
                     .removeDuplicateScriptWitnesses(true)
                     // Offline: cardano-client-lib would otherwise walk every reference input for a script
                     // to fetch and NPE on the missing supplier.
-                    .withScriptSupplier(scriptHash -> Optional.empty())
-                    // No validFrom / validTo — pool_cancel_action reads no validity range.
-                    .build();
+                    .withScriptSupplier(scriptHash -> Optional.empty());
+            // No validFrom / validTo — pool_cancel_action reads no validity range.
+            return withExUnitsEvaluation(context).build();
         } catch (Exception e) {
             throw new IllegalStateException("cannot build the pool-cancel transaction", e);
         }
+    }
+
+    /**
+     * Wires the evaluator when there is one, and leaves the context untouched when there is not — so the
+     * no-evaluator build is the same call sequence it has always been. {@code
+     * ignoreScriptCostEvaluationError(false)} is set with the evaluator and only with it: a build that
+     * asked for real budgets must fail loudly rather than fall back to placeholders.
+     */
+    private QuickTxBuilder.TxContext withExUnitsEvaluation(QuickTxBuilder.TxContext context) {
+        if (txEvaluator == null) {
+            return context;
+        }
+        return context.withTxEvaluator(txEvaluator).ignoreScriptCostEvaluationError(false);
     }
 
     private PlutusScript[] referencedScripts() {

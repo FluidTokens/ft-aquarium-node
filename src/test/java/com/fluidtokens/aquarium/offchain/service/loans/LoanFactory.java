@@ -1,16 +1,23 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
 import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.common.OrderEnum;
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.model.EvaluationResult;
+import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Network;
+import com.bloxbean.cardano.client.common.model.SlotConfigs;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
+import com.bloxbean.cardano.client.plutus.spec.Redeemer;
+import com.bloxbean.cardano.client.spec.Script;
 import com.bloxbean.cardano.client.transaction.spec.Asset;
 import com.bloxbean.cardano.client.transaction.spec.MultiAsset;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
@@ -56,14 +63,26 @@ import java.util.Set;
  * Each of the three builders constructs its {@code QuickTxBuilder} with a <b>null</b>
  * {@code TransactionProcessor} — the only thing in cardano-client-lib that can put a transaction on a
  * network. This tool holds none of its own, opens no backend, signs nothing, and returns unsigned
- * transactions. Originating the first loan <em>on chain</em> is T-016-X and is deferred entirely to
- * that slice: there is deliberately no signer, no flag-gated submit path and no backend wiring here,
- * not even an off-by-default one.
+ * transactions. There is deliberately no signer, no flag-gated submit path and no backend wiring here,
+ * not even an off-by-default one. The optional {@code TransactionEvaluator} below does not change that:
+ * an evaluator only measures script cost, it cannot submit.
+ *
+ * <h2>The optional evaluator</h2>
+ * Constructed without one (the four-argument constructor) this is the build-only tool it has always
+ * been, byte-for-byte: no evaluator reaches the builders, their redeemers keep {@code ScriptTx}'s
+ * placeholder {@code mem 10000 / steps 10000}, and the ex-units gate stays silent. Constructed
+ * <em>with</em> one, all three builders wire it, the returned transactions carry real execution budgets
+ * and a fee computed from them, and the ex-units gate is armed.
  *
  * <h2>The gates, each read off the finished body</h2>
  * <ul>
  *   <li><b>Dry-eval</b> — every returned transaction passed {@link EvalFixtures#evaluateRaw}; a
  *       non-green build is refused, not returned.</li>
+ *   <li><b>Ex-units</b> — <em>only when a {@code TransactionEvaluator} is configured</em>: every
+ *       redeemer of the returned body must declare at least the budget an independent measurement of
+ *       that same body reports ({@link #measureBudgets}), and must not still carry {@code ScriptTx}'s
+ *       placeholder. Without an evaluator the transactions are explicitly build-only and keep their
+ *       placeholders, so this gate stays silent — see {@link #assertExUnitsAreReal}.</li>
  *   <li><b>Fee-100</b> — {@link #buildBorrow} decodes the emitted lender-bond output's inline datum
  *       with the production {@link LenderManagerDatumConverter} and refuses unless
  *       {@code liquidationFeePerMille == 100}. This is a hard refusal inside the tool, not a test
@@ -74,7 +93,19 @@ import java.util.Set;
  *   <li><b>Recovery destination</b> — {@link #buildRecoveryCancel} refuses unless the finished body
  *       has no output at the pool address and every output goes to the lender (findings §14: the
  *       validators constrain no output, so this is the only backstop).</li>
+ *   <li><b>Ledger preflight</b> — <em>only when a {@code TransactionEvaluator} is configured</em>: no
+ *       script may travel both in the witness set and as a reference script on a resolved input, which
+ *       Conway refuses as {@code ExtraneousScriptWitnessesUTXOW}. See
+ *       {@link #assertNoDuplicateScriptWitnesses}.</li>
  * </ul>
+ *
+ * <h2>What these gates do not check, and who does</h2>
+ * {@link EvalFixtures} runs the scripts and nothing else — its own javadoc says so — and every gate
+ * above reads the finished body. <b>Fee adequacy is not gated here and must not be:</b> the fee is
+ * cardano-client-lib's to compute, off the protocol parameters the build was balanced with, and the
+ * three builders' job is to hand it the facts it needs (see
+ * {@link PoolCreateTransactionBuilder}'s reference-script wiring). A gate that recomputed the fee would
+ * be a second, divergent implementation of a rule the ledger already owns.
  */
 public final class LoanFactory {
 
@@ -91,6 +122,13 @@ public final class LoanFactory {
     private final ProtocolParamsSupplier protocolParamsSupplier;
 
     /**
+     * The evaluator handed to all three builders, or null. Null is the build-only tool this class was
+     * born as: placeholder ex-units, understated fee, {@link #EX_UNITS_GATE} silent. Non-null makes the
+     * returned transactions carry real budgets and arms that gate.
+     */
+    private final TransactionEvaluator txEvaluator;
+
+    /**
      * The pool-create builder, constructed once with the given supplier: pool creation collects its
      * seed by name and coin-selects the funder, and needs no post-create pool UTxO. The borrow and
      * cancel builders are constructed per call, over a supplier that also resolves the pool
@@ -98,16 +136,26 @@ public final class LoanFactory {
      */
     private final PoolCreateTransactionBuilder poolCreateBuilder;
 
+    /** No evaluator: the build-only tool, unchanged. */
     public LoanFactory(LoansContractRegistry registry,
                        Network network,
                        UtxoSupplier utxoSupplier,
                        ProtocolParamsSupplier protocolParamsSupplier) {
+        this(registry, network, utxoSupplier, protocolParamsSupplier, null);
+    }
+
+    public LoanFactory(LoansContractRegistry registry,
+                       Network network,
+                       UtxoSupplier utxoSupplier,
+                       ProtocolParamsSupplier protocolParamsSupplier,
+                       TransactionEvaluator txEvaluator) {
         this.registry = registry;
         this.network = network;
         this.utxoSupplier = utxoSupplier;
         this.protocolParamsSupplier = protocolParamsSupplier;
-        this.poolCreateBuilder =
-                new PoolCreateTransactionBuilder(registry, utxoSupplier, protocolParamsSupplier);
+        this.txEvaluator = txEvaluator;
+        this.poolCreateBuilder = new PoolCreateTransactionBuilder(registry, utxoSupplier,
+                protocolParamsSupplier, txEvaluator);
     }
 
     /**
@@ -172,6 +220,33 @@ public final class LoanFactory {
      * {@link GateFailure}) on any non-green evaluation.
      */
     public Transaction buildCreate(Recipe recipe) {
+        return buildCreate(recipe, PoolCreateTransactionBuilder.Mutation.none(), true);
+    }
+
+    /**
+     * As {@link #buildCreate}, but from a create builder whose reference-script wiring is omitted — the
+     * pre-fix shape, in which the {@code pool.pool} policy travels both in the witness set and on a
+     * reference input, and no reference-script fee is paid for it. <b>The gates still run</b>, which is
+     * the point: this is the seam {@code LoanFactoryDryEvalTest} uses to prove that
+     * {@code LEDGER_PREFLIGHT} refuses the very transaction the preview ledger refused with
+     * {@code ExtraneousScriptWitnessesUTXOW}. Package-private, no production caller.
+     */
+    Transaction buildCreateWithoutReferenceScriptWiring(Recipe recipe) {
+        return buildCreate(recipe, new PoolCreateTransactionBuilder.Mutation(true), true);
+    }
+
+    /**
+     * The same pre-fix shape, handed back with <b>no gate run over it</b> — so a test can measure what it
+     * costs and compare. {@link #buildCreateWithoutReferenceScriptWiring} above is what proves the gate
+     * refuses this body; this exists only to be measured, never to be returned to a caller who might
+     * submit it. Package-private, no production caller.
+     */
+    Transaction assembleCreateWithoutReferenceScriptWiring(Recipe recipe) {
+        return buildCreate(recipe, new PoolCreateTransactionBuilder.Mutation(true), false);
+    }
+
+    private Transaction buildCreate(Recipe recipe, PoolCreateTransactionBuilder.Mutation mutation,
+                                    boolean gate) {
         PoolCreateTransactionBuilder.Request request = new PoolCreateTransactionBuilder.Request(
                 recipe.seedUtxo(),
                 recipe.configUtxo(),
@@ -182,8 +257,11 @@ public final class LoanFactory {
                 PoolTxEncoder.poolDatum(poolDatum(recipe)),
                 recipe.params().poolLiquidityLovelace());
 
-        Transaction tx = poolCreateBuilder.build(request);
-        dryEval(tx, universeOf(tx, utxoSupplier, List.of(recipe.poolPolicyRefScriptUtxo())), List.of());
+        Transaction tx = poolCreateBuilder.build(request, mutation);
+        if (gate) {
+            dryEval(tx, universeOf(tx, utxoSupplier, List.of(recipe.poolPolicyRefScriptUtxo())),
+                    createExtraScripts());
+        }
         return tx;
     }
 
@@ -280,12 +358,218 @@ public final class LoanFactory {
 
     // ---- gates ------------------------------------------------------------------------------------
 
+    /**
+     * The dry-eval gate, immediately followed by the ex-units and ledger-preflight gates over the same
+     * finished body and the same resolved universe.
+     */
     private void dryEval(Transaction tx, List<Utxo> universe, List<PlutusScript> extra) {
         EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(tx, universe, registry, extra);
         if (!outcome.successful()) {
             throw new GateFailure("DRY_EVAL_GATE: the transaction was refused by the real validators: "
                     + outcome.detail());
         }
+        assertExUnitsAreReal(tx, universe, extra);
+        assertNoDuplicateScriptWitnesses(tx, universe);
+    }
+
+    /** The placeholder budget {@code ScriptTx} stamps on every redeemer it creates. */
+    private static final long PLACEHOLDER_EX_UNIT = 10_000L;
+
+    /** The gate's name, as it appears in every refusal it throws. */
+    private static final String EX_UNITS_GATE = "EX_UNITS_GATE";
+
+    /**
+     * The ex-units gate: when an evaluator is configured, every redeemer of the returned body must
+     * declare a budget at least as large as an <em>independent</em> measurement of the same body, and
+     * must not still carry the placeholder.
+     * <p>
+     * <b>Silent without an evaluator.</b> A no-evaluator {@link LoanFactory} is explicitly build-only —
+     * cardano-client-lib swallows the "Transaction evaluator is not set" throw and leaves
+     * {@code ScriptTx}'s {@code mem 10000 / steps 10000} in place — and those transactions are never
+     * meant to be submitted, so firing here would redden the whole offline rig instead of catching
+     * anything. The gate exists for the submittable path, where a redeemer declaring less than it costs
+     * fails phase-2 validation on chain: the collateral is forfeit and the failure arrives as an opaque
+     * budget message long after every other gate has gone green.
+     */
+    private void assertExUnitsAreReal(Transaction tx, List<Utxo> universe, List<PlutusScript> extra) {
+        if (txEvaluator == null) {
+            return;
+        }
+        List<EvaluationResult> measured = measureBudgets(tx, universe, extra);
+        List<Redeemer> redeemers = tx.getWitnessSet() == null ? null : tx.getWitnessSet().getRedeemers();
+        if (redeemers == null || redeemers.isEmpty()) {
+            return;   // a script-free body has no budget to understate
+        }
+        for (Redeemer redeemer : redeemers) {
+            String what = redeemer.getTag() + "#" + redeemer.getIndex();
+            BigInteger declaredMem = redeemer.getExUnits().getMem();
+            BigInteger declaredSteps = redeemer.getExUnits().getSteps();
+
+            if (declaredMem.longValueExact() <= PLACEHOLDER_EX_UNIT
+                    && declaredSteps.longValueExact() <= PLACEHOLDER_EX_UNIT) {
+                throw new GateFailure(EX_UNITS_GATE + ": redeemer " + what + " still carries the "
+                        + "placeholder budget mem " + declaredMem + " / steps " + declaredSteps
+                        + " — the evaluator did not write a real one");
+            }
+
+            EvaluationResult result = measured.stream()
+                    .filter(r -> r.getRedeemerTag() == redeemer.getTag()
+                            && r.getIndex() == redeemer.getIndex().intValueExact())
+                    .findFirst()
+                    .orElseThrow(() -> new GateFailure(EX_UNITS_GATE + ": the UPLC machine reported no "
+                            + "budget for redeemer " + what + ", so its declared one cannot be checked"));
+            BigInteger neededMem = result.getExUnits().getMem();
+            BigInteger neededSteps = result.getExUnits().getSteps();
+            if (declaredMem.compareTo(neededMem) < 0 || declaredSteps.compareTo(neededSteps) < 0) {
+                throw new GateFailure(EX_UNITS_GATE + ": redeemer " + what + " declares mem "
+                        + declaredMem + " / steps " + declaredSteps + " but really costs mem "
+                        + neededMem + " / steps " + neededSteps + " — it would fail phase-2 validation");
+            }
+        }
+    }
+
+    /**
+     * The ex-units gate's oracle: a second, independent UPLC evaluation of the finished body.
+     *
+     * <h2>Why it is not {@link EvalFixtures#evaluateRaw}, which the dry-eval gate just ran</h2>
+     * {@link EvalFixtures} evaluates under its own {@code ProtocolParams}, whose PlutusV3 cost model is
+     * the one <em>bundled with cardano-client-lib</em>. A submittable build's budgets are written by an
+     * evaluator running under the <em>chain's live</em> cost model, and the two are not identical:
+     * measured on preview 2026-08-18, the same create body costs {@code steps 70,583,881} under the
+     * bundled model and {@code steps 70,579,642} under preview's — a 0.006% skew, enough to make a
+     * correct transaction look 4,239 steps short. The ledger charges under the chain's model, so that is
+     * the only model this gate may judge against; it therefore measures under {@code
+     * protocolParamsSupplier}, the very parameters the build was balanced with. Cold, that supplier
+     * carries the same bundled model as {@link EvalFixtures}, so the offline numbers are unchanged.
+     *
+     * <h2>It is still independent of the wired evaluator</h2>
+     * This is a freshly constructed evaluator, not {@link #txEvaluator}. That is what gives the gate its
+     * teeth: an evaluator that reports an understated budget — the exact defect this gate exists for —
+     * writes that understatement into the redeemers, and this oracle contradicts it.
+     */
+    private List<EvaluationResult> measureBudgets(Transaction tx, List<Utxo> universe,
+                                                  List<PlutusScript> extra) {
+        AikenTransactionEvaluator oracle = new AikenTransactionEvaluator(
+                LoanFixtures.utxoSupplier(universe), protocolParamsSupplier,
+                EvalFixtures.scriptSupplier(registry, extra), SlotConfigs.preview());
+        try {
+            Result<List<EvaluationResult>> result =
+                    oracle.evaluateTx(tx.serialize(), new LinkedHashSet<>(universe));
+            if (!result.isSuccessful()) {
+                throw new GateFailure(EX_UNITS_GATE + ": the budget oracle could not measure the "
+                        + "finished body: " + result.getResponse());
+            }
+            return result.getValue();
+        } catch (GateFailure e) {
+            throw e;
+        } catch (Exception e) {
+            throw new GateFailure(EX_UNITS_GATE + ": the budget oracle could not measure the finished "
+                    + "body: " + e);
+        }
+    }
+
+    /** The gate's name, as it appears in every refusal it throws. */
+    private static final String LEDGER_PREFLIGHT_GATE = "LEDGER_PREFLIGHT";
+
+    /**
+     * The ledger-preflight gate: no script may reach the ledger twice. A script that sits in the witness
+     * set <em>and</em> is published as a reference script on an input or reference input of the same
+     * transaction is refused by Conway as {@code ExtraneousScriptWitnessesUTXOW} — phase 1, so the
+     * transaction never runs and every other gate here has already gone green by then. Measured on
+     * preview 2026-08-18: the create transaction carried {@code pool.pool} both ways and the node
+     * answered {@code ExtraneousScriptWitnessesUTXOW (NonEmptySet (fromList [ScriptHash
+     * "65a0bc5e6e5152fbe2bf3e1053f4020f6c7ee0a563beb0fe070a7b93"]))}.
+     * <p>
+     * <b>It asserts the artefact; it computes nothing.</b> The referenced hashes are read off the very
+     * UTxOs the dry-evaluator resolved this body against, and the witnessed hashes off the finished
+     * witness set.
+     * <p>
+     * <b>And it refuses when it cannot see them.</b> Those referenced hashes come from
+     * {@code Utxo.getReferenceScriptHash()}, which a fixture — or a resolver handed the wrong
+     * coordinates — may simply leave null. The set is then empty, no witnessed script can ever be found
+     * in it, and the gate returns green on anything, including a body carrying its own policy both ways.
+     * So a body that reads reference inputs while its universe publishes no reference-script hash at all
+     * is refused outright: the difference between "no duplicate" and "no visibility" is the whole value
+     * of this gate, and only one of them is an answer.
+     * <p>
+     * Fee adequacy — the other half of that same rejection — is deliberately not checked
+     * here: cardano-client-lib owns the fee, and the fix for the fee was to give it the reference-script
+     * bytes it needs ({@link PoolCreateTransactionBuilder}), not to recompute its answer.
+     * <p>
+     * <b>Silent without an evaluator</b>, on the {@link #EX_UNITS_GATE} convention: a no-evaluator
+     * {@link LoanFactory} is explicitly build-only and none of its output is ever submitted.
+     * <p>
+     * <b>Do not restate that silence as "the witness copy is still there without an evaluator".</b> It
+     * was true once and is now false: the reference-script wiring in {@link PoolCreateTransactionBuilder}
+     * is <em>unconditional</em>, so the no-evaluator create carries an <em>empty</em> witness set too and
+     * the pin is taken over that corrected shape. The silence rests on build-only and never-submitted,
+     * nothing else.
+     * <p>
+     * <b>Known limit — partial blindness.</b> The precondition below fires only when <em>no</em>
+     * reference-script hash is resolvable at all. If the universe publishes some hashes but the one UTxO
+     * carrying the duplicated script has a null or wrong {@code referenceScriptHash}, a genuine duplicate
+     * passes unseen — the gate cannot tell "legitimately witnessed, never published" from "published but
+     * the metadata did not say so". Inherent to asserting the artefact rather than recomputing it; on
+     * real chain data the hash is populated, which is what keeps the severity low.
+     */
+    private void assertNoDuplicateScriptWitnesses(Transaction tx, List<Utxo> universe) {
+        if (txEvaluator == null) {
+            return;
+        }
+        Set<String> referenced = new LinkedHashSet<>();
+        for (Utxo utxo : universe) {
+            if (utxo.getReferenceScriptHash() != null) {
+                referenced.add(utxo.getReferenceScriptHash().toLowerCase());
+            }
+        }
+
+        // The gate's precondition: it can only see duplicates if it can see the reference scripts. A
+        // body that reads reference inputs but whose resolved universe publishes no reference-script
+        // hash at all has starved this gate of its input — every witnessed script would then look
+        // un-referenced and the gate would wave through the very shape it exists to refuse. A gate that
+        // cannot see its input must say so rather than return green.
+        List<TransactionInput> referenceInputs = tx.getBody().getReferenceInputs();
+        if (referenceInputs != null && !referenceInputs.isEmpty() && referenced.isEmpty()) {
+            throw new GateFailure(LEDGER_PREFLIGHT_GATE + ": this transaction reads "
+                    + referenceInputs.size() + " reference input(s) but not one UTxO in the resolved "
+                    + "universe publishes a reference-script hash — the gate cannot see its input, so it "
+                    + "cannot tell a duplicated script from a clean one and refuses rather than pass");
+        }
+
+        for (String witnessed : witnessScriptHashes(tx)) {
+            if (referenced.contains(witnessed)) {
+                throw new GateFailure(LEDGER_PREFLIGHT_GATE + ": script " + witnessed + " travels both in "
+                        + "the witness set and as a reference script this transaction resolves — Conway "
+                        + "refuses that as ExtraneousScriptWitnessesUTXOW; exactly one route is permitted");
+            }
+        }
+    }
+
+    /** Every script hash the finished witness set carries, in any language. */
+    private static Set<String> witnessScriptHashes(Transaction tx) {
+        Set<String> hashes = new LinkedHashSet<>();
+        if (tx.getWitnessSet() == null) {
+            return hashes;
+        }
+        List<List<? extends Script>> scriptLists = new ArrayList<>();
+        scriptLists.add(tx.getWitnessSet().getPlutusV1Scripts());
+        scriptLists.add(tx.getWitnessSet().getPlutusV2Scripts());
+        scriptLists.add(tx.getWitnessSet().getPlutusV3Scripts());
+        scriptLists.add(tx.getWitnessSet().getNativeScripts());
+        for (List<? extends Script> scripts : scriptLists) {
+            if (scripts == null) {
+                continue;
+            }
+            for (Script script : scripts) {
+                try {
+                    hashes.add(HexUtil.encodeHexString(script.getScriptHash()).toLowerCase());
+                } catch (Exception e) {
+                    throw new GateFailure(LEDGER_PREFLIGHT_GATE + ": a witness-set script cannot be "
+                            + "hashed, so it cannot be checked against the reference scripts: " + e);
+                }
+            }
+        }
+        return hashes;
     }
 
     /**
@@ -337,11 +621,13 @@ public final class LoanFactory {
     // ---- per-call builders over a supplier that resolves the pool continuation ---------------------
 
     private PoolBorrowTransactionBuilder borrowBuilder(Utxo poolUtxo) {
-        return new PoolBorrowTransactionBuilder(registry, network, resolving(poolUtxo), protocolParamsSupplier);
+        return new PoolBorrowTransactionBuilder(registry, network, resolving(poolUtxo),
+                protocolParamsSupplier, txEvaluator);
     }
 
     private PoolCancelTransactionBuilder cancelBuilder(Utxo poolUtxo) {
-        return new PoolCancelTransactionBuilder(registry, network, resolving(poolUtxo), protocolParamsSupplier);
+        return new PoolCancelTransactionBuilder(registry, network, resolving(poolUtxo),
+                protocolParamsSupplier, txEvaluator);
     }
 
     /**
@@ -488,6 +774,28 @@ public final class LoanFactory {
             }
         }
         return universe;
+    }
+
+    /**
+     * The one validator the create transaction needs the dry-evaluator to resolve. The {@code pool.pool}
+     * witness copy is stripped and the policy travels by reference input only, and a Blockfrost
+     * {@link Utxo} publishes a reference script's hash but never its bytes — so without this the
+     * evaluator would answer {@code RequiredRedeemersMismatch}.
+     * <p>
+     * <b>Load-bearing on every path, including the no-evaluator one — do not scope it to the evaluator.</b>
+     * An earlier version of this comment called it "inert without an evaluator, where the witness copy is
+     * still there". That stopped being true when the reference-script wiring in
+     * {@link PoolCreateTransactionBuilder} became unconditional: the witness copy is now gone everywhere.
+     * Returning an empty list when {@code txEvaluator == null} fails six tests with
+     * {@code RequiredRedeemersMismatch {missing: [65a0bc5e…]}} — verified by mutation, so this is a
+     * measured claim rather than a caution.
+     * <p>
+     * Reference-script resolution needs <b>two independent facts</b> and this supplies only one: the UTxO
+     * must publish {@code referenceScriptHash} (<em>which</em> script is reachable) and the
+     * {@code ScriptSupplier} must hold its <em>bytes</em>. Neither alone is sufficient.
+     */
+    private List<PlutusScript> createExtraScripts() {
+        return List.of(registry.getPoolScript());
     }
 
     private List<PlutusScript> borrowExtraScripts() {
