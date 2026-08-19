@@ -71,6 +71,8 @@ public class ScheduledTransactionService {
 
     private final BlockEventListener blockEventListener;
 
+    private final NodeMetrics nodeMetrics;
+
     private final Vector<TransactionInput> unprocessableScheduledTransactions = new Vector<>();
 
     private final DatumTankConverter datumConverter = new DatumTankConverter();
@@ -203,7 +205,10 @@ public class ScheduledTransactionService {
                         .ignoreScriptCostEvaluationError(false)
                         .completeAndWait();
 
+                nodeMetrics.recordScheduledTxSuccess();
+
             } catch (Exception e) {
+                nodeMetrics.recordScheduledTxFailure();
                 unprocessableScheduledTransactions.add(TransactionInput.builder()
                         .transactionId(tankPaymentUtxo.getTxHash())
                         .index(tankPaymentUtxo.getOutputIndex())

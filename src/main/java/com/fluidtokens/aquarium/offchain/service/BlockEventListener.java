@@ -19,6 +19,8 @@ public class BlockEventListener {
 
     private final CardanoConverters cardanoConverters;
 
+    private final NodeMetrics nodeMetrics;
+
     @Getter
     private final AtomicBoolean isSyncing = new AtomicBoolean(true);
 
@@ -27,11 +29,12 @@ public class BlockEventListener {
 
         var currentRealSlot = cardanoConverters.time().toSlot(LocalDateTime.now(ZoneOffset.UTC));
 
-        if (commitEvent.getMetadata().getSlot() < currentRealSlot - 60 * 10) {
-            isSyncing.set(true);
-        } else {
-            isSyncing.set(false);
-        }
+        long slot = commitEvent.getMetadata().getSlot();
+        boolean syncing = slot < currentRealSlot - 60 * 10;
+        isSyncing.set(syncing);
+        nodeMetrics.recordBlockProcessed();
+        nodeMetrics.setChainTipSlot(slot);
+        nodeMetrics.setSyncing(syncing);
 
     }
 

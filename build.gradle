@@ -22,6 +22,7 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-web'
 	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
 	implementation 'org.springframework.boot:spring-boot-starter-webflux'
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
 
 	implementation 'org.cardanofoundation:cf-cardano-conversions-java:1.2.0'
@@ -33,7 +34,7 @@ dependencies {
 	implementation('com.bloxbean.cardano:cardano-client-backend-blockfrost:0.7.2')
 	implementation('com.bloxbean.cardano:cardano-client-backend-ogmios:0.7.2')
 
-	implementation 'io.micrometer:micrometer-registry-prometheus:latest.release'
+	implementation 'io.micrometer:micrometer-registry-prometheus'
 
 	implementation 'org.postgresql:postgresql:42.6.0'
 	testImplementation 'com.h2database:h2:2.1.214'
