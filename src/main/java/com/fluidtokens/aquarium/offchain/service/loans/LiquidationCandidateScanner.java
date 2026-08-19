@@ -55,22 +55,25 @@ import java.util.stream.Collectors;
  *       {@link LiquidationExclusion#HEALTH_NOT_COMPUTABLE}</li>
  *   <li>D9 — the loan must actually be late or over its liquidation LTV →
  *       {@link LiquidationExclusion#NOT_LIQUIDATABLE}</li>
- *   <li>deployment scope — the equity must be zero →
- *       {@link LiquidationExclusion#POSITIVE_EQUITY_UNSUPPORTED}</li>
  * </ol>
- * Anything that survives all eleven steps is {@link LiquidationAssessment#buildable()}.
+ * Anything that survives all ten steps is {@link LiquidationAssessment#buildable()}.
  * <p>
- * <b>Why the positive-equity filter is step 11 and not up with D1-D3.</b> It reads as a scope filter
- * and its D-family cousins sit at steps 2-5, but it cannot join them: {@code equity} is not a datum
- * field, it is {@link LoanFinance#redeemerEquity} of the loan, the debt and <em>both</em> priced
- * legs, so nothing before step 9 knows it. Given that it has to come after the finance math, it goes
- * after D9 rather than before it for a diagnostic reason: {@link LiquidationExclusion#NOT_LIQUIDATABLE}
- * is a fact about the <em>loan</em> (it is healthy, nobody may liquidate it), while
- * {@link LiquidationExclusion#POSITIVE_EQUITY_UNSUPPORTED} is a fact about the <em>deployment</em>
- * and about what {@code LiquidateTransactionBuilder} emits against it (no layout it emits satisfies
- * both validators at a positive equity; whether some other layout would is untested). Reporting the
- * loan-level truth first keeps the operator-visible reason stable across a redeploy: a healthy loan reads
- * {@code NOT_LIQUIDATABLE} before and after, and only the genuinely blocked candidates change verdict.
+ * <b>There used to be an eleventh step: the equity had to be zero.</b> It was a scope filter, and the
+ * scope it described turned out not to exist. It rested on the claim that no output layout
+ * {@code LiquidateTransactionBuilder} emits satisfies both {@code lm_liquidate_action} and
+ * {@code loan_claim_action} at a positive equity — true of the layouts that had been tried, and never
+ * a proof. In fact only {@code loan_claim_action}'s slot is forced; {@code lm_liquidate_action}
+ * reaches its own through the {@code assetOutputIndexes} the builder writes. Emitting the borrower's
+ * compensation output at the forced slot and pointing the free index at the displaced collateral
+ * output satisfies both — see {@code LiquidateTransactionBuilder}'s "Positive equity: rule R", and
+ * {@code RealEquityLoanDryEvalTest} for the evaluation against the deployed validators on a real
+ * preview loan. A liquidatable loan with a positive equity is now an ordinary candidate.
+ * <p>
+ * <b>What still refuses, and where.</b> {@code repaymentReceipts == True} together with a positive
+ * equity needs a receipt-NFT mint this repo does not model. That is refused by the <em>builder</em>
+ * ({@code Refusal.REPAYMENT_RECEIPTS_WITH_EQUITY}), loudly and per candidate, rather than filtered out
+ * here — the scanner's job is to describe the loan, and a loan that a future mint implementation would
+ * make liquidatable is not one this class should be quietly hiding.
  * <p>
  * <b>Ports no arithmetic.</b> Every number in a buildable assessment comes straight out of
  * {@link LoanFinance}; every oracle-usability call defers to {@link OracleEntry#usableForLiquidation()}
@@ -182,18 +185,20 @@ public class LiquidationCandidateScanner {
                     "not late and currentLtv <= liquidationLtv");
         }
 
-        // At the deployed pin, loan_claim_action reads the loan-index slot of the asset-manager-filtered
-        // output list directly while lm_liquidate_action reaches it through assetOutputIndexes[index];
-        // LiquidateTransactionBuilder emits identity indexes, which collapses both onto the same slot
-        // wanting mutually exclusive datums, so no layout it emits carries a positive equity through
-        // both. Whether some other layout would is untested — see POSITIVE_EQUITY_UNSUPPORTED for the
-        // file:line references and the dry-eval test that pins it. Excluded here so such a candidate
-        // never reaches LiquidateTransactionBuilder in the first place.
-        if (equity.signum() > 0) {
-            return LiquidationAssessment.excluded(bond, loan, LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED,
-                    "equity " + equity + " > 0; no output layout the builder emits satisfies both "
-                            + "lm_liquidate_action and loan_claim_action");
-        }
+        // A positive equity used to be excluded here, on the belief that no output layout
+        // LiquidateTransactionBuilder emits could satisfy both lm_liquidate_action and
+        // loan_claim_action at once. That belief was wrong: only loan_claim_action's slot is forced,
+        // lm_liquidate_action reaches its own through the assetOutputIndexes the builder chooses, and
+        // putting the borrower's compensation output at the forced slot satisfies both (rule R — see
+        // LiquidateTransactionBuilder's class javadoc, and RealEquityLoanDryEvalTest for the
+        // evaluation against the deployed validators on real chain data). So a liquidatable loan with
+        // a positive equity is now an ordinary candidate and is passed through.
+        //
+        // One branch of it is still unbuildable and the BUILDER refuses it loudly rather than the
+        // scanner filtering it out: repaymentReceipts == True together with a positive equity needs a
+        // receipt-NFT mint this repo does not model (Refusal.REPAYMENT_RECEIPTS_WITH_EQUITY). That
+        // refusal is reachable from a real scan now, which is why its @UnreachableFromScannedBatch
+        // marking was removed with this exclusion.
 
         // §7.5 fee maths: liquidationFee = loanCollateralAmount * liquidationFeePerMille / 1000, floored.
         // liquidationFeePerMille is a lender-authored bond-datum field with no non-negativity

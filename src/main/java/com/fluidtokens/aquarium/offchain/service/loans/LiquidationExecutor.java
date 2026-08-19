@@ -432,6 +432,26 @@ public class LiquidationExecutor {
      * a lovelace transaction fee. For ada collateral that feed is {@link OraclePriceFeed#unit()},
      * the 1:1 identity {@code retrieve_oracle_data} synthesises for the empty policy id — the same
      * feed the scanner and the builder used, not a special case invented here.
+     *
+     * <h3>⚠ KNOWN GAP: the expected-profit arithmetic does not count min-ada</h3>
+     * {@code expectedProfit = expectedFee - txFee - margin} below has <b>no min-ada term</b>. It
+     * therefore <b>overstates profit on every positive-equity liquidation</b>, by roughly the min-ada
+     * the builder funds on the borrower-compensation output: that output is emitted carrying only the
+     * equity quantity and cardano-client-lib tops it to the floor out of the bot's own inputs, which
+     * is real lovelace leaving the wallet that {@code txFee} does not include. On token collateral the
+     * whole rider is unaccounted (the equity is denominated in the token, so the output carries no ada
+     * of its own); on ada collateral it is the shortfall between a sub-floor equity and the floor.
+     * <p>
+     * Measured on the real preview loan in {@code RealEquityLoanDryEvalTest}: a 1_364_238 lovelace
+     * transaction fee plus a 1_655_040 lovelace compensation rider — 3_019_278 out of pocket against
+     * a 1_364_238 the arithmetic below sees. That is enough to flip the verdict on that loan under the
+     * preview {@code profit-margin-lovelace} of −3_000_000.
+     * <p>
+     * The rider is <em>bounded</em> — {@code LiquidateTransactionBuilder}'s
+     * {@code assertCompensationSubsidyBounded} refuses a body whose compensation output exceeds one
+     * min-ada above the equity — so the overstatement cannot grow silently. Bounding is not counting.
+     * Closing it is a change to the profitability model (a check-profitability flag, an absolute ADA
+     * minimum, a percentage minimum) and belongs to that work, not here; it is tracked separately.
      */
     private void record(LiquidationAssessment assessment, long now, Transaction transaction,
                         Map<String, OracleEntry> oraclesByUnit) {

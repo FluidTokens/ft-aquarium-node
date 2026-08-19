@@ -519,35 +519,47 @@ class LiquidationCandidateScannerTest {
         assertTrue(assessment.late(), "30 days elapsed against a 24h installment period");
     }
 
-    // ---- POSITIVE_EQUITY_UNSUPPORTED (deployment scope) --------------------------------------
+    // ---- a positive equity is an ordinary candidate ------------------------------------------
 
     /**
+     * <b>A liquidatable loan with a positive equity is admitted.</b> This test replaces
+     * {@code aLiquidatableLoanWithPositiveEquityIsExcludedAsUnsupported}, which asserted the exact
+     * opposite on this same fixture.
+     *
+     * <h3>Why the old assertion was removed rather than adjusted</h3>
+     * It pinned {@code LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED} as intended behaviour. That
+     * exclusion rested on the claim that the deployed {@code lm_liquidate_action} and
+     * {@code loan_claim_action} both force the loan-index slot of the asset-manager-filtered output
+     * list and want mutually exclusive datums there. Only half of that is true: at the deployed pin,
+     * {@code lm_liquidate_action.ak:87-91} reaches its slot through
+     * {@code redeemer.assetOutputIndexes}, which the builder writes. Put the borrower's compensation
+     * output at {@code loan_claim_action}'s forced slot and point the free index at the displaced
+     * collateral output, and both validators are satisfied — rule R, evaluated against the deployed
+     * scripts on real chain data in {@code RealEquityLoanDryEvalTest}. The exclusion described a
+     * limitation of the builder, not of the deployment, and the builder no longer has it.
+     *
+     * <h3>The fixture</h3>
      * Boundary partner to {@link #lateButLtvHealthyLoanIsBuildableViaLateness()}: the identical loan,
      * identical collateral, identical feeds, with the partial-liquidation penalty flipped from
      * negative to positive so the borrower's surplus is actually computed instead of short-circuited.
-     * 1,000,000,000 units of collateral at 2 lovelace is 2 ADA-orders more than the 1,000,000-unit
-     * debt at 5 lovelace, so the equity is large and positive — and the loan is still liquidatable,
-     * by lateness, which is what makes this a deployment-scope exclusion rather than a health one.
-     * <p>
-     * The deployed {@code lm_liquidate_action} and {@code loan_claim_action} both claim the loan-index
-     * slot of the same asset-manager-filtered output list and want mutually exclusive datums in it, so
-     * no such liquidation is submittable; {@code LiquidateDryEvalTest} is the evidence. The scanner
-     * excludes it here so it never reaches {@code LiquidateTransactionBuilder}.
+     * 1,000,000,000 units of collateral at 2 lovelace is far more than the 1,000,000-unit debt at
+     * 5 lovelace, so the equity is large and positive — and the loan is still liquidatable, by
+     * lateness. Both facts are asserted, so this cannot pass by the equity having quietly gone to zero.
      */
     @Test
-    void aLiquidatableLoanWithPositiveEquityIsExcludedAsUnsupported() throws Exception {
+    void aLiquidatableLoanWithPositiveEquityIsBuildable() throws Exception {
         var datum = lateDatum(100);
         var loan = loan(datum, BigInteger.valueOf(1_000_000_000));
         var client = oracleClientWith(entry(PRINCIPAL, 5), entry(COLLATERAL, 2));
 
         var assessment = scanOne(List.of(loan), List.of(permissiveBond()), client);
 
-        // The exclusion first, so that removing the filter fails this test by name rather than on a
-        // generic "expected false but was true" from buildable().
-        assertEquals(LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED, assessment.exclusion());
-        assertFalse(assessment.buildable());
-        assertTrue(assessment.detail().contains("> 0"),
-                "the detail must name the equity that blocked it: " + assessment.detail());
+        assertTrue(assessment.equity().signum() > 0,
+                "the fixture must really carry a positive equity, or this test proves nothing");
+        assertTrue(assessment.late(), "30 days elapsed against a 24h installment period");
+        assertTrue(assessment.buildable(),
+                assessment.exclusion() + ": " + assessment.detail());
+        assertNull(assessment.exclusion());
     }
 
     @Test

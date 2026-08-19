@@ -181,132 +181,121 @@ class LiquidateDryEvalTest {
     }
 
     /**
-     * Positive equity is refused in <b>both output layouts this builder can emit</b>. Exactly three
-     * things are claimed here, and nothing beyond them.
-     * <p>
-     * <b>(a) The two validators no longer structurally collide.</b> At the deployed commit
-     * {@code ff005fb}, {@code lm_liquidate_action} reads its asset output as
-     * {@code safe_list_at(assetOutputs, safe_list_at(redeemer.assetOutputIndexes, index))} — through
-     * the redeemer — while {@code loan_claim_action} <em>still</em> reads
-     * {@code safe_list_at(get_outputs_to_smart_credential(..), index)}, the bare loan index,
-     * unchanged at {@code ff005fb}. Both filter the same list (the outputs whose payment credential
-     * is the asset-manager spend script) and want mutually exclusive datums
-     * ({@code action_claimed_collateral} against
-     * {@code action_partial_liquidation_compensation}), but the position each names is no longer
-     * forced to be the same one.
-     * <p>
-     * <b>(b) This builder emits identity {@code assetOutputIndexes}, so both layouts it can produce
-     * still fail.</b> At the identity the redeemer names slot {@code index}, which is where
-     * {@code loan_claim_action} looks too — so the collision is back, and the two evaluation runs
-     * below show it: as built, the claimed collateral is in the slot and {@code loan_claim_action}
-     * refuses; mirrored, the compensation output is in the slot, {@code loan_claim_action}
-     * <em>accepts</em> our compensation output and {@code lm_liquidate_action} refuses.
-     * <p>
-     * <b>(c) Whether some other layout satisfies both is an open question, deliberately not answered
-     * here.</b> A non-identity {@code assetOutputIndexes} over a reordered output list is not tested
-     * by this file and not claimed either way. What is enforced is only (b):
-     * {@link LiquidateTransactionBuilder}'s V8 refuses a positive-equity batch with
-     * {@code POSITIVE_EQUITY_UNSUPPORTED}, and {@code LiquidationCandidateScanner} excludes one before
-     * it can reach the builder.
+     * <b>Positive equity evaluates green against the deployed validators under rule R.</b>
      *
-     * <h3>Exactly what the two evaluation runs below do and do not prove</h3>
-     * The evaluator stops at the first failing redeemer ({@link EvalFixtures} — "Harness
-     * limitations"), and this transaction's {@code loan_claim_action} withdrawal sorts <em>before</em>
-     * its {@code lm_liquidate_action} one in the body (indexes 0 and 2; the test asserts that
-     * ordering rather than assuming it, because both inferences below depend on it).
-     * <ul>
-     *   <li><b>Mirrored run — the load-bearing one.</b> With the compensation output moved into the
-     *       slot, the failure moves to {@code lm_liquidate_action} at the <em>higher</em> index. The
-     *       evaluator would have reported the lower index had it also failed, so this proves
-     *       {@code loan_claim_action} <b>accepted</b> the compensation output — its datum, its
-     *       amount, its {@code dosProtection} flatten count, all of it — while
-     *       {@code lm_liquidate_action} refused the same layout.</li>
-     *   <li><b>As-built run — weak on its own.</b> A failure at the <em>lower</em> index is equally
-     *       consistent with both validators refusing, so it proves only that
-     *       {@code loan_claim_action} cannot accept the as-built layout. It is deliberately
-     *       <em>not</em> read as evidence that {@code lm_liquidate_action} accepted anything.</li>
-     * </ul>
-     * What rules out "our claimed-collateral output is simply malformed" is not either failure but
-     * the datum assertions: both asset-manager output datums are pinned by their serialized bytes,
-     * with the two action strings spelled out as ASCII literals here rather than taken from
-     * {@link LiquidationTxEncoder}'s constants — so a mutated constant moves the transaction without
-     * moving the expectation, and this test fails.
+     * <h3>What this test replaces, and why the old assertion had to go</h3>
+     * It replaces {@code positiveEquityIsRefusedInBothLayoutsThisBuilderCanEmit}, which asserted that
+     * this same fixture is refused by the chain in every layout the builder could produce, and which
+     * was the sole evidence for the builder's {@code POSITIVE_EQUITY_UNSUPPORTED} veto (V8). That test
+     * was <em>correct about what it ran</em> and wrong about what it implied. It ran exactly two
+     * layouts — claimed-collateral in the loan-index slot, and compensation in the loan-index slot —
+     * both with <b>identity</b> {@code assetOutputIndexes}, and its own javadoc said so: "(c) Whether
+     * some other layout satisfies both is an open question, deliberately not answered here."
      * <p>
-     * <b>Which is why this test builds through the package-private
-     * {@link LiquidateTransactionBuilder#buildIgnoringPositiveEquityVeto} seam.</b> V8 exists
-     * <em>because</em> of what is proven below; running the evidence through the veto it justifies
-     * would leave the veto resting on nothing. The seam disables V8 and only V8 — every other guard,
-     * including the two permanent V7 {@code expect}s, still applies to the transaction evaluated here.
+     * The answer is yes. {@code loan_claim_action.ak:275-284} indexes the filtered output list with
+     * the bare loan index and cannot be redirected; {@code lm_liquidate_action.ak:87-91} reaches it
+     * through {@code assetOutputIndexes[index]}, which the builder chooses. Holding
+     * {@code assetOutputIndexes} at the identity forced both onto the same slot and made the collision
+     * look structural. Releasing it — compensation at the forced slot, {@code assetOutputIndexes}
+     * pointed at the displaced collateral output — satisfies both. That is rule R.
+     * <p>
+     * The old assertion was therefore <b>deleted rather than adjusted</b>: it pinned a limitation of
+     * the builder as if it were a property of the deployment, and leaving it in any form would have
+     * kept a false claim alive in the suite.
+     *
+     * <h3>What is claimed here</h3>
+     * Everything, and by evaluation rather than by inference. This transaction is built on the
+     * <b>public entry point</b> — there is no V8 seam any more — and every one of its seven redeemers
+     * returns ex-units from the real PlutusV3 machine against the deployed scripts. Unlike the two
+     * runs it replaces, no reasoning about which redeemer index the evaluator stopped at is needed:
+     * nothing stopped.
+     * <p>
+     * The two asset-manager datums are still pinned by their serialized bytes, with the action strings
+     * spelled as ASCII literals rather than taken from {@link LiquidationTxEncoder}'s constants, so a
+     * mutated constant moves the transaction without moving the expectation.
      */
     @Test
-    void positiveEquityIsRefusedInBothLayoutsThisBuilderCanEmit() {
+    void positiveEquityEvaluatesAgainstTheDeployedValidatorsUnderRuleR() {
         Scenario scenario = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 200_000_000L);
         List<Utxo> universe = universe(List.of(scenario));
 
         assertEquals(BigInteger.valueOf(84_500_000), scenario.assessment().equity(),
                 "the fixture must really produce a compensation output");
 
-        // Our side first: the builder emits both asset-manager outputs, and each one is pinned by
-        // its serialized datum bytes — not just by its lovelace — so "the collision is upstream"
-        // cannot be confused with "our output is malformed". The two action strings are spelled as
-        // ASCII literals here: deriving them from LiquidationTxEncoder's constants would move the
-        // expectation in lockstep with any mutation of them and pin nothing.
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario));
+        Transaction tx = build(List.of(scenario));
         List<Integer> assetManagerOutputs = assetManagerOutputIndexes(tx);
-        assertEquals(2, assetManagerOutputs.size(), "a claimed-collateral and a compensation output");
+        assertEquals(2, assetManagerOutputs.size(), "a compensation and a claimed-collateral output");
 
-        TransactionOutput claimedCollateral =
+        // Rule R, first row: the compensation output is at filtered slot 0 — loan 0's own index, the
+        // position loan_claim_action reads and cannot be pointed away from.
+        TransactionOutput compensation =
                 tx.getBody().getOutputs().get(assetManagerOutputs.get(0));
-        assertEquals(BigInteger.valueOf(113_500_000), claimedCollateral.getValue().getCoin(),
-                "collateral - equity - fee");
-        assertEquals(assetManagerDatum(scenario, "claimed_collateral", REGISTRY.getLenderBondPolicyId()),
-                claimedCollateral.getInlineDatum().serializeToHex(),
-                "the claimed-collateral output must carry constants.action_claimed_collateral and be "
-                        + "owned by the lender bond");
-
-        TransactionOutput compensation = tx.getBody().getOutputs().get(assetManagerOutputs.get(1));
         assertEquals(BigInteger.valueOf(84_500_000), compensation.getValue().getCoin(),
                 "the borrower's equity");
         assertEquals(assetManagerDatum(scenario, "partial_liquidation", REGISTRY.getBorrowerBondPolicyId()),
                 compensation.getInlineDatum().serializeToHex(),
-                "the compensation output must carry "
-                        + "constants.action_partial_liquidation_compensation and be owned by the "
-                        + "borrower bond");
+                "filtered slot 0 must carry constants.action_partial_liquidation_compensation and be "
+                        + "owned by the borrower bond");
 
-        // Claim (b): the layouts below are the ones the *identity* redeemer produces. Read off the
-        // deserialised lm redeemer rather than assumed, because the whole inference rests on
-        // lm_liquidate_action being pointed at slot 0 — the same slot loan_claim_action reads.
-        assertEquals(List.of(BigInteger.ZERO), emittedAssetOutputIndexes(tx),
-                "this builder emits identity assetOutputIndexes; that is what re-creates the collision");
+        // Rule R, second row: the claimed-collateral output, displaced to slot 1.
+        TransactionOutput claimedCollateral =
+                tx.getBody().getOutputs().get(assetManagerOutputs.get(1));
+        assertEquals(BigInteger.valueOf(113_500_000), claimedCollateral.getValue().getCoin(),
+                "collateral - equity - fee");
+        assertEquals(assetManagerDatum(scenario, "claimed_collateral", REGISTRY.getLenderBondPolicyId()),
+                claimedCollateral.getInlineDatum().serializeToHex(),
+                "filtered slot 1 must carry constants.action_claimed_collateral and be owned by the "
+                        + "lender bond");
 
-        // Both inferences below rest on loan_claim_action being evaluated before lm_liquidate_action,
-        // because the evaluator reports only the first failing redeemer. Asserted, not assumed.
-        int claimWithdrawal = withdrawalIndexOf(tx,
-                LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()));
-        int liquidateWithdrawal = withdrawalIndexOf(tx,
-                LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()));
-        assertTrue(claimWithdrawal < liquidateWithdrawal,
-                "the mirrored-run inference needs loan_claim_action at the lower redeemer index, got "
-                        + claimWithdrawal + " and " + liquidateWithdrawal);
+        // The free index, read back off the deserialised witness set: this is what yields.
+        assertEquals(List.of(BigInteger.ONE), emittedAssetOutputIndexes(tx),
+                "assetOutputIndexes must point lm_liquidate_action at the displaced collateral output");
 
-        // As built — claimed collateral in the slot. loan_claim_action refuses. This alone does not
-        // say what lm_liquidate_action would have done: it is at the higher index, and the evaluator
-        // never got there.
-        EvalFixtures.Outcome asBuilt = EvalFixtures.evaluateRaw(tx, universe, REGISTRY);
-        assertFalse(asBuilt.successful(), "loan_claim_action cannot accept this layout");
-        assertTrue(asBuilt.detail().contains(redeemerError(tx,
-                        LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))),
-                "expected loan_claim_action to be the rejecting script, got: " + asBuilt.detail());
+        // The gate. Seven redeemers, all costed, none refused.
+        List<EvaluationResult> results = EvalFixtures.evaluate(tx, universe, REGISTRY);
+        assertRedeemerCoverage(tx, results);
+        assertEquals(2, count(results, RedeemerTag.Spend));
+        assertEquals(1, count(results, RedeemerTag.Mint));
+        assertEquals(4, count(results, RedeemerTag.Reward));
+        assertWithinBudget(results);
+    }
 
-        // Mirrored — compensation in the slot. The refusal moves to the *higher* index, so the
-        // lower one passed: loan_claim_action accepted the compensation output, and
-        // lm_liquidate_action refused the very same layout.
+    /**
+     * <b>The layout this builder emitted before rule R is rejected on chain by
+     * {@code loan_claim_action}.</b>
+     * <p>
+     * Rule R is not a free choice dressed up as a rule, and this is the evidence. The transaction from
+     * the test above is mutated back into the pre-rule-R shape — claimed collateral at filtered slot 0,
+     * compensation at slot 1, {@code assetOutputIndexes} moved to {@code [0]} so that
+     * {@code lm_liquidate_action} still finds its collateral output — and handed to the same machine.
+     * Both validators are pointed at outputs whose datum they can read; only the forced position is
+     * wrong. The refusal that comes back is {@code loan_claim_action}'s, which is the validator whose
+     * index cannot be redirected.
+     * <p>
+     * Without this, "rule R" would be indistinguishable from "one of several layouts that happen to
+     * work", and a future edit reverting the emission order would show up only as a lost fee on
+     * preview.
+     */
+    @Test
+    void thePreRuleROutputOrderIsRejectedByLoanClaimAction() {
+        Scenario scenario = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 200_000_000L);
+        List<Utxo> universe = universe(List.of(scenario));
+
+        Transaction tx = build(List.of(scenario));
+        List<Integer> assetManagerOutputs = assetManagerOutputIndexes(tx);
+
+        // Back to the old order, with the redeemer kept consistent so that lm_liquidate_action is not
+        // the thing that breaks: only loan_claim_action's forced slot is now wrong.
         swapOutputs(tx, assetManagerOutputs.get(0), assetManagerOutputs.get(1));
-        EvalFixtures.Outcome mirrored = EvalFixtures.evaluateRaw(tx, universe, REGISTRY);
-        assertFalse(mirrored.successful(), "lm_liquidate_action cannot accept the mirrored layout");
-        assertTrue(mirrored.detail().contains(redeemerError(tx,
-                        LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))),
-                "expected lm_liquidate_action to be the rejecting script, got: " + mirrored.detail());
+        replaceLmLiquidateRedeemer(tx, List.of(0L));
+
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(tx, universe, REGISTRY);
+        assertFalse(outcome.successful(),
+                "loan_claim_action reads filtered slot 0 with the bare loan index; the collateral "
+                        + "datum there cannot satisfy equity_sent_to_borrower");
+        assertTrue(outcome.detail().contains(redeemerError(tx,
+                        LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))),
+                "expected loan_claim_action to be the rejecting script, got: " + outcome.detail());
     }
 
     // ======================================================================================
@@ -725,17 +714,6 @@ class LiquidateDryEvalTest {
     private static Transaction build(List<Scenario> scenarios,
                                      LiquidateTransactionBuilder.ReferenceScripts refs) {
         return builder(scenarios).build(request(scenarios, refs));
-    }
-
-    /**
-     * The same build with {@link LiquidateTransactionBuilder}'s V8 positive-equity veto disabled, and
-     * nothing else. Used by exactly one test — the one whose evaluation runs are <em>the evidence for
-     * V8</em>. Building that transaction through the veto it justifies would make the veto
-     * self-certifying; see the seam's own javadoc.
-     */
-    private static Transaction buildIgnoringPositiveEquityVeto(List<Scenario> scenarios) {
-        return builder(scenarios).buildIgnoringPositiveEquityVeto(
-                request(scenarios, LiquidateTransactionBuilder.ReferenceScripts.none()));
     }
 
     private static LiquidateTransactionBuilder builder(List<Scenario> scenarios) {

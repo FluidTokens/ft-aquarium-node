@@ -16,7 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Guards the six {@link LiquidateTransactionBuilder.Refusal} constants that
+ * Guards the {@link LiquidateTransactionBuilder.Refusal} constants that
  * {@link UnreachableFromScannedBatch} documents as unreachable when a batch comes from a real
  * {@link LiquidationCandidateScanner} scan. All three assertions have to hold together for the
  * marking to mean anything: the set has to be exactly right (a), the marked check has to still
@@ -25,15 +25,26 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class UnreachableVetoMarkingTest {
 
     /**
-     * The six constants this slice marks, exactly as named in the slice contract. Deliberately
-     * spelled out as literals rather than derived from the source, so an accidental annotation
-     * addition or removal changes this test's answer independently of the production code.
+     * The constants currently marked. Deliberately spelled out as literals rather than derived from
+     * the source, so an accidental annotation addition or removal changes this test's answer
+     * independently of the production code.
+     * <p>
+     * <b>It was six; it is now four.</b> Positive-equity liquidation removed two of them, and for two
+     * different reasons:
+     * <ul>
+     *   <li>{@code POSITIVE_EQUITY_UNSUPPORTED} — the constant no longer exists. It was the V8 veto,
+     *       and V8 is gone.</li>
+     *   <li>{@code REPAYMENT_RECEIPTS_WITH_EQUITY} — the constant is still there and still refuses,
+     *       but it is <b>no longer unreachable</b>. Its marking claimed the scanner filtered it out
+     *       via {@code LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED}; that exclusion is gone, so a
+     *       {@code repaymentReceipts = True} loan with a positive equity now reaches the builder for
+     *       real. Leaving the annotation would have been a claim of unreachability that the scanner no
+     *       longer backs.</li>
+     * </ul>
      */
     private static final Set<String> EXPECTED_ANNOTATED = Set.of(
             "EQUITY_IN_PRINCIPAL_CURRENCY",
             "CONVERSION_TO_PRINCIPAL_REQUIRED",
-            "POSITIVE_EQUITY_UNSUPPORTED",
-            "REPAYMENT_RECEIPTS_WITH_EQUITY",
             "UNSUPPORTED_ORACLE_VARIANT",
             "CHARLIE_PROVIDER_REFERENCE_INPUT_MISSING");
 

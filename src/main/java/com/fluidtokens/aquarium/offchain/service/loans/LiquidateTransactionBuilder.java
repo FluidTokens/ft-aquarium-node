@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
+import com.bloxbean.cardano.client.api.MinAdaCalculator;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
@@ -135,13 +136,10 @@ import java.util.stream.Stream;
  *       {@code shouldLiquidationConvertToPrincipal == False} a conjunct of the same check. The
  *       scanner already excludes both (D2 and §7.5), so this is the builder's own last line rather
  *       than the only one.</li>
- *   <li><b>V8</b> — deployment scope: {@code equity > 0} is refused, because no output layout
- *       <em>this builder emits</em> satisfies both validators (see
- *       {@link Refusal#POSITIVE_EQUITY_UNSUPPORTED}). This is the only veto here that is a statement
- *       about <em>this deployment</em> rather than about the design, so it is checked last of the
- *       per-loan vetoes: a batch that is wrong for a permanent reason reports that permanent
- *       reason.</li>
  * </ul>
+ * <b>There is no V8.</b> It used to refuse {@code equity > 0} outright, on the belief that no output
+ * layout satisfied both validators at once. That belief was wrong — see "Positive equity: rule R"
+ * below — and the veto was deleted rather than relaxed.
  *
  * <h2>Ex-units are measured, not guessed</h2>
  * A redeemer's declared ex-units are not checked by the mempool: a transaction that under-declares is
@@ -195,17 +193,50 @@ import java.util.stream.Stream;
  *   <li>The output layout — <b>corrected</b>. The bond echoes have to go out in bond-input order,
  *       not loan-input order; see the comment at their emission site.</li>
  * </ul>
- * One thing evaluation settled the other way: a batch containing a loan with a <em>positive
- * equity</em> is not satisfiable in <b>either output layout this builder can emit</b>.
- * {@code loan_claim_action} still reads the index-th entry of the asset-manager-filtered output list
- * directly, while {@code lm_liquidate_action} now reaches it through
- * {@code assetOutputIndexes[index]} — so the two no longer <em>structurally</em> collide, but this
- * builder emits identity indexes, and at the identity both layouts still fail. That is V8 above: such
- * a batch is refused rather than built, and the caller no longer has to remember not to schedule one.
- * <b>Whether some other layout — a non-identity {@code assetOutputIndexes} paired with a reordered
- * output list — satisfies both validators is an open question that has not been tested.</b> V8 is
- * therefore a statement about what this builder emits, not a proof of impossibility; it is the veto
- * to lift if that question is ever answered yes.
+ *
+ * <h2>Positive equity: rule R</h2>
+ * A partially liquidated loan owes the borrower the residual value of the collateral. The deployed
+ * validators demand <em>two</em> asset-manager outputs for such a loan, and they locate them
+ * differently:
+ * <ul>
+ *   <li>{@code loan_claim_action.ak:271-295} reads the borrower's compensation output as
+ *       {@code safe_list_at(get_outputs_to_smart_credential(..), index)} — the <b>bare loan index</b>
+ *       into the asset-manager-credential-filtered output list, with no redeemer indirection
+ *       available to move it.</li>
+ *   <li>{@code lm_liquidate_action.ak:87-91} reads the lender's claimed-collateral output as
+ *       {@code safe_list_at(assetOutputs, safe_list_at(redeemer.assetOutputIndexes, index))} — the
+ *       same filtered list, but through a redeemer field this builder chooses.</li>
+ * </ul>
+ * Only one of the two positions is forced, so the layout is decided by the forced one. With the loans
+ * in canonical loan-input order, {@code N} of them and {@code K} carrying a positive equity, the
+ * filtered asset-manager output list is emitted as:
+ * <pre>
+ *   slots 0 .. N-1     loan i's EQUITY output if equity(i) &gt; 0, else loan i's COLLATERAL output
+ *   slots N .. N+K-1   the COLLATERAL outputs of the positive-equity loans, in loan order
+ * </pre>
+ * That is <b>rule R</b>. It puts every compensation output exactly where {@code loan_claim_action}
+ * insists on finding it, and leaves {@code assetOutputIndexes} — which is free — to point
+ * {@code lm_liquidate_action} at wherever the matching collateral output ended up. Verified against
+ * the deployed validators at N=1 and N=2 in both shapes, and on real chain data
+ * ({@code RealEquityLoanDryEvalTest}).
+ * <p>
+ * <b>Rule R degenerates to the previous emission order when {@code K = 0}</b>: every loan takes the
+ * "else" branch, slot {@code i} holds loan {@code i}'s collateral output, and the second row is
+ * empty. The zero-equity path — the only one that has ever been submitted — is therefore
+ * byte-identical, which is why this is a widening rather than a change.
+ * <p>
+ * {@code assetOutputIndexes} is still <em>observed</em> off the probe body by collateral-datum match
+ * ({@link #assetOutputIndexes}) rather than computed from rule R. Nothing here predicts a position:
+ * the rule decides what is emitted, the probe reports where it landed, and V5 refuses if the two
+ * disagree.
+ *
+ * <h2>Where the compensation output is sent</h2>
+ * {@code equity_sent_to_borrower}'s {@code and{}} block opens with the comment
+ * {@code //No staking check here}, so the validator constrains the compensation output's payment
+ * credential and nothing else — the stake part is the transaction builder's free choice. This builder
+ * emits an <b>enterprise address</b>: the asset-manager spend credential with no stake part at all.
+ * See {@link #equityAddress()} for why that is the only neutral answer, and note that it is asserted
+ * off the finished body precisely <em>because</em> the validator will not assert it for us.
  */
 @Slf4j
 public final class LiquidateTransactionBuilder {
@@ -292,12 +323,19 @@ public final class LiquidateTransactionBuilder {
         POINTER_STAKE_CREDENTIAL,
         /** The stake credential field is not an {@code Option<StakeCredential>}. */
         UNDECODABLE_STAKE_CREDENTIAL,
-        /** V6 — a repayment-receipt NFT would have to be minted, and that mint is not modelled. */
-        @UnreachableFromScannedBatch(
-                scannerFilter = "LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED",
-                reason = "reachable only with equity > 0, which the scanner already excludes on; "
-                        + "checked BEFORE V8 in vet(), so V8's own POSITIVE_EQUITY_UNSUPPORTED veto "
-                        + "does not mask it")
+        /**
+         * V6 — a repayment-receipt NFT would have to be minted, and that mint is not modelled.
+         * <p>
+         * <b>This is now reachable from a scanned batch</b>, and its {@code @UnreachableFromScannedBatch}
+         * marking was removed with V8. The marking claimed the scanner filtered it out via
+         * {@code LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED}; that exclusion is gone, because
+         * positive-equity liquidations are now built rather than refused. A
+         * {@code repaymentReceipts = True} loan with a positive equity therefore reaches this check
+         * for real, and this is the loud refusal of the one branch of {@code equity_sent_to_borrower}
+         * this repo still cannot satisfy: {@code loan_claim_action.ak:433-438} requires exactly one
+         * NFT named {@code hash_output_ref(loanInputOutputReference)} under {@code repaymentPolicyId}
+         * on the compensation output, and nothing here mints it.
+         */
         REPAYMENT_RECEIPTS_WITH_EQUITY,
         /**
          * V7 — findings §7.1 D2: the loan's {@code Liquidation.equityInPrincipalCurrency} is true, and
@@ -318,35 +356,6 @@ public final class LiquidateTransactionBuilder {
                 scannerFilter = "LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED",
                 reason = "the scanner already excludes on §7.5 (LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED)")
         CONVERSION_TO_PRINCIPAL_REQUIRED,
-        /**
-         * V8 — the equity derived at {@code validFrom} is positive, and <b>no output layout this builder
-         * emits</b> satisfies both validators of the <em>currently deployed</em> pin {@code ff005fb}.
-         * <p>
-         * The two validators reach into the same list — the outputs filtered by
-         * {@code get_outputs_to_smart_credential(..)} — but no longer at the same position:
-         * {@code lm_liquidate_action.ak:87-91} reads
-         * {@code safe_list_at(assetOutputs, safe_list_at(redeemer.assetOutputIndexes, index))} and
-         * requires {@code constants.action_claimed_collateral} in it ({@code :160}), while
-         * {@code loan_claim_action.ak:275-284} still reads {@code index} of that list directly
-         * (unchanged at {@code ff005fb}) and requires
-         * {@code constants.action_partial_liquidation_compensation}. So the redeemer indirection means
-         * the collision is no longer structural. This builder, however, emits identity
-         * {@code assetOutputIndexes} — which puts both validators back on the same slot, wanting
-         * mutually exclusive datums, and {@code loan_claim_action.ak:273}'s
-         * {@code or { inputAction.equity == 0, .. }} is then the only way through. Pinned by
-         * {@code LiquidateDryEvalTest}'s
-         * {@code positiveEquityIsRefusedInBothLayoutsThisBuilderCanEmit}, which runs both layouts
-         * against the deployed scripts.
-         * <p>
-         * <b>Not a proof of impossibility.</b> Whether a non-identity {@code assetOutputIndexes} over
-         * a reordered output list satisfies both validators is untested and deliberately left open;
-         * this veto records what this builder emits. It is the veto to lift if that question is
-         * answered yes, or if a redeploy removes the constraint another way.
-         */
-        @UnreachableFromScannedBatch(
-                scannerFilter = "LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED",
-                reason = "the scanner already excludes on positive equity (LiquidationExclusion.POSITIVE_EQUITY_UNSUPPORTED)")
-        POSITIVE_EQUITY_UNSUPPORTED,
         /** D6 needs the bond datum echoed byte for byte; this one does not survive a round trip. */
         BOND_DATUM_NOT_BYTE_IDENTICAL,
         /** The requested window does not contain at least one whole slot. */
@@ -555,31 +564,6 @@ public final class LiquidateTransactionBuilder {
      * @throws RefusedException whenever anything about the batch is not certain
      */
     public Transaction build(Request request) {
-        return build(request, true);
-    }
-
-    /**
-     * The same build with V8 — and only V8 — disabled. Package-private, no production caller, and
-     * deliberately not part of the public surface.
-     * <p>
-     * V8 refuses a positive equity because no output layout this builder emits satisfies both
-     * validators of the deployed pin ({@link Refusal#POSITIVE_EQUITY_UNSUPPORTED}); the transaction it
-     * would have built is still the structurally correct one, and becomes submittable the day the
-     * constraint lifts. Two kinds of test need that transaction to exist:
-     * {@code LiquidateDryEvalTest}, which is the <em>evidence</em> for V8 — it runs both output layouts
-     * this builder can emit through the real PlutusV3 machine and shows each validator refusing the
-     * other's — and the structural anatomy tests in
-     * {@code LiquidateTransactionBuilderTest}, which pin the equity output's datum, value and place in
-     * the body. Routing those through this seam keeps them proving what they proved before V8 existed.
-     * <p>
-     * Every other veto still applies. In particular V7's two {@code expect}-backed refusals are
-     * permanent facts about the validators rather than about this deployment, so nothing bypasses them.
-     */
-    Transaction buildIgnoringPositiveEquityVeto(Request request) {
-        return build(request, false);
-    }
-
-    private Transaction build(Request request, boolean vetoPositiveEquity) {
         checkRequestShape(request);
 
         // The instant every time-dependent redeemer figure is derived from is chosen FIRST, and
@@ -598,7 +582,7 @@ public final class LiquidateTransactionBuilder {
         // Pass 1 — vet every loan on its own. Nothing about the transaction shape yet.
         List<VettedLoan> vetted = new ArrayList<>();
         for (LoanLiquidation liquidation : request.liquidations()) {
-            vetted.add(vet(liquidation, request, validFrom, validTo, vetoPositiveEquity));
+            vetted.add(vet(liquidation, request, validFrom, validTo));
         }
 
         // Pass 2 — canonical ordering. The loan inputs sorted alone are in the same relative order
@@ -634,10 +618,10 @@ public final class LiquidateTransactionBuilder {
         // The asset-output indexes are observed from the same probe, for the same reason: they too
         // are positions in the finished body's output sequence (filtered by the asset-manager spend
         // credential — see assetOutputIndexes), and nothing here may predict where cardano-client-lib
-        // put things. As it happens this builder emits every collateral output before every equity
-        // output, so the answer is currently the identity [0..n-1] — which is exactly why it is
-        // observed rather than written as a literal: an identity that is only true by today's
-        // emission order must not be encoded as if it were a rule.
+        // put things. Under rule R the answer is the identity [0..n-1] only when no loan in the batch
+        // has a positive equity; the moment one does, its collateral output is displaced past the
+        // first row and the indexes stop being the identity. Observing rather than computing them is
+        // what let rule R be introduced without touching this line at all.
         //
         // The two bodies are not identical — only the probe's redeemers hold placeholder indexes, and
         // only the second one is script-costed, so they differ in ex-units, fee and size. So the
@@ -780,6 +764,78 @@ public final class LiquidateTransactionBuilder {
         return indexes;
     }
 
+    /**
+     * <b>Rule R's first row: every borrower-compensation output sits at its own loan's index in the
+     * asset-manager-filtered output list.</b>
+     * <p>
+     * This is the one position in a {@code Liquidate} that no redeemer can move.
+     * {@code loan_claim_action.ak:275-284} reads the compensation output as
+     * {@code safe_list_at(get_outputs_to_smart_credential(self.outputs, ..), index)}, where
+     * {@code index} is the loan's own position among the loan inputs — there is no
+     * {@code assetOutputIndexes}-style indirection on that side. Emit the compensation output
+     * anywhere else and the validator reads whatever output happens to occupy slot {@code index},
+     * {@code equals_data} fails on the datum, and the transaction dies in phase-2 evaluation with the
+     * fee already spent. {@link #assetOutputIndexes} then does the yielding for the <em>other</em>
+     * validator, which does have an indirection.
+     * <p>
+     * Separate from {@link #assemble} on purpose. {@code assemble} decides the layout; this decides
+     * whether the layout that actually reached the body is the one the chain will accept, and it is
+     * handed the finished body's own filtered list rather than anything the emission path carried
+     * down. Package-private and static so it can be exercised directly on a synthetic filtered list —
+     * the same treatment {@link #assetOutputIndexes} gets, and for the same reason: a guard whose only
+     * exercise is the happy path is a guard nobody has watched fail.
+     *
+     * <h3>Why this <em>returns</em> the outputs rather than only asserting on them</h3>
+     * Because a guard whose call can be deleted without anything going red is not a guard. An earlier
+     * shape of this method was {@code void}, and deleting its single call site left the whole suite
+     * green — every downstream assertion located the compensation output by scanning the body for its
+     * datum, so it went on checking an output that carried the right bytes at the wrong slot. Handing
+     * the located outputs back, and making {@code assertStructure} do all of its amount, shape and
+     * address checks on <em>those</em>, means the position is what the rest of V5 is talking about.
+     * Removing the call now fails to compile.
+     *
+     * @param assetManagerOutputs               the body's outputs filtered by the asset-manager spend
+     *                                          credential, in body order — the list
+     *                                          {@code get_outputs_to_smart_credential} produces
+     * @param compensationDatumHexByLoanIndex   one entry per loan, in loan-input order: the
+     *                                          serialized compensation datum that loan requires at its
+     *                                          own slot, or {@code null} for a loan with no equity —
+     *                                          which emits no compensation output and whose slot
+     *                                          {@code loan_claim_action} never reads, because
+     *                                          {@code or { inputAction.equity == 0, .. }}
+     *                                          short-circuits first
+     * @param loanIdsByLoanIndex                the loan ids, in the same order, for the refusal detail
+     * @return one entry per loan, in the same order: the compensation output found at that loan's own
+     *         slot, or {@code null} for a loan that requires none. Never a wrong-slot output — those
+     *         refuse rather than return.
+     */
+    static List<TransactionOutput> compensationOutputsAtTheirLoanIndex(
+            List<TransactionOutput> assetManagerOutputs,
+            List<String> compensationDatumHexByLoanIndex,
+            List<String> loanIdsByLoanIndex) {
+        List<TransactionOutput> located = new ArrayList<>();
+        for (int i = 0; i < compensationDatumHexByLoanIndex.size(); i++) {
+            String expected = compensationDatumHexByLoanIndex.get(i);
+            if (expected == null) {
+                located.add(null);
+                continue;
+            }
+            String loanId = loanIdsByLoanIndex.get(i);
+            structural(i < assetManagerOutputs.size(),
+                    ("loan %s has a compensation output but loan index %d is outside the %d "
+                            + "asset-manager outputs, so loan_claim_action has no slot to read")
+                            .formatted(loanId, i, assetManagerOutputs.size()));
+            TransactionOutput atLoanSlot = assetManagerOutputs.get(i);
+            PlutusData datum = atLoanSlot.getInlineDatum();
+            structural(datum != null && datum.serializeToHex().equalsIgnoreCase(expected),
+                    ("loan %s's compensation output is not at filtered asset-manager slot %d; "
+                            + "loan_claim_action reads it at the bare loan index and cannot be "
+                            + "redirected").formatted(loanId, i));
+            located.add(atLoanSlot);
+        }
+        return located;
+    }
+
     // ---- request shape ---------------------------------------------------------------------
 
     private static void checkRequestShape(Request request) {
@@ -835,6 +891,15 @@ public final class LiquidateTransactionBuilder {
      *                              at scan time; see {@code vet})
      * @param redeemerEquity        {@code LoanFinance.redeemerEquity} from that same debt, likewise
      *                              not the assessment's
+     * @param assetManagerAddress   where the lender's claimed collateral goes: the asset-manager spend
+     *                              credential carrying the <em>lender's</em> stake part
+     * @param equityAddress         where the borrower's compensation goes: the same spend credential
+     *                              with <em>no</em> stake part. Deliberately a separate field rather
+     *                              than a reuse of {@code assetManagerAddress} — see
+     *                              {@link #equityAddress()}. On a bond whose
+     *                              {@code lenderStakeCredential} is {@code None} the two happen to be
+     *                              the same string; that coincidence is not the reason either is
+     *                              correct.
      */
     private record VettedLoan(LiquidationAssessment assessment,
                               Utxo loanUtxo,
@@ -847,6 +912,7 @@ public final class LiquidateTransactionBuilder {
                               BigInteger collateralPayout,
                               PlutusData bondDatum,
                               String assetManagerAddress,
+                              String equityAddress,
                               BigInteger redeemerRemainingDebt,
                               BigInteger redeemerEquity,
                               BigInteger recomputedFee) {
@@ -860,8 +926,7 @@ public final class LiquidateTransactionBuilder {
         }
     }
 
-    private VettedLoan vet(LoanLiquidation liquidation, Request request, long validFrom, long validTo,
-                           boolean vetoPositiveEquity) {
+    private VettedLoan vet(LoanLiquidation liquidation, Request request, long validFrom, long validTo) {
         LiquidationAssessment assessment = liquidation.assessment();
 
         // V1 — the scanner's verdict is the only admission ticket.
@@ -1004,25 +1069,9 @@ public final class LiquidateTransactionBuilder {
 
         PlutusData bondDatum = roundTrippableBondDatum(bond);
 
-        // V8 — last of the per-loan vetoes, and the only one that is a statement about *this
-        // deployment* rather than about the design: loan_claim_action reads the loan-index slot of the
-        // asset-manager-filtered output list directly while lm_liquidate_action reaches it through
-        // assetOutputIndexes[index], and this builder emits identity indexes — which puts both on the
-        // same slot wanting mutually exclusive datums, so no layout this builder emits carries a
-        // positive equity through both. Whether some other layout would is untested. See
-        // Refusal.POSITIVE_EQUITY_UNSUPPORTED for the file:line references and the dry-eval test that
-        // pins it. Kept last so a batch that is wrong for a permanent reason reports that permanent
-        // reason instead of this transient one.
-        if (vetoPositiveEquity && equity.signum() > 0) {
-            throw refuse(Refusal.POSITIVE_EQUITY_UNSUPPORTED,
-                    ("loan %s has equity %s; no output layout this builder emits satisfies both "
-                            + "lm_liquidate_action and loan_claim_action at a positive equity")
-                            .formatted(loan.loanId(), equity));
-        }
-
         return new VettedLoan(assessment, loanUtxo, bondUtxo, loan, bond, datum.liquidationMode(),
                 principal, collateral, collateralPayout, bondDatum, assetManagerAddress,
-                remainingDebt, equity, recomputedFee);
+                equityAddress(), remainingDebt, equity, recomputedFee);
     }
 
     /**
@@ -1152,6 +1201,46 @@ public final class LiquidateTransactionBuilder {
         return stake == null
                 ? AddressProvider.getEntAddress(payment, network).getAddress()
                 : AddressProvider.getBaseAddress(payment, stake, network).getAddress();
+    }
+
+    /**
+     * The address the borrower's partial-liquidation compensation goes to: the asset-manager spend
+     * credential as an <b>enterprise address</b> — no stake credential at all.
+     *
+     * <h3>Why the validator does not decide this, and we must</h3>
+     * {@code equity_sent_to_borrower}'s {@code and{}} block opens with the comment
+     * {@code //No staking check here} ({@code loan_claim_action.ak:454}) and then checks the datum,
+     * the amount, the receipt condition and the flatten count — never the address beyond the payment
+     * credential the filter already imposed. So every choice of stake part evaluates identically on
+     * chain. That is exactly why the choice has to be made deliberately here: the chain will not
+     * catch a wrong one, and staking rewards on a compensation output are real money accruing to
+     * whoever the stake credential names.
+     *
+     * <h3>Why enterprise, and not one of the alternatives</h3>
+     * We are a third-party liquidator moving someone else's money. The neutral choice is the only one
+     * that is not a decision about whose money it is.
+     * <ul>
+     *   <li><b>The lender's stake credential</b> — which is what this builder used to emit, by reusing
+     *       {@link #assetManagerAddress(LenderBond)} for both outputs. That was an accident, not a
+     *       decision, and it is the one option that is affirmatively wrong: it would have the
+     *       <em>borrower's</em> refund earn staking rewards for the <em>lender</em>.</li>
+     *   <li><b>The bot's own stake credential</b> — self-dealing. This is operator-distributed
+     *       software; an operator's node quietly staking other people's refunds to the operator is not
+     *       something to ship by default.</li>
+     *   <li><b>The borrower's stake credential</b> — the option we would prefer, and it does not
+     *       exist. Lending v4 carries no borrower address anywhere: {@code LoanDatum} has no address
+     *       field, and the protocol's only datum-carried stake credential is the bond's
+     *       {@code lenderStakeCredential}. There is nothing to read.</li>
+     *   <li><b>Enterprise</b> — no stake part, so no one is credited. Nothing is earned rather than
+     *       the wrong party earning it.</li>
+     * </ul>
+     * <b>Reversible.</b> If FluidTokens ever adds a borrower stake credential to the loan datum, this
+     * method is the single place that changes, and the assertion in {@code assertStructure} is the
+     * single place that has to agree.
+     */
+    private String equityAddress() {
+        return AddressProvider.getEntAddress(
+                Credential.fromScript(registry.getAssetManagerSpendScriptHash()), network).getAddress();
     }
 
     /**
@@ -1342,8 +1431,8 @@ public final class LiquidateTransactionBuilder {
         tx.mintAsset(registry.getLoanScript(), burns,
                 LiquidationTxEncoder.loanMintRedeemer(configRefIndex, false, 0));
 
-        // Outputs: every bond echo, then every collateral output, then the equity outputs of the
-        // loans that have one.
+        // Outputs: every bond echo, then the asset-manager outputs in RULE R order (see the class
+        // javadoc, "Positive equity: rule R").
         //
         // The bond echoes go out in *bond-input* order, not loan-input order. lm_liquidate_action
         // reads the echo as `safe_list_at(lenderBondOutputs, lenderBondIndex)` where
@@ -1356,14 +1445,35 @@ public final class LiquidateTransactionBuilder {
             tx.payToContract(bond.bondUtxo().getAddress(), List.copyOf(bond.bondUtxo().getAmount()),
                     bond.bondDatum());
         }
+        // RULE R, first row — filtered slots 0..N-1, one per loan in loan-input order.
+        //
+        // loan_claim_action.ak:275-284 reads the borrower's compensation output as the BARE LOAN
+        // INDEX into the asset-manager-credential-filtered output list. It has no redeemer
+        // indirection, so that position is not negotiable: for a loan with a positive equity, slot i
+        // must be its compensation output. lm_liquidate_action, which wants the claimed-collateral
+        // output, reaches its slot through assetOutputIndexes[index] — a field this builder chooses —
+        // so it is the one that yields.
+        //
+        // A loan with no equity emits no compensation output at all (loan_claim_action.ak:273's
+        // `or { inputAction.equity == 0, .. }` short-circuits before looking), so its slot i holds its
+        // collateral output — which is what makes the K=0 case byte-identical to the emission order
+        // this branch replaced.
         for (VettedLoan loan : loanOrder) {
-            tx.payToContract(loan.assetManagerAddress(),
-                    assetManagerAmounts(loan, loan.collateralPayout()), collateralDatum(loan));
+            if (loan.redeemerEquity().signum() > 0) {
+                tx.payToContract(loan.equityAddress(),
+                        assetManagerAmounts(loan, loan.redeemerEquity()), equityDatum(loan));
+            } else {
+                tx.payToContract(loan.assetManagerAddress(),
+                        assetManagerAmounts(loan, loan.collateralPayout()), collateralDatum(loan));
+            }
         }
+        // RULE R, second row — filtered slots N..N+K-1: the collateral outputs displaced out of the
+        // first row, in loan order. Nothing reads these by a forced position; assetOutputIndexes is
+        // observed off the probe body and points at wherever they landed.
         for (VettedLoan loan : loanOrder) {
             if (loan.redeemerEquity().signum() > 0) {
                 tx.payToContract(loan.assetManagerAddress(),
-                        assetManagerAmounts(loan, loan.redeemerEquity()), equityDatum(loan));
+                        assetManagerAmounts(loan, loan.collateralPayout()), collateralDatum(loan));
             }
         }
 
@@ -1860,17 +1970,44 @@ public final class LiquidateTransactionBuilder {
             // says which loan an asset-manager output descends from, so matching on it is what
             // proves the right loan got the right payout.
             boolean adaCollateral = loan.loan().datum().collateral().isAda();
+            String collateralUnit = unitOf(loan.loan().datum().collateral().assetType());
             TransactionOutput collateralOutput = onlyOutputWithDatum(outputs, loan.assetManagerAddress(),
                     collateralDatum(loan), "collateral output for loan " + loan.loan().loanId());
-            assertAssetManagerOutput(collateralOutput, loan, adaCollateral,
+            List<Amount> collateralAmounts = assertAssetManagerOutput(collateralOutput,
+                    loan.assetManagerAddress(), adaCollateral,
                     "collateral output for loan " + loan.loan().loanId());
-            structural(quantityIn(collateralOutput, loan).equals(loan.collateralPayout()),
+            structural(quantityIn(collateralAmounts, collateralUnit).equals(loan.collateralPayout()),
                     "collateral output for loan %s carries %s, expected collateral - equity - fee = %s"
-                            .formatted(loan.loan().loanId(), quantityIn(collateralOutput, loan),
+                            .formatted(loan.loan().loanId(),
+                                    quantityIn(collateralAmounts, collateralUnit),
                                     loan.collateralPayout()));
         }
 
+        // RULE R's first row, located off the FINISHED body's own filtered list. The expectation is
+        // built from the equity the EMITTED redeemer carries, not from the builder's own variable, so
+        // a loan whose redeemer says "no equity" is expected to have no compensation output.
+        //
+        // This runs BEFORE the equity assertions below and hands them the outputs they check, which is
+        // deliberate: everything V5 says about a compensation output is then a statement about the
+        // output at the slot loan_claim_action will actually read. Locating it by scanning the body
+        // for its datum instead — the shape this replaced — checks the right bytes at whatever slot
+        // they happen to occupy, and passes just as happily when the layout is wrong.
+        List<String> compensationDatums = new ArrayList<>();
+        for (int i = 0; i < loanOrder.size(); i++) {
+            compensationDatums.add(emittedEquity.get(i).signum() > 0
+                    ? equityDatum(loanOrder.get(i)).serializeToHex()
+                    : null);
+        }
+        List<TransactionOutput> compensationOutputs = compensationOutputsAtTheirLoanIndex(
+                assetManagerFilteredOutputs, compensationDatums,
+                loanOrder.stream().map(loan -> loan.loan().loanId()).toList());
+
         // Equity outputs — one per loan with a positive equity, and none for the others.
+        //
+        // The min-ada calculator is built once and only if this batch has a compensation output at
+        // all: a zero-equity batch reaches the protocol params exactly as often as it did before the
+        // subsidy bound existed, which is what keeps that path unchanged end to end.
+        MinAdaCalculator minAdaCalculator = null;
         long expectedEquityOutputs = 0;
         for (int i = 0; i < loanOrder.size(); i++) {
             VettedLoan loan = loanOrder.get(i);
@@ -1880,20 +2017,55 @@ public final class LiquidateTransactionBuilder {
             }
             expectedEquityOutputs++;
             String what = "equity output for loan " + loan.loan().loanId();
-            TransactionOutput equityOutput =
-                    onlyOutputWithDatum(outputs, loan.assetManagerAddress(), equityDatum(loan), what);
-            assertAssetManagerOutput(equityOutput, loan, loan.loan().datum().collateral().isAda(), what);
+
+            // The output at the forced slot, and the only output in the body carrying this datum,
+            // must be one and the same. Reference equality is exact here — both lists hold entries of
+            // transaction.getBody().getOutputs() itself — and it is what rules out a second output
+            // with the same datum sitting somewhere the validator would never look.
+            TransactionOutput equityOutput = compensationOutputs.get(i);
+            structural(equityOutput == onlyOutputWithDatum(outputs, loan.equityAddress(),
+                            equityDatum(loan), what),
+                    ("%s at filtered asset-manager slot %d is not the body's only output carrying "
+                            + "that datum").formatted(what, i));
+            List<Amount> equityAmounts = assertAssetManagerOutput(equityOutput, loan.equityAddress(),
+                    loan.loan().datum().collateral().isAda(), what);
             // loan_claim_action checks the compensation with `>=`, so a min-ada top-up is legal here
-            // where it would not be on the collateral output.
-            structural(quantityIn(equityOutput, loan).compareTo(equity) >= 0,
-                    "%s carries %s, less than the redeemer's equity %s".formatted(what,
-                            quantityIn(equityOutput, loan), equity));
+            // where it would not be on the collateral output. Legal is not free: the top-up comes out
+            // of the bot's inputs, so the rider is bounded to one min-ada before the `>=` is checked
+            // on the value that bound vetted.
+            if (minAdaCalculator == null) {
+                minAdaCalculator = new MinAdaCalculator(protocolParamsSupplier.getProtocolParams());
+            }
+            BigInteger emittedCompensation = assertCompensationSubsidyBounded(equityOutput, equityAmounts,
+                    unitOf(loan.loan().datum().collateral().assetType()), equity,
+                    minAdaCalculator.calculateMinAda(equityOutput), what);
+            structural(emittedCompensation.compareTo(equity) >= 0,
+                    "%s carries %s, less than the redeemer's equity %s"
+                            .formatted(what, emittedCompensation, equity));
+
+            // The stake part the validator explicitly does not check — see equityAddress(). Asserted
+            // in two independent ways off the emitted address: it must decompose to the asset-manager
+            // spend credential with NO delegation part, and it must be exactly the enterprise address
+            // that credential derives on this network.
+            Address emitted = new Address(equityOutput.getAddress());
+            structural(registry.getAssetManagerSpendScriptHash()
+                            .equals(paymentCredentialOf(equityOutput.getAddress())),
+                    "%s is not at the asset-manager spend credential".formatted(what));
+            structural(emitted.getDelegationCredential().isEmpty(),
+                    ("%s carries a stake credential; the borrower's compensation goes to an enterprise "
+                            + "address so that no third party earns staking rewards on it")
+                            .formatted(what));
+            structural(equityOutput.getAddress().equals(equityAddress()),
+                    "%s is at %s, expected the enterprise address %s"
+                            .formatted(what, equityOutput.getAddress(), equityAddress()));
         }
 
         // Nothing else may sit at an asset-manager address: exactly one collateral output per loan
-        // plus the equity outputs just accounted for.
-        Set<String> assetManagerAddresses = loanOrder.stream()
-                .map(VettedLoan::assetManagerAddress)
+        // plus the equity outputs just accounted for. Both addresses count — the collateral outputs'
+        // (which carry the lender's stake part) and the equity outputs' enterprise one.
+        Set<String> assetManagerAddresses = Stream.concat(
+                        loanOrder.stream().map(VettedLoan::assetManagerAddress),
+                        loanOrder.stream().map(VettedLoan::equityAddress))
                 .collect(Collectors.toSet());
         long assetManagerOutputs = outputs.stream()
                 .filter(output -> assetManagerAddresses.contains(output.getAddress()))
@@ -2041,13 +2213,81 @@ public final class LiquidateTransactionBuilder {
                 .toList();
     }
 
-    private void assertAssetManagerOutput(TransactionOutput output, VettedLoan loan, boolean adaCollateral,
-                                          String what) {
-        structural(output.getAddress().equals(loan.assetManagerAddress()),
-                what + " is at " + output.getAddress() + ", expected " + loan.assetManagerAddress());
-        int flattened = ValueUtil.toAmountList(output.getValue()).size();
+    /**
+     * D7's shape check on one asset-manager output: it sits at exactly {@code expectedAddress}, and
+     * its value flattens to exactly one entry for ada collateral or two otherwise — the
+     * {@code dosProtection} conjunct both {@code validate_repayment_output} and
+     * {@code equity_sent_to_borrower} impose. The address is a parameter rather than
+     * {@code loan.assetManagerAddress()} because the two outputs no longer share one: the collateral
+     * output carries the lender's stake part, the compensation output is an enterprise address.
+     *
+     * <h3>Why this <em>returns</em> the flattened amounts rather than only asserting on them</h3>
+     * Same reason {@link #compensationOutputsAtTheirLoanIndex} does. As a {@code void} guard it was
+     * optional: either of its two call sites could be deleted and the whole suite stayed green,
+     * because the amount checks that follow each of them re-flattened the output for themselves.
+     * Handing the flattened list back, and making those amount checks read it, means a deleted call
+     * no longer compiles. Package-private and static for the same reason again — a guard whose only
+     * exercise is the happy path is a guard nobody has watched fail, and neither call site can be
+     * made to emit a wrong flatten count from a legitimate build, so the violating bodies have to be
+     * handed to it directly.
+     *
+     * @return {@code output}'s value, flattened — one {@link Amount} per unit, lovelace included
+     */
+    static List<Amount> assertAssetManagerOutput(TransactionOutput output, String expectedAddress,
+                                                 boolean adaCollateral, String what) {
+        structural(output.getAddress().equals(expectedAddress),
+                what + " is at " + output.getAddress() + ", expected " + expectedAddress);
+        List<Amount> amounts = ValueUtil.toAmountList(output.getValue());
+        int flattened = amounts.size();
         structural(flattened == (adaCollateral ? 1 : 2),
                 what + " flattens to " + flattened + " assets, expected " + (adaCollateral ? 1 : 2));
+        return amounts;
+    }
+
+    /**
+     * <b>The min-ada the bot funds on a borrower-compensation output is bounded to one min-ada.</b>
+     * <p>
+     * {@code equity_sent_to_borrower} checks the compensation with {@code >=}, not the {@code ==} the
+     * claimed-collateral output gets, so a lovelace rider on it is legal on chain and nothing upstream
+     * refuses one. That rider is real money and it is the <em>bot's</em>: the output is emitted
+     * carrying only the equity quantity, and cardano-client-lib tops it to min-ada out of the bot's
+     * own inputs during balancing. On token collateral the whole coin is that subsidy — the equity is
+     * denominated in the collateral token and the lovelace is pure rider. On ada collateral it is the
+     * shortfall between a sub-min-ada equity and the floor: an equity of one lovelace still emits an
+     * output of a full min-ada.
+     * <p>
+     * A min-ada rider is unavoidable — the ledger will not accept the output without one — so this
+     * does not refuse it. It refuses anything <em>larger</em>, which is the part no validator, no
+     * balancer and no profitability check would ever object to and which would therefore grow
+     * silently. The ceiling is computed from the caller's protocol params against this very output,
+     * so it moves with the params rather than being pinned to a number.
+     * <p>
+     * <b>This is a bound, not an accounting fix.</b> {@code LiquidationExecutor}'s expected-profit
+     * arithmetic still does not subtract this subsidy — see its javadoc at the calculation. Bounding
+     * it caps how wrong that arithmetic can be; it does not make it right.
+     *
+     * @param amounts        {@code output}'s flattened value, as {@link #assertAssetManagerOutput}
+     *                       returned it
+     * @param collateralUnit the unit the equity is denominated in — the collateral asset's
+     * @param equity         the equity the emitted redeemer carries, in {@code collateralUnit}
+     * @param minAda         the min-ada {@code output} itself requires under the caller's protocol
+     *                       params
+     * @return the {@code collateralUnit} quantity {@code output} carries, so the caller's {@code >=}
+     *         check is made on the value this method vetted and deleting the call stops compiling
+     */
+    static BigInteger assertCompensationSubsidyBounded(TransactionOutput output, List<Amount> amounts,
+                                                       String collateralUnit, BigInteger equity,
+                                                       BigInteger minAda, String what) {
+        // Only an ada-denominated equity is payable in the coin field; a token equity rides on top of
+        // a coin that is subsidy end to end.
+        BigInteger equityInLovelace = AssetType.LOVELACE.equals(collateralUnit) ? equity : BigInteger.ZERO;
+        BigInteger ceiling = equityInLovelace.add(minAda);
+        BigInteger coin = output.getValue().getCoin();
+        structural(coin.compareTo(ceiling) <= 0,
+                ("%s carries %s lovelace against %s of ada-denominated equity, so the bot subsidises "
+                        + "%s — more than the %s min-ada this output requires")
+                        .formatted(what, coin, equityInLovelace, coin.subtract(equityInLovelace), minAda));
+        return quantityIn(amounts, collateralUnit);
     }
 
     /** The single output at {@code address} carrying {@code datum}, or a refusal. */
@@ -2066,10 +2306,13 @@ public final class LiquidateTransactionBuilder {
         return matches.getFirst();
     }
 
-    private static BigInteger quantityIn(TransactionOutput output, VettedLoan loan) {
-        AssetType collateral = loan.loan().datum().collateral().assetType();
-        String unit = unitOf(collateral);
-        return ValueUtil.toAmountList(output.getValue()).stream()
+    /**
+     * The {@code unit} quantity in an already-flattened value. It takes the flattened list rather than
+     * the output on purpose: the list is what {@link #assertAssetManagerOutput} hands back, so every
+     * amount check in {@code assertStructure} is made on a value that guard has vetted.
+     */
+    private static BigInteger quantityIn(List<Amount> amounts, String unit) {
+        return amounts.stream()
                 .filter(amount -> unit.equals(amount.getUnit()))
                 .map(Amount::getQuantity)
                 .reduce(BigInteger.ZERO, BigInteger::add);

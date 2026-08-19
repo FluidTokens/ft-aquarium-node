@@ -1,5 +1,6 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.TransactionProcessor;
 import com.bloxbean.cardano.client.api.exception.ApiException;
@@ -9,17 +10,21 @@ import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.BytesPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ExUnits;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
+import com.bloxbean.cardano.client.transaction.spec.Asset;
+import com.bloxbean.cardano.client.transaction.spec.MultiAsset;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
+import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.AssetManagerDatumWithToken;
 import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
@@ -232,7 +237,7 @@ class LiquidateTransactionBuilderTest {
         assertEquals(BigInteger.valueOf(2_000_000), scenario.assessment().liquidationFee());
         assertTrue(scenario.assessment().late());
 
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario), Map.of(),
+        Transaction tx = build(List.of(scenario), Map.of(),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
         // Inputs: the loan, its bond, and the bot's ada.
@@ -252,8 +257,12 @@ class LiquidateTransactionBuilderTest {
         // triggers input selection) and appends the change output, so the builder's own three sit
         // between them. Pinned literally: if that ever changes, this test says so loudly rather
         // than the indexes silently drifting.
+        // Under rule R the EQUITY output comes first: loan 0's compensation output has to occupy
+        // filtered asset-manager slot 0, which is the one loan_claim_action reads with the bare loan
+        // index. The claimed-collateral output is the one that yields, because lm_liquidate_action
+        // reaches its slot through assetOutputIndexes.
         List<TransactionOutput> outputs = tx.getBody().getOutputs();
-        assertEquals(5, outputs.size(), "dummy, bond, collateral, equity, change");
+        assertEquals(5, outputs.size(), "dummy, bond, equity, collateral, change");
         assertEquals(LoanFixtures.botAddress(), outputs.get(0).getAddress());
 
         TransactionOutput bondOutput = outputs.get(1);
@@ -264,20 +273,20 @@ class LiquidateTransactionBuilderTest {
                 bondOutput.getInlineDatum().serializeToHex().toLowerCase(),
                 "D6: the bond output must echo the input's datum bytes");
 
-        TransactionOutput collateralOutput = outputs.get(2);
-        assertEquals(BigInteger.valueOf(113_500_000), collateralOutput.getValue().getCoin());
-        assertEquals(1, ValueUtil.toAmountList(collateralOutput.getValue()).size(),
-                "D7: an ada-collateral asset-manager output flattens to exactly one asset");
-        assertEquals(expectedAssetManagerDatum(scenario, LiquidationTxEncoder.CLAIMED_COLLATERAL_ACTION_HEX,
-                        REGISTRY.getLenderBondPolicyId()),
-                collateralOutput.getInlineDatum().serializeToHex());
-
-        TransactionOutput equityOutput = outputs.get(3);
+        TransactionOutput equityOutput = outputs.get(2);
         assertEquals(BigInteger.valueOf(84_500_000), equityOutput.getValue().getCoin());
-        assertEquals(1, ValueUtil.toAmountList(equityOutput.getValue()).size());
+        assertEquals(1, ValueUtil.toAmountList(equityOutput.getValue()).size(),
+                "D7: an ada-collateral asset-manager output flattens to exactly one asset");
         assertEquals(expectedAssetManagerDatum(scenario, LiquidationTxEncoder.PARTIAL_LIQUIDATION_ACTION_HEX,
                         REGISTRY.getBorrowerBondPolicyId()),
                 equityOutput.getInlineDatum().serializeToHex());
+
+        TransactionOutput collateralOutput = outputs.get(3);
+        assertEquals(BigInteger.valueOf(113_500_000), collateralOutput.getValue().getCoin());
+        assertEquals(1, ValueUtil.toAmountList(collateralOutput.getValue()).size());
+        assertEquals(expectedAssetManagerDatum(scenario, LiquidationTxEncoder.CLAIMED_COLLATERAL_ACTION_HEX,
+                        REGISTRY.getLenderBondPolicyId()),
+                collateralOutput.getInlineDatum().serializeToHex());
 
         // The loan NFT is burned.
         assertEquals(1, tx.getBody().getMint().size());
@@ -302,8 +311,11 @@ class LiquidateTransactionBuilderTest {
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash()))),
                 "the LenderManager validator is authorised by the LM config, not the main one");
+        // assetOutputIndexes is [1], not the identity: this loan has a positive equity, so rule R
+        // gives filtered slot 0 to its compensation output and displaces the claimed-collateral
+        // output to slot 1 — which is the one lm_liquidate_action has to be pointed at.
         assertEquals(hex(LiquidationTxEncoder.lmLiquidateWithdrawRedeemer(0, List.of(0L),
-                        List.of(LOAN_ID_A), List.of(0L))),
+                        List.of(LOAN_ID_A), List.of(1L))),
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))));
 
@@ -327,7 +339,7 @@ class LiquidateTransactionBuilderTest {
     void burnsWithTheNonPoolMintRedeemer() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario), Map.of(),
+        Transaction tx = build(List.of(scenario), Map.of(),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
         assertEquals(hex(LiquidationTxEncoder.loanMintRedeemer(0, false, 0)),
@@ -339,7 +351,7 @@ class LiquidateTransactionBuilderTest {
     void anAbsentStakeCredentialProducesAnEnterpriseAssetManagerAddress() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.noStakeCredential());
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario), Map.of(),
+        Transaction tx = build(List.of(scenario), Map.of(),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
         assertEquals(LoanFixtures.entAddress(REGISTRY.getAssetManagerSpendScriptHash()),
@@ -363,7 +375,7 @@ class LiquidateTransactionBuilderTest {
         AdaScenario b = adaScenario(LOAN_ID_B, TX_LOAN_B, TX_BOND_B, 100_000_000L, 1000L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
 
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(a, b), Map.of(),
+        Transaction tx = build(List.of(a, b), Map.of(),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
         List<TransactionInput> inputs = sortedInputs(tx);
@@ -374,14 +386,17 @@ class LiquidateTransactionBuilderTest {
 
         // loan order is [A, B]; bond order is [B(bb), A(dd)] — so A pairs with bond index 1.
         //
-        // assetOutputIndexes is [0, 1] while lenderBondInputIndexes is [1, 0], and the difference is
-        // the point of this golden: the bond echoes go out in *bond*-input order, so pairing a loan
-        // with its echo needs the permutation, while the collateral outputs go out in *loan*-input
-        // order, so loan i's collateral is at filtered position i. An implementation that reused the
-        // bond ordering — or simply passed lenderBondInputIndexes twice — would emit [1, 0] here and
-        // this assertion is what catches it.
+        // assetOutputIndexes is [2, 3] while lenderBondInputIndexes is [1, 0], and the difference is
+        // the point of this golden. The bond echoes go out in *bond*-input order, so pairing a loan
+        // with its echo needs the permutation. The asset-manager outputs go out in RULE R order: both
+        // loans here have a positive equity, so filtered slots 0 and 1 hold their COMPENSATION
+        // outputs — the positions loan_claim_action reads with the bare loan index — and their
+        // claimed-collateral outputs are displaced to slots 2 and 3, which is what assetOutputIndexes
+        // points lm_liquidate_action at. An implementation that reused the bond ordering — or simply
+        // passed lenderBondInputIndexes twice — would emit [3, 2] here, and one that had not
+        // implemented rule R would emit [0, 1]; this assertion catches both.
         assertEquals(hex(LiquidationTxEncoder.lmLiquidateWithdrawRedeemer(0, List.of(1L, 0L),
-                        List.of(LOAN_ID_A, LOAN_ID_B), List.of(0L, 1L))),
+                        List.of(LOAN_ID_A, LOAN_ID_B), List.of(2L, 3L))),
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()))));
 
@@ -569,7 +584,7 @@ class LiquidateTransactionBuilderTest {
         assertEquals(BigInteger.valueOf(422_500), scenario.assessment().equity());
         assertEquals(BigInteger.valueOf(10_000), scenario.assessment().liquidationFee());
 
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario.scenario()),
+        Transaction tx = build(List.of(scenario.scenario()),
                 Map.of(ORACLE_TOKEN.toUnit(), scenario.oracle()),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
@@ -599,16 +614,19 @@ class LiquidateTransactionBuilderTest {
                 hex(withdrawRedeemer(tx,
                         LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))));
 
-        // D7 — token collateral flattens to exactly two assets, and the quantity is exact.
+        // D7 — token collateral flattens to exactly two assets, and the quantity is exact. Rule R
+        // puts the compensation output first (filtered slot 0, loan 0's own index) and displaces the
+        // claimed-collateral output behind it.
         List<TransactionOutput> outputs = tx.getBody().getOutputs();
-        TransactionOutput collateralOutput = outputs.get(2);
+        TransactionOutput equityOutput = outputs.get(2);
+        assertEquals(2, ValueUtil.toAmountList(equityOutput.getValue()).size());
+        assertEquals(BigInteger.valueOf(422_500), quantityOf(equityOutput, COLLATERAL_TOKEN));
+        assertTrue(equityOutput.getValue().getCoin().signum() > 0, "min-ada rider");
+
+        TransactionOutput collateralOutput = outputs.get(3);
         assertEquals(2, ValueUtil.toAmountList(collateralOutput.getValue()).size());
         assertEquals(BigInteger.valueOf(567_500), quantityOf(collateralOutput, COLLATERAL_TOKEN));
         assertTrue(collateralOutput.getValue().getCoin().signum() > 0, "min-ada rider");
-
-        TransactionOutput equityOutput = outputs.get(3);
-        assertEquals(2, ValueUtil.toAmountList(equityOutput.getValue()).size());
-        assertEquals(BigInteger.valueOf(422_500), quantityOf(equityOutput, COLLATERAL_TOKEN));
 
         // The liquidation fee is left to the bot as change — the whole point of the batch.
         BigInteger feeSlice = outputs.stream()
@@ -642,7 +660,7 @@ class LiquidateTransactionBuilderTest {
                         new TransactionInput(TX_REF_SCRIPTS, 5),
                         null);
 
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario), Map.of(), published);
+        Transaction tx = build(List.of(scenario), Map.of(), published);
 
         assertTrue(tx.getWitnessSet().getPlutusV3Scripts().isEmpty(),
                 "a published script must not also travel in the witness set");
@@ -668,16 +686,17 @@ class LiquidateTransactionBuilderTest {
      * empty-witness-set assertion is what makes it a measurement of the reference-script shape at
      * all.
      * <p>
-     * The scenario has a positive equity, so it is built through the V8 seam for the reason
-     * {@link #buildIgnoringPositiveEquityVeto} gives: the transaction is the structurally correct
-     * one, and its size is the size a submittable liquidation of this shape would have.
+     * The scenario has a positive equity, so the transaction carries <em>two</em> asset-manager
+     * outputs rather than one — the lender's claimed collateral and the borrower's compensation. That
+     * is the larger of the two shapes, which is what makes it the right one to measure against
+     * {@code maxTxSize}.
      */
     @Test
     void aTokenCollateralLiquidationFitsUnderMaxTxSizeWithThePublishedReferenceScripts() {
         TokenScenario scenario = tokenScenario(LoanFixtures.inlineKeyStakeCredential(STAKE_KEY),
                 VALID_FROM - 60_000L, VALID_FROM + 600_000L);
 
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario.scenario()),
+        Transaction tx = build(List.of(scenario.scenario()),
                 Map.of(ORACLE_TOKEN.toUnit(), scenario.oracle()), PUBLISHED_PREVIEW);
 
         assertTrue(tx.getWitnessSet().getPlutusV3Scripts().isEmpty(),
@@ -806,7 +825,7 @@ class LiquidateTransactionBuilderTest {
         AdaScenario lying = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
                 scenario.assessment().remainingDebt(), BigInteger.valueOf(-1),
                 scenario.assessment().liquidationFee()));
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(lying), Map.of(),
+        Transaction tx = build(List.of(lying), Map.of(),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
         assertEquals(BigInteger.ZERO, emittedEquity(tx, 0),
@@ -919,13 +938,16 @@ class LiquidateTransactionBuilderTest {
      * It used to refuse {@code REMAINING_DEBT_NOT_INVARIANT}. Now the debt reproduces at
      * {@code validFrom}, and so does the equity: {@code get_equity_in_collateral_currency}
      * ({@code lib/fluidtokens/finance.ak:381}) takes no time argument, so its only time-varying input
-     * is the {@code validFrom} debt it is handed. Both V4 legs pass, and what refuses instead is V8 —
-     * the positive-equity layout gap, which is a statement about the deployed validators and has
-     * nothing to do with the window. That the reason moved from a V4 refusal to a V8 one is the
-     * clearest single demonstration that <em>both</em> narrowings took effect on the same fixture.
+     * is the {@code validFrom} debt it is handed. Both V4 legs pass.
+     * <p>
+     * It then refused a second time, under V8, for having a positive equity. V8 is gone — see
+     * {@link #aPositiveEquityBatchBuildsAndLaysOutTheAssetManagerOutputsByRuleR()} — so this fixture,
+     * whose whole point is a debt and an equity that both drift across a 50-minute window, now builds
+     * end to end. That is the strongest available statement that the {@code validFrom} narrowing
+     * really took effect: nothing downstream is left to mask it.
      */
     @Test
-    void v4NoLongerRefusesTheDriftingDebtFixtureAndV8IsWhatStopsIt() {
+    void v4NoLongerRefusesTheDriftingDebtFixtureAndItNowBuilds() {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
                 BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
                 LoanFixtures.liquidation(),
@@ -935,8 +957,14 @@ class LiquidateTransactionBuilderTest {
 
         assertTrue(scenario.assessment().equity().signum() > 0,
                 "the fixture must carry a positive — and therefore drifting — equity");
-        assertEquals(LiquidateTransactionBuilder.Refusal.POSITIVE_EQUITY_UNSUPPORTED,
-                refusal(List.of(scenario), Map.of(), MARGIN, VALID_FROM, VALID_FROM + 3_000_000L));
+
+        Transaction tx = builder(List.of(scenario), Map.of()).build(
+                request(List.of(scenario), Map.of(), WALLET_UTXO, MARGIN, VALID_FROM,
+                        VALID_FROM + 3_000_000L,
+                        LiquidateTransactionBuilder.ReferenceScripts.none()));
+        assertNotNull(tx, "a drifting debt and a drifting equity assessed at validFrom are buildable");
+        assertEquals(2, assetManagerOutputs(tx).size(),
+                "a positive equity means a compensation output as well as a collateral one");
     }
 
     /**
@@ -1009,7 +1037,7 @@ class LiquidateTransactionBuilderTest {
         AdaScenario stale = scenario.withAssessment(LoanFixtures.withNumbers(scenario.assessment(),
                 scenario.assessment().remainingDebt(), equityAtValidTo,
                 scenario.assessment().liquidationFee()));
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(stale), Map.of(),
+        Transaction tx = build(List.of(stale), Map.of(),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
         assertEquals(equityAtValidFrom, emittedEquity(tx, 0));
@@ -1173,7 +1201,7 @@ class LiquidateTransactionBuilderTest {
                 scenario.assessment().remainingDebt(), derived.add(BigInteger.ONE),
                 scenario.assessment().liquidationFee()));
 
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(wrong), Map.of(),
+        Transaction tx = build(List.of(wrong), Map.of(),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
         assertEquals(derived, emittedEquity(tx, 0),
@@ -1210,7 +1238,7 @@ class LiquidateTransactionBuilderTest {
         assertEquals(BigInteger.ZERO, scenario.assessment().liquidationFee());
 
         assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
-                refusalIgnoringPositiveEquityVeto(scenario));
+                refusal(scenario));
     }
 
     // ======================================================================================
@@ -1340,43 +1368,122 @@ class LiquidateTransactionBuilderTest {
     }
 
     // ======================================================================================
-    // V8 — positive equity is unsatisfiable on the deployed validators
+    // Rule R — the positive-equity output layout (the section that used to be V8)
     // ======================================================================================
 
     /**
-     * The 200-ADA-collateral scenario the anatomy tests above build — 84.5 ADA of borrower equity —
-     * is refused outright on the public entry point.
-     * <p>
-     * {@code lm_liquidate_action.ak:87-91} reaches the {@code get_outputs_to_smart_credential(..)}
-     * list through {@code assetOutputIndexes[index]} while {@code loan_claim_action.ak:275-284} still
-     * indexes it with the bare loan index, and the two demand mutually exclusive datums
-     * ({@code action_claimed_collateral} against {@code action_partial_liquidation_compensation}). The
-     * builder emits identity {@code assetOutputIndexes}, which puts both on the same slot;
-     * {@code LiquidateDryEvalTest} runs both layouts <em>the builder can emit</em> against the deployed
-     * scripts and watches each validator refuse the other's. Nothing here re-derives that — this test
-     * only pins that the builder refuses instead of building.
-     * <p>
-     * The refusal is <em>deployment-specific</em> and scoped to what this builder emits — whether some
-     * other layout satisfies both validators is untested. The same batch built through the seam is
-     * still a well-formed transaction, which is why the anatomy tests keep asserting on it.
+     * <b>The 200-ADA-collateral scenario — 84.5 ADA of borrower equity — now builds on the public
+     * entry point.</b> This test replaces {@code v8RefusesAPositiveEquityTheDeployedValidatorsCannotSatisfy},
+     * which asserted the exact opposite.
+     *
+     * <h3>Why the old assertion was removed rather than adjusted</h3>
+     * It pinned {@code Refusal.POSITIVE_EQUITY_UNSUPPORTED} as intended behaviour. That veto rested on
+     * the claim that <em>no</em> output layout satisfies both validators at a positive equity, which
+     * was never proven — the javadoc said so, calling it "a statement about what this builder emits,
+     * not a proof of impossibility". It is now known to be false. {@code lm_liquidate_action.ak:87-91}
+     * reaches its asset output through {@code assetOutputIndexes[index]}, a redeemer field the builder
+     * chooses, while {@code loan_claim_action.ak:275-284} indexes the same filtered list with the bare
+     * loan index and cannot be redirected. Put the compensation output at the forced position and
+     * point the free index at the collateral output, and both are satisfied — rule R. Keeping the old
+     * assertion would have pinned a limitation the builder no longer has.
+     *
+     * <h3>What is asserted here</h3>
+     * The layout itself, off the built body: two asset-manager outputs, the compensation one first
+     * (filtered slot 0, where {@code loan_claim_action} looks for loan 0) and the claimed-collateral
+     * one second, with {@code assetOutputIndexes = [1]} pointing {@code lm_liquidate_action} at it.
+     * The chain-level proof that this is accepted lives in {@code LiquidateDryEvalTest} and
+     * {@code RealEquityLoanDryEvalTest}; this test pins the shape those evaluate.
      */
     @Test
-    void v8RefusesAPositiveEquityTheDeployedValidatorsCannotSatisfy() {
+    void aPositiveEquityBatchBuildsAndLaysOutTheAssetManagerOutputsByRuleR() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
                 200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
 
         assertEquals(BigInteger.valueOf(84_500_000), scenario.assessment().equity(),
                 "the fixture must really carry a borrower compensation");
-        assertEquals(LiquidateTransactionBuilder.Refusal.POSITIVE_EQUITY_UNSUPPORTED, refusal(scenario));
+
+        Transaction tx = build(List.of(scenario), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
+
+        List<TransactionOutput> assetManager = assetManagerOutputs(tx);
+        assertEquals(2, assetManager.size(), "a compensation output and a claimed-collateral one");
+
+        // Rule R, first row: filtered slot 0 is loan 0's COMPENSATION output — the position
+        // loan_claim_action reads with the bare loan index and cannot be redirected away from.
+        assertEquals(expectedAssetManagerDatum(scenario,
+                        LiquidationTxEncoder.PARTIAL_LIQUIDATION_ACTION_HEX,
+                        REGISTRY.getBorrowerBondPolicyId()),
+                assetManager.get(0).getInlineDatum().serializeToHex(),
+                "filtered slot 0 must carry the partial-liquidation compensation datum");
+        assertEquals(BigInteger.valueOf(84_500_000), assetManager.get(0).getValue().getCoin());
+
+        // Rule R, second row: the displaced claimed-collateral output.
+        assertEquals(expectedAssetManagerDatum(scenario,
+                        LiquidationTxEncoder.CLAIMED_COLLATERAL_ACTION_HEX,
+                        REGISTRY.getLenderBondPolicyId()),
+                assetManager.get(1).getInlineDatum().serializeToHex(),
+                "filtered slot 1 must carry the claimed-collateral datum");
+        assertEquals(BigInteger.valueOf(113_500_000), assetManager.get(1).getValue().getCoin(),
+                "collateral - equity - fee = 200_000_000 - 84_500_000 - 2_000_000");
+
+        // And the redeemer field that does the yielding, read back off the emitted witness set.
+        assertEquals(List.of(BigInteger.ONE), emittedAssetOutputIndexes(tx),
+                "assetOutputIndexes must point lm_liquidate_action at the displaced collateral output");
+    }
+
+    /**
+     * <b>The compensation output goes to an ENTERPRISE address</b> — the asset-manager spend
+     * credential with no stake part — while the claimed-collateral output keeps the lender's stake
+     * credential. The two addresses must therefore differ, and this fixture's bond really does carry a
+     * stake credential, which is what stops the assertion from being vacuously true.
+     * <p>
+     * The validator does not check this: {@code equity_sent_to_borrower}'s {@code and{}} block opens
+     * with {@code //No staking check here}. That is precisely why the builder must — see
+     * {@code LiquidateTransactionBuilder.equityAddress()} for the reasoning, which comes down to
+     * a third-party liquidator having no business deciding whose stake earns rewards on someone
+     * else's refund.
+     */
+    @Test
+    void theCompensationOutputGoesToAnEnterpriseAddressAndTheCollateralKeepsTheLendersStake() {
+        AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
+                200_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
+
+        Transaction tx = build(List.of(scenario), Map.of(),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
+        List<TransactionOutput> assetManager = assetManagerOutputs(tx);
+
+        Address compensation = new Address(assetManager.get(0).getAddress());
+        Address collateral = new Address(assetManager.get(1).getAddress());
+
+        // Both sit at the asset-manager spend credential — that is what put them in the filtered list.
+        assertEquals(REGISTRY.getAssetManagerSpendScriptHash(),
+                HexUtil.encodeHexString(compensation.getPaymentCredentialHash().orElseThrow()));
+        assertEquals(REGISTRY.getAssetManagerSpendScriptHash(),
+                HexUtil.encodeHexString(collateral.getPaymentCredentialHash().orElseThrow()));
+
+        // The collateral output carries the lender's stake credential, so the fixture is one where
+        // the enterprise choice is a real choice rather than the only address available.
+        assertEquals(STAKE_KEY,
+                HexUtil.encodeHexString(collateral.getDelegationCredentialHash().orElseThrow()),
+                "the fixture bond must really carry a lender stake credential");
+
+        // The compensation output carries none.
+        assertTrue(compensation.getDelegationCredential().isEmpty(),
+                "the borrower's compensation must go to an enterprise address, so that no third "
+                        + "party earns staking rewards on it");
+        assertNotEquals(collateral.getAddress(), compensation.getAddress(),
+                "the two outputs must not share an address; the old builder sent both to the "
+                        + "lender's, which had the borrower's refund fund the lender");
     }
 
     /**
      * The boundary partner: the identical loan against 100 ADA of collateral instead of 200 owes more
-     * than it holds, so the equity clamps to zero and the batch builds. Without this, V8 would be
-     * indistinguishable from a veto that refuses every ada liquidation.
+     * than it holds, so the equity clamps to zero, no compensation output is emitted, and rule R
+     * degenerates to a single asset-manager output at filtered slot 0. This is the shape that has
+     * always shipped, and it is unchanged.
      */
     @Test
-    void v8LetsAZeroEquityLiquidationThrough() {
+    void aZeroEquityLiquidationEmitsNoCompensationOutputAtAll() {
         AdaScenario scenario = adaScenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 1000L,
                 100_000_000L, BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY));
 
@@ -1386,8 +1493,7 @@ class LiquidateTransactionBuilderTest {
         Transaction tx = build(List.of(scenario), Map.of(),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
-        // Four outputs, not five: dummy, bond echo, collateral, change — and no equity output, which
-        // is exactly the shape that stays submittable on the deployed validators.
+        // Four outputs, not five: dummy, bond echo, collateral, change — and no equity output.
         List<TransactionOutput> outputs = tx.getBody().getOutputs();
         assertEquals(4, outputs.size(), "dummy, bond, collateral, change");
         assertEquals(BigInteger.valueOf(99_000_000), outputs.get(2).getValue().getCoin(),
@@ -1395,6 +1501,266 @@ class LiquidateTransactionBuilderTest {
         assertEquals(expectedAssetManagerDatum(scenario, LiquidationTxEncoder.CLAIMED_COLLATERAL_ACTION_HEX,
                         REGISTRY.getLenderBondPolicyId()),
                 outputs.get(2).getInlineDatum().serializeToHex());
+        assertEquals(List.of(BigInteger.ZERO), emittedAssetOutputIndexes(tx),
+                "with no compensation output rule R leaves the indexes at the identity");
+    }
+
+    // ======================================================================================
+    // Rule R's positional guard, exercised directly
+    // ======================================================================================
+
+    /**
+     * {@link LiquidateTransactionBuilder#compensationOutputsAtTheirLoanIndex} on a synthetic
+     * filtered list, in both directions — a guard whose only exercise is the happy path is a guard
+     * nobody has watched fail.
+     * <p>
+     * The list is built by hand rather than taken from a build, so the "wrong" case is genuinely
+     * reachable: the builder itself always emits rule R, so nothing it produces could ever make this
+     * guard fire, and a test that only ran the guard over real builds would be green whether the
+     * guard's body did anything or not.
+     */
+    @Test
+    void thePositionalGuardAcceptsRuleRAndRejectsEverythingElse() {
+        PlutusData compensationZero = BytesPlutusData.of(new byte[]{0x0a});
+        PlutusData compensationOne = BytesPlutusData.of(new byte[]{0x0b});
+        PlutusData collateralZero = BytesPlutusData.of(new byte[]{0x0c});
+        PlutusData collateralOne = BytesPlutusData.of(new byte[]{0x0d});
+
+        String hexZero = compensationZero.serializeToHex();
+        String hexOne = compensationOne.serializeToHex();
+        List<String> loanIds = List.of(LOAN_ID_A, LOAN_ID_B);
+
+        // Rule R for N=2, K=2: slots 0,1 are the compensations; 2,3 the displaced collaterals. The
+        // RETURN is asserted, not just the absence of a throw: V5 does all of its amount, shape and
+        // address checks on these, so handing back the wrong output would move every one of them onto
+        // an output the validator never reads.
+        List<TransactionOutput> ruleR = outputsWithDatums(compensationZero, compensationOne,
+                collateralZero, collateralOne);
+        assertEquals(List.of(ruleR.get(0), ruleR.get(1)),
+                LiquidateTransactionBuilder.compensationOutputsAtTheirLoanIndex(
+                        ruleR, List.of(hexZero, hexOne), loanIds),
+                "each loan's compensation output is the one at its own slot");
+
+        // K=1: loan 0 has no equity, so slot 0 is its collateral and slot 1 is loan 1's compensation.
+        // The no-equity loan gets a null back — it has no compensation output to check anything on.
+        List<TransactionOutput> mixed = outputsWithDatums(collateralZero, compensationOne, collateralOne);
+        assertEquals(Arrays.asList(null, mixed.get(1)),
+                LiquidateTransactionBuilder.compensationOutputsAtTheirLoanIndex(
+                        mixed, Arrays.asList(null, hexOne), loanIds));
+
+        // The two compensations swapped: each is present, each is at the OTHER loan's slot. This is
+        // the case a presence-only check would wave through and the chain would kill.
+        List<TransactionOutput> swapped = outputsWithDatums(compensationOne, compensationZero,
+                collateralZero, collateralOne);
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> LiquidateTransactionBuilder.compensationOutputsAtTheirLoanIndex(
+                                swapped, List.of(hexZero, hexOne), loanIds)).getReason());
+
+        // The pre-rule-R layout: collaterals first, compensations after. This is exactly what the
+        // builder emitted before this slice, and it is what loan_claim_action refuses on chain.
+        List<TransactionOutput> oldLayout = outputsWithDatums(collateralZero, collateralOne,
+                compensationZero, compensationOne);
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> LiquidateTransactionBuilder.compensationOutputsAtTheirLoanIndex(
+                                oldLayout, List.of(hexZero, hexOne), loanIds)).getReason());
+
+        // A compensation output omitted entirely, leaving the slot short.
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> LiquidateTransactionBuilder.compensationOutputsAtTheirLoanIndex(
+                                outputsWithDatums(compensationZero), List.of(hexZero, hexOne), loanIds))
+                        .getReason());
+
+        // A slot with no inline datum at all.
+        List<TransactionOutput> noDatum = new ArrayList<>(outputsWithDatums(compensationZero,
+                compensationOne));
+        noDatum.set(1, TransactionOutput.builder().address(LoanFixtures.botAddress())
+                .value(Value.builder().coin(BigInteger.TEN).build()).build());
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                        () -> LiquidateTransactionBuilder.compensationOutputsAtTheirLoanIndex(
+                                noDatum, List.of(hexZero, hexOne), loanIds)).getReason());
+    }
+
+    private static List<TransactionOutput> outputsWithDatums(PlutusData... datums) {
+        return Arrays.stream(datums)
+                .map(datum -> TransactionOutput.builder()
+                        .address(LoanFixtures.botAddress())
+                        .value(Value.builder().coin(BigInteger.TEN).build())
+                        .inlineDatum(datum)
+                        .build())
+                .toList();
+    }
+
+    // ======================================================================================
+    // the asset-manager shape guard, exercised directly
+    // ======================================================================================
+
+    /**
+     * {@link LiquidateTransactionBuilder#assertAssetManagerOutput} on synthetic outputs, in both
+     * directions. It is the {@code dosProtection} conjunct of <em>both</em>
+     * {@code validate_repayment_output} and {@code equity_sent_to_borrower} — the flatten count
+     * {@code loan_claim_action.ak} and {@code lm_liquidate_action.ak} each require of the output they
+     * read — and it guards two call sites, the claimed-collateral output's and the borrower
+     * compensation's.
+     * <p>
+     * Driven directly rather than through a build for the same reason
+     * {@link #thePositionalGuardAcceptsRuleRAndRejectsEverythingElse()} is: {@code assemble} emits
+     * each asset-manager output from {@code assetManagerAmounts}, which produces exactly one entry
+     * for ada collateral and exactly one token entry otherwise, and the balancer only ever adds the
+     * lovelace rider. No legitimate build can therefore reach this guard with a violating body, so a
+     * test that only ran it over real builds would be green whether the flatten check did anything or
+     * not — which is exactly what the suite was before this test existed.
+     * <p>
+     * The <b>return</b> is asserted, not merely the absence of a throw: {@code assertStructure} does
+     * its collateral-payout and compensation-amount arithmetic on the list this hands back, so
+     * returning the wrong flattening would move those checks onto a value nothing vetted.
+     */
+    @Test
+    void theAssetManagerShapeGuardRefusesAWrongFlattenCountAndAWrongAddress() {
+        String address = LoanFixtures.botAddress();
+        String other = LoanFixtures.loanAddress();
+        assertNotEquals(address, other, "the two fixture addresses must differ");
+
+        // Ada collateral: one entry, the lovelace, and that is the whole value.
+        TransactionOutput adaShaped = outputAt(address, 1_357_650L);
+        assertEquals(List.of(Amount.lovelace(BigInteger.valueOf(1_357_650L))),
+                LiquidateTransactionBuilder.assertAssetManagerOutput(adaShaped, address, true, "probe"),
+                "the flattened value is handed back for the caller's amount checks");
+
+        // Token collateral: the min-ada rider plus exactly one token entry.
+        TransactionOutput tokenShaped = outputAt(address, 1_655_040L,
+                Map.of(COLLATERAL_TOKEN, BigInteger.valueOf(100_000_000L)));
+        assertEquals(2,
+                LiquidateTransactionBuilder.assertAssetManagerOutput(tokenShaped, address, false, "probe")
+                        .size());
+
+        // A stray token on the compensation output of a TOKEN-collateral loan: three entries where
+        // equity_sent_to_borrower's dosProtection conjunct demands two. This is the violating body the
+        // guard exists for, and until this test it had never been handed one.
+        TransactionOutput strayToken = outputAt(address, 1_655_040L,
+                Map.of(COLLATERAL_TOKEN, BigInteger.valueOf(100_000_000L),
+                        ORACLE_TOKEN, BigInteger.ONE));
+        LiquidateTransactionBuilder.RefusedException stray = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> LiquidateTransactionBuilder.assertAssetManagerOutput(strayToken, address, false,
+                        "equity output for loan " + LOAN_ID_A));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED, stray.getReason());
+        assertTrue(stray.getMessage().contains(
+                        "equity output for loan " + LOAN_ID_A + " flattens to 3 assets, expected 2"),
+                "the refusal must name the flatten count it refused: " + stray.getMessage());
+
+        // The same shape on an ADA-collateral loan: one entry expected, two present.
+        LiquidateTransactionBuilder.RefusedException riderOnAda = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> LiquidateTransactionBuilder.assertAssetManagerOutput(tokenShaped, address, true,
+                        "equity output for loan " + LOAN_ID_A));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                riderOnAda.getReason());
+        assertTrue(riderOnAda.getMessage().contains("flattens to 2 assets, expected 1"),
+                riderOnAda.getMessage());
+
+        // And the address half of the guard.
+        LiquidateTransactionBuilder.RefusedException elsewhere = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> LiquidateTransactionBuilder.assertAssetManagerOutput(adaShaped, other, true, "probe"));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED,
+                elsewhere.getReason());
+        assertTrue(elsewhere.getMessage().contains("is at " + address + ", expected " + other),
+                elsewhere.getMessage());
+    }
+
+    /**
+     * {@link LiquidateTransactionBuilder#assertCompensationSubsidyBounded} — the ceiling on the
+     * min-ada the bot funds on a borrower-compensation output.
+     *
+     * <h3>What is unbounded without it</h3>
+     * The compensation output is emitted carrying <em>only</em> the equity quantity;
+     * cardano-client-lib tops it to min-ada during balancing, out of the bot's own inputs.
+     * {@code equity_sent_to_borrower} checks it with {@code >=} rather than the {@code ==} the
+     * claimed-collateral output gets, so nothing on chain objects to a rider, and the builder's own
+     * {@code >=} mirrors that. An equity of one lovelace therefore still emits an output of a full
+     * min-ada — the bot's money, moved to the borrower, with nothing refusing and nothing bounding it.
+     * <p>
+     * Bounding it is not the same as accounting for it: {@code LiquidationExecutor}'s expected-profit
+     * arithmetic still does not subtract this subsidy. See its javadoc at the calculation.
+     */
+    @Test
+    void theCompensationSubsidyGuardBoundsTheMinAdaTheBotFunds() {
+        BigInteger minAda = BigInteger.valueOf(1_357_650L);
+        String token = COLLATERAL_TOKEN.toUnit();
+
+        // Ada collateral, the pathological case: one lovelace of equity, a full min-ada emitted. The
+        // subsidy is 1_357_649 lovelace and it is legal, because the ledger will not take the output
+        // for less. Accepted, and the emitted quantity is handed back for the caller's `>=` check.
+        TransactionOutput floored = outputAt(LoanFixtures.botAddress(), 1_357_650L);
+        assertEquals(BigInteger.valueOf(1_357_650L),
+                LiquidateTransactionBuilder.assertCompensationSubsidyBounded(floored,
+                        ValueUtil.toAmountList(floored.getValue()), AssetType.LOVELACE,
+                        BigInteger.ONE, minAda, "probe"));
+
+        // One lovelace beyond that floor is refused: nothing else in the build would have.
+        TransactionOutput overFloor = outputAt(LoanFixtures.botAddress(), 1_357_652L);
+        LiquidateTransactionBuilder.RefusedException over = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> LiquidateTransactionBuilder.assertCompensationSubsidyBounded(overFloor,
+                        ValueUtil.toAmountList(overFloor.getValue()), AssetType.LOVELACE,
+                        BigInteger.ONE, minAda, "equity output for loan " + LOAN_ID_A));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED, over.getReason());
+        assertTrue(over.getMessage().contains("so the bot subsidises 1357651"), over.getMessage());
+
+        // Ada collateral well above the floor: no subsidy at all, and the ceiling is not in the way.
+        TransactionOutput funded = outputAt(LoanFixtures.botAddress(), 84_500_000L);
+        assertEquals(BigInteger.valueOf(84_500_000L),
+                LiquidateTransactionBuilder.assertCompensationSubsidyBounded(funded,
+                        ValueUtil.toAmountList(funded.getValue()), AssetType.LOVELACE,
+                        BigInteger.valueOf(84_500_000L), minAda, "probe"));
+
+        // Token collateral: the equity is denominated in the token, so the WHOLE coin is subsidy and
+        // the ceiling is one min-ada flat. The returned quantity is the token's, not the coin.
+        TransactionOutput tokenAtFloor = outputAt(LoanFixtures.botAddress(), 1_357_650L,
+                Map.of(COLLATERAL_TOKEN, BigInteger.valueOf(100_000_000L)));
+        assertEquals(BigInteger.valueOf(100_000_000L),
+                LiquidateTransactionBuilder.assertCompensationSubsidyBounded(tokenAtFloor,
+                        ValueUtil.toAmountList(tokenAtFloor.getValue()), token,
+                        BigInteger.valueOf(100_000_000L), minAda, "probe"),
+                "the compensation quantity is the collateral token's, not the lovelace rider's");
+
+        // The same output with the rider inflated — the equity is untouched and satisfies `>=` just as
+        // happily, which is what makes this the shape that would have grown silently.
+        TransactionOutput tokenInflated = outputAt(LoanFixtures.botAddress(), 6_357_650L,
+                Map.of(COLLATERAL_TOKEN, BigInteger.valueOf(100_000_000L)));
+        LiquidateTransactionBuilder.RefusedException inflated = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> LiquidateTransactionBuilder.assertCompensationSubsidyBounded(tokenInflated,
+                        ValueUtil.toAmountList(tokenInflated.getValue()), token,
+                        BigInteger.valueOf(100_000_000L), minAda, "equity output for loan " + LOAN_ID_A));
+        assertEquals(LiquidateTransactionBuilder.Refusal.STRUCTURAL_ASSERTION_FAILED, inflated.getReason());
+        assertTrue(inflated.getMessage().contains("so the bot subsidises 6357650"), inflated.getMessage());
+    }
+
+    /** A synthetic output at {@code address} holding {@code lovelace} and the given token quantities. */
+    private static TransactionOutput outputAt(String address, long lovelace,
+                                              Map<AssetType, BigInteger> tokens) {
+        Value value = Value.builder().coin(BigInteger.valueOf(lovelace)).build();
+        for (Map.Entry<AssetType, BigInteger> token : tokens.entrySet()) {
+            value = value.plus(Value.builder()
+                    .multiAssets(List.of(MultiAsset.builder()
+                            .policyId(token.getKey().policyId())
+                            .assets(List.of(Asset.builder()
+                                    .name("0x" + token.getKey().assetName())
+                                    .value(token.getValue())
+                                    .build()))
+                            .build()))
+                    .build());
+        }
+        return TransactionOutput.builder().address(address).value(value).build();
+    }
+
+    private static TransactionOutput outputAt(String address, long lovelace) {
+        return outputAt(address, lovelace, Map.of());
     }
 
     // ======================================================================================
@@ -1463,7 +1829,7 @@ class LiquidateTransactionBuilderTest {
     void collapsesTwoLegsBehindOneOracleIntoASingleWithdrawal() {
         TokenScenario scenario = sameOracleBothLegsScenario();
 
-        Transaction tx = buildIgnoringPositiveEquityVeto(List.of(scenario.scenario()),
+        Transaction tx = build(List.of(scenario.scenario()),
                 Map.of(ORACLE_TOKEN.toUnit(), scenario.oracle()),
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
@@ -2094,39 +2460,6 @@ class LiquidateTransactionBuilderTest {
         return transaction;
     }
 
-    /**
-     * Builds through {@link LiquidateTransactionBuilder}'s package-private V8 seam, for the anatomy
-     * tests whose scenarios have a positive equity.
-     * <p>
-     * V8 refuses those outright, because no output layout this builder emits satisfies a positive
-     * equity on the <em>deployed</em> validators ({@code LiquidateDryEvalTest} is the evidence). The
-     * transaction is still the structurally correct one and becomes submittable the day that lifts, so
-     * every claim these tests make about its anatomy — the equity output's datum, its value, its place
-     * in the body, the indexes that point at it — is worth keeping exactly as it was. Routing them
-     * through the seam preserves them without weakening a single assertion; V8 itself is proven by
-     * {@link #v8RefusesAPositiveEquityTheDeployedValidatorsCannotSatisfy()} on the public entry point.
-     */
-    private static Transaction buildIgnoringPositiveEquityVeto(
-            List<AdaScenario> scenarios, Map<String, OracleEntry> oracles,
-            LiquidateTransactionBuilder.ReferenceScripts refs) {
-        Transaction transaction = builder(scenarios, oracles).buildIgnoringPositiveEquityVeto(
-                request(scenarios, oracles, WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO, refs));
-        assertNotNull(transaction);
-        return transaction;
-    }
-
-    /** {@link #refusal(AdaScenario)} through the same seam, for a refusal V8 would otherwise mask. */
-    private static LiquidateTransactionBuilder.Refusal refusalIgnoringPositiveEquityVeto(
-            AdaScenario scenario) {
-        List<AdaScenario> scenarios = List.of(scenario);
-        LiquidateTransactionBuilder.RefusedException refused =
-                assertThrows(LiquidateTransactionBuilder.RefusedException.class,
-                        () -> builder(scenarios, Map.of()).buildIgnoringPositiveEquityVeto(
-                                request(scenarios, Map.of(), WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO,
-                                        LiquidateTransactionBuilder.ReferenceScripts.none())));
-        return refused.getReason();
-    }
-
     private static LiquidateTransactionBuilder.Refusal refusal(AdaScenario scenario) {
         return refusal(List.of(scenario), Map.of(), MARGIN);
     }
@@ -2227,5 +2560,46 @@ class LiquidateTransactionBuilderTest {
         Map<String, BigInteger> byUnit = new LinkedHashMap<>();
         amounts.forEach(amount -> byUnit.merge(amount.getUnit(), amount.getQuantity(), BigInteger::add));
         return byUnit;
+    }
+
+    /**
+     * The body's outputs filtered by the asset-manager <em>spend</em> credential, in body order —
+     * exactly the list {@code get_outputs_to_smart_credential} builds, and the one both
+     * {@code loan_claim_action} and {@code lm_liquidate_action} index into. Filtered on the payment
+     * credential alone, so the compensation output's enterprise address and the collateral output's
+     * base address both belong to it.
+     */
+    private static List<TransactionOutput> assetManagerOutputs(Transaction tx) {
+        return tx.getBody().getOutputs().stream()
+                .filter(output -> REGISTRY.getAssetManagerSpendScriptHash().equals(
+                        new Address(output.getAddress()).getPaymentCredentialHash()
+                                .map(HexUtil::encodeHexString).orElse(null)))
+                .toList();
+    }
+
+    /** {@code LMLiquidateWithdrawRedeemer.assetOutputIndexes} — field 3 — off the built transaction. */
+    private static List<BigInteger> emittedAssetOutputIndexes(Transaction tx) {
+        int withdrawal = withdrawalIndexOf(tx,
+                LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateActionScriptHash()));
+        for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
+            if (redeemer.getTag() == RedeemerTag.Reward && redeemer.getIndex().intValue() == withdrawal) {
+                ListPlutusData indexes = (ListPlutusData) ((ConstrPlutusData) redeemer.getData())
+                        .getData().getPlutusDataList().get(3);
+                return indexes.getPlutusDataList().stream()
+                        .map(data -> ((BigIntPlutusData) data).getValue())
+                        .toList();
+            }
+        }
+        throw new AssertionError("no reward redeemer for the lm_liquidate_action withdrawal");
+    }
+
+    private static int withdrawalIndexOf(Transaction tx, String rewardAddress) {
+        List<Withdrawal> withdrawals = tx.getBody().getWithdrawals();
+        for (int i = 0; i < withdrawals.size(); i++) {
+            if (withdrawals.get(i).getRewardAddress().equals(rewardAddress)) {
+                return i;
+            }
+        }
+        throw new AssertionError("no withdrawal at " + rewardAddress);
     }
 }
