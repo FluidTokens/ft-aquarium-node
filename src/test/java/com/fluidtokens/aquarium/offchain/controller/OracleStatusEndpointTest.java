@@ -42,7 +42,7 @@ class OracleStatusEndpointTest {
             public FluidOracleClient getIfUnique() {
                 return client;
             }
-        });
+        }, null);
     }
 
     @Test

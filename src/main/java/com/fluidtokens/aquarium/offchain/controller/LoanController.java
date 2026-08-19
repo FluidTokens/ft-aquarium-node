@@ -2,12 +2,15 @@ package com.fluidtokens.aquarium.offchain.controller;
 
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.annotation.JsonNaming;
+import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
+import com.fluidtokens.aquarium.offchain.model.loans.LiquidationExclusion;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
 import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanHealth;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
+import com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanService;
 import lombok.RequiredArgsConstructor;
@@ -24,6 +27,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Read-only view over the indexed Lending v4 loans.
@@ -46,6 +52,8 @@ public class LoanController {
     private final LoanHealthService loanHealthService;
 
     private final ObjectProvider<FluidOracleClient> oracleClient;
+
+    private final LiquidationCandidateScanner scanner;
 
     /**
      * One oracle's freshness. {@code usable_now} is the question that matters: a feed can be
@@ -150,6 +158,17 @@ public class LoanController {
                                 BigInteger maxPossibleRecasts) {
     }
 
+    /**
+     * {@code bot_liquidatable} is the executor's verdict: true exactly when
+     * {@link LiquidationCandidateScanner#scan(long)} produced a {@link LiquidationAssessment#buildable()}
+     * for this loan — i.e. the executor would <em>build</em> a liquidation now. It is not
+     * {@link Loan#botLiquidatable()} (a loan-side type filter alone) and not a would-<em>submit</em>
+     * verdict (fee/profitability is a separate economic veto at {@code /loans/liquidations}).
+     * <p>
+     * {@code bot_liquidatable_reason} is null exactly when {@code bot_liquidatable} is true; otherwise
+     * it names why — the excluded assessment's {@link LiquidationExclusion} name, or
+     * {@link LiquidationExclusion#BOND_NOT_DELEGATED} when no bond assessment exists for the loan.
+     */
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record LoanView(String loanId,
                            String utxo,
@@ -172,24 +191,54 @@ public class LoanController {
                            BigInteger doneRecasts,
                            boolean repaymentReceipts,
                            boolean botLiquidatable,
+                           String botLiquidatableReason,
                            LiquidationView liquidation,
                            RepaymentView repayment,
                            HealthView health) {
     }
 
+    /** The executor's per-loan liquidation verdict, sourced from a {@link LiquidationAssessment}. */
+    private record Verdict(boolean botLiquidatable, String reason) {
+    }
+
     /**
-     * @param botLiquidatableOnly keep only loans the LenderManager actions could ever accept —
-     *                            {@code Liquidation} mode with equity in collateral currency
-     *                            (docs/lending-v4-findings.md §7 D1/D2). Not a health check:
-     *                            these are eligible by <em>type</em>, not necessarily unhealthy.
+     * present + buildable ⇒ {@code (true, null)}; present + excluded ⇒ {@code (false, exclusion)};
+     * absent ⇒ {@code (false, BOND_NOT_DELEGATED)}. A missing assessment is never liquidatable.
+     */
+    private static Verdict verdict(LiquidationAssessment assessment) {
+        if (assessment == null) {
+            return new Verdict(false, LiquidationExclusion.BOND_NOT_DELEGATED.name());
+        }
+        if (assessment.buildable()) {
+            return new Verdict(true, null);
+        }
+        return new Verdict(false, assessment.exclusion().name());
+    }
+
+    /**
+     * @param botLiquidatableOnly keep only loans whose {@code bot_liquidatable} is true — the ones the
+     *                            executor would build a liquidation for right now. Sourced from the
+     *                            same {@link LiquidationCandidateScanner} assessment the
+     *                            {@code /loans/liquidations} path uses, not the loan-side type filter.
      */
     @GetMapping
     public List<LoanView> loans(
             @RequestParam(name = "bot_liquidatable_only", defaultValue = "false") boolean botLiquidatableOnly) {
         long now = System.currentTimeMillis();
+        // One scan per request, joined loan-side by loanId. A duplicate bond loanId must not blank the
+        // endpoint — same "one bad input must not blank the endpoint" posture as the scanner/LoanService:
+        // keep the first, log and drop the rest.
+        Map<String, LiquidationAssessment> assessmentsByLoanId = scanner.scan(now).stream()
+                .collect(Collectors.toMap(a -> a.bond().loanId(), Function.identity(), (first, duplicate) -> {
+                    log.warn("duplicate bond loanId {} in liquidation scan: keeping {}, dropping {}",
+                            first.bond().loanId(), first.bond().utxoRef(), duplicate.bond().utxoRef());
+                    return first;
+                }));
         return loanService.findAll().stream()
-                .filter(loan -> !botLiquidatableOnly || loan.botLiquidatable())
-                .map(loan -> toView(loan, loanHealthService.health(loan, now)))
+                .map(loan -> Map.entry(loan, verdict(assessmentsByLoanId.get(loan.loanId()))))
+                .filter(entry -> !botLiquidatableOnly || entry.getValue().botLiquidatable())
+                .map(entry -> toView(entry.getKey(), entry.getValue(),
+                        loanHealthService.health(entry.getKey(), now)))
                 .toList();
     }
 
@@ -198,7 +247,7 @@ public class LoanController {
                 health.equity(), health.liquidatable(), health.unavailableReason());
     }
 
-    private static LoanView toView(Loan loan, LoanHealth health) {
+    private static LoanView toView(Loan loan, Verdict verdict, LoanHealth health) {
         var d = loan.datum();
         return new LoanView(
                 loan.loanId(),
@@ -224,7 +273,8 @@ public class LoanController {
                 d.penaltyFeeForLateRepayment(),
                 d.doneRecasts(),
                 d.repaymentReceipts(),
-                loan.botLiquidatable(),
+                verdict.botLiquidatable(),
+                verdict.reason(),
                 toView(d.liquidationMode()),
                 toView(d.repaymentMode()),
                 toView(health));

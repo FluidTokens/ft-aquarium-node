@@ -77,5 +77,14 @@ public enum LiquidationExclusion {
      * D9 — not late and {@code currentLtv <= liquidationLtv}. {@code can_liquidate} is
      * strict-greater ({@code finance.ak:174-195}); equality does not liquidate.
      */
-    NOT_LIQUIDATABLE
+    NOT_LIQUIDATABLE,
+
+    /**
+     * Produced <b>only</b> by the loan-anchored {@code GET /api/v1/loans} join, <b>never</b> by
+     * {@link LiquidationCandidateScanner#scan(long)}: a loan for which no bond assessment exists,
+     * because the bond is not locked at the LenderManager spend credential — the lender never
+     * delegated auto-liquidation to the bot. It is the inverse of {@link #LOAN_NOT_FOUND}: that is
+     * the bond-anchored scanner's "a bond with no loan"; this is "a loan with no bond".
+     */
+    BOND_NOT_DELEGATED
 }
