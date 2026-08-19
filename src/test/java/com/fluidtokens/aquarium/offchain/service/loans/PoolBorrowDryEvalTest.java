@@ -534,7 +534,14 @@ class PoolBorrowDryEvalTest {
                 PoolFixtures.poolPolicyRefScriptUtxo(), FUNDER, PoolFixtures.poolAddress(),
                 PoolFixtures.poolAssetName(),
                 PoolTxEncoder.poolDatum(PoolFixtures.factoryPoolDatum(PoolFixtures.defaults())),
-                PoolFixtures.defaults().poolLiquidityLovelace());
+                PoolFixtures.defaults().poolLiquidityLovelace(),
+                // T-024: every pool this factory creates now mints a PoolManager NFT beside its pool
+                // NFT. Nothing on the borrow path reads it — pool_borrow_action never mentions the
+                // PoolManager — so this only keeps the fixture's pool the same pool the create builder
+                // actually emits, rather than a shape we no longer produce.
+                PoolFixtures.poolManagerAddress(),
+                PoolTxEncoder.poolManagerDatum(PoolFixtures.poolManagerDatum()),
+                PoolFixtures.POOL_MANAGER_LOVELACE);
         return poolBuilder.build(request);
     }
 

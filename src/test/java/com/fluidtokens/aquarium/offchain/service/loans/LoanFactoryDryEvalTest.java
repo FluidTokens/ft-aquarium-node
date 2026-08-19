@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.function.UnaryOperator;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -95,10 +96,22 @@ class LoanFactoryDryEvalTest {
      * {@code 293,853 − 269,523 = 24,330 = 1,622 bytes × 15}, the same arithmetic
      * {@link #withAnEvaluatorTheCreateStripsTheWitnessCopyAndPaysTheReferenceScriptFee} checks. The pin
      * keeps its drift-detection job; it now pins a submittable shape.
+     *
+     * <h2>And a second time, in T-024, for a reason of substance</h2>
+     * The immediately preceding numbers were <b>fee 293,853</b>, sha256
+     * <b>{@code 46721cef0b9ed793cb4f5c6d2fde3994e0b18890016d63315f5dae1d0c469988}</b>. They pinned a create that minted a pool NFT and
+     * <em>no PoolManager NFT</em> — the shape FluidTokens reviewed and rejected, and the shape that
+     * produces a pool nobody can ever compound. The transaction now carries a second mint (the
+     * PoolManager policy, in the witness set), a second redeemer, a second output with its own
+     * {@link PoolFixtures#POOL_MANAGER_LOVELACE} and datum, and a {@code lenderAuth} that delegates to
+     * the PoolManager withdraw script instead of naming a key. Every one of those is a deliberate change
+     * to what this transaction <em>is</em>, so the bytes had to move; the pin is re-taken over the new
+     * shape and goes on doing its job. <b>A pin is re-taken when the artefact was meant to change and
+     * never to make a red test green.</b>
      */
-    private static final long NO_EVALUATOR_CREATE_FEE = 293_853L;
+    private static final long NO_EVALUATOR_CREATE_FEE = 411_119L;
     private static final String NO_EVALUATOR_CREATE_SHA256 =
-            "46721cef0b9ed793cb4f5c6d2fde3994e0b18890016d63315f5dae1d0c469988";
+            "c6176f030651cf63fa5436ac02e00d0521a8e711d6027dc5906113b014b2e921";
 
     /**
      * {@code minFeeRefScriptCostPerByte}, as {@link EvalFixtures#protocolParams()} carries it and as
@@ -124,7 +137,7 @@ class LoanFactoryDryEvalTest {
         LoanFactory factory = factory(baseUniverse());
         LoanFactory.Recipe recipe = recipe(params, 1, 2);   // born liquidatable at 0.5 lovelace/unit
 
-        Transaction create = factory.buildCreate(recipe);
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
         Transaction borrow = factory.buildBorrow(recipe, create);
         Transaction cancel = factory.buildRecoveryCancel(recipe, create);
 
@@ -154,6 +167,175 @@ class LoanFactoryDryEvalTest {
     }
 
     // ======================================================================================
+    // The pool-id gate — the bond's poolId, the pool NFT and the PoolManager NFT are one name
+    // ======================================================================================
+
+    /**
+     * <b>The three names really are one name, read off the finished body.</b>
+     * <p>
+     * {@code LenderManagerDatum.poolId} is what a compounding bot follows back to a PoolManager
+     * (README item 5). This factory has always written the <em>pool</em> NFT's name there, which until
+     * T-024 advertised a PoolManager that was never minted — the defect FluidTokens reported. It is
+     * correct now, but only because {@code pool_manager.ak:173} forces the two minted names equal, so it
+     * is asserted rather than assumed: {@code LoanFactory}'s {@code POOL_ID_GATE} refuses the create if
+     * the pool NFT, the PoolManager NFT and the advertised {@code poolId} are not all the same 29 bytes.
+     * <p>
+     * This checks the same three off the emitted transaction and the emitted bond datum, so the gate and
+     * the test cannot both be wrong in the same direction: the gate reads the mint field, this also reads
+     * the bond datum the borrow actually stamps.
+     */
+    @Test
+    void thePoolNftThePoolManagerNftAndTheBondPoolIdAreTheSameName() {
+        LoanFactory.Recipe recipe = recipe(PoolFixtures.defaults(), 1, 2);
+        LoanFactory factory = factory(baseUniverse());
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
+
+        String poolName = null;
+        String poolManagerName = null;
+        for (var multiAsset : create.getBody().getMint()) {
+            String name = strip(multiAsset.getAssets().get(0).getNameAsHex());
+            if (multiAsset.getPolicyId().equalsIgnoreCase(REGISTRY.getPoolPolicyId())) {
+                poolName = name;
+            } else if (multiAsset.getPolicyId().equalsIgnoreCase(REGISTRY.getPoolManagerPolicyId())) {
+                poolManagerName = name;
+            }
+        }
+        assertEquals(poolName, poolManagerName,
+                "the pool NFT and the PoolManager NFT must carry the same asset name");
+
+        Transaction borrow = factory.buildBorrow(recipe, create);
+        TransactionOutput bond = outputWithNft(borrow,
+                AddressProvider.getEntAddress(
+                        Credential.fromScript(REGISTRY.getLenderManagerSpendScriptHash()),
+                        LoanFixtures.NETWORK).getAddress(),
+                REGISTRY.getLenderBondPolicyId(),
+                PoolTxEncoder.bondAssetName(new TransactionInput(TransactionUtil.getTxHash(create), 0)));
+        LenderManagerDatum bondDatum = new LenderManagerDatumConverter()
+                .deserialize(bond.getInlineDatum().serializeToHex());
+
+        assertEquals(poolName, bondDatum.poolId(),
+                "the lender bond's poolId must be the PoolManager NFT that now really exists");
+    }
+
+    /**
+     * <b>The pool-id gate refuses when the names disagree.</b>
+     * <p>
+     * Through {@code buildCreate} that branch is unreachable — {@code pool_manager.ak} forces the two
+     * minted names equal and the builder writes the advertised one into both — so neutering the gate's
+     * body would leave every other test green and the gate would be a name with nothing behind it. It is
+     * therefore called directly, on a body whose PoolManager mint has been renamed.
+     */
+    @Test
+    void thePoolIdGateRefusesAMintWhoseNamesDisagree() {
+        LoanFactory.Recipe recipe = recipe(PoolFixtures.defaults(), 1, 2);
+        LoanFactory factory = factory(baseUniverse());
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
+
+        assertDoesNotThrow(() -> factory.assertPoolIdsAgree(recipe, create),
+                "the honest create must pass its own pool-id gate");
+
+        Transaction doctored = deserialise(create);
+        doctored.getBody().getMint().stream()
+                .filter(ma -> ma.getPolicyId().equalsIgnoreCase(REGISTRY.getPoolManagerPolicyId()))
+                .findFirst().orElseThrow(() -> new AssertionError("no PoolManager mint entry"))
+                .getAssets().set(0, new Asset("0x00" + "5b".repeat(28), BigInteger.ONE));
+
+        LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
+                () -> factory.assertPoolIdsAgree(recipe, doctored),
+                "a PoolManager NFT named differently from the pool NFT must be refused");
+        assertTrue(failure.getMessage().contains("POOL_ID_GATE")
+                        && failure.getMessage().contains("pool_manager.ak requires them equal"),
+                "the refusal must be the pool-id gate's name-equality arm: " + failure.getMessage());
+        log.info("pool-id gate refusal (names disagree): {}", failure.getMessage());
+
+        // The gate's second arm, which the first case cannot reach: rename BOTH mints to the same wrong
+        // name. They now agree with each other and disagree with the poolId the lender bond advertises —
+        // which is the failure mode that shipped before T-024, only in the other direction. Neutering
+        // this arm alone must not leave the test green.
+        Transaction bothRenamed = deserialise(create);
+        for (var multiAsset : bothRenamed.getBody().getMint()) {
+            multiAsset.getAssets().set(0, new Asset("0x00" + "5c".repeat(28), BigInteger.ONE));
+        }
+        LoanFactory.GateFailure advertised = assertThrows(LoanFactory.GateFailure.class,
+                () -> factory.assertPoolIdsAgree(recipe, bothRenamed),
+                "a mint that agrees with itself but not with the advertised poolId must be refused");
+        assertTrue(advertised.getMessage().contains("POOL_ID_GATE")
+                        && advertised.getMessage().contains("advertises poolId"),
+                "the refusal must be the pool-id gate's advertised-name arm: " + advertised.getMessage());
+        log.info("pool-id gate refusal (advertised mismatch): {}", advertised.getMessage());
+    }
+
+    // ======================================================================================
+    // The publication gate — T-024's seventh gate: never create value you cannot release
+    // ======================================================================================
+
+    /**
+     * <b>{@link LoanFactory#buildCreate} refuses today, by name, and that is the point.</b>
+     * <p>
+     * Every pool this factory now creates carries a PoolManager NFT, and only the pool-cancel
+     * transaction can burn it. That cancel invokes three validators — the PoolManager
+     * {@code general_spend}, {@code pool_manager.poolManager} and {@code pm_cancel_pool_manager} — for
+     * which preview publishes no reference script. Create a pool before they exist and the PoolManager
+     * is stranded: {@code pool_cancel_action} constrains no mint but its own, so the pool can still be
+     * cancelled without the PoolManager, after which {@code pm_cancel_pool_manager} wants a live pool
+     * holding the matching NFT and there is none. Roughly two ADA locked forever, per pool, with no
+     * recovery at any price.
+     * <p>
+     * So the public entry point refuses. It is the same rule this repo applied at T-016-K when it built
+     * the cancel before funding a pool: <b>never create value you have no code to release</b>. Here the
+     * code exists and its <em>publication prerequisite</em> does not, which is the same hole.
+     * <p>
+     * <b>Every other {@code LoanFactory} test in this class goes through
+     * {@link LoanFactory#buildCreateWithUnpublishedPoolManagerScripts} instead</b>, which bypasses this
+     * gate and only this gate. That seam proves the transaction shape against the real validators; it
+     * licenses nothing about submission, and it is package-private with no production caller. The two
+     * on-chain runners ({@code LoanFactoryOnChainRunnerTest}, {@code LoanFactoryRunnerTest}) still call
+     * {@link LoanFactory#buildCreate} and are therefore refused — intended, not a regression.
+     */
+    @Test
+    void creatingAPoolManagerBearingPoolIsRefusedWhileItsReferenceScriptsAreUnpublished() {
+        LoanFactory factory = factory(baseUniverse());
+
+        LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
+                () -> factory.buildCreate(recipe(PoolFixtures.defaults(), 1, 2)),
+                "a pool whose PoolManager could never be burnt must not be created");
+
+        assertTrue(failure.getMessage().contains("POOL_MANAGER_PUBLICATION_GATE"),
+                "the refusal must name this gate and not another: " + failure.getMessage());
+        for (String hash : PoolFixtures.poolManagerCancelScriptHashes()) {
+            assertTrue(failure.getMessage().contains(hash),
+                    "the refusal must name every unpublished script — " + hash + " is missing from: "
+                            + failure.getMessage());
+        }
+        log.info("publication gate refusal: {}", failure.getMessage());
+    }
+
+    /**
+     * The gate is <b>closed by a fact, not by a constant</b>: it reads
+     * {@link PoolFixtures#PUBLISHED_REFERENCE_SCRIPTS}, so the day FluidTokens publishes the three
+     * coordinates and they are recorded there, it falls silent on its own and the factory may create
+     * real PoolManager-bearing pools.
+     * <p>
+     * This asserts that wiring rather than the outcome: the set the gate refuses over is exactly the set
+     * of pool-manager validators absent from the published table. Were the gate hardcoded to "always
+     * refuse", this would still pass — which is why the test above additionally requires each hash to
+     * appear in the message, and why {@link #creatingAPoolManagerBearingPoolIsRefusedWhileItsReferenceScriptsAreUnpublished}
+     * turns green the moment the table is completed.
+     */
+    @Test
+    void thePublicationGateIsDrivenByThePublishedCoordinateTable() {
+        assertEquals(3, PoolFixtures.poolManagerCancelScriptHashes().size(),
+                "the cancel invokes three pool-manager validators");
+        assertEquals(PoolFixtures.poolManagerCancelScriptHashes(),
+                PoolFixtures.unpublishedPoolManagerScripts(),
+                "all three are unpublished today, which is why the gate is closed");
+        for (String hash : PoolFixtures.poolManagerCancelScriptHashes()) {
+            assertFalse(PoolFixtures.PUBLISHED_REFERENCE_SCRIPTS.containsKey(hash),
+                    hash + " must not appear in the verified published table");
+        }
+    }
+
+    // ======================================================================================
     // The ex-units gate — the fifth gate, and the null path it must not disturb
     // ======================================================================================
 
@@ -169,7 +351,7 @@ class LoanFactoryDryEvalTest {
     @Test
     void withoutAnEvaluatorTheCreateBuildIsUnchanged() throws Exception {
         LoanFactory factory = factory(baseUniverse());
-        Transaction create = factory.buildCreate(recipe(PoolFixtures.defaults(), 1, 2));
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe(PoolFixtures.defaults(), 1, 2));
 
         assertEquals(BigInteger.valueOf(NO_EVALUATOR_CREATE_FEE), create.getBody().getFee(),
                 "the no-evaluator create fee must not move");
@@ -177,11 +359,14 @@ class LoanFactoryDryEvalTest {
                 "the no-evaluator create transaction must be byte-identical to the pre-evaluator tree");
 
         List<Redeemer> redeemers = create.getWitnessSet().getRedeemers();
-        assertEquals(1, redeemers.size(), "the create carries exactly one redeemer, Mint#0");
-        assertEquals(BigInteger.valueOf(10_000), redeemers.get(0).getExUnits().getMem(),
-                "without an evaluator the placeholder mem must survive");
-        assertEquals(BigInteger.valueOf(10_000), redeemers.get(0).getExUnits().getSteps(),
-                "without an evaluator the placeholder steps must survive");
+        assertEquals(2, redeemers.size(),
+                "since T-024 the create carries two redeemers: the pool mint and the PoolManager mint");
+        for (Redeemer redeemer : redeemers) {
+            assertEquals(BigInteger.valueOf(10_000), redeemer.getExUnits().getMem(),
+                    "without an evaluator the placeholder mem must survive");
+            assertEquals(BigInteger.valueOf(10_000), redeemer.getExUnits().getSteps(),
+                    "without an evaluator the placeholder steps must survive");
+        }
     }
 
     /**
@@ -195,12 +380,14 @@ class LoanFactoryDryEvalTest {
     void withAnEvaluatorTheCreateBuildCarriesRealExUnits() throws Exception {
         List<Utxo> universe = baseUniverse();
         LoanFactory factory = factoryWith(universe, evaluatorOver(createEvalUniverse()));
-        Transaction create = factory.buildCreate(recipe(PoolFixtures.defaults(), 1, 2));
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe(PoolFixtures.defaults(), 1, 2));
 
+        for (Redeemer redeemer : create.getWitnessSet().getRedeemers()) {
+            assertTrue(redeemer.getExUnits().getMem().longValueExact() > 10_000L
+                            && redeemer.getExUnits().getSteps().longValueExact() > 10_000L,
+                    "the evaluator must replace every placeholder budget: " + redeemer.getExUnits());
+        }
         Redeemer mint = create.getWitnessSet().getRedeemers().get(0);
-        assertTrue(mint.getExUnits().getMem().longValueExact() > 10_000L
-                        && mint.getExUnits().getSteps().longValueExact() > 10_000L,
-                "the evaluator must replace the placeholder budget: " + mint.getExUnits());
         assertTrue(create.getBody().getFee().longValueExact() > NO_EVALUATOR_CREATE_FEE,
                 "a real budget costs real lovelace: fee " + create.getBody().getFee()
                         + " must exceed the placeholder-budget fee " + NO_EVALUATOR_CREATE_FEE);
@@ -234,7 +421,7 @@ class LoanFactoryDryEvalTest {
                 understatingEvaluator(createEvalUniverse(), AS_PLACEHOLDER));
 
         LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
-                () -> factory.buildCreate(recipe(PoolFixtures.defaults(), 1, 2)),
+                () -> factory.buildCreateWithUnpublishedPoolManagerScripts(recipe(PoolFixtures.defaults(), 1, 2)),
                 "a transaction still carrying the placeholder budget must not be returned");
         assertTrue(failure.getMessage().contains("EX_UNITS_GATE"),
                 "the refusal must be the ex-units gate, not another gate: " + failure.getMessage());
@@ -255,7 +442,7 @@ class LoanFactoryDryEvalTest {
         LoanFactory factory = factoryWith(baseUniverse(), understatingEvaluator(createEvalUniverse(), HALVED));
 
         LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
-                () -> factory.buildCreate(recipe(PoolFixtures.defaults(), 1, 2)),
+                () -> factory.buildCreateWithUnpublishedPoolManagerScripts(recipe(PoolFixtures.defaults(), 1, 2)),
                 "a transaction declaring half of what it really costs must not be returned");
         assertTrue(failure.getMessage().contains("EX_UNITS_GATE")
                         && failure.getMessage().contains("really costs"),
@@ -287,15 +474,22 @@ class LoanFactoryDryEvalTest {
         LoanFactory factory = factoryWith(baseUniverse(), evaluatorOver(createEvalUniverse()));
         LoanFactory.Recipe recipe = recipe(PoolFixtures.defaults(), 1, 2);
 
-        Transaction wired = factory.buildCreate(recipe);
+        Transaction wired = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
         Transaction unwired = factory.assembleCreateWithoutReferenceScriptWiring(recipe);
 
-        assertTrue(wired.getWitnessSet().getPlutusV3Scripts() == null
-                        || wired.getWitnessSet().getPlutusV3Scripts().isEmpty(),
-                "the submittable create must carry no Plutus script in its witness set");
-        assertEquals(1, unwired.getWitnessSet().getPlutusV3Scripts().size(),
-                "the unwired build must still carry the duplicate witness copy — otherwise this "
-                        + "comparison proves nothing");
+        // T-024: the witness set is no longer empty and must not be asserted empty. The PoolManager
+        // policy legitimately travels there — preview publishes no reference script for it — so the
+        // property that matters is narrower and sharper: pool.pool, the one script that ALSO sits on a
+        // reference input, must not be in the witness set. That is the whole of the Conway rule this
+        // wiring exists to satisfy.
+        assertEquals(List.of(REGISTRY.getPoolManagerPolicyId()), witnessScriptHashes(wired),
+                "the submittable create must witness the PoolManager policy and nothing else — above "
+                        + "all not pool.pool, which travels by reference input");
+        assertEquals(List.of(REGISTRY.getPoolManagerPolicyId(), REGISTRY.getPoolPolicyId()).stream()
+                        .sorted().toList(),
+                witnessScriptHashes(unwired).stream().sorted().toList(),
+                "the unwired build must still carry the duplicate pool.pool witness copy — otherwise "
+                        + "this comparison proves nothing");
 
         int refScriptBytes = REGISTRY.getPoolScript().scriptRefBytes().length;
         assertTrue(refScriptBytes < CONWAY_REF_SCRIPT_TIER_BYTES,
@@ -351,10 +545,11 @@ class LoanFactoryDryEvalTest {
     void borrowAndCancelAlsoPassTheLedgerPreflightGate() {
         LoanFactory.Recipe recipe = recipe(PoolFixtures.defaults(), 1, 2);
         Transaction create = factoryWith(baseUniverse(), evaluatorOver(createEvalUniverse()))
-                .buildCreate(recipe);
+                .buildCreateWithUnpublishedPoolManagerScripts(recipe);
 
         List<Utxo> poolUniverse = new ArrayList<>(baseUniverse());
         poolUniverse.add(poolContinuationOf(create));
+        poolUniverse.add(poolManagerContinuationOf(create));
         poolUniverse.addAll(borrowReferenceScriptUtxos());
         poolUniverse.addAll(cancelReferenceScriptUtxos());
         LoanFactory poolFactory = factoryWith(baseUniverse(), evaluatorOverReferencing(poolUniverse));
@@ -362,10 +557,12 @@ class LoanFactoryDryEvalTest {
         Transaction borrow = poolFactory.buildBorrow(recipe, create);
         Transaction cancel = poolFactory.buildRecoveryCancel(recipe, create);
 
-        for (Transaction tx : List.of(create, borrow, cancel)) {
+        assertEquals(List.of(REGISTRY.getPoolManagerPolicyId()), witnessScriptHashes(create),
+                "the create witnesses only the PoolManager policy, which is on no reference input");
+        for (Transaction tx : List.of(borrow, cancel)) {
             assertTrue(tx.getWitnessSet().getPlutusV3Scripts() == null
                             || tx.getWitnessSet().getPlutusV3Scripts().isEmpty(),
-                    "every submittable transaction must carry an empty Plutus witness set");
+                    "the borrow and the cancel must carry an empty Plutus witness set");
         }
         log.info("ledger-preflight green on create, borrow and cancel; fees {} / {} / {}",
                 create.getBody().getFee(), borrow.getBody().getFee(), cancel.getBody().getFee());
@@ -487,9 +684,23 @@ class LoanFactoryDryEvalTest {
                 .build();
     }
 
+    /**
+     * The PoolManager output the create produced, found by address rather than by a pinned position:
+     * the pool is output 0 by the create builder's proven placement, the PoolManager is not pinned.
+     */
+    private static Utxo poolManagerContinuationOf(Transaction poolTx) {
+        TransactionOutput output = poolTx.getBody().getOutputs().stream()
+                .filter(o -> PoolFixtures.poolManagerAddress().equals(o.getAddress()))
+                .findFirst().orElseThrow(() -> new AssertionError("the create minted no PoolManager"));
+        return continuationAt(poolTx, poolTx.getBody().getOutputs().indexOf(output), output);
+    }
+
     /** Output 0 of a pool-bearing transaction, as a {@link Utxo} the evaluator can resolve. */
     private static Utxo poolContinuationOf(Transaction poolTx) {
-        TransactionOutput output = poolTx.getBody().getOutputs().get(0);
+        return continuationAt(poolTx, 0, poolTx.getBody().getOutputs().get(0));
+    }
+
+    private static Utxo continuationAt(Transaction poolTx, int index, TransactionOutput output) {
         List<Amount> amounts = new ArrayList<>();
         amounts.add(Amount.lovelace(output.getValue().getCoin()));
         for (var multiAsset : output.getValue().getMultiAssets()) {
@@ -498,7 +709,7 @@ class LoanFactoryDryEvalTest {
                         asset.getValue()));
             }
         }
-        return LoanFixtures.utxo(TransactionUtil.getTxHash(poolTx), 0, output.getAddress(), amounts,
+        return LoanFixtures.utxo(TransactionUtil.getTxHash(poolTx), index, output.getAddress(), amounts,
                 output.getInlineDatum() == null ? null : output.getInlineDatum().serializeToHex());
     }
 
@@ -591,7 +802,7 @@ class LoanFactoryDryEvalTest {
         LoanFactory factory = factory(baseUniverse());
         LoanFactory.Recipe recipe = recipe(feeZero, 1, 2);  // a liquidatable price, so only the fee gate can fire
 
-        Transaction create = factory.buildCreate(recipe);
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
         LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
                 () -> factory.buildBorrow(recipe, create),
                 "a fee-0 pool must not yield a returned borrow transaction");
@@ -621,7 +832,7 @@ class LoanFactoryDryEvalTest {
         // A 3,700-slot (≈1h2m) window — wider than the validator's one-hour ceiling, but otherwise honest.
         LoanFactory.Recipe recipe = recipe(params, 1, 2, VALID_FROM_SLOT + 3_700L);
 
-        Transaction create = factory.buildCreate(recipe);
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
         LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
                 () -> factory.buildBorrow(recipe, create),
                 "a borrow the real validators reject must not be returned");
@@ -640,7 +851,7 @@ class LoanFactoryDryEvalTest {
         LoanFactory factory = factory(baseUniverse());
         LoanFactory.Recipe recipe = recipe(params, 1, 1);  // 1 lovelace/unit: the borrower has equity
 
-        Transaction create = factory.buildCreate(recipe);
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
         LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
                 () -> factory.buildBorrow(recipe, create),
                 "a loan that is not born liquidatable must be refused");
@@ -666,7 +877,7 @@ class LoanFactoryDryEvalTest {
         LoanFactory factory = factory(universe);
         LoanFactory.Recipe recipe = recipe(params, 1, 2);
 
-        Transaction create = factory.buildCreate(recipe);
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
         LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
                 () -> factory.buildRecoveryCancel(recipe, create, wrong),
                 "a recovery whose change is not the lender must be refused");
@@ -741,7 +952,10 @@ class LoanFactoryDryEvalTest {
                         REGISTRY.getPoolScript(), REGISTRY.getPoolSpendScript(),
                         REGISTRY.getPoolBorrowActionScript(), REGISTRY.getPoolCancelActionScript(),
                         REGISTRY.getLoanScript(), REGISTRY.getLenderBondScript(),
-                        REGISTRY.getBorrowerBondScript())),
+                        REGISTRY.getBorrowerBondScript(),
+                        // T-024: the cancel resolves these three by reference input too
+                        REGISTRY.getPoolManagerSpendScript(), REGISTRY.getPoolManagerScript(),
+                        REGISTRY.getPmCancelPoolManagerScript())),
                 SlotConfigs.preview());
     }
 
@@ -856,15 +1070,25 @@ class LoanFactoryDryEvalTest {
                 REGISTRY.getLenderBondPolicyId(), REGISTRY.getBorrowerBondPolicyId()));
     }
 
+    /**
+     * The cancel's six reference scripts. The three pool ones carry published preview coordinates; the
+     * three pool-manager ones carry synthesised coordinates, because preview publishes none — the very
+     * fact {@code LoanFactory}'s publication gate refuses to create a pool over. See
+     * {@link PoolFixtures#SYNTHETIC_POOL_MANAGER_REFERENCE_SCRIPTS}.
+     */
     private static List<Utxo> cancelReferenceScriptUtxos() {
-        return referenceScriptUtxos(List.of(REGISTRY.getPoolSpendScriptHash(), REGISTRY.getPoolPolicyId(),
-                REGISTRY.getPoolCancelActionScriptHash()));
+        List<String> hashes = new ArrayList<>(List.of(REGISTRY.getPoolSpendScriptHash(),
+                REGISTRY.getPoolPolicyId(), REGISTRY.getPoolCancelActionScriptHash()));
+        hashes.addAll(PoolFixtures.poolManagerCancelScriptHashes());
+        return referenceScriptUtxos(hashes);
     }
 
     private static List<Utxo> referenceScriptUtxos(List<String> hashes) {
         List<Utxo> utxos = new ArrayList<>();
         for (String hash : hashes) {
-            String coord = PoolFixtures.PUBLISHED_REFERENCE_SCRIPTS.get(hash);
+            String coord = PoolFixtures.PUBLISHED_REFERENCE_SCRIPTS.containsKey(hash)
+                    ? PoolFixtures.PUBLISHED_REFERENCE_SCRIPTS.get(hash)
+                    : PoolFixtures.SYNTHETIC_POOL_MANAGER_REFERENCE_SCRIPTS.get(hash);
             String txHash = coord.substring(0, coord.indexOf('#'));
             int index = Integer.parseInt(coord.substring(coord.indexOf('#') + 1));
             utxos.add(Utxo.builder()
@@ -894,6 +1118,31 @@ class LoanFactoryDryEvalTest {
                         .anyMatch(a -> strip(a.getNameAsHex()).equalsIgnoreCase(assetNameHex)))
                 .findFirst().orElseThrow(() -> new AssertionError("no output at " + address + " holding "
                         + policyId + assetNameHex));
+    }
+
+    /** Every Plutus V3 script hash in the finished witness set, in witness-set order. */
+    private static List<String> witnessScriptHashes(Transaction tx) {
+        if (tx.getWitnessSet() == null || tx.getWitnessSet().getPlutusV3Scripts() == null) {
+            return List.of();
+        }
+        return tx.getWitnessSet().getPlutusV3Scripts().stream()
+                .map(script -> {
+                    try {
+                        return HexUtil.encodeHexString(script.getScriptHash());
+                    } catch (Exception e) {
+                        throw new AssertionError("cannot hash a witness-set script", e);
+                    }
+                })
+                .toList();
+    }
+
+    /** A detached copy of a finished transaction, for surgery that must not touch the original. */
+    private static Transaction deserialise(Transaction tx) {
+        try {
+            return Transaction.deserialize(tx.serialize());
+        } catch (Exception e) {
+            throw new AssertionError("cannot copy the transaction", e);
+        }
     }
 
     private static int sizeOf(Transaction tx) {

@@ -90,8 +90,22 @@ public final class LoanFixtures {
     /** {@code constants.no_oracle_token_asset} — the ASCII "NONE" sentinel, in hex. */
     public static final AssetType NO_ORACLE = new AssetType("4e4f4e45", "4e4f4e45");
 
-    private static final LoansContractRegistry REGISTRY =
-            new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, null);
+    /**
+     * {@code smartTokensSpendScriptHash}, read from the live preview {@code ConfigDatum} (index 0) —
+     * the blueprint ships no {@code smart_tokens} validator, so it cannot be derived. Supplying it is
+     * what unlocks the pool-manager branch of {@link LoansContractRegistry}'s derivation
+     * ({@code poolManagerPolicyId}, {@code poolManagerSpendScriptHash},
+     * {@code pmCancelPoolManagerScriptHash}), without which T-024's PoolManager mint and burn cannot be
+     * expressed at all.
+     * <p>
+     * The same constant appears in {@code application.yaml} and in {@code LoansContractDerivationTest},
+     * which pins the two hashes it unlocks against the live {@code ConfigDatum}. Passing it adds
+     * derivations and moves no existing hash.
+     */
+    public static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
+
+    private static final LoansContractRegistry REGISTRY = new LoansContractRegistry(
+            CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
 
     public static LoansContractRegistry registry() {
         return REGISTRY;

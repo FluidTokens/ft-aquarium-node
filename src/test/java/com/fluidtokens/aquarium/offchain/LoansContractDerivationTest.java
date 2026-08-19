@@ -59,6 +59,15 @@ class LoansContractDerivationTest {
     private static final String POOL_COMPOUND_ACTION = "a5e9ce2d7fa196b9bbbb2aac183a17540e7a5e52bece9ab7b23d7e38";
     private static final String POOL_MANAGER_SPEND = "720deaf94fecfd4ae2ff9510e562cdbfc4f86c17bc41950719b5de32";
     private static final String POOL_MANAGER_POLICY_ID = "b2324fbdcace499f6f1a9599daaebd707eb0ca70edbd6676fa20520b";
+    /**
+     * <b>Not ground truth from the datum</b> — the {@code ConfigDatum} does not publish the pool-manager
+     * <em>action</em> hashes, they are baked into {@code pool_manager.ak}'s parameters instead. It is
+     * pinned <em>transitively</em> and that pin is not weak: {@code poolManagerPolicyId} is derived by
+     * applying this hash (with {@code pmUpdate} and {@code pmCompound}) to {@code pool_manager.poolManager},
+     * and {@link #POOL_MANAGER_POLICY_ID} above <em>is</em> ground truth off the live datum. A wrong value
+     * here cannot produce the right value there.
+     */
+    private static final String PM_CANCEL_POOL_MANAGER = "e1945d090cab66d9ad314ecb8550c13ced6e1f194309d5c937f3426e";
     private static final String LOCKED_BORROWER_MANAGER_SPEND = "b0e010c5d8cf28b20d7dfb14e109d19632c2590b0057e40f6a7433fa";
 
     /**
@@ -142,6 +151,8 @@ class LoansContractDerivationTest {
 
         assertEquals(POOL_MANAGER_POLICY_ID, r.getPoolManagerPolicyId(), "poolManagerPolicyId");
         assertEquals(POOL_MANAGER_SPEND, r.getPoolManagerSpendScriptHash(), "poolManagerSpendScriptHash");
+        assertEquals(PM_CANCEL_POOL_MANAGER, r.getPmCancelPoolManagerScriptHash(),
+                "pmCancelPoolManagerScriptHash — transitively pinned through poolManagerPolicyId");
         assertEquals(LM_COMPOUND_ACTION, r.getLmCompoundActionScriptHash(), "lmCompoundActionScriptHash");
         assertEquals(LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION,
                 r.getLmLiquidatePayInAdvanceAndCompoundActionScriptHash(),
@@ -163,6 +174,8 @@ class LoansContractDerivationTest {
         assertEquals(LENDER_MANAGER_SPEND, r.getLenderManagerSpendScriptHash(), "lenderManagerSpendScriptHash");
 
         assertNull(r.getPoolManagerPolicyId(), "poolManagerPolicyId without smart tokens");
+        assertNull(r.getPmCancelPoolManagerScriptHash(),
+                "pmCancelPoolManagerScriptHash without smart tokens");
         assertNull(r.getLmCompoundActionScriptHash(), "lmCompoundActionScriptHash without smart tokens");
     }
 
@@ -212,6 +225,25 @@ class LoansContractDerivationTest {
         assertScript(r.getPoolCancelActionScript(), POOL_CANCEL_ACTION, "pool/pool_cancel_action");
         assertScript(r.getLenderBondScript(), LENDER_BOND_POLICY_ID, "bond.bond(1)");
         assertScript(r.getBorrowerBondScript(), BORROWER_BOND_POLICY_ID, "bond.bond(0)");
+    }
+
+    /**
+     * The three pool-manager accessors added for T-024 hand out the applied {@code PlutusScript} the
+     * pool-create transaction mints under and the pool-cancel transaction spends, withdraws and burns
+     * with. Same rule as the two tests above: each must hash back to its own derived hash and be
+     * PlutusV3, so an accessor can never serve a plausible-looking wrong validator.
+     * <p>
+     * Two of the three hashes ({@code b2324fbd…}, {@code 720deaf9…}) are ground truth off the live
+     * {@code ConfigDatum}; the third is pinned transitively — see {@link #PM_CANCEL_POOL_MANAGER}.
+     */
+    @Test
+    void everyPoolManagerScriptHashesToItsDerivedHash() {
+        LoansContractRegistry r = registry(SMART_TOKENS_SPEND);
+
+        assertScript(r.getPoolManagerScript(), POOL_MANAGER_POLICY_ID, "pool_manager.poolManager");
+        assertScript(r.getPoolManagerSpendScript(), POOL_MANAGER_SPEND, "pool_manager general_spend");
+        assertScript(r.getPmCancelPoolManagerScript(), PM_CANCEL_POOL_MANAGER,
+                "pool_manager/pm_cancel_pool_manager");
     }
 
     /** The scripts must also come up without smartTokensSpendScriptHash, like the hashes do. */

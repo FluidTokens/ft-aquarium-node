@@ -71,6 +71,19 @@ public final class PoolTxEncoder {
     /** {@code Action.Compound} — constructor 3. */
     public static final int ACTION_COMPOUND = 3;
 
+    // ---- PoolManagerAction alternatives ----------------------------------------------------------
+    //
+    // fluidtokens/types/pool_manager/PoolManagerAction — the enum pool_manager.poolManager's withdraw
+    // handler switches on to pick which pool-manager action withdraw script must be present. A separate
+    // enum from pool.ak's Action above, with its own numbering; pinned by PoolTxEncoderSchemaTest.
+
+    /** {@code PoolManagerAction.CancelPoolManager} — constructor 0. */
+    public static final int PM_ACTION_CANCEL_POOL_MANAGER = 0;
+    /** {@code PoolManagerAction.UpdatePoolManager} — constructor 1. */
+    public static final int PM_ACTION_UPDATE_POOL_MANAGER = 1;
+    /** {@code PoolManagerAction.CompoundLiquidity} — constructor 2. */
+    public static final int PM_ACTION_COMPOUND_LIQUIDITY = 2;
+
     // ---- test-scope models -----------------------------------------------------------------------
 
     /**
@@ -206,6 +219,92 @@ public final class PoolTxEncoder {
                                                              List<String> poolIdHexes) {
         return constr(0, BigIntPlutusData.of(configRefInputIndex),
                 list(poolIdHexes.stream().map(PoolTxEncoder::cancelData).toList()));
+    }
+
+    // ---- PoolManagerDatum / pool_manager.poolManager ---------------------------------------------
+
+    /**
+     * {@code PoolManagerDatum} from {@code lib/fluidtokens/types/pool_manager.ak} — constructor 0, two
+     * fields, in the order pinned by {@link PoolTxEncoderSchemaTest}.
+     *
+     * <h2>{@code compoudingFeePerMille} is spelled that way upstream — do not "fix" it</h2>
+     * The typo is FluidTokens', in {@code lib/fluidtokens/types/pool_manager.ak} at pin {@code ff005fb},
+     * and the component name here mirrors it deliberately so the two can be matched by eye against the
+     * schema oracle. Nothing in the CBOR carries a field name — a {@code Constr} is positional — so the
+     * spelling is a readability contract with the upstream source, never a wire contract.
+     *
+     * <h2>This datum IS validated at mint, unlike {@code PoolDatum}</h2>
+     * {@code pool_manager.ak}'s {@code check_mint} does {@code expect PoolManagerDatum { .. } =
+     * outputDatum} on the PoolManager output, so an ill-typed datum aborts the mint. That is the
+     * opposite of {@code pool.pool}, whose mint never reads the {@code PoolDatum} at all
+     * ({@link PoolCreateDryEvalTest}, consequence B) — so here dry-evaluation really does arbitrate the
+     * datum's shape, and {@link PoolCreateDryEvalTest} proves it with an ill-typed mutant.
+     *
+     * @param poolOwnerAuth          who may cancel or edit the pool through this PoolManager. Read by
+     *                               {@code pm_cancel_pool_manager}'s {@code authorize_action}
+     * @param compoudingFeePerMille  the compounding bot's cut of compounded principal, per mille. It is
+     *                               <b>not</b> the liquidation fee — that one lives in the lender bond's
+     *                               {@code LenderManagerDatum.liquidationFeePerMille} — and nothing on
+     *                               the create or cancel path reads this field
+     */
+    public record PoolManagerDatum(AuthorizationMethod poolOwnerAuth,
+                                   BigInteger compoudingFeePerMille) {
+    }
+
+    /** {@code PoolManagerDatum { poolOwnerAuth, compoudingFeePerMille } } — constructor 0. */
+    public static PlutusData poolManagerDatum(PoolManagerDatum d) {
+        return constr(0,
+                RequestTxEncoder.authorizationMethod(d.poolOwnerAuth()),
+                BigIntPlutusData.of(d.compoudingFeePerMille()));
+    }
+
+    /**
+     * {@code PoolManagerMintRedeemer { configRefInputIndex, poolWithdrawRedeemerIndex } } —
+     * constructor 0.
+     * <p>
+     * {@code poolWithdrawRedeemerIndex} indexes {@code self.redeemers} — the whole
+     * {@code Pairs<ScriptPurpose, Redeemer>} list, not the withdrawals — and must point at the
+     * {@code pool.pool} withdraw entry. {@code pool_manager.ak}'s {@code check_mint} reads it
+     * <b>only</b> inside {@code if length(poolManagerBurntNFTs) > 0}, so on a pure mint (a pool
+     * creation) it is never evaluated; on a burn (a pool cancel) it is load-bearing. Either way it must
+     * be derived from the finished body, never assumed — see
+     * {@link PoolCancelTransactionBuilder#poolWithdrawRedeemerIndexIn}, the single derivation both
+     * builders use.
+     */
+    public static PlutusData poolManagerMintRedeemer(long configRefInputIndex,
+                                                     long poolWithdrawRedeemerIndex) {
+        return constr(0, BigIntPlutusData.of(configRefInputIndex),
+                BigIntPlutusData.of(poolWithdrawRedeemerIndex));
+    }
+
+    /**
+     * {@code PoolManagerWithdrawRedeemer { configRefInputIndex, action } } — constructor 0, where
+     * {@code action} is the fieldless {@code PoolManagerAction} at {@code actionAlternative} (one of the
+     * {@code PM_ACTION_*} constants). This is the redeemer {@code pool_manager.poolManager}'s
+     * {@code withdraw} handler reads to pick which pool-manager action withdraw script must be present.
+     */
+    public static PlutusData poolManagerWithdrawRedeemer(long configRefInputIndex,
+                                                         int actionAlternative) {
+        return constr(0, BigIntPlutusData.of(configRefInputIndex), constr(actionAlternative));
+    }
+
+    /**
+     * {@code CancelPoolManagerActionWithdrawRedeemer { configRefInputIndex, poolWithdrawRedeemerIndex,
+     * poolManagerNFTAssetNames } } — constructor 0.
+     * <p>
+     * {@code poolManagerNFTAssetNames} is positionally aligned with the PoolManager <em>inputs</em>:
+     * {@code pm_cancel_pool_manager} walks them with {@code indexed_all} and reads
+     * {@code safe_list_at(redeemer.poolManagerNFTAssetNames, index)}. Its second field is a second,
+     * independent copy of the same {@code self.redeemers} index the mint redeemer above carries; both
+     * are derived from the finished body separately, never copied from one another.
+     */
+    public static PlutusData cancelPoolManagerActionWithdrawRedeemer(long configRefInputIndex,
+                                                                     long poolWithdrawRedeemerIndex,
+                                                                     List<String> poolManagerNftNameHexes) {
+        return constr(0,
+                BigIntPlutusData.of(configRefInputIndex),
+                BigIntPlutusData.of(poolWithdrawRedeemerIndex),
+                list(poolManagerNftNameHexes.stream().map(PoolTxEncoder::bytes).toList()));
     }
 
     // ---- BondRedeemer ----------------------------------------------------------------------------

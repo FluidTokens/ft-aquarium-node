@@ -17,7 +17,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * <p>
  * The pool types ({@code PoolDatum}, {@code PoolMintRedeemer}, {@code PoolWithdrawRedeemer} and its
  * {@code Action}, {@code BorrowData}, {@code PoolBorrowActionWithdrawRedeemer}, {@code CancelData},
- * {@code PoolCancelActionWithdrawRedeemer}, {@code BondRedeemer}) are all <b>present</b> in the
+ * {@code PoolCancelActionWithdrawRedeemer}, {@code BondRedeemer}) and the pool-manager types
+ * ({@code PoolManagerDatum}, {@code PoolManagerMintRedeemer}, {@code PoolManagerWithdrawRedeemer} and
+ * its {@code PoolManagerAction}, {@code CancelPoolManagerActionWithdrawRedeemer}) are all
+ * <b>present</b> in the
  * {@code aiken build --include-all-types} oracle {@code /loans-v4/loans-v4-alltypes.plutus.json} at
  * pin {@code ff005fb} — the fixture is not stale for any of them, so it is the source of truth for
  * their constructor indices and field order, and nothing here falls back to the deployed blueprint.
@@ -122,6 +125,55 @@ class PoolTxEncoderSchemaTest {
     void poolCancelActionWithdrawRedeemerFieldOrderMatchesTheContract() {
         var redeemer = constructor("fluidtokens/types/pool/PoolCancelActionWithdrawRedeemer", 0);
         assertEquals(List.of("configRefInputIndex", "actionsForEachInput"), fieldTitles(redeemer));
+    }
+
+    // ---- the pool-manager types (T-024) ----------------------------------------------------------
+
+    @Test
+    void poolManagerDatumFieldOrderMatchesTheContract() {
+        var datum = constructor("fluidtokens/types/pool_manager/PoolManagerDatum", 0);
+        var expected = List.of("poolOwnerAuth", "compoudingFeePerMille");
+        assertEquals(expected, fieldTitles(datum),
+                "the upstream typo 'compoudingFeePerMille' is the contract's spelling, not ours");
+        assertEquals(expected.size(), PoolTxEncoder.PoolManagerDatum.class.getRecordComponents().length);
+    }
+
+    @Test
+    void poolManagerMintRedeemerFieldOrderMatchesTheContract() {
+        var mint = constructor("fluidtokens/types/pool_manager/PoolManagerMintRedeemer", 0);
+        assertEquals(List.of("configRefInputIndex", "poolWithdrawRedeemerIndex"), fieldTitles(mint));
+    }
+
+    @Test
+    void poolManagerWithdrawRedeemerFieldOrderMatchesTheContract() {
+        var withdraw = constructor("fluidtokens/types/pool_manager/PoolManagerWithdrawRedeemer", 0);
+        assertEquals(List.of("configRefInputIndex", "action"), fieldTitles(withdraw));
+    }
+
+    /**
+     * The {@code PoolManagerAction} enum's constructor indices — the pins behind {@link PoolTxEncoder}'s
+     * {@code PM_ACTION_*} constants. All three are fieldless, so nothing in the encoded bytes tells them
+     * apart but the constructor tag. It is a <b>different enum from {@code pool.ak}'s {@code Action}</b>
+     * with different numbering, which is exactly why each index is asserted against its own title: 0
+     * means {@code Cancel} on one and {@code CancelPoolManager} on the other, and 2 means
+     * {@code SellLenderPosition} on one and {@code CompoundLiquidity} on the other.
+     */
+    @Test
+    void poolManagerActionConstructorIndicesMatchTheContract() {
+        assertEquals("CancelPoolManager", constructor("fluidtokens/types/pool_manager/PoolManagerAction",
+                PoolTxEncoder.PM_ACTION_CANCEL_POOL_MANAGER).get("title").asText());
+        assertEquals("UpdatePoolManager", constructor("fluidtokens/types/pool_manager/PoolManagerAction",
+                PoolTxEncoder.PM_ACTION_UPDATE_POOL_MANAGER).get("title").asText());
+        assertEquals("CompoundLiquidity", constructor("fluidtokens/types/pool_manager/PoolManagerAction",
+                PoolTxEncoder.PM_ACTION_COMPOUND_LIQUIDITY).get("title").asText());
+    }
+
+    @Test
+    void cancelPoolManagerActionWithdrawRedeemerFieldOrderMatchesTheContract() {
+        var redeemer = constructor(
+                "fluidtokens/types/pool_manager/CancelPoolManagerActionWithdrawRedeemer", 0);
+        assertEquals(List.of("configRefInputIndex", "poolWithdrawRedeemerIndex",
+                "poolManagerNFTAssetNames"), fieldTitles(redeemer));
     }
 
     @Test

@@ -114,6 +114,14 @@ public class LoansContractRegistry {
     // on-chain ConfigDatum. Null when it is absent — the liquidation path does not use them.
     private final String poolManagerPolicyId;
     private final String poolManagerSpendScriptHash;
+    /**
+     * {@code pool_manager/pm_cancel_pool_manager} — the withdraw script that validates burning a
+     * PoolManager NFT alongside its pool. Unlike the two above it is <b>not</b> published in the
+     * {@code ConfigDatum} (the pool-manager action hashes are baked into {@code pool_manager.ak}'s
+     * parameters instead), so nothing cross-checks it on chain and {@code LoansConfigVerifier} must
+     * not grow an expectation for it — the same standing as the LenderManager hashes.
+     */
+    private final String pmCancelPoolManagerScriptHash;
     private final String lmCompoundActionScriptHash;
     private final String lmLiquidatePayInAdvanceAndCompoundActionScriptHash;
 
@@ -207,6 +215,7 @@ public class LoansContractRegistry {
                     "lmLiquidatePayInAdvanceAndCompound hashes will not be derived");
             this.poolManagerPolicyId = null;
             this.poolManagerSpendScriptHash = null;
+            this.pmCancelPoolManagerScriptHash = null;
             this.lmCompoundActionScriptHash = null;
             this.lmLiquidatePayInAdvanceAndCompoundActionScriptHash = null;
         } else {
@@ -219,6 +228,7 @@ public class LoansContractRegistry {
                     mainCfg, name, poolSpend, poolPolicy, smartTokensSpend);
             String pmCompound = derive("pool_manager/pm_compound_liquidity.poolManager",
                     b(lenderManagerWithdrawScriptHash), b(poolPolicyId));
+            this.pmCancelPoolManagerScriptHash = pmCancel;
             this.poolManagerPolicyId = derive("pool_manager.poolManager",
                     mainCfg, name, poolSpend, poolPolicy, b(pmCancel), b(pmUpdate), b(pmCompound));
             this.poolManagerSpendScriptHash = generalSpend(poolManagerPolicyId, configPolicyId);
@@ -266,6 +276,9 @@ public class LoansContractRegistry {
         m.put("lmLiquidateConvertAndCompoundActionScriptHash", lmLiquidateConvertAndCompoundActionScriptHash);
         m.put("poolManagerPolicyId", poolManagerPolicyId);
         m.put("poolManagerSpendScriptHash", poolManagerSpendScriptHash);
+        // Logged and cross-checkable, but deliberately absent from LoansConfigVerifier's expectations:
+        // the ConfigDatum does not publish it (see the field's own javadoc).
+        m.put("pmCancelPoolManagerScriptHash", pmCancelPoolManagerScriptHash);
         m.put("lmCompoundActionScriptHash", lmCompoundActionScriptHash);
         m.put("lmLiquidatePayInAdvanceAndCompoundActionScriptHash", lmLiquidatePayInAdvanceAndCompoundActionScriptHash);
         return m;
@@ -315,13 +328,21 @@ public class LoansContractRegistry {
     // a Cancel spends the request UTxO, so it needs the `general_spend` *wrapper* the UTxO sits at
     // as well as the policy — three script purposes, two distinct scripts.
     //
-    // The last six — `getPoolScript()`, `getPoolSpendScript()`, `getPoolBorrowActionScript()`,
+    // The next six — `getPoolScript()`, `getPoolSpendScript()`, `getPoolBorrowActionScript()`,
     // `getPoolCancelActionScript()`, `getLenderBondScript()`, `getBorrowerBondScript()` — are
     // `src/test`-only too, serving the T-016 S1 pool-origination fixtures. Each delegates to
     // `scriptOf(<existing hash field>)`; none introduces a new derivation or a new field. Pool
     // creation, borrowing and cancelling are not things the node does either — it indexes pools
     // and liquidates loans — so these stay out of every `src/main` code path for the same reason
     // the request accessors do.
+    //
+    // The last three — `getPoolManagerScript()`, `getPoolManagerSpendScript()` and
+    // `getPmCancelPoolManagerScript()` — are `src/test`-only on the same terms, serving T-024: a pool
+    // this factory creates must mint a PoolManager NFT beside its pool NFT, and cancelling it must burn
+    // that NFT in the same transaction (`pool_manager.ak`'s mint pairs the two, and
+    // `pm_cancel_pool_manager.ak` refuses a burn that does not also spend the PoolManager UTxO). Only
+    // `pmCancelPoolManagerScriptHash` is a new field, and it is a hash this constructor already derived
+    // and then discarded — no new derivation.
     //
     // Every one of them is the same applied compiled code the hash above was taken from, so
     // `script.getScriptHash()` is the matching `…ScriptHash`/`…PolicyId` by construction rather
@@ -402,7 +423,43 @@ public class LoansContractRegistry {
         return scriptOf(borrowerBondPolicyId);
     }
 
+    /**
+     * {@code pool_manager.poolManager} — simultaneously the PoolManager minting policy and the
+     * PoolManager withdraw script. Serves the T-024 pool-create transaction, which mints the
+     * PoolManager NFT beside the pool NFT, and the pool-cancel transaction, which burns it.
+     */
+    public PlutusScript getPoolManagerScript() {
+        return scriptOf(poolManagerPolicyId);
+    }
+
+    /**
+     * The PoolManager {@code general_spend} wrapper — the spending validator PoolManager UTxOs sit at.
+     * Serves the T-024 pool-cancel transaction: {@code pm_cancel_pool_manager} requires the PoolManager
+     * UTxO to be <em>spent</em>, not merely read, so the cancel needs the wrapper as well as the policy.
+     */
+    public PlutusScript getPoolManagerSpendScript() {
+        return scriptOf(poolManagerSpendScriptHash);
+    }
+
+    /**
+     * {@code pool_manager/pm_cancel_pool_manager} — the withdraw script that validates the PoolManager
+     * burn. Serves the T-024 pool-cancel transaction, whose {@code pool_manager.poolManager} withdraw
+     * routes its {@code CancelPoolManager} action here.
+     */
+    public PlutusScript getPmCancelPoolManagerScript() {
+        return scriptOf(pmCancelPoolManagerScriptHash);
+    }
+
     private PlutusScript scriptOf(String scriptHash) {
+        // Only the pool-manager family can be null here, and only when smartTokensSpendScriptHash was
+        // absent so its hashes were never derived (see the constructor). Say so, rather than letting
+        // computeIfAbsent throw a bare NullPointerException with nothing in it to act on.
+        if (scriptHash == null) {
+            throw new IllegalStateException("no script hash was derived: "
+                    + "loans.smart-tokens-spend-script-hash is not set, so the pool-manager validators "
+                    + "(pool_manager.poolManager, its general_spend wrapper and pm_cancel_pool_manager) "
+                    + "have no hash and no script");
+        }
         return scriptCache.computeIfAbsent(scriptHash, hash -> {
             String applied = appliedCompiledCode.get(hash);
             if (applied == null) {

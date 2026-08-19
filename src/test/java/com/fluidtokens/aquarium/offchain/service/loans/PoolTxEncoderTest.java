@@ -406,6 +406,106 @@ class PoolTxEncoderTest {
         assertEquals(expected, hex(PoolTxEncoder.poolCancelActionWithdrawRedeemer(3, List.of(idA, idB))));
     }
 
+    // =============================================================================================
+    // Pool-manager pins (hand-derived) — T-024
+    // =============================================================================================
+
+    /**
+     * {@code PoolManagerDatum}, both authorisation shapes and both interesting fee values.
+     * <pre>
+     * d879 9f                                   PoolManagerDatum constr 0
+     *   d879 9f 581c &lt;d3×28&gt; ff                   [0] poolOwnerAuth = CardanoSignature (constr 0)
+     *   00                                        [1] compoudingFeePerMille = 0
+     * ff
+     * </pre>
+     * The second case swaps the authorisation to {@code CardanoWithdrawScript} (constr 2, {@code d87b})
+     * and the fee to 7, so neither field can be a constant the encoder ignores.
+     */
+    @Test
+    void poolManagerDatumEncodesToTheExactPinnedBytes() {
+        assertEquals("d8799f" + "d8799f581c" + "d3".repeat(28) + "ff" + "00" + "ff",
+                hex(PoolTxEncoder.poolManagerDatum(new PoolTxEncoder.PoolManagerDatum(
+                        new AuthorizationMethod.CardanoSignature("d3".repeat(28)), BigInteger.ZERO))));
+
+        assertEquals("d8799f" + "d87b9f581c" + "c4".repeat(28) + "ff" + "07" + "ff",
+                hex(PoolTxEncoder.poolManagerDatum(new PoolTxEncoder.PoolManagerDatum(
+                        new AuthorizationMethod.CardanoWithdrawScript("c4".repeat(28)),
+                        BigInteger.valueOf(7)))));
+    }
+
+    /**
+     * {@code PoolManagerMintRedeemer}'s two fields are <b>both {@code Int}</b> and adjacent, so a
+     * transposition is invisible to the compiler and to any pin taken at a single argument ordering.
+     * Both orderings are therefore pinned, and asserted to differ.
+     */
+    @Test
+    void poolManagerMintRedeemerEncodesToTheExactPinnedBytes() {
+        assertEquals("d8799f0305ff", hex(PoolTxEncoder.poolManagerMintRedeemer(3, 5)));
+        assertEquals("d8799f0503ff", hex(PoolTxEncoder.poolManagerMintRedeemer(5, 3)));
+        assertNotEquals(hex(PoolTxEncoder.poolManagerMintRedeemer(3, 5)),
+                hex(PoolTxEncoder.poolManagerMintRedeemer(5, 3)),
+                "configRefInputIndex and poolWithdrawRedeemerIndex must not encode identically");
+
+        // A two-byte configRefInputIndex (300 = 0x012c), so neither field is width-assumed.
+        assertEquals("d8799f19012c07ff", hex(PoolTxEncoder.poolManagerMintRedeemer(300, 7)));
+    }
+
+    /**
+     * The three {@code PoolManagerAction} alternatives: {@code d879 80} (CancelPoolManager),
+     * {@code d87a 80} (UpdatePoolManager), {@code d87b 80} (CompoundLiquidity).
+     * <p>
+     * <b>Byte-identical to {@code PoolWithdrawRedeemer} at the same numbers</b> — {@code
+     * poolManagerWithdrawRedeemer(0, PM_ACTION_CANCEL_POOL_MANAGER)} and
+     * {@code poolWithdrawRedeemer(0, ACTION_CANCEL)} both produce {@code d8799f00d87980ff}. The two are
+     * told apart only by which script consumes them, which is why the enum's numbering is pinned
+     * separately in {@link PoolTxEncoderSchemaTest}: nothing in these bytes would catch using one
+     * enum's constant on the other's redeemer.
+     */
+    @Test
+    void poolManagerWithdrawRedeemerEncodesEachActionToTheExactPinnedBytes() {
+        assertEquals("d8799f00d87980ff", hex(PoolTxEncoder.poolManagerWithdrawRedeemer(
+                0, PoolTxEncoder.PM_ACTION_CANCEL_POOL_MANAGER)));
+        assertEquals("d8799f05d87a80ff", hex(PoolTxEncoder.poolManagerWithdrawRedeemer(
+                5, PoolTxEncoder.PM_ACTION_UPDATE_POOL_MANAGER)));
+        assertEquals("d8799f07d87b80ff", hex(PoolTxEncoder.poolManagerWithdrawRedeemer(
+                7, PoolTxEncoder.PM_ACTION_COMPOUND_LIQUIDITY)));
+
+        assertEquals(hex(PoolTxEncoder.poolWithdrawRedeemer(0, PoolTxEncoder.ACTION_CANCEL)),
+                hex(PoolTxEncoder.poolManagerWithdrawRedeemer(
+                        0, PoolTxEncoder.PM_ACTION_CANCEL_POOL_MANAGER)),
+                "the collision is real and documented — do not let a future change hide it");
+    }
+
+    /**
+     * {@code CancelPoolManagerActionWithdrawRedeemer}: two adjacent {@code Int}s again (both orderings
+     * pinned), then a {@code List<ByteArray>} of PoolManager NFT names.
+     * <pre>
+     * d879 9f
+     *   03                                        [0] configRefInputIndex        = 3
+     *   05                                        [1] poolWithdrawRedeemerIndex  = 5
+     *   9f 581d &lt;0a a1×28&gt; 581d &lt;0b b2×28&gt; ff      [2] poolManagerNFTAssetNames
+     * ff
+     * </pre>
+     * The names are <b>flat {@code ByteArray}s</b>, not wrapped in a per-element constructor — unlike
+     * {@code PoolCancelActionWithdrawRedeemer}, whose elements are {@code CancelData} constructors
+     * ({@code d8799f581d…ff}). Encoding one like the other is the mistake this pin exists to catch, so
+     * the two are asserted to differ on the same names.
+     */
+    @Test
+    void cancelPoolManagerActionWithdrawRedeemerEncodesToTheExactPinnedBytes() {
+        String nameA = "0a" + "a1".repeat(28);
+        String nameB = "0b" + "b2".repeat(28);
+
+        assertEquals("d8799f03059f581d" + nameA + "581d" + nameB + "ffff",
+                hex(PoolTxEncoder.cancelPoolManagerActionWithdrawRedeemer(3, 5, List.of(nameA, nameB))));
+        assertEquals("d8799f05039f581d" + nameA + "581d" + nameB + "ffff",
+                hex(PoolTxEncoder.cancelPoolManagerActionWithdrawRedeemer(5, 3, List.of(nameA, nameB))));
+
+        assertNotEquals(hex(PoolTxEncoder.poolCancelActionWithdrawRedeemer(3, List.of(nameA, nameB))),
+                hex(PoolTxEncoder.cancelPoolManagerActionWithdrawRedeemer(3, 5, List.of(nameA, nameB))),
+                "the pool-manager names are flat ByteArrays; the pool ids are CancelData constructors");
+    }
+
     @Test
     void bondRedeemerEncodesToTheExactPinnedBytes() {
         // d879 9f 9f <OutputReference ee×32 #0> <OutputReference ab×32 #7> ff ff

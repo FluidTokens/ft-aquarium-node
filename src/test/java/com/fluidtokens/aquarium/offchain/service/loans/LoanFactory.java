@@ -220,6 +220,65 @@ public final class LoanFactory {
      * {@link GateFailure}) on any non-green evaluation.
      */
     public Transaction buildCreate(Recipe recipe) {
+        assertPoolManagerIsReleasable();
+        return buildCreate(recipe, PoolCreateTransactionBuilder.Mutation.none(), true);
+    }
+
+    /** The gate's name, as it appears in every refusal it throws. */
+    private static final String POOL_MANAGER_PUBLICATION_GATE = "POOL_MANAGER_PUBLICATION_GATE";
+
+    /**
+     * The publication gate: <b>never create value you have no code to release.</b>
+     * <p>
+     * Since T-024 a created pool carries a PoolManager NFT, and the only way to get it back is the
+     * cancel transaction {@link PoolCancelTransactionBuilder} builds — which invokes three validators
+     * ({@code general_spend} over the PoolManager, {@code pool_manager.poolManager},
+     * {@code pm_cancel_pool_manager}) that preview publishes no reference script for. A pool created
+     * before they are published is a pool whose PoolManager is stranded: {@code pool_cancel_action}
+     * constrains no mint but its own, so the pool can still be cancelled without burning the
+     * PoolManager, and {@code pm_cancel_pool_manager} then wants a live pool holding the matching NFT
+     * that no longer exists. That is ~2 ADA locked forever, per pool, with no recovery path at any
+     * price.
+     * <p>
+     * So this refuses the whole creation while any of {@link PoolFixtures#poolManagerCancelScriptHashes()}
+     * is missing from {@link PoolFixtures#PUBLISHED_REFERENCE_SCRIPTS}. It fires <em>before</em> anything
+     * is assembled, so no transaction that could be signed is ever produced. It is not silent without an
+     * evaluator, unlike {@link #EX_UNITS_GATE} and {@link #LEDGER_PREFLIGHT_GATE}: those two guard
+     * against a submission failing, this one guards against a submission <em>succeeding</em> and locking
+     * funds, which is worse and is not conditional on how the tool was constructed.
+     *
+     * @see #buildCreateWithUnpublishedPoolManagerScripts for the offline-shape seam that bypasses it
+     */
+    private void assertPoolManagerIsReleasable() {
+        List<String> unpublished = PoolFixtures.unpublishedPoolManagerScripts();
+        if (!unpublished.isEmpty()) {
+            throw new GateFailure(POOL_MANAGER_PUBLICATION_GATE + ": a created pool carries a PoolManager "
+                    + "NFT that only the pool-cancel transaction can burn, and " + unpublished.size()
+                    + " of the validators it needs have no published preview reference script: "
+                    + unpublished + ". Creating the pool now would strand the PoolManager permanently. "
+                    + "Publish a reference-script UTxO for each, add its coordinate to "
+                    + "PoolFixtures.PUBLISHED_REFERENCE_SCRIPTS, and this gate falls silent.");
+        }
+    }
+
+    /**
+     * As {@link #buildCreate}, but with {@link #assertPoolManagerIsReleasable} bypassed and every other
+     * gate still running — the seam the offline rig uses to exercise the create → borrow → cancel
+     * pipeline against the real validators while the pool-manager reference scripts remain unpublished.
+     *
+     * <h2>What it does and does not license</h2>
+     * It proves the transaction <b>shape</b>: the dry-eval, ex-units, ledger-preflight, fee-100,
+     * born-liquidatable and recovery-destination gates all still run, against the real deployed
+     * validators. It licenses <b>nothing</b> about submission — the cancel that would release the
+     * PoolManager reads reference inputs that hold no UTxO on preview, so it would be rejected before any
+     * script ran, and a pool created from this seam would be exactly the stranded pool the gate exists to
+     * prevent.
+     * <p>
+     * Package-private, with no production caller and none of the on-chain runners using it: both
+     * {@code LoanFactoryOnChainRunnerTest} and {@code LoanFactoryRunnerTest} call {@link #buildCreate} and
+     * will now be refused by name, which is the intended behaviour and not a regression.
+     */
+    Transaction buildCreateWithUnpublishedPoolManagerScripts(Recipe recipe) {
         return buildCreate(recipe, PoolCreateTransactionBuilder.Mutation.none(), true);
     }
 
@@ -255,14 +314,71 @@ public final class LoanFactory {
                 poolAddress(),
                 poolAssetName(recipe),
                 PoolTxEncoder.poolDatum(poolDatum(recipe)),
-                recipe.params().poolLiquidityLovelace());
+                recipe.params().poolLiquidityLovelace(),
+                poolManagerAddress(),
+                PoolTxEncoder.poolManagerDatum(poolManagerDatum(recipe)),
+                PoolFixtures.POOL_MANAGER_LOVELACE);
 
         Transaction tx = poolCreateBuilder.build(request, mutation);
         if (gate) {
             dryEval(tx, universeOf(tx, utxoSupplier, List.of(recipe.poolPolicyRefScriptUtxo())),
                     createExtraScripts());
+            return assertPoolIdsAgree(recipe, tx);
         }
         return tx;
+    }
+
+    /** The gate's name, as it appears in every refusal it throws. */
+    private static final String POOL_ID_GATE = "POOL_ID_GATE";
+
+    /**
+     * The pool-id consistency gate, read off the finished body.
+     * <p>
+     * The lender bond's {@code LenderManagerDatum.poolId} is what a compounding bot follows back to a
+     * PoolManager (README item 5: <em>"the field poolId must be set as the NFT AssetName of the newly
+     * created PoolManager"</em>). This factory has always set it to the <em>pool</em> NFT's name — which
+     * was an <b>advertisement for a PoolManager that was never minted</b> until T-024, and is correct now
+     * only because {@code pool_manager.ak:173} forces the two names equal at mint.
+     * <p>
+     * "Correct because a validator forces it" is a reason to assert it, not a reason to assume it: this
+     * reads the two minted names off the body and refuses unless they agree with each other and with the
+     * name the bond datum will carry. Return-consuming, so the call site cannot be deleted without a
+     * compile error.
+     * <p>
+     * <b>Package-private so its refusing branches can be pinned.</b> Through {@link #buildCreate} they
+     * are unreachable — the validator forces the names equal and the builder writes the advertised one —
+     * so neutering the body would change nothing observable and the gate would be unproven.
+     * {@code LoanFactoryDryEvalTest} calls it directly with a body whose names disagree.
+     */
+    Transaction assertPoolIdsAgree(Recipe recipe, Transaction tx) {
+        String advertised = poolAssetName(recipe);
+        String mintedPool = soleMintedName(tx, registry.getPoolPolicyId(), "the pool policy");
+        String mintedPoolManager =
+                soleMintedName(tx, registry.getPoolManagerPolicyId(), "the PoolManager policy");
+        if (!mintedPool.equalsIgnoreCase(mintedPoolManager)) {
+            throw new GateFailure(POOL_ID_GATE + ": the pool NFT is named " + mintedPool
+                    + " but the PoolManager NFT is named " + mintedPoolManager
+                    + " — pool_manager.ak requires them equal");
+        }
+        if (!mintedPool.equalsIgnoreCase(advertised)) {
+            throw new GateFailure(POOL_ID_GATE + ": the lender bond datum advertises poolId " + advertised
+                    + " but the transaction mints " + mintedPool);
+        }
+        return tx;
+    }
+
+    /** The one asset name minted under {@code policyId} in the finished body, refusing anything else. */
+    private static String soleMintedName(Transaction tx, String policyId, String what) {
+        List<Asset> assets = tx.getBody().getMint() == null ? List.of()
+                : tx.getBody().getMint().stream()
+                .filter(ma -> ma.getPolicyId().equalsIgnoreCase(policyId))
+                .flatMap(ma -> ma.getAssets().stream())
+                .toList();
+        if (assets.size() != 1) {
+            throw new GateFailure(POOL_ID_GATE + ": " + what + " mints " + assets.size()
+                    + " asset name(s), expected exactly one");
+        }
+        return strip(assets.get(0).getNameAsHex());
     }
 
     // ---- borrow -----------------------------------------------------------------------------------
@@ -339,9 +455,11 @@ public final class LoanFactory {
      */
     Transaction buildRecoveryCancel(Recipe recipe, Transaction poolTx, Address changeSigner) {
         Utxo poolUtxo = poolOutputZero(recipe, poolTx);
+        Utxo poolManagerUtxo = poolManagerOutput(recipe, poolTx);
 
         PoolCancelTransactionBuilder.Request request = new PoolCancelTransactionBuilder.Request(
                 poolUtxo,
+                poolManagerUtxo,
                 recipe.funderUtxo(),
                 recipe.configUtxo(),
                 recipe.cancelReferenceScriptUtxos(),
@@ -349,11 +467,30 @@ public final class LoanFactory {
                 lenderKeyHash(recipe),
                 poolAssetName(recipe));
 
-        Transaction tx = cancelBuilder(poolUtxo).build(request);
-        dryEval(tx, universeOf(tx, resolving(poolUtxo), recipe.cancelReferenceScriptUtxos()),
-                cancelExtraScripts());
+        Transaction tx = cancelBuilder(poolUtxo, poolManagerUtxo).build(request);
+        dryEval(tx, universeOf(tx, resolving(poolUtxo, poolManagerUtxo),
+                recipe.cancelReferenceScriptUtxos()), cancelExtraScripts());
         assertRecoveryReturnsToLender(recipe, tx);
         return tx;
+    }
+
+    /**
+     * Resolves the PoolManager UTxO out of a pool-bearing transaction, by <b>searching</b> for the
+     * output at the PoolManager address holding the matching NFT rather than assuming a position. The
+     * pool is output 0 by the create builder's proven placement; the PoolManager has no such pin, and
+     * inventing one would be a claim this slice has not earned.
+     */
+    private Utxo poolManagerOutput(Recipe recipe, Transaction poolTx) {
+        TransactionOutput output = findOutput(poolTx, poolManagerAddress(),
+                registry.getPoolManagerPolicyId(), poolAssetName(recipe), "the created PoolManager");
+        int index = poolTx.getBody().getOutputs().indexOf(output);
+        Utxo utxo = new Utxo();
+        utxo.setTxHash(TransactionUtil.getTxHash(poolTx));
+        utxo.setOutputIndex(index);
+        utxo.setAddress(output.getAddress());
+        utxo.setAmount(amountsOf(output));
+        utxo.setInlineDatum(output.getInlineDatum() == null ? null : output.getInlineDatum().serializeToHex());
+        return utxo;
     }
 
     // ---- gates ------------------------------------------------------------------------------------
@@ -625,20 +762,22 @@ public final class LoanFactory {
                 protocolParamsSupplier, txEvaluator);
     }
 
-    private PoolCancelTransactionBuilder cancelBuilder(Utxo poolUtxo) {
-        return new PoolCancelTransactionBuilder(registry, network, resolving(poolUtxo),
+    private PoolCancelTransactionBuilder cancelBuilder(Utxo... produced) {
+        return new PoolCancelTransactionBuilder(registry, network, resolving(produced),
                 protocolParamsSupplier, txEvaluator);
     }
 
     /**
-     * The construction supplier, wrapped so it also resolves {@code poolUtxo} — the pool continuation
-     * this pipeline produced, which cannot be in the construction supplier because it does not exist
-     * until create is built. {@code PoolCancelTransactionBuilder} resolves every input's address through
-     * {@code getTxOutput} in its structural checks, so the cancel needs the pool UTxO resolvable there;
-     * coin selection ({@code getPage}) is delegated unchanged, as the pool output sits at the pool
-     * credential and is never coin-selected.
+     * The construction supplier, wrapped so it also resolves the outputs this pipeline just produced —
+     * the pool continuation and, since T-024, the PoolManager — which cannot be in the construction
+     * supplier because they do not exist until create is built.
+     * {@code PoolCancelTransactionBuilder} resolves every input's address through
+     * {@code getTxOutput} in its structural checks, so the cancel needs both resolvable there;
+     * coin selection ({@code getPage}) is delegated unchanged, as neither output sits at an address the
+     * funder coin-selects from.
      */
-    private UtxoSupplier resolving(Utxo poolUtxo) {
+    private UtxoSupplier resolving(Utxo... produced) {
+        List<Utxo> extra = List.of(produced);
         return new UtxoSupplier() {
             @Override
             public List<Utxo> getPage(String address, Integer nrOfItems, Integer page, OrderEnum order) {
@@ -647,8 +786,10 @@ public final class LoanFactory {
 
             @Override
             public Optional<Utxo> getTxOutput(String txHash, int outputIndex) {
-                if (poolUtxo.getTxHash().equals(txHash) && poolUtxo.getOutputIndex() == outputIndex) {
-                    return Optional.of(poolUtxo);
+                for (Utxo utxo : extra) {
+                    if (utxo.getTxHash().equals(txHash) && utxo.getOutputIndex() == outputIndex) {
+                        return Optional.of(utxo);
+                    }
                 }
                 return utxoSupplier.getTxOutput(txHash, outputIndex);
             }
@@ -681,9 +822,34 @@ public final class LoanFactory {
                 new TransactionInput(recipe.seedUtxo().getTxHash(), recipe.seedUtxo().getOutputIndex()));
     }
 
-    /** {@code lenderAuth = CardanoSignature(lenderKeyHash)} — the pool datum's authorisation. */
-    private AuthorizationMethod lenderAuth(Recipe recipe) {
-        return new AuthorizationMethod.CardanoSignature(HexUtil.encodeHexString(lenderKeyHash(recipe)));
+    /**
+     * {@code lenderAuth = CardanoWithdrawScript(poolManagerPolicyId)} — the pool datum's authorisation,
+     * delegated to the PoolManager withdraw script per FluidTokens' convention (README:60). It used to be
+     * {@code CardanoSignature(lenderKeyHash)}; the lender's key still authorises, one level in, as the
+     * {@code PoolManagerDatum.poolOwnerAuth} of {@link #poolManagerDatum()}.
+     */
+    private AuthorizationMethod lenderAuth() {
+        return new AuthorizationMethod.CardanoWithdrawScript(registry.getPoolManagerPolicyId());
+    }
+
+    /**
+     * The {@code PoolManagerDatum} the created PoolManager output carries: the recipe's lender as
+     * {@code poolOwnerAuth}, and {@link PoolFixtures#COMPOUNDING_FEE_PER_MILLE} as the compounding fee.
+     * <p>
+     * That fee is <b>not</b> the liquidation fee: {@code liquidationFeePerMille} lives in the lender bond
+     * and is what {@link #assertEmittedBondFeeIs100} gates at 100. Nothing on the create or cancel path
+     * reads this one.
+     */
+    private PoolTxEncoder.PoolManagerDatum poolManagerDatum(Recipe recipe) {
+        return new PoolTxEncoder.PoolManagerDatum(
+                new AuthorizationMethod.CardanoSignature(
+                        HexUtil.encodeHexString(lenderKeyHash(recipe))),
+                BigInteger.valueOf(PoolFixtures.COMPOUNDING_FEE_PER_MILLE));
+    }
+
+    private String poolManagerAddress() {
+        return AddressProvider.getEntAddress(
+                Credential.fromScript(registry.getPoolManagerSpendScriptHash()), network).getAddress();
     }
 
     /** The lender-bond template datum, at the recipe's fee and with this pool's NFT name as its poolId. */
@@ -694,7 +860,7 @@ public final class LoanFactory {
     }
 
     private PoolTxEncoder.PoolDatum poolDatum(Recipe recipe) {
-        return PoolFixtures.poolDatum(recipe.params(), lenderAuth(recipe), lenderBondAddress(),
+        return PoolFixtures.poolDatum(recipe.params(), lenderAuth(), lenderBondAddress(),
                 PoolFixtures.bondInlineDatumHash(bondDatum(recipe)));
     }
 
@@ -798,15 +964,22 @@ public final class LoanFactory {
         return List.of(registry.getPoolScript());
     }
 
+    /**
+     * The PoolManager policy is deliberately absent from {@link #createExtraScripts}: it travels in the
+     * create transaction's <b>witness set</b> (see {@link PoolCreateTransactionBuilder}), so the
+     * evaluator already has its bytes and a {@code ScriptSupplier} entry would be dead weight — and,
+     * worse, would hide a regression in which the witness copy went missing.
+     */
+    private List<PlutusScript> cancelExtraScripts() {
+        return List.of(registry.getPoolSpendScript(), registry.getPoolScript(),
+                registry.getPoolCancelActionScript(), registry.getPoolManagerSpendScript(),
+                registry.getPoolManagerScript(), registry.getPmCancelPoolManagerScript());
+    }
+
     private List<PlutusScript> borrowExtraScripts() {
         return List.of(registry.getPoolScript(), registry.getPoolSpendScript(),
                 registry.getPoolBorrowActionScript(), registry.getLoanScript(),
                 registry.getLenderBondScript(), registry.getBorrowerBondScript());
-    }
-
-    private List<PlutusScript> cancelExtraScripts() {
-        return List.of(registry.getPoolSpendScript(), registry.getPoolScript(),
-                registry.getPoolCancelActionScript());
     }
 
     // ---- helpers ----------------------------------------------------------------------------------

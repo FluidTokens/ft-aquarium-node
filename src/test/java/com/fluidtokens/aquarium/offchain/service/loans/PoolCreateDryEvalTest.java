@@ -1,9 +1,17 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.address.AddressProvider;
+import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusData;
+import com.bloxbean.cardano.client.plutus.spec.Redeemer;
+import com.bloxbean.cardano.client.plutus.spec.ExUnits;
 import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
+import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
 import com.bloxbean.cardano.client.transaction.spec.Asset;
 import com.bloxbean.cardano.client.transaction.spec.MultiAsset;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
@@ -18,8 +26,10 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -101,25 +111,28 @@ class PoolCreateDryEvalTest {
         List<EvaluationResult> results =
                 EvalFixtures.evaluate(tx, resolvable(universe), REGISTRY, POOL_POLICY);
 
-        assertEquals(1, results.size(), "exactly one script runs: the pool minting policy");
-        assertEquals(RedeemerTag.Mint, results.get(0).getRedeemerTag());
-        log.info("Pool create mint ex-units: mem={} steps={}",
-                results.get(0).getExUnits().getMem(), results.get(0).getExUnits().getSteps());
+        assertEquals(2, results.size(),
+                "two scripts run: the pool minting policy and the PoolManager minting policy");
+        for (EvaluationResult r : results) {
+            assertEquals(RedeemerTag.Mint, r.getRedeemerTag());
+            log.info("Pool create mint ex-units: index={} mem={} steps={}",
+                    r.getIndex(), r.getExUnits().getMem(), r.getExUnits().getSteps());
+        }
 
         Transaction onChain = roundTrip(tx);
 
         // --- the mint field ---
         List<MultiAsset> mint = onChain.getBody().getMint();
-        assertEquals(1, mint.size(), "one policy in the mint field");
-        assertEquals(REGISTRY.getPoolPolicyId(), mint.get(0).getPolicyId());
-        assertEquals(1, mint.get(0).getAssets().size(), "one asset name under the pool policy");
-        Asset minted = mint.get(0).getAssets().get(0);
-        assertEquals(BigInteger.ONE, minted.getValue(), "an NFT is minted, not burnt or doubled");
-        String mintedName = strip(minted.getNameAsHex());
+        assertEquals(2, mint.size(), "two policies in the mint field: the pool and the PoolManager");
+        String mintedName = soleMintedName(onChain, REGISTRY.getPoolPolicyId());
         assertEquals(PoolFixtures.poolAssetName(), mintedName);
         assertEquals(29, mintedName.length() / 2,
                 "the pool NFT asset name is 29 bytes: 1-byte index prefix + 28-byte hash");
         assertEquals("00", mintedName.substring(0, 2), "the index prefix of the only minted token");
+
+        // --- the PoolManager NFT: same name, same quantity (pool_manager.ak:173) ---
+        assertEquals(mintedName, soleMintedName(onChain, REGISTRY.getPoolManagerPolicyId()),
+                "the PoolManager NFT must carry the pool NFT's own asset name");
 
         // --- the seed really is spent ---
         assertTrue(onChain.getBody().getInputs().contains(PoolFixtures.seed()),
@@ -136,12 +149,90 @@ class PoolCreateDryEvalTest {
                 "exactly one policy beside lovelace: the pool NFT");
         assertEquals(BigInteger.ONE, quantityOf(poolOutput, REGISTRY.getPoolPolicyId(), mintedName));
 
+        // --- the PoolManager output ---
+        List<TransactionOutput> atPoolManagerAddress = onChain.getBody().getOutputs().stream()
+                .filter(output -> PoolFixtures.poolManagerAddress().equals(output.getAddress()))
+                .toList();
+        assertEquals(1, atPoolManagerAddress.size(),
+                "exactly one output at the PoolManager spend address");
+        TransactionOutput poolManagerOutput = atPoolManagerAddress.get(0);
+        assertEquals(1, poolManagerOutput.getValue().getMultiAssets().size(),
+                "exactly one policy beside lovelace: the PoolManager NFT");
+        assertEquals(BigInteger.ONE,
+                quantityOf(poolManagerOutput, REGISTRY.getPoolManagerPolicyId(), mintedName));
+        assertEquals(HexUtil.encodeHexString(serialise(
+                        PoolTxEncoder.poolManagerDatum(PoolFixtures.poolManagerDatum()))),
+                poolManagerOutput.getInlineDatum().serializeToHex(),
+                "the PoolManager output carries the factory PoolManagerDatum, unchanged through CBOR");
+
         // --- the reference inputs: config + published pool-policy ref script ---
         assertEquals(2, onChain.getBody().getReferenceInputs().size(),
                 "two reference inputs: the config and the pool-policy reference script");
         assertTrue(onChain.getBody().getReferenceInputs()
                         .contains(new TransactionInput(RequestFixtures.TX_CONFIG, 0)),
                 "the config reference input must be present");
+    }
+
+    /**
+     * The two policies travel by different routes, and each route is asserted rather than assumed:
+     * {@code pool.pool} by reference input with its witness copy stripped, and
+     * {@code pool_manager.poolManager} in the witness set, because preview publishes no reference script
+     * for it. The witness set therefore holds <b>exactly one</b> script, and it is the PoolManager's.
+     * <p>
+     * This is what keeps the create transaction free of Conway's {@code ExtraneousScriptWitnessesUTXOW}:
+     * no script travels both ways. {@code LoanFactory}'s {@code LEDGER_PREFLIGHT} gate checks the same
+     * property over the resolved universe; this checks it over the artefact.
+     */
+    @Test
+    void thePoolPolicyTravelsByReferenceAndThePoolManagerPolicyInTheWitnessSet() {
+        Transaction onChain = roundTrip(build());
+        List<com.bloxbean.cardano.client.plutus.spec.PlutusScript> witnessed =
+                onChain.getWitnessSet().getPlutusV3Scripts() == null ? List.of()
+                        : List.copyOf(onChain.getWitnessSet().getPlutusV3Scripts());
+
+        assertEquals(1, witnessed.size(),
+                "only the PoolManager policy travels in the witness set");
+        assertEquals(REGISTRY.getPoolManagerPolicyId(),
+                HexUtil.encodeHexString(scriptHash(witnessed.get(0))),
+                "the witnessed script must be pool_manager.poolManager, not the pool policy");
+    }
+
+    /**
+     * <b>Inverse-polarity mutant.</b> The PoolManager mint redeemer's {@code poolWithdrawRedeemerIndex}
+     * is set to a wild value, and the transaction must still evaluate <b>green</b>.
+     * <p>
+     * That is the only honest evidence for the claim {@link PoolCreateTransactionBuilder} makes about
+     * the field: {@code pool_manager.ak}'s {@code check_mint} reads it only inside
+     * {@code if length(poolManagerBurntNFTs) > 0}, and a creation burns nothing, so neither the
+     * {@code safe_list_at} nor its {@code expect index >= 0} is ever evaluated. A refusal-based mutant
+     * cannot prove inertness — an index nobody reads has no refusal to produce — so the assertion runs
+     * the other way: break it as hard as possible and watch nothing happen. {@code 9999} would be out of
+     * range for any redeemer list this transaction could have, so if the guard ever did open, this would
+     * abort.
+     */
+    @Test
+    void thePoolManagerMintRedeemersPoolWithdrawIndexIsUnreadOnCreate() {
+        Transaction mutated = roundTrip(build());
+        Redeemer poolManagerMint = mutated.getWitnessSet().getRedeemers().stream()
+                .filter(r -> r.getTag() == RedeemerTag.Mint)
+                .filter(r -> r.getIndex().intValueExact() == poolManagerMintIndex(mutated))
+                .findFirst().orElseThrow(() -> new AssertionError("no PoolManager mint redeemer"));
+        List<PlutusData> fields = ((ConstrPlutusData) poolManagerMint.getData()).getData()
+                .getPlutusDataList();
+        assertEquals(BigInteger.ZERO, ((BigIntPlutusData) fields.get(1)).getValue(),
+                "the builder encodes 0 there — if that changed, this mutant is testing the wrong thing");
+        fields.set(1, BigIntPlutusData.of(9999));
+
+        Transaction reserialised = reserialise(mutated);
+        assertNotEquals(HexUtil.encodeHexString(serialiseTx(build())),
+                HexUtil.encodeHexString(serialiseTx(reserialised)),
+                "the mutation must really change the transaction bytes");
+
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(reserialised,
+                resolvable(PoolFixtures.universe(FUNDER)), REGISTRY, POOL_POLICY);
+        assertTrue(outcome.successful(),
+                "poolWithdrawRedeemerIndex is unread on the create path, so a wild value must still "
+                        + "evaluate green; got: " + outcome.detail());
     }
 
     /**
@@ -185,8 +276,9 @@ class PoolCreateDryEvalTest {
                 "the mutation's inputRef must really be absent from the inputs");
 
         String consistentName = "00" + RequestFixtures.hashOutputRef(unspent);
-        Transaction mutated = builder().buildWith(request(), unspent, consistentName,
-                PoolFixtures.poolAddress());
+        Transaction mutated = builder().buildWith(request(),
+                PoolCreateTransactionBuilder.Overrides.pool(unspent, consistentName,
+                        PoolFixtures.poolAddress()));
         assertRefusedByTheMint(mutated, "an inputRef the transaction does not spend");
     }
 
@@ -194,8 +286,9 @@ class PoolCreateDryEvalTest {
     @Test
     void aWrongIndexPrefixIsRejectedByThePoolPolicy() {
         String wrongName = "01" + RequestFixtures.hashOutputRef(PoolFixtures.seed());
-        Transaction mutated = builder().buildWith(request(), PoolFixtures.seed(), wrongName,
-                PoolFixtures.poolAddress());
+        Transaction mutated = builder().buildWith(request(),
+                PoolCreateTransactionBuilder.Overrides.pool(PoolFixtures.seed(), wrongName,
+                        PoolFixtures.poolAddress()));
         assertRefusedByTheMint(mutated, "a 0x01 index prefix on the only minted token");
     }
 
@@ -207,16 +300,18 @@ class PoolCreateDryEvalTest {
         assertFalse(wrongName.equals(PoolFixtures.poolAssetName()),
                 "the mutation must really change the name, or it proves nothing");
 
-        Transaction mutated = builder().buildWith(request(), PoolFixtures.seed(), wrongName,
-                PoolFixtures.poolAddress());
+        Transaction mutated = builder().buildWith(request(),
+                PoolCreateTransactionBuilder.Overrides.pool(PoolFixtures.seed(), wrongName,
+                        PoolFixtures.poolAddress()));
         assertRefusedByTheMint(mutated, "a token named after the wrong output reference");
     }
 
     /** M4 — the pool output is paid to the funder's own address, not the pool spend credential. */
     @Test
     void aPoolOutputPaidToTheWrongAddressIsRejectedByThePoolPolicy() {
-        Transaction mutated = builder().buildWith(request(), PoolFixtures.seed(),
-                PoolFixtures.poolAssetName(), FUNDER);
+        Transaction mutated = builder().buildWith(request(),
+                PoolCreateTransactionBuilder.Overrides.pool(PoolFixtures.seed(),
+                        PoolFixtures.poolAssetName(), FUNDER));
         assertRefusedByTheMint(mutated, "a pool output that is not at the pool spend credential");
     }
 
@@ -255,7 +350,10 @@ class PoolCreateDryEvalTest {
                 PoolFixtures.seedUtxo(FUNDER), configWithoutNft, PoolFixtures.poolPolicyRefScriptUtxo(),
                 FUNDER, PoolFixtures.poolAddress(), PoolFixtures.poolAssetName(),
                 PoolTxEncoder.poolDatum(PoolFixtures.factoryPoolDatum(PoolFixtures.defaults())),
-                POOL_LOVELACE);
+                POOL_LOVELACE,
+                PoolFixtures.poolManagerAddress(),
+                PoolTxEncoder.poolManagerDatum(PoolFixtures.poolManagerDatum()),
+                PoolFixtures.POOL_MANAGER_LOVELACE);
 
         List<Utxo> universe = new ArrayList<>(List.of(configWithoutNft,
                 PoolFixtures.seedUtxo(FUNDER), PoolFixtures.poolPolicyRefScriptUtxo()));
@@ -263,9 +361,164 @@ class PoolCreateDryEvalTest {
         assertRefusedByTheMint(mutated, universe, "a config reference input with no config NFT");
     }
 
+    /**
+     * The other half of the unread claim: {@link PoolCreateTransactionBuilder}'s guard <b>refuses</b> a
+     * body that does carry a {@code pool.pool} withdraw redeemer.
+     * <p>
+     * The test above proves the index is inert on every transaction the builder emits. That is exactly
+     * why the guard's refusing branch is unreachable through {@code build()} — and an unreachable branch
+     * is an unproven one: neutering its body would leave every other test in this class green. So the
+     * guard is called here directly, on a body doctored to carry the withdrawal and redeemer a pool
+     * creation never has. If a future change ever gives the create a {@code pool.pool} withdrawal, the
+     * encoded {@code 0} stops being safe and the guard is what says so.
+     */
+    @Test
+    void theUnreadClaimRefusesABodyCarryingAPoolWithdrawRedeemer() {
+        Transaction honest = roundTrip(build());
+        assertDoesNotThrow(() -> builder().assertPoolWithdrawRedeemerIsUnread(honest),
+                "the honest create must pass its own guard");
+
+        Transaction doctored = roundTrip(build());
+        String poolPolicyRewardAddress = AddressProvider.getRewardAddress(
+                Credential.fromScript(REGISTRY.getPoolPolicyId()), LoanFixtures.NETWORK).getAddress();
+        doctored.getBody().setWithdrawals(new ArrayList<>(List.of(
+                new Withdrawal(poolPolicyRewardAddress, BigInteger.ZERO))));
+        doctored.getWitnessSet().getRedeemers().add(Redeemer.builder()
+                .tag(RedeemerTag.Reward)
+                .index(BigInteger.ZERO)
+                .data(PoolTxEncoder.poolWithdrawRedeemer(0, PoolTxEncoder.ACTION_CANCEL))
+                .exUnits(ExUnits.builder()
+                        .mem(BigInteger.valueOf(10_000)).steps(BigInteger.valueOf(10_000)).build())
+                .build());
+
+        IllegalStateException refusal = assertThrows(IllegalStateException.class,
+                () -> builder().assertPoolWithdrawRedeemerIsUnread(doctored),
+                "a create carrying a pool.pool withdraw redeemer must be refused");
+        assertTrue(refusal.getMessage().contains("no longer unread"),
+                "the refusal must name the claim it defends: " + refusal.getMessage());
+        log.info("unread-claim guard refusal: {}", refusal.getMessage());
+    }
+
+    // ======================================================================================
+    // Falsifiability — the PoolManager mint (T-024), refused by the PoolManager policy
+    // ======================================================================================
+
+    /**
+     * M7 — the PoolManager NFT is minted under a name that is not the pool NFT's.
+     * {@code pool_manager.ak:173} compares the two minted-token lists with {@code Pairs} equality, so
+     * {@code poolManagerMintedNFTs == poolMintedNFTs} is false the moment the names differ. The pool
+     * mint itself is untouched and still correct, so this isolates the PoolManager policy.
+     * <p>
+     * The name used is a well-formed 29-byte, {@code 0x00}-prefixed name — not obviously junk — so the
+     * refusal is the equality failing, not a length or prefix check somewhere else.
+     */
+    @Test
+    void aPoolManagerNftUnderTheWrongNameIsRejectedByThePoolManagerPolicy() {
+        String wrongName = "00" + "8e".repeat(28);
+        assertNotEquals(PoolFixtures.poolAssetName(), wrongName, "the mutation must change the name");
+        Transaction mutated = builder().buildWith(request(),
+                PoolCreateTransactionBuilder.Overrides.poolManagerAssetName(wrongName));
+        assertRefusedByThePoolManagerMint(mutated, "a PoolManager NFT named differently from the pool NFT");
+    }
+
+    /**
+     * M8 — the PoolManager output is paid to the funder's own address instead of
+     * {@code Script(poolManagerSpendScriptHash)}. {@code check_mint}'s {@code correctAddress} conjunct
+     * refuses it.
+     * <p>
+     * This is the mutation that falsifies the <b>stale comment</b> at {@code pool_manager.ak:166}
+     * — <em>"we don't check the destination of the minted NFTs"</em>. The code at lines 121-127 does
+     * check it, and this proves the code rather than the comment is what runs.
+     */
+    @Test
+    void aPoolManagerOutputPaidToTheWrongAddressIsRejectedByThePoolManagerPolicy() {
+        Transaction mutated = builder().buildWith(request(),
+                PoolCreateTransactionBuilder.Overrides.poolManagerAddress(FUNDER));
+        assertRefusedByThePoolManagerMint(mutated,
+                "a PoolManager output that is not at the PoolManager spend credential");
+    }
+
+    /**
+     * M9 — the PoolManager output's inline datum is not a {@code PoolManagerDatum}.
+     * {@code check_mint} does {@code expect PoolManagerDatum { .. } = outputDatum}, which aborts on a
+     * datum of the wrong shape.
+     * <p>
+     * The mutant uses a bare {@code Int}, which cannot be read as a two-field constructor under any
+     * interpretation. It is the one datum check in this whole slice that the chain genuinely arbitrates:
+     * {@code pool.pool}'s mint never reads the {@code PoolDatum} at all (consequence B above), so this
+     * is the first pool-creation datum field that a dry-evaluation can defend.
+     */
+    @Test
+    void anIllTypedPoolManagerDatumIsRejectedByThePoolManagerPolicy() {
+        Transaction mutated = builder().buildWith(request(),
+                PoolCreateTransactionBuilder.Overrides.poolManagerDatum(BigIntPlutusData.of(42)));
+        assertRefusedByThePoolManagerMint(mutated,
+                "a PoolManager output whose inline datum is not a PoolManagerDatum");
+    }
+
     // ======================================================================================
     // plumbing
     // ======================================================================================
+
+    /**
+     * As {@link #assertRefusedByTheMint}, but naming the <b>PoolManager</b> policy's Mint redeemer.
+     * Which index that is depends on where {@code poolManagerPolicyId} sorts among the minted policy
+     * ids, so it is derived from the mutated body rather than written down — and it must be a
+     * {@code RedeemerError} at that exact index, so a fault in the pool policy (index 0) or anywhere
+     * else cannot satisfy the expectation.
+     */
+    private static void assertRefusedByThePoolManagerMint(Transaction mutated, String what) {
+        int index = poolManagerMintIndex(roundTrip(mutated));
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated,
+                resolvable(PoolFixtures.universe(FUNDER)), REGISTRY, POOL_POLICY);
+        log.info("MUTATION [{}] refusal: {}", what, outcome.detail().replace("\n", " | "));
+        assertFalse(outcome.successful(), "the PoolManager policy must reject " + what);
+        String expected = "RedeemerError { tag: \"Mint\", index: " + index;
+        assertTrue(outcome.detail().contains(expected),
+                "expected [" + expected + "] rejecting " + what + ", got: " + outcome.detail());
+    }
+
+    /** Where the PoolManager policy sits among the canonically sorted policy ids of the mint field. */
+    private static int poolManagerMintIndex(Transaction tx) {
+        List<String> policies = tx.getBody().getMint().stream()
+                .map(MultiAsset::getPolicyId)
+                .map(String::toLowerCase)
+                .sorted()
+                .toList();
+        int index = policies.indexOf(REGISTRY.getPoolManagerPolicyId().toLowerCase());
+        if (index < 0) {
+            throw new AssertionError("the mint field carries nothing under the PoolManager policy");
+        }
+        return index;
+    }
+
+    /** The one asset name minted under {@code policyId}, refusing anything but exactly one. */
+    private static String soleMintedName(Transaction tx, String policyId) {
+        List<Asset> assets = tx.getBody().getMint().stream()
+                .filter(ma -> ma.getPolicyId().equalsIgnoreCase(policyId))
+                .flatMap(ma -> ma.getAssets().stream())
+                .toList();
+        assertEquals(1, assets.size(), "exactly one asset name under " + policyId);
+        assertEquals(BigInteger.ONE, assets.get(0).getValue(),
+                "an NFT is minted, not burnt or doubled, under " + policyId);
+        return strip(assets.get(0).getNameAsHex());
+    }
+
+    private static byte[] scriptHash(com.bloxbean.cardano.client.plutus.spec.PlutusScript script) {
+        try {
+            return script.getScriptHash();
+        } catch (Exception e) {
+            throw new AssertionError("cannot hash a witness-set script", e);
+        }
+    }
+
+    private static byte[] serialiseTx(Transaction tx) {
+        try {
+            return tx.serialize();
+        } catch (Exception e) {
+            throw new AssertionError("cannot serialise the transaction", e);
+        }
+    }
 
     private static void assertRefusedByTheMint(Transaction mutated, String what) {
         assertRefusedByTheMint(mutated, PoolFixtures.universe(FUNDER), what);
@@ -346,7 +599,10 @@ class PoolCreateDryEvalTest {
                 PoolFixtures.poolAddress(),
                 PoolFixtures.poolAssetName(),
                 PoolTxEncoder.poolDatum(PoolFixtures.factoryPoolDatum(PoolFixtures.defaults())),
-                POOL_LOVELACE);
+                POOL_LOVELACE,
+                PoolFixtures.poolManagerAddress(),
+                PoolTxEncoder.poolManagerDatum(PoolFixtures.poolManagerDatum()),
+                PoolFixtures.POOL_MANAGER_LOVELACE);
     }
 
     private static Transaction build() {

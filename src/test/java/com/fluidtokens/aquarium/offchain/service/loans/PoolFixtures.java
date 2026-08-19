@@ -33,10 +33,28 @@ import java.util.Optional;
  * {@link PoolTxEncoderTest} pins {@link PoolTxEncoder} against FluidTokens' <em>own</em> deployed
  * preview pool ({@code 0edd513b…#0}), whose datum this repo did not choose. This class is the pool
  * <em>we</em> would create: same collateral (tFLDT + its FluidTokens oracle) and same interest/LTV
- * numbers, but {@code dynamicCollateralPrice = false} (the no-oracle floor path), a
- * {@link #LIQUIDATION_FEE_PER_MILLE} the bot can actually collect, and
- * {@code lenderAuth = CardanoSignature(ourKeyHash)} — we mint only the pool NFT, never a
- * pool-manager NFT, because {@code pool.pool} never mentions the manager.
+ * numbers, but {@code dynamicCollateralPrice = false} (the no-oracle floor path) and a
+ * {@link #LIQUIDATION_FEE_PER_MILLE} the bot can actually collect.
+ *
+ * <h2>T-024: the pool now carries a PoolManager, and {@code lenderAuth} delegates to it</h2>
+ * This class used to say "we mint only the pool NFT, never a pool-manager NFT, because
+ * {@code pool.pool} never mentions the manager", with {@code lenderAuth = CardanoSignature(ourKeyHash)}.
+ * <b>Both halves were wrong as protocol, and FluidTokens said so on review.</b> {@code pool.pool} indeed
+ * never mentions the manager — that part was accurate — but the PoolManager NFT is what makes a pool
+ * compoundable, and a pool minted without one can never be compounded by anyone. The convention is
+ * FluidTokens' own (README:60): <em>"The pool lenderAuth field must be set as the Withdraw script hash
+ * of the PoolManager"</em>, which is the same shape their deployed pool carries and
+ * {@link PoolTxEncoderTest} already pinned. So:
+ * <ul>
+ *   <li>{@link #lenderAuth()} is now {@code CardanoWithdrawScript(poolManagerPolicyId)};</li>
+ *   <li>the create transaction mints a PoolManager NFT with the same asset name as the pool NFT
+ *       ({@code pool_manager.ak:173} makes that mandatory, not optional);</li>
+ *   <li>the cancel transaction must burn it in the same transaction — see
+ *       {@link PoolCancelTransactionBuilder}, and {@link #poolManagerCancelScriptHashes()} for why
+ *       that path is not yet submittable on preview.</li>
+ * </ul>
+ * The authority the bare lender key used to hold moves inward: it is now
+ * {@link #poolManagerDatum()}'s {@code poolOwnerAuth} that names our key.
  *
  * <h2>{@code pool.pool}'s mint never reads the datum</h2>
  * As with the request mint, {@code pool.pool}'s {@code mint} handler validates only the NFT name and
@@ -255,11 +273,90 @@ public final class PoolFixtures {
         return PoolTxEncoder.poolAssetName(0, seed());
     }
 
-    /** {@code lenderAuth = CardanoSignature(ourKeyHash)} — our bot's payment key. */
+    /**
+     * {@code lenderAuth = CardanoWithdrawScript(poolManagerPolicyId)} — FluidTokens' convention
+     * (README:60), and the same shape their own deployed pool carries
+     * ({@link PoolTxEncoderTest}'s chain golden, {@code lenderAuth = d87b9f581cb2324fbd…ff}).
+     * <p>
+     * {@code pool_manager.poolManager}'s own hash is simultaneously its minting policy id and its
+     * withdraw script hash, so this is {@code registry().getPoolManagerPolicyId()} and not a fourth
+     * derived value.
+     * <p>
+     * <b>What it changes downstream.</b> {@code pool_cancel_action}'s third conjunct becomes
+     * {@code pairs.has_key(withdrawals, Script(poolManagerPolicyId))} rather than
+     * {@code list.has(extra_signatories, ourKeyHash)} ({@code lib/fluidtokens/authorizer.ak}), so a bare
+     * signature no longer cancels a pool: the cancel must carry the {@code pool_manager.poolManager}
+     * withdrawal, which in turn drags in the whole PoolManager burn path. Our key still authorises,
+     * one level in, through {@link #poolManagerDatum()}'s {@code poolOwnerAuth}.
+     */
     public static AuthorizationMethod lenderAuth() {
-        byte[] key = new Address(LoanFixtures.botAddress()).getPaymentCredentialHash().orElseThrow();
-        return new AuthorizationMethod.CardanoSignature(HexUtil.encodeHexString(key));
+        return new AuthorizationMethod.CardanoWithdrawScript(registry().getPoolManagerPolicyId());
     }
+
+    /** Our bot's payment key hash — {@code poolOwnerAuth}, and the cancel's required signer. */
+    public static byte[] ownerKeyHash() {
+        return new Address(LoanFixtures.botAddress()).getPaymentCredentialHash().orElseThrow();
+    }
+
+    /**
+     * The compounding bot's cut of compounded principal, per mille — <b>0</b>, deliberately.
+     *
+     * <h2>Why zero, and why it is not the liquidation fee</h2>
+     * This is a different fee with a different payer, a different collector and a different validator:
+     * {@link #LIQUIDATION_FEE_PER_MILLE} (100‰) lives in the lender bond's
+     * {@code LenderManagerDatum.liquidationFeePerMille} and is what <em>our</em> bot collects for
+     * liquidating; this one lives in the PoolManager datum, is read only by the compounding validators
+     * ({@code pm_compound_liquidity}, {@code lm_compound_action}) which this repo does not build a
+     * transaction for, and is what a <em>third-party</em> bot would collect for compounding our pool.
+     * Setting it non-zero would be a standing offer to strangers on a pool we create to test
+     * liquidation. Zero withdraws the offer without disabling anything we use.
+     * <p>
+     * It also keeps the two fees un-transposable by value, the same discipline {@link #defaults()}
+     * already documents for splitting the 90‰ penalty from the 100‰ fee: 0 and 100 cannot be confused
+     * for one another, so a guard reading the wrong field cannot pass by coincidence.
+     * <p>
+     * <b>{@code liquidationFeePerMille = 100} is untouched by this slice</b> — it is a standing
+     * invariant, enforced by {@link #assertBornLiquidatable} and by {@code LoanFactory}'s fee gate.
+     */
+    public static final long COMPOUNDING_FEE_PER_MILLE = 0L;
+
+    /**
+     * The {@code PoolManagerDatum} our factory stamps on the PoolManager output:
+     * {@code poolOwnerAuth = CardanoSignature(ourKeyHash)} — the authority that used to sit in the
+     * pool's own {@code lenderAuth} — and {@link #COMPOUNDING_FEE_PER_MILLE}.
+     * <p>
+     * Unlike {@code PoolDatum}, this datum <b>is</b> arbitrated at mint: {@code pool_manager.ak}'s
+     * {@code check_mint} does {@code expect PoolManagerDatum { .. } = outputDatum}, so an ill-typed
+     * datum aborts the pool creation ({@link PoolCreateDryEvalTest} proves it with a mutant).
+     */
+    public static PoolTxEncoder.PoolManagerDatum poolManagerDatum() {
+        return new PoolTxEncoder.PoolManagerDatum(
+                new AuthorizationMethod.CardanoSignature(HexUtil.encodeHexString(ownerKeyHash())),
+                BigInteger.valueOf(COMPOUNDING_FEE_PER_MILLE));
+    }
+
+    /**
+     * The PoolManager NFT's asset name — <b>identical to the pool NFT's</b>, and not by our choice.
+     * {@code pool_manager.ak:173} asserts {@code poolManagerMintedNFTs == poolMintedNFTs}, a
+     * {@code Pairs} equality over the two sorted token dicts, so the names <em>and</em> the quantities
+     * must match exactly. This method exists so every caller reads the constraint rather than
+     * re-deriving the name and hoping.
+     */
+    public static String poolManagerAssetName() {
+        return poolAssetName();
+    }
+
+    /** The enterprise PoolManager address: the {@code general_spend} wrapper the PM UTxO sits at. */
+    public static String poolManagerAddress() {
+        return LoanFixtures.entAddress(registry().getPoolManagerSpendScriptHash());
+    }
+
+    /**
+     * The PoolManager output's lovelace leg. It holds one NFT and a two-field datum, so this is a
+     * min-ada floor with headroom, not a tuned number; it is also the ~2 ADA the orphan lock would
+     * strand per pool if a cancel burnt the pool NFT and left the PoolManager behind.
+     */
+    public static final long POOL_MANAGER_LOVELACE = 2_000_000L;
 
     /** Where our lender bonds go: the enterprise address of the LenderManager spend script. */
     public static Address lenderBondAddress() {
@@ -424,6 +521,74 @@ public final class PoolFixtures {
         // pool_cancel_action
         m.put("4e4c5ed0d8c96fd158fa70ed619b93ec6bb9d0dfb425f3961b35d95b",
                 "c85c812d4668080ff3cd121377f08710b8ea3b4d893500f46a708de62ef4fc38#0");
+        return m;
+    }
+
+    // ---- the pool-manager reference scripts, which preview does NOT publish ----------------------
+
+    /**
+     * The three validators a PoolManager-burning cancel invokes on top of the pool's own three, in the
+     * order {@link PoolCancelTransactionBuilder} declares them: the PoolManager {@code general_spend}
+     * wrapper (the PM UTxO must be <em>spent</em>, not merely read), {@code pool_manager.poolManager}
+     * (both the burn's minting policy and the withdraw its {@code general_spend} defers to), and
+     * {@code pool_manager/pm_cancel_pool_manager} (the action that does the real work).
+     * <p>
+     * <b>Not one of them is in {@link #PUBLISHED_REFERENCE_SCRIPTS}</b>, which is the whole reason
+     * {@link #unpublishedPoolManagerScripts()} exists: FluidTokens has published reference scripts for
+     * the pool family on preview and not for the pool-manager family, so the cancel transaction this
+     * repo can now build and dry-evaluate cannot yet be submitted.
+     */
+    public static List<String> poolManagerCancelScriptHashes() {
+        return List.of(registry().getPoolManagerSpendScriptHash(),
+                registry().getPoolManagerPolicyId(),
+                registry().getPmCancelPoolManagerScriptHash());
+    }
+
+    /**
+     * Which of {@link #poolManagerCancelScriptHashes()} have no published preview coordinate — today,
+     * all three. Empty means the cancel path is publishable as built and
+     * {@code LoanFactory}'s publication gate would fall silent; that is the condition under which this
+     * factory may create a PoolManager-bearing pool on chain.
+     */
+    public static List<String> unpublishedPoolManagerScripts() {
+        return poolManagerCancelScriptHashes().stream()
+                .filter(hash -> !PUBLISHED_REFERENCE_SCRIPTS.containsKey(hash))
+                .toList();
+    }
+
+    /**
+     * <b>Synthetic</b> reference-script coordinates for the three scripts above — deliberately kept out
+     * of {@link #PUBLISHED_REFERENCE_SCRIPTS}, whose entries are verified preview coordinates and must
+     * stay that way.
+     *
+     * <h2>What they prove and what they do not</h2>
+     * A reference input contributes nothing to a transaction but its coordinate, and the evaluator
+     * resolves a reference script's <em>bytes</em> from the {@code ScriptSupplier}, never from the UTxO.
+     * So a synthetic coordinate lets the offline rig build and dry-evaluate the exact 8-redeemer,
+     * reference-only cancel shape the deployed validators demand — the <b>shape</b> is genuinely
+     * arbitrated by the real scripts. It proves nothing whatever about <b>submittability</b>: on preview
+     * these coordinates hold no UTxO, so the transaction would be rejected before any script ran.
+     *
+     * <h2>What must be published before the path is usable on chain</h2>
+     * A reference-script UTxO for each of {@link #poolManagerCancelScriptHashes()}. Until then
+     * {@code LoanFactory} refuses to create a PoolManager-bearing pool at all — creating one whose
+     * cancel cannot be submitted would strand the PoolManager permanently ({@code pool_cancel_action}
+     * constrains no mint but its own, so a pool can be cancelled without burning its PoolManager, and
+     * {@code pm_cancel_pool_manager} then requires a live pool holding the matching NFT, which no longer
+     * exists).
+     */
+    public static final Map<String, String> SYNTHETIC_POOL_MANAGER_REFERENCE_SCRIPTS =
+            syntheticPoolManagerReferenceScripts();
+
+    private static Map<String, String> syntheticPoolManagerReferenceScripts() {
+        List<String> hashes = poolManagerCancelScriptHashes();
+        // Obviously-fake transaction ids: no preview transaction has an all-one-byte hash.
+        List<String> coordinates = List.of("ff".repeat(32) + "#0", "fe".repeat(32) + "#0",
+                "fd".repeat(32) + "#0");
+        Map<String, String> m = new LinkedHashMap<>();
+        for (int i = 0; i < hashes.size(); i++) {
+            m.put(hashes.get(i), coordinates.get(i));
+        }
         return m;
     }
 }

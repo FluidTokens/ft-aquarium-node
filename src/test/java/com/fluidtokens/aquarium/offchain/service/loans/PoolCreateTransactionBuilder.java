@@ -18,11 +18,40 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 /**
  * Builds the <b>pool-creation</b> transaction of a Lending v4 pool: mint one pool NFT under the
- * deployed {@code pool.pool} policy, and lock the pool liquidity plus that NFT at the pool spend
- * address under a hand-encoded {@code PoolDatum}.
+ * deployed {@code pool.pool} policy, lock the pool liquidity plus that NFT at the pool spend address
+ * under a hand-encoded {@code PoolDatum}, and mint the matching <b>PoolManager NFT</b> under the
+ * deployed {@code pool_manager.poolManager} policy into the PoolManager spend address under a
+ * {@code PoolManagerDatum}.
+ *
+ * <h2>The PoolManager is not optional here, whatever the README says (T-024)</h2>
+ * {@code pool.ak} never mentions the PoolManager, and FluidTokens' README calls it mandatory only
+ * <em>"for automatic compounding"</em>. Both are true and neither makes it skippable in practice: a
+ * pool minted without one <b>can never be compounded by anyone</b>, which is why FluidTokens flagged
+ * the pools this factory produced. Once the PoolManager <em>is</em> minted, {@code pool_manager.ak}'s
+ * own {@code check_mint} is strict about it:
+ * <ul>
+ *   <li>{@code poolManagerMintedNFTs == poolMintedNFTs} (line 173) — a {@code Pairs} equality over the
+ *       two sorted token dicts, so the PoolManager NFT must carry the <b>same asset name</b> at the
+ *       <b>same quantity</b>, and a PoolManager mint without a same-transaction pool mint is refused;</li>
+ *   <li>the output must sit at {@code Script(poolManagerSpendScriptHash)}, hold exactly one token of
+ *       the policy, and carry an inline datum that type-checks as {@code PoolManagerDatum} (lines
+ *       121-127). The stale comment at line 166 — <em>"we don't check the destination of the minted
+ *       NFTs"</em> — describes code that is no longer there; the code is stronger than its comment;</li>
+ *   <li>{@code length(poolInputs) == length(poolManagerBurntNFTs)} — both zero on a creation.</li>
+ * </ul>
+ *
+ * <h2>The PoolManager policy travels in the witness set, not by reference input</h2>
+ * Unlike {@code pool.pool}, which has a published preview reference script this builder declares to
+ * {@code withReferenceScripts} (see below), the pool-manager family has none. A minting policy may
+ * legitimately travel either way, so this transaction simply keeps the witness copy {@code mintAsset}
+ * leaves behind — nothing is stripped for it, nothing is read for it, and no reference input is
+ * invented for a dependency the mint does not have. It costs ~2.2 KB of transaction size and no
+ * reference-script fee. The <em>cancel</em> is where the missing publications bite; see
+ * {@link PoolFixtures#poolManagerCancelScriptHashes()}.
  *
  * <h2>Structurally incapable of submitting</h2>
  * The {@link QuickTxBuilder} below is constructed with a <b>null</b> {@code TransactionProcessor} —
@@ -115,9 +144,14 @@ public final class PoolCreateTransactionBuilder {
      *                               reference input)
      * @param funderAddress          fee payer, collateral payer and change address
      * @param poolAddress            the enterprise address of {@code poolSpendScriptHash}
-     * @param poolAssetNameHex       the 29-byte pool NFT name (index prefix + hashed output ref)
+     * @param poolAssetNameHex       the 29-byte pool NFT name (index prefix + hashed output ref). The
+     *                               PoolManager NFT is minted under the <em>same</em> name; the
+     *                               validator requires it, so there is no second name to pass
      * @param poolDatum              the {@code PoolDatum} the pool output carries inline
      * @param poolLovelace           the pool liquidity leg of the pool output's value
+     * @param poolManagerAddress     the enterprise address of {@code poolManagerSpendScriptHash}
+     * @param poolManagerDatum       the {@code PoolManagerDatum} the PoolManager output carries inline
+     * @param poolManagerLovelace    the PoolManager output's lovelace leg
      */
     public record Request(Utxo seedUtxo,
                           Utxo configUtxo,
@@ -126,7 +160,10 @@ public final class PoolCreateTransactionBuilder {
                           String poolAddress,
                           String poolAssetNameHex,
                           PlutusData poolDatum,
-                          long poolLovelace) {
+                          long poolLovelace,
+                          String poolManagerAddress,
+                          PlutusData poolManagerDatum,
+                          long poolManagerLovelace) {
     }
 
     /**
@@ -164,31 +201,70 @@ public final class PoolCreateTransactionBuilder {
      * index.
      */
     Transaction build(Request request, Mutation mutation) {
-        return buildWith(request,
-                new TransactionInput(request.seedUtxo().getTxHash(), request.seedUtxo().getOutputIndex()),
-                request.poolAssetNameHex(),
-                request.poolAddress(),
-                mutation);
+        return buildWith(request, Overrides.none(), mutation);
     }
 
     /**
-     * As {@link #build}, but with the mint redeemer's {@code inputRef}, the NFT's asset name and the
-     * pool output's address overridden — the seam the adversarial mutations of
-     * {@link PoolCreateDryEvalTest} use to hand the machine a transaction this builder would never
-     * emit on its own.
+     * The adversarial seam: every field {@link PoolCreateDryEvalTest} needs to corrupt in order to hand
+     * the machine a transaction this builder would never emit on its own. A null component means "use
+     * the {@link Request}'s honest value", so {@link Overrides#none()} builds exactly what
+     * {@link #build} builds.
+     *
+     * <h2>Why the PoolManager legs need their own overrides</h2>
+     * Three of {@code pool_manager.ak}'s {@code check_mint} conjuncts can only be broken at assembly
+     * time, not by byte-surgery on a finished body: minting the PoolManager NFT under a name that is not
+     * the pool NFT's ({@code poolManagerMintedNFTs == poolMintedNFTs}), paying it somewhere other than
+     * {@code Script(poolManagerSpendScriptHash)} ({@code correctAddress}), and giving it a datum that is
+     * not a {@code PoolManagerDatum} ({@code expect PoolManagerDatum { .. } = outputDatum}). Surgery
+     * would work for the first two but would leave the value unbalanced; rebuilding keeps every other
+     * property of the transaction intact so the named conjunct is the only thing wrong.
+     *
+     * @param inputRef                 the mint redeemer's {@code inputRef}
+     * @param poolAssetNameHex         the pool NFT's asset name
+     * @param poolAddress              where the pool output is paid
+     * @param poolManagerAssetNameHex  the PoolManager NFT's asset name (honestly: the pool NFT's)
+     * @param poolManagerAddress       where the PoolManager output is paid
+     * @param poolManagerDatum         the PoolManager output's inline datum
      */
-    Transaction buildWith(Request request, TransactionInput inputRefOverride,
-                          String assetNameOverride, String poolAddressOverride) {
-        return buildWith(request, inputRefOverride, assetNameOverride, poolAddressOverride,
-                Mutation.none());
+    record Overrides(TransactionInput inputRef,
+                     String poolAssetNameHex,
+                     String poolAddress,
+                     String poolManagerAssetNameHex,
+                     String poolManagerAddress,
+                     PlutusData poolManagerDatum) {
+
+        static Overrides none() {
+            return new Overrides(null, null, null, null, null, null);
+        }
+
+        static Overrides pool(TransactionInput inputRef, String assetNameHex, String poolAddress) {
+            return new Overrides(inputRef, assetNameHex, poolAddress, null, null, null);
+        }
+
+        static Overrides poolManagerAssetName(String assetNameHex) {
+            return new Overrides(null, null, null, assetNameHex, null, null);
+        }
+
+        static Overrides poolManagerAddress(String address) {
+            return new Overrides(null, null, null, null, address, null);
+        }
+
+        static Overrides poolManagerDatum(PlutusData datum) {
+            return new Overrides(null, null, null, null, null, datum);
+        }
     }
 
-    private Transaction buildWith(Request request, TransactionInput inputRefOverride,
-                                  String assetNameOverride, String poolAddressOverride,
-                                  Mutation mutation) {
+    /**
+     * As {@link #build}, but with the {@link Overrides} applied — see that record for what each one
+     * breaks and why it cannot be done by byte-surgery instead.
+     */
+    Transaction buildWith(Request request, Overrides overrides) {
+        return buildWith(request, overrides, Mutation.none());
+    }
+
+    private Transaction buildWith(Request request, Overrides overrides, Mutation mutation) {
         long configRefInputIndex = configRefIndexAmong(request);
-        ScriptTx tx = assemble(request, configRefInputIndex, inputRefOverride, assetNameOverride,
-                poolAddressOverride);
+        ScriptTx tx = assemble(request, configRefInputIndex, overrides);
         Transaction built = complete(request, tx, mutation);
 
         int actual = configRefIndexOf(built, request.configUtxo());
@@ -198,13 +274,75 @@ public final class PoolCreateTransactionBuilder {
                             + " but the config reference input landed at " + actual
                             + " in the finished body");
         }
+        return assertPoolWithdrawRedeemerIsUnread(built);
+    }
+
+    /**
+     * The evidence behind {@link #UNREAD_POOL_WITHDRAW_INDEX}, read off the FINISHED body: a pool
+     * creation carries no {@code pool.pool} withdraw redeemer at all, which is why the PoolManager mint
+     * redeemer's {@code poolWithdrawRedeemerIndex} has nothing to point at and — per
+     * {@code pool_manager.ak}'s {@code if length(poolManagerBurntNFTs) > 0} guard — is never evaluated.
+     * <p>
+     * <b>Return-consuming on purpose.</b> It hands back the transaction it checked, so the only way to
+     * drop this call is to stop returning a transaction, which does not compile. That is the same reason
+     * the value it defends is proven <em>green</em> rather than red by
+     * {@link PoolCreateDryEvalTest}: an index the validator never reads cannot be shown load-bearing by
+     * a refusal, only inert by an acceptance.
+     * <p>
+     * <b>Package-private so its refusing branch can be pinned.</b> On every transaction this builder
+     * emits the branch is unreachable — that is the whole claim — so neutering the body would change
+     * nothing observable and the guard would be unproven. {@link PoolCreateDryEvalTest} therefore hands
+     * it, directly, a body that <em>does</em> carry a {@code pool.pool} withdraw redeemer and requires
+     * the refusal.
+     */
+    Transaction assertPoolWithdrawRedeemerIsUnread(Transaction built) {
+        OptionalInt found = PoolCancelTransactionBuilder
+                .poolWithdrawRedeemerIndexIn(built, registry.getPoolPolicyId());
+        if (found.isPresent()) {
+            throw new IllegalStateException(
+                    "the pool-creation transaction carries a pool.pool withdraw redeemer at "
+                            + "self.redeemers[" + found.getAsInt() + "], so the PoolManager mint "
+                            + "redeemer's poolWithdrawRedeemerIndex is no longer unread and "
+                            + UNREAD_POOL_WITHDRAW_INDEX + " can no longer be assumed safe");
+        }
         return built;
     }
 
+    /**
+     * The value the PoolManager mint redeemer's {@code poolWithdrawRedeemerIndex} carries on the create
+     * path. It is <b>never read</b> there — {@code check_mint} consults it only inside
+     * {@code if length(poolManagerBurntNFTs) > 0}, and a creation burns nothing, so neither the
+     * {@code safe_list_at} nor its {@code expect index >= 0} is evaluated. Zero rather than a sentinel
+     * such as {@code -1} because an out-of-range index would abort the moment the guard ever did open,
+     * and because {@link #assertPoolWithdrawRedeemerIsUnread} — not this constant — is what keeps the
+     * claim true.
+     */
+    private static final long UNREAD_POOL_WITHDRAW_INDEX = 0L;
+
     // ---- assembly ---------------------------------------------------------------------------------
 
+    private ScriptTx assemble(Request request, long configRefInputIndex, Overrides overrides) {
+        TransactionInput inputRef = overrides.inputRef() != null ? overrides.inputRef()
+                : new TransactionInput(request.seedUtxo().getTxHash(), request.seedUtxo().getOutputIndex());
+        String assetNameHex = orElse(overrides.poolAssetNameHex(), request.poolAssetNameHex());
+        String poolAddress = orElse(overrides.poolAddress(), request.poolAddress());
+        // Honestly the pool NFT's own name: pool_manager.ak makes them equal, so the default is the
+        // pool's name and not a second field of the request.
+        String poolManagerAssetNameHex = orElse(overrides.poolManagerAssetNameHex(), assetNameHex);
+        String poolManagerAddress = orElse(overrides.poolManagerAddress(), request.poolManagerAddress());
+        PlutusData poolManagerDatum = overrides.poolManagerDatum() != null
+                ? overrides.poolManagerDatum() : request.poolManagerDatum();
+        return assemble(request, configRefInputIndex, inputRef, assetNameHex, poolAddress,
+                poolManagerAssetNameHex, poolManagerAddress, poolManagerDatum);
+    }
+
+    private static String orElse(String override, String honest) {
+        return override != null ? override : honest;
+    }
+
     private ScriptTx assemble(Request request, long configRefInputIndex, TransactionInput inputRef,
-                              String assetNameHex, String poolAddress) {
+                              String assetNameHex, String poolAddress, String poolManagerAssetNameHex,
+                              String poolManagerAddress, PlutusData poolManagerDatum) {
         ScriptTx tx = new ScriptTx();
 
         // The seed, by name: coin selection must not be free to leave it out.
@@ -222,6 +360,21 @@ public final class PoolCreateTransactionBuilder {
                 Amount.lovelace(BigInteger.valueOf(request.poolLovelace())),
                 Amount.asset(registry.getPoolPolicyId() + assetNameHex, BigInteger.ONE));
         tx.payToContract(poolAddress, poolValue, request.poolDatum());
+
+        // The PoolManager NFT: same asset name, same quantity, minted in the same transaction — all
+        // three forced by pool_manager.ak:173's `poolManagerMintedNFTs == poolMintedNFTs`, a Pairs
+        // equality over the two sorted token dicts. poolWithdrawRedeemerIndex is encoded 0 and is
+        // UNREAD here: check_mint only consults it inside `if length(poolManagerBurntNFTs) > 0`, and a
+        // creation burns nothing. assertPoolWithdrawRedeemerIsUnread re-checks that from the finished
+        // body.
+        tx.mintAsset(registry.getPoolManagerScript(),
+                List.of(new Asset("0x" + poolManagerAssetNameHex, BigInteger.ONE)),
+                PoolTxEncoder.poolManagerMintRedeemer(configRefInputIndex, UNREAD_POOL_WITHDRAW_INDEX));
+
+        List<Amount> poolManagerValue = List.of(
+                Amount.lovelace(BigInteger.valueOf(request.poolManagerLovelace())),
+                Amount.asset(registry.getPoolManagerPolicyId() + poolManagerAssetNameHex, BigInteger.ONE));
+        tx.payToContract(poolManagerAddress, poolManagerValue, poolManagerDatum);
 
         tx.readFrom(new TransactionInput(request.configUtxo().getTxHash(),
                 request.configUtxo().getOutputIndex()));
