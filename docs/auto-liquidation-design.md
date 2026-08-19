@@ -375,11 +375,15 @@ needs a `provider_ref_input_index` that only means anything relative to a specif
 transaction. Encoding one as `Aggregated` — which is what we did before this was
 noticed — produces a redeemer that fails for want of signatures.
 
-So a c3 feed is **priceable for reporting and not buildable for liquidation**.
-`OracleEntry.usableForLiquidation()` says so explicitly rather than letting it be
-discovered when a transaction is rejected. Supporting c3 properly means modelling
-`PriceDataCharlie` and locating the Charli3 provider UTxO, which the registry does
-publish under `supportedOracle.c3.referenceInput`.
+So a c3 feed is priceable **and, since T-006, buildable for liquidation**: `PriceDataCharlie`
+is modelled and the Charli3 provider UTxO is located from `supportedOracle.c3.referenceInput`.
+`OracleEntry.usableForLiquidation()` returns true for a c3 entry exactly when that Charli3
+provider reference input is known **and** the entry's own `fluidOracle.referenceInput` parses.
+(T-012 closed a fail-open in that predicate: a null `fluidOracle.referenceInput` now yields
+not-usable for **every** variant — multisig and c3 alike — because `retrieve_oracle_data`
+requires that reference input regardless of provider kind.) The three live c3 feeds are the
+working preview liquidation path; encoding a c3 entry as `Aggregated` — which is what we did
+before this was noticed — produced a redeemer that failed for want of signatures.
 
 Note this is a *reporting* distinction, not a health one: `liquidatable` still answers
 "would the chain permit this", which is true regardless of whether we can currently
@@ -429,8 +433,8 @@ profile. Five entries, and crucially it **prices tFLDT**
 oracle NFT `9a2ec5c9…000de1406f766f3633` that those loan datums name. Preview health is
 therefore fully computable, where the mainnet registry left LTV permanently unavailable.
 
-The sting: **tFLDT is Charli3-backed**, so those loans are priceable but not liquidatable
-by us until `PriceDataCharlie` is modelled.
+**tFLDT is Charli3-backed**, so those loans are priceable and — since `PriceDataCharlie` is
+modelled (T-006) — liquidatable by us via the c3 path.
 
 ### 6.7 The signable preview feeds are dead (2026-08-10)
 
@@ -445,18 +449,21 @@ c3 feeds are actually being published:
 | fGold | multisig | 2026-02-24 | 167 days stale |
 
 The validator requires the feed's window to contain the transaction's validity range, so
-a months-old feed cannot be used no matter how well-formed its signatures are. **Every
-oracle we could sign a redeemer with is stale, and every live oracle is one we cannot
-sign.** That is the Phase 3 blocker on preview, and it has exactly two exits:
+a months-old feed cannot be used no matter how well-formed its signatures are. When this
+was written, every oracle we could sign a redeemer with was stale and every live oracle was
+one we could not sign — the Phase 3 blocker on preview. It had two exits:
 
 1. **Ask FluidTokens to resume publishing fresh multisig feeds on preview.** No new
-   contract modelling, and it makes end-to-end liquidation testable immediately.
+   contract modelling, and it makes multisig-signed liquidation testable immediately.
 2. **Implement `PriceDataCharlie`.** Larger: the redeemer carries a
    `provider_ref_input_index` into the transaction's own `reference_inputs`, so it can
    only be set while building the transaction, and the validator checks the price against
    the Charli3 datum rather than against signatures.
 
-(1) is worth asking for before committing to (2).
+**Exit (2) is done (T-006).** The three live c3 feeds (tFLDT, NIGHT, OADA) are now the
+working preview liquidation path, and the bot has liquidated real loans against them. Exit
+(1) is no longer a blocker — it matters only if a *multisig*-signed liquidation is ever
+needed; the stale multisig feeds remain unusable until FluidTokens republishes them.
 
 ### 6.8 There is a price blackout every 5 minutes, and it is upstream
 

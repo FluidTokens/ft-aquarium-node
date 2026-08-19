@@ -77,9 +77,9 @@ import java.util.stream.Collectors;
  * <p>
  * <b>Ports no arithmetic.</b> Every number in a buildable assessment comes straight out of
  * {@link LoanFinance}; every oracle-usability call defers to {@link OracleEntry#usableForLiquidation()}
- * and {@link OraclePriceFeed#usableAt(long)} as they stand today — including their known residue
- * (T-012: {@code usableForLiquidation()} fails open on a multisig entry with an unresolvable
- * {@code referenceInput}).
+ * and {@link OraclePriceFeed#usableAt(long)} as they stand today. (T-012 closed the former's fail-open:
+ * a null {@code fluidOracle.referenceInput} now yields not-usable for every variant, so a corrupted
+ * registry value can no longer produce a buildable oracle whose NFT reference UTxO cannot resolve.)
  */
 @Service
 @RequiredArgsConstructor
