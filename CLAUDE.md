@@ -114,6 +114,9 @@ This repo is factory-operated (fabbrica plugin). Non-trivial requests go through
 `intake` (never straight to code); tickets run as slice contracts with the
 worker/auditor pair; before ending any significant work, run `distill` — "close
 the circle" — even if Giovanni forgets to ask. State lives in PLAN.md + WORKLOG.md.
+Authority class: 2 (partner) — see fabbrica-init ## Authority classes. Branch push
+free (never the default branch); PRs wait for Giovanni's merge; history rewrite
+never; on-chain/mainnet/funds actions need his first-hand word.
 <!-- fabbrica:end -->
 
 ## Constitution
