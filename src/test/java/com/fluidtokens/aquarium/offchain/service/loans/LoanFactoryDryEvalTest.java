@@ -12,6 +12,7 @@ import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.SlotConfigs;
+import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.transaction.spec.Asset;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
@@ -19,6 +20,8 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
+import com.fluidtokens.aquarium.offchain.model.loans.AuthorizationMethod;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import lombok.extern.slf4j.Slf4j;
@@ -108,10 +111,28 @@ class LoanFactoryDryEvalTest {
      * to what this transaction <em>is</em>, so the bytes had to move; the pin is re-taken over the new
      * shape and goes on doing its job. <b>A pin is re-taken when the artefact was meant to change and
      * never to make a red test green.</b>
+     *
+     * <h2>And a third time, in T-026 — the sha alone, and the fee deliberately not</h2>
+     * The immediately preceding sha256 was
+     * <b>{@code c6176f030651cf63fa5436ac02e00d0521a8e711d6027dc5906113b014b2e921}</b>. It pinned a create
+     * whose {@code lenderBondInlineDatumHash} committed to a lender bond carrying
+     * {@link LoanFixtures#PLACEHOLDER_AUTH_HASH} — a hand-written test constant with no private key
+     * behind it — as the bond's {@code lenderAuth}. A pool created from that commitment can never
+     * release its bond, because {@code lm_withdraw_bonds_action} demands exactly that authorisation and
+     * {@code PoolDatum.lenderBondInlineDatumHash} freezes the choice at creation. The bond now names the
+     * recipe lender's own payment key hash, so the 32-byte hash the pool commits to has a different
+     * value and the transaction has different bytes. Same reason as the two re-takes above: <b>the
+     * artefact was meant to change.</b>
+     * <p>
+     * <b>{@link #NO_EVALUATOR_CREATE_FEE} did not move, and that is not an oversight.</b> A payment key
+     * hash and the ramp constant are both 28 bytes, and the pool datum carries only the bond datum's
+     * 32-byte blake2b hash in either case — so the create transaction's <em>size</em> is identical and
+     * its fee is unchanged at 411,119. The pin that had to be re-taken is the sha256; leaving the fee
+     * alone is what keeps it a measurement.
      */
     private static final long NO_EVALUATOR_CREATE_FEE = 411_119L;
     private static final String NO_EVALUATOR_CREATE_SHA256 =
-            "c6176f030651cf63fa5436ac02e00d0521a8e711d6027dc5906113b014b2e921";
+            "0ce6e01e042bd76499fe6ec13b66af260d5efefb5a51b6d06e2e85118ef8e2f2";
 
     /**
      * {@code minFeeRefScriptCostPerByte}, as {@link EvalFixtures#protocolParams()} carries it and as
@@ -263,6 +284,203 @@ class LoanFactoryDryEvalTest {
                         && advertised.getMessage().contains("advertises poolId"),
                 "the refusal must be the pool-id gate's advertised-name arm: " + advertised.getMessage());
         log.info("pool-id gate refusal (advertised mismatch): {}", advertised.getMessage());
+    }
+
+    // ======================================================================================
+    // T-026 — the lender bond's authorisation, and the two gates that keep it real
+    // ======================================================================================
+
+    /**
+     * <b>The emitted bond names the recipe lender's own key, and provably not the fixture's constant.</b>
+     * <p>
+     * This is the field a factory-created pool got wrong on chain: the bond's {@code lenderAuth} was
+     * {@link LoanFixtures#PLACEHOLDER_AUTH_HASH}, 28 bytes of arithmetic ramp with no private key behind
+     * them, while the <em>pool's</em> was correctly derived from the wallet. Only
+     * {@code lm_withdraw_bonds_action.ak} reads this field, and it feeds it straight to
+     * {@code authorizer.authorize_action}, so a value nobody can sign for is a bond nobody can ever
+     * release — and {@code PoolDatum.lenderBondInlineDatumHash} pins the datum by hash at pool creation,
+     * so the choice cannot be revisited.
+     * <p>
+     * Read off the finished borrow body with the production {@link LenderManagerDatumConverter}, so this
+     * checks the bytes an output would really carry rather than the object the factory composed.
+     */
+    @Test
+    void theEmittedBondNamesTheRecipeLendersOwnKeyHash() {
+        LoanFactory.Recipe recipe = recipe(PoolFixtures.defaults(), 1, 2);
+        LoanFactory factory = factory(baseUniverse());
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
+        Transaction borrow = factory.buildBorrow(recipe, create);
+
+        LenderManagerDatum bond = emittedBond(borrow, create);
+        String lenderKeyHash =
+                HexUtil.encodeHexString(LENDER.getPaymentCredentialHash().orElseThrow());
+
+        assertEquals(new AuthorizationMethod.CardanoSignature(lenderKeyHash), bond.lenderAuth(),
+                "the emitted bond must be releasable by the recipe's lender and nobody else");
+        assertFalse(LoanFixtures.hex(bond).toLowerCase()
+                        .contains(LoanFixtures.PLACEHOLDER_AUTH_HASH.toLowerCase()),
+                "no LoanFixtures placeholder may appear anywhere in the committed bond datum");
+        log.info("emitted bond lenderAuth: {}", bond.lenderAuth());
+    }
+
+    /**
+     * <b>The mutant: revert the bond to the fixture constant and the factory refuses it by name.</b>
+     * <p>
+     * {@link LoanFactory#buildCreateWithFixtureBondAuth} and
+     * {@link LoanFactory#buildBorrowWithFixtureBondAuth} compose the bond exactly as the pre-fix factory
+     * did — {@code LoanFixtures.bondDatum(...)}, placeholder auth and all — and change nothing else.
+     * Both are refused while the datum is being composed, so no assemblable body exists at any point on
+     * either path. Neuter {@code assertBondAuthIsTheRecipeLender}'s body and both halves go green, which
+     * is what makes this a pin rather than a restatement.
+     * <p>
+     * The create half deliberately goes through the seam that bypasses
+     * {@code POOL_MANAGER_PUBLICATION_GATE}, so the refusal it asserts can only be the lender-auth
+     * gate's.
+     */
+    @Test
+    void theLenderAuthGateRefusesABondBuiltFromTheFixtureConstant() {
+        LoanFactory.Recipe recipe = recipe(PoolFixtures.defaults(), 1, 2);
+        LoanFactory factory = factory(baseUniverse());
+
+        LoanFactory.GateFailure atCreate = assertThrows(LoanFactory.GateFailure.class,
+                () -> factory.buildCreateWithFixtureBondAuth(recipe),
+                "a pool must not commit to a bond datum whose lenderAuth is a fixture constant");
+        assertTrue(atCreate.getMessage().contains("LENDER_AUTH_GATE"),
+                "the refusal must be the lender-auth gate and not another: " + atCreate.getMessage());
+        assertTrue(atCreate.getMessage().contains(LoanFixtures.PLACEHOLDER_AUTH_HASH),
+                "the refusal must name the value it refused: " + atCreate.getMessage());
+        log.info("lender-auth gate refusal (create): {}", atCreate.getMessage());
+
+        // The borrow half needs a real pool to borrow against, so it is built honestly first — which
+        // also shows the two paths are independently gated rather than one covering for the other.
+        Transaction create = factory.buildCreateWithUnpublishedPoolManagerScripts(recipe);
+        LoanFactory.GateFailure atBorrow = assertThrows(LoanFactory.GateFailure.class,
+                () -> factory.buildBorrowWithFixtureBondAuth(recipe, create),
+                "a borrow must not emit a bond datum whose lenderAuth is a fixture constant");
+        assertTrue(atBorrow.getMessage().contains("LENDER_AUTH_GATE"),
+                "the refusal must be the lender-auth gate and not another: " + atBorrow.getMessage());
+        log.info("lender-auth gate refusal (borrow): {}", atBorrow.getMessage());
+    }
+
+    /**
+     * <b>The gate's other input, doctored: an honest bond checked against a different lender.</b>
+     * <p>
+     * {@code assertBondAuthIsTheRecipeLender} reads two things — the bond datum and the {@link
+     * LoanFactory.Recipe} — and the mutant above only doctors the first. This doctors the second: the
+     * bond composed for our lender is checked against a recipe naming {@link #wrongAddress()}, which is
+     * the shape of the defect where the bond is fine and the pool was created for somebody else. The
+     * gate refuses it and names both credentials, so a reader of the failure can see which one it kept.
+     */
+    @Test
+    void theLenderAuthGateRefusesARecipeNamingAnotherLender() {
+        LoanFactory.Recipe ours = recipe(PoolFixtures.defaults(), 1, 2);
+        LoanFactory factory = factory(baseUniverse());
+        LenderManagerDatum ourBond = LoanFixtures.bondDatum(
+                new AuthorizationMethod.CardanoSignature(
+                        HexUtil.encodeHexString(LENDER.getPaymentCredentialHash().orElseThrow())),
+                BigInteger.valueOf(PoolFixtures.LIQUIDATION_FEE_PER_MILLE),
+                LoanFixtures.noStakeCredential(), AssetType.ada(), PoolFixtures.poolAssetName());
+
+        assertDoesNotThrow(() -> factory.assertBondAuthIsTheRecipeLender(ours, ourBond),
+                "the honest pairing must pass its own gate");
+
+        LoanFactory.Recipe someoneElses = recipeLentBy(wrongAddress());
+        LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
+                () -> factory.assertBondAuthIsTheRecipeLender(someoneElses, ourBond),
+                "a bond naming a lender other than the recipe's must be refused");
+        assertTrue(failure.getMessage().contains("LENDER_AUTH_GATE"),
+                "the refusal must be the lender-auth gate: " + failure.getMessage());
+        assertTrue(failure.getMessage().contains(
+                        HexUtil.encodeHexString(wrongAddress().getPaymentCredentialHash().orElseThrow())),
+                "the refusal must name the lender the recipe asked for: " + failure.getMessage());
+        log.info("lender-auth gate refusal (wrong lender): {}", failure.getMessage());
+    }
+
+    /**
+     * <b>The right hash under the wrong constructor: refused, and this case is the only thing pinning
+     * that.</b>
+     * <p>
+     * {@code assertBondAuthIsTheRecipeLender} matches on {@code CardanoSignature} before it compares
+     * hashes, and until this case existed nothing tested it: relaxing the match to accept the hash from
+     * <em>any</em> constructor left the whole suite green, because both cases above already differ in
+     * the hash. So the clause that carries the entire point of the gate was unpinned.
+     * <p>
+     * What it prevents, read off the validators at upstream {@code ff005fb}, is not a stranded bond but
+     * a public one. {@code CardanoWithdrawScript(h)} is discharged by {@code authorizer.authorize_action}
+     * with {@code pairs.has_key(withdrawals, Script(h))} alone — a withdrawal, never a signature — so a
+     * bond delegating to a script anyone can make withdraw is a bond anyone can withdraw, along with the
+     * asset-manager vault its NFT gates. The hash here is the recipe lender's own, which is exactly the
+     * shape a plausible refactor produces, and the gate must still refuse it.
+     */
+    @Test
+    void theLenderAuthGateRefusesTheRightHashUnderTheWrongConstructor() {
+        LoanFactory.Recipe recipe = recipe(PoolFixtures.defaults(), 1, 2);
+        LoanFactory factory = factory(baseUniverse());
+        String lenderKeyHash = HexUtil.encodeHexString(LENDER.getPaymentCredentialHash().orElseThrow());
+
+        LenderManagerDatum delegated = LoanFixtures.bondDatum(
+                new AuthorizationMethod.CardanoWithdrawScript(lenderKeyHash),
+                BigInteger.valueOf(PoolFixtures.LIQUIDATION_FEE_PER_MILLE),
+                LoanFixtures.noStakeCredential(), AssetType.ada(), PoolFixtures.poolAssetName());
+
+        LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
+                () -> factory.assertBondAuthIsTheRecipeLender(recipe, delegated),
+                "a bond delegating its lenderAuth to a withdraw script must be refused even when the "
+                        + "hash is the recipe lender's own");
+        assertTrue(failure.getMessage().contains("LENDER_AUTH_GATE"),
+                "the refusal must be the lender-auth gate: " + failure.getMessage());
+        assertTrue(failure.getMessage().contains("CardanoWithdrawScript"),
+                "the refusal must name the constructor it refused: " + failure.getMessage());
+        assertTrue(failure.getMessage().contains("CardanoSignature"),
+                "the refusal must name the constructor it demanded: " + failure.getMessage());
+        log.info("lender-auth gate refusal (right hash, wrong constructor): {}", failure.getMessage());
+    }
+
+    /**
+     * <b>The fixture-origin gate: a placeholder anywhere in a committed datum's bytes is refused.</b>
+     * <p>
+     * The lender-auth gate defends one field of one datum; this one defends every field of every datum
+     * the factory commits, by scanning the serialised CBOR for {@link LoanFixtures#PLACEHOLDER_CONSTANTS}.
+     * Through the honest builders it never fires — the lender-auth gate stops the only path that
+     * currently reaches a placeholder — so it is driven directly, with the encoded fixture bond datum on
+     * one side and the honest one on the other.
+     */
+    @Test
+    void theFixtureOriginGateRefusesADatumCarryingAPlaceholder() {
+        LoanFactory factory = factory(baseUniverse());
+        PlutusData placeholderBearing = LoanFixtures.encode(LoanFixtures.bondDatum(
+                BigInteger.valueOf(PoolFixtures.LIQUIDATION_FEE_PER_MILLE),
+                LoanFixtures.noStakeCredential(), AssetType.ada(), PoolFixtures.poolAssetName()));
+
+        LoanFactory.GateFailure failure = assertThrows(LoanFactory.GateFailure.class,
+                () -> factory.assertNoFixtureOriginConstants("the lender bond datum", placeholderBearing),
+                "a datum carrying a LoanFixtures placeholder must not be committed");
+        assertTrue(failure.getMessage().contains("FIXTURE_ORIGIN_GATE"),
+                "the refusal must be the fixture-origin gate: " + failure.getMessage());
+        assertTrue(failure.getMessage().contains(LoanFixtures.PLACEHOLDER_AUTH_HASH),
+                "the refusal must name the placeholder it found: " + failure.getMessage());
+        log.info("fixture-origin gate refusal: {}", failure.getMessage());
+
+        PlutusData honest = LoanFixtures.encode(LoanFixtures.bondDatum(
+                new AuthorizationMethod.CardanoSignature(
+                        HexUtil.encodeHexString(LENDER.getPaymentCredentialHash().orElseThrow())),
+                BigInteger.valueOf(PoolFixtures.LIQUIDATION_FEE_PER_MILLE),
+                LoanFixtures.noStakeCredential(), AssetType.ada(), PoolFixtures.poolAssetName()));
+        assertDoesNotThrow(() -> factory.assertNoFixtureOriginConstants("the lender bond datum", honest),
+                "a datum built from the recipe's own credential must pass");
+
+        assertTrue(LoanFixtures.PLACEHOLDER_CONSTANTS.contains(LoanFixtures.PLACEHOLDER_AUTH_HASH),
+                "the gate is driven by the named set, so the known placeholder must be in it");
+    }
+
+    /** The emitted lender bond of a borrow, decoded with the production converter. */
+    private static LenderManagerDatum emittedBond(Transaction borrow, Transaction create) {
+        String bondAssetName = PoolTxEncoder.bondAssetName(
+                new TransactionInput(TransactionUtil.getTxHash(create), 0));
+        TransactionOutput bondOutput = outputWithNft(borrow, LoanFixtures.bondAddress(),
+                REGISTRY.getLenderBondPolicyId(), bondAssetName);
+        return new LenderManagerDatumConverter()
+                .deserialize(bondOutput.getInlineDatum().serializeToHex());
     }
 
     // ======================================================================================
@@ -1011,6 +1229,22 @@ class LoanFactoryDryEvalTest {
                 PoolFixtures.TFLDT, params.principalLovelace(), 0L,
                 LOAN_OUTPUT_LOVELACE, BOND_LOVELACE, BOND_LOVELACE,
                 VALID_FROM_SLOT, validToSlot);
+    }
+
+    /**
+     * The default recipe with only its lender swapped — the seam
+     * {@link #theLenderAuthGateRefusesARecipeNamingAnotherLender} turns, so the gate is driven by a
+     * doctored {@link LoanFactory.Recipe} and not only by a doctored datum.
+     */
+    private static LoanFactory.Recipe recipeLentBy(Address lender) {
+        return new LoanFactory.Recipe(
+                PoolFixtures.defaults(), lender, lender,
+                1, 2,
+                seedUtxo(), funderUtxo(), PoolFixtures.configUtxo(), poolPolicyRefScriptUtxo(),
+                borrowReferenceScriptUtxos(), cancelReferenceScriptUtxos(),
+                PoolFixtures.TFLDT, PoolFixtures.defaults().principalLovelace(), 0L,
+                LOAN_OUTPUT_LOVELACE, BOND_LOVELACE, BOND_LOVELACE,
+                VALID_FROM_SLOT, VALID_TO_SLOT);
     }
 
     /**

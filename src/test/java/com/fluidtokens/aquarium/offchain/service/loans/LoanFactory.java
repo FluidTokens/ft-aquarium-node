@@ -58,6 +58,13 @@ import java.util.Set;
  * and lender-bond datum are the same {@link PoolFixtures} / {@link LoanFixtures} machinery the
  * builders' own dry-eval tests use — parameterised by the {@link Recipe}, never hardcoded to
  * {@link PoolFixtures#defaults()}.
+ * <p>
+ * <b>Composing from fixture machinery is not the same as committing fixture values.</b> T-026: the
+ * lender bond's {@code lenderAuth} used to come from {@link LoanFixtures}' own hand-written constant
+ * while the <em>pool's</em> came from the wallet — one real credential and one placeholder, in the same
+ * builder, in the same transaction, with nothing comparing them — and the pool that shipped from it can
+ * never release its bond. Every authorisation this class writes now comes from the {@link Recipe} or the
+ * registry, and two gates below refuse a build that would do otherwise.
  *
  * <h2>Structurally incapable of submitting</h2>
  * Each of the three builders constructs its {@code QuickTxBuilder} with a <b>null</b>
@@ -87,6 +94,13 @@ import java.util.Set;
  *       with the production {@link LenderManagerDatumConverter} and refuses unless
  *       {@code liquidationFeePerMille == 100}. This is a hard refusal inside the tool, not a test
  *       assertion, so a fee-0 pool can never yield a returned borrow transaction.</li>
+ *   <li><b>Lender-auth</b> — the lender bond's {@code lenderAuth} must be {@code CardanoSignature} over
+ *       the recipe lender's payment key hash, asserted while the datum is composed, on both the create
+ *       (which hash-pins it) and the borrow (which emits it). See
+ *       {@link #assertBondAuthIsTheRecipeLender}.</li>
+ *   <li><b>Fixture-origin</b> — no datum this class commits may contain a
+ *       {@link LoanFixtures#PLACEHOLDER_CONSTANTS} value anywhere in its serialised bytes. See
+ *       {@link #assertNoFixtureOriginConstants}.</li>
  *   <li><b>Born-liquidatable</b> — {@link #buildBorrow} calls
  *       {@link PoolFixtures#assertBornLiquidatable} at the recipe's collateral price and refuses if
  *       it throws.</li>
@@ -283,6 +297,20 @@ public final class LoanFactory {
     }
 
     /**
+     * The T-026 mutant on the create side: the pool whose {@code lenderBondInlineDatumHash} commits to a
+     * bond built from {@link LoanFixtures#PLACEHOLDER_AUTH_HASH} — the exact transaction that stranded
+     * real funds, since pool creation is the only moment a bond's authorisation can be chosen.
+     * {@link #LENDER_AUTH_GATE} refuses it while the datum is being composed, so no assemblable body
+     * exists at any point. The publication gate is bypassed as in
+     * {@link #buildCreateWithUnpublishedPoolManagerScripts}, so this refusal is provably the lender-auth
+     * gate's and not that one's. Package-private, no production caller.
+     */
+    Transaction buildCreateWithFixtureBondAuth(Recipe recipe) {
+        return buildCreate(recipe, PoolCreateTransactionBuilder.Mutation.none(), true,
+                BondLenderAuth.FIXTURE);
+    }
+
+    /**
      * As {@link #buildCreate}, but from a create builder whose reference-script wiring is omitted — the
      * pre-fix shape, in which the {@code pool.pool} policy travels both in the witness set and on a
      * reference input, and no reference-script fee is paid for it. <b>The gates still run</b>, which is
@@ -306,6 +334,11 @@ public final class LoanFactory {
 
     private Transaction buildCreate(Recipe recipe, PoolCreateTransactionBuilder.Mutation mutation,
                                     boolean gate) {
+        return buildCreate(recipe, mutation, gate, BondLenderAuth.RECIPE);
+    }
+
+    private Transaction buildCreate(Recipe recipe, PoolCreateTransactionBuilder.Mutation mutation,
+                                    boolean gate, BondLenderAuth bondAuth) {
         PoolCreateTransactionBuilder.Request request = new PoolCreateTransactionBuilder.Request(
                 recipe.seedUtxo(),
                 recipe.configUtxo(),
@@ -313,10 +346,12 @@ public final class LoanFactory {
                 funderAddress(recipe),
                 poolAddress(),
                 poolAssetName(recipe),
-                PoolTxEncoder.poolDatum(poolDatum(recipe)),
+                assertNoFixtureOriginConstants("the pool datum",
+                        PoolTxEncoder.poolDatum(poolDatum(recipe, bondAuth))),
                 recipe.params().poolLiquidityLovelace(),
                 poolManagerAddress(),
-                PoolTxEncoder.poolManagerDatum(poolManagerDatum(recipe)),
+                assertNoFixtureOriginConstants("the PoolManager datum",
+                        PoolTxEncoder.poolManagerDatum(poolManagerDatum(recipe))),
                 PoolFixtures.POOL_MANAGER_LOVELACE);
 
         Transaction tx = poolCreateBuilder.build(request, mutation);
@@ -392,6 +427,20 @@ public final class LoanFactory {
      * {@link GateFailure}.
      */
     public Transaction buildBorrow(Recipe recipe, Transaction poolCreateTx) {
+        return buildBorrow(recipe, poolCreateTx, BondLenderAuth.RECIPE);
+    }
+
+    /**
+     * The T-026 mutant: the borrow the pre-fix factory built, whose lender bond takes its
+     * {@code lenderAuth} from {@link LoanFixtures#PLACEHOLDER_AUTH_HASH} instead of from the recipe.
+     * Every gate still runs, and {@link #LENDER_AUTH_GATE} refuses it before a single byte is assembled.
+     * Package-private, no production caller.
+     */
+    Transaction buildBorrowWithFixtureBondAuth(Recipe recipe, Transaction poolCreateTx) {
+        return buildBorrow(recipe, poolCreateTx, BondLenderAuth.FIXTURE);
+    }
+
+    private Transaction buildBorrow(Recipe recipe, Transaction poolCreateTx, BondLenderAuth bondAuth) {
         Utxo poolUtxo = poolOutputZero(recipe, poolCreateTx);
         TransactionInput poolRef = new TransactionInput(TransactionUtil.getTxHash(poolCreateTx), 0);
         String bondAssetName = PoolTxEncoder.bondAssetName(poolRef);
@@ -417,9 +466,10 @@ public final class LoanFactory {
                 recipe.loanOutputLovelace(),
                 poolAssetName(recipe),
                 bondAssetName,
-                LoanFixtures.encode(loanDatum),
+                assertNoFixtureOriginConstants("the loan datum", LoanFixtures.encode(loanDatum)),
                 lenderBondAddress().getAddress(),
-                LoanFixtures.encode(bondDatum(recipe)),
+                assertNoFixtureOriginConstants("the lender bond datum",
+                        LoanFixtures.encode(bondDatum(recipe, bondAuth))),
                 recipe.lenderBondLovelace(),
                 recipe.borrowerBondLovelace(),
                 recipe.validFromSlot(),
@@ -726,6 +776,102 @@ public final class LoanFactory {
         }
     }
 
+    /** The gate's name, as it appears in every refusal it throws. */
+    private static final String LENDER_AUTH_GATE = "LENDER_AUTH_GATE";
+
+    /**
+     * <b>The T-026 gate: a bond this factory commits must name the recipe's lender, and nothing else.</b>
+     * <p>
+     * The bond's {@code lenderAuth} is the only key to the bond, to the ~3 ADA and the collateral it
+     * accrues, and to the asset-manager vault the bond NFT gates — and
+     * {@code PoolDatum.lenderBondInlineDatumHash} pins the bond datum by hash at <em>pool creation</em>,
+     * so this field can only be chosen once, in the transaction that creates the pool, and can never be
+     * corrected afterwards. There is no failure here: a bond naming an unsatisfiable authorisation
+     * builds green, dry-evaluates green, submits, and simply never opens again.
+     * <p>
+     * So this asserts the whole thing <b>positively</b> — the bond's {@code lenderAuth} must be exactly
+     * {@link #bondLenderAuth}, {@code CardanoSignature} over the recipe lender's own payment key hash.
+     * That is structural rather than a list: it does not enumerate bad values, it admits exactly one
+     * good one, so every placeholder — the known one and any future one — is refused as a consequence
+     * of not being the caller's credential. Hex case is not load-bearing, the constructor is.
+     * <p>
+     * <b>Package-private, return-consuming, and reachable in refusal.</b> Return-consuming so the call
+     * site in {@link #bondDatum(Recipe, BondLenderAuth)} cannot be deleted without a compile error;
+     * package-private so the mismatch arm can be driven by a doctored {@link Recipe}, which
+     * {@link #buildCreateWithFixtureBondAuth} cannot reach.
+     */
+    LenderManagerDatum assertBondAuthIsTheRecipeLender(Recipe recipe, LenderManagerDatum bond) {
+        AuthorizationMethod expected = bondLenderAuth(recipe);
+        AuthorizationMethod actual = bond.lenderAuth();
+        boolean agrees = actual instanceof AuthorizationMethod.CardanoSignature signature
+                && signature.hash().equalsIgnoreCase(
+                        ((AuthorizationMethod.CardanoSignature) expected).hash());
+        if (!agrees) {
+            throw new GateFailure(LENDER_AUTH_GATE + ": the lender bond would be committed with "
+                    + "lenderAuth " + actual + ", but the recipe's lender is " + expected
+                    + ". lm_withdraw_bonds_action demands exactly the datum's lenderAuth to release the "
+                    + "bond, and PoolDatum.lenderBondInlineDatumHash pins this datum at pool creation, "
+                    + "so a wrong value here locks the bond, its lovelace and the asset-manager vault it "
+                    + "gates, permanently and with no correction possible"
+                    + (isPlaceholder(actual) ? " — and this one is a LoanFixtures placeholder, for which "
+                            + "no private key exists at all" : ""));
+        }
+        return bond;
+    }
+
+    /** The gate's name, as it appears in every refusal it throws. */
+    private static final String FIXTURE_ORIGIN_GATE = "FIXTURE_ORIGIN_GATE";
+
+    /**
+     * <b>The second T-026 gate: no datum bound for chain may carry a test-scope placeholder.</b>
+     * <p>
+     * {@link #assertBondAuthIsTheRecipeLender} defends one field of one datum. This defends every field
+     * of every datum this factory commits, by refusing over the <em>serialised bytes</em>: if any
+     * constant in {@link LoanFixtures#PLACEHOLDER_CONSTANTS} appears anywhere in the CBOR that is about
+     * to be written into an output, the build stops. Reading the bytes rather than the fields is what
+     * makes it total — it cannot miss a field it was never told about, including a field added later.
+     * <p>
+     * <b>It is blind on the create, which is the transaction that matters most.</b> The pool datum
+     * carries the bond only as {@code lenderBondInlineDatumHash}, the 32-byte blake2b digest of the
+     * bond's serialised inline datum ({@code lib/fluidtokens/types/pool.ak}) — the bond's own bytes are
+     * nowhere in the pool's CBOR, so this byte scan cannot see a placeholder inside them. On the
+     * create, and only on the create, the pinning is <em>irrevocable</em>: that hash fixes the bond
+     * datum for the life of the pool. So on the create {@link #LENDER_AUTH_GATE} is the <b>sole</b>
+     * defence, and "every field of every datum" above means every field the factory writes out in the
+     * clear, not every field it commits to.
+     * <p>
+     * It is the belt to the other gate's braces, and it is deliberately the weaker of the two: it can
+     * only refuse placeholders that have been <em>named</em> in {@link LoanFixtures#PLACEHOLDER_CONSTANTS}.
+     * A brand-new unnamed placeholder is caught by the positive gate above where the field is an
+     * authorisation, and by nothing at all where it is not — which is why that set's javadoc is a
+     * standing obligation rather than a record.
+     * <p>
+     * Package-private: through the honest builders it never fires, so its refusing branch is driven
+     * directly with an encoded placeholder-bearing datum.
+     */
+    PlutusData assertNoFixtureOriginConstants(String what, PlutusData datum) {
+        String hex = datum.serializeToHex().toLowerCase();
+        for (String placeholder : LoanFixtures.PLACEHOLDER_CONSTANTS) {
+            if (hex.contains(placeholder.toLowerCase())) {
+                throw new GateFailure(FIXTURE_ORIGIN_GATE + ": " + what + " carries the LoanFixtures "
+                        + "placeholder " + placeholder + ", which is a hand-written test constant and "
+                        + "not a credential — nothing can ever satisfy it. It must not reach an output.");
+            }
+        }
+        return datum;
+    }
+
+    /** Whether an authorisation names one of the placeholders — for the refusal's wording only. */
+    private static boolean isPlaceholder(AuthorizationMethod auth) {
+        String hash = switch (auth) {
+            case AuthorizationMethod.CardanoSignature a -> a.hash();
+            case AuthorizationMethod.CardanoSpendScript a -> a.hash();
+            case AuthorizationMethod.CardanoWithdrawScript a -> a.hash();
+            case AuthorizationMethod.CardanoMintScript a -> a.hash();
+        };
+        return LoanFixtures.PLACEHOLDER_CONSTANTS.stream().anyMatch(hash::equalsIgnoreCase);
+    }
+
     private void assertBornLiquidatable(Recipe recipe) {
         try {
             PoolFixtures.assertBornLiquidatable(recipe.params(),
@@ -852,16 +998,122 @@ public final class LoanFactory {
                 Credential.fromScript(registry.getPoolManagerSpendScriptHash()), network).getAddress();
     }
 
-    /** The lender-bond template datum, at the recipe's fee and with this pool's NFT name as its poolId. */
-    private LenderManagerDatum bondDatum(Recipe recipe) {
-        return LoanFixtures.bondDatum(
-                BigInteger.valueOf(recipe.params().liquidationFeePerMille()),
-                LoanFixtures.noStakeCredential(), AssetType.ada(), poolAssetName(recipe));
+    /**
+     * Where the lender bond's {@code lenderAuth} is sourced from. The honest path has exactly one
+     * source; the other exists only so {@link #LENDER_AUTH_GATE} can be shown to refuse the defect.
+     */
+    enum BondLenderAuth {
+        /** {@link #bondLenderAuth} — the recipe's lender, the only source a committable bond may have. */
+        RECIPE,
+        /**
+         * {@link LoanFixtures#PLACEHOLDER_AUTH_HASH} — the T-026 defect reproduced exactly: the bond
+         * built by the pre-fix factory, which took its whole datum from the fixture. No production
+         * caller, and every gate still runs over it, which is the point.
+         */
+        FIXTURE
     }
 
-    private PoolTxEncoder.PoolDatum poolDatum(Recipe recipe) {
+    /**
+     * The lender bond's {@code lenderAuth}: {@code CardanoSignature(the recipe lender's payment key
+     * hash)} — a real credential the recipe supplies, never a constant this class reaches for.
+     *
+     * <h2>Why a signature, and deliberately <em>not</em> the pool's delegation</h2>
+     * The pool's own {@code lenderAuth} is {@link #lenderAuth()}, a
+     * {@code CardanoWithdrawScript(poolManagerPolicyId)} delegation (T-024, README:60). Copying that
+     * shape onto the bond would look symmetric and would hand the bond to the public. Read off the
+     * validators at upstream {@code ff005fb}:
+     * <ul>
+     *   <li><b>The delegation is satisfiable by anyone, forever — this is theft, not stranding.</b>
+     *       {@code CardanoWithdrawScript(h)} becomes {@code CardanoWithdrawScriptAuth}, and
+     *       {@code authorizer.authorize_action} discharges that with nothing but
+     *       {@code pairs.has_key(withdrawals, Script(h))}: it asks for a withdrawal, never for a
+     *       signature. {@code pool_manager.ak}'s {@code withdraw} then only demands that the action
+     *       script named by the redeemer withdraw in the same transaction, and for
+     *       {@code UpdatePoolManager} that is {@code pm_update_pool_manager}, whose entire body is
+     *       {@code list.length(poolInputs) == 0} and {@code utils.indexed_all(poolManagerInputs, …)}.
+     *       {@code utils.indexed_all} is {@code list.indexed_foldr(self, True, …)}, so on an
+     *       <b>empty</b> list it returns {@code True} without ever invoking the predicate — and the
+     *       {@code poolOwnerAuth} check lives <em>inside</em> that predicate. A transaction with no
+     *       pool inputs and no PoolManager inputs therefore satisfies the delegation unconditionally;
+     *       its only surviving requirement is the config NFT reference input, which is
+     *       protocol-permanent. (It also needs those two withdrawal credentials to be registered
+     *       reward accounts — the same registrations every honest pool cancel already depends on.) A
+     *       bond carrying this shape could be withdrawn by any passer-by, taking its lovelace, its
+     *       collateral, and the asset-manager vault the bond NFT gates.</li>
+     *   <li><b>A key hash is what keeps the bond the lender's alone, and two validators read it.</b>
+     *       {@code lm_withdraw_bonds_action.ak:23-26} destructures {@code lenderAuth} from the bond's
+     *       inline datum and passes it to {@code authorizer.create_auth} / {@code authorize_action};
+     *       for {@code CardanoSignature} that is {@code list.has(extra_signatories, hash)}, which
+     *       nobody but the holder of that key can produce. {@code lm_liquidate_and_convert_action.ak}
+     *       is the second reader: it destructures the same field out of the bond datum ({@code :149})
+     *       and writes it into the Minswap order it forces —
+     *       {@code canceller: minswap_conversions.to_order_auth_method(lenderAuth)} ({@code :249}),
+     *       where {@code CardanoSignature} maps to {@code OAMSignature{pub_key_hash}}. So this field
+     *       also decides who may cancel or refund a stuck conversion order, and a signature serves
+     *       that reader correctly too.</li>
+     *   <li><b>The bond withdrawal's own dependencies are protocol-permanent, not pool-scoped.</b> It
+     *       is not dependency-free: {@code lender_manager.ak} requires the LM config NFT reference
+     *       input and a withdrawal at the config's {@code lmWithdrawBondsActionScriptHash}. Neither
+     *       can be burnt by cancelling a pool, which is the distinction that matters — unlike the
+     *       delegation, whose reachability the lender does not control. Publication is a separate
+     *       question from satisfiability: an unpublished script can still travel in the witness set,
+     *       so {@link PoolFixtures#unpublishedPoolManagerScripts()} says nothing either way.</li>
+     *   <li><b>Nothing constrains the field in the opposite direction.</b>
+     *       {@code lm_liquidate_action.ak} never reads {@code lenderAuth} at all, and both it
+     *       ({@code :149}) and the convert variant ({@code :316}) require
+     *       {@code builtin.equals_data(lenderBondInput.output, lenderBondOutput)}, so the bond travels
+     *       through a liquidation byte-identical. The readers want nothing incompatible.</li>
+     *   <li><b>Why the pool's field may be the delegation and the bond's may not: whether the
+     *       consuming transaction spends a pool.</b> Both readers of the <em>pool's</em>
+     *       {@code lenderAuth} — {@code pool_cancel_action.ak:49} and
+     *       {@code pool_compound_action.ak:99} — iterate {@code poolInputs}, so they run only when a
+     *       pool is spent. {@code poolInputs > 0} fails {@code pm_update_pool_manager}'s
+     *       {@code list.length(poolInputs) == 0}, closing the empty-list hatch and forcing the
+     *       transaction through {@code pm_cancel_pool_manager}, which re-checks {@code poolOwnerAuth}
+     *       per PoolManager input, or through {@code pm_compound_liquidity}, which does not re-check
+     *       it but permits only a compound — and {@code pool_compound_action} requires
+     *       {@code addedPrincipal > 0} with the pool's datum, address and remaining value unchanged,
+     *       so that path can only donate to the pool. Withdrawing a bond spends no pool, which is
+     *       precisely why the hatch opens there and nowhere else.</li>
+     *   <li>The README constrains only the <em>pool's</em> field ("The pool lenderAuth field must be set
+     *       as the Withdraw script hash of the PoolManager", README:60). It says nothing about the
+     *       bond's, which {@code lib/fluidtokens/types/lender_manager.ak} annotates as "Auth to get the
+     *       lender bond back".</li>
+     *   <li>It also unlocks the vault: {@code asset_manager.ak}'s withdraw over an
+     *       {@code AssetManagerDatumWithToken} requires the bond NFT to be a transaction <b>input</b>,
+     *       and spending the bond runs {@code lender_manager.ak} → {@code WithdrawBonds} → this check.</li>
+     * </ul>
+     */
+    private AuthorizationMethod bondLenderAuth(Recipe recipe) {
+        return new AuthorizationMethod.CardanoSignature(
+                HexUtil.encodeHexString(lenderKeyHash(recipe)));
+    }
+
+    /** The lender-bond template datum, at the recipe's fee and with this pool's NFT name as its poolId. */
+    private LenderManagerDatum bondDatum(Recipe recipe) {
+        return bondDatum(recipe, BondLenderAuth.RECIPE);
+    }
+
+    /**
+     * The bond datum, composed from {@code source} and then <b>gated</b> — so both the create (which
+     * hash-pins this datum into the pool) and the borrow (which emits its bytes) pass through
+     * {@link #assertBondAuthIsTheRecipeLender} before anything is assembled.
+     */
+    private LenderManagerDatum bondDatum(Recipe recipe, BondLenderAuth source) {
+        LenderManagerDatum bond = switch (source) {
+            case RECIPE -> LoanFixtures.bondDatum(bondLenderAuth(recipe),
+                    BigInteger.valueOf(recipe.params().liquidationFeePerMille()),
+                    LoanFixtures.noStakeCredential(), AssetType.ada(), poolAssetName(recipe));
+            case FIXTURE -> LoanFixtures.bondDatum(
+                    BigInteger.valueOf(recipe.params().liquidationFeePerMille()),
+                    LoanFixtures.noStakeCredential(), AssetType.ada(), poolAssetName(recipe));
+        };
+        return assertBondAuthIsTheRecipeLender(recipe, bond);
+    }
+
+    private PoolTxEncoder.PoolDatum poolDatum(Recipe recipe, BondLenderAuth source) {
         return PoolFixtures.poolDatum(recipe.params(), lenderAuth(), lenderBondAddress(),
-                PoolFixtures.bondInlineDatumHash(bondDatum(recipe)));
+                PoolFixtures.bondInlineDatumHash(bondDatum(recipe, source)));
     }
 
     /**

@@ -47,6 +47,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Synthetic Lending v4 fixtures for {@link LiquidateTransactionBuilderTest}.
@@ -269,6 +270,75 @@ public final class LoanFixtures {
         return constr(2);
     }
 
+    // ---- the placeholder constants, named so the on-chain path can refuse them ----------------
+
+    /**
+     * The hand-written authorisation hash every no-auth {@link #bondDatum} overload stamps —
+     * <b>28 bytes of arithmetic ramp</b>: 11, 18, 25, 32 … 200, step 7. It is not a key hash and it is
+     * not a script hash; <b>no private key and no script exists for it</b>, so nothing on earth can
+     * satisfy an {@code AuthorizationMethod} that names it.
+     *
+     * <h2>Why it now has a name</h2>
+     * It reached chain. A pool originated through {@code LoanFactory} carried a lender bond whose
+     * {@code lenderAuth} was this constant, and {@code lm_withdraw_bonds_action.ak} demands exactly that
+     * authorisation to release the bond — so the bond, the ~3.17 ADA and 9,000,000 tFLDT behind it, and
+     * the asset-manager vault the bond NFT gates ({@code asset_manager.ak} wants the bond as a
+     * transaction <em>input</em>) are unrecoverable at any price. {@code PoolDatum.lenderBondInlineDatumHash}
+     * pins the bond datum by hash at pool creation, so pool creation is the only moment the bond's
+     * authorisation can ever be chosen and there is no later correction.
+     * <p>
+     * Naming it is what lets {@code LoanFactory}'s {@code FIXTURE_ORIGIN_GATE} refuse any datum whose
+     * serialised bytes contain it, instead of the on-chain path being defended by nothing but the hope
+     * that a test constant stays in tests.
+     *
+     * <h2>It stays here, and it stays in use</h2>
+     * Every fixture bond in the offline liquidation suites carries it, and that is <em>correct</em> — but
+     * for a narrower reason than this javadoc used to give. It claimed "none of the liquidation validators
+     * reads {@code lenderAuth} at all". <b>That is false, and the correction is recorded here rather than
+     * quietly deleted, because the false version is the one a reader would find plausible.</b> Only the
+     * parenthetical survives: {@code lm_liquidate_action.ak:149} indeed reads no {@code lenderAuth}, it
+     * requires {@code equals_data(lenderBondInput.output, lenderBondOutput)}. But
+     * {@code lm_liquidate_and_convert_action.ak} <em>does</em> read it — destructured from the bond's inline
+     * datum at {@code :145-152} and written into the Minswap order as
+     * {@code canceller: to_order_auth_method(lenderAuth)} at {@code :249}, i.e. it decides who may cancel or
+     * refund a stuck conversion order.
+     * <p>
+     * So the real reason these fixtures are safe is <b>that they are never submitted</b>, not that nothing
+     * reads the field. On the convert path this constant would be copied into a real order's
+     * {@code canceller}, and no key exists for it — the order would be uncancellable by anyone. Nothing is
+     * broken today because we do not build that path; if we ever do, these fixtures must not reach it. {@code LiquidationTxEncoderTest} also uses the same 28 bytes as a synthetic
+     * <em>policy id</em> — likewise legitimate test scope. The defect was never the constant; it was the
+     * committable path reaching for it.
+     */
+    public static final String PLACEHOLDER_AUTH_HASH =
+            "0b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8";
+
+    /**
+     * Every hand-written placeholder in this class that must never appear in a datum bound for chain,
+     * as lowercase hex. {@code LoanFactory}'s {@code FIXTURE_ORIGIN_GATE} refuses a datum whose
+     * serialised bytes contain any of them, in any field — so a future placeholder is defended the
+     * moment it is added here, without the gate needing to know which field it might land in.
+     *
+     * <h2>What this set is not</h2>
+     * It is not "every synthetic value in test scope". {@link #botAddress()}'s {@code 11…} / {@code 22…}
+     * key hashes are deliberately absent: those arrive at the factory through the caller's
+     * {@code Recipe}, as the caller's declared identity, and the offline rig legitimately declares a
+     * synthetic lender because it never submits. The factory cannot adjudicate whether a caller holds a
+     * key — that is what {@code LoanFactoryOnChainRunnerTest}'s mnemonic-derives-wallet-B check is for.
+     * <p>
+     * Nor is it a guarantee that the factory never <em>substitutes</em> a constant of its own for a
+     * caller-supplied value — an earlier revision of this javadoc claimed exactly that, and it is not
+     * true. What the set enforces is narrower and purely mechanical: <b>none of the values named here
+     * may appear in the serialised bytes of a datum bound for an output.</b> A substitution by a
+     * constant that is <em>not</em> named here goes straight through, and one such substitution is
+     * live and known: {@code PoolFixtures.poolDatum} writes {@code List.of(PoolFixtures.COLLATERAL)}
+     * as the pool's {@code collateralOptions} whatever {@code Recipe.collateralAsset()} says, and
+     * {@code COLLATERAL} is deliberately not in this set (it is a real preview asset with a real
+     * oracle, so the offline rig needs it to evaluate). Adding a constant here is what brings it under
+     * the gate; being a constant is not enough.
+     */
+    public static final Set<String> PLACEHOLDER_CONSTANTS = Set.of(PLACEHOLDER_AUTH_HASH);
+
     // ---- datums ------------------------------------------------------------------------------
 
     /**
@@ -360,9 +430,21 @@ public final class LoanFixtures {
                                                PlutusData stakeCredential,
                                                AssetType principalAsset,
                                                String poolIdHex) {
+        return bondDatum(new AuthorizationMethod.CardanoSignature(PLACEHOLDER_AUTH_HASH),
+                liquidationFeePerMille, stakeCredential, principalAsset, poolIdHex);
+    }
+
+    /**
+     * As above, with the {@code lenderAuth} supplied by the caller — the overload anything that builds
+     * a <b>committable</b> bond must use, because every other one stamps {@link #PLACEHOLDER_AUTH_HASH}.
+     */
+    public static LenderManagerDatum bondDatum(AuthorizationMethod lenderAuth,
+                                               BigInteger liquidationFeePerMille,
+                                               PlutusData stakeCredential,
+                                               AssetType principalAsset,
+                                               String poolIdHex) {
         return new LenderManagerDatum(
-                new AuthorizationMethod.CardanoSignature(
-                        "0b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8"),
+                lenderAuth,
                 stakeCredential,
                 false,
                 liquidationFeePerMille,
