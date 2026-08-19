@@ -84,6 +84,12 @@ loans:
     # Published reference-script UTxOs, one `txHash#index` per validator a Liquidate invokes. Empty
     # means "not published" and that validator travels in the witness set instead.
     #
+    # Resolution rule, per validator: a coordinate configured here for a validator -- and verified
+    # resolvable on chain by LoansReferenceScriptVerifier at startup -- means that validator travels
+    # by reference; an unconfigured (empty) coordinate means it travels inline in the witness set.
+    # At least one validator must be referenced: six inline validators total 18_584 bytes, over the
+    # 16_384-byte maxTxSize, so "all inline" cannot build.
+    #
     # This is not a tuning knob, it is the difference between a buildable and an unbuildable
     # transaction. Measured: the six applied validators total 18_584 bytes against a maxTxSize of
     # 16_384, and a real single-loan liquidation measured in shadow mode came to 19_838 bytes with no
@@ -171,6 +177,12 @@ loans:
     # an answer and not an outage. asset-manager is deliberately left empty: a plain Liquidate only
     # *creates* asset-manager outputs and never spends one, so its script is neither attached nor
     # needed; publishing a coordinate for it would only add a reference input and its fee.
+    #
+    # Resolution rule, per validator: a coordinate configured here for a validator -- and verified
+    # resolvable on chain by LoansReferenceScriptVerifier at startup -- means that validator travels
+    # by reference; an unconfigured (empty) coordinate means it travels inline in the witness set.
+    # At least one validator must be referenced: six inline validators total 18_584 bytes, over the
+    # 16_384-byte maxTxSize, so "all inline" cannot build.
     #
     # Without these the transaction cannot fit: 18_584 bytes of validators against a 16_384-byte
     # maxTxSize, and a measured 19_838-byte single-loan liquidation with none of them referenced.

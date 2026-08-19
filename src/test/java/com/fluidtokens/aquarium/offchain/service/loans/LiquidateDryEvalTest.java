@@ -381,6 +381,49 @@ class LiquidateDryEvalTest {
         assertWithinBudget(results);
     }
 
+    /**
+     * <b>The consolidated proof, in one test: why at least one validator must travel by reference.</b>
+     * <p>
+     * The two tests above prove the two halves separately — redeemer coverage for the all-inline
+     * shape ({@link #oneAdaLoanWithZeroEquityEvaluatesAgainstTheDeployedValidators}), size for the
+     * fully-referenced shape ({@link #oneAdaLiquidationFitsUnderMaxTxSizeOnceTheReferenceScriptsAreResolved})
+     * — but neither one measures the all-inline size, so the "18,584 &gt; 16,384" claim documented in
+     * {@code application.yaml}'s {@code reference-scripts} comment was never itself a regression-locked
+     * assertion. This test rebuilds the SAME scenario A in both arrangements, evaluates both against
+     * the real PlutusV3 machine, and measures both sizes side by side, so the boundary the resolution
+     * rule depends on cannot silently move.
+     */
+    @Test
+    void theRefVsInlineBoundaryOnScenarioA() {
+        Scenario scenario = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+        List<Utxo> universe = universe(List.of(scenario));
+
+        // All six validators inline: this is what oneAdaLoanWithZeroEquityEvaluatesAgainstTheDeployed-
+        // Validators() also builds and evaluates; here its size is measured too.
+        Transaction allInline = build(List.of(scenario));
+        List<EvaluationResult> inlineResults = EvalFixtures.evaluate(allInline, universe, REGISTRY);
+        assertRedeemerCoverage(allInline, inlineResults);
+        int inlineSize = serializedSize(allInline);
+
+        // All six validators referenced, resolved through the reference-script UTxOs in the universe.
+        Transaction fullyReferenced = build(List.of(scenario), PUBLISHED);
+        List<Utxo> referencedUniverse = new ArrayList<>(universe);
+        referencedUniverse.addAll(referenceScriptUtxos());
+        List<EvaluationResult> referencedResults =
+                EvalFixtures.evaluate(fullyReferenced, referencedUniverse, REGISTRY);
+        assertRedeemerCoverage(fullyReferenced, referencedResults);
+        int referencedSize = serializedSize(fullyReferenced);
+
+        log.info("Liquidate N=1 ada/ada boundary: all-inline {} bytes, fully-referenced {} bytes "
+                + "(maxTxSize {})", inlineSize, referencedSize, MAX_TX_SIZE);
+        assertTrue(inlineSize > MAX_TX_SIZE,
+                "all-inline is " + inlineSize + " bytes; must exceed maxTxSize " + MAX_TX_SIZE
+                        + " -- this is why at least one validator must travel by reference");
+        assertTrue(referencedSize < MAX_TX_SIZE,
+                "fully-referenced is " + referencedSize + " bytes; must fit under maxTxSize "
+                        + MAX_TX_SIZE);
+    }
+
     // ======================================================================================
     // N = 2
     // ======================================================================================
