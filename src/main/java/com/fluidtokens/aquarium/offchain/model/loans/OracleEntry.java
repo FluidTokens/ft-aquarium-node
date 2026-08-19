@@ -66,13 +66,20 @@ public record OracleEntry(AssetType token,
     /**
      * Whether a liquidation could actually be built against this oracle today.
      * <p>
-     * A price is not sufficient. {@code AGGREGATED}/{@code DEDICATED} feeds need enough resolved
-     * signatures; a {@code PRICE_DATA_CHARLIE} feed carries none at all — it is validated
-     * structurally against {@link #charlieProviderReferenceInput}, so it is usable exactly when
-     * that reference input is known. {@code PRICE_DATA_ORCFAX}/{@code POOLED} are not modelled and
-     * stay unusable.
+     * A price is not sufficient. First, no parseable {@code fluidOracle.referenceInput} means no
+     * liquidation can be built for <em>any</em> variant — {@code retrieve_oracle_data} requires that
+     * reference input (the UTxO holding {@link #oracleToken}) to be present, and a
+     * {@code null} {@link #referenceInput} is a parse-time property that never resolves later — so
+     * this fails closed regardless of signatures or Charli3 backing. Beyond that:
+     * {@code AGGREGATED}/{@code DEDICATED} feeds need enough resolved signatures; a
+     * {@code PRICE_DATA_CHARLIE} feed carries none at all — it is validated structurally against
+     * {@link #charlieProviderReferenceInput}, so it is usable exactly when that reference input is
+     * known. {@code PRICE_DATA_ORCFAX}/{@code POOLED} are not modelled and stay unusable.
      */
     public boolean usableForLiquidation() {
+        if (referenceInput == null) {
+            return false;
+        }
         return switch (feed.variant()) {
             case AGGREGATED, DEDICATED -> hasEnoughSignatures();
             case PRICE_DATA_CHARLIE -> charlieProviderReferenceInput != null;

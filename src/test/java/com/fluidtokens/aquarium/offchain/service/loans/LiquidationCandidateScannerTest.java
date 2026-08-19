@@ -107,6 +107,45 @@ class LiquidationCandidateScannerTest {
         return entry(token, price, VALID_FROM, VALID_TO, 1, true);
     }
 
+    /**
+     * Identical to {@link #entry(AssetType, long)} but with a malformed {@code
+     * fluidOracle.referenceInput} ({@code "#0"} — an empty transaction id), so the parsed
+     * {@link OracleEntry} carries a null reference input. Signatures, validity window and price are
+     * all well-formed, so the entry is priceable and meets its signature threshold; only the oracle
+     * NFT reference input fails to resolve.
+     */
+    private static String entryWithMalformedOracleReferenceInput(AssetType token, long price) {
+        return """
+                {
+                  "active": true,
+                  "preferredOracle": "multisig",
+                  "token": { "policyId": "%s", "assetName": "%s" },
+                  "fluidOracle": {
+                    "policyId": "%s",
+                    "assetName": "%s",
+                    "rewardAddress": "%s",
+                    "referenceInput": "#0",
+                    "referenceScript": "bb00000000000000000000000000000000000000000000000000000000000000#0"
+                  },
+                  "multisigOracle": { "publicKeys": ["%s"], "requiredSignatures": 1 },
+                  "supportedOracle": {
+                    "multisig": {
+                      "validFrom": %d,
+                      "validTo": %d,
+                      "tokenPriceInLovelaces": %d,
+                      "tokenPriceDenominator": 1,
+                      "multisigOracle": {
+                        "requiredSignatures": 1,
+                        "signatures": [{ "publicKey": "%s", "signature": "ff" }]
+                      }
+                    }
+                  }
+                }
+                """.formatted(token.policyId(), token.assetName(),
+                oracleTokenFor(token).policyId(), oracleTokenFor(token).assetName(), REWARD_ADDRESS,
+                "0".repeat(64), VALID_FROM, VALID_TO, price, "0".repeat(64));
+    }
+
     private static FluidOracleClient oracleClientWith(String... entries) throws Exception {
         var client = new FluidOracleClient("http://unused.invalid");
         client.load(new ObjectMapper().readTree("[" + String.join(",", entries) + "]"));
@@ -363,6 +402,27 @@ class LiquidationCandidateScannerTest {
         var loan = loan(datum, BigInteger.valueOf(1_000));
         var client = oracleClientWith(
                 entry(PRINCIPAL, 5, VALID_FROM, VALID_TO, 1, false), // no signatures published
+                entry(COLLATERAL, 2));
+
+        var assessment = scanOne(List.of(loan), List.of(permissiveBond()), client);
+
+        assertEquals(LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE, assessment.exclusion());
+        assertTrue(assessment.detail().contains("not usable for liquidation"), assessment.detail());
+    }
+
+    /**
+     * T-012: a principal-leg oracle whose {@code fluidOracle.referenceInput} failed to parse (null
+     * reference input) cannot have a liquidation built against it — {@code retrieve_oracle_data}
+     * requires that reference input. The loan is otherwise buildable (late, with a valid collateral
+     * feed), so this isolates the principal oracle leg. Against code without the fail-closed guard
+     * this loan is buildable, because the malformed entry still meets its signature threshold.
+     */
+    @Test
+    void principalLegWithAnUnparseableOracleReferenceInputIsExcluded() throws Exception {
+        var datum = lateDatum(-1); // late, so buildable if the principal leg were usable
+        var loan = loan(datum, BigInteger.valueOf(1_000_000_000));
+        var client = oracleClientWith(
+                entryWithMalformedOracleReferenceInput(PRINCIPAL, 5),
                 entry(COLLATERAL, 2));
 
         var assessment = scanOne(List.of(loan), List.of(permissiveBond()), client);

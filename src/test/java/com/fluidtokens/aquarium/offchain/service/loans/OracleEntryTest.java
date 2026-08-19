@@ -369,4 +369,123 @@ class OracleEntryTest {
         assertNull(entry.charlieProviderReferenceInput(),
                 "only a c3-preferred entry may capture a Charli3 reference input");
     }
+
+    /**
+     * A multisig entry can meet its signature threshold and still be unbuildable: {@code
+     * retrieve_oracle_data} requires the oracle NFT reference input, and a malformed {@code
+     * fluidOracle.referenceInput} ({@code "#0"} — an empty transaction id) parses to a null
+     * reference input. {@link OracleEntry#usableForLiquidation()} must fail closed on that null even
+     * though every signature is present.
+     */
+    @Test
+    void aMultisigEntryWithAnUnparseableReferenceInputIsNotUsableForLiquidation() throws Exception {
+        String key = "0".repeat(64);
+        String json = """
+                [{
+                  "active": true,
+                  "preferredOracle": "multisig",
+                  "token": { "policyId": "33333333333333333333333333333333333333333333333333333333", "assetName": "" },
+                  "fluidOracle": {
+                    "policyId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "assetName": "6f7261636c65",
+                    "rewardAddress": "stake1799y3huw4j0n4weehlx3t6xvst50ge0vuv32ghk50mm7hwg5ucz8p",
+                    "referenceInput": "#0",
+                    "referenceScript": "bb00000000000000000000000000000000000000000000000000000000000000#0"
+                  },
+                  "multisigOracle": { "publicKeys": ["%s"], "requiredSignatures": 1 },
+                  "supportedOracle": {
+                    "multisig": {
+                      "validFrom": 1786000000000,
+                      "validTo": 1786000600000,
+                      "tokenPriceInLovelaces": 1,
+                      "tokenPriceDenominator": 1,
+                      "multisigOracle": {
+                        "requiredSignatures": 1,
+                        "signatures": [{ "publicKey": "%s", "signature": "ff" }]
+                      }
+                    }
+                  }
+                }]
+                """.formatted(key, key);
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new ObjectMapper().readTree(json));
+        var entry = client.findEntry(
+                new AssetType("33333333333333333333333333333333333333333333333333333333", "")).orElseThrow();
+
+        assertNotNull(entry.feed().price(), "still priceable despite the malformed reference input");
+        assertNull(entry.referenceInput(), "an empty transaction id resolves to no reference UTxO");
+        assertTrue(entry.hasEnoughSignatures(), "the signature threshold is met");
+        assertFalse(entry.usableForLiquidation(),
+                "no parseable oracle reference input means no liquidation can be built, signatures notwithstanding");
+    }
+
+    /**
+     * The c3 twin of {@link #aMultisigEntryWithAnUnparseableReferenceInputIsNotUsableForLiquidation()}:
+     * a c3 entry whose Charli3 provider reference input parses fine (so {@link
+     * OracleEntry#charlieProviderReferenceInput()} is non-null) but whose {@code
+     * fluidOracle.referenceInput} is malformed. The oracle NFT reference input is required for a c3
+     * feed too, so a null one must fail closed — the guard is one invariant over every variant.
+     */
+    @Test
+    void aC3EntryWithAnUnparseableFluidOracleReferenceInputIsNotUsableForLiquidation() throws Exception {
+        String json = """
+                [{
+                  "active": true,
+                  "preferredOracle": "c3",
+                  "token": { "policyId": "44444444444444444444444444444444444444444444444444444444", "assetName": "" },
+                  "fluidOracle": {
+                    "policyId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "assetName": "6f7261636c65",
+                    "rewardAddress": "stake1799y3huw4j0n4weehlx3t6xvst50ge0vuv32ghk50mm7hwg5ucz8p",
+                    "referenceInput": "#0",
+                    "referenceScript": "bb00000000000000000000000000000000000000000000000000000000000000#0"
+                  },
+                  "supportedOracle": {
+                    "c3": {
+                      "referenceInput": "aa00000000000000000000000000000000000000000000000000000000000000#0",
+                      "validFrom": 1786000000000,
+                      "validTo": 1786000600000,
+                      "tokenPriceInLovelaces": 1,
+                      "tokenPriceDenominator": 1
+                    }
+                  }
+                }]
+                """;
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new ObjectMapper().readTree(json));
+        var entry = client.findEntry(
+                new AssetType("44444444444444444444444444444444444444444444444444444444", "")).orElseThrow();
+
+        assertEquals(OraclePriceFeed.Variant.PRICE_DATA_CHARLIE, entry.feed().variant());
+        assertNotNull(entry.charlieProviderReferenceInput(),
+                "the Charli3 provider reference input parsed fine — only fluidOracle.referenceInput is malformed");
+        assertNull(entry.referenceInput(), "an empty transaction id resolves to no reference UTxO");
+        assertFalse(entry.usableForLiquidation(),
+                "the oracle NFT reference input is required for a c3 feed too, so a null one fails closed");
+    }
+
+    /**
+     * T-012(b): the transaction id must be exactly 64 hex characters. A shorter, longer, or non-hex
+     * id resolves to no UTxO; a well-formed 64-hex id parses in either case — the pattern is
+     * {@code [0-9a-fA-F]}, so case must not be rejected.
+     */
+    @Test
+    void utxoRefRequiresExactlySixtyFourHexForTheTransactionId() {
+        assertNull(FluidOracleClient.utxoRef("a".repeat(63) + "#0"), "63 hex chars is too short");
+        assertNull(FluidOracleClient.utxoRef("a".repeat(65) + "#0"), "65 hex chars is too long");
+        assertNull(FluidOracleClient.utxoRef("a".repeat(63) + "g#0"),
+                "64 chars with a non-hex char is not a transaction id");
+
+        String lower = "ab".repeat(32); // 64 lowercase hex chars
+        var fromLower = FluidOracleClient.utxoRef(lower + "#0");
+        assertNotNull(fromLower, "a valid lowercase 64-hex id parses");
+        assertEquals(lower, fromLower.getTransactionId());
+        assertEquals(0, fromLower.getIndex());
+
+        String mixed = "AbCdEf0123456789".repeat(4); // 64 mixed/upper-case hex chars
+        var fromMixed = FluidOracleClient.utxoRef(mixed + "#0");
+        assertNotNull(fromMixed, "case must not be rejected — the pattern accepts [0-9a-fA-F]");
+        assertEquals(mixed, fromMixed.getTransactionId());
+        assertEquals(0, fromMixed.getIndex());
+    }
 }
