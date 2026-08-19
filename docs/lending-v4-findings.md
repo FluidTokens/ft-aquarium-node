@@ -882,3 +882,70 @@ A defense-in-depth boundary worth knowing for whoever builds the compound / sell
 the guarantee is *we build the tx correctly*, not *the chain protects us*. That distinction is exactly
 the kind that reads as safe until the day an off-chain bug sends recovery to the wrong address with no
 validator to catch it.
+
+## 15. The Pool Manager NFT convention, the orphan lock, and a self-inflicted footgun (verified at `ff005fb`, 2026-08-19)
+
+**Provenance: found when FluidTokens flagged that our factory's pool "didn't mint a pool manager nft".
+Read at `ff005fb`; some points reproduced against the real deployed validators via dry-eval (T-024).**
+
+**The PM NFT is optional at the validator, expected by convention.** `validators/pool.ak` never mentions
+the pool manager; the pairing is enforced only from the PM side (`pool_manager.ak`'s mint checks the pool
+mint, not the reverse). README: mandatory *"for automatic compounding"*, *"otherwise leave it empty"*.
+So a PM-less pool is a legitimate configuration that **can never be compounded by anyone** — nothing is
+lost, but `lm_compound_action` / `lm_liquidate_pay_in_advance_and_compound_action` cannot be built
+against it (`poolId != ""` gate plus a required PM UTxO that does not exist). Liquidations are unaffected.
+
+**The orphan lock (D-15).** `pool_cancel_action` constrains no mint but the pool NFT's own, so a pool can
+be cancelled **without** burning its PoolManager — and `pm_cancel_pool_manager.ak:55,87-91` then requires
+a **live pool holding the matching NFT**, so the orphaned PM UTxO becomes permanently unspendable (its
+min-ADA only). A front-end that always co-burns avoids it; a hand-built cancel would not. Our T-024 cancel
+path burns the PM in the same transaction and, with the pool's `lenderAuth` delegating to the PM, refuses
+outright to cancel without it.
+
+**The `//No staking check here` comment at `pool_manager.ak:166` is stale.** It claims *"We don't check
+the destination of the minted NFTs"*, but `:121-127` enforces `Script(poolManagerSpendScriptHash)`, a
+single token at quantity 1, and a well-typed `PoolManagerDatum`. The code is stronger than its comment.
+
+**The self-inflicted footgun (D-16) — unreachable as an attack, real as a footgun.** A bond's
+`lenderAuth` is read by `lm_withdraw_bonds_action` to release the bond, and by
+`lm_liquidate_and_convert_action` (written into a Minswap order's `canceller`). If it were
+`CardanoWithdrawScript(poolManagerPolicyId)`, satisfying it needs only a withdrawal from
+`pool_manager.poolManager` → `pm_update_pool_manager`, whose body is
+`and { length(poolInputs) == 0, indexed_all(poolManagerInputs, …poolOwnerAuth…) }` — and
+`utils.indexed_all` **returns `True` on an empty list** (`utils.ak:203-209`), so a tx with zero pool
+inputs and zero PM inputs satisfies it unconditionally (only the config NFT reference input survives).
+The bond-spend path has **no second gate** (`lm_withdraw_bonds_action.ak:19-25` asserts only
+`authorize_action(lenderAuth)` — no output, no value preservation, no signature). **So a bond delegated
+that way is withdrawable by anyone, along with the asset-manager vault its NFT gates.**
+
+BUT it is **UNREACHABLE by a third party**: `pool_borrow_action.ak:356-357` fixes the bond datum to
+`blake2b_256(serialise(datum)) == poolDatum.lenderBondInlineDatumHash`, pre-committed by the **pool
+creator** at pool creation — not copied from the pool's own `lenderAuth`, not free-form per-borrow, not
+influenceable by any borrower or attacker. The only party who can commit the vulnerable shape is the
+bond's own owner, against their own interest; FluidTokens' tooling commits a `CardanoSignature`
+(observed: preview loan `714e923d…`, bond auth `CardanoSignature(ea1bb1cc…)`). **Verdict: footgun with a
+live trigger nobody sane pulls, not an exploitable vulnerability. Advisory to FT optional; no PoC, no
+security disclosure.** Not exhaustively verified: no chain-wide scan of live bond datums for a
+delegation-shaped preimage.
+
+**Why our pool delegation (T-024) is safe from the same hole.** Every path that consumes the *pool's*
+`lenderAuth` (`pool_cancel_action.ak:49`, `pool_compound_action.ak:99`) **spends a pool**, so
+`poolInputs > 0` fails `pm_update`'s `length(poolInputs) == 0` and forces the tx through
+`pm_cancel_pool_manager` (re-checks `poolOwnerAuth`) or `pm_compound_liquidity`. The empty-fold hatch
+opens only where there is no pool input — the bond withdrawal — and that is exactly where we use a
+signature, not the delegation.
+
+**D-17 — `pm_compound_liquidity` authorises nothing of its own.** Its body gates purely on two sibling
+redeemers' action tags (the pool withdraw redeemer is `Compound`, the LM withdraw redeemer is one of the
+compound actions). The "pool owner authorises compound" reading is *not* what the validators do — the
+authorisation chain is circular (`pool_compound_action` → PM delegation → `pool_manager.withdraw` →
+`pm_compound_liquidity` → back to `pool_compound_action`'s redeemer tag) and is benign only because
+`pool_compound_action` independently constrains the output to `addedPrincipal > 0` with the pool's datum,
+address and remaining value `equals_data`-identical, so that branch can only *donate* to the pool.
+
+**D-18 — `indexed_all([]) == True` is a general vacuity shape, not a one-off.** Any validator whose only
+real check lives inside an `indexed_all` / `list.all` predicate is unconditionally satisfiable when the
+iterated list is empty. `pm_update_pool_manager` is where it bites because it also demands the list be
+empty (`length(poolInputs) == 0`). Other call sites are protected by an outer non-emptiness constraint or
+by being irrelevant when empty — a per-site accident, not a property of the helper. Worth an upstream
+audit note.
