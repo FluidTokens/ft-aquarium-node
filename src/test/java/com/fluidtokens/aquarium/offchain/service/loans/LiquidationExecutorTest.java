@@ -434,7 +434,8 @@ class LiquidationExecutorTest {
         LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder, log, oracles,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder,
+                LoanFixtures.registry(), log, oracles,
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles);

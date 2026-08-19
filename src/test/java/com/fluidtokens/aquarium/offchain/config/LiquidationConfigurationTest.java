@@ -141,6 +141,40 @@ class LiquidationConfigurationTest {
         assertEquals("[DISABLED, SHADOW, LIVE]", Arrays.toString(Mode.values()));
     }
 
+    // ---- the profitability floors, and their safe defaults ------------------------------------
+
+    /**
+     * The convenience constructors — the ones that do not state the floors — default to the SPEC §3
+     * safe pair: profitability checking ON and the absolute floor at zero. The pair is safe because a
+     * floor that is active but permits any non-negative floored profit still refuses a loss, whereas a
+     * checking-off default would let the very loss E5-A/E5-B exist to catch through unchecked.
+     */
+    @Test
+    void theConvenienceConstructorsDefaultToTheSafeProfitabilityFloors() {
+        LiquidationConfiguration eightArg = new LiquidationConfiguration(Mode.SHADOW, false,
+                60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
+        assertTrue(eightArg.isCheckProfitability(), "profitability checking defaults ON");
+        assertEquals(BigInteger.ZERO, eightArg.getMinProfitAbsoluteLovelace(),
+                "the absolute floor defaults to zero");
+
+        LiquidationConfiguration nineArg = new LiquidationConfiguration(Mode.SHADOW, false,
+                60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30, eightArg.getReferenceScripts());
+        assertTrue(nineArg.isCheckProfitability());
+        assertEquals(BigInteger.ZERO, nineArg.getMinProfitAbsoluteLovelace());
+    }
+
+    /** The full constructor carries the floors through verbatim, both halves. */
+    @Test
+    void theFullConstructorCarriesTheStatedFloors() {
+        LiquidationConfiguration stated = new LiquidationConfiguration(Mode.LIVE, true,
+                60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30,
+                false, BigInteger.valueOf(2_000_000),
+                com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder
+                        .ReferenceScripts.none());
+        assertFalse(stated.isCheckProfitability(), "check-profitability is carried verbatim");
+        assertEquals(BigInteger.valueOf(2_000_000), stated.getMinProfitAbsoluteLovelace());
+    }
+
     // ======================================================================================
     // the reference-script coordinates
     // ======================================================================================

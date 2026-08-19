@@ -189,6 +189,30 @@ public class AppConfig {
         @Value("${loans.liquidation.profit-margin-lovelace:1500000}")
         private BigInteger profitMarginLovelace;
 
+        /**
+         * Whether the profitability floors run at all. {@code false} is the operator's "liquidate
+         * regardless" (SPEC §3 Q3.1): the absolute floor is not applied. Defaults to {@code true} —
+         * profitability is checked — because a floor that silently does not floor is worse than an
+         * absent one. The margin lever (below) is a separate control and is always applied.
+         */
+        @Value("${loans.liquidation.check-profitability:true}")
+        private boolean checkProfitability;
+
+        /**
+         * The absolute lovelace floor a liquidation's <em>margin-excluded</em> profit
+         * ({@code floorProfit = fee − txFee − minAdaFunded}) must reach, applied only when
+         * {@link #checkProfitability} is true. Default 0: a floor that is active but permits any
+         * non-negative floored profit. It is a floor on {@code floorProfit}, NOT on the
+         * margin-adjusted number, so a negative margin can no longer inflate a loss past it.
+         * <p>
+         * SPEC §5 Finding 3 / O-2: the {@code fee} term inside {@code floorProfit} is a
+         * mark-to-oracle token value, so on token collateral this floor still compares ADA against
+         * tokens. Resolving that is O-2, out of scope here; this field carries today's fee term
+         * unchanged.
+         */
+        @Value("${loans.liquidation.min-profit-absolute-lovelace:0}")
+        private BigInteger minProfitAbsoluteLovelace;
+
         @Value("${loans.liquidation.decision-log-size:200}")
         private int decisionLogSize;
 
@@ -252,6 +276,19 @@ public class AppConfig {
                                         BigInteger profitMarginLovelace, int decisionLogSize,
                                         long quarantineMinutes,
                                         LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
+            // The profitability floors default to the safe pair: checking on, absolute floor at 0.
+            this(mode, enabled, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
+                    profitMarginLovelace, decisionLogSize, quarantineMinutes, true, BigInteger.ZERO,
+                    referenceScripts);
+        }
+
+        /** As above, with the profitability floors stated. */
+        public LiquidationConfiguration(Mode mode, boolean enabled, long delaySeconds,
+                                        long validityWindowSeconds, long oracleWindowMarginSeconds,
+                                        BigInteger profitMarginLovelace, int decisionLogSize,
+                                        long quarantineMinutes, boolean checkProfitability,
+                                        BigInteger minProfitAbsoluteLovelace,
+                                        LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
             this.mode = mode;
             this.modeName = mode.name();
             this.enabled = enabled;
@@ -261,6 +298,8 @@ public class AppConfig {
             this.profitMarginLovelace = profitMarginLovelace;
             this.decisionLogSize = decisionLogSize;
             this.quarantineMinutes = quarantineMinutes;
+            this.checkProfitability = checkProfitability;
+            this.minProfitAbsoluteLovelace = minProfitAbsoluteLovelace;
             this.referenceScripts = referenceScripts;
         }
 

@@ -36,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -86,6 +87,13 @@ class LiquidationSubmitVetoTest {
     private static final BigInteger FAT_FEE_PER_MILLE = BigInteger.valueOf(500);
 
     private static final BigInteger SMALL_MARGIN = BigInteger.valueOf(1_500_000);
+
+    /**
+     * The exact preview override T-027 ran under: a negative margin, which under the old
+     * margin-inside-the-number arithmetic was a subtraction of a negative and re-authorised a
+     * loss-making liquidation. Kept as the number that reproduces the measured incident.
+     */
+    private static final BigInteger NEGATIVE_MARGIN = BigInteger.valueOf(-3_000_000);
 
     /** Larger than the whole fee slice, so the same candidate stops being worth doing. */
     private static final BigInteger HUGE_MARGIN = BigInteger.valueOf(100_000_000);
@@ -387,6 +395,71 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
+     * The T-027 shape: a token-collateral loan whose fee slice is tiny, so once the min-ada the bot
+     * funds on the emitted asset-manager output is counted the liquidation is a net loss.
+     * <p>
+     * Collateral 1_000_000 TOK at 50 lovelace against 55 ADA of debt — under water, equity zero. The
+     * bond's fee is only 10 per mille, so the fee slice is {@code 1_000_000 * 10 / 1000 = 10_000 TOK},
+     * priced through the c3 feed to {@code 500_000 lovelace}. That is below the transaction fee plus
+     * the ~min-ada rider the token collateral output has to be funded to, so {@code floorProfit} is
+     * negative — a real loss, exactly as {@code 79e62601…} was.
+     */
+    private static Scenario lossMakingTokenScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(50_000_000),
+                BigInteger.valueOf(1000),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, ORACLE_TOKEN), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum, 2_000_000L,
+                List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.bondDatum(BigInteger.valueOf(10),
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
+                2_000_000L);
+
+        LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.unit(), collateralFeed(), VALID_FROM);
+        return new Scenario(loan, bond, assessment);
+    }
+
+    /**
+     * The T-027 shape as a min-ada-DRIVEN loss: a positive-equity token-collateral liquidation whose
+     * fee slice comfortably covers the transaction fee, yet the min-ada the bot funds on the two emitted
+     * asset-manager outputs turns it into a net loss all on its own.
+     * <p>
+     * Collateral 1_000_000 TOK at 50 lovelace = 50 ADA against a 40 ADA principal, so the equity is
+     * positive and <em>not</em> in the principal currency — which is exactly the loan the builder emits
+     * with <b>two</b> asset-manager outputs (borrower compensation + lender claim), just as
+     * {@code 79e62601…} did. Each token-carrying output is topped to its ~1.6 ADA min-ada, so
+     * {@code Σ(assetManagerOutput.ada) = A = 3_193_710} against the loan UTxO's own {@code L =
+     * 2_000_000}: the bot funds {@code A − L = 1_193_710}.
+     * <p>
+     * The bond's fee is 40 per mille, so the fee slice is {@code 1_000_000 * 40 / 1000 = 40_000 TOK},
+     * priced through the c3 feed to {@code 2_000_000 lovelace} — above the ~1.36 ADA transaction fee, so
+     * {@code expectedFee − txFee > 0} and the loss is NOT a fee/size artefact. It is the {@code A − L}
+     * rider that pulls {@code floorProfit} below zero. Zero that rider out and the fee slice alone clears
+     * the floor and the candidate submits — which is the verdict flip {@link
+     * #aTokenLiquidationRefusedSolelyByTheMinAdaRider()} pins.
+     */
+    private static Scenario minAdaDrivenLossTokenScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(40_000_000),
+                BigInteger.valueOf(1000),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, ORACLE_TOKEN), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum, 2_000_000L,
+                List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.bondDatum(BigInteger.valueOf(40),
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
+                2_000_000L);
+
+        LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.unit(), collateralFeed(), VALID_FROM);
+        return new Scenario(loan, bond, assessment);
+    }
+
+    /**
      * A loan whose <em>principal</em> is a token and whose collateral is ada. 100 ADA of collateral
      * against 110 PRI of debt at 1 lovelace apiece: under water, so the equity is exactly zero, and
      * the only oracle feed in the transaction is the principal one.
@@ -548,8 +621,8 @@ class LiquidationSubmitVetoTest {
                     new FakeAppUtxoService(), ACCOUNT, new FakeScanner(List.of(scenario.assessment())),
                     new FakeResolver(unspent, loanAnswersBeforeItIsGone, bondAnswersBeforeItIsGone,
                             loanThrows),
-                    builder, log, provider(oracle), networkNamed(networkName), params,
-                    LoanFixtures.converters(), submitter);
+                    builder, LoanFixtures.registry(), log, provider(oracle), networkNamed(networkName),
+                    params, LoanFixtures.converters(), submitter);
             long[] elapsed = {0};
             executor.setSubmitClock(() -> submitTime + elapsed[0]);
 
@@ -711,6 +784,139 @@ class LiquidationSubmitVetoTest {
                 LiquidationDecision.Outcome.UNPROFITABLE);
         assertEquals(BigInteger.ZERO, atZero.expectedProfitLovelace(),
                 "the fixture must sit exactly on zero, or this is not a break-even test");
+    }
+
+    /**
+     * FIX 1 + FIX 2, the T-027 measured loss, reproduced and shown refused.
+     * <p>
+     * The candidate is a real net loss: its fee slice does not cover the transaction fee plus the
+     * min-ada the bot funds on the emitted asset-manager output, so {@code floorProfit} — the
+     * margin-EXCLUDED {@code fee − txFee − minAdaFunded} — is negative. It is armed, LIVE, on preview,
+     * and running under the exact {@code −3,000,000} preview margin the incident ran under.
+     * <p>
+     * The verdict-flip is built into the assertions, so the test is its own mutant:
+     * <ul>
+     *   <li>the recorded {@code expectedProfitLovelace} (= {@code floorProfit − margin}) is
+     *       <b>positive</b> — because the negative margin, subtracted-as-a-negative, inflates it. That
+     *       is precisely the number the old {@code fee − txFee − margin} arithmetic tested, and a code
+     *       that still put the margin inside the floored number would clear this candidate and submit a
+     *       loss;</li>
+     *   <li>the reconstructed {@code floorProfit} (= {@code expectedProfit + margin}) is
+     *       <b>negative</b>, and it is what the absolute floor tests, so the candidate is refused
+     *       {@code NOT_PROFITABLE} and nothing is submitted;</li>
+     *   <li>and {@code minAdaFunded} (= {@code expectedFee − txFee − floorProfit}) is <b>zero</b>: this
+     *       fixture liquidates at zero equity, so the builder emits a single lender-claim output whose
+     *       min-ada the loan UTxO's own ada already covers, and FIX 1 funds nothing. The loss here is
+     *       therefore fee-driven — the {@code 500_000} fee slice does not cover the {@code ~1.35 ADA}
+     *       transaction fee — <em>not</em> min-ada-driven. The min-ada-driven verdict is pinned
+     *       separately by {@link #aTokenLiquidationRefusedSolelyByTheMinAdaRider()}.</li>
+     * </ul>
+     */
+    @Test
+    void aFloorNegativeLiquidationIsRefusedEvenWhenANegativeMarginInflatesTheMarginAdjustedNumber() {
+        Run run = new Rig()
+                .scenario(lossMakingTokenScenario())
+                .oracle(new FakeOracleClient(List.of(collateralOracle())))
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                        NEGATIVE_MARGIN, PUBLISHED))
+                .run();
+
+        LiquidationDecision decision = vetoed(run, LiquidationExecutor.SubmitVeto.NOT_PROFITABLE,
+                LiquidationDecision.Outcome.UNPROFITABLE);
+
+        BigInteger margin = decision.marginLovelace();
+        BigInteger expectedProfit = decision.expectedProfitLovelace();
+        BigInteger floorProfit = expectedProfit.add(margin);
+        BigInteger minAdaFunded = decision.expectedFeeLovelace()
+                .subtract(decision.txFeeLovelace()).subtract(floorProfit);
+
+        assertEquals(NEGATIVE_MARGIN, margin, "the incident's negative preview margin");
+        assertTrue(expectedProfit.signum() > 0,
+                ("the margin-adjusted number the OLD arithmetic tested is positive (%s) — a code that "
+                        + "put the margin back inside the floored number would submit this loss")
+                        .formatted(expectedProfit));
+        assertTrue(floorProfit.signum() < 0,
+                "the margin-excluded floorProfit is negative (" + floorProfit + "), and it is what the "
+                        + "absolute floor tests — so the loss is refused regardless of the margin");
+        assertEquals(BigInteger.ZERO, minAdaFunded,
+                "this zero-equity fixture emits a single output the loan UTxO's own ada covers, so FIX 1 "
+                        + "funds nothing (" + minAdaFunded + ") and the loss is fee-driven, not "
+                        + "min-ada-driven: " + decision.detail());
+    }
+
+    /**
+     * FIX 1, the T-027 min-ada rider as a VERDICT-flipping pin — the case the zero-equity fixture above
+     * cannot exercise. A positive-equity token liquidation whose fee slice ({@code 2_000_000}) covers
+     * the transaction fee, so neither the fee nor the size makes it a loss; only the min-ada the bot
+     * funds on the two asset-manager outputs ({@code A − L = 1_193_710}) pulls {@code floorProfit} below
+     * the absolute floor. Armed, LIVE, on preview, margin at zero so the floor is the only lever.
+     * <p>
+     * The candidate is refused {@code NOT_PROFITABLE} and nothing is submitted, and that {@code vetoed}
+     * verdict — not an arithmetic identity — is the pin. It is a genuine mutant catcher: zero the
+     * {@code minAdaFunded} rider in {@link LiquidationExecutor} and {@code floorProfit} becomes
+     * {@code expectedFee − txFee} (positive), clearing both the absolute floor and the zero margin, so
+     * the candidate SUBMITS and this test reddens on {@code assertNothingWasSubmitted}. The two
+     * relationships asserted below spell out why the rider — and only the rider — is what refuses it:
+     * {@code floorProfit < 0} (refused) while {@code expectedFee − txFee > 0} (the fee slice covers the
+     * fee), so the entire shortfall is the min-ada rider.
+     */
+    @Test
+    void aTokenLiquidationRefusedSolelyByTheMinAdaRider() {
+        Run run = new Rig()
+                .scenario(minAdaDrivenLossTokenScenario())
+                .oracle(new FakeOracleClient(List.of(collateralOracle())))
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                        BigInteger.ZERO, PUBLISHED))
+                .run();
+
+        LiquidationDecision decision = vetoed(run, LiquidationExecutor.SubmitVeto.NOT_PROFITABLE,
+                LiquidationDecision.Outcome.UNPROFITABLE);
+
+        BigInteger margin = decision.marginLovelace();
+        BigInteger floorProfit = decision.expectedProfitLovelace().add(margin);
+        BigInteger feeSliceOverFee = decision.expectedFeeLovelace().subtract(decision.txFeeLovelace());
+        BigInteger minAdaFunded = feeSliceOverFee.subtract(floorProfit);
+
+        assertEquals(BigInteger.ZERO, margin, "the floor is the only lever in play here");
+        assertTrue(floorProfit.signum() < 0,
+                "the margin-excluded floorProfit is negative (" + floorProfit + "), so the candidate is "
+                        + "refused: " + decision.detail());
+        assertTrue(feeSliceOverFee.signum() > 0,
+                "the fee slice covers the transaction fee (" + feeSliceOverFee + " > 0), so zeroing the "
+                        + "min-ada rider would lift floorProfit above the floor and submit this candidate "
+                        + "— the loss is the rider, not a fee/size artefact: " + decision.detail());
+        assertTrue(minAdaFunded.compareTo(feeSliceOverFee) > 0,
+                "the min-ada rider (" + minAdaFunded + ") is the whole reason floorProfit is below zero: "
+                        + decision.detail());
+    }
+
+    /**
+     * FIX 3 (F1.ii). A negative {@code profit-margin-lovelace} is a preview-only override; on mainnet
+     * it is a hard startup failure, so a preview config copied to a mainnet node cannot silently
+     * sanction losses. The guard lives where both the network and the margin are known — construction
+     * of the liquidation executor — so a mainnet node that would arm the path refuses to come up. On
+     * preview the same margin is a WARN and the loop runs.
+     */
+    @Test
+    void aNegativeMarginHardFailsOnMainnetButIsOnlyAWarningOnPreview() {
+        // Mainnet: constructing the executor (inside run()) throws, naming the override.
+        IllegalStateException mainnet = assertThrows(IllegalStateException.class, () -> new Rig()
+                .network("mainnet")
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, false,
+                        NEGATIVE_MARGIN, PUBLISHED))
+                .run());
+        assertTrue(mainnet.getMessage().contains("profit-margin-lovelace")
+                        && mainnet.getMessage().contains("mainnet"),
+                "the failure must name the override and the network: " + mainnet.getMessage());
+
+        // Preview: the identical negative margin does not stop the node — it warns and runs a cycle.
+        Run preview = new Rig()
+                .network("preview")
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, false,
+                        NEGATIVE_MARGIN, PUBLISHED))
+                .run();
+        assertNotNull(preview.onlyDecision(),
+                "on preview the negative margin is a WARN, so the loop still records a decision");
     }
 
     // ======================================================================================
@@ -1044,7 +1250,8 @@ class LiquidationSubmitVetoTest {
                 new LiquidateTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                         LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
                         protocolParams()),
-                log, provider(new FakeOracleClient(List.of())), networkNamed("preview"), protocolParams(),
+                LoanFixtures.registry(), log, provider(new FakeOracleClient(List.of())),
+                networkNamed("preview"), protocolParams(),
                 LoanFixtures.converters(), submitter);
         executor.setSubmitClock(() -> NOW);
 

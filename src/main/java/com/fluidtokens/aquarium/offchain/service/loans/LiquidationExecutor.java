@@ -1,13 +1,17 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
+import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationDecision;
@@ -183,6 +187,14 @@ public class LiquidationExecutor {
 
     private final LiquidateTransactionBuilder builder;
 
+    /**
+     * The runtime-derived v4 hashes. Read here for one thing only: the asset-manager spend script
+     * hash, which is the payment credential the builder sends every funded asset-manager output to,
+     * so {@link #minAdaFunded} can pick those outputs out of the finished body by credential rather
+     * than by a predicted position.
+     */
+    private final LoansContractRegistry registry;
+
     private final LiquidationDecisionLog decisionLog;
 
     private final ObjectProvider<FluidOracleClient> oracleClient;
@@ -234,6 +246,7 @@ public class LiquidationExecutor {
                                LiquidationCandidateScanner scanner,
                                LiquidationUtxoResolver utxoResolver,
                                LiquidateTransactionBuilder builder,
+                               LoansContractRegistry registry,
                                LiquidationDecisionLog decisionLog,
                                ObjectProvider<FluidOracleClient> oracleClient,
                                AppConfig.Network network,
@@ -241,7 +254,7 @@ public class LiquidationExecutor {
                                CardanoConverters converters,
                                BFBackendService backendService) {
         this(configuration, blockEventListener, appUtxoService, account, scanner, utxoResolver, builder,
-                decisionLog, oracleClient, network, protocolParamsSupplier, converters,
+                registry, decisionLog, oracleClient, network, protocolParamsSupplier, converters,
                 bytes -> backendService.getTransactionService().submitTransaction(bytes));
     }
 
@@ -253,6 +266,7 @@ public class LiquidationExecutor {
                                LiquidationCandidateScanner scanner,
                                LiquidationUtxoResolver utxoResolver,
                                LiquidateTransactionBuilder builder,
+                               LoansContractRegistry registry,
                                LiquidationDecisionLog decisionLog,
                                ObjectProvider<FluidOracleClient> oracleClient,
                                AppConfig.Network network,
@@ -266,12 +280,43 @@ public class LiquidationExecutor {
         this.scanner = scanner;
         this.utxoResolver = utxoResolver;
         this.builder = builder;
+        this.registry = registry;
         this.decisionLog = decisionLog;
         this.oracleClient = oracleClient;
         this.network = network;
         this.protocolParamsSupplier = protocolParamsSupplier;
         this.converters = converters;
         this.submitter = submitter;
+        guardMainnetNegativeMargin();
+    }
+
+    /**
+     * FIX 3 (F1.ii). A negative {@code profit-margin-lovelace} is a preview-only override — it
+     * re-authorises loss-making liquidations, which is a thing to do only on throwaway preview
+     * capital. On mainnet it is a hard startup failure rather than a WARN, because "copy a working
+     * preview config to mainnet" is the foreseeable operator action and a WARN on the mainnet path
+     * is a comment, not a guard. This bean only exists when {@code loans.enabled=true} (the arming
+     * condition), so failing construction here refuses to arm the liquidation path on a mainnet node
+     * whose margin would silently sanction losses. On preview it stays a WARN and proceeds.
+     */
+    private void guardMainnetNegativeMargin() {
+        BigInteger margin = configuration.getProfitMarginLovelace();
+        if (margin == null || margin.signum() >= 0) {
+            return;
+        }
+        String networkName = network == null ? null : network.getNetwork();
+        // Fail-closed: anything that is not preview or preprod resolves to mainnet, exactly as
+        // AppConfig.Network.getCardanoNetwork() treats an unrecognised value.
+        boolean mainnet = networkName == null
+                || (!"preview".equalsIgnoreCase(networkName) && !"preprod".equalsIgnoreCase(networkName));
+        if (mainnet) {
+            throw new IllegalStateException(("loans.liquidation.profit-margin-lovelace is %s (negative) "
+                    + "on network %s; a negative margin is a preview-only override that re-authorises "
+                    + "loss-making liquidations and must never be set on mainnet")
+                    .formatted(margin, networkName));
+        }
+        log.warn("loans.liquidation.profit-margin-lovelace is {} (negative) on network {}; this is a "
+                + "preview-only override that re-authorises loss-making liquidations", margin, networkName);
     }
 
     @Scheduled(timeUnit = TimeUnit.SECONDS, fixedDelayString = "${loans.liquidation.delay-seconds}")
@@ -433,25 +478,31 @@ public class LiquidationExecutor {
      * the 1:1 identity {@code retrieve_oracle_data} synthesises for the empty policy id — the same
      * feed the scanner and the builder used, not a special case invented here.
      *
-     * <h3>⚠ KNOWN GAP: the expected-profit arithmetic does not count min-ada</h3>
-     * {@code expectedProfit = expectedFee - txFee - margin} below has <b>no min-ada term</b>. It
-     * therefore <b>overstates profit on every positive-equity liquidation</b>, by roughly the min-ada
-     * the builder funds on the borrower-compensation output: that output is emitted carrying only the
-     * equity quantity and cardano-client-lib tops it to the floor out of the bot's own inputs, which
-     * is real lovelace leaving the wallet that {@code txFee} does not include. On token collateral the
-     * whole rider is unaccounted (the equity is denominated in the token, so the output carries no ada
-     * of its own); on ada collateral it is the shortfall between a sub-floor equity and the floor.
-     * <p>
-     * Measured on the real preview loan in {@code RealEquityLoanDryEvalTest}: a 1_364_238 lovelace
-     * transaction fee plus a 1_655_040 lovelace compensation rider — 3_019_278 out of pocket against
-     * a 1_364_238 the arithmetic below sees. That is enough to flip the verdict on that loan under the
-     * preview {@code profit-margin-lovelace} of −3_000_000.
-     * <p>
-     * The rider is <em>bounded</em> — {@code LiquidateTransactionBuilder}'s
-     * {@code assertCompensationSubsidyBounded} refuses a body whose compensation output exceeds one
-     * min-ada above the equity — so the overstatement cannot grow silently. Bounding is not counting.
-     * Closing it is a change to the profitability model (a check-profitability flag, an absolute ADA
-     * minimum, a percentage minimum) and belongs to that work, not here; it is tracked separately.
+     * <h3>The min-ada the bot funds is counted (E5-A / F4)</h3>
+     * {@link #minAdaFunded} is the lovelace the builder puts into the emitted asset-manager outputs
+     * (compensation + claim) <em>beyond</em> what the loan UTxO's own collateral already carried — the
+     * per-loan {@code Σ(assetManagerOutput.ada) − adaFromTheCollateralInput} that
+     * cardano-client-lib tops to the min-ada floor out of the bot's own inputs. It is real lovelace
+     * leaving the wallet that {@code txFee} does not include, and it is per-loan rather than a
+     * constant: on token collateral the outputs carry no ada of their own, so the whole rider is
+     * funded; on ada collateral only the shortfall between a sub-floor payout and the floor is.
+     *
+     * <h3>Two numbers, deliberately kept apart (E5-B Finding 1 / F1.i)</h3>
+     * <ul>
+     *   <li>{@code floorProfit = expectedFee − txFee − minAdaFunded} — the margin-EXCLUDED profit the
+     *       profitability floors ({@link #verdict}'s S4) test. The margin is <b>not</b> inside it, so a
+     *       negative {@code profit-margin-lovelace} can no longer be subtracted-as-a-negative to
+     *       inflate the number past a floor (T-027: at margin −3,000,000 a real −0.19 ADA result scored
+     *       +2.81 ADA and cleared).</li>
+     *   <li>{@code expectedProfit = floorProfit − margin} — the same margin-adjusted "is it worth
+     *       doing" number the decision log has always recorded, now corrected for min-ada. It is what
+     *       the margin lever in {@link #verdict} tests, exactly where it did before.</li>
+     * </ul>
+     *
+     * <h3>⚠ O-2 seam (unresolved) — see {@link #verdict} where {@code floorProfit} is used</h3>
+     * {@code expectedFee} is a <b>mark-to-oracle token value</b> priced through the collateral feed,
+     * not realisable ADA. This ticket keeps today's fee computation and only adds the min-ada term; O-2
+     * may later restrict the floor to realisable ADA, which is not decided here.
      */
     private void record(LiquidationAssessment assessment, long now, Transaction transaction,
                         Map<String, OracleEntry> oraclesByUnit) {
@@ -460,11 +511,14 @@ public class LiquidationExecutor {
                 .toLovelace(Rational.fromInt(assessment.liquidationFee()), collateralFeed)
                 .floor();
         BigInteger txFee = transaction.getBody().getFee();
+        BigInteger minAdaFunded = minAdaFunded(assessment, transaction);
+        // FIX 1/FIX 2: the floors test this margin-EXCLUDED number; the margin is applied separately.
+        BigInteger floorProfit = expectedFee.subtract(txFee).subtract(minAdaFunded);
         BigInteger margin = configuration.getProfitMarginLovelace();
-        BigInteger expectedProfit = expectedFee.subtract(txFee).subtract(margin);
+        BigInteger expectedProfit = floorProfit.subtract(margin);
 
-        String detail = "fee slice %s lovelace - tx fee %s - margin %s = %s"
-                .formatted(expectedFee, txFee, margin, expectedProfit);
+        String detail = "fee slice %s lovelace - tx fee %s - min-ada %s = floor %s; - margin %s = %s"
+                .formatted(expectedFee, txFee, minAdaFunded, floorProfit, margin, expectedProfit);
 
         int size;
         String cborHex;
@@ -478,7 +532,7 @@ public class LiquidationExecutor {
             // and is recorded without the fields that could not be produced.
             log.warn("could not serialise the built liquidation of {}: {}",
                     assessment.loan().utxoRef(), e.toString());
-            LiquidationDecision.Outcome unmeasured = expectedProfit.signum() > 0
+            LiquidationDecision.Outcome unmeasured = wouldSubmit(floorProfit, expectedProfit)
                     ? LiquidationDecision.Outcome.WOULD_SUBMIT
                     : LiquidationDecision.Outcome.UNPROFITABLE;
             decisionLog.record(decision(assessment, now, unmeasured, unmeasured.name(), detail,
@@ -486,8 +540,8 @@ public class LiquidationExecutor {
             return;
         }
 
-        Verdict verdict = verdict(assessment, now, transaction, oraclesByUnit, expectedProfit, size,
-                detail);
+        Verdict verdict = verdict(assessment, now, transaction, oraclesByUnit, floorProfit,
+                expectedProfit, size, detail);
 
         decisionLog.record(new LiquidationDecision(
                 now,
@@ -539,9 +593,11 @@ public class LiquidationExecutor {
      * otherwise armed node, and they get {@link LiquidationDecision.Outcome#SUBMIT_VETOED}.
      */
     private Verdict verdict(LiquidationAssessment assessment, long now, Transaction transaction,
-                            Map<String, OracleEntry> oraclesByUnit, BigInteger expectedProfit,
-                            int size, String detail) {
-        LiquidationDecision.Outcome shadowOutcome = expectedProfit.signum() > 0
+                            Map<String, OracleEntry> oraclesByUnit, BigInteger floorProfit,
+                            BigInteger expectedProfit, int size, String detail) {
+        // What the row says on an unarmed node: WOULD_SUBMIT only if it would actually clear S4 on an
+        // armed one — i.e. it passes both the profitability floor and the margin lever.
+        LiquidationDecision.Outcome shadowOutcome = wouldSubmit(floorProfit, expectedProfit)
                 ? LiquidationDecision.Outcome.WOULD_SUBMIT
                 : LiquidationDecision.Outcome.UNPROFITABLE;
 
@@ -562,7 +618,25 @@ public class LiquidationExecutor {
                     "%s; network is %s, this epic submits only on %s"
                             .formatted(detail, networkName, SUBMITTABLE_NETWORK));
         }
-        // S4 — strictly positive. Breaking even is not a reason to move someone's collateral.
+        // S4 — profitability. Two independent gates, and the margin is deliberately NOT inside the
+        // number the floors test (F1.i): a negative margin can no longer inflate a loss past a floor.
+        //
+        // (a) The absolute floor, applied only when check-profitability is on, tests floorProfit —
+        //     the margin-EXCLUDED fee − txFee − minAdaFunded. Default floor 0: a floored loss is
+        //     refused regardless of the margin. (O-2 seam: floorProfit's fee term is a mark-to-oracle
+        //     token value, unchanged here — see record()'s javadoc.)
+        if (configuration.isCheckProfitability()
+                && floorProfit.compareTo(configuration.getMinProfitAbsoluteLovelace()) < 0) {
+            return new Verdict(LiquidationDecision.Outcome.UNPROFITABLE, SubmitVeto.NOT_PROFITABLE,
+                    detail);
+        }
+        // (b) A percentage floor rides here too (SPEC §5). It is INERT for the current non-fronting
+        //     Liquidate mode (SPEC S8): "percent of the principal advanced" has no advanced principal
+        //     to apply to until a fronting mode (E1) exists. Left as a marked hook, wired then.
+        //
+        // (c) The margin lever, exactly where it was: strictly positive over the operator's margin.
+        //     Breaking even is not a reason to move someone's collateral. Kept separate from the floor
+        //     so it stays an operator preference, not a defeater of the floor.
         if (expectedProfit.signum() <= 0) {
             return new Verdict(LiquidationDecision.Outcome.UNPROFITABLE, SubmitVeto.NOT_PROFITABLE,
                     detail);
@@ -765,6 +839,66 @@ public class LiquidationExecutor {
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
                     detail + "; submission threw: " + e);
         }
+    }
+
+    /**
+     * Whether this candidate would be submitted on an armed node — the two S4 gates as one predicate,
+     * so the shadow outcome and the unmeasured-body outcome say the same thing S4 does: it clears the
+     * absolute floor (when check-profitability is on) AND clears the operator's margin.
+     */
+    private boolean wouldSubmit(BigInteger floorProfit, BigInteger expectedProfit) {
+        if (configuration.isCheckProfitability()
+                && floorProfit.compareTo(configuration.getMinProfitAbsoluteLovelace()) < 0) {
+            return false;
+        }
+        return expectedProfit.signum() > 0;
+    }
+
+    /**
+     * FIX 1 (E5-A / F4). The lovelace the builder funds on the emitted asset-manager outputs beyond
+     * what the loan's own collateral carried — per-loan, never a constant.
+     * <p>
+     * The builder sends every funded asset-manager output (the borrower compensation output and the
+     * lender claim output) to the asset-manager spend credential, and cardano-client-lib tops each to
+     * its min-ada floor out of the bot's own inputs. So the ada the bot puts in is
+     * {@code Σ(assetManagerOutput.ada) − adaFromTheLoanInput}: the spent loan UTxO's own ada is
+     * available to cover those outputs before the bot adds any of its own, so it is the offset. The
+     * ledger delta the bot's wallet sees is {@code L − A − F} (loan-UTxO ada {@code L}, asset-manager
+     * output ada {@code A}, fee {@code F}), so the cost beyond the fee is {@code A − L} for either
+     * collateral type — which is exactly this offset applied to {@code Σ(assetManagerOutput.ada)}:
+     * <ul>
+     *   <li><b>ada collateral</b> — the loan UTxO's ada <em>is</em> the collateral, and the
+     *       {@code liquidationFee} slice returns to the bot rather than to the outputs, so the ada that
+     *       actually flows into the outputs is {@code L − liquidationFee = collateralAmount −
+     *       liquidationFee} regardless of how the builder split it between {@code equity} and
+     *       {@code collateralPayout}. Only the shortfall between a sub-floor payout and the floor is
+     *       actually funded.</li>
+     *   <li><b>token collateral</b> — the outputs carry tokens and no ada of their own, so the whole of
+     *       the loan UTxO's ada {@code L} is available to cover their min-ada floor; the offset is that
+     *       ada ({@code loan().lovelace()}), and only the min-ada beyond it is funded.</li>
+     * </ul>
+     * Read off the finished body by credential (never a predicted position), exactly as the builder's
+     * own {@code assetOutputIndexes} locates the same outputs. Clamped at zero as defence in depth: the
+     * outputs can only ever carry their intrinsic ada plus a non-negative top-up.
+     */
+    private BigInteger minAdaFunded(LiquidationAssessment assessment, Transaction transaction) {
+        String assetManagerCredential = registry.getAssetManagerSpendScriptHash();
+        BigInteger outputAda = BigInteger.ZERO;
+        for (TransactionOutput output : transaction.getBody().getOutputs()) {
+            if (assetManagerCredential.equals(paymentCredentialOf(output.getAddress()))) {
+                outputAda = outputAda.add(output.getValue().getCoin());
+            }
+        }
+        BigInteger collateralAdaOffset = assessment.loan().datum().collateral().isAda()
+                ? assessment.loan().collateralAmount().subtract(assessment.liquidationFee())
+                : assessment.loan().lovelace();
+        BigInteger funded = outputAda.subtract(collateralAdaOffset);
+        return funded.signum() > 0 ? funded : BigInteger.ZERO;
+    }
+
+    /** The payment credential hash of an address, or null — the same read the builder does. */
+    private static String paymentCredentialOf(String address) {
+        return new Address(address).getPaymentCredentialHash().map(HexUtil::encodeHexString).orElse(null);
     }
 
     private static OraclePriceFeed collateralFeed(LiquidationAssessment assessment,
