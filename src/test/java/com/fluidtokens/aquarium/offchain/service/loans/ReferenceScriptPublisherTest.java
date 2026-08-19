@@ -1,25 +1,42 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.address.Address;
+import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ExUnits;
+import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
+import com.bloxbean.cardano.client.plutus.spec.Redeemer;
+import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionBody;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
+import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.BuiltTransaction;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.Mutation;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.Plan;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.PublishedScript;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.UnspendableDestination;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.Validator;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -339,6 +356,169 @@ class ReferenceScriptPublisherTest {
                 "the refusal must state what it should have held: " + e.getMessage());
         assertTrue(e.getMessage().contains("97613711"),
                 "the refusal must state what it actually held: " + e.getMessage());
+    }
+
+    // ======================================================================================
+    // T-028 — an unspendable-by-us destination, fail-closed on mainnet
+    // ======================================================================================
+
+    /**
+     * The mainnet fail-closed guard, made mutant-proof by pairing it with the testnet controls.
+     * A mutant that "always throws" fails the preview/preprod positives; a mutant that "never
+     * throws" fails the mainnet negative. Only a guard that throws on mainnet and returns on the
+     * testnets passes both, so this pins the guard rather than either half of it.
+     * <p>
+     * Mainnet is refused <b>before any address is produced</b>: no mainnet destination is derived
+     * here, ever — that is a separate, later decision.
+     */
+    @Test
+    void forNetworkRefusesMainnetButReturnsOnTheTestnets() {
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> UnspendableDestination.forNetwork(Networks.mainnet()),
+                "deriving an unspendable destination on mainnet must be refused");
+        System.out.println("mainnet destination refused: " + refused.getMessage());
+        assertTrue(refused.getMessage().contains("mainnet"),
+                "the refusal must name mainnet: " + refused.getMessage());
+        assertTrue(refused.getMessage().contains("separate, later"),
+                "the refusal must state it is a separate, later decision: " + refused.getMessage());
+
+        assertNotNull(UnspendableDestination.forNetwork(Networks.preview()).address(),
+                "preview must return a destination — the guard is not a blanket always-throw");
+        assertNotNull(UnspendableDestination.forNetwork(Networks.preprod()).address(),
+                "preprod must return a destination too");
+    }
+
+    /**
+     * The destination is structurally not one we could sign for: its payment credential is a
+     * <b>script</b> credential whose hash is the always-fails script's, and it carries no stake
+     * credential (an enterprise address). A wallet base address we control would parse to a key
+     * payment credential instead, so this rules that out by construction rather than by trust.
+     */
+    @Test
+    void theUnspendableDestinationIsAScriptCredentialWeCannotSignFor() {
+        UnspendableDestination dest = UnspendableDestination.forNetwork(Networks.preview());
+        Address parsed = new Address(dest.address());
+
+        assertTrue(parsed.getPaymentCredentialHash().isPresent(),
+                "the destination must have a payment credential");
+        assertEquals(dest.scriptHash(),
+                HexUtil.encodeHexString(parsed.getPaymentCredentialHash().orElseThrow()),
+                "the payment credential must be the always-fails script's hash");
+        assertTrue(parsed.isScriptHashInPaymentPart(),
+                "the payment credential must be a SCRIPT credential, not a key we could sign for");
+        assertEquals(Optional.empty(), parsed.getDelegationCredentialHash(),
+                "an enterprise address: no stake credential, so it is not a wallet base address");
+    }
+
+    /**
+     * Permanence, proven rather than assumed. A synthetic UTxO placed at the destination — carrying
+     * an inline datum, so the V3-optional datum does not let the spend skip script execution — is
+     * spent through the real PlutusV3 machine, and the always-fails script must refuse it.
+     * <p>
+     * Mutant-proof: an always-<em>succeeds</em> script substituted here would make
+     * {@code outcome.successful()} true and turn this red. The refusal is asserted to be the spend
+     * redeemer's ({@code tag: "Spend", index: 0}), so a rig fault that fails elsewhere cannot pass
+     * for the script refusing.
+     */
+    @Test
+    void spendingAUtxoAtTheUnspendableDestinationIsRefusedByItsAlwaysFailsScript() throws Exception {
+        UnspendableDestination dest = UnspendableDestination.forNetwork(Networks.preview());
+
+        String spentTxHash = "dd".repeat(32);
+        PlutusData unit = ConstrPlutusData.builder().alternative(0).data(ListPlutusData.of()).build();
+        Utxo atDestination = LoanFixtures.utxo(spentTxHash, 0, dest.address(),
+                List.of(Amount.lovelace(BigInteger.valueOf(2_000_000L))), unit.serializeToHex());
+
+        Redeemer spend = Redeemer.builder()
+                .tag(RedeemerTag.Spend)
+                .index(BigInteger.ZERO)
+                .data(unit)
+                .exUnits(ExUnits.builder()
+                        .mem(BigInteger.valueOf(1_000_000)).steps(BigInteger.valueOf(500_000_000)).build())
+                .build();
+        TransactionBody body = TransactionBody.builder()
+                .inputs(new ArrayList<>(List.of(new TransactionInput(spentTxHash, 0))))
+                .outputs(new ArrayList<>(List.of(TransactionOutput.builder()
+                        .address(LoanFixtures.botAddress())
+                        .value(Value.builder().coin(BigInteger.valueOf(1_000_000L)).build())
+                        .build())))
+                .fee(BigInteger.valueOf(1_000_000L))
+                .build();
+        // The always-fails script travels in the witness set so the input's spend redeemer resolves
+        // to it, and is passed to the supplier too so the evaluator can run it — both, exactly as a
+        // real witness-attached spend would be.
+        Transaction spendTx = Transaction.builder()
+                .body(body)
+                .witnessSet(TransactionWitnessSet.builder()
+                        .redeemers(new ArrayList<>(List.of(spend)))
+                        .plutusV3Scripts(new ArrayList<>(List.of(
+                                (com.bloxbean.cardano.client.plutus.spec.PlutusV3Script) dest.script())))
+                        .build())
+                .build();
+
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(spendTx, List.of(atDestination),
+                LoanFixtures.registry(), List.of(dest.script()));
+        System.out.println("spend of the unspendable destination refused: "
+                + outcome.detail().replace("\n", " | "));
+
+        assertFalse(outcome.successful(),
+                "the always-fails script must refuse any spend of a UTxO at its address");
+        assertTrue(outcome.detail().contains("tag: \"Spend\", index: 0"),
+                "the refusal must be the spend redeemer's, not a rig fault elsewhere: " + outcome.detail());
+    }
+
+    /**
+     * The six are published to the unspendable destination with the same shape the base-address
+     * publish has: two transactions, six reference-script outputs, every script-bearing output at
+     * the destination, none carrying a datum, each hash the repo-derived one. The min-ada is freshly
+     * computed against the 29-byte enterprise destination — <b>not</b> the base-address pins, which
+     * are specific to {@code botAddress()} and stay untouched.
+     */
+    @Test
+    void theSixArePublishedToTheUnspendableDestination() throws Exception {
+        String destination = UnspendableDestination.forNetwork(Networks.preview()).address();
+        ReferenceScriptPublisher publisher = publisher(FUNDER);
+        List<BuiltTransaction> built = publisher.build(Plan.minimumSplit(), destination, FUNDER, CHANGE);
+        assertEquals(2, built.size(), "the minimum split is two transactions");
+
+        int scriptOutputs = 0;
+        long totalMinAda = 0L;
+        for (BuiltTransaction tx : built) {
+            assertTrue(tx.sizeBytes() < ReferenceScriptPublisher.MAX_TX_SIZE,
+                    "each transaction must fit maxTxSize");
+            Transaction decoded = Transaction.deserialize(tx.cbor());
+            for (TransactionOutput output : decoded.getBody().getOutputs()) {
+                assertNull(output.getInlineDatum(), "no reference-script output carries an inline datum");
+                assertNull(output.getDatumHash(), "no reference-script output carries a datum hash");
+                if (output.getScriptRef() == null) {
+                    assertEquals(CHANGE, output.getAddress(), "the only script-less output is the change");
+                    continue;
+                }
+                scriptOutputs++;
+                assertEquals(destination, output.getAddress(),
+                        "every reference script is paid to the unspendable destination");
+            }
+            for (PublishedScript published : tx.published()) {
+                totalMinAda += published.lovelace();
+                assertEquals(publisher.scriptHashOf(published.validator()), published.scriptHash(),
+                        published.validator() + " must be published under its derived hash");
+                assertEquals(publisher.minAdaFor(published.validator(), destination), published.lovelace(),
+                        published.validator() + " must hold exactly its min-ada at the unspendable "
+                                + "destination, freshly computed for the 29-byte enterprise address");
+            }
+        }
+        assertEquals(6, scriptOutputs, "six reference-script outputs across the two transactions");
+
+        long expectedTotal = 0L;
+        for (Validator validator : Validator.values()) {
+            expectedTotal += publisher.minAdaFor(validator, destination);
+        }
+        assertEquals(expectedTotal, totalMinAda,
+                "the locked total is the sum of the enterprise-destination min-adas");
+        assertNotEquals(86_837_880L, totalMinAda,
+                "and it is NOT the base-address pin — the enterprise destination is a smaller output");
+        System.out.printf("published six to %s, locking %d lovelace (%.6f ada)%n",
+                destination, totalMinAda, totalMinAda / 1_000_000d);
     }
 
     // ---- helpers ---------------------------------------------------------------------------------

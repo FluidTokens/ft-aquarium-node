@@ -49,12 +49,23 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * consuming and will move by a few hundred bytes and a few thousand lovelace once real UTxOs are
  * resolved. Resolving them belongs to the submission change.
  *
- * <h2>Measured 2026-08-17, three synthetic 60-ada inputs</h2>
+ * <h2>The locked ada is now permanent, by design</h2>
+ * The reference-script outputs are paid to an <b>unspendable</b> destination — the enterprise
+ * address of an always-fails PlutusV3 script ({@code ReferenceScriptPublisher.UnspendableDestination}) —
+ * so the ~85 ada they lock is <b>not recoverable</b>. That is the point: the coordinates outlive this
+ * project and their permanence rests on the ledger rather than on custody of a wallet key. A reference
+ * input is never spent, so locking the ada permanently costs nothing the liquidation path needs.
+ *
+ * <h2>Measured 2026-08-17, three synthetic 60-ada inputs (earlier BASE-address destination)</h2>
  * <pre>
  *   TX1  loanClaimAction + lmLiquidateAction    13_164 bytes  fee 743_705  locks 57_603_150
  *   TX2  the other four                          6_262 bytes  fee 440_017  locks 29_234_730
- *   total locked 86_837_880 lovelace (86.83788 ada), all of it recoverable
+ *   total locked 86_837_880 lovelace (86.83788 ada)
  * </pre>
+ * These figures predate repointing the destination to the 29-byte enterprise address; that smaller
+ * output lowers each script's min-ada, so the enterprise-destination totals are slightly less. The
+ * exact per-output figures are pinned in {@code ReferenceScriptPublisherTest} against the live params;
+ * the runner logs its own at build time.
  */
 @Slf4j
 @EnabledIfEnvironmentVariable(named = "WALLET_MNEMONIC", matches = ".+",
@@ -82,27 +93,39 @@ public class ReferenceScriptPublishRunnerTest {
         // address it derives, which is public and is the coordinate everything else will refer to.
         String mnemonic = System.getenv("WALLET_MNEMONIC");
         Account walletA = new Account(preview(), mnemonic);
-        String destination = walletA.baseAddress();
+        String funder = walletA.baseAddress();
+        // The reference-script outputs are paid to a destination we PROVABLY do not control — the
+        // enterprise address of an always-fails PlutusV3 script — rather than back to wallet A. The
+        // coordinates outlive this project and their permanence should rest on the ledger, not on
+        // whoever holds wallet A's key later. Fail-closed on mainnet; this runner is preview only.
+        ReferenceScriptPublisher.UnspendableDestination unspendable =
+                ReferenceScriptPublisher.UnspendableDestination.forNetwork(preview());
+        String destination = unspendable.address();
         // The change must not land at the destination: cardano-client-lib would then take the fee
         // out of the largest output there — a reference-script output — and top it back up with a
         // whole extra UTxO. The next address on wallet A's own derivation path is the same
         // account, well inside any wallet's address gap limit, and is not the destination.
         String change = new Account(preview(), mnemonic, CHANGE_ADDRESS_INDEX).baseAddress();
 
+        // Synthetic funding UTxOs sit at the FUNDER (wallet A): we cannot fund from the destination,
+        // whose key nobody holds. See the class javadoc — the real UTxOs are resolved at submission.
         List<Utxo> synthetic = List.of(
-                LoanFixtures.adaUtxo("aa".repeat(32), 0, destination, SYNTHETIC_UTXO_LOVELACE),
-                LoanFixtures.adaUtxo("bb".repeat(32), 0, destination, SYNTHETIC_UTXO_LOVELACE),
-                LoanFixtures.adaUtxo("cc".repeat(32), 0, destination, SYNTHETIC_UTXO_LOVELACE));
+                LoanFixtures.adaUtxo("aa".repeat(32), 0, funder, SYNTHETIC_UTXO_LOVELACE),
+                LoanFixtures.adaUtxo("bb".repeat(32), 0, funder, SYNTHETIC_UTXO_LOVELACE),
+                LoanFixtures.adaUtxo("cc".repeat(32), 0, funder, SYNTHETIC_UTXO_LOVELACE));
 
         ReferenceScriptPublisher publisher = new ReferenceScriptPublisher(
                 LoanFixtures.registry(), LoanFixtures.utxoSupplier(synthetic),
                 LoanFixtures.protocolParams());
 
         List<BuiltTransaction> built =
-                publisher.build(Plan.minimumSplit(), destination, destination, change);
+                publisher.build(Plan.minimumSplit(), destination, funder, change);
         assertEquals(2, built.size(), "the minimum split is two transactions");
 
-        log.info("destination address (wallet A index 0, preview): {}", destination);
+        log.info("destination address (unspendable always-fails script, preview): {}", destination);
+        log.info("destination script hash (always-fails; the locked ada is NOT recoverable): {}",
+                unspendable.scriptHash());
+        log.info("funder address (wallet A index 0, preview): {}", funder);
         log.info("change address (wallet A index {}, preview): {}", CHANGE_ADDRESS_INDEX, change);
 
         long totalMinAda = 0L;
@@ -122,8 +145,8 @@ public class ReferenceScriptPublishRunnerTest {
             log.info("TX{} unsigned cbor: {}", i + 1, HexUtil.encodeHexString(tx.cbor()));
         }
 
-        log.info("TOTAL locked {} lovelace ({} ada) + fees {} lovelace, all of the locked ada "
-                        + "recoverable by spending the outputs later",
+        log.info("TOTAL locked {} lovelace ({} ada) + fees {} lovelace; the locked ada sits at an "
+                        + "unspendable always-fails address and is NOT recoverable — permanent by design",
                 totalMinAda, totalMinAda / 1_000_000d, totalFee);
         log.info("NOTHING WAS SUBMITTED. This runner has no backend and no signer; the "
                 + "coordinates for application.yaml come from a real publication, later.");

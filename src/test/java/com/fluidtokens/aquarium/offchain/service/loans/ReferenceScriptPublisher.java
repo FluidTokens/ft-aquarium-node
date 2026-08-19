@@ -1,9 +1,15 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.client.address.AddressProvider;
+import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.MinAdaCalculator;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.common.model.Network;
+import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil;
+import com.bloxbean.cardano.client.plutus.blueprint.model.PlutusVersion;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.Tx;
@@ -569,5 +575,113 @@ public final class ReferenceScriptPublisher {
             byHash.put(scriptHashOf(validator), validator);
         }
         return byHash;
+    }
+
+    /**
+     * A publishing destination we can <b>prove</b> we do not control: the enterprise address of an
+     * always-fails PlutusV3 script, derived per network. This is what a real publication should pay
+     * its reference-script outputs to — the coordinates outlive this project, and paying them to a
+     * wallet we happen to hold today makes their permanence a matter of key custody rather than of
+     * the ledger.
+     *
+     * <h2>Why an always-fails script, and not merely a datum-less output</h2>
+     * Under Plutus V3 a datum is <em>optional</em>, so a datum-less output at a V3 script address can
+     * still be spent — "no datum" is not "unspendable". Permanence here rests <b>entirely</b> on the
+     * script genuinely always failing. The script is {@code (program 1.1.0 (error))}: a bare
+     * {@code error} term that aborts the UPLC machine before it inspects any argument, so it refuses
+     * every spend regardless of datum, redeemer or context. That behaviour is not assumed — it is
+     * proven by {@code ReferenceScriptPublisherTest}'s dry-eval permanence test, which spends a
+     * synthetic UTxO at this address through the real UPLC machine and asserts the spend redeemer is
+     * refused.
+     *
+     * <h2>Derivation (all three steps reproducible)</h2>
+     * <ol>
+     *   <li>{@code compiledCode = 4401010061} is the CBOR-wrapped flat encoding of
+     *       {@code (program 1.1.0 (error))} — {@code aiken uplc encode --cbor --hex} over that
+     *       one-line program (aiken v1.1.22). The bare {@code 01010061} flat body is wrapped in the
+     *       {@code 0x44} CBOR bytestring header the blueprint's own {@code compiledCode} fields use.</li>
+     *   <li>{@link PlutusBlueprintUtil#getPlutusScriptFromCompiledCode} builds the PlutusV3 script;
+     *       {@link PlutusScript#getScriptHash()} is {@code blake2b_224(0x03 || compiledCode) =
+     *       994b345acef955ada938b01e9f0405ab57743d41f0b398de604d0969} — the same {@code 0x03}-prefixed
+     *       rule that reproduces every loans-v4 blueprint hash.</li>
+     *   <li>{@link AddressProvider#getEntAddress} over that script credential and the requested
+     *       network is the enterprise (no-stake) address the reference-script outputs are paid to.</li>
+     * </ol>
+     *
+     * <h2>Fail-closed on mainnet</h2>
+     * {@link #forNetwork} refuses mainnet outright — see there. This destination is for preview /
+     * preprod publishing only; sending reference scripts to an address nobody controls on mainnet is
+     * a separate, later, deliberate decision, and no mainnet destination is derived here.
+     */
+    public static final class UnspendableDestination {
+
+        /**
+         * The CBOR-wrapped flat encoding of the always-fails program {@code (program 1.1.0 (error))};
+         * see the class javadoc for the full derivation. A wrong constant here is the exact
+         * catastrophe this type exists to prevent, which is why the dry-eval permanence test proves
+         * the resulting script always fails rather than trusting these bytes.
+         */
+        private static final String ALWAYS_FAILS_COMPILED_CODE = "4401010061";
+
+        private static final PlutusScript ALWAYS_FAILS_SCRIPT = buildAlwaysFailsScript();
+
+        private final String address;
+
+        private UnspendableDestination(String address) {
+            this.address = address;
+        }
+
+        /**
+         * The unspendable destination for {@code network} — <b>except mainnet, which is refused</b>.
+         * <p>
+         * Mainnet is identified by its protocol magic (preprod and preview both carry testnet
+         * network-id 0, so the network-id alone cannot tell mainnet apart). Constructing a destination
+         * we do not control on mainnet is deliberately out of reach here: it is a separate, later
+         * decision, so this throws rather than derive any mainnet address at all.
+         */
+        public static UnspendableDestination forNetwork(Network network) {
+            if (network.getProtocolMagic() == Networks.mainnet().getProtocolMagic()) {
+                throw new IllegalStateException(
+                        "refusing to derive an unspendable reference-script destination on mainnet: "
+                        + "sending reference scripts to an address nobody controls is a separate, later "
+                        + "decision — no mainnet destination is implemented here");
+            }
+            String address = AddressProvider.getEntAddress(
+                    Credential.fromScript(scriptHashHex()), network).getAddress();
+            return new UnspendableDestination(address);
+        }
+
+        /** The enterprise script address the reference-script outputs are paid to. */
+        public String address() {
+            return address;
+        }
+
+        /** The always-fails script's hash, hex — the payment credential of {@link #address()}. */
+        public String scriptHash() {
+            return scriptHashHex();
+        }
+
+        /** The always-fails PlutusV3 script itself, for the dry-eval permanence proof. */
+        public PlutusScript script() {
+            return ALWAYS_FAILS_SCRIPT;
+        }
+
+        private static String scriptHashHex() {
+            try {
+                return HexUtil.encodeHexString(ALWAYS_FAILS_SCRIPT.getScriptHash());
+            } catch (Exception e) {
+                throw new IllegalStateException("cannot hash the always-fails script", e);
+            }
+        }
+
+        private static PlutusScript buildAlwaysFailsScript() {
+            try {
+                return PlutusBlueprintUtil.getPlutusScriptFromCompiledCode(
+                        ALWAYS_FAILS_COMPILED_CODE, PlutusVersion.v3);
+            } catch (Exception e) {
+                throw new IllegalStateException("cannot build the always-fails PlutusV3 script from "
+                        + ALWAYS_FAILS_COMPILED_CODE, e);
+            }
+        }
     }
 }
