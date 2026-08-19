@@ -1,6 +1,7 @@
 package com.fluidtokens.aquarium.offchain.controller.health;
 
 import com.fluidtokens.aquarium.offchain.service.StakerService;
+import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.actuate.health.Health;
@@ -13,9 +14,16 @@ import org.springframework.stereotype.Component;
 public class StakingHealthIndicator implements HealthIndicator {
 
     private final StakerService stakerService;
+    private final BlockEventListener blockEventListener;
 
     @Override
     public Health health() {
+        if (blockEventListener.getIsSyncing().get()) {
+            return Health.up()
+                    .withDetail("state", "starting")
+                    .withDetail("component", "staking")
+                    .build();
+        }
         try {
             var stakerRefInputs = stakerService.findStakerRefInput();
             boolean hasStaking = !stakerRefInputs.isEmpty();

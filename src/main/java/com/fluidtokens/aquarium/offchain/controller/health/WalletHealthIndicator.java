@@ -1,6 +1,7 @@
 package com.fluidtokens.aquarium.offchain.controller.health;
 
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
+import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.actuate.health.Health;
@@ -13,9 +14,16 @@ import org.springframework.stereotype.Component;
 public class WalletHealthIndicator implements HealthIndicator {
 
     private final AppUtxoService utxoService;
+    private final BlockEventListener blockEventListener;
 
     @Override
     public Health health() {
+        if (blockEventListener.getIsSyncing().get()) {
+            return Health.up()
+                    .withDetail("state", "starting")
+                    .withDetail("component", "wallet")
+                    .build();
+        }
         try {
             var walletUtxos = utxoService.listWalletUtxo();
             boolean hasAdaOnlyUtxo = walletUtxos.stream()
