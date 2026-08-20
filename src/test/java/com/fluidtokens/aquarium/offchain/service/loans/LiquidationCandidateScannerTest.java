@@ -360,15 +360,51 @@ class LiquidationCandidateScannerTest {
         assertTrue(assessment.buildable(), assessment.exclusion() + ": " + assessment.detail());
     }
 
-    // ---- CONVERSION_TO_PRINCIPAL_REQUIRED (epic scope) -----------------------------------------
+    // ---- a convert bond is no longer excluded for conversion (A3) ------------------------------
 
+    /**
+     * <b>A convert-to-principal bond is no longer excluded here.</b> This test replaces
+     * {@code convertToPrincipalBondIsExcluded}, which asserted the exact opposite on a convert bond:
+     * pre-change, the scanner filtered {@code shouldLiquidationConvertToPrincipal == True} out as
+     * {@link LiquidationExclusion#CONVERSION_TO_PRINCIPAL_REQUIRED}. A3 lifted that exclusion, so a
+     * convert loan is now scanned like any other and routed by {@code LiquidationExecutor} (A2) rather
+     * than filtered here.
+     * <p>
+     * The fixture is the convert-bond twin of {@link #lateButLtvHealthyLoanIsBuildableViaLateness()}:
+     * the identical late loan and feeds, with the bond's {@code shouldLiquidationConvertToPrincipal}
+     * flipped to true. It comes back buildable with a null exclusion — the convert flag alone no longer
+     * stops a candidate. (Pre-change, the same fixture would come back excluded as
+     * {@code CONVERSION_TO_PRINCIPAL_REQUIRED}, which is the fail-first red for this expectation.)
+     */
     @Test
-    void convertToPrincipalBondIsExcluded() {
-        var datum = healthyDatum(liquidation(100, 125, 100, false), BigInteger.valueOf(1_000_000));
-        var loan = loan(datum, BigInteger.valueOf(1_000));
-        var assessment = scanOne(List.of(loan), List.of(bond(true, 100)), null);
+    void convertToPrincipalBondIsNoLongerExcludedForConversion() throws Exception {
+        var datum = lateDatum(-1); // late, so buildable via lateness; equity short-circuits to zero
+        var loan = loan(datum, BigInteger.valueOf(1_000_000_000));
+        var client = oracleClientWith(entry(PRINCIPAL, 5), entry(COLLATERAL, 2));
 
-        assertEquals(LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED, assessment.exclusion());
+        var assessment = scanOne(List.of(loan), List.of(bond(true, 100)), client);
+
+        assertTrue(assessment.buildable(), assessment.exclusion() + ": " + assessment.detail());
+        assertNull(assessment.exclusion(),
+                "the convert flag alone no longer excludes; conversion is the executor's routing job now");
+    }
+
+    /**
+     * The control: a convert bond whose loan is still excluded, for a reason the convert flag has
+     * nothing to do with. Exactly {@link #ltvExactlyAtTheThresholdIsNotLiquidatable()}'s fixture with
+     * the bond's convert flag flipped on — it still reaches {@link LiquidationExclusion#NOT_LIQUIDATABLE},
+     * proving A3 lifted only the conversion filter and left every downstream exclusion (and its order)
+     * intact.
+     */
+    @Test
+    void aConvertBondStillReachesTheDownstreamExclusionItDeserves() throws Exception {
+        var datum = ltvBoundaryDatum(BigInteger.valueOf(1_000_000));
+        var loan = loan(datum, BigInteger.valueOf(100));
+        var client = oracleClientWith(entry(COLLATERAL, 10_000));
+
+        var assessment = scanOne(List.of(loan), List.of(bond(true, 100)), client);
+
+        assertEquals(LiquidationExclusion.NOT_LIQUIDATABLE, assessment.exclusion());
     }
 
     // ---- PRINCIPAL_ORACLE_UNUSABLE -----------------------------------------------------------

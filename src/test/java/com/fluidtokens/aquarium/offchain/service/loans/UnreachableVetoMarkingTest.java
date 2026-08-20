@@ -29,8 +29,8 @@ class UnreachableVetoMarkingTest {
      * the source, so an accidental annotation addition or removal changes this test's answer
      * independently of the production code.
      * <p>
-     * <b>It was six; it is now four.</b> Positive-equity liquidation removed two of them, and for two
-     * different reasons:
+     * <b>It was six, then four; it is now three.</b> Positive-equity liquidation removed two of them,
+     * and A3 removed a third — each because the scanner filter the annotation named was lifted:
      * <ul>
      *   <li>{@code POSITIVE_EQUITY_UNSUPPORTED} — the constant no longer exists. It was the V8 veto,
      *       and V8 is gone.</li>
@@ -40,11 +40,17 @@ class UnreachableVetoMarkingTest {
      *       {@code repaymentReceipts = True} loan with a positive equity now reaches the builder for
      *       real. Leaving the annotation would have been a claim of unreachability that the scanner no
      *       longer backs.</li>
+     *   <li>{@code CONVERSION_TO_PRINCIPAL_REQUIRED} — the same story one slice later. The constant is
+     *       still there and its V7 guard still refuses, but it is <b>no longer unreachable from a
+     *       scanned batch</b>. Its marking claimed the scanner filtered it out via
+     *       {@code LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED}; A3 lifted that exclusion, so
+     *       a convert loan is now scanned and kept from the plain builder by
+     *       {@code LiquidationExecutor}'s routing to the pay-in-advance seam (A2), not by the scanner.
+     *       Leaving the annotation would claim an unreachability the scanner no longer backs.</li>
      * </ul>
      */
     private static final Set<String> EXPECTED_ANNOTATED = Set.of(
             "EQUITY_IN_PRINCIPAL_CURRENCY",
-            "CONVERSION_TO_PRINCIPAL_REQUIRED",
             "UNSUPPORTED_ORACLE_VARIANT",
             "CHARLIE_PROVIDER_REFERENCE_INPUT_MISSING");
 

@@ -13,6 +13,7 @@ import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
+import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationDecision;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationExclusion;
@@ -315,6 +316,32 @@ class LiquidationExecutorTest {
     }
 
     /**
+     * The same ada/ada scenario as {@link #scenario(BigInteger)}, but with a <em>convert</em> bond
+     * ({@code shouldLiquidationConvertToPrincipal == True}) — the one datum flag
+     * {@link LiquidationExecutor} routes on. Every other field is identical, so the difference between
+     * this and {@code scenario} is exactly the routing decision. Used by the executor-level convert
+     * tests that exercise the {@code PayInAdvanceNotModelledException → REFUSED} and
+     * {@code genuine-exception → quarantine} mappings without needing the full oracle universe the
+     * buildable-convert path requires.
+     */
+    private static Scenario convertScenario(BigInteger feePerMille) {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum,
+                COLLATERAL_LOVELACE, List.of());
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.convertToPrincipalBondDatum(feePerMille,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
+                2_000_000L);
+
+        LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.unit(), OraclePriceFeed.unit(), VALID_FROM);
+        return new Scenario(loan, bond, assessment);
+    }
+
+    /**
      * A token-collateral loan priced by a Charli3 feed, and the oracle entry that prices it.
      * <pre>
      *   principal 50 ADA at 10%                    -> remainingDebt   55_000_000 lovelace
@@ -517,6 +544,192 @@ class LiquidationExecutorTest {
                                            Scenario scenario, List<Utxo> walletUtxos) {
         return wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
                 allUnspent(List.of(scenario)), walletUtxos, noOracle(), false);
+    }
+
+    // ======================================================================================
+    // the frozen f855 convert fixture (duplicated from PayInAdvanceLiquidationRouterTest)
+    // ======================================================================================
+
+    /**
+     * The frozen convert loan {@code f855d1b4…#1/#3} — the same real preview shape
+     * {@code PayInAdvanceLiquidationRouterTest} and {@code LiquidatePayInAdvanceDryEvalTest} pin,
+     * duplicated here so this class owns its convert inputs. 100 000 000 tFLDT of collateral against a
+     * 28 000 000-lovelace (ada) principal, with a lender bond whose
+     * {@code shouldLiquidationConvertToPrincipal == True} — the flag {@link LiquidationExecutor} routes
+     * on. Only what the executor's buildable-convert path actually reads is duplicated.
+     */
+    private static final class F855 {
+
+        private static final String LOAN_TX =
+                "f855d1b4cae6e1ec6db5aac9ef8038f53927e60004693729ce27d8273199aea1";
+        private static final int LOAN_INDEX = 1;
+        private static final int BOND_INDEX = 3;
+        private static final String LOAN_ID = "1d391e2258a62aeeae1275f2b31df80560e76732b266b2ab63c62e22";
+
+        private static final String LOAN_DATUM_HEX =
+                "d8799f001a01ab3f001b000001a01e60ee00001901cb00d8799f4040ffd8799f4040ff0000d87b9f1864"
+                        + "187d1864d87980ffd87b9f181c05ff0000d879805821504f4f4c00183f8ba4d1e645b1e26e9caf5"
+                        + "6f802b129b50d833689727c920abe11d8799f581c0b77d150c275bd0a600633e4be7d09f83c4b9f"
+                        + "00981e22ac9c9d3f62d8799f490014df1074464c4454ffd8799f581c9a2ec5c92daccbb269611a9"
+                        + "eae7a40f9788d3f9c0229661b6234286f49000de1406f766f3633ffffff";
+        private static final String BOND_DATUM_HEX =
+                "d8799fd8799f581cea1bb1ccd33aeb9e02516c2eb50adbaa63d7b7538b03c96908bfc934ffd8799fd879"
+                        + "9fd8799f581c1c5621a0d3f7ee5041ece1c8f41a9f611ab4bca268923c21b6ca8dc3ffffffd87a80"
+                        + "1832581d00183f8ba4d1e645b1e26e9caf56f802b129b50d833689727c920abe11d8799f4040ff"
+                        + "ff";
+        private static final String LOAN_ADDRESS =
+                "addr_test1zzrr2mm7vnwzsnn8eqsqf62dgf84sr3z2rq2xnne5a7mr0y788t0nqjduhey4swhxfp7h42thj"
+                        + "hhvnjkmcgaps3ahx5qxanp9j";
+        private static final String BOND_ADDRESS =
+                "addr_test1zr3s95d7aq2zhm597lnk76pengtsk2s52jkpnl7ejfen95cu2cs6p5lhaegyrm8per6p48mpr2"
+                        + "6tegngjg7zrdk23hps7h96kk";
+
+        private static final AssetType COLLATERAL = new AssetType(
+                "0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62", "0014df1074464c4454");
+        private static final long COLLATERAL_AMOUNT = 100_000_000L;
+        private static final long LOAN_LOVELACE = 3_000_000L;
+        private static final long BOND_LOVELACE = 1_810_200L;
+
+        private static final AssetType ORACLE_NFT = new AssetType(
+                "9a2ec5c92daccbb269611a9eae7a40f9788d3f9c0229661b6234286f", "000de1406f766f3633");
+        private static final AssetType C3_FEED_NFT = new AssetType(
+                "decfbd6bdd5c3eb1915564d414fe099db8c08d5e18037562cc7bb4b3", "4f7261636c6546656564");
+        private static final String ORACLE_SCRIPT_HASH =
+                "402c984d6397f508ced0674646bb2fcd67f593c5b79d91e1e5c0b124";
+        private static final String ORACLE_ADDRESS =
+                "addr_test1wpqzexzdvwtl2zxw6pn5v34m9lxk0avnckmemy0puhqtzfqw4jw8q";
+        private static final TransactionInput ORACLE_REF_INPUT = new TransactionInput(
+                "cc4721afdf4721f8f179b3afddb8e096805c0fad16afe54687d7368d12bd769c", 0);
+        private static final TransactionInput ORACLE_REF_SCRIPT = new TransactionInput(
+                "ba34f9e5bbf6d148b67208d53f11be9253de0d9df81190bcf034438d3838218f", 0);
+        private static final TransactionInput C3_PROVIDER = new TransactionInput(
+                "a17501465ed79dbc6cb25e2e99edbc421b1baa9d100b6780da89770702b235a5", 0);
+        private static final String C3_PROVIDER_ADDRESS =
+                "addr_test1wzgy7cu7mnnjau2qn5th8932tr27f83tfgusm60sklwppmgh6re39";
+        private static final String C3_PROVIDER_DATUM_HEX =
+                "d8799fd87b9fa3001a000528f30100021b000001a47d6fbc38ffff";
+        private static final BigInteger PRICE = BigInteger.valueOf(338163);
+        private static final BigInteger PRICE_DENOMINATOR = BigInteger.valueOf(1_000_000);
+
+        /** This loan's lendDate; the cycle instant sits ~1h after it, exactly as the router test does. */
+        private static final long LEND_DATE = 1_787_216_064_000L;
+        private static final long NOW = LEND_DATE + 3_600_000L;
+        private static final long FEED_VALID_FROM = NOW - 35_555L;
+        private static final long FEED_VALID_TO = FEED_VALID_FROM + 600_000L;
+
+        private static final long REMAINING_DEBT = 28_000_147L;
+        private static final long EQUITY = 8_919_184L;
+        private static final long LIQUIDATION_FEE = 5_000_000L;
+
+        static LoanDatum loanDatum() {
+            return new LoanDatumConverter().deserialize(LOAN_DATUM_HEX);
+        }
+
+        static LenderManagerDatum bondDatum() {
+            return new LenderManagerDatumConverter().deserialize(BOND_DATUM_HEX);
+        }
+
+        static Loan loan() {
+            return new Loan(LOAN_TX, LOAN_INDEX, LOAN_ADDRESS, LOAN_ID,
+                    BigInteger.valueOf(COLLATERAL_AMOUNT), BigInteger.valueOf(LOAN_LOVELACE), loanDatum());
+        }
+
+        static LenderBond bond() {
+            return new LenderBond(LOAN_TX, BOND_INDEX, BOND_ADDRESS, LOAN_ID, BOND_DATUM_HEX, bondDatum());
+        }
+
+        static Utxo loanUtxo() {
+            return LoanFixtures.utxo(LOAN_TX, LOAN_INDEX, LOAN_ADDRESS, List.of(
+                    Amount.lovelace(BigInteger.valueOf(LOAN_LOVELACE)),
+                    Amount.asset(LoanFixtures.unit(COLLATERAL), BigInteger.valueOf(COLLATERAL_AMOUNT)),
+                    Amount.asset(LoanFixtures.registry().getLoanPolicyId() + LOAN_ID, BigInteger.ONE)),
+                    LOAN_DATUM_HEX);
+        }
+
+        static Utxo bondUtxo() {
+            return LoanFixtures.utxo(LOAN_TX, BOND_INDEX, BOND_ADDRESS, List.of(
+                    Amount.lovelace(BigInteger.valueOf(BOND_LOVELACE)),
+                    Amount.asset(LoanFixtures.registry().getLenderBondPolicyId() + LOAN_ID, BigInteger.ONE)),
+                    BOND_DATUM_HEX);
+        }
+
+        static OracleEntry oracle() {
+            return LoanFixtures.charli3(COLLATERAL, ORACLE_NFT, ORACLE_SCRIPT_HASH,
+                    OraclePriceFeed.priceDataCharlie(COLLATERAL, PRICE, PRICE_DENOMINATOR,
+                            FEED_VALID_FROM, FEED_VALID_TO),
+                    ORACLE_REF_INPUT, ORACLE_REF_SCRIPT, C3_PROVIDER);
+        }
+
+        /** The three oracle reference-input UTxOs the pay-in-advance builder resolves to assemble the body. */
+        static List<Utxo> oracleUniverse() {
+            List<Utxo> universe = new ArrayList<>();
+            universe.add(LoanFixtures.utxo(ORACLE_REF_INPUT.getTransactionId(), ORACLE_REF_INPUT.getIndex(),
+                    ORACLE_ADDRESS, List.of(Amount.lovelace(BigInteger.valueOf(1_038_710L)),
+                            Amount.asset(LoanFixtures.unit(ORACLE_NFT), BigInteger.ONE)), null));
+            universe.add(Utxo.builder()
+                    .txHash(ORACLE_REF_SCRIPT.getTransactionId())
+                    .outputIndex(ORACLE_REF_SCRIPT.getIndex())
+                    .address(ORACLE_ADDRESS)
+                    .amount(List.of(Amount.lovelace(BigInteger.valueOf(40_000_000L))))
+                    .referenceScriptHash(ORACLE_SCRIPT_HASH)
+                    .build());
+            universe.add(LoanFixtures.utxo(C3_PROVIDER.getTransactionId(), C3_PROVIDER.getIndex(),
+                    C3_PROVIDER_ADDRESS, List.of(Amount.lovelace(BigInteger.valueOf(2_000_000L)),
+                            Amount.asset(LoanFixtures.unit(C3_FEED_NFT), BigInteger.ONE)),
+                    C3_PROVIDER_DATUM_HEX));
+            return universe;
+        }
+
+        static LiquidationAssessment assessment() {
+            return LiquidationAssessment.buildable(bond(), loan(), "f855 convert fixture",
+                    BigInteger.valueOf(REMAINING_DEBT), BigInteger.valueOf(EQUITY), false,
+                    BigInteger.valueOf(LIQUIDATION_FEE));
+        }
+    }
+
+    /**
+     * The whole loop wired for the frozen f855 convert loan: the scanner returns its buildable convert
+     * assessment, the resolver reports both UTxOs unspent, the oracle registry carries the collateral
+     * c3 oracle, and the pay-in-advance builder is handed a universe that includes the three oracle
+     * reference inputs so it can actually assemble the {@code LiquidateAndPayInAdvance} body. Shadow
+     * mode and the exploding submitter, exactly like every other wiring in this class.
+     */
+    private static Wiring convertWiring() {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+                F855.loanUtxo(), F855.bondUtxo()));
+        universe.addAll(F855.oracleUniverse());
+
+        LiquidateTransactionBuilder builder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+
+        LiquidationAssessment assessment = F855.assessment();
+        FakeScanner scanner = new FakeScanner(List.of(assessment));
+
+        Map<String, Utxo> unspent = new LinkedHashMap<>();
+        unspent.put(assessment.loan().utxoRef(), F855.loanUtxo());
+        unspent.put(assessment.bond().utxoRef(), F855.bondUtxo());
+        FakeResolver resolver = new FakeResolver(unspent);
+
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        CountingOracleProvider oracles = new CountingOracleProvider(
+                new FakeOracleClient(List.of(F855.oracle())), new FakeOracleClient(List.of()));
+
+        PayInAdvanceLiquidationRouter router = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT, scanner, resolver, builder,
+                router, LoanFixtures.registry(), log, oracles, previewNetwork(),
+                LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
+        return new Wiring(executor, log, scanner, resolver, oracles);
     }
 
     // ======================================================================================
@@ -1161,6 +1374,112 @@ class LiquidationExecutorTest {
                 "the entry closest to expiry is the one dropped");
         assertTrue(executor.quarantinedRefs().contains("ref#1"),
                 "and only that one — nothing else is evicted to make room");
+    }
+
+    // ======================================================================================
+    // the executor's convert branch: routing + the two failure mappings (A3 Part 2)
+    // ======================================================================================
+    //
+    // The A2 auditor found the executor's convert branch undefended: forcing it to `if (false)`
+    // left the whole suite green, because no executor-level test fed a CONVERT assessment through
+    // consider()/record(). These three tests close that — they exercise the routing selection, the
+    // PayInAdvanceNotModelledException -> REFUSED mapping, and the genuine-exception -> quarantine
+    // mapping at the executor layer, and every one of them goes RED under the `if (false)` mutation
+    // (a convert assessment then reaches the plain builder, whose V7 guard refuses it as
+    // CONVERSION_TO_PRINCIPAL_REQUIRED instead of routing / refusing-cleanly / quarantining).
+
+    /**
+     * (a) A <b>buildable</b> convert assessment — the real f855 shape — reaches the router, which
+     * assembles a {@code LiquidateAndPayInAdvance} transaction that flows into the executor's normal
+     * pricing + veto path and is recorded, held un-submitted by shadow mode. Nothing reaches the
+     * exploding submitter.
+     * <p>
+     * The plain {@code Liquidate} builder refuses this loan outright (V7), so a <em>built</em> body is
+     * itself proof the candidate went through the pay-in-advance router rather than the plain builder —
+     * which is exactly what the {@code if (false)} mutation breaks.
+     */
+    @Test
+    void aBuildableConvertLoanIsRoutedAndRecordedButNeverSubmitted() {
+        Wiring wiring = convertWiring();
+
+        wiring.executor().cycle(F855.NOW);
+
+        assertEquals(1, wiring.scanner().scans);
+        LiquidationDecision decision = onlyDecision(wiring);
+
+        assertNotNull(decision.txHash(), decision.detail());
+        assertNotNull(decision.txCborHex());
+        assertEquals(LiquidationDecision.VARIANT, decision.variant());
+        assertEquals(F855.LOAN_ID, decision.loanId());
+        // Shadow mode: a priced verdict (WOULD_SUBMIT or UNPROFITABLE), never a submit or a refusal.
+        assertTrue(decision.outcome() == LiquidationDecision.Outcome.WOULD_SUBMIT
+                        || decision.outcome() == LiquidationDecision.Outcome.UNPROFITABLE,
+                "a routed convert tx is priced, not refused: " + decision.outcome() + " " + decision.detail());
+        assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(), decision.submitVeto(),
+                "shadow mode is what held it, and nothing reached the submitter");
+        assertNotEquals(LiquidationDecision.Outcome.SUBMITTED, decision.outcome());
+        assertNotEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, decision.outcome());
+        // The pay-in-advance shape: both configs plus the oracle nft, its reference script and the c3
+        // provider — five reference inputs the plain ada/ada path never carries.
+        assertTrue(decision.referenceInputs() >= 5,
+                "the convert body reads both configs and the three oracle reference inputs, got "
+                        + decision.referenceInputs());
+        assertEquals(0, wiring.executor().quarantinedCount(), "a clean build is not quarantined");
+    }
+
+    /**
+     * (b) A convert assessment the seam cannot model — here a non-positive equity — is mapped to a
+     * clean {@code REFUSED} row under the router's own message, <b>not</b> quarantined and with no
+     * transaction built. The ada/ada convert fixture is under water, so its equity is exactly zero: the
+     * shape {@code PayInAdvanceLiquidationRouter} refuses before it ever calls the builder.
+     */
+    @Test
+    void aConvertAssessmentWithNonPositiveEquityIsRefusedNotQuarantined() {
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        assertTrue(convert.bond().bond().datum().shouldLiquidationConvertToPrincipal(),
+                "the fixture must be a convert bond, or the executor would not route it");
+        assertEquals(BigInteger.ZERO, convert.assessment().equity(),
+                "the ada/ada fixture is under water: equity is zero, the non-positive shape the seam refuses");
+
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), convert, false);
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertEquals("pay-in-advance not yet modelled for non-positive equity", decision.reason());
+        assertNull(decision.txHash(), "a clean not-modelled refusal builds no transaction");
+        assertNull(decision.txCborHex());
+        assertEquals(0, wiring.executor().quarantinedCount(),
+                "a shape the seam cannot model is a REFUSED row, never a quarantine");
+    }
+
+    /**
+     * (c) A convert assessment that clears the router's preconditions (ada principal, positive equity)
+     * but whose {@code builder.build} then throws a <em>genuine</em> exception — the machinery failing,
+     * not a verdict on the loan — is mapped to the QUARANTINE path, exactly like the plain path's
+     * machinery-failure branch. Here the positive-equity ada-collateral convert loan carries no oracle
+     * entry for its (nominal) collateral leg, so the promoted builder dereferences a null oracle
+     * ({@code NullPointerException}); in production the same branch would catch a Blockfrost timeout.
+     */
+    @Test
+    void aConvertAssessmentWhoseBuildThrowsIsQuarantined() {
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        // Force a strictly positive equity so the router clears both preconditions (ada principal +
+        // positive equity) and actually calls the promoted builder, which then throws.
+        LiquidationAssessment positiveEquity = LoanFixtures.withNumbers(convert.assessment(),
+                convert.assessment().remainingDebt(), BigInteger.ONE, convert.assessment().liquidationFee());
+        Scenario tampered = convert.withAssessment(positiveEquity);
+
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(tampered.assessment()), List.of(tampered),
+                allUnspent(List.of(tampered)), List.of(WALLET_UTXO), noOracle(), false);
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertNull(decision.txHash(), "the build threw, so nothing was routed");
+        assertEquals(1, wiring.executor().quarantinedCount(),
+                "a genuine build failure quarantines, unlike a clean not-modelled refusal");
+        assertEquals(Set.of(TX_LOAN + "#0"), wiring.executor().quarantinedRefs());
     }
 
     // ======================================================================================

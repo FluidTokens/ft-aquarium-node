@@ -351,10 +351,17 @@ public final class LiquidateTransactionBuilder {
          * {@code lm_liquidate_action.ak:143} makes {@code shouldLiquidationConvertToPrincipal == False}
          * a conjunct of the check the plain {@code Liquidate} path runs. Converting proceeds to the
          * principal currency is a different action, not this one.
+         * <p>
+         * <b>This is no longer unreachable from a scanned batch</b>, and its
+         * {@code @UnreachableFromScannedBatch} marking was removed with A3. The marking claimed the
+         * scanner filtered it out via {@code LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED}; A3
+         * lifted that exclusion, so a convert loan is now scanned. What keeps it away from <em>this</em>
+         * plain builder is {@code LiquidationExecutor}'s routing, which sends a convert candidate to the
+         * pay-in-advance seam ({@code PayInAdvanceLiquidationRouter}) rather than here (A2). The V7 guard
+         * below stays as a hard last line: if a convert assessment ever does reach this builder — an
+         * assessment that did not come from the routing of the UTxOs actually being spent — it still
+         * refuses rather than emitting a transaction the {@code lm_liquidate_action} validator rejects.
          */
-        @UnreachableFromScannedBatch(
-                scannerFilter = "LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED",
-                reason = "the scanner already excludes on §7.5 (LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED)")
         CONVERSION_TO_PRINCIPAL_REQUIRED,
         /** D6 needs the bond datum echoed byte for byte; this one does not survive a round trip. */
         BOND_DATUM_NOT_BYTE_IDENTICAL,

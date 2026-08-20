@@ -28,9 +28,9 @@ import java.util.stream.Collectors;
  * <p>
  * <b>Filter order — first failure wins.</b> This is this scanner's own diagnostic convention, not
  * a mirror of on-chain evaluation order: join first (nothing else can be evaluated without a
- * loan), then the cheap type filters in the order this ticket specifies, then the epic-scope
- * restriction, then the two oracle legs, and finally the finance math — the most expensive step,
- * and the one every earlier filter exists to protect from bad inputs. The validators themselves
+ * loan), then the cheap type filters in the order this ticket specifies, then the two oracle legs,
+ * and finally the finance math — the most expensive step, and the one every earlier filter exists
+ * to protect from bad inputs. The validators themselves
  * check D3's collateral shape ({@code lm_liquidate_action.ak:108,116}) <em>before</em> D1/D2
  * ({@code :120,121}), the opposite of steps 2-4 below — so a bond excluded here for reason N is
  * not guaranteed to be the first check a validator would actually reach; it only means the
@@ -45,8 +45,6 @@ import java.util.stream.Collectors;
  *       {@link LiquidationExclusion#COLLATERAL_IS_COLLECTION}</li>
  *   <li>D3 — collateral quantity must be &gt; 1 →
  *       {@link LiquidationExclusion#COLLATERAL_AMOUNT_TOO_SMALL}</li>
- *   <li>epic scope — {@code shouldLiquidationConvertToPrincipal} must be false →
- *       {@link LiquidationExclusion#CONVERSION_TO_PRINCIPAL_REQUIRED}</li>
  *   <li>the principal leg must be priceable and liquidatable →
  *       {@link LiquidationExclusion#PRINCIPAL_ORACLE_UNUSABLE}</li>
  *   <li>the collateral leg must be priceable and liquidatable →
@@ -56,7 +54,16 @@ import java.util.stream.Collectors;
  *   <li>D9 — the loan must actually be late or over its liquidation LTV →
  *       {@link LiquidationExclusion#NOT_LIQUIDATABLE}</li>
  * </ol>
- * Anything that survives all ten steps is {@link LiquidationAssessment#buildable()}.
+ * Anything that survives all nine steps is {@link LiquidationAssessment#buildable()}.
+ * <p>
+ * <b>There used to be a sixth step: {@code shouldLiquidationConvertToPrincipal} had to be false</b>,
+ * excluded here as {@code CONVERSION_TO_PRINCIPAL_REQUIRED}. That was the epic-scope filter, and it is
+ * gone. A convert loan — one whose lender bond requires the liquidation proceeds be converted to the
+ * principal currency — is now scanned like any other and, if buildable, routed by
+ * {@code LiquidationExecutor} to the {@code LiquidateAndPayInAdvance} seam instead of the plain
+ * {@code Liquidate} builder (A2). It is no longer filtered out here; the routing is the executor's job,
+ * not this scanner's. The {@code CONVERSION_TO_PRINCIPAL_REQUIRED} exclusion value still exists (the
+ * endpoint layer produces it), but this scanner no longer emits it.
  * <p>
  * <b>There used to be an eleventh step: the equity had to be zero.</b> It was a scope filter, and the
  * scope it described turned out not to exist. It rested on the claim that no output layout
@@ -137,12 +144,6 @@ public class LiquidationCandidateScanner {
         if (loan.collateralAmount().compareTo(BigInteger.ONE) <= 0) {
             return LiquidationAssessment.excluded(bond, loan, LiquidationExclusion.COLLATERAL_AMOUNT_TOO_SMALL,
                     "collateral amount " + loan.collateralAmount() + " <= 1");
-        }
-
-        if (bond.datum().shouldLiquidationConvertToPrincipal()) {
-            return LiquidationAssessment.excluded(bond, loan, LiquidationExclusion.CONVERSION_TO_PRINCIPAL_REQUIRED,
-                    "bond requires converting liquidation proceeds to principal; "
-                            + "plain Liquidate enforces shouldLiquidationConvertToPrincipal == False");
         }
 
         FeedLookup principalFeed = lookupFeed(datum.principalAsset().isAda(), datum.principalOracleAsset(),
