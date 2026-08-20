@@ -50,10 +50,10 @@ import java.util.Optional;
  * <h2>Structurally incapable of submitting</h2>
  * The {@link QuickTxBuilder} below is constructed with a <b>null</b> {@code TransactionProcessor} —
  * the only thing in cardano-client-lib that can put a transaction on a network — exactly as
- * {@link PoolBorrowTransactionBuilder} is. {@link #build} returns an <b>unsigned</b>
+ * {@code PoolBorrowTransactionBuilder} is. {@link #build} returns an <b>unsigned</b>
  * {@link Transaction}; there is no evaluator, no signer, no key and no network. The ex-units the
  * redeemers carry are cardano-client-lib's placeholders; the real ones are measured separately by
- * {@link LiquidatePayInAdvanceDryEvalTest} through the UPLC machine.
+ * {@code LiquidatePayInAdvanceDryEvalTest} through the UPLC machine.
  *
  * <h2>How it differs from the plain {@code Liquidate} builder</h2>
  * The transaction is the plain-liquidation shape with three changes the pay-in-advance validators
@@ -64,7 +64,7 @@ import java.util.Optional;
  *       {@code lib/fluidtokens/types/lender_manager.ak} at {@code ff005fb}), not {@code Liquidate};</li>
  *   <li>the action withdraw is {@code lm_liquidate_and_pay_in_advance_action}, whose redeemer adds a
  *       {@code principalAndCollateralOracleRefInputIndexes} list to the four fields the plain one has;
- *       its script is <b>witness-attached</b> because {@link EvalFixtures#scriptSupplier} does not
+ *       its script is <b>witness-attached</b> because {@code EvalFixtures#scriptSupplier} does not
  *       carry it;</li>
  *   <li>the lender is paid in ADA — {@code convertedLoanCollateralToPrincipalAmount}, an
  *       ADA-only output ({@code dosProtection} demands {@code flatten == 1}) carrying the
@@ -120,7 +120,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     /**
      * Everything the pay-in-advance transaction needs, all of it honest values — the adversarial
-     * shape {@link LiquidatePayInAdvanceDryEvalTest} feeds the machine is produced by byte-surgery on
+     * shape {@code LiquidatePayInAdvanceDryEvalTest} feeds the machine is produced by byte-surgery on
      * the finished body, not by mis-configuring this request.
      *
      * @param loan             the decoded loan, spent through {@code general_spend}
@@ -287,7 +287,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     /**
      * The six validators this transaction invokes, attached to the witness set. The
-     * pay-in-advance action script is the one {@link EvalFixtures#scriptSupplier} does not carry, so
+     * pay-in-advance action script is the one {@code EvalFixtures#scriptSupplier} does not carry, so
      * attaching every one of them keeps the resolution self-contained (the oracle travels by reference
      * input, resolved from the {@code List.of(oracleScript())} extra at evaluation time).
      */
