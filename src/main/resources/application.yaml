@@ -56,8 +56,12 @@ loans:
     enabled: ${LOANS_ORACLE_ENABLED:true}
     url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
   # The auto-liquidation bot. `mode` is disabled / shadow / live; `enabled` is the separate arming
-  # flag, and BOTH must be set before anything could ever be submitted. Nothing in this codebase
-  # submits a liquidation yet, so today live behaves exactly like shadow.
+  # flag. Submitting requires BOTH mode==live AND enabled==true (isArmed) -- one switch is too easy
+  # to flip by accident. This is not a drill: when armed and all eight submit-vetoes pass, the
+  # executor SIGNS AND SUBMITS the liquidation on preview (LiquidationExecutor wires the real
+  # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
+  # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely. Preview only:
+  # SUBMITTABLE_NETWORK is hard-coded to preview, so mainnet stays fail-closed regardless of flags.
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
     enabled: ${AQUARIUM_LIQUIDATION_ENABLED:false}
