@@ -174,6 +174,15 @@ class LiquidatePayInAdvanceDryEvalTest {
 
     private static final int MAX_TX_SIZE = 16_384;
 
+    /**
+     * The preview {@code loan-claim-action} reference-script coordinate (the one committed in
+     * {@code application.yaml}) — where the 8 665-byte {@code loan_claim_action} script is published so
+     * the convert liquidation can shed it from the witness set. Any coordinate would do here; this is
+     * the real one for provenance.
+     */
+    private static final TransactionInput LOAN_CLAIM_ACTION_REF = new TransactionInput(
+            "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd", 0);
+
     // ======================================================================================
     // the fixtures
     // ======================================================================================
@@ -334,6 +343,83 @@ class LiquidatePayInAdvanceDryEvalTest {
                 "expected " + expected + " to be the refuser, got: " + outcome.detail());
     }
 
+    /**
+     * <b>The convert liquidation fits under {@code maxTxSize} when {@code loan_claim_action} travels by
+     * reference.</b> The same fixture, but with the 8 665-byte {@code loan_claim_action} published as a
+     * reference script instead of witness-attached: the transaction evaluates to the identical
+     * 8-redeemer shape with every ExUnit positive and within the same bounds — ref-vs-inline changes
+     * serialization, not UPLC validation — yet the script is no longer in the witness set (it is a
+     * reference input instead) and the serialized transaction is under {@link #MAX_TX_SIZE}, which the
+     * all-inline shape is not.
+     */
+    @Test
+    void referencingLoanClaimActionFitsUnderMaxTxSizeAndShedsItFromTheWitnessSet() throws Exception {
+        Fixture fixture = fixture();
+
+        // Same fixture, but loan_claim_action published as a reference script instead of witness-attached.
+        LiquidatePayInAdvanceTransactionBuilder.Request base = fixture.request();
+        LiquidatePayInAdvanceTransactionBuilder.Request refRequest =
+                new LiquidatePayInAdvanceTransactionBuilder.Request(base.loan(), base.loanUtxo(),
+                        base.bond(), base.bondUtxo(), base.walletUtxo(), base.configUtxo(),
+                        base.lmConfigUtxo(), base.oracle(), base.validFromMillis(), base.validFromSlot(),
+                        base.validToSlot(), base.changeAddress(),
+                        new LiquidateTransactionBuilder.ReferenceScripts(
+                                null, null, null, null, LOAN_CLAIM_ACTION_REF, null, null));
+
+        // The chain must resolve the referenced script: publish it at the coord, min-ada carrier only —
+        // mirrors the oracle ref-script UTxO above.
+        List<Utxo> universe = new ArrayList<>(universe(fixture));
+        universe.add(Utxo.builder()
+                .txHash(LOAN_CLAIM_ACTION_REF.getTransactionId())
+                .outputIndex(LOAN_CLAIM_ACTION_REF.getIndex())
+                .address(LoanFixtures.botAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                .referenceScriptHash(REGISTRY.getLoanClaimActionScriptHash())
+                .build());
+
+        Transaction tx = new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams()).build(refRequest);
+
+        // Same 8-redeemer shape, every ExUnit positive, same budget bounds as the all-inline path.
+        List<EvaluationResult> results =
+                EvalFixtures.evaluate(tx, universe, REGISTRY, List.of(oracleScript()));
+        assertRedeemerCoverage(tx, results);
+        assertEquals(2, count(results, RedeemerTag.Spend), "the loan and the bond");
+        assertEquals(1, count(results, RedeemerTag.Mint), "one policy, one burn redeemer");
+        assertEquals(5, count(results, RedeemerTag.Reward),
+                "loan, loan_claim_action, lenderManager, pay-in-advance action, oracle");
+        BigInteger mem = BigInteger.ZERO;
+        BigInteger steps = BigInteger.ZERO;
+        for (EvaluationResult result : results) {
+            assertTrue(result.getExUnits().getMem().signum() > 0, "a script that ran costs memory");
+            assertTrue(result.getExUnits().getSteps().signum() > 0, "a script that ran costs steps");
+            mem = mem.add(result.getExUnits().getMem());
+            steps = steps.add(result.getExUnits().getSteps());
+        }
+        assertTrue(mem.compareTo(BigInteger.valueOf(14_000_000L)) <= 0, "total mem " + mem);
+        assertTrue(steps.compareTo(BigInteger.valueOf(10_000_000_000L)) <= 0, "total steps " + steps);
+
+        // loan_claim_action moved: absent from the witness set, present as a reference input. Asserting
+        // both proves the script was relocated, not merely that some byte count shrank.
+        Transaction body = deserialise(tx);
+        String claimHash = REGISTRY.getLoanClaimActionScriptHash();
+        List<String> witnessHashes = new ArrayList<>();
+        for (PlutusScript script : body.getWitnessSet().getPlutusV3Scripts()) {
+            witnessHashes.add(HexUtil.encodeHexString(script.getScriptHash()));
+        }
+        assertFalse(witnessHashes.contains(claimHash),
+                "loan_claim_action must not be witness-attached in the reference shape");
+        assertTrue(body.getBody().getReferenceInputs().stream()
+                        .anyMatch(in -> in.getTransactionId().equals(LOAN_CLAIM_ACTION_REF.getTransactionId())
+                                && in.getIndex() == LOAN_CLAIM_ACTION_REF.getIndex()),
+                "the loan_claim_action coordinate must be among the body's reference inputs");
+
+        // Under budget — the whole point of A4.
+        int size = serializedSize(tx);
+        log.info("reference-shape pay-in-advance liquidation of {}: {} bytes", LOAN_ID, size);
+        assertTrue(size < MAX_TX_SIZE, "reference shape must fit under maxTxSize, was " + size);
+    }
+
     // ======================================================================================
     // pinned arithmetic — measured off builder.numbers() and frozen
     // ======================================================================================
@@ -383,7 +469,9 @@ class LiquidatePayInAdvanceDryEvalTest {
         LiquidatePayInAdvanceTransactionBuilder.Request request =
                 new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond, bondUtxo,
                         WALLET_UTXO, CONFIG_UTXO, LM_CONFIG_UTXO, oracle, validFromMillis,
-                        slots[0], slots[1], LoanFixtures.botAddress());
+                        slots[0], slots[1], LoanFixtures.botAddress(),
+                        // All-inline shape: every validator travels in the witness set.
+                        LiquidateTransactionBuilder.ReferenceScripts.none());
         return new Fixture(loan, loanUtxo, bond, bondUtxo, oracle, request);
     }
 

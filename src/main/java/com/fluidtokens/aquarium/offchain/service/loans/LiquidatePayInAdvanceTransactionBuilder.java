@@ -12,6 +12,7 @@ import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.Asset;
@@ -35,8 +36,12 @@ import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Stream;
 
 /**
  * A <b>test-only</b> builder for a {@code LiquidateAndPayInAdvance} liquidation — the money-path
@@ -136,6 +141,11 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * @param validFromSlot    the validity range lower bound, in slots
      * @param validToSlot      the validity range upper bound, in slots
      * @param changeAddress    fee payer and change address (the bot); it keeps the collateral it took
+     * @param referenceScripts published reference-script coordinates for the validators this builder
+     *                         can shed to a reference input; a {@code null} field means "carry that
+     *                         script in the witness set instead". {@link LiquidateTransactionBuilder.ReferenceScripts#none()}
+     *                         is the all-inline shape. This builder only honours the subset it attaches
+     *                         and that the shared record can name — see {@link #publishedScripts}.
      */
     public record Request(Loan loan,
                           Utxo loanUtxo,
@@ -148,7 +158,8 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                           long validFromMillis,
                           long validFromSlot,
                           long validToSlot,
-                          String changeAddress) {
+                          String changeAddress,
+                          LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
     }
 
     /** The five numbers the redeemer and the outputs rest on, all computed through {@link LoanFinance}. */
@@ -300,10 +311,40 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         tx.attachRewardValidator(registry.getLmLiquidateAndPayInAdvanceActionScript());
     }
 
+    /**
+     * The scripts the caller says are published, paired with the registry object for each — only the
+     * five this builder attaches AND that the shared {@link LiquidateTransactionBuilder.ReferenceScripts}
+     * record can name. It deliberately IGNORES {@code lmLiquidateAction}: this builder attaches the
+     * pay-in-advance action {@code getLmLiquidateAndPayInAdvanceActionScript}, which has no
+     * {@code ReferenceScripts} field and so cannot be referenced. It also ignores {@code assetManager},
+     * which this builder never attaches ({@link #attachValidators}). On preview only
+     * {@code loanClaimAction} is set, which is the 8 665-byte biggest inline script and brings the
+     * transaction under {@code maxTxSize}.
+     */
+    private List<PlutusScript> publishedScripts(LiquidateTransactionBuilder.ReferenceScripts scripts) {
+        List<PlutusScript> published = new ArrayList<>();
+        if (scripts.loan() != null) {
+            published.add(registry.getLoanScript());
+        }
+        if (scripts.loanSpend() != null) {
+            published.add(registry.getLoanSpendScript());
+        }
+        if (scripts.lenderManager() != null) {
+            published.add(registry.getLenderManagerScript());
+        }
+        if (scripts.lenderManagerSpend() != null) {
+            published.add(registry.getLenderManagerSpendScript());
+        }
+        if (scripts.loanClaimAction() != null) {
+            published.add(registry.getLoanClaimActionScript());
+        }
+        return published;
+    }
+
     private Transaction complete(Request request, ScriptTx tx) {
         try {
             // Third argument (TransactionProcessor) stays null; see the class javadoc.
-            return new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
+            QuickTxBuilder.TxContext context = new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
                     .compose(tx)
                     .feePayer(request.changeAddress())
                     .collateralPayer(request.changeAddress())
@@ -313,8 +354,17 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                     // No evaluator here: the redeemers keep placeholder ex-units and the offline rig
                     // prices them itself. Nothing must be fetched — the rig hands every script in.
                     .ignoreScriptCostEvaluationError(true)
-                    .withScriptSupplier(scriptHash -> Optional.empty())
-                    .build();
+                    .withScriptSupplier(scriptHash -> Optional.empty());
+
+            // Published scripts are declared as reference scripts and their witness copies stripped,
+            // mirroring LiquidateTransactionBuilder.complete: a script also reachable by reference is
+            // ExtraneousScriptWitnessesUTXOW, so the strip is required, not an optimisation.
+            List<PlutusScript> published = publishedScripts(request.referenceScripts());
+            if (!published.isEmpty()) {
+                context = context.withReferenceScripts(published.toArray(PlutusScript[]::new))
+                        .removeDuplicateScriptWitnesses(true);
+            }
+            return context.build();
         } catch (Exception e) {
             throw new IllegalStateException("cannot build the pay-in-advance transaction", e);
         }
@@ -437,16 +487,27 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     // ---- reference inputs & derivations -----------------------------------------------------------
 
-    /** Config, LM config and the three oracle reference inputs, canonically sorted. */
+    /**
+     * Config, LM config and the three oracle reference inputs, plus any published reference-script
+     * coordinates this builder can shed — deduplicated (a coordinate that collides with a config or
+     * oracle input is not added twice) and canonically sorted, mirroring
+     * {@link LiquidateTransactionBuilder#referenceInputs}.
+     */
     private List<TransactionInput> referenceInputs(Request request) {
-        List<TransactionInput> refInputs = new ArrayList<>(List.of(
+        Set<TransactionInput> refInputs = new LinkedHashSet<>(List.of(
                 inputOf(request.configUtxo()),
                 inputOf(request.lmConfigUtxo()),
                 request.oracle().referenceInput(),
                 request.oracle().referenceScript(),
                 request.oracle().charlieProviderReferenceInput()));
-        refInputs.sort(new TransactionInputComparator());
-        return refInputs;
+        // Only the subset this builder attaches AND the shared record can name: lmLiquidateAction and
+        // assetManager are excluded here, exactly as in publishedScripts().
+        LiquidateTransactionBuilder.ReferenceScripts scripts = request.referenceScripts();
+        Stream.of(scripts.loan(), scripts.loanSpend(), scripts.lenderManager(),
+                        scripts.lenderManagerSpend(), scripts.loanClaimAction())
+                .filter(Objects::nonNull)
+                .forEach(refInputs::add);
+        return refInputs.stream().sorted(new TransactionInputComparator()).toList();
     }
 
     private static int refIndex(List<TransactionInput> refInputs, TransactionInput input, String what) {

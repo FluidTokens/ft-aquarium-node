@@ -131,7 +131,12 @@ public class PayInAdvanceLiquidationRouter {
                         // The bot keeps the collateral and pays change back to itself: the fee/collateral
                         // wallet UTxO is one of its own, so its address is the change address — the same
                         // identity account.baseAddress() carries on the plain path.
-                        walletUtxo.getAddress());
+                        walletUtxo.getAddress(),
+                        // Published reference scripts, exactly as the plain path threads them
+                        // (LiquidationExecutor.java:479-485): an unset coordinate leaves that validator
+                        // inline; preview sets only loan-claim-action, which brings the convert
+                        // liquidation under maxTxSize.
+                        configuration.getReferenceScripts());
         return builder.build(request);
     }
 
