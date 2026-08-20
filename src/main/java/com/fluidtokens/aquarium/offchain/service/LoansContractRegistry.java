@@ -378,6 +378,16 @@ public class LoansContractRegistry {
         return scriptOf(lmLiquidateActionScriptHash);
     }
 
+    /**
+     * {@code lender_manager/lm_liquidate_and_pay_in_advance_action} — the withdraw script for a
+     * liquidation that pays the principal in advance and takes the collateral. Mirrors
+     * {@link #getLmLiquidateActionScript()}; the matching hash getter
+     * {@code getLmLiquidateAndPayInAdvanceActionScriptHash()} is the class-level {@code @Getter}.
+     */
+    public PlutusScript getLmLiquidateAndPayInAdvanceActionScript() {
+        return scriptOf(lmLiquidateAndPayInAdvanceActionScriptHash);
+    }
+
     /** {@code asset_manager.assetManager} — the withdraw script guarding the collateral outputs. */
     public PlutusScript getAssetManagerScript() {
         return scriptOf(assetManagerWithdrawScriptHash);

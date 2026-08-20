@@ -203,6 +203,11 @@ class LoansContractDerivationTest {
                 "loan/loan_claim_action");
         assertScript(r.getLmLiquidateActionScript(), r.getLmLiquidateActionScriptHash(),
                 "lender_manager/lm_liquidate_action");
+        assertEquals(LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION, r.getLmLiquidateAndPayInAdvanceActionScriptHash(),
+                "lmLiquidateAndPayInAdvanceActionScriptHash");
+        assertScript(r.getLmLiquidateAndPayInAdvanceActionScript(),
+                r.getLmLiquidateAndPayInAdvanceActionScriptHash(),
+                "lender_manager/lm_liquidate_and_pay_in_advance_action");
         assertScript(r.getAssetManagerScript(), r.getAssetManagerWithdrawScriptHash(),
                 "asset_manager.assetManager");
     }
