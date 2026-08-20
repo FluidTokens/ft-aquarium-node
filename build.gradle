@@ -36,7 +36,7 @@ dependencies {
 	// Applies parameters to unapplied Aiken validators at runtime (multi-network parameterisation)
 	implementation('com.bloxbean.cardano:aiken-java-binding:0.1.0')
 
-	implementation 'io.micrometer:micrometer-registry-prometheus:latest.release'
+	implementation 'io.micrometer:micrometer-registry-prometheus:1.13.4'
 
 	implementation 'org.postgresql:postgresql:42.6.0'
 	testImplementation 'com.h2database:h2:2.1.214'
