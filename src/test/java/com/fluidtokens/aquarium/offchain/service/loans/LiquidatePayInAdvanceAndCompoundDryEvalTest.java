@@ -5,6 +5,7 @@ import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil;
 import com.bloxbean.cardano.client.plutus.blueprint.model.PlutusVersion;
+import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
@@ -381,6 +382,73 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
                 "expected " + expected + " to be the refuser, got: " + outcome.detail());
     }
 
+    /**
+     * <b>The compounded pool output datum echo is load-bearing.</b> Replacing the pool output's inline
+     * datum with a datum that is not the pool input datum is refused by {@code pool_compound_action}: its
+     * {@code builtin.equals_data(output.datum, input.output.datum)} conjunct (verified against
+     * {@code validators/pool/pool_compound_action.ak} at {@code ff005fb}) binds the echo. The compound
+     * action {@code lm_liquidate_pay_in_advance_and_compound_action} does <em>not</em> catch this — it
+     * checks the pool output <em>value</em> but explicitly leaves the datum to the pool compound action
+     * ("Pool compound action already ensures datum and address are correct") — so the value-echo negative
+     * above cannot stand in for this one. The refusal is named by withdrawal index; the clean build passes
+     * it, so this isolates the one field that moved.
+     */
+    @Test
+    void aWrongCompoundedPoolDatumIsRejected() {
+        Fixture fixture = fixture();
+        List<Utxo> universe = universe(fixture);
+        List<PlutusScript> extra = List.of(oracleScript());
+
+        Transaction clean = build(fixture);
+        EvalFixtures.evaluate(clean, universe, REGISTRY, extra);
+
+        Transaction mutated = build(fixture);
+        perturbPoolOutputDatum(mutated);
+
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated, universe, REGISTRY, extra);
+        assertFalse(outcome.successful(),
+                "pool_compound_action must reject a pool output datum that is not equal_data to the input datum");
+        String expected = redeemerError(mutated, LoanFixtures.rewardAddress(
+                REGISTRY.getPoolCompoundActionScriptHash()));
+        assertTrue(outcome.detail().contains(expected),
+                "expected " + expected + " to be the refuser, got: " + outcome.detail());
+    }
+
+    /**
+     * <b>The {@code pm_compound_liquidity} {@code self.redeemers} pointers are load-bearing.</b> The
+     * pool-manager compound-liquidity redeemer carries two indexes into the finished body's
+     * {@code self.redeemers} — {@code poolWithdrawRedeemerIndex} and
+     * {@code lenderManagerWithdrawRedeemerIndex} — and {@code pm_compound_liquidity} reads the redeemers at
+     * those positions and demands the first be {@code Withdraw(Script(poolWithdrawScriptHash))} carrying a
+     * {@code PoolWithdrawRedeemer} with a {@code Compound} action (verified against
+     * {@code validators/pool-manager/pm_compound_liquidity.ak} at {@code ff005fb}). Repointing
+     * {@code poolWithdrawRedeemerIndex} at the (in-range) lender-manager withdraw redeemer instead — a
+     * {@code Withdraw(Script(lenderManagerWithdrawScriptHash))} — makes that
+     * {@code expect ... == Withdraw(Script(poolWithdrawScriptHash))} fail. The refusal is named by
+     * withdrawal index; the clean build passes it, so this isolates the one pointer that moved.
+     */
+    @Test
+    void aWrongPmCompoundLiquidityRedeemerIndexIsRejected() {
+        Fixture fixture = fixture();
+        List<Utxo> universe = universe(fixture);
+        List<PlutusScript> extra = List.of(oracleScript());
+
+        Transaction clean = build(fixture);
+        EvalFixtures.evaluate(clean, universe, REGISTRY, extra);
+
+        Transaction mutated = build(fixture);
+        perturbPmCompoundLiquidityRedeemerIndex(mutated);
+
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated, universe, REGISTRY, extra);
+        assertFalse(outcome.successful(),
+                "pm_compound_liquidity must reject a poolWithdrawRedeemerIndex that does not point at the "
+                        + "pool.pool withdraw redeemer");
+        String expected = redeemerError(mutated, LoanFixtures.rewardAddress(
+                REGISTRY.getPmCompoundLiquidityScriptHash()));
+        assertTrue(outcome.detail().contains(expected),
+                "expected " + expected + " to be the refuser, got: " + outcome.detail());
+    }
+
     // ======================================================================================
     // pinned arithmetic — measured off builder.numbers() and frozen
     // ======================================================================================
@@ -667,5 +735,55 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
                 .coin(value.getCoin().add(delta))
                 .multiAssets(value.getMultiAssets())
                 .build());
+    }
+
+    /**
+     * Replaces the compounded pool output's inline datum — and only that — with {@code Constr 0 []}, a
+     * valid inline datum that is not the pool input datum, so {@code pool_compound_action}'s
+     * {@code equals_data(output.datum, input.output.datum)} no longer holds.
+     */
+    private static void perturbPoolOutputDatum(Transaction tx) {
+        String poolCredential = paymentCredentialOf(POOL_ADDRESS);
+        List<TransactionOutput> outputs = tx.getBody().getOutputs();
+        TransactionOutput poolOutput = null;
+        for (TransactionOutput output : outputs) {
+            if (paymentCredentialOf(output.getAddress()).equals(poolCredential)) {
+                if (poolOutput != null) {
+                    throw new IllegalStateException("more than one pool output to perturb");
+                }
+                poolOutput = output;
+            }
+        }
+        if (poolOutput == null) {
+            throw new IllegalStateException("no pool output to perturb");
+        }
+        PlutusData wrong = ConstrPlutusData.of(0);
+        if (poolOutput.getInlineDatum() != null
+                && poolOutput.getInlineDatum().serializeToHex().equals(wrong.serializeToHex())) {
+            throw new IllegalStateException("the chosen wrong datum coincides with the pool input datum");
+        }
+        poolOutput.setInlineDatum(wrong);
+    }
+
+    /**
+     * Repoints the {@code pm_compound_liquidity} redeemer's {@code poolWithdrawRedeemerIndex} at the
+     * {@code lenderManagerWithdrawRedeemerIndex} — a different, in-range {@code self.redeemers} slot whose
+     * ScriptPurpose is {@code Withdraw(Script(lenderManagerWithdrawScriptHash))} — and changes nothing
+     * else, so the validator's {@code expect ... == Withdraw(Script(poolWithdrawScriptHash))} fails.
+     */
+    private static void perturbPmCompoundLiquidityRedeemerIndex(Transaction tx) {
+        String pmReward = LoanFixtures.rewardAddress(REGISTRY.getPmCompoundLiquidityScriptHash());
+        Redeemer pm = rewardRedeemer(tx, pmReward);
+        ConstrPlutusData data = (ConstrPlutusData) pm.getData();
+        List<PlutusData> fields = data.getData().getPlutusDataList();
+        BigInteger poolWithdrawRedeemerIndex = ((BigIntPlutusData) fields.get(0)).getValue();
+        BigInteger lenderManagerWithdrawRedeemerIndex = ((BigIntPlutusData) fields.get(1)).getValue();
+        if (poolWithdrawRedeemerIndex.equals(lenderManagerWithdrawRedeemerIndex)) {
+            throw new IllegalStateException(
+                    "the two self.redeemers indexes coincide; cannot repoint to a distinct redeemer");
+        }
+        pm.setData(ConstrPlutusData.of(0,
+                BigIntPlutusData.of(lenderManagerWithdrawRedeemerIndex),
+                BigIntPlutusData.of(lenderManagerWithdrawRedeemerIndex)));
     }
 }
