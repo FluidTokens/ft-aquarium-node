@@ -617,12 +617,16 @@ class LiquidationSubmitVetoTest {
             blockEventListener.getIsSyncing().set(false);
 
             LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+            PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                    LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                    new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                            LoanFixtures.utxoSupplier(universe), protocolParams()));
             LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                     new FakeAppUtxoService(), ACCOUNT, new FakeScanner(List.of(scenario.assessment())),
                     new FakeResolver(unspent, loanAnswersBeforeItIsGone, bondAnswersBeforeItIsGone,
                             loanThrows),
-                    builder, LoanFixtures.registry(), log, provider(oracle), networkNamed(networkName),
-                    params, LoanFixtures.converters(), submitter);
+                    builder, payInAdvanceRouter, LoanFixtures.registry(), log, provider(oracle),
+                    networkNamed(networkName), params, LoanFixtures.converters(), submitter);
             long[] elapsed = {0};
             executor.setSubmitClock(() -> submitTime + elapsed[0]);
 
@@ -1244,13 +1248,17 @@ class LiquidationSubmitVetoTest {
         BlockEventListener blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(false);
 
+        PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), protocolParams()));
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(), ACCOUNT, new FakeScanner(List.of(scenario.assessment())),
                 FakeResolver.stable(unspent),
                 new LiquidateTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                         LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
                         protocolParams()),
-                LoanFixtures.registry(), log, provider(new FakeOracleClient(List.of())),
+                payInAdvanceRouter, LoanFixtures.registry(), log, provider(new FakeOracleClient(List.of())),
                 networkNamed("preview"), protocolParams(),
                 LoanFixtures.converters(), submitter);
         executor.setSubmitClock(() -> NOW);

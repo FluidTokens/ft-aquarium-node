@@ -433,9 +433,14 @@ class LiquidationExecutorTest {
         FakeResolver resolver = new FakeResolver(unspent);
         LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
 
+        PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder,
-                LoanFixtures.registry(), log, oracles,
+                payInAdvanceRouter, LoanFixtures.registry(), log, oracles,
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles);

@@ -188,6 +188,15 @@ public class LiquidationExecutor {
     private final LiquidateTransactionBuilder builder;
 
     /**
+     * The convert-liquidation seam. A candidate whose lender bond carries
+     * {@code shouldLiquidationConvertToPrincipal == True} is routed through this to the promoted,
+     * submit-incapable {@link LiquidatePayInAdvanceTransactionBuilder} rather than through
+     * {@link #builder}; a convert shape the seam cannot yet model is a clean {@code REFUSED} row, not a
+     * crash. Non-convert candidates never touch it.
+     */
+    private final PayInAdvanceLiquidationRouter payInAdvanceRouter;
+
+    /**
      * The runtime-derived v4 hashes. Read here for one thing only: the asset-manager spend script
      * hash, which is the payment credential the builder sends every funded asset-manager output to,
      * so {@link #minAdaFunded} can pick those outputs out of the finished body by credential rather
@@ -246,6 +255,7 @@ public class LiquidationExecutor {
                                LiquidationCandidateScanner scanner,
                                LiquidationUtxoResolver utxoResolver,
                                LiquidateTransactionBuilder builder,
+                               PayInAdvanceLiquidationRouter payInAdvanceRouter,
                                LoansContractRegistry registry,
                                LiquidationDecisionLog decisionLog,
                                ObjectProvider<FluidOracleClient> oracleClient,
@@ -254,8 +264,8 @@ public class LiquidationExecutor {
                                CardanoConverters converters,
                                BFBackendService backendService) {
         this(configuration, blockEventListener, appUtxoService, account, scanner, utxoResolver, builder,
-                registry, decisionLog, oracleClient, network, protocolParamsSupplier, converters,
-                bytes -> backendService.getTransactionService().submitTransaction(bytes));
+                payInAdvanceRouter, registry, decisionLog, oracleClient, network, protocolParamsSupplier,
+                converters, bytes -> backendService.getTransactionService().submitTransaction(bytes));
     }
 
     /** The same loop with the submitter stated, so a test can watch exactly what reaches the wire. */
@@ -266,6 +276,7 @@ public class LiquidationExecutor {
                                LiquidationCandidateScanner scanner,
                                LiquidationUtxoResolver utxoResolver,
                                LiquidateTransactionBuilder builder,
+                               PayInAdvanceLiquidationRouter payInAdvanceRouter,
                                LoansContractRegistry registry,
                                LiquidationDecisionLog decisionLog,
                                ObjectProvider<FluidOracleClient> oracleClient,
@@ -280,6 +291,7 @@ public class LiquidationExecutor {
         this.scanner = scanner;
         this.utxoResolver = utxoResolver;
         this.builder = builder;
+        this.payInAdvanceRouter = payInAdvanceRouter;
         this.registry = registry;
         this.decisionLog = decisionLog;
         this.oracleClient = oracleClient;
@@ -427,42 +439,70 @@ public class LiquidationExecutor {
             return;
         }
 
-        LiquidateTransactionBuilder.Request request = new LiquidateTransactionBuilder.Request(
-                List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loanUtxo.get(),
-                        bondUtxo.get())),
-                configUtxo,
-                lmConfigUtxo,
-                oraclesByUnit,
-                walletUtxo,
-                account.baseAddress(),
-                now - VALID_FROM_BACKDATE_MILLIS,
-                now + configuration.getValidityWindowSeconds() * 1000L,
-                configuration.getOracleWindowMarginSeconds() * 1000L,
-                // Whatever loans.liquidation.reference-scripts.* names. Every unset one means that
-                // validator travels in the witness set instead, which is legal and much larger —
-                // with none set at all the transaction cannot fit under maxTxSize, and the
-                // TX_TOO_LARGE veto below is what says so.
-                configuration.getReferenceScripts());
-
         Transaction transaction;
-        try {
-            transaction = builder.build(request);
-        } catch (LiquidateTransactionBuilder.RefusedException e) {
-            // A refusal is the builder working: it is a statement about this candidate, reproducible
-            // next cycle, and costs nothing. Not quarantined for that reason.
-            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                    e.getReason().name(), e.getMessage()));
-            return;
-        } catch (Exception e) {
-            // Anything else is a failure of the machinery rather than a verdict on the candidate —
-            // a Blockfrost timeout fetching protocol params, say. Quarantined so a systematically
-            // broken candidate does not burn a build attempt every cycle, but only for a while.
-            quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
-            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                    e.getClass().getSimpleName(), e.getMessage()));
-            log.warn("building the liquidation of {} threw: {}", loanUtxoRef, e.toString());
-            log.debug("liquidation build failed", e);
-            return;
+        if (assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
+            // Convert loan: routed to the promoted, submit-incapable pay-in-advance builder. The same
+            // window the plain path uses is handed to the router, which derives its own slots from it.
+            try {
+                transaction = payInAdvanceRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
+                        bondUtxo.get(), configUtxo, lmConfigUtxo, oraclesByUnit, walletUtxo,
+                        now - VALID_FROM_BACKDATE_MILLIS,
+                        now + configuration.getValidityWindowSeconds() * 1000L);
+            } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
+                // A convert shape the seam cannot yet model (non-ada principal / non-positive equity):
+                // a clean statement about this candidate, reproducible next cycle. Not quarantined, and
+                // no transaction was built — exactly the plain path's RefusedException treatment.
+                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                        e.getMessage(), e.getMessage()));
+                return;
+            } catch (Exception e) {
+                // A genuine builder failure. Quarantined exactly as the plain path's machinery-failure
+                // branch does, so a systematically broken candidate does not burn a build attempt every
+                // cycle, but only for a while.
+                quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
+                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                        e.getClass().getSimpleName(), e.getMessage()));
+                log.warn("building the pay-in-advance liquidation of {} threw: {}", loanUtxoRef, e.toString());
+                log.debug("pay-in-advance liquidation build failed", e);
+                return;
+            }
+        } else {
+            LiquidateTransactionBuilder.Request request = new LiquidateTransactionBuilder.Request(
+                    List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loanUtxo.get(),
+                            bondUtxo.get())),
+                    configUtxo,
+                    lmConfigUtxo,
+                    oraclesByUnit,
+                    walletUtxo,
+                    account.baseAddress(),
+                    now - VALID_FROM_BACKDATE_MILLIS,
+                    now + configuration.getValidityWindowSeconds() * 1000L,
+                    configuration.getOracleWindowMarginSeconds() * 1000L,
+                    // Whatever loans.liquidation.reference-scripts.* names. Every unset one means that
+                    // validator travels in the witness set instead, which is legal and much larger —
+                    // with none set at all the transaction cannot fit under maxTxSize, and the
+                    // TX_TOO_LARGE veto below is what says so.
+                    configuration.getReferenceScripts());
+
+            try {
+                transaction = builder.build(request);
+            } catch (LiquidateTransactionBuilder.RefusedException e) {
+                // A refusal is the builder working: it is a statement about this candidate, reproducible
+                // next cycle, and costs nothing. Not quarantined for that reason.
+                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                        e.getReason().name(), e.getMessage()));
+                return;
+            } catch (Exception e) {
+                // Anything else is a failure of the machinery rather than a verdict on the candidate —
+                // a Blockfrost timeout fetching protocol params, say. Quarantined so a systematically
+                // broken candidate does not burn a build attempt every cycle, but only for a while.
+                quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
+                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                        e.getClass().getSimpleName(), e.getMessage()));
+                log.warn("building the liquidation of {} threw: {}", loanUtxoRef, e.toString());
+                log.debug("liquidation build failed", e);
+                return;
+            }
         }
 
         record(assessment, now, transaction, oraclesByUnit);

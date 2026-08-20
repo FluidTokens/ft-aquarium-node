@@ -8,6 +8,7 @@ import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
@@ -78,6 +79,26 @@ public class YaciConfig {
         // as a reference script has to be fetchable by hash for the transaction to be priced.
         return new LiquidateTransactionBuilder(registry, network.getCardanoNetwork(), cardanoConverters,
                 bfBackendService, scriptCostEvaluator);
+    }
+
+    /**
+     * The pay-in-advance liquidation builder, wired from the same two suppliers the plain builder
+     * uses. It is <b>submit-incapable by construction</b>: it takes no {@code BackendService} and no
+     * {@code TransactionProcessor} — its {@code QuickTxBuilder} is composed with a {@code null}
+     * processor — so, exactly like the offline plain builder, {@code build()} returns an unsigned
+     * transaction and nothing here can reach the network with it. The routing seam
+     * ({@code PayInAdvanceLiquidationRouter}) only ever invokes its {@code build(Request)}; arming and
+     * submission stay in {@code LiquidationExecutor} behind the two independent flags.
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
+    public LiquidatePayInAdvanceTransactionBuilder liquidatePayInAdvanceTransactionBuilder(
+            LoansContractRegistry registry,
+            AppConfig.Network network,
+            UtxoSupplier utxoSupplier,
+            ProtocolParamsSupplier protocolParamsSupplier) {
+        return new LiquidatePayInAdvanceTransactionBuilder(registry, network.getCardanoNetwork(),
+                utxoSupplier, protocolParamsSupplier);
     }
 
 }
