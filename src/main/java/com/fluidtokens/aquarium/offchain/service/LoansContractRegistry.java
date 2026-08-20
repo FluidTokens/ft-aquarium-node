@@ -122,6 +122,13 @@ public class LoansContractRegistry {
      * not grow an expectation for it — the same standing as the LenderManager hashes.
      */
     private final String pmCancelPoolManagerScriptHash;
+    /**
+     * {@code pool_manager/pm_compound_liquidity} — the withdraw script that validates compounding a
+     * pool's liquidity. Same standing as {@link #pmCancelPoolManagerScriptHash}: not published in the
+     * {@code ConfigDatum} (baked into {@code pool_manager.ak}'s parameters instead), so
+     * {@code LoansConfigVerifier} must not grow an expectation for it either.
+     */
+    private final String pmCompoundLiquidityScriptHash;
     private final String lmCompoundActionScriptHash;
     private final String lmLiquidatePayInAdvanceAndCompoundActionScriptHash;
 
@@ -216,6 +223,7 @@ public class LoansContractRegistry {
             this.poolManagerPolicyId = null;
             this.poolManagerSpendScriptHash = null;
             this.pmCancelPoolManagerScriptHash = null;
+            this.pmCompoundLiquidityScriptHash = null;
             this.lmCompoundActionScriptHash = null;
             this.lmLiquidatePayInAdvanceAndCompoundActionScriptHash = null;
         } else {
@@ -229,6 +237,7 @@ public class LoansContractRegistry {
             String pmCompound = derive("pool_manager/pm_compound_liquidity.poolManager",
                     b(lenderManagerWithdrawScriptHash), b(poolPolicyId));
             this.pmCancelPoolManagerScriptHash = pmCancel;
+            this.pmCompoundLiquidityScriptHash = pmCompound;
             this.poolManagerPolicyId = derive("pool_manager.poolManager",
                     mainCfg, name, poolSpend, poolPolicy, b(pmCancel), b(pmUpdate), b(pmCompound));
             this.poolManagerSpendScriptHash = generalSpend(poolManagerPolicyId, configPolicyId);
@@ -279,6 +288,7 @@ public class LoansContractRegistry {
         // Logged and cross-checkable, but deliberately absent from LoansConfigVerifier's expectations:
         // the ConfigDatum does not publish it (see the field's own javadoc).
         m.put("pmCancelPoolManagerScriptHash", pmCancelPoolManagerScriptHash);
+        m.put("pmCompoundLiquidityScriptHash", pmCompoundLiquidityScriptHash);
         m.put("lmCompoundActionScriptHash", lmCompoundActionScriptHash);
         m.put("lmLiquidatePayInAdvanceAndCompoundActionScriptHash", lmLiquidatePayInAdvanceAndCompoundActionScriptHash);
         return m;
@@ -458,6 +468,21 @@ public class LoansContractRegistry {
      */
     public PlutusScript getPmCancelPoolManagerScript() {
         return scriptOf(pmCancelPoolManagerScriptHash);
+    }
+
+    /** {@code lender_manager/lm_liquidate_pay_in_advance_and_compound_action} — the withdraw script for a liquidation that pays the principal in advance, takes the collateral, and compounds. */
+    public PlutusScript getLmLiquidatePayInAdvanceAndCompoundActionScript() {
+        return scriptOf(lmLiquidatePayInAdvanceAndCompoundActionScriptHash);
+    }
+
+    /** {@code pool/pool_compound_action} — the withdraw script that validates the Compound action. */
+    public PlutusScript getPoolCompoundActionScript() {
+        return scriptOf(poolCompoundActionScriptHash);
+    }
+
+    /** {@code pool_manager/pm_compound_liquidity} — the withdraw script that validates compounding a pool's liquidity. */
+    public PlutusScript getPmCompoundLiquidityScript() {
+        return scriptOf(pmCompoundLiquidityScriptHash);
     }
 
     private PlutusScript scriptOf(String scriptHash) {

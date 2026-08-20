@@ -249,6 +249,12 @@ class LoansContractDerivationTest {
         assertScript(r.getPoolManagerSpendScript(), POOL_MANAGER_SPEND, "pool_manager general_spend");
         assertScript(r.getPmCancelPoolManagerScript(), PM_CANCEL_POOL_MANAGER,
                 "pool_manager/pm_cancel_pool_manager");
+        assertScript(r.getPmCompoundLiquidityScript(), r.getPmCompoundLiquidityScriptHash(),
+                "pm_compound_liquidity — transitively pinned through poolManagerPolicyId");
+        assertScript(r.getPoolCompoundActionScript(), POOL_COMPOUND_ACTION, "pool_compound_action");
+        assertScript(r.getLmLiquidatePayInAdvanceAndCompoundActionScript(),
+                LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION,
+                "lm_liquidate_pay_in_advance_and_compound_action");
     }
 
     /** The scripts must also come up without smartTokensSpendScriptHash, like the hashes do. */
