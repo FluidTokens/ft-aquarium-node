@@ -1480,6 +1480,67 @@ class LiquidationExecutorTest {
         assertEquals(1, wiring.executor().quarantinedCount(),
                 "a genuine build failure quarantines, unlike a clean not-modelled refusal");
         assertEquals(Set.of(TX_LOAN + "#0"), wiring.executor().quarantinedRefs());
+        // The refusal must SAY WHY. The old code recorded e.getMessage(), which is null for this
+        // message-less NPE, leaving the operator debugging blind — the exact defect Giovanni hit. The
+        // detail now carries the cause chain, so it is non-null and names the fault even with no message.
+        assertEquals("NullPointerException", decision.reason(),
+                "the refusal names the root-cause class");
+        assertNotNull(decision.detail(),
+                "a build-failure refusal must carry a detail — the old e.getMessage() was null here");
+        assertTrue(decision.detail().contains("NullPointerException"),
+                "the cause chain surfaces the real fault: " + decision.detail());
+    }
+
+    // ======================================================================================
+    // failure surfacing — the swallowed-cause fix (causeChain / rootReason)
+    // ======================================================================================
+
+    /**
+     * Giovanni's exact shape: the pay-in-advance builder wraps the real fault as
+     * {@code IllegalStateException("cannot build the pay-in-advance transaction", realCause)}. The old
+     * executor recorded only the wrapper's message and dropped the cause, so the decision read
+     * "cannot build the pay-in-advance transaction" with nothing actionable. The chain keeps the
+     * wrapper AND surfaces the real cause; the reason names the root, not the wrapper.
+     */
+    @Test
+    void causeChainSurfacesTheWrappedRealCauseNotJustTheWrapper() {
+        Exception real = new IllegalArgumentException("not enough funds to front the pay-in-advance principal");
+        Exception wrapped = new IllegalStateException("cannot build the pay-in-advance transaction", real);
+
+        String chain = LiquidationExecutor.causeChain(wrapped);
+
+        assertTrue(chain.contains("cannot build the pay-in-advance transaction"),
+                "the wrapper message is kept: " + chain);
+        assertTrue(chain.contains("not enough funds to front the pay-in-advance principal"),
+                "and the REAL cause is surfaced, not swallowed: " + chain);
+        assertEquals("IllegalArgumentException", LiquidationExecutor.rootReason(wrapped),
+                "the reason names the root cause, not the wrapper");
+    }
+
+    /** A message-less exception still yields a non-null, class-named detail — never a null refusal. */
+    @Test
+    void causeChainIsNeverNullForAMessagelessException() {
+        assertEquals("NullPointerException", LiquidationExecutor.causeChain(new NullPointerException()),
+                "a message-less exception contributes its class name, never a null detail");
+        assertEquals("NullPointerException", LiquidationExecutor.rootReason(new NullPointerException()));
+    }
+
+    /**
+     * A pathological cyclic cause chain (a caused-by b caused-by a) must not hang the executor's error
+     * path. The depth bound is what guarantees termination — remove it and this test hangs.
+     */
+    @Test
+    void causeChainTerminatesOnACyclicCauseChain() {
+        Exception a = new RuntimeException("a");
+        Exception b = new RuntimeException("b");
+        a.initCause(b);
+        b.initCause(a);
+
+        String chain = LiquidationExecutor.causeChain(a);
+
+        assertTrue(chain.startsWith("RuntimeException: a"), chain);
+        assertTrue(chain.length() < 500, "the bounded walk cannot run away on a cycle: " + chain.length());
+        assertNotNull(LiquidationExecutor.rootReason(a), "rootReason must also terminate on a cycle");
     }
 
     // ======================================================================================

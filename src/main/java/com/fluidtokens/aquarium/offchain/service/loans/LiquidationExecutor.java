@@ -458,12 +458,17 @@ public class LiquidationExecutor {
             } catch (Exception e) {
                 // A genuine builder failure. Quarantined exactly as the plain path's machinery-failure
                 // branch does, so a systematically broken candidate does not burn a build attempt every
-                // cycle, but only for a while.
+                // cycle, but only for a while. The refusal MUST say why: the builder wraps the real
+                // fault as IllegalStateException("cannot build the pay-in-advance transaction", cause),
+                // so recording only e.getMessage() drops the cause and leaves the operator debugging
+                // blind. The detail carries the whole cause chain and the exception is logged in full at
+                // ERROR (never DEBUG, which an INFO-level node never prints) — a build failure whose
+                // cause never reaches the log hides the next one too.
                 quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        e.getClass().getSimpleName(), e.getMessage()));
-                log.warn("building the pay-in-advance liquidation of {} threw: {}", loanUtxoRef, e.toString());
-                log.debug("pay-in-advance liquidation build failed", e);
+                        rootReason(e), causeChain(e)));
+                log.error("building the pay-in-advance liquidation of {} failed: {}",
+                        loanUtxoRef, causeChain(e), e);
                 return;
             }
         } else {
@@ -495,17 +500,69 @@ public class LiquidationExecutor {
             } catch (Exception e) {
                 // Anything else is a failure of the machinery rather than a verdict on the candidate —
                 // a Blockfrost timeout fetching protocol params, say. Quarantined so a systematically
-                // broken candidate does not burn a build attempt every cycle, but only for a while.
+                // broken candidate does not burn a build attempt every cycle, but only for a while. Same
+                // rule as the convert branch: surface the whole cause chain in the detail and log the
+                // exception in full at ERROR, never at DEBUG where an INFO-level operator never sees it.
                 quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        e.getClass().getSimpleName(), e.getMessage()));
-                log.warn("building the liquidation of {} threw: {}", loanUtxoRef, e.toString());
-                log.debug("liquidation build failed", e);
+                        rootReason(e), causeChain(e)));
+                log.error("building the liquidation of {} failed: {}", loanUtxoRef, causeChain(e), e);
                 return;
             }
         }
 
         record(assessment, now, transaction, oraclesByUnit);
+    }
+
+    // ---- failure surfacing ------------------------------------------------------------------------
+
+    /**
+     * The class name of the exception's <em>root</em> cause, which is more actionable than the
+     * wrapper's: a build failure surfaces as {@code IllegalStateException("cannot build …", realCause)},
+     * and "IllegalStateException" tells an operator nothing while the root cause names what actually
+     * broke. Falls back to the exception's own class when there is no cause.
+     */
+    static String rootReason(Throwable t) {
+        return rootCause(t).getClass().getSimpleName();
+    }
+
+    /**
+     * The whole cause chain rendered wrapper-first — {@code Class: message ⇐ Class: message ⇐ …} — so a
+     * refusal's {@code detail} always says <em>why</em>. This is the string that reaches the decision
+     * log; the swallowed-wrapper-message bug (a refusal reading only "cannot build the pay-in-advance
+     * transaction", with the real cause discarded) is exactly what it fixes. Never null: a message-less
+     * exception still contributes its class name.
+     */
+    static String causeChain(Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        Throwable c = t;
+        // Bounded against a self-referential or cyclic cause chain (getCause() returning this or an
+        // ancestor): at most a handful of links, never an unbounded walk.
+        for (int depth = 0; c != null && depth < 12; depth++) {
+            if (sb.length() > 0) {
+                sb.append(" ⇐ ");
+            }
+            sb.append(c.getClass().getSimpleName());
+            if (c.getMessage() != null) {
+                sb.append(": ").append(c.getMessage());
+            }
+            Throwable next = c.getCause();
+            if (next == c) {
+                break;
+            }
+            c = next;
+        }
+        return sb.toString();
+    }
+
+    private static Throwable rootCause(Throwable t) {
+        Throwable root = t;
+        int depth = 0;
+        while (root.getCause() != null && root.getCause() != root && depth < 12) {
+            root = root.getCause();
+            depth++;
+        }
+        return root;
     }
 
     /**
