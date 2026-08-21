@@ -1237,7 +1237,12 @@ class LiquidationSubmitVetoTest {
      */
     @Test
     void aThrowingSubmissionIsLoggedAtErrorWithTheCauseAttached() {
-        RuntimeException boom = new IllegalStateException("connection reset");
+        // WRAPPED deliberately, and the assertions below key on the ROOT cause's message. A cause-less
+        // exception would make this test vacuous: causeChain(e) is then a substring of e.toString(), so
+        // every assertion would pass under the very toString() this ticket exists to replace (audit
+        // finding, 2026-08-21). The real shape is a wrapper around a transport fault.
+        RuntimeException boom = new IllegalStateException("submit failed",
+                new java.net.SocketTimeoutException("connect timed out"));
         RecordingSubmitter submitter = RecordingSubmitter.throwing(boom);
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
@@ -1253,6 +1258,11 @@ class LiquidationSubmitVetoTest {
 
         assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, run.onlyDecision().outcome(),
                 "the fix is log-only — the recorded outcome must not change");
+        // The ROOT cause's message is the discriminating assertion: toString() on the wrapper never
+        // contains it, so this can only pass if the chain was genuinely walked.
+        assertTrue(run.onlyDecision().detail().contains("connect timed out"),
+                "the decision detail must carry the ROOT cause, not just the wrapper: "
+                        + run.onlyDecision().detail());
         assertTrue(run.onlyDecision().detail().contains(LiquidationExecutor.causeChain(boom)),
                 "the decision detail should also carry the cause chain: " + run.onlyDecision().detail());
 
@@ -1263,6 +1273,9 @@ class LiquidationSubmitVetoTest {
         assertEquals(1, errors.size(), "expected exactly one ERROR event for the submit-threw path: "
                 + appender.list);
         ILoggingEvent event = errors.getFirst();
+        assertTrue(event.getFormattedMessage().contains("connect timed out"),
+                "must surface the ROOT cause, not just toString() of the wrapper: "
+                        + event.getFormattedMessage());
         assertTrue(event.getFormattedMessage().contains(LiquidationExecutor.causeChain(boom)),
                 "must surface the real cause chain, not just toString(): " + event.getFormattedMessage());
         assertNotNull(event.getThrowableProxy(),
@@ -1278,7 +1291,11 @@ class LiquidationSubmitVetoTest {
      */
     @Test
     void aFailedSignIsLoggedAtErrorWithTheCauseAndStillRecordsSubmitVetoed() {
-        RuntimeException boom = new IllegalStateException("hsm unavailable");
+        // WRAPPED deliberately — see the sibling submit-threw test: a cause-less exception makes
+        // causeChain(e) a substring of e.toString(), so the assertions would pass under the toString()
+        // this ticket replaces. The root cause's message below is what discriminates.
+        RuntimeException boom = new IllegalStateException("hsm unavailable",
+                new java.security.KeyException("signing key rejected"));
         Account brokenSigner = spy(ACCOUNT);
         doThrow(boom).when(brokenSigner).sign(any(Transaction.class));
 
@@ -1299,6 +1316,8 @@ class LiquidationSubmitVetoTest {
                 "the fix is log-only — the recorded outcome must not change");
         assertEquals(null, decision.submitVeto(),
                 "not one of the eight vetoes, so none is named — unchanged by the fix");
+        assertTrue(decision.detail().contains("signing key rejected"),
+                "the decision detail must carry the ROOT cause, not just the wrapper: " + decision.detail());
         assertTrue(decision.detail().contains(LiquidationExecutor.causeChain(boom)),
                 "the decision detail should also carry the cause chain: " + decision.detail());
 
@@ -1309,6 +1328,9 @@ class LiquidationSubmitVetoTest {
         assertEquals(1, errors.size(), "expected exactly one ERROR event for the sign-failure path: "
                 + appender.list);
         ILoggingEvent event = errors.getFirst();
+        assertTrue(event.getFormattedMessage().contains("signing key rejected"),
+                "must surface the ROOT cause, not just toString() of the wrapper: "
+                        + event.getFormattedMessage());
         assertTrue(event.getFormattedMessage().contains(LiquidationExecutor.causeChain(boom)),
                 "must surface the real cause chain, not just toString(): " + event.getFormattedMessage());
         assertNotNull(event.getThrowableProxy(),
