@@ -1,5 +1,9 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
@@ -25,6 +29,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 
 import java.math.BigDecimal;
@@ -1541,6 +1546,80 @@ class LiquidationExecutorTest {
         assertTrue(chain.startsWith("RuntimeException: a"), chain);
         assertTrue(chain.length() < 500, "the bounded walk cannot run away on a cycle: " + chain.length());
         assertNotNull(LiquidationExecutor.rootReason(a), "rootReason must also terminate on a cycle");
+    }
+
+    /** Audit residue: {@code rootCause} used to deref {@code getCause()} before any null check. */
+    @Test
+    void rootReasonAndCauseChainAreTotalOnANullThrowable() {
+        assertEquals("", LiquidationExecutor.rootReason(null), "must not NPE on a null throwable");
+        assertEquals("", LiquidationExecutor.causeChain(null));
+    }
+
+    // ======================================================================================
+    // the outer net (T-036): consider() throwing OUTSIDE its own build try/catch
+    // ======================================================================================
+
+    /**
+     * A "buildable" assessment ({@code exclusion == null}) whose {@link LiquidationAssessment#loan()}
+     * is {@code null} — the shape {@link LiquidationExecutor}'s outer-catch comment names explicitly.
+     * The model's own javadoc says a null loan is only ever paired with
+     * {@code LiquidationExclusion#LOAN_NOT_FOUND}, so a real scanner never produces this; it is
+     * constructed directly here to drive the defence-in-depth the outer catch exists for.
+     * <p>
+     * {@code consider()}'s very first statement is {@code assessment.loan().utxoRef()}, before any
+     * try block, so this NPEs straight out of {@code consider()} and is caught only by the cycle
+     * loop's outer net — never by either build-path {@code catch}.
+     */
+    private static LiquidationAssessment nullLoanAssessment() {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        return LiquidationAssessment.buildable(honest.bond().bond(), null,
+                "buildable per the scanner, but the join dropped the loan",
+                honest.assessment().remainingDebt(), honest.assessment().equity(), false,
+                honest.assessment().liquidationFee());
+    }
+
+    /**
+     * The outer net is the ONLY observability for this failure — it records no decision — so the log
+     * line is what this test proves. Before T-036 the two lines were
+     * {@code log.warn(..., e.toString())} + {@code log.debug(..., e)}: a generic message at WARN and
+     * the real exception buried at DEBUG, invisible on an INFO-level node. Now it is a single ERROR
+     * line carrying the full cause chain plus the exception itself.
+     */
+    @Test
+    void anExceptionOutsideTheBuildTryIsCaughtByTheOuterNetAndLoggedAtErrorWithTheCause() {
+        LiquidationAssessment assessment = nullLoanAssessment();
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(assessment), List.of(), Map.of(),
+                List.of(WALLET_UTXO), noOracle(), false);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+
+            // The tell that this is genuinely the OUTER net and not the build-path catch: no decision
+            // was recorded for it at all — consider() threw before it ever produced one.
+            assertEquals(0, wiring.log().size(),
+                    "the outer net records NO decision — that is exactly why the log is the only "
+                            + "observability for this failure");
+
+            List<ILoggingEvent> errors = appender.list.stream()
+                    .filter(event -> event.getLevel() == Level.ERROR)
+                    .toList();
+            assertEquals(1, errors.size(), "expected exactly one ERROR event from the outer net: "
+                    + appender.list);
+            ILoggingEvent event = errors.getFirst();
+            assertTrue(event.getFormattedMessage().contains("could not consider bond"),
+                    "must name the operation: " + event.getFormattedMessage());
+            assertTrue(event.getFormattedMessage().contains("NullPointerException"),
+                    "must surface the real cause, not just a generic message: "
+                            + event.getFormattedMessage());
+            assertNotNull(event.getThrowableProxy(),
+                    "the exception itself must be attached for the stack trace, not just the message");
+        } finally {
+            logger.detachAppender(appender);
+        }
     }
 
     // ======================================================================================

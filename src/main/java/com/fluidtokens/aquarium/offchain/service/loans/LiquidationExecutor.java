@@ -411,8 +411,7 @@ public class LiquidationExecutor {
                 // did not anticipate, and a null loan on a supposedly buildable assessment is one of
                 // them — dereferencing assessment.loan() here would throw out of the handler that is
                 // meant to contain it. The bond is the one thing every assessment always carries.
-                log.warn("could not consider bond {}: {}", assessment.bond().utxoRef(), e.toString());
-                log.debug("liquidation candidate failed", e);
+                log.error("could not consider bond {}: {}", assessment.bond().utxoRef(), causeChain(e), e);
             }
         }
     }
@@ -523,6 +522,9 @@ public class LiquidationExecutor {
      * broke. Falls back to the exception's own class when there is no cause.
      */
     static String rootReason(Throwable t) {
+        if (t == null) {
+            return "";
+        }
         return rootCause(t).getClass().getSimpleName();
     }
 
