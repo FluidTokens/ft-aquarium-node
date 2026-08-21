@@ -1,5 +1,9 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.model.ProtocolParams;
@@ -22,6 +26,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 
 import java.math.BigInteger;
@@ -38,6 +43,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.spy;
 
 /**
  * The armed half of the liquidation loop: the eight submit vetoes, and the one path that reaches the
@@ -539,6 +547,7 @@ class LiquidationSubmitVetoTest {
         private int bondAnswersBeforeItIsGone = Integer.MAX_VALUE;
         private RuntimeException loanThrows;
         private RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        private Account account = ACCOUNT;
 
         Rig configuration(AppConfig.LiquidationConfiguration configuration) {
             this.configuration = configuration;
@@ -591,6 +600,15 @@ class LiquidationSubmitVetoTest {
         }
 
         /**
+         * T-037: overrides the default {@code ACCOUNT} — a spy of it with {@code sign} stubbed to
+         * throw is how the sign-failure catch (not one of the eight vetoes) gets driven.
+         */
+        Rig account(Account account) {
+            this.account = account;
+            return this;
+        }
+
+        /**
          * How many cycles to drive against the same executor. Each subsequent cycle advances both
          * the cycle clock and the submit clock by one minute, which is what a real scheduler does
          * and what makes the quarantine's effect observable.
@@ -622,7 +640,7 @@ class LiquidationSubmitVetoTest {
                     new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                             LoanFixtures.utxoSupplier(universe), protocolParams()));
             LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                    new FakeAppUtxoService(), ACCOUNT, new FakeScanner(List.of(scenario.assessment())),
+                    new FakeAppUtxoService(), account, new FakeScanner(List.of(scenario.assessment())),
                     new FakeResolver(unspent, loanAnswersBeforeItIsGone, bondAnswersBeforeItIsGone,
                             loanThrows),
                     builder, payInAdvanceRouter, LoanFixtures.registry(), log, provider(oracle),
@@ -1207,6 +1225,94 @@ class LiquidationSubmitVetoTest {
                 "a submission whose outcome is UNKNOWN was retried on the next cycle — that is the "
                         + "double-submit the quarantine exists to prevent");
         assertEquals(1, run.log().size(), "and no second decision was even derived for it");
+    }
+
+    /**
+     * T-037: before the fix this catch was {@code log.warn(..., e.toString())} — a generic message at
+     * WARN with the stack invisible on an INFO-level node. This is exactly the failure a live-armed
+     * node needs to see, so it is now a single ERROR line carrying the full cause chain plus the
+     * exception itself — the same idiom the build-path catches already use. The recorded outcome is
+     * untouched: this is a log/detail-only fix, proved here by asserting {@code SUBMIT_FAILED} still
+     * comes out unchanged alongside the new log event.
+     */
+    @Test
+    void aThrowingSubmissionIsLoggedAtErrorWithTheCauseAttached() {
+        RuntimeException boom = new IllegalStateException("connection reset");
+        RecordingSubmitter submitter = RecordingSubmitter.throwing(boom);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        Run run;
+        try {
+            run = new Rig().submitter(submitter).run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, run.onlyDecision().outcome(),
+                "the fix is log-only — the recorded outcome must not change");
+        assertTrue(run.onlyDecision().detail().contains(LiquidationExecutor.causeChain(boom)),
+                "the decision detail should also carry the cause chain: " + run.onlyDecision().detail());
+
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .filter(event -> event.getFormattedMessage().contains("submitting the liquidation"))
+                .toList();
+        assertEquals(1, errors.size(), "expected exactly one ERROR event for the submit-threw path: "
+                + appender.list);
+        ILoggingEvent event = errors.getFirst();
+        assertTrue(event.getFormattedMessage().contains(LiquidationExecutor.causeChain(boom)),
+                "must surface the real cause chain, not just toString(): " + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(),
+                "the exception itself must be attached for the stack trace, not just the message");
+    }
+
+    /**
+     * T-037: the sibling swallow, on the sign path. Before the fix this catch was also
+     * {@code log.warn(..., e.toString())}. Driven with a spy of {@code ACCOUNT} whose {@code sign} is
+     * stubbed to throw — this is the machinery failing after all eight vetoes already said yes, so
+     * nothing here is one of them: the recorded outcome stays {@code SUBMIT_VETOED} with no veto name,
+     * exactly as before the fix, and nothing reaches the wire.
+     */
+    @Test
+    void aFailedSignIsLoggedAtErrorWithTheCauseAndStillRecordsSubmitVetoed() {
+        RuntimeException boom = new IllegalStateException("hsm unavailable");
+        Account brokenSigner = spy(ACCOUNT);
+        doThrow(boom).when(brokenSigner).sign(any(Transaction.class));
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        Run run;
+        try {
+            run = new Rig().account(brokenSigner).run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertEquals(0, run.submitter().submitted.size(), "signing threw, so nothing reached the wire");
+        LiquidationDecision decision = run.onlyDecision();
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_VETOED, decision.outcome(),
+                "the fix is log-only — the recorded outcome must not change");
+        assertEquals(null, decision.submitVeto(),
+                "not one of the eight vetoes, so none is named — unchanged by the fix");
+        assertTrue(decision.detail().contains(LiquidationExecutor.causeChain(boom)),
+                "the decision detail should also carry the cause chain: " + decision.detail());
+
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .filter(event -> event.getFormattedMessage().contains("could not sign the liquidation"))
+                .toList();
+        assertEquals(1, errors.size(), "expected exactly one ERROR event for the sign-failure path: "
+                + appender.list);
+        ILoggingEvent event = errors.getFirst();
+        assertTrue(event.getFormattedMessage().contains(LiquidationExecutor.causeChain(boom)),
+                "must surface the real cause chain, not just toString(): " + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(),
+                "the exception itself must be attached for the stack trace, not just the message");
     }
 
     /** The same property for a cleanly rejected submission. */

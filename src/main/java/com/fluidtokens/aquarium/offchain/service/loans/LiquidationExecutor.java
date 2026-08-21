@@ -915,9 +915,9 @@ public class LiquidationExecutor {
             // Not one of the seven — those are all about whether submitting is *allowed*, and this
             // is the machinery failing after they all said yes. It carries no veto name for exactly
             // that reason, and it still transmits nothing.
-            log.warn("could not sign the liquidation of {}: {}", loanUtxoRef, e.toString());
+            log.error("could not sign the liquidation of {}: {}", loanUtxoRef, causeChain(e), e);
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, null,
-                    detail + "; signing threw (" + e + "), nothing was transmitted");
+                    detail + "; signing threw (" + causeChain(e) + "), nothing was transmitted");
         }
 
         try {
@@ -934,9 +934,9 @@ public class LiquidationExecutor {
         } catch (Exception e) {
             // Transmitted or not — we do not know, which is exactly why the quarantine above was
             // taken before the attempt rather than after it.
-            log.warn("submitting the liquidation of {} threw: {}", loanUtxoRef, e.toString());
+            log.error("submitting the liquidation of {} threw: {}", loanUtxoRef, causeChain(e), e);
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
-                    detail + "; submission threw: " + e);
+                    detail + "; submission threw: " + causeChain(e));
         }
     }
 
