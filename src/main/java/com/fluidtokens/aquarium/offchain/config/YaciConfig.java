@@ -82,23 +82,32 @@ public class YaciConfig {
     }
 
     /**
-     * The pay-in-advance liquidation builder, wired from the same two suppliers the plain builder
-     * uses. It is <b>submit-incapable by construction</b>: it takes no {@code BackendService} and no
-     * {@code TransactionProcessor} — its {@code QuickTxBuilder} is composed with a {@code null}
-     * processor — so, exactly like the offline plain builder, {@code build()} returns an unsigned
-     * transaction and nothing here can reach the network with it. The routing seam
-     * ({@code PayInAdvanceLiquidationRouter}) only ever invokes its {@code build(Request)}; arming and
-     * submission stay in {@code LiquidationExecutor} behind the two independent flags.
+     * The pay-in-advance liquidation builder, with a real script-cost evaluator — the convert-path
+     * mirror of {@code liquidateTransactionBuilder} above (T-014).
+     * <p>
+     * Without an evaluator, cardano-client-lib leaves every redeemer holding placeholder ex-units, and a
+     * transaction that under-declares is not rejected by the mempool: it lands and then fails on chain,
+     * forfeiting the collateral. So this path is given the same Blockfrost {@code /utils/txs/evaluate}
+     * evaluator the plain builder's bean uses — its protocol parameters and cost models are the chain's
+     * by construction — narrowed to the one-method {@link TransactionEvaluator} so the builder can price
+     * a transaction and nothing else. And, exactly as the plain builder, the builder is constructed from
+     * the {@code BFBackendService}: its {@code QuickTxBuilder} needs the backend's script supplier to
+     * fetch a validator travelling as a reference script (the oracle script, and on preview
+     * {@code loan_claim_action}) so the transaction can be priced and feed correctly. Holding a backend
+     * does not reopen submission — nothing in the builder calls {@code submit}; the routing seam
+     * ({@code PayInAdvanceLiquidationRouter}) only ever invokes {@code build(Request)}, and arming and
+     * submission stay in {@code LiquidationExecutor} behind its two independent flags.
      */
     @Bean
     @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public LiquidatePayInAdvanceTransactionBuilder liquidatePayInAdvanceTransactionBuilder(
             LoansContractRegistry registry,
             AppConfig.Network network,
-            UtxoSupplier utxoSupplier,
-            ProtocolParamsSupplier protocolParamsSupplier) {
+            BFBackendService bfBackendService) {
+        TransactionEvaluator scriptCostEvaluator =
+                (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
         return new LiquidatePayInAdvanceTransactionBuilder(registry, network.getCardanoNetwork(),
-                utxoSupplier, protocolParamsSupplier);
+                bfBackendService, scriptCostEvaluator);
     }
 
 }

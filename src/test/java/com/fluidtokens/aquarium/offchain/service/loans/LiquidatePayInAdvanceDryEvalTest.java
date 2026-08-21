@@ -1,8 +1,12 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
+import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.common.model.SlotConfigs;
 import com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil;
 import com.bloxbean.cardano.client.plutus.blueprint.model.PlutusVersion;
 import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
@@ -39,6 +43,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -418,6 +423,168 @@ class LiquidatePayInAdvanceDryEvalTest {
         int size = serializedSize(tx);
         log.info("reference-shape pay-in-advance liquidation of {}: {} bytes", LOAN_ID, size);
         assertTrue(size < MAX_TX_SIZE, "reference shape must fit under maxTxSize, was " + size);
+    }
+
+    // ======================================================================================
+    // the evaluator is load-bearing: real ex-units on the PRODUCTION wiring, not placeholders
+    // ======================================================================================
+
+    /**
+     * <b>The defect this ticket exists to close, on the pay-in-advance path.</b> Every ex-units
+     * assertion above reads {@link EvaluationResult#getExUnits()} — what the evaluator <em>said</em>.
+     * That is not the number the chain charges: the chain reads the redeemers of the transaction, and
+     * if nothing copied the evaluation into them they still hold cardano-client-lib's placeholders
+     * (10000 mem, and 10000 or 1000 steps) against a measured cost orders of magnitude larger.
+     * Under-declared ex-units are not rejected by the mempool; the transaction lands and fails during
+     * on-chain evaluation, forfeiting the collateral.
+     * <p>
+     * So this test builds through the <b>evaluator-present</b> wiring — the same code path
+     * {@code YaciConfig} arms, only with the offline PlutusV3 machine standing in for Blockfrost — and
+     * reads each redeemer's declared ex-units off the <em>deserialised transaction body</em>, then
+     * compares them with what the evaluator returned for that exact {@code (tag, index)} pair. A build
+     * that wrote <em>an</em> evaluation into <em>every</em> redeemer without matching them up, or that
+     * left the placeholders in place, both fail here.
+     */
+    @Test
+    void theBuiltTransactionCarriesTheEvaluatedExUnitsAndNotThePlaceholders() throws Exception {
+        Fixture fixture = fixture();
+        List<Utxo> universe = universe(fixture);
+
+        int[] calls = {0};
+        @SuppressWarnings("unchecked")
+        List<EvaluationResult>[] captured = new List[]{null};
+        AikenTransactionEvaluator aiken = new AikenTransactionEvaluator(
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
+                EvalFixtures.scriptSupplier(REGISTRY, List.of(oracleScript())), SlotConfigs.preview());
+        TransactionEvaluator evaluator = (cbor, inputUtxos) -> {
+            calls[0]++;
+            Result<List<EvaluationResult>> result = aiken.evaluateTx(cbor, inputUtxos);
+            captured[0] = result.getValue();
+            return result;
+        };
+
+        // The offline-with-evaluator constructor: the production complete() path (evaluator set,
+        // ignoreScriptCostEvaluationError(false)), with the real UPLC machine instead of Blockfrost.
+        Transaction built = new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), evaluator)
+                .build(fixture.request());
+
+        // Once, though the builder assembles twice. The first assembly is the layout probe, whose claim
+        // redeemers carry placeholder output indexes no validator accepts; costing it would fail by
+        // construction and refuse every batch. Pinned in both directions: it must happen (or the
+        // redeemers keep their placeholders) and it must not happen twice (each call is a remote round
+        // trip in production).
+        assertEquals(1, calls[0],
+                "only the final assembly may be script-costed — never the throwaway layout probe");
+
+        // Re-read from the bytes, not from the object the builder happens to hold.
+        Transaction reread = Transaction.deserialize(built.serialize());
+        List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
+        assertFalse(redeemers.isEmpty(), "a pay-in-advance liquidation has redeemers");
+        assertEquals(8, redeemers.size(), "two spends, one mint, five withdrawals");
+
+        for (Redeemer redeemer : redeemers) {
+            EvaluationResult costing = costingFor(captured[0], redeemer);
+            assertEquals(costing.getExUnits().getMem(), redeemer.getExUnits().getMem(),
+                    "declared mem for " + redeemer.getTag() + "#" + redeemer.getIndex()
+                            + " is not the evaluated one");
+            assertEquals(costing.getExUnits().getSteps(), redeemer.getExUnits().getSteps(),
+                    "declared steps for " + redeemer.getTag() + "#" + redeemer.getIndex()
+                            + " is not the evaluated one");
+            // And it is unmistakably not a placeholder: the placeholder mem is 10000, three to five
+            // orders of magnitude under what these scripts really cost.
+            assertTrue(redeemer.getExUnits().getMem().compareTo(BigInteger.valueOf(10_000)) > 0,
+                    "declared mem for " + redeemer.getTag() + "#" + redeemer.getIndex()
+                            + " is the 10000 placeholder — the evaluator was not load-bearing");
+            assertTrue(redeemer.getExUnits().getSteps().compareTo(BigInteger.valueOf(10_000)) > 0,
+                    "declared steps for " + redeemer.getTag() + "#" + redeemer.getIndex()
+                            + " is a placeholder — the evaluator was not load-bearing");
+        }
+    }
+
+    /**
+     * The negative pin: with no evaluator (the offline rig's default, and the state nothing may ever be
+     * submitted from), the redeemers keep cardano-client-lib's placeholder ex-units and nothing is
+     * thrown. It is the measurement the whole defect rests on — the placeholder is a constant the
+     * library writes, orders of magnitude under the real cost — and it is what makes the load-bearing
+     * test above prove something: without an evaluator, that test's redeemers would all read 10000.
+     */
+    @Test
+    void withNoEvaluatorTheRedeemersStillCarryPlaceholdersAndNothingIsThrown() throws Exception {
+        Transaction built = build(fixture());   // the 4-arg, no-evaluator constructor
+        Transaction reread = Transaction.deserialize(built.serialize());
+        for (Redeemer redeemer : reread.getWitnessSet().getRedeemers()) {
+            assertEquals(BigInteger.valueOf(10_000), redeemer.getExUnits().getMem(),
+                    "the placeholder mem changed; the defect's measurement has to be redone");
+            assertTrue(redeemer.getExUnits().getSteps().compareTo(BigInteger.valueOf(10_000)) <= 0,
+                    "the placeholder steps changed: " + redeemer.getExUnits().getSteps());
+        }
+    }
+
+    /**
+     * The loud half. {@code ignoreScriptCostEvaluationError} defaults to {@code true}, which is what
+     * turned "there is no evaluator" into a {@code log.warn} and a transaction full of placeholders. With
+     * an evaluator wired, the builder sets it to {@code false}, so an evaluator that fails — Blockfrost
+     * down, the transaction rejected by the evaluation endpoint — fails the build (which the executor
+     * quarantines with the cause) instead of producing an unsubmittable-but-submitted transaction. The
+     * evaluator's own words must survive to the operator, two cardano-client-lib wrappers notwithstanding.
+     */
+    @Test
+    void anEvaluatorThatThrowsFailsTheBuildRatherThanFallingBackToPlaceholders() {
+        Fixture fixture = fixture();
+        TransactionEvaluator exploding = (cbor, inputUtxos) -> {
+            throw new RuntimeException("blockfrost says no");
+        };
+
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe(fixture)), EvalFixtures.protocolParams(), exploding)
+                        .build(fixture.request()));
+
+        assertTrue(causeChain(thrown).contains("blockfrost says no"),
+                "the evaluator's own reason must survive to the operator: " + causeChain(thrown));
+    }
+
+    /**
+     * The failure shape that looks like success: HTTP 200 with an <em>empty</em> costing array. Checking
+     * only {@code isSuccessful()} would pass this straight through — every redeemer would keep its
+     * 10000-mem placeholder and, in live mode, forfeit collateral in phase 2. The coverage check inside
+     * {@code reporting()} catches it, per {@code (tag, index)} pair.
+     */
+    @Test
+    void anEvaluatorThatSucceedsWithNoCostingsFailsTheBuildRatherThanShippingPlaceholders() {
+        Fixture fixture = fixture();
+        TransactionEvaluator emptySuccess =
+                (cbor, inputUtxos) -> Result.success("ok").withValue(List.<EvaluationResult>of());
+
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe(fixture)), EvalFixtures.protocolParams(), emptySuccess)
+                        .build(fixture.request()));
+
+        assertTrue(causeChain(thrown).contains("costed 0 of "),
+                "the failure must say how many of how many were costed: " + causeChain(thrown));
+    }
+
+    private static String causeChain(Throwable thrown) {
+        StringBuilder detail = new StringBuilder();
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            detail.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage()).append('\n');
+            if (t.getCause() == t) {
+                break;
+            }
+        }
+        return detail.toString();
+    }
+
+    private static EvaluationResult costingFor(List<EvaluationResult> results, Redeemer redeemer) {
+        for (EvaluationResult result : results) {
+            if (result.getRedeemerTag() == redeemer.getTag()
+                    && result.getIndex() == redeemer.getIndex().intValue()) {
+                return result;
+            }
+        }
+        throw new AssertionError("no evaluation result for " + redeemer.getTag() + "#" + redeemer.getIndex());
     }
 
     // ======================================================================================

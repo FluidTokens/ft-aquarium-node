@@ -3,9 +3,15 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.model.EvaluationResult;
+import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.backend.api.BackendService;
+import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
+import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
 import com.bloxbean.cardano.client.common.model.Network;
 import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
@@ -13,6 +19,8 @@ import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
+import com.bloxbean.cardano.client.plutus.spec.Redeemer;
+import com.bloxbean.cardano.client.plutus.spec.RedeemerTag;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.Asset;
@@ -36,6 +44,7 @@ import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
@@ -52,13 +61,40 @@ import java.util.stream.Stream;
  * {@code general_spend} and the FluidTokens oracle accept under the real PlutusV3 machine, for
  * <b>one</b> loan.
  *
- * <h2>Structurally incapable of submitting</h2>
- * The {@link QuickTxBuilder} below is constructed with a <b>null</b> {@code TransactionProcessor} —
- * the only thing in cardano-client-lib that can put a transaction on a network — exactly as
- * {@code PoolBorrowTransactionBuilder} is. {@link #build} returns an <b>unsigned</b>
- * {@link Transaction}; there is no evaluator, no signer, no key and no network. The ex-units the
- * redeemers carry are cardano-client-lib's placeholders; the real ones are measured separately by
- * {@code LiquidatePayInAdvanceDryEvalTest} through the UPLC machine.
+ * <h2>Ex-units are measured, not guessed</h2>
+ * As in {@link LiquidateTransactionBuilder} (T-014), a redeemer's declared ex-units are not checked by
+ * the mempool: a transaction that under-declares is accepted, lands on chain, and then exhausts its
+ * budget during on-chain evaluation — phase 2, fee and collateral forfeit. cardano-client-lib fills
+ * every redeemer with a placeholder (10000 mem, and 10000 or 1000 steps) and only overwrites it from a
+ * {@link TransactionEvaluator}; with no evaluator set, {@code QuickTxBuilder} swallows the resulting
+ * "Transaction evaluator is not set" because {@code ignoreScriptCostEvaluationError} defaults to
+ * {@code true}. So the evaluator is <em>optional but load-bearing</em>, exactly as it is on the plain
+ * path:
+ * <ul>
+ *   <li><b>Supplied</b> (the production wiring in {@code YaciConfig}) — it is set with
+ *       {@code withTxEvaluator}, and {@code ignoreScriptCostEvaluationError(false)} turns a failed
+ *       evaluation into a build failure the executor quarantines with its cause, instead of a
+ *       {@code log.warn} followed by a transaction that would burn collateral. Only the final assembly
+ *       is priced; the throwaway layout probe is not (its placeholder output indexes would make a real
+ *       evaluator refuse every batch).</li>
+ *   <li><b>Absent</b> — the offline test rigs, which have no network and evaluate separately against
+ *       the real PlutusV3 machine ({@code LiquidatePayInAdvanceDryEvalTest}). Behaviour is then exactly
+ *       as it was: placeholder ex-units, no throw.</li>
+ * </ul>
+ *
+ * <h2>Holds a backend in production, and never submits</h2>
+ * {@link #build} returns an <b>unsigned</b> {@link Transaction}; there is no signer, no key. In the
+ * offline rigs the {@link QuickTxBuilder} is constructed with a <b>null</b> {@code TransactionProcessor}
+ * and every script is handed in explicitly. In production it is constructed from a
+ * {@code BackendService} — the one-argument constructor the library documents — so cardano-client-lib
+ * can fetch a validator travelling as a reference script (the oracle script and, on preview,
+ * {@code loan_claim_action}) to price and fee the transaction correctly; this mirrors
+ * {@link LiquidateTransactionBuilder} exactly, which found on its first armed night that a
+ * reference-script transaction cannot be priced without that supplier. The safety property is
+ * therefore <b>a stated decision, not a constructor trick</b>: nothing in this class calls
+ * {@code submit}, and arming and submission live only in {@code LiquidationExecutor} behind its two
+ * independent flags. The evaluator ({@link TransactionEvaluator}) has one method and no way to submit,
+ * so pricing the transaction does not grant submitting it.
  *
  * <h2>How it differs from the plain {@code Liquidate} builder</h2>
  * The transaction is the plain-liquidation shape with three changes the pay-in-advance validators
@@ -113,14 +149,76 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     private final UtxoSupplier utxoSupplier;
     private final ProtocolParamsSupplier protocolParamsSupplier;
 
+    /**
+     * Where the redeemers' ex-units come from, or {@code null} for "nowhere" — see "Ex-units are
+     * measured, not guessed" in the class javadoc. Nullable rather than optional because the two states
+     * are not a preference: with it, the transaction is priced and a failed evaluation fails the build;
+     * without it, the transaction carries placeholders and must not be submitted.
+     */
+    private final TransactionEvaluator scriptCostEvaluator;
+
+    /**
+     * The backend cardano-client-lib builds against in production, or {@code null} for the offline rigs.
+     * When present, {@code QuickTxBuilder} is constructed from it directly so it has the utxo supplier,
+     * protocol params, <b>script supplier</b> and transaction processor in one object — the script
+     * supplier is what lets it fetch a validator travelling as a reference script. See the class javadoc
+     * for why holding this does not reopen the submission path.
+     */
+    private final BackendService backendService;
+
+    /**
+     * The offline builder: no evaluator, so redeemers keep cardano-client-lib's placeholder ex-units.
+     * For the test rigs, which evaluate separately. Production goes through the {@code BackendService}
+     * constructor.
+     */
     public LiquidatePayInAdvanceTransactionBuilder(LoansContractRegistry registry,
                                                    Network network,
                                                    UtxoSupplier utxoSupplier,
                                                    ProtocolParamsSupplier protocolParamsSupplier) {
+        this(registry, network, utxoSupplier, protocolParamsSupplier, null, null);
+    }
+
+    /**
+     * Offline builder with an evaluator — what the dry-eval rig uses to prove the priced path against
+     * the deployed validators without a network.
+     */
+    public LiquidatePayInAdvanceTransactionBuilder(LoansContractRegistry registry,
+                                                   Network network,
+                                                   UtxoSupplier utxoSupplier,
+                                                   ProtocolParamsSupplier protocolParamsSupplier,
+                                                   TransactionEvaluator scriptCostEvaluator) {
+        this(registry, network, utxoSupplier, protocolParamsSupplier, null, scriptCostEvaluator);
+    }
+
+    /**
+     * The production constructor. {@code QuickTxBuilder} is built from the {@code BackendService}
+     * exactly as the library documents, so it has a script supplier that can fetch a validator
+     * travelling as a reference script. The evaluator is passed separately (Blockfrost's
+     * {@code /utils/txs/evaluate}, wired in {@code YaciConfig}) so its parameters and cost models are
+     * the chain's by construction.
+     */
+    public LiquidatePayInAdvanceTransactionBuilder(LoansContractRegistry registry,
+                                                   Network network,
+                                                   BackendService backendService,
+                                                   TransactionEvaluator scriptCostEvaluator) {
+        this(registry, network,
+                new DefaultUtxoSupplier(Objects.requireNonNull(backendService, "backendService").getUtxoService()),
+                new DefaultProtocolParamsSupplier(backendService.getEpochService()),
+                backendService, scriptCostEvaluator);
+    }
+
+    private LiquidatePayInAdvanceTransactionBuilder(LoansContractRegistry registry,
+                                                    Network network,
+                                                    UtxoSupplier utxoSupplier,
+                                                    ProtocolParamsSupplier protocolParamsSupplier,
+                                                    BackendService backendService,
+                                                    TransactionEvaluator scriptCostEvaluator) {
         this.registry = registry;
         this.network = network;
         this.utxoSupplier = utxoSupplier;
         this.protocolParamsSupplier = protocolParamsSupplier;
+        this.backendService = backendService;
+        this.scriptCostEvaluator = scriptCostEvaluator;
     }
 
     /**
@@ -223,16 +321,19 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         int providerRefIndex = refIndex(refInputs, request.oracle().charlieProviderReferenceInput(),
                 "charli3 provider");
 
-        // Probe with placeholder output indexes purely to observe the finished layout.
+        // Probe with placeholder output indexes purely to observe the finished layout. Never priced:
+        // its claim redeemers carry placeholder output indexes no validator accepts, so a real evaluator
+        // run against it would fail by construction and refuse every batch.
         Transaction probe = complete(request, assemble(request, numbers, configRefIndex, lmConfigRefIndex,
-                collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex, refInputs, 0L, 0L));
+                collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex, refInputs, 0L, 0L),
+                false);
 
         long lenderBondOutputIndex = locateBondOutput(probe, request);
         long assetOutputIndex = locateLenderConvertedOutput(probe, request, numbers);
 
         Transaction transaction = complete(request, assemble(request, numbers, configRefIndex,
                 lmConfigRefIndex, collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex,
-                refInputs, lenderBondOutputIndex, assetOutputIndex));
+                refInputs, lenderBondOutputIndex, assetOutputIndex), true);
 
         assertStructure(transaction, request, numbers, lenderBondOutputIndex, assetOutputIndex);
         return transaction;
@@ -341,20 +442,47 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         return published;
     }
 
-    private Transaction complete(Request request, ScriptTx tx) {
+    /**
+     * Assembles and balances one body. Mirrors {@link LiquidateTransactionBuilder#complete}.
+     *
+     * @param priceScripts whether this assembly is the one whose redeemers must carry measured
+     *                     ex-units. Only the final assembly is; the layout probe is not (see
+     *                     {@link #build}).
+     */
+    private Transaction complete(Request request, ScriptTx tx, boolean priceScripts) {
+        TransactionEvaluator evaluator =
+                priceScripts && scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
         try {
-            // Third argument (TransactionProcessor) stays null; see the class javadoc.
-            QuickTxBuilder.TxContext context = new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
+            // Production: the one-argument constructor the library documents, which wires the utxo
+            // supplier, protocol params, SCRIPT SUPPLIER and transaction processor from one backend —
+            // the script supplier is what lets it fetch a validator that only exists on chain as a
+            // reference script. Offline: the three-argument form with no processor and no supplier,
+            // because the rigs hand every script in explicitly and evaluate for themselves.
+            QuickTxBuilder quickTxBuilder = backendService != null
+                    ? new QuickTxBuilder(backendService)
+                    : new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null);
+            QuickTxBuilder.TxContext context = quickTxBuilder
                     .compose(tx)
                     .feePayer(request.changeAddress())
                     .collateralPayer(request.changeAddress())
                     .validFrom(request.validFromSlot())
                     .validTo(request.validToSlot())
                     .mergeOutputs(false)
-                    // No evaluator here: the redeemers keep placeholder ex-units and the offline rig
-                    // prices them itself. Nothing must be fetched — the rig hands every script in.
-                    .ignoreScriptCostEvaluationError(true)
-                    .withScriptSupplier(scriptHash -> Optional.empty());
+                    // With an evaluator, a failed evaluation must stop the build: the default (true)
+                    // turns it into a log.warn and hands back a transaction whose redeemers still carry
+                    // placeholder ex-units — a phase-2 failure waiting to be submitted. Without one, the
+                    // flag stays true because there is nothing to evaluate with and the offline rig
+                    // prices the transaction itself.
+                    .ignoreScriptCostEvaluationError(evaluator == null);
+
+            if (backendService == null) {
+                // Offline: cardano-client-lib would otherwise walk every reference input looking for a
+                // script to fetch and NPE on the missing supplier. The rig hands scripts in explicitly.
+                context = context.withScriptSupplier(scriptHash -> Optional.empty());
+            }
+            if (evaluator != null) {
+                context = context.withTxEvaluator(evaluator);
+            }
 
             // Published scripts are declared as reference scripts and their witness copies stripped,
             // mirroring LiquidateTransactionBuilder.complete: a script also reachable by reference is
@@ -366,8 +494,91 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
             }
             return context.build();
         } catch (Exception e) {
+            // An evaluator failure arrives here with the ScriptCostEvaluationException marker at the
+            // head of its cause chain; the executor's convert branch quarantines this candidate and
+            // logs the whole cause chain at ERROR, so the evaluator's own words ("Blockfrost is down",
+            // "costed 3 of 8 redeemers") reach the operator rather than a bare "Error while evaluating
+            // script cost". See LiquidationExecutor's pay-in-advance catch.
             throw new IllegalStateException("cannot build the pay-in-advance transaction", e);
         }
+    }
+
+    /**
+     * Thrown by {@link #reporting} when the evaluator itself fails to price the transaction, so the
+     * operator-facing detail carries the evaluator's root cause rather than cardano-client-lib's
+     * two-layer wrapping of it. Unchecked on purpose: {@code ScriptCostEvaluators} only catches
+     * {@code CborSerializationException} and {@code ApiException}, so a {@link RuntimeException} reaches
+     * {@link #complete}'s catch with the marker still in the chain.
+     */
+    private static final class ScriptCostEvaluationException extends RuntimeException {
+
+        ScriptCostEvaluationException(String detail, Throwable cause) {
+            super(detail, cause);
+        }
+    }
+
+    /**
+     * The caller's evaluator, with every way it can fail to price the transaction turned into one
+     * {@link ScriptCostEvaluationException}. Three failure shapes, not two: a thrown exception, an
+     * unsuccessful {@link Result}, and — the dangerous one because it looks like success — a
+     * <b>successful result that does not cost every redeemer</b>, which would leave the uncosted
+     * redeemers on their 10000-mem placeholders. Mirrors {@link LiquidateTransactionBuilder}'s wrapper.
+     */
+    private static TransactionEvaluator reporting(TransactionEvaluator delegate) {
+        return (cbor, inputUtxos) -> {
+            Result<List<EvaluationResult>> result;
+            try {
+                result = delegate.evaluateTx(cbor, inputUtxos);
+            } catch (Exception e) {
+                throw new ScriptCostEvaluationException(String.valueOf(e.getMessage()), e);
+            }
+            if (result == null) {
+                throw new ScriptCostEvaluationException("the evaluator returned no result", null);
+            }
+            if (!result.isSuccessful()) {
+                throw new ScriptCostEvaluationException(String.valueOf(result.getResponse()), null);
+            }
+            requireEveryRedeemerCosted(cbor, result.getValue());
+            return result;
+        };
+    }
+
+    /**
+     * Every redeemer in the transaction sent for evaluation must come back with a costing of its own.
+     * Coverage is checked per {@code (tag, index)} pair — the key {@code ScriptCostEvaluators} writes
+     * back on — because N results for N redeemers can still leave one redeemer uncosted.
+     */
+    private static void requireEveryRedeemerCosted(byte[] cbor, List<EvaluationResult> results) {
+        List<Redeemer> redeemers;
+        try {
+            redeemers = Transaction.deserialize(cbor).getWitnessSet().getRedeemers();
+        } catch (Exception e) {
+            throw new ScriptCostEvaluationException(
+                    "the transaction sent for evaluation could not be read back", e);
+        }
+        if (redeemers == null || redeemers.isEmpty()) {
+            return;
+        }
+        Set<String> costed = new HashSet<>();
+        if (results != null) {
+            for (EvaluationResult costing : results) {
+                costed.add(redeemerKey(costing.getRedeemerTag(), costing.getIndex()));
+            }
+        }
+        List<String> uncosted = redeemers.stream()
+                .map(redeemer -> redeemerKey(redeemer.getTag(), redeemer.getIndex().intValue()))
+                .filter(key -> !costed.contains(key))
+                .toList();
+        if (!uncosted.isEmpty()) {
+            throw new ScriptCostEvaluationException(
+                    ("the evaluator costed %d of %d redeemers; %s would have kept placeholder ex-units")
+                            .formatted(redeemers.size() - uncosted.size(), redeemers.size(), uncosted),
+                    null);
+        }
+    }
+
+    private static String redeemerKey(RedeemerTag tag, int index) {
+        return tag + "#" + index;
     }
 
     // ---- redeemers --------------------------------------------------------------------------------
