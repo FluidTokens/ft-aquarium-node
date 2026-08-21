@@ -76,6 +76,25 @@ Proven 2026-08-14 (Java 21.0.11):
 
 - **`main` is production.** Operators build Docker images from it. All lending-v4 work
   stays on `feat/lending-v4`; PRs into `main`.
+- **Every tx-building path MUST wire a real `TransactionEvaluator`** (CCL trap 8 — it cost us a
+  production incident on 2026-08-21). `new QuickTxBuilder(utxoSupplier, protocolParamsSupplier,
+  null)` is the natural way to make a builder *submit-incapable*, but **the same `null` becomes the
+  evaluator**: `.build()` then throws `"Transaction evaluator is not set"`, or — worse, since
+  `ignoreScriptCostEvaluationError` defaults `true` — silently ships **placeholder ex-units**
+  (10000 mem / 10000-or-1000 steps, under-declaring by 2–5 orders of magnitude → phase-2 failure and
+  forfeited collateral). Pass an evaluator via `withTxEvaluator(...)` (it is a one-method interface
+  that *cannot* submit, so the no-submit guarantee survives) and set
+  `ignoreScriptCostEvaluationError(evaluator == null)`. **Assert ex-units off the BUILT (deserialised)
+  transaction, never off `EvaluationResult`** — a rig-supplied evaluator makes the report look right
+  while production has none. A transaction carrying **reference scripts** needs the backend's script
+  supplier (`new QuickTxBuilder(backendService)`) to price and fee correctly; the offline rig proves
+  scripts but *not* ledger fees, so it cannot settle that question. Reference: `LiquidateTransactionBuilder`
+  (javadoc "Ex-units are measured, not guessed") + T-014 / commit `458f00d`.
+- **Promoting test code to `src/main` requires a production-wiring test — byte-identity is never the
+  sole gate.** The 2026-08-21 incident: a dry-eval-only builder was promoted byte-identically, which
+  structurally preserved its null-evaluator bug, and every test used the rig that supplies what
+  production must earn. Before wiring any builder into a live caller, prove it builds through the
+  **Spring-wired** shape, and cite the sibling builder's hard-won lessons in the slice contract.
 - **Never run `aiken build` over `src/main/resources/loans-v4.plutus.json`** or replace it
   with rebuilt output — byte-identity with the upstream deployed commit is what makes the
   runtime hash derivation valid (proven: sha256 match + 26 derivation assertions).
