@@ -41,6 +41,15 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
+ * <h2>Reviewer's orientation — and note this is the PLAIN path, not the failing one</h2>
+ * <b>This class covers {@code Liquidate}, where the lender receives the collateral itself. The convert
+ * path that failed in production is {@code LiquidateAndPayInAdvance}, covered by
+ * {@link LiquidatePayInAdvanceDryEvalTest}.</b> They are different on-chain actions with different
+ * script hashes; do not read a green run here as saying anything about the convert path.
+ * <b>Proves:</b> the plain transaction's shape is accepted by the real deployed PlutusV3 validators.
+ * <b>Does NOT prove:</b> any LEDGER rule — fees, min-ada, collateral adequacy, {@code maxTxSize} —
+ * none of which the offline evaluator enforces. <b>Evaluator:</b> offline (aiken-java-binding).
+ *
  * The structural answer to "a green suite proves nothing": the {@code Liquidate} transaction
  * {@link LiquidateTransactionBuilder} assembles is handed to the real PlutusV3 machine and run
  * against the <em>real deployed validators</em>, not against this repo's model of them.

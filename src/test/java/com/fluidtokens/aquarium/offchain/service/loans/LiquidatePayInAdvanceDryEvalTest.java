@@ -48,6 +48,30 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
+ * <h2>⚠ READ THIS BEFORE TRUSTING A GREEN RUN OF THIS CLASS</h2>
+ * <b>Green here means: the deployed validators accept this shape, at the pinned instant, with a
+ * healthy oracle feed. It does NOT mean the chain will accept this transaction.</b>
+ * <p>
+ * That distinction is not theoretical — it cost a full day on 2026-08-24. Every fixture below pins
+ * {@code FEED_VALID_FROM = NOW - 35_555} against a 600 000 ms oracle window, i.e. <b>~564 s of feed
+ * still ahead: a feed in the best moment of its life.</b> Production built in the <em>tail</em> of a
+ * feed's life, where the deployed
+ * {@code lm_liquidate_and_pay_in_advance_action} passes both validity bounds into
+ * {@code retrieve_oracle_data}, gets {@code None}, and the {@code expect Some(..)} aborts — a failure
+ * with an EMPTY trace, which Blockfrost reports as {@code {"ScriptFailures":{}}} naming nothing. This
+ * class was green throughout.
+ * <p>
+ * The general form, worth carrying to any fixture over a time- or price-dependent contract:
+ * <b>a pinned fixture does not merely freeze a value — it freezes a value at a chosen point in that
+ * value's LIFE CYCLE, and a fixture author naturally chooses a healthy one.</b> The three
+ * {@code V3 — the oracle feed must cover the WHOLE transaction window} tests below exist to cover
+ * exactly that blind spot, and they are the only cases here that exercise an unhealthy feed.
+ * <p>
+ * What this class genuinely proves, and it is worth having: the transaction's <em>shape</em> is one
+ * the real deployed PlutusV3 validators accept, verified through the real UPLC machine. What no test
+ * in this class can prove is a LEDGER rule — fees, min-ada, collateral adequacy, {@code maxTxSize} —
+ * because the offline evaluator does not enforce any of them.
+ *
  * <b>Proof that a {@code LiquidateAndPayInAdvance} liquidation can be built and would pass the
  * deployed preview validators.</b> The real preview loan
  * {@code f855d1b4…#1} — 100 000 000 tFLDT of collateral against a 28 000 000-lovelace principal, with
@@ -56,8 +80,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@link LiquidatePayInAdvanceTransactionBuilder} and handed to the real PlutusV3 machine through
  * {@link EvalFixtures#evaluate}. No network, no key, no wallet, no submission: the builder has a null
  * transaction processor and this test only <em>evaluates</em> an unsigned transaction. It proves the
- * capability in principle; it arms nothing — the live bot is unchanged and the scanner still excludes
- * this loan under {@code CONVERSION_TO_PRINCIPAL_REQUIRED}.
+ * capability in principle; it arms nothing. (The sentence that used to sit here — "the scanner still
+ * excludes this loan under {@code CONVERSION_TO_PRINCIPAL_REQUIRED}" — has been false since E1-BOT A3
+ * lifted that exclusion on 2026-08-20; the executor now routes convert bonds to this builder.)
  *
  * <h2>Why this loan is the pay-in-advance fixture</h2>
  * {@link RealLoanDryEvalTest} and {@link RealEquityLoanDryEvalTest} both liquidate loans whose bond
@@ -806,8 +831,12 @@ class LiquidatePayInAdvanceDryEvalTest {
     }
 
     /**
-     * The other direction, and the reason this guard is safe to add: a feed with the margin intact
-     * still builds. Without this, a guard that refused everything would look like a fix.
+     * The other direction, and <b>this test is not optional</b>: a feed with the margin still ahead of
+     * {@code validTo} must STILL BUILD.
+     * <p>
+     * Without it the guard is unfalsifiable — a check that refused every candidate would pass both
+     * refusal tests above and look exactly like a fix, while silently disabling the convert path
+     * entirely. The pair of directions is what makes the guard a guard rather than a switch.
      */
     @Test
     void aFeedWithTheMarginIntactStillBuilds() {

@@ -60,6 +60,15 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
+ * <h2>Reviewer's orientation — what this class proves, and what it does not</h2>
+ * <b>Proves:</b> the executor's decision LOGIC — which candidates it routes where, what it records,
+ * what it quarantines, which of the eight submit-vetoes fires, and that shadow mode never reaches the
+ * wire (every wiring here gets a submitter that fails the test on contact).
+ * <b>Does NOT prove:</b> anything about the chain. Its collaborators are hand-built fakes and its
+ * evaluator is either the offline PlutusV3 rig or absent entirely. A green run here says the loop
+ * behaves; it says nothing about whether a transaction it produced would be accepted.
+ * <b>Evaluator:</b> offline (aiken-java-binding) where ex-units matter, otherwise none.
+ *
  * End-to-end proof for the shadow liquidation loop: a real {@link LiquidateTransactionBuilder}, real
  * {@link LoanFinance} arithmetic and real fixtures, with only the collaborators that would otherwise
  * need a database, a chain or a clock replaced by hand-built subclasses — the
