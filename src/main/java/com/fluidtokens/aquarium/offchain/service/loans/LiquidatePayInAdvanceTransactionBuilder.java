@@ -393,7 +393,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
         tx.readFrom(refInputs.toArray(TransactionInput[]::new));
 
-        attachValidators(tx);
+        attachValidators(tx, request.referenceScripts());
         return tx.withChangeAddress(request.changeAddress());
     }
 
@@ -403,12 +403,31 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * attaching every one of them keeps the resolution self-contained (the oracle travels by reference
      * input, resolved from the {@code List.of(oracleScript())} extra at evaluation time).
      */
-    private void attachValidators(ScriptTx tx) {
-        tx.attachSpendingValidator(registry.getLoanSpendScript());
-        tx.attachSpendingValidator(registry.getLenderManagerSpendScript());
-        tx.attachRewardValidator(registry.getLoanScript());
-        tx.attachRewardValidator(registry.getLoanClaimActionScript());
-        tx.attachRewardValidator(registry.getLenderManagerScript());
+    private void attachValidators(ScriptTx tx, LiquidateTransactionBuilder.ReferenceScripts scripts) {
+        // A script that travels by REFERENCE must not also be attached here. cardano-client-lib's
+        // removeDuplicateScriptWitnesses(true) does strip the copy — but only AFTER balancing, and
+        // script-cost evaluation runs BEFORE that. So an attached-and-referenced script is still in
+        // the witness set when the transaction is handed to the evaluator, and a REMOTE evaluator is
+        // shown a body 8,665 bytes larger than the one that would finally be submitted. Measured on
+        // preview 2026-08-24: 23,459 bytes against a live maxTxSize of 16,384 — 43% over — and
+        // Blockfrost answered EvaluationFailure with an EMPTY ScriptFailures map, i.e. "could not be
+        // evaluated at all". The offline rig never saw this because it does not enforce maxTxSize.
+        if (scripts.loanSpend() == null) {
+            tx.attachSpendingValidator(registry.getLoanSpendScript());
+        }
+        if (scripts.lenderManagerSpend() == null) {
+            tx.attachSpendingValidator(registry.getLenderManagerSpendScript());
+        }
+        if (scripts.loan() == null) {
+            tx.attachRewardValidator(registry.getLoanScript());
+        }
+        if (scripts.loanClaimAction() == null) {
+            tx.attachRewardValidator(registry.getLoanClaimActionScript());
+        }
+        if (scripts.lenderManager() == null) {
+            tx.attachRewardValidator(registry.getLenderManagerScript());
+        }
+        // No ReferenceScripts field names the pay-in-advance action, so it always travels inline.
         tx.attachRewardValidator(registry.getLmLiquidateAndPayInAdvanceActionScript());
     }
 
