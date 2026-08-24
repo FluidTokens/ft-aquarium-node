@@ -9,6 +9,7 @@ import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.fluidtokens.aquarium.offchain.config.AccountConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.Loan;
@@ -74,6 +75,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 @EnabledIfEnvironmentVariable(named = "BLOCKFROST_KEY", matches = ".+",
         disabledReason = "live preview check: run with `set -a; . ./.env.preview; set +a`")
+@EnabledIfEnvironmentVariable(named = "WALLET_MNEMONIC", matches = ".+",
+        disabledReason = "needs the bot's mnemonic to resolve its operational address the way "
+                + "AccountConfig does — see botAccount()")
 class LiquidatePayInAdvanceProductionWiringLiveTest {
 
     private static final String PREVIEW_URL = "https://cardano-preview.blockfrost.io/api/v0/";
@@ -120,6 +124,28 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
     private static <T> T skip(String reason) {
         System.out.println("[T-039 SKIPPED] " + reason);
         return abort("[T-039] " + reason);
+    }
+
+    /**
+     * The bot's account, resolved through <b>the production bean</b> rather than re-derived here.
+     * <p>
+     * Not fussiness. On 2026-08-24 two places derived "the bot's wallet" independently and disagreed:
+     * this test read {@code .env.preview}'s mnemonic and reported {@code addr_test1qztwnc4…} as the
+     * bot's address, while the running node was on {@code addr_test1qz3vp0h9…}. A whole diagnosis was
+     * built on the wrong wallet. <b>Where a test and production must agree about identity, they share
+     * the resolution rather than duplicating it</b> — so if {@link AccountConfig} ever changes network
+     * mapping or derivation, this follows automatically.
+     * <p>
+     * What sharing the code path CANNOT fix is a different {@code WALLET_MNEMONIC} in the shell than
+     * the node runs with. That is why every abort below names the address it resolved: a mismatch has
+     * to be visible in the output, not inferred.
+     */
+    private static Account botAccount() {
+        String mnemonic = System.getenv("WALLET_MNEMONIC");
+        if (mnemonic == null || mnemonic.isBlank()) {
+            skip("WALLET_MNEMONIC is not set — run with `set -a; . ./.env.preview; set +a`");
+        }
+        return new AccountConfig().account(mnemonic, "preview");
     }
 
     private static BFBackendService backend() {
@@ -182,7 +208,7 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
         // The published reference script is still there. This is what keeps the convert tx under
         // maxTxSize; without it the transaction is ~23,462 bytes against a 16,384 limit.
         Utxo refScript = liveUtxo(backend, REF_LOAN_CLAIM_ACTION_TX, REF_LOAN_CLAIM_ACTION_INDEX,
-                new Account(Networks.preview(), System.getenv("WALLET_MNEMONIC")).baseAddress())
+                botAccount().baseAddress())
                 .orElseGet(() -> skip("the published loan_claim_action reference script "
                         + REF_LOAN_CLAIM_ACTION_TX + "#" + REF_LOAN_CLAIM_ACTION_INDEX
                         + " is gone — every convert liquidation is now TX_TOO_LARGE"));
@@ -212,7 +238,7 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
     void theProductionWiringBuildsTheConvertLiquidation() throws Exception {
         BFBackendService backend = backend();
         LoansContractRegistry registry = registry();
-        Account bot = new Account(Networks.preview(), System.getenv("WALLET_MNEMONIC"));
+        Account bot = botAccount();
 
         var walletPage = backend.getUtxoService().getUtxos(bot.baseAddress(), 100, 1);
         assumeTrue(walletPage.isSuccessful() && walletPage.getValue() != null,
@@ -224,10 +250,14 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
                         && u.getInlineDatum() == null
                         && u.getDataHash() == null)
                 .findFirst()
-                .orElseGet(() -> skip("the bot's address " + bot.baseAddress() + " holds no "
-                        + "spendable utxo: " + walletPage.getValue().size() + " present, none of them "
-                        + "ada-only-and-datum-free-and-reference-script-free. Fund index 0 with ONE "
-                        + "ada-only utxo comfortably covering the whole transaction."));
+                .orElseGet(() -> skip("no spendable utxo at " + bot.baseAddress() + " — "
+                        + walletPage.getValue().size() + " present, none of them ada-only AND "
+                        + "datum-free AND reference-script-free. TWO different causes look identical "
+                        + "here, so check the address above FIRST: (a) if it is NOT the address your "
+                        + "node logs at startup, the WALLET_MNEMONIC in this shell is a different "
+                        + "wallet from the node's and nothing about funding is wrong; (b) if it IS "
+                        + "the node's address, it needs one ada-only utxo comfortably covering the "
+                        + "whole transaction on its own."));
 
         // Everything else the request needs, live.
         Utxo loanUtxo = liveUtxo(backend, LOAN_TX, LOAN_INDEX, LOAN_ADDRESS)

@@ -13,6 +13,24 @@ public enum LiquidationExclusion {
     /**
      * No loan under {@code loanPolicyId} shares the bond's asset name. The loan↔bond join key is
      * the asset name ({@code lm_liquidate_action.ak:131-135}, §7.5).
+     *
+     * <h2>This is the ORDINARY post-settlement state, not a sign the bot is blind</h2>
+     * A large {@code LOAN_NOT_FOUND} count in the scan histogram reads alarmingly — it looks like
+     * loans the bot cannot see — and it was carried as an open question for four days on exactly
+     * that reading. <b>Verified against preview on 2026-08-24, per bond rather than in aggregate:</b>
+     * of the eleven lender bonds then at the LenderManager spend address, nine had a loan NFT of
+     * quantity <b>zero</b> (minted and later burned — one traced mint {@code 4ff983e7…} → burn
+     * {@code 9dadfca3…}), and the loan spend address held exactly <b>two</b> live loan NFTs, which
+     * were exactly the two the scan reported buildable.
+     * <p>
+     * The reason is structural: closing a loan (repayment or liquidation) <b>burns the loan NFT</b>,
+     * while the <b>lender bond survives</b> — it is the lender's separate claim ticket, withdrawn
+     * later through {@code lmWithdrawBondsAction}. A bond whose loan is gone is therefore a settled
+     * loan awaiting its lender's withdrawal, and there is nothing for a liquidator to do with it.
+     * <p>
+     * So: this value at scale means <em>the market has history</em>. What would genuinely indicate
+     * blindness is a loan NFT alive at the loan spend address whose bond is at the LenderManager
+     * credential and which is still excluded here — that pairing was checked and did not occur.
      */
     LOAN_NOT_FOUND,
 
