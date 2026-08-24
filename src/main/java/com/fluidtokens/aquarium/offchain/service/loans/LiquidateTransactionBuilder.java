@@ -1620,6 +1620,14 @@ public final class LiquidateTransactionBuilder {
     private Transaction complete(Request request, ScriptTx tx, boolean priceScripts) {
         TransactionEvaluator evaluator =
                 priceScripts && scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
+        // The probe assembly is never priced — its claim redeemers carry placeholder output indexes
+        // no validator accepts — but cardano-client-lib DEMANDS an evaluator the moment balancing
+        // adds an input, and throws "Transaction evaluator is not set" on that path regardless of
+        // ignoreScriptCostEvaluationError. Without this the build dies in the probe whenever the
+        // nominated wallet utxo does not cover the whole transaction alone. See LayoutProbeEvaluator.
+        TransactionEvaluator contextEvaluator = evaluator != null
+                ? evaluator
+                : (priceScripts ? null : LayoutProbeEvaluator.INSTANCE);
         long[] slots = validitySlots(request);
         // Production: the one-argument constructor the library documents, which wires the utxo
         // supplier, protocol params, SCRIPT SUPPLIER and transaction processor from one backend.
@@ -1647,15 +1655,36 @@ public final class LiquidateTransactionBuilder {
                         // coin selection has no reference-script exclusion, and the bot's published
                         // scripts live at its own address. See ReferenceScriptSafeUtxoSelection.
                         .withUtxoSelectionStrategy(
-                                ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier));
+                                ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
+                        // The strategy above guards only the path ChangeOutputAdjustments tries SECOND. The
+                        // UtxoSelector it tries FIRST has no withUtxoSelector on TxContext, so it is installed
+                        // here — preBalanceTx hands over the TxBuilderContext itself and runs before balancing.
+                        .preBalanceTx((ctx, txn) ->
+                                ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                        // COLLATERAL is chosen by neither of the above: QuickTxBuilder.buildCollateralOutput
+                        // (:507) builds its OWN DefaultUtxoSelectionStrategyImpl rather than reading the
+                        // context's, so withUtxoSelectionStrategy and the selector alike are invisible to it.
+                        // Measured, not reasoned: with both guards installed and this line absent, a build
+                        // still pledged the published loan_claim_action script as collateral — and collateral
+                        // is what a PHASE-2 failure consumes, which makes it the worse of the two paths.
+                        //
+                        // Pinning it to the wallet utxo is safe and costs no extra funding: that utxo is
+                        // already an explicit input (collectFrom above), the executor's adaOnlyWalletUtxo()
+                        // guarantees it is ada-only with no datum and no reference script, and one utxo may
+                        // serve as both spend input and collateral (CCL trap 12 — a collateral return is
+                        // emitted). Pinning also excludes it from ordinary coin selection, which changes
+                        // nothing here precisely because it was never selected: it is handed in.
+                        .withCollateralInputs(inputOf(request.walletUtxo()));
 
         if (backendService == null) {
             // Offline: cardano-client-lib would otherwise walk every reference input looking for a
             // script to fetch and NPE on the missing supplier. The rigs hand scripts in explicitly.
             context = context.withScriptSupplier(scriptHash -> Optional.empty());
         }
-        if (evaluator != null) {
-            context = context.withTxEvaluator(evaluator);
+        if (contextEvaluator != null) {
+            // Keyed on contextEvaluator, but ignoreScriptCostEvaluationError above stays keyed on
+            // `evaluator`: a probe must never turn an evaluation failure into a build failure.
+            context = context.withTxEvaluator(contextEvaluator);
         }
 
         List<PlutusScript> published = publishedScripts(request.referenceScripts());

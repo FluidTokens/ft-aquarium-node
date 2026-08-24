@@ -2,7 +2,10 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.api.exception.ApiException;
 import com.bloxbean.cardano.client.coinselection.UtxoSelectionStrategy;
+import com.bloxbean.cardano.client.coinselection.UtxoSelector;
+import com.bloxbean.cardano.client.coinselection.impl.DefaultUtxoSelector;
 import com.bloxbean.cardano.client.coinselection.impl.DefaultUtxoSelectionStrategyImpl;
 import com.bloxbean.cardano.client.coinselection.impl.LargestFirstUtxoSelectionStrategy;
 
@@ -35,6 +38,18 @@ import com.bloxbean.cardano.client.coinselection.impl.LargestFirstUtxoSelectionS
  * repeatedly. Both halves of the chain are therefore overridden below, and a test drives the fallback
  * path specifically.
  *
+ * <h2>Two selectors, not one — the strategy alone is NOT enough</h2>
+ * {@code ChangeOutputAdjustments.adjustChangeOutput} ({@code :218-244}) reaches for a
+ * <b>{@link UtxoSelector}</b> FIRST — {@code context.getUtxoSelector().findFirst(addr, predicate)}
+ * with a predicate that tests only "not already an input", "ada only" and "big enough" — and only
+ * falls through to the {@code UtxoSelectionStrategy} when that finds nothing. Guarding the strategy
+ * alone therefore guards the path that is tried SECOND. Measured, not reasoned: with the strategy
+ * guarded and the selector not, a build still spent {@code 48c102c0…#0}.
+ * <p>
+ * {@code QuickTxBuilder.TxContext} exposes {@code withUtxoSelectionStrategy} but has <b>no</b>
+ * {@code withUtxoSelector}, so the selector is installed through {@code preBalanceTx}, which hands
+ * over the {@code TxBuilderContext} itself and runs before balancing.
+ *
  * <h2>What this does NOT cover</h2>
  * <b>Collateral selection is not governed by this strategy.</b> {@code QuickTxBuilder}'s
  * {@code buildCollateralOutput} constructs its <em>own</em> {@code DefaultUtxoSelectionStrategyImpl}
@@ -51,6 +66,51 @@ final class ReferenceScriptSafeUtxoSelection {
     /** A UTxO is spendable by the bot only if it is not carrying a published reference script. */
     static boolean spendable(Utxo utxo) {
         return utxo.getReferenceScriptHash() == null;
+    }
+
+    /**
+     * The selector to install on the {@code TxBuilderContext} via {@code preBalanceTx}. It composes
+     * the reference-script guard into whatever predicate the library passes, so it cannot be bypassed
+     * by a caller-supplied predicate that does not know about reference scripts — which is exactly
+     * what {@code ChangeOutputAdjustments} supplies.
+     */
+    static UtxoSelector selector(UtxoSupplier utxoSupplier) {
+        DefaultUtxoSelector delegate = new DefaultUtxoSelector(utxoSupplier);
+        return new UtxoSelector() {
+            @Override
+            public java.util.Optional<Utxo> findFirst(String address,
+                                                      java.util.function.Predicate<Utxo> predicate)
+                    throws ApiException {
+                return delegate.findFirst(address,
+                        predicate.and(ReferenceScriptSafeUtxoSelection::spendable));
+            }
+
+            @Override
+            public java.util.Optional<Utxo> findFirst(String address,
+                                                      java.util.function.Predicate<Utxo> predicate,
+                                                      java.util.Set<Utxo> excludeUtxos)
+                    throws ApiException {
+                return delegate.findFirst(address,
+                        predicate.and(ReferenceScriptSafeUtxoSelection::spendable), excludeUtxos);
+            }
+
+            @Override
+            public java.util.List<Utxo> findAll(String address,
+                                                java.util.function.Predicate<Utxo> predicate)
+                    throws ApiException {
+                return delegate.findAll(address,
+                        predicate.and(ReferenceScriptSafeUtxoSelection::spendable));
+            }
+
+            @Override
+            public java.util.List<Utxo> findAll(String address,
+                                                java.util.function.Predicate<Utxo> predicate,
+                                                java.util.Set<Utxo> excludeUtxos)
+                    throws ApiException {
+                return delegate.findAll(address,
+                        predicate.and(ReferenceScriptSafeUtxoSelection::spendable), excludeUtxos);
+            }
+        };
     }
 
     /** The strategy to hand to {@code QuickTxBuilder.TxContext.withUtxoSelectionStrategy}. */

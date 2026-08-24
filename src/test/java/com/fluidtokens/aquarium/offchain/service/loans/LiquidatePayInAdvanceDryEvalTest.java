@@ -599,6 +599,133 @@ class LiquidatePayInAdvanceDryEvalTest {
     // fixture plumbing
     // ======================================================================================
 
+
+    // ======================================================================================
+    // balancing that ADDS an input: the probe pass, and what the balancer may spend
+    //
+    // Two defects meet here, both found from the pinned cardano-client-lib v0.7.2 source:
+    //   (b) ScriptBalanceTxProviders.balanceTx re-runs script-cost evaluation whenever balancing
+    //       added inputs, and throws "Transaction evaluator is not set" UNCONDITIONALLY on that
+    //       branch — ignoreScriptCostEvaluationError does not guard it. The layout probe has no
+    //       evaluator by design, so before LayoutProbeEvaluator any build whose wallet utxo did not
+    //       cover the whole transaction alone died in the probe.
+    //   (a) DefaultUtxoSelectionStrategyImpl.accept() is `return true`: nothing stops the balancer
+    //       spending the bot's own published reference script, which on preview sits at the bot's
+    //       own operational address.
+    // Neither is reachable at all unless balancing actually adds an input, which is what the
+    // deliberately thin wallet utxo below forces.
+    // ======================================================================================
+
+    /**
+     * A real offline PlutusV3 evaluator over the given universe, for the PRICED pass.
+     */
+    private static TransactionEvaluator offlineEvaluator(List<Utxo> universe) {
+        return (cbor, inputUtxos) -> new AikenTransactionEvaluator(
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
+                EvalFixtures.scriptSupplier(REGISTRY, List.of(oracleScript())), SlotConfigs.preview())
+                .evaluateTx(cbor, new java.util.LinkedHashSet<>(universe));
+    }
+
+    /** The published loan_claim_action reference script, at the bot's own address. Real coordinate. */
+    private static Utxo publishedScriptUtxo(long lovelace) {
+        return Utxo.builder()
+                .txHash("48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd")
+                .outputIndex(0)
+                .address(LoanFixtures.botAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(lovelace))))
+                .referenceScriptHash("9ae63b26c98d90024a45f9cdb57e4154f72144d44325f0a261b8bc1d")
+                .build();
+    }
+
+    /** The universe with its funded wallet utxo replaced by a deliberately inadequate one. */
+    private static List<Utxo> universeWithThinWallet(Fixture fixture, long walletLovelace,
+                                                     List<Utxo> extra) {
+        List<Utxo> universe = new ArrayList<>(universe(fixture).stream()
+                .filter(u -> !(u.getTxHash().equals(TX_WALLET) && u.getOutputIndex() == 0))
+                .toList());
+        universe.add(LoanFixtures.adaUtxo(TX_WALLET, 0, LoanFixtures.botAddress(), walletLovelace));
+        universe.addAll(extra);
+        return universe;
+    }
+
+    private static LiquidatePayInAdvanceTransactionBuilder.Request thinWalletRequest(Fixture fixture,
+                                                                                     long lovelace) {
+        var r = fixture.request();
+        return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
+                r.bondUtxo(),
+                LoanFixtures.adaUtxo(TX_WALLET, 0, LoanFixtures.botAddress(), lovelace),
+                r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.validFromMillis(), r.validFromSlot(),
+                r.validToSlot(), r.changeAddress(), r.referenceScripts());
+    }
+
+    /**
+     * Defect (b), and the positive half of (a). The wallet utxo cannot cover the 28-ada principal, so
+     * balancing MUST add an input — which is the only way to reach either defect. The build has to
+     * succeed, take the ordinary utxo, and leave the published reference script alone.
+     * <p>
+     * Remove {@code LayoutProbeEvaluator} from {@code complete} and this fails with "Transaction
+     * evaluator is not set", thrown from the probe. That is the failure Giovanni's first funded
+     * attempt would have hit.
+     */
+    @Test
+    void aBuildThatNeedsABalancingInputSucceedsAndSpendsAnOrdinaryUtxo() {
+        Fixture fixture = fixture();
+        String ordinaryTx = "aa".repeat(32);
+        Utxo ordinary = LoanFixtures.adaUtxo(ordinaryTx, 0, LoanFixtures.botAddress(), 100_000_000L);
+        List<Utxo> universe = universeWithThinWallet(fixture, 2_000_000L,
+                List.of(publishedScriptUtxo(100_000_000L), ordinary));
+
+        Transaction tx = new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
+                offlineEvaluator(universe))
+                .build(thinWalletRequest(fixture, 2_000_000L));
+
+        List<String> inputs = tx.getBody().getInputs().stream()
+                .map(in -> in.getTransactionId() + "#" + in.getIndex())
+                .toList();
+        assertTrue(inputs.contains(ordinaryTx + "#0"),
+                "a balancing input MUST have been added, or neither defect is exercised: " + inputs);
+        assertFalse(inputs.contains(
+                        "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0"),
+                "the published reference script must never be spent: " + inputs);
+
+        // COLLATERAL is selected by a DIFFERENT mechanism — QuickTxBuilder.buildCollateralOutput
+        // constructs its OWN DefaultUtxoSelectionStrategyImpl (:507) instead of reading the one on
+        // the context — so neither guard above can reach it. Collateral is consumed on a phase-2
+        // failure, which makes it the more dangerous of the two paths.
+        List<String> collateral = tx.getBody().getCollateral() == null ? List.<String>of()
+                : tx.getBody().getCollateral().stream()
+                        .map(in -> in.getTransactionId() + "#" + in.getIndex())
+                        .toList();
+        assertFalse(collateral.contains(
+                        "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0"),
+                "the published reference script must never be pledged as COLLATERAL either — a "
+                        + "phase-2 failure would consume it: " + collateral);
+    }
+
+    /**
+     * The deterministic half of (a). The published reference script is the only other ada at the
+     * address and would comfortably cover the shortfall. Failing the build is the correct answer:
+     * refusing to liquidate is recoverable, eating the reference script is not.
+     */
+    @Test
+    void aBuildWillNotFundItselfFromThePublishedReferenceScript() {
+        Fixture fixture = fixture();
+        List<Utxo> universe = universeWithThinWallet(fixture, 2_000_000L,
+                List.of(publishedScriptUtxo(100_000_000L)));
+        var builder = new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
+                offlineEvaluator(universe));
+
+        var e = assertThrows(IllegalStateException.class,
+                () -> builder.build(thinWalletRequest(fixture, 2_000_000L)));
+
+        String chain = LiquidationExecutor.causeChain(e);
+        assertTrue(chain.contains("Not enough funds"),
+                "must fail for want of SPENDABLE funds, not by consuming the reference script "
+                        + "and not for want of an evaluator: " + chain);
+    }
+
     private record Fixture(Loan loan, Utxo loanUtxo, LenderBond bond, Utxo bondUtxo, OracleEntry oracle,
                            LiquidatePayInAdvanceTransactionBuilder.Request request) {
     }
