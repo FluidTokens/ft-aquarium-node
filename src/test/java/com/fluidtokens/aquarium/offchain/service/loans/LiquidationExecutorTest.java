@@ -6,6 +6,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
@@ -45,6 +46,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -182,14 +186,29 @@ class LiquidationExecutorTest {
 
         private int loanResolutions;
 
+        /**
+         * Thrown by the FIRST loan resolution, which {@code consider()} performs before it enters
+         * either build {@code try} — so it leaves {@code consider()} entirely and can only be caught
+         * by the cycle loop's outer net. Null means the resolver behaves.
+         */
+        private final RuntimeException firstResolutionThrows;
+
         FakeResolver(Map<String, Utxo> unspent) {
+            this(unspent, null);
+        }
+
+        FakeResolver(Map<String, Utxo> unspent, RuntimeException firstResolutionThrows) {
             super(null, null, null);
             this.unspent = unspent;
+            this.firstResolutionThrows = firstResolutionThrows;
         }
 
         @Override
         public Optional<Utxo> resolveLoanUtxo(Loan loan) {
             loanResolutions++;
+            if (firstResolutionThrows != null) {
+                throw firstResolutionThrows;
+            }
             return Optional.ofNullable(unspent.get(loan.utxoRef()));
         }
 
@@ -446,6 +465,36 @@ class LiquidationExecutorTest {
                                  CountingOracleProvider oracles,
                                  boolean syncing,
                                  boolean honestExUnits) {
+        return wiring(configuration, scanned, inUniverse, stillUnspent, walletUtxos, oracles, syncing,
+                honestExUnits, LoanFixtures.protocolParams(), null, null);
+    }
+
+    /**
+     * As above, with the two seams the failure-surfacing tests drive.
+     *
+     * @param builderParams  the {@link ProtocolParamsSupplier} handed to the two transaction builders
+     *                       — <em>not</em> to the executor, so a throwing one fails the BUILD and
+     *                       nothing else. This is the branch comment's own example ("a Blockfrost
+     *                       timeout fetching protocol params, say") made executable
+     * @param resolverThrows thrown by the first loan resolution, which happens before either build
+     *                       {@code try} and therefore reaches only the cycle loop's outer net
+     * @param plainBuilder   overrides the plain {@link LiquidateTransactionBuilder}. Needed because
+     *                       that builder converts <em>everything</em> its own {@code context.build()}
+     *                       can throw into a named {@code RefusedException} — so no fault injected
+     *                       through its suppliers can reach the executor's machinery-failure catch,
+     *                       which is the site under test
+     */
+    private static Wiring wiring(AppConfig.LiquidationConfiguration configuration,
+                                 List<LiquidationAssessment> scanned,
+                                 List<Scenario> inUniverse,
+                                 Map<String, Utxo> stillUnspent,
+                                 List<Utxo> walletUtxos,
+                                 CountingOracleProvider oracles,
+                                 boolean syncing,
+                                 boolean honestExUnits,
+                                 ProtocolParamsSupplier builderParams,
+                                 RuntimeException resolverThrows,
+                                 LiquidateTransactionBuilder plainBuilder) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
         universe.addAll(walletUtxos);
         for (Scenario scenario : inUniverse) {
@@ -454,21 +503,22 @@ class LiquidationExecutorTest {
         }
         Map<String, Utxo> unspent = new LinkedHashMap<>(stillUnspent);
 
-        LiquidateTransactionBuilder builder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
-                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
-                LoanFixtures.protocolParams(), honestExUnits ? realExUnitsEvaluator(universe) : null);
+        LiquidateTransactionBuilder builder = plainBuilder != null ? plainBuilder
+                : new LiquidateTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                        builderParams, honestExUnits ? realExUnitsEvaluator(universe) : null);
 
         BlockEventListener blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(syncing);
 
         FakeScanner scanner = new FakeScanner(scanned);
-        FakeResolver resolver = new FakeResolver(unspent);
+        FakeResolver resolver = new FakeResolver(unspent, resolverThrows);
         LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
 
         PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
                 LoanFixtures.registry(), LoanFixtures.converters(), configuration,
                 new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
-                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+                        LoanFixtures.utxoSupplier(universe), builderParams));
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder,
@@ -491,6 +541,25 @@ class LiquidationExecutorTest {
             }
         };
     }
+
+    /**
+     * A {@link ProtocolParamsSupplier} that fails the way a real one does: a transport fault wrapped
+     * by the client that hit it. <b>Wrapped deliberately.</b> A cause-less fixture makes every
+     * "surfaces the real cause" assertion vacuous, because {@code causeChain(e)} is then merely a
+     * substring of {@code e.toString()} and the assertions pass under the very {@code toString()} the
+     * fix exists to replace — the audit finding of 2026-08-21, first on the T-037 submit sites and
+     * then again on these build sites. The root message below is what discriminates: no
+     * {@code toString()} of any wrapper in the chain ever contains it.
+     */
+    private static ProtocolParamsSupplier throwingParams() {
+        return () -> {
+            throw new IllegalStateException("cannot fetch protocol parameters",
+                    new java.net.SocketTimeoutException(BLOCKFROST_TIMEOUT));
+        };
+    }
+
+    /** The root-cause message {@code throwingParams()} buries one level down. */
+    private static final String BLOCKFROST_TIMEOUT = "connect timed out";
 
     /**
      * The falsifiable form of "shadow mode cannot submit". Every wiring in this class gets this
@@ -700,6 +769,18 @@ class LiquidationExecutorTest {
      * mode and the exploding submitter, exactly like every other wiring in this class.
      */
     private static Wiring convertWiring() {
+        return convertWiring(LoanFixtures.protocolParams());
+    }
+
+    /**
+     * As above, with the {@link ProtocolParamsSupplier} the pay-in-advance builder is handed made
+     * explicit. A throwing one fails <em>inside</em> that builder's own {@code try}, so the exception
+     * the executor's convert catch receives is the genuine production wrapper
+     * {@code IllegalStateException("cannot build the pay-in-advance transaction", cause)} raised at
+     * {@code LiquidatePayInAdvanceTransactionBuilder:502} — earned by the real builder, not supplied
+     * by the fixture.
+     */
+    private static Wiring convertWiring(ProtocolParamsSupplier payInAdvanceParams) {
         AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
 
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
@@ -728,7 +809,7 @@ class LiquidationExecutorTest {
         PayInAdvanceLiquidationRouter router = new PayInAdvanceLiquidationRouter(
                 LoanFixtures.registry(), LoanFixtures.converters(), configuration,
                 new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
-                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+                        LoanFixtures.utxoSupplier(universe), payInAdvanceParams));
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT, scanner, resolver, builder,
@@ -1297,6 +1378,12 @@ class LiquidationExecutorTest {
         assertEquals(LiquidationDecision.Outcome.REFUSED, first.outcome());
         assertEquals("NullPointerException", first.reason(),
                 "a thrown failure is recorded under the exception, not under a Refusal name");
+        // This fixture's NPE has NO cause, so nothing here can tell causeChain(e) from e.toString():
+        // one is a substring of the other. The simple-vs-qualified name is the only discrimination
+        // available at this fixture, and the load-bearing proof for this site is the wrapped-cause
+        // test below. Leaving this comment off is how the same hole was dug twice.
+        assertTrue(first.detail().startsWith("NullPointerException"),
+                "causeChain uses the SIMPLE name; e.toString() qualifies it: " + first.detail());
         assertEquals(1, wiring.executor().quarantinedCount());
         assertEquals(Set.of(TX_LOAN + "#0"), wiring.executor().quarantinedRefs());
 
@@ -1494,6 +1581,10 @@ class LiquidationExecutorTest {
                 "a build-failure refusal must carry a detail — the old e.getMessage() was null here");
         assertTrue(decision.detail().contains("NullPointerException"),
                 "the cause chain surfaces the real fault: " + decision.detail());
+        // Cause-less fixture — see the plain path's twin: this assertion discriminates only on the
+        // simple-vs-qualified name, and the wrapped-cause test below is what really defends this site.
+        assertTrue(decision.detail().startsWith("NullPointerException"),
+                "causeChain uses the SIMPLE name; e.toString() qualifies it: " + decision.detail());
     }
 
     // ======================================================================================
@@ -1615,11 +1706,188 @@ class LiquidationExecutorTest {
             assertTrue(event.getFormattedMessage().contains("NullPointerException"),
                     "must surface the real cause, not just a generic message: "
                             + event.getFormattedMessage());
+            // Cause-less fixture: this pair discriminates only on the simple-vs-qualified name. The
+            // wrapped-cause test below is what proves this site actually walks the chain.
+            assertFalse(event.getFormattedMessage().contains("java.lang.NullPointerException"),
+                    "causeChain uses the SIMPLE name; e.toString() qualifies it: "
+                            + event.getFormattedMessage());
             assertNotNull(event.getThrowableProxy(),
                     "the exception itself must be attached for the stack trace, not just the message");
         } finally {
             logger.detachAppender(appender);
         }
+    }
+
+    // ======================================================================================
+    // the vacuity fix: these three sites must surface a WRAPPED cause, not just toString()
+    //
+    // 943960d (both build paths) and d4b2192 (the outer net) each replaced e.toString()/e.getMessage()
+    // with causeChain(e), but every test defending them seeded a CAUSE-LESS exception. For those,
+    // causeChain(e) is a substring of e.toString(), so re-applying the exact mutant the fixes exist to
+    // kill — causeChain(e) -> e.toString() at all three sites — left the whole suite GREEN. Proven by
+    // running it, 2026-08-24: 53 tests, 0 failures, mutant survived. The cause-chain half of all three
+    // fixes was undefended decoration, exactly as on the T-037 submit sites before 9539fb3.
+    //
+    // Each test below wraps a real fault and asserts on the ROOT cause's message, which no wrapper's
+    // toString() ever contains. That, not a green suite, is what makes these tests load-bearing.
+    // ======================================================================================
+
+    /**
+     * The convert build path. This is Giovanni's own failure shape and the reason 943960d exists: the
+     * refusal read "cannot build the pay-in-advance transaction" and the real cause was discarded.
+     * <p>
+     * Nothing here is mocked. The pay-in-advance builder is handed a protocol-params supplier that
+     * throws, which fails <em>inside</em> that builder's own {@code try}, so the wrapper the executor
+     * catches — {@code IllegalStateException("cannot build the pay-in-advance transaction", cause)} —
+     * is raised by production code at {@code LiquidatePayInAdvanceTransactionBuilder:502}. The fixture
+     * supplies the fault; the builder earns the wrapping.
+     */
+    @Test
+    void aConvertBuildFailureSurfacesTheRootCauseBehindTheProductionWrapper() {
+        Wiring wiring = convertWiring(throwingParams());
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            // F855.NOW, not NOW: the frozen fixture's oracle feed is only valid around its own
+            // instant, and at any other one the numbers this builder derives are not the f855 ones.
+            wiring.executor().cycle(F855.NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertNull(decision.txHash(), "the build threw, so nothing was routed");
+        assertEquals(1, wiring.executor().quarantinedCount(),
+                "a genuine build failure quarantines — unchanged by the surfacing fix");
+
+        // The production wrapper really is in the chain: this is the string that used to be the WHOLE
+        // detail, and keeping it is what makes the next assertion a statement about walking the chain
+        // rather than about having replaced one message with another.
+        assertTrue(decision.detail().contains("cannot build the pay-in-advance transaction"),
+                "the wrapper is kept: " + decision.detail());
+        // THE DISCRIMINATOR. toString() on that wrapper stops at its own message; only a walked chain
+        // reaches this. Revert the site to e.toString() and this line is what fails.
+        assertTrue(decision.detail().contains(BLOCKFROST_TIMEOUT),
+                "the detail must carry the ROOT cause, not just the wrapper: " + decision.detail());
+        assertEquals("SocketTimeoutException", decision.reason(),
+                "the reason names the ROOT cause, never the IllegalStateException wrapper");
+
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .toList();
+        assertEquals(1, errors.size(), "expected exactly one ERROR event: " + appender.list);
+        ILoggingEvent event = errors.getFirst();
+        assertTrue(event.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
+                "the log must surface the ROOT cause too, not just toString() of the wrapper: "
+                        + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(),
+                "the exception itself must be attached for the stack trace, not just the message");
+    }
+
+    /**
+     * The plain build path. Its branch comment names this exact failure — "a Blockfrost timeout
+     * fetching protocol params, say" — so the fixture is that sentence made executable, with the
+     * timeout wrapped the way a transport client wraps one.
+     */
+    @Test
+    void aPlainBuildFailureSurfacesTheRootCauseNotJustTheWrapper() {
+        // The wrapper shape a transport client really produces. It has to be stubbed rather than
+        // provoked: the plain builder turns everything its own context.build() can throw into a named
+        // RefusedException — a DIFFERENT executor branch, which is why a throwing params supplier
+        // lands as TRANSACTION_NOT_BUILDABLE and never reaches the catch under test here. The convert
+        // sibling above is the one that proves production earns its wrapper; this test isolates the
+        // executor's catch, which is all that is in question at this site.
+        RuntimeException boom = new IllegalStateException("cannot fetch protocol parameters",
+                new java.net.SocketTimeoutException(BLOCKFROST_TIMEOUT));
+        LiquidateTransactionBuilder brokenBuilder = mock(LiquidateTransactionBuilder.class);
+        when(brokenBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenThrow(boom);
+
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, brokenBuilder);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertEquals(1, wiring.executor().quarantinedCount(),
+                "a machinery failure quarantines — unchanged by the surfacing fix");
+
+        // THE DISCRIMINATOR, as above: unreachable from toString() on the outermost exception.
+        assertTrue(decision.detail().contains(BLOCKFROST_TIMEOUT),
+                "the detail must carry the ROOT cause, not just the wrapper: " + decision.detail());
+        assertEquals("SocketTimeoutException", decision.reason(),
+                "the reason names the ROOT cause, not whatever wrapped it");
+
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .toList();
+        assertEquals(1, errors.size(), "expected exactly one ERROR event: " + appender.list);
+        ILoggingEvent event = errors.getFirst();
+        assertTrue(event.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
+                "the log must surface the ROOT cause too: " + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+    }
+
+    /**
+     * The outer net (d4b2192). Its sibling test drives a cause-less NPE, which cannot tell
+     * {@code causeChain(e)} from {@code e.toString()}; this one drives a wrapped fault through the
+     * same net. The seam is the first loan resolution, which {@code consider()} performs before it
+     * enters either build {@code try} — so this can only be the outer net, and the zero-decisions
+     * assertion below is what proves that.
+     * <p>
+     * The net records no decision at all, so the log line is the only observability this failure has.
+     */
+    @Test
+    void theOuterNetSurfacesTheRootCauseBehindAWrapper() {
+        RuntimeException boom = new IllegalStateException("the local index is not readable",
+                new java.io.IOException("index segment 000042 is corrupt"));
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                LoanFixtures.protocolParams(), boom, null);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertEquals(0, wiring.log().size(),
+                "the outer net records NO decision — the log is the only observability, which is "
+                        + "exactly why its content is the thing under test");
+
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .toList();
+        assertEquals(1, errors.size(), "expected exactly one ERROR event: " + appender.list);
+        ILoggingEvent event = errors.getFirst();
+        assertTrue(event.getFormattedMessage().contains("could not consider bond"),
+                "must name the operation: " + event.getFormattedMessage());
+        assertTrue(event.getFormattedMessage().contains("the local index is not readable"),
+                "the wrapper is kept: " + event.getFormattedMessage());
+        // THE DISCRIMINATOR: toString() on the wrapper stops one link short of this.
+        assertTrue(event.getFormattedMessage().contains("index segment 000042 is corrupt"),
+                "must surface the ROOT cause, not just toString() of the wrapper: "
+                        + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
     }
 
     // ======================================================================================
