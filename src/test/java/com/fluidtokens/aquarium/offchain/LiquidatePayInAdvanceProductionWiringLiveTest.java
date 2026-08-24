@@ -290,9 +290,9 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
 
         long now = System.currentTimeMillis();
         var request = new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond,
-                bondUtxo, walletUtxo, configUtxo, lmConfigUtxo, oracleEntry, now,
+                bondUtxo, walletUtxo, configUtxo, lmConfigUtxo, oracleEntry, now, now + 120_000L,
                 slotOf(now - 60_000L), slotOf(now + 120_000L), bot.baseAddress(),
-                referenceScripts());
+                referenceScripts(), 30_000L);
 
         // THE POINT OF THE TEST: the production constructor. Backend-supplied script supplier,
         // Blockfrost evaluator, real ledger fee.

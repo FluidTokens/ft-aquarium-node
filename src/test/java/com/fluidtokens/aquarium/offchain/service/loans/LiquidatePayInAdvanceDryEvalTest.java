@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -178,6 +179,9 @@ class LiquidatePayInAdvanceDryEvalTest {
             LoanFixtures.botAddress(), 60_000_000L);
 
     private static final int MAX_TX_SIZE = 16_384;
+
+    /** The operator default, {@code loans.liquidation.oracle-window-margin-seconds} = 30. */
+    private static final long ORACLE_WINDOW_MARGIN_MILLIS = 30_000L;
 
     /**
      * The preview {@code loan-claim-action} reference-script coordinate (the one committed in
@@ -366,10 +370,12 @@ class LiquidatePayInAdvanceDryEvalTest {
         LiquidatePayInAdvanceTransactionBuilder.Request refRequest =
                 new LiquidatePayInAdvanceTransactionBuilder.Request(base.loan(), base.loanUtxo(),
                         base.bond(), base.bondUtxo(), base.walletUtxo(), base.configUtxo(),
-                        base.lmConfigUtxo(), base.oracle(), base.validFromMillis(), base.validFromSlot(),
+                        base.lmConfigUtxo(), base.oracle(), base.validFromMillis(),
+                        base.validToMillis(), base.validFromSlot(),
                         base.validToSlot(), base.changeAddress(),
                         new LiquidateTransactionBuilder.ReferenceScripts(
-                                null, null, null, null, LOAN_CLAIM_ACTION_REF, null, null));
+                                null, null, null, null, LOAN_CLAIM_ACTION_REF, null, null),
+                        base.oracleWindowMarginMillis());
 
         // The chain must resolve the referenced script: publish it at the coord, min-ada carrier only —
         // mirrors the oracle ref-script UTxO above.
@@ -654,8 +660,9 @@ class LiquidatePayInAdvanceDryEvalTest {
         return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
                 r.bondUtxo(),
                 LoanFixtures.adaUtxo(TX_WALLET, 0, LoanFixtures.botAddress(), lovelace),
-                r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.validFromMillis(), r.validFromSlot(),
-                r.validToSlot(), r.changeAddress(), r.referenceScripts());
+                r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.validFromMillis(), r.validToMillis(),
+                r.validFromSlot(), r.validToSlot(), r.changeAddress(), r.referenceScripts(),
+                r.oracleWindowMarginMillis());
     }
 
     /**
@@ -726,6 +733,94 @@ class LiquidatePayInAdvanceDryEvalTest {
                         + "and not for want of an evaluator: " + chain);
     }
 
+
+    // ======================================================================================
+    // V3 — the oracle feed must cover the WHOLE transaction window
+    //
+    // THIS IS THE BOUNDARY THE SUITE NEVER EXERCISED, and that omission cost a full day of live
+    // debugging on 2026-08-24. Every fixture here pins FEED_VALID_FROM = NOW - 35_555 against a
+    // 600_000 ms window, i.e. ~564 s of feed still ahead — a feed in the best moment of its life. The
+    // convert path had no window guard at all, so it happily built transactions in the TAIL of a
+    // feed's life; the deployed lm_liquidate_and_pay_in_advance_action passes validFrom AND validTo
+    // into retrieve_oracle_data, which returns None when the feed does not cover that window, and the
+    // `expect Some(..)` then ABORTS. An aborting expect fails with an EMPTY trace, which Blockfrost
+    // reports as {"ScriptFailures":{}} naming nothing at all.
+    //
+    // Measured live: feed had 25.8 s left, the tx window ran 94.2 s past the feed's end.
+    // Preview's Charli3 feeds are CONTIGUOUS 600 s windows (one ends 1787576664408, the next starts
+    // 1787576664367), so there is never a fresher feed to pick — refusing and rebuilding later is the
+    // only correct answer, and it is what the plain path has always done.
+    // ======================================================================================
+
+    /** The same fixture with the feed's remaining window dialled to an arbitrary value. */
+    private static LiquidatePayInAdvanceTransactionBuilder.Request withFeedEndingAt(Fixture fixture,
+                                                                                    long feedValidTo) {
+        var r = fixture.request();
+        OracleEntry narrowed = LoanFixtures.charli3(COLLATERAL, ORACLE_NFT, ORACLE_SCRIPT_HASH,
+                OraclePriceFeed.priceDataCharlie(COLLATERAL, PRICE, PRICE_DENOMINATOR,
+                        FEED_VALID_FROM, feedValidTo),
+                ORACLE_REF_INPUT, ORACLE_REF_SCRIPT, C3_PROVIDER);
+        return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
+                r.bondUtxo(), r.walletUtxo(), r.configUtxo(), r.lmConfigUtxo(), narrowed,
+                r.validFromMillis(), r.validToMillis(), r.validFromSlot(), r.validToSlot(),
+                r.changeAddress(), r.referenceScripts(), r.oracleWindowMarginMillis());
+    }
+
+    /**
+     * THE REGRESSION TEST. The feed expires INSIDE the transaction's validity window — the live shape
+     * on 2026-08-24. The builder must refuse rather than hand the chain a transaction whose validator
+     * will abort.
+     * <p>
+     * Delete the {@code usableOver} check and this test fails: the build succeeds and produces exactly
+     * the transaction that fails on chain with an empty {@code ScriptFailures}.
+     */
+    @Test
+    void aFeedThatExpiresInsideTheTxWindowIsRefusedRatherThanBuilt() {
+        Fixture fixture = fixture();
+        long txValidTo = fixture.request().validToMillis();
+        // Feed dies one second before the transaction's own upper bound.
+        var request = withFeedEndingAt(fixture, txValidTo - 1_000L);
+
+        var e = assertThrows(RuntimeException.class, () -> builder(fixture).build(request));
+
+        assertTrue(e.getMessage() != null && e.getMessage().contains("does not cover tx window"),
+                "must refuse for the WINDOW, naming it, not fail somewhere downstream: " + e);
+    }
+
+    /**
+     * The margin half: the feed covers the window but leaves less than the operator's margin. Same
+     * refusal family, and the reason a bot should not build in the last seconds of a feed even when
+     * the arithmetic technically fits.
+     */
+    @Test
+    void aFeedWithLessThanTheMarginLeftAfterValidToIsRefused() {
+        Fixture fixture = fixture();
+        long txValidTo = fixture.request().validToMillis();
+        // Covers the window, but only by half the required margin.
+        var request = withFeedEndingAt(fixture, txValidTo + ORACLE_WINDOW_MARGIN_MILLIS / 2);
+
+        var e = assertThrows(RuntimeException.class, () -> builder(fixture).build(request));
+
+        assertTrue(e.getMessage() != null && e.getMessage().contains("of oracle feed window left"),
+                "must refuse for the MARGIN, naming it: " + e);
+    }
+
+    /**
+     * The other direction, and the reason this guard is safe to add: a feed with the margin intact
+     * still builds. Without this, a guard that refused everything would look like a fix.
+     */
+    @Test
+    void aFeedWithTheMarginIntactStillBuilds() {
+        Fixture fixture = fixture();
+        long txValidTo = fixture.request().validToMillis();
+        var request = withFeedEndingAt(fixture,
+                txValidTo + ORACLE_WINDOW_MARGIN_MILLIS + 1_000L);
+
+        Transaction tx = builder(fixture).build(request);
+
+        assertNotNull(tx, "a feed with the margin still ahead of validTo must build");
+    }
+
     private record Fixture(Loan loan, Utxo loanUtxo, LenderBond bond, Utxo bondUtxo, OracleEntry oracle,
                            LiquidatePayInAdvanceTransactionBuilder.Request request) {
     }
@@ -760,12 +855,14 @@ class LiquidatePayInAdvanceDryEvalTest {
 
         long[] slots = validitySlots();
         long validFromMillis = millisOf(converters().slot().slotToTime(slots[0]));
+        long validToMillis = millisOf(converters().slot().slotToTime(slots[1]));
         LiquidatePayInAdvanceTransactionBuilder.Request request =
                 new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond, bondUtxo,
                         WALLET_UTXO, CONFIG_UTXO, LM_CONFIG_UTXO, oracle, validFromMillis,
-                        slots[0], slots[1], LoanFixtures.botAddress(),
+                        validToMillis, slots[0], slots[1], LoanFixtures.botAddress(),
                         // All-inline shape: every validator travels in the witness set.
-                        LiquidateTransactionBuilder.ReferenceScripts.none());
+                        LiquidateTransactionBuilder.ReferenceScripts.none(),
+                        ORACLE_WINDOW_MARGIN_MILLIS);
         return new Fixture(loan, loanUtxo, bond, bondUtxo, oracle, request);
     }
 

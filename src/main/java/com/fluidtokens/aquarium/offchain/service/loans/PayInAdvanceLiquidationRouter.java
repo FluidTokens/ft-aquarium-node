@@ -123,11 +123,15 @@ public class PayInAdvanceLiquidationRouter {
         // at, so the on-chain equality holds.
         long[] slots = validitySlots(validFromMillis, validToMillis);
         long slotFromMillis = millisOf(converters.slot().slotToTime(slots[0]));
+        // The upper bound the same way: the builder's V3 oracle-window check must be made against the
+        // window the LEDGER will see, which is the slot-derived pair, not the caller's raw millis.
+        long slotToMillis = millisOf(converters.slot().slotToTime(slots[1]));
 
         LiquidatePayInAdvanceTransactionBuilder.Request request =
                 new LiquidatePayInAdvanceTransactionBuilder.Request(
                         assessment.loan(), loanUtxo, assessment.bond(), bondUtxo, walletUtxo,
-                        configUtxo, lmConfigUtxo, collateralOracle, slotFromMillis, slots[0], slots[1],
+                        configUtxo, lmConfigUtxo, collateralOracle, slotFromMillis, slotToMillis,
+                        slots[0], slots[1],
                         // The bot keeps the collateral and pays change back to itself: the fee/collateral
                         // wallet UTxO is one of its own, so its address is the change address — the same
                         // identity account.baseAddress() carries on the plain path.
@@ -136,7 +140,11 @@ public class PayInAdvanceLiquidationRouter {
                         // (LiquidationExecutor.java:479-485): an unset coordinate leaves that validator
                         // inline; preview sets only loan-claim-action, which brings the convert
                         // liquidation under maxTxSize.
-                        configuration.getReferenceScripts());
+                        configuration.getReferenceScripts(),
+                        // Same operator setting the plain path uses, threaded the same way. Without it
+                        // this path builds transactions the oracle feed cannot cover and the validator
+                        // aborts with an empty trace — see the builder's V3 comment.
+                        configuration.getOracleWindowMarginSeconds() * 1000L);
         return builder.build(request);
     }
 

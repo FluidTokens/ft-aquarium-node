@@ -254,10 +254,23 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                           Utxo lmConfigUtxo,
                           OracleEntry oracle,
                           long validFromMillis,
+                          /**
+                           * The validity upper bound in milliseconds, derived from {@code validToSlot}
+                           * by the caller — that slot is what the ledger converts back into the
+                           * {@code validTo} the validator reads out of {@code self.validity_range},
+                           * so the window checked here is the window the chain will check.
+                           */
+                          long validToMillis,
                           long validFromSlot,
                           long validToSlot,
                           String changeAddress,
-                          LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
+                          LiquidateTransactionBuilder.ReferenceScripts referenceScripts,
+                          /**
+                           * How much of the oracle feed's window must still be unused AFTER this
+                           * transaction's {@code validTo}. Same meaning and same source as the plain
+                           * path's field of this name — {@code loans.liquidation.oracle-window-margin-seconds}.
+                           */
+                          long oracleWindowMarginMillis) {
     }
 
     /** The five numbers the redeemer and the outputs rest on, all computed through {@link LoanFinance}. */
@@ -395,6 +408,35 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         if (!request.bond().datum().shouldLiquidationConvertToPrincipal()) {
             throw new IllegalStateException(
                     "lm_liquidate_and_pay_in_advance_action requires shouldLiquidationConvertToPrincipal == True");
+        }
+        // V3 — the oracle feed must cover this transaction's WHOLE validity window, with the
+        // operator's margin still unused after it. This mirrors LiquidateTransactionBuilder's V3
+        // (~:1136-1148) deliberately: the plain path has had this check since the beginning and this
+        // path never did, and that divergence IS the defect. Do not invent a third shape here.
+        //
+        // Why it matters, measured against live preview 2026-08-24: the deployed
+        // lm_liquidate_and_pay_in_advance_action reads validFrom/validTo out of
+        // self.validity_range and passes BOTH into retrieve_oracle_data, which returns None unless
+        // the feed covers that window. `expect Some(..)` on a None ABORTS the validator — and an
+        // aborting expect produces a script failure with an EMPTY trace, which Blockfrost reports as
+        // `{"ScriptFailures":{}}` with nothing named. Every convert liquidation built in the tail of
+        // a feed's life failed exactly that way, and the empty report is why it took a day to find.
+        //
+        // Preview's Charli3 feeds are CONTIGUOUS 600s windows, not overlapping (measured: one feed's
+        // validTo 1787576664408 against the next one's validFrom 1787576664367), so there is never a
+        // fresher feed to pick instead. Refusing and rebuilding on a later cycle is the only correct
+        // response, and it is exactly what the plain path already does.
+        long feedRemainingAfterValidTo = request.oracle().feed().validTo() - request.validToMillis();
+        if (!request.oracle().feed().usableOver(request.validFromMillis(), request.validToMillis())) {
+            throw new PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException(
+                    "oracle feed window [%d,%d] does not cover tx window [%d,%d]".formatted(
+                            request.oracle().feed().validFrom(), request.oracle().feed().validTo(),
+                            request.validFromMillis(), request.validToMillis()));
+        }
+        if (feedRemainingAfterValidTo < request.oracleWindowMarginMillis()) {
+            throw new PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException(
+                    "only %dms of oracle feed window left after validTo, %dms required".formatted(
+                            feedRemainingAfterValidTo, request.oracleWindowMarginMillis()));
         }
 
         List<TransactionInput> refInputs = referenceInputs(request);
