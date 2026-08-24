@@ -473,7 +473,13 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                     // placeholder ex-units — a phase-2 failure waiting to be submitted. Without one, the
                     // flag stays true because there is nothing to evaluate with and the offline rig
                     // prices the transaction itself.
-                    .ignoreScriptCostEvaluationError(evaluator == null);
+                    .ignoreScriptCostEvaluationError(evaluator == null)
+                    // The balancer must never reach for a UTxO carrying a published reference
+                    // script: on preview the loan_claim_action script sits at the bot's OWN
+                    // operational address, and cardano-client-lib's default selection has no
+                    // reference-script exclusion at all (verified against the pinned v0.7.2 source).
+                    // Spending it would refuse every later convert liquidation as TX_TOO_LARGE.
+                    .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier));
 
             if (backendService == null) {
                 // Offline: cardano-client-lib would otherwise walk every reference input looking for a

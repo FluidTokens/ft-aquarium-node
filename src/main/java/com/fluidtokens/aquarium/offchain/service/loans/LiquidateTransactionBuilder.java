@@ -1642,7 +1642,12 @@ public final class LiquidateTransactionBuilder {
                         // still carry placeholder ex-units, which is a phase-2 failure waiting to be
                         // submitted. Without one, the flag stays true because there is nothing to
                         // evaluate with and the offline rigs price the transaction themselves.
-                        .ignoreScriptCostEvaluationError(evaluator == null);
+                        .ignoreScriptCostEvaluationError(evaluator == null)
+                        // Same guard as the pay-in-advance builder: cardano-client-lib's default
+                        // coin selection has no reference-script exclusion, and the bot's published
+                        // scripts live at its own address. See ReferenceScriptSafeUtxoSelection.
+                        .withUtxoSelectionStrategy(
+                                ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier));
 
         if (backendService == null) {
             // Offline: cardano-client-lib would otherwise walk every reference input looking for a

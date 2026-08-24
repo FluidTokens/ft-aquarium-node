@@ -1119,10 +1119,42 @@ public class LiquidationExecutor {
                         && utxo.getDataHash() == null)
                 .findFirst();
         if (walletUtxo.isEmpty()) {
-            log.warn("no valid utxos found. please ensure wallet has at least one utxo which contains "
-                    + "ONLY ADA and carries no datum");
+            // Say WHAT was rejected and WHY, not just that nothing qualified. The 2026-08-24 shadow
+            // run cost a full diagnosis round to establish something this line would have stated
+            // outright: the only UTxO at the bot's address was the published loan_claim_action
+            // reference script. "No valid utxos" alone cannot tell an empty wallet apart from a
+            // wallet whose entire contents are ineligible, and those need opposite responses.
+            log.warn("no spendable wallet utxo at {} — {} candidate(s) all rejected: [{}]. The bot "
+                            + "needs at least one utxo holding ONLY ada, with no datum and no "
+                            + "reference script.",
+                    account.baseAddress(), walletUtxos.size(),
+                    walletUtxos.stream().map(LiquidationExecutor::whyNotSpendable)
+                            .collect(java.util.stream.Collectors.joining("; ")));
+        } else {
+            log.info("wallet utxo for this cycle: {}#{} ({} lovelace)",
+                    walletUtxo.get().getTxHash(), walletUtxo.get().getOutputIndex(),
+                    walletUtxo.get().getAmount().getFirst().getQuantity());
         }
         return walletUtxo;
+    }
+
+    /** Why one wallet candidate cannot be spent, for the operator-facing rejection list. */
+    private static String whyNotSpendable(Utxo utxo) {
+        List<String> reasons = new ArrayList<>();
+        if (utxo.getAmount().size() != 1) {
+            reasons.add("carries " + utxo.getAmount().size() + " assets, not ada alone");
+        }
+        if (utxo.getReferenceScriptHash() != null) {
+            reasons.add("carries reference script " + utxo.getReferenceScriptHash());
+        }
+        if (utxo.getInlineDatum() != null) {
+            reasons.add("carries an inline datum");
+        }
+        if (utxo.getDataHash() != null) {
+            reasons.add("carries a datum hash");
+        }
+        return utxo.getTxHash() + "#" + utxo.getOutputIndex()
+                + (reasons.isEmpty() ? " eligible" : " " + String.join(", ", reasons));
     }
 
     /**
