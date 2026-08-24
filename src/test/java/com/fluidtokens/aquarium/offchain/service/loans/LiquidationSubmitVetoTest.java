@@ -26,6 +26,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import org.junit.jupiter.api.Test;
+import org.cardanofoundation.conversions.CardanoConverters;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 
@@ -44,7 +45,11 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Answers.RETURNS_DEEP_STUBS;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.spy;
 
 /**
@@ -345,9 +350,17 @@ class LiquidationSubmitVetoTest {
     /** A supplier that cannot answer — the "protocol parameters cannot be fetched" case. */
     private static ProtocolParamsSupplier unfetchableProtocolParams() {
         return () -> {
-            throw new IllegalStateException("blockfrost timed out fetching protocol parameters");
+            // WRAPPED deliberately, the way a transport client wraps the fault it hit. A cause-less
+            // fixture cannot tell causeChain(e) from e.toString() — one is a substring of the other —
+            // which is exactly how the cause-surfacing assertions on three separate sites came to be
+            // vacuous (2026-08-21, 2026-08-24). PARAMS_ROOT_CAUSE below is the discriminator.
+            throw new IllegalStateException("blockfrost timed out fetching protocol parameters",
+                    new java.net.SocketTimeoutException(PARAMS_ROOT_CAUSE));
         };
     }
+
+    /** The root-cause message {@link #unfetchableProtocolParams()} buries one level down. */
+    private static final String PARAMS_ROOT_CAUSE = "connect timed out";
 
     /** Real parameters with the one field S5 reads removed. */
     private static ProtocolParamsSupplier protocolParamsWithoutMaxTxSize() {
@@ -548,6 +561,7 @@ class LiquidationSubmitVetoTest {
         private RuntimeException loanThrows;
         private RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         private Account account = ACCOUNT;
+        private CardanoConverters executorConverters = LoanFixtures.converters();
 
         Rig configuration(AppConfig.LiquidationConfiguration configuration) {
             this.configuration = configuration;
@@ -609,6 +623,16 @@ class LiquidationSubmitVetoTest {
         }
 
         /**
+         * T-040: overrides the converters handed to the EXECUTOR only — the builders keep their own
+         * real instance. Safe to replace wholesale because the executor uses {@code converters} in
+         * exactly one place, the S8 slot-to-time conversion this override exists to break.
+         */
+        Rig executorConverters(CardanoConverters executorConverters) {
+            this.executorConverters = executorConverters;
+            return this;
+        }
+
+        /**
          * How many cycles to drive against the same executor. Each subsequent cycle advances both
          * the cycle clock and the submit clock by one minute, which is what a real scheduler does
          * and what makes the quarantine's effect observable.
@@ -644,7 +668,7 @@ class LiquidationSubmitVetoTest {
                     new FakeResolver(unspent, loanAnswersBeforeItIsGone, bondAnswersBeforeItIsGone,
                             loanThrows),
                     builder, payInAdvanceRouter, LoanFixtures.registry(), log, provider(oracle),
-                    networkNamed(networkName), params, LoanFixtures.converters(), submitter);
+                    networkNamed(networkName), params, executorConverters, submitter);
             long[] elapsed = {0};
             executor.setSubmitClock(() -> submitTime + elapsed[0]);
 
@@ -1112,6 +1136,130 @@ class LiquidationSubmitVetoTest {
         LiquidationDecision threw = vetoed(unreadable, LiquidationExecutor.SubmitVeto.STALE_UTXO,
                 LiquidationDecision.Outcome.SUBMIT_VETOED);
         assertTrue(threw.detail().contains("threw"), threw.detail());
+    }
+
+
+    // ======================================================================================
+    // T-040 — the three catches that logged NOTHING
+    //
+    // S5's maxTxSize fetch, S8's slot-to-time conversion and S7's UTxO re-check each swallowed their
+    // exception into a veto detail with no log line at all, so an operator saw a refusal and had no
+    // way to find out why. Each test below drives a WRAPPED fault and asserts on the ROOT cause's
+    // message: a cause-less fixture would pass under the very e.toString() these fixes replace, which
+    // is how the same hole was dug on the build paths and the outer net.
+    // ======================================================================================
+
+    /** S5: the protocol-parameter fetch throws. The veto is unchanged; the ERROR line is new. */
+    @Test
+    void s5AnUnfetchableMaxTxSizeIsLoggedAtErrorWithTheRootCause() {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        Run run;
+        try {
+            run = new Rig().params(unfetchableProtocolParams()).run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = vetoed(run, LiquidationExecutor.SubmitVeto.TX_TOO_LARGE,
+                LiquidationDecision.Outcome.SUBMIT_VETOED);
+        assertEquals(0, run.submitter().submitted.size(), "nothing reached the wire");
+        assertTrue(decision.detail().contains("maxTxSize could not be fetched"),
+                "the veto detail is unchanged in shape: " + decision.detail());
+        // THE DISCRIMINATOR: toString() on the wrapper stops one link short of this.
+        assertTrue(decision.detail().contains(PARAMS_ROOT_CAUSE),
+                "the detail must carry the ROOT cause, not just the wrapper: " + decision.detail());
+
+        ILoggingEvent event = onlyError(appender);
+        assertTrue(event.getFormattedMessage().contains("maxTxSize"),
+                "must name the operation: " + event.getFormattedMessage());
+        assertTrue(event.getFormattedMessage().contains(PARAMS_ROOT_CAUSE),
+                "must surface the ROOT cause: " + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+    }
+
+    /** S7: the UTxO re-check throws. Still treated as "not shown unspent"; now it says why. */
+    @Test
+    void s7AThrowingUtxoRecheckIsLoggedAtErrorWithTheRootCause() {
+        RuntimeException boom = new IllegalStateException("the local index is not readable",
+                new java.io.IOException("index segment 000042 is corrupt"));
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        Run run;
+        try {
+            run = new Rig().loanRecheckThrows(boom).run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = vetoed(run, LiquidationExecutor.SubmitVeto.STALE_UTXO,
+                LiquidationDecision.Outcome.SUBMIT_VETOED);
+        assertEquals(0, run.submitter().submitted.size(), "nothing reached the wire");
+        assertTrue(decision.detail().contains("the utxo re-check threw"),
+                "the veto detail is unchanged in shape: " + decision.detail());
+        assertTrue(decision.detail().contains("index segment 000042 is corrupt"),
+                "the detail must carry the ROOT cause, not just the wrapper: " + decision.detail());
+
+        ILoggingEvent event = onlyError(appender);
+        assertTrue(event.getFormattedMessage().contains("utxo re-check"),
+                "must name the operation: " + event.getFormattedMessage());
+        assertTrue(event.getFormattedMessage().contains("index segment 000042 is corrupt"),
+                "must surface the ROOT cause: " + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+    }
+
+    /**
+     * S8: the slot-to-time conversion throws. Only the EXECUTOR's converters are replaced — the
+     * builders keep their real one, so the transaction under test is a genuinely built one and the
+     * failure is isolated to the single line the executor uses converters for.
+     */
+    @Test
+    void s8AnUnconvertibleSlotIsLoggedAtErrorWithTheRootCause() {
+        RuntimeException boom = new IllegalStateException("slot conversion failed",
+                new ArithmeticException("slot 133742000 predates the shelley era start"));
+        CardanoConverters broken = mock(CardanoConverters.class, RETURNS_DEEP_STUBS);
+        when(broken.slot().slotToTime(anyLong())).thenThrow(boom);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        Run run;
+        try {
+            run = new Rig().executorConverters(broken).run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = vetoed(run,
+                LiquidationExecutor.SubmitVeto.TRANSACTION_WINDOW_ELAPSED,
+                LiquidationDecision.Outcome.SUBMIT_VETOED);
+        assertEquals(0, run.submitter().submitted.size(), "nothing reached the wire");
+        assertTrue(decision.detail().contains("could not be converted to a time"),
+                "the veto detail is unchanged in shape: " + decision.detail());
+        assertTrue(decision.detail().contains("predates the shelley era start"),
+                "the detail must carry the ROOT cause, not just the wrapper: " + decision.detail());
+
+        ILoggingEvent event = onlyError(appender);
+        assertTrue(event.getFormattedMessage().contains("could not convert slot"),
+                "must name the operation: " + event.getFormattedMessage());
+        assertTrue(event.getFormattedMessage().contains("predates the shelley era start"),
+                "must surface the ROOT cause: " + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+    }
+
+    /** The single ERROR event these three sites must each produce — exactly one, never zero or two. */
+    private static ILoggingEvent onlyError(ListAppender<ILoggingEvent> appender) {
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .toList();
+        assertEquals(1, errors.size(), "expected exactly one ERROR event: " + appender.list);
+        return errors.getFirst();
     }
 
     // ======================================================================================

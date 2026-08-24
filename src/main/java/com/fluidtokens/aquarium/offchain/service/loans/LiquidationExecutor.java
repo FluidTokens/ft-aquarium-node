@@ -746,10 +746,16 @@ public class LiquidationExecutor {
         try {
             maxTxSize = protocolParamsSupplier.getProtocolParams().getMaxTxSize();
         } catch (Exception e) {
-            // Not knowing the limit is not evidence of being under it.
+            // Not knowing the limit is not evidence of being under it. The veto is unchanged; what
+            // changes (T-040) is that the operator can now find out WHY. This catch used to log
+            // NOTHING AT ALL and interpolate e.toString() into the veto detail — which stops at the
+            // outermost exception, so a transport timeout wrapped by its client showed as the wrapper
+            // and the real fault was gone. A veto an operator cannot explain is a veto they cannot act on.
+            log.error("could not fetch maxTxSize while vetting the liquidation of {}: {}",
+                    assessment.loan().utxoRef(), causeChain(e), e);
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, SubmitVeto.TX_TOO_LARGE,
                     "%s; maxTxSize could not be fetched (%s), so the %d-byte transaction cannot be "
-                            .formatted(detail, e, size) + "cleared for submission");
+                            .formatted(detail, causeChain(e), size) + "cleared for submission");
         }
         if (maxTxSize == null) {
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, SubmitVeto.TX_TOO_LARGE,
@@ -780,7 +786,8 @@ public class LiquidationExecutor {
         // S8 — the transaction's own validity interval. Last, so that where a feed exists S6 reports
         // the more specific reason; but reached on every candidate, including the ada/ada ones S6
         // has nothing to say about.
-        String elapsed = transactionWindowElapsed(transaction, submitClock.getAsLong());
+        String elapsed = transactionWindowElapsed(transaction, submitClock.getAsLong(),
+                assessment.loan().utxoRef());
         if (elapsed != null) {
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED,
                     SubmitVeto.TRANSACTION_WINDOW_ELAPSED, detail + "; " + elapsed);
@@ -800,7 +807,8 @@ public class LiquidationExecutor {
      *
      * @return null when the window is still open, otherwise why it is not
      */
-    private String transactionWindowElapsed(Transaction transaction, long submitTime) {
+    private String transactionWindowElapsed(Transaction transaction, long submitTime,
+                                            String loanUtxoRef) {
         Long ttlSlot = transaction.getBody().getTtl();
         if (ttlSlot == null || ttlSlot <= 0) {
             return "the built transaction carries no validity end, so it cannot be shown unexpired";
@@ -810,8 +818,12 @@ public class LiquidationExecutor {
             LocalDateTime endsAt = converters.slot().slotToTime(ttlSlot);
             validToMillis = endsAt.toInstant(ZoneOffset.UTC).toEpochMilli();
         } catch (Exception e) {
+            // T-040: logged nothing, and buried e.toString() in the veto detail. Same rule as the
+            // maxTxSize fetch above — the whole cause chain, at ERROR, with the throwable attached.
+            log.error("could not convert slot {} to a time while vetting the liquidation of {}: {}",
+                    ttlSlot, loanUtxoRef, causeChain(e), e);
             return "slot %d could not be converted to a time (%s), so the validity end is unknown"
-                    .formatted(ttlSlot, e);
+                    .formatted(ttlSlot, causeChain(e));
         }
         if (submitTime > validToMillis) {
             return "the transaction's validity interval ended at %d (slot %d), %dms before submit time"
@@ -883,7 +895,13 @@ public class LiquidationExecutor {
             }
             return null;
         } catch (Exception e) {
-            return "the utxo re-check threw (" + e + "), so neither utxo could be confirmed unspent";
+            // T-040: logged nothing, and buried e.toString() in the veto detail. A resolver that
+            // throws is still treated exactly like a spent UTxO — the veto is unchanged — but the
+            // operator now gets the whole cause chain at ERROR with the throwable attached.
+            log.error("the utxo re-check threw while vetting the liquidation of {}: {}",
+                    assessment.loan().utxoRef(), causeChain(e), e);
+            return "the utxo re-check threw (" + causeChain(e)
+                    + "), so neither utxo could be confirmed unspent";
         }
     }
 

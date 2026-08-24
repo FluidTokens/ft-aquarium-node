@@ -54,13 +54,36 @@ import java.util.Optional;
  * and the FluidTokens oracle accept under the real PlutusV3 machine, for <b>one</b> loan compounded
  * into <b>one</b> pool.
  *
+ * <h2>⚠ DO NOT PROMOTE THIS TO {@code src/main} AS IT STANDS — CCL TRAP 8 IS STILL IN IT</h2>
+ * {@link #complete} builds with {@code new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)}
+ * and {@code ignoreScriptCostEvaluationError(true)}. That third {@code null} is <b>not only</b> the
+ * {@code TransactionProcessor} — <b>the same argument becomes the {@code TransactionEvaluator}</b>, so
+ * the script-cost step is never run and every transaction this builds declares cardano-client-lib's
+ * <b>placeholder ex-units</b> (10000 mem / 10000-or-1000 steps) against real costs 2–5 orders of
+ * magnitude larger. Under-declared ex-units are not rejected at the mempool: the transaction lands and
+ * exhausts its budget on chain, <b>in phase two, collateral forfeit</b>.
+ * <p>
+ * This is exactly the defect that took down the production convert path on <b>2026-08-21</b> and was
+ * fixed for the sibling builder by {@code 5b439da} ({@code withTxEvaluator(...)} +
+ * {@code ignoreScriptCostEvaluationError(evaluator == null)}). It survives here only because this
+ * builder has <b>no production caller</b> — the dry-eval test supplies its own evaluator through the
+ * offline rig, which is why the tests are green and prove nothing about this.
+ * <p>
+ * <b>Corrective #2 (in force since 2026-08-21) applies directly: a test→{@code src/main} promotion
+ * REQUIRES a production-wiring test; byte-identity is NEVER the sole gate.</b> Promoting this file
+ * byte-identically — the way {@link LiquidatePayInAdvanceTransactionBuilder} was promoted — would
+ * reintroduce the same incident verbatim. Fix the evaluator first, then prove it through the
+ * Spring-wired shape. See {@code CLAUDE.md} "Gotchas" and {@code LiquidateTransactionBuilder}'s own
+ * javadoc, which documented this trap before either incident.
+ *
  * <h2>Structurally incapable of submitting</h2>
  * The {@link QuickTxBuilder} below is constructed with a <b>null</b> {@code TransactionProcessor} —
  * the only thing in cardano-client-lib that can put a transaction on a network — exactly as
  * {@link LiquidatePayInAdvanceTransactionBuilder} is. {@link #build} returns an <b>unsigned</b>
  * {@link Transaction}; there is no evaluator, no signer, no key and no network. The ex-units the
  * redeemers carry are cardano-client-lib's placeholders; the real ones are measured separately by
- * {@link LiquidatePayInAdvanceAndCompoundDryEvalTest} through the UPLC machine.
+ * {@link LiquidatePayInAdvanceAndCompoundDryEvalTest} through the UPLC machine. <b>That last sentence
+ * is the trap above, stated as if it were a safety property: read it together with the warning.</b>
  *
  * <h2>How it differs from the plain {@code LiquidateAndPayInAdvance} builder</h2>
  * The claim leg — the loan spend, the {@code loan_claim_action} redeemer, the borrower's equity
@@ -366,7 +389,11 @@ public final class LiquidatePayInAdvanceAndCompoundTransactionBuilder {
 
     private Transaction complete(Request request, ScriptTx tx) {
         try {
-            // Third argument (TransactionProcessor) stays null; see the class javadoc.
+            // ⚠ CCL TRAP 8 — the third argument is NOT only the TransactionProcessor. The same null
+            // becomes the TransactionEvaluator, so the two lines below ship PLACEHOLDER ex-units.
+            // Harmless while this builder is test-only; a phase-2 failure with collateral forfeit the
+            // moment it is promoted. DO NOT PROMOTE WITHOUT FIXING THIS — see the class javadoc's
+            // "DO NOT PROMOTE" section, corrective #2, and the 5b439da fix for the sibling builder.
             return new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
                     .compose(tx)
                     .feePayer(request.changeAddress())
@@ -376,6 +403,7 @@ public final class LiquidatePayInAdvanceAndCompoundTransactionBuilder {
                     .mergeOutputs(false)
                     // No evaluator here: the redeemers keep placeholder ex-units and the offline rig
                     // prices them itself. Nothing must be fetched — the rig hands every script in.
+                    // This is the fixture supplying what production would have to earn: see above.
                     .ignoreScriptCostEvaluationError(true)
                     .withScriptSupplier(scriptHash -> Optional.empty())
                     .build();
