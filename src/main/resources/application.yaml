@@ -83,6 +83,25 @@ loans:
     # fee. 1.5 ADA leaves headroom for either shape and still refuses dust liquidations, whose fee
     # slice would not repay the transaction that claims it.
     profit-margin-lovelace: ${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:1500000}
+    # THE ABSOLUTE FLOOR, and it is a SECOND gate that profit-margin-lovelace cannot reach.
+    # S4 tests two independent things: (a) floorProfit = feeSlice - txFee - minAdaFunded against
+    # min-profit-absolute-lovelace, and only then (b) the margin lever. The margin is deliberately
+    # OUTSIDE the floor's number, so lowering it -- even to a large negative -- can never rescue a
+    # candidate the floor refuses. Measured on preview 2026-08-24: a convert liquidation logged
+    # "floor -27303331; - margin -100000000 = 72696669" and was still refused NOT_PROFITABLE,
+    # because -27303331 < 0 and the floor is what (a) tests. The positive number on that line is
+    # real but is not what gated it.
+    #
+    # Why the floor is so negative on a CONVERT liquidation: minAdaFunded is the bot FRONTING the
+    # loan's principal, counted here as a cost, while the collateral it receives in exchange is not
+    # counted as a benefit at all -- the fee term is a mark-to-oracle token slice (T-027, SPEC O-2).
+    # So this floor currently compares ADA out against tokens in. Setting it negative is therefore a
+    # DELIBERATE statement that mark-to-oracle economics are accepted for these liquidations, not a
+    # tuning knob. Default 0 is unchanged.
+    min-profit-absolute-lovelace: ${AQUARIUM_LIQUIDATION_MIN_PROFIT_ABSOLUTE_LOVELACE:0}
+    # Whether the absolute floor above is applied at all. Turning it off removes gate (a) entirely
+    # and leaves only the margin lever.
+    check-profitability: ${AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY:true}
     decision-log-size: ${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}
     quarantine-minutes: ${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}
     # Published reference-script UTxOs, one `txHash#index` per validator a Liquidate invokes. Empty
