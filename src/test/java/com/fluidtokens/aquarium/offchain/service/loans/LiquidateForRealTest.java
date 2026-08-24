@@ -156,34 +156,31 @@ public class LiquidateForRealTest {
             // masking this under-charge.
             // Overpaying a fee is always legal; underpaying is a phase-1 rejection. The uplift comes
             // out of the change output so value stays conserved, and ex-units are untouched.
-            BigInteger uplift = BigInteger.valueOf(300_000L);
-            var outs = tx.getBody().getOutputs();
-            var change = outs.stream()
-                    .filter(x -> x.getAddress().equals(signer.baseAddress()))
-                    .max(Comparator.comparing(x -> x.getValue().getCoin())).orElseThrow();
-            change.getValue().setCoin(change.getValue().getCoin().subtract(uplift));
-            tx.getBody().setFee(tx.getBody().getFee().add(uplift));
-            System.out.println("LQ fee uplifted to " + tx.getBody().getFee()
-                    + ", change now " + change.getValue().getCoin());
+            // D2 CHECK: with D1 in place CCL should price every reference script itself, so the fee
+            // it computes should already satisfy the ledger and the collateral triple it derived
+            // should already be consistent. Report both before touching anything.
+            var ppChk = b.getEpochService().getProtocolParameters().getValue();
+            BigInteger collInChk = q(wallet, true);
+            BigInteger retChk = tx.getBody().getCollateralReturn() == null ? BigInteger.ZERO
+                    : tx.getBody().getCollateralReturn().getValue().getCoin();
+            BigInteger totChk = tx.getBody().getTotalCollateral() == null ? BigInteger.ZERO
+                    : tx.getBody().getTotalCollateral();
+            BigInteger neededChk = tx.getBody().getFee()
+                    .multiply(BigInteger.valueOf(ppChk.getCollateralPercent().longValue()))
+                    .add(BigInteger.valueOf(99)).divide(BigInteger.valueOf(100));
+            System.out.println("LQ D2CHECK fee=" + tx.getBody().getFee()
+                    + " | collateral in=" + collInChk + " return=" + retChk + " total=" + totChk
+                    + " | in-return=" + collInChk.subtract(retChk)
+                    + (collInChk.subtract(retChk).equals(totChk) ? " CONSISTENT" : " VIOLATED")
+                    + " | needed>=" + neededChk
+                    + (totChk.compareTo(neededChk) >= 0 ? " SUFFICIENT" : " INSUFFICIENT"));
 
-            // COLLATERAL follows the fee. Iteration 2 was rejected with
-            //   InsufficientCollateral (DeltaCoin 1819517) (Coin 2269517)
-            // because the ledger requires collateral >= collateralPercent% of the FEE, and raising
-            // the fee without raising totalCollateral left the old 150%-of-the-old-fee figure behind.
-            // Recomputed from the live protocol parameter rather than assuming 150.
-            var pp = b.getEpochService().getProtocolParameters().getValue();
-            BigInteger pct = BigInteger.valueOf(pp.getCollateralPercent().longValue());
-            BigInteger needed = tx.getBody().getFee().multiply(pct)
-                    .add(BigInteger.valueOf(99)).divide(BigInteger.valueOf(100))
-                    .add(BigInteger.valueOf(100_000L));   // headroom, overpaying is legal
-            BigInteger collIn = q(wallet, true);
-            tx.getBody().setTotalCollateral(needed);
-            if (tx.getBody().getCollateralReturn() != null) {
-                tx.getBody().getCollateralReturn().getValue().setCoin(collIn.subtract(needed));
-            }
-            System.out.println("LQ collateralPercent=" + pct + " totalCollateral=" + needed
-                    + " collateralReturn=" + collIn.subtract(needed)
-                    + " (collateral input " + collIn + ")");
+            // The manual fee uplift and collateral recomputation that iterations 2 and 3 needed are
+            // GONE on purpose. They were workarounds for a defect D1 now fixes in src/main: CCL was
+            // pricing only the reference scripts we declared and skipping the supplier that would
+            // have priced the oracle's. Leaving them here would mask whether D1 actually works — the
+            // test must exercise what production does, and if the fee is short the ledger says so
+            // loudly and cheaply in phase 1.
 
             // 7. SIGN AND SUBMIT — real, on preview.
             Transaction signed = signer.sign(tx);

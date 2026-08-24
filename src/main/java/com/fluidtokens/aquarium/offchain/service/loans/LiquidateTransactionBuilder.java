@@ -1687,8 +1687,12 @@ public final class LiquidateTransactionBuilder {
             context = context.withTxEvaluator(contextEvaluator);
         }
 
+        // Same trap as the pay-in-advance builder, mirrored deliberately: withReferenceScripts with
+        // a PARTIAL list makes FeeCalculators price only what it was handed and skip the supplier
+        // that would have priced every reference script. With a backend, declare nothing and let the
+        // supplier do it. See LiquidatePayInAdvanceTransactionBuilder.complete for the measurement.
         List<PlutusScript> published = publishedScripts(request.referenceScripts());
-        if (!published.isEmpty()) {
+        if (backendService == null && !published.isEmpty()) {
             context = context.withReferenceScripts(published.toArray(PlutusScript[]::new))
                     .removeDuplicateScriptWitnesses(true);
         }

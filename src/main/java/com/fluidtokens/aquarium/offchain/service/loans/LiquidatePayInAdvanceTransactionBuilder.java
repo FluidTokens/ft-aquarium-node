@@ -667,11 +667,29 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                 context = context.withTxEvaluator(contextEvaluator);
             }
 
-            // Published scripts are declared as reference scripts and their witness copies stripped,
-            // mirroring LiquidateTransactionBuilder.complete: a script also reachable by reference is
-            // ExtraneousScriptWitnessesUTXOW, so the strip is required, not an optimisation.
+            // ⚠ CCL TRAP: withReferenceScripts with a PARTIAL list makes the fee LESS complete.
+            // FeeCalculators (v0.7.2, ~:125-145) branches on context.getRefScripts(): when it is
+            // EMPTY it uses the ScriptSupplier to fetch and price EVERY script reachable from the
+            // reference inputs; when it is non-empty it prices ONLY the scripts it was handed and
+            // never consults the supplier. So passing MORE information produces a SMALLER fee.
+            //
+            // We can only name the scripts in our own registry. The oracle's script is a third
+            // party's, reachable by reference input but absent from publishedScripts(), so declaring
+            // ours silently un-priced theirs. Measured on preview 2026-08-24: the ledger rejected the
+            // first real liquidation with FeeTooSmallUTxO {supplied 1213011, expected 1275007}, short
+            // by 61,996 -- and the oracle script is 4,138 bytes, ~62,070 at the reference-script rate.
+            // That is not a plausible match, it is the thing itself.
+            //
+            // With a backend we therefore declare NOTHING and let its supplier price them all.
+            // Verified before relying on it: Blockfrost serves BOTH by hash --
+            // loan_claim_action 9ae63b26… (8,662 bytes) and the oracle 402c984d… (4,138 bytes).
+            // Offline there is no supplier and no ledger to satisfy, so the declaration stays.
+            //
+            // removeDuplicateScriptWitnesses is no longer needed on either path: since e11ccca a
+            // script that travels by reference is not attached in the first place, so there is no
+            // duplicate to strip.
             List<PlutusScript> published = publishedScripts(request.referenceScripts());
-            if (!published.isEmpty()) {
+            if (backendService == null && !published.isEmpty()) {
                 context = context.withReferenceScripts(published.toArray(PlutusScript[]::new))
                         .removeDuplicateScriptWitnesses(true);
             }
