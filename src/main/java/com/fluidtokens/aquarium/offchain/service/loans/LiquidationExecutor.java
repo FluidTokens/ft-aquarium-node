@@ -493,8 +493,20 @@ public class LiquidationExecutor {
             } catch (LiquidateTransactionBuilder.RefusedException e) {
                 // A refusal is the builder working: it is a statement about this candidate, reproducible
                 // next cycle, and costs nothing. Not quarantined for that reason.
+                //
+                // T-040, fifth site. TWO of the builder's fifty refusals wrap a real fault —
+                // SCRIPT_COST_EVALUATION_FAILED and TRANSACTION_NOT_BUILDABLE, both raised from the
+                // catch around context.build(). Recording only e.getMessage() dropped that cause, so
+                // "the machinery broke" and "this candidate is not liquidatable" reached the operator
+                // looking identical. The other forty-eight carry no cause and are untouched: a clean
+                // verdict needs no stack trace, and logging every refusal at ERROR would bury the two
+                // that matter under the forty-eight that do not.
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        e.getReason().name(), e.getMessage()));
+                        e.getReason().name(), refusalDetail(e)));
+                if (e.getCause() != null) {
+                    log.error("the liquidation of {} was refused as {} by a failure underneath: {}",
+                            loanUtxoRef, e.getReason(), causeChain(e.getCause()), e);
+                }
                 return;
             } catch (Exception e) {
                 // Anything else is a failure of the machinery rather than a verdict on the candidate —
@@ -555,6 +567,18 @@ public class LiquidationExecutor {
             c = next;
         }
         return sb.toString();
+    }
+
+    /**
+     * A refusal's operator-facing detail: the builder's own message when the refusal is a verdict on
+     * the candidate, and that message followed by the whole underlying cause chain when the refusal is
+     * wrapping a failure. Only the {@code context.build()} catch passes a cause, so forty-eight of the
+     * fifty refusals are unchanged by this and keep reading exactly as the builder wrote them.
+     */
+    static String refusalDetail(LiquidateTransactionBuilder.RefusedException e) {
+        return e.getCause() == null
+                ? e.getMessage()
+                : e.getMessage() + " \u21d0 " + causeChain(e.getCause());
     }
 
     private static Throwable rootCause(Throwable t) {
@@ -629,8 +653,12 @@ public class LiquidationExecutor {
             // The transaction exists but cannot be measured — which is also the S5 evidence, so
             // there is nothing here that could ever be submitted. The pricing verdict still stands
             // and is recorded without the fields that could not be produced.
-            log.warn("could not serialise the built liquidation of {}: {}",
-                    assessment.loan().utxoRef(), e.toString());
+            // T-040: was WARN with e.toString() and no throwable — the nearest sibling of the three
+            // silent sites and the most surprising omission, because the exception reaches NOTHING
+            // else. The recorded decision carries the pricing detail, not the fault, so this line is
+            // the only place the cause can ever appear.
+            log.error("could not serialise the built liquidation of {}: {}",
+                    assessment.loan().utxoRef(), causeChain(e), e);
             LiquidationDecision.Outcome unmeasured = wouldSubmit(floorProfit, expectedProfit)
                     ? LiquidationDecision.Outcome.WOULD_SUBMIT
                     : LiquidationDecision.Outcome.UNPROFITABLE;

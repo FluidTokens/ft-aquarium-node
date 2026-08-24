@@ -1305,7 +1305,7 @@ class LiquidationSubmitVetoTest {
     // ======================================================================================
 
     /**
-     * All seven vetoes pass. The bytes that reach the submitter are the bytes that were vetted, plus
+     * All eight vetoes pass. The bytes that reach the submitter are the bytes that were vetted, plus
      * exactly one signature.
      * <p>
      * The comparison is made against the CBOR the decision recorded — that is the transaction the

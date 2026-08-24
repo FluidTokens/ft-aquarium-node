@@ -11,6 +11,7 @@ import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.SlotConfigs;
+import com.bloxbean.cardano.client.exception.CborSerializationException;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
@@ -47,6 +48,8 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1888,6 +1891,149 @@ class LiquidationExecutorTest {
                 "must surface the ROOT cause, not just toString() of the wrapper: "
                         + event.getFormattedMessage());
         assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+    }
+
+    /**
+     * T-040, the FIFTH site — found while building the plain-path test above, not by re-auditing.
+     * <p>
+     * A {@code RefusedException} is normally the builder <em>working</em>: a verdict on the candidate,
+     * and forty-eight of the builder's fifty refusals carry no cause at all. But TWO of them wrap a
+     * real failure — {@code SCRIPT_COST_EVALUATION_FAILED} and {@code TRANSACTION_NOT_BUILDABLE}, both
+     * raised from the catch around {@code context.build()}. Recording only {@code e.getMessage()} threw
+     * that cause away, so "Blockfrost is unreachable" and "this loan is not liquidatable" reached the
+     * operator as the same kind of row.
+     * <p>
+     * Nothing is mocked: a protocol-params supplier that throws IS the natural way into that branch,
+     * which is exactly how this site was discovered.
+     */
+    @Test
+    void aRefusalWrappingARealFailureSurfacesTheCauseInsteadOfReadingLikeAVerdict() {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                throwingParams(), null, null);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertEquals(LiquidateTransactionBuilder.Refusal.TRANSACTION_NOT_BUILDABLE.name(),
+                decision.reason(), "recorded under the builder's own Refusal name, unchanged");
+        assertEquals(0, wiring.executor().quarantinedCount(),
+                "a refusal is not a machinery failure and is still not quarantined");
+        // THE DISCRIMINATOR: the refusal's own message stops at the wrapper.
+        assertTrue(decision.detail().contains(BLOCKFROST_TIMEOUT),
+                "the detail must carry the cause underneath the refusal: " + decision.detail());
+
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .toList();
+        assertEquals(1, errors.size(),
+                "a refusal that wraps a failure gets exactly one ERROR line: " + appender.list);
+        assertTrue(errors.getFirst().getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
+                "which must name the root cause: " + errors.getFirst().getFormattedMessage());
+        assertNotNull(errors.getFirst().getThrowableProxy(), "with the exception attached");
+    }
+
+    /**
+     * The other half of the same rule: a refusal that is a genuine verdict on the candidate — no cause
+     * — keeps its clean message and produces NO error log. Forty-eight of the fifty refusals are this
+     * shape, and turning them all into ERROR rows would bury the two that matter.
+     */
+    @Test
+    void aPlainVerdictRefusalStaysCleanAndSilent() {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Scenario tampered = honest.withAssessment(LoanFixtures.withNumbers(honest.assessment(),
+                honest.assessment().remainingDebt(), honest.assessment().equity(),
+                honest.assessment().liquidationFee().add(BigInteger.ONE)));
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(tampered.assessment()), List.of(tampered),
+                false);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidateTransactionBuilder.Refusal.LIQUIDATION_FEE_NOT_REPRODUCIBLE.name(),
+                decision.reason());
+        assertFalse(decision.detail().contains("\u21d0"),
+                "a cause-less refusal keeps the builder's own message, with no chain appended: "
+                        + decision.detail());
+        assertTrue(appender.list.stream().noneMatch(event -> event.getLevel() == Level.ERROR),
+                "a clean verdict must not produce an ERROR line: " + appender.list);
+    }
+
+    /**
+     * T-040, the serialisation catch. The most surprising omission of the family: the exception reaches
+     * NOTHING else — the recorded decision carries the pricing arithmetic, not the fault — so this log
+     * line is the only place the cause can ever appear. It used to be WARN, with e.toString() and no
+     * throwable.
+     * <p>
+     * The transaction under test is a REAL built one, re-read from the cbor a clean cycle produced and
+     * spied so that only {@code serialize()} fails. Nothing about the pricing that precedes it is
+     * fabricated — the executor reads the real fee off the real body.
+     */
+    @Test
+    void aTransactionThatCannotBeSerialisedIsLoggedAtErrorWithTheRootCause() throws Exception {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring clean = wiring(shadow(SMALL_MARGIN), honest, false);
+        clean.executor().cycle(NOW);
+        String cborHex = onlyDecision(clean).txCborHex();
+        assertNotNull(cborHex, "the fixture must build a real transaction to spy on");
+
+        Transaction real = Transaction.deserialize(HexUtil.decodeHexString(cborHex));
+        Transaction broken = spy(real);
+        doThrow(new CborSerializationException("the witness set could not be encoded",
+                new java.io.IOException("cbor writer refused a 4-byte tag")))
+                .when(broken).serialize();
+
+        LiquidateTransactionBuilder unserialisable = mock(LiquidateTransactionBuilder.class);
+        when(unserialisable.build(any(LiquidateTransactionBuilder.Request.class))).thenReturn(broken);
+
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, unserialisable);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationExecutor.SubmitVeto.TX_TOO_LARGE.name(), decision.submitVeto(),
+                "a transaction that cannot be measured cannot be cleared — the verdict is unchanged");
+
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .toList();
+        assertEquals(1, errors.size(), "expected exactly one ERROR event: " + appender.list);
+        ILoggingEvent event = errors.getFirst();
+        assertTrue(event.getFormattedMessage().contains("could not serialise"),
+                "must name the operation: " + event.getFormattedMessage());
+        // THE DISCRIMINATOR: toString() on the wrapper stops one link short of this.
+        assertTrue(event.getFormattedMessage().contains("cbor writer refused a 4-byte tag"),
+                "must surface the ROOT cause, not just toString(): " + event.getFormattedMessage());
+        assertNotNull(event.getThrowableProxy(),
+                "and the throwable must be attached — the old WARN passed none");
     }
 
     // ======================================================================================

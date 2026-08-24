@@ -102,7 +102,7 @@ public record LiquidationDecision(long decidedAt,
      * How far a candidate got.
      * <p>
      * {@link #SUBMITTED} and {@link #SUBMIT_FAILED} are the only two states that imply the node
-     * transmitted anything, and reaching either takes all seven vetoes of
+     * transmitted anything, and reaching either takes all eight vetoes of
      * {@code LiquidationExecutor} passing. Everything else is a record of a judgement.
      */
     public enum Outcome {
