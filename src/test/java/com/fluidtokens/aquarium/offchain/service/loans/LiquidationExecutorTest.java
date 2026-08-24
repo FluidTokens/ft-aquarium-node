@@ -1721,6 +1721,87 @@ class LiquidationExecutorTest {
         }
     }
 
+    /**
+     * The nominated wallet utxo must be the LARGEST spendable one, not the first the wallet happens
+     * to list.
+     * <p>
+     * It is the only wallet input the builder declares, and cardano-client-lib evaluates script cost
+     * BEFORE balancing can add any more — so a remote evaluator is shown a transaction whose declared
+     * inputs must already cover its outputs. Blockfrost refuses one that cannot with
+     * {@code EvaluationFailure} and an EMPTY {@code ScriptFailures} map, which reads as anything but
+     * a funding problem.
+     * <p>
+     * Measured on preview 2026-08-24: the bot's wallet held 776 ada across 14 utxos, a 5-ada one came
+     * first, and every convert liquidation failed on it while a 58-ada and a 38-ada ada-only utxo sat
+     * unused at the same address. Revert {@code max(...)} to {@code findFirst()} and this fails.
+     */
+    @Test
+    void theWalletUtxoIsTheLargestSpendableOneNotTheFirstListed() {
+        Utxo small = LoanFixtures.adaUtxo("11".repeat(32), 0, ACCOUNT.baseAddress(), 5_000_000L);
+        Utxo large = LoanFixtures.adaUtxo("22".repeat(32), 0, ACCOUNT.baseAddress(), 58_384_544L);
+        Utxo middling = LoanFixtures.adaUtxo("33".repeat(32), 0, ACCOUNT.baseAddress(), 38_839_574L);
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+
+        // Deliberately listed smallest-first, the order that produced the live failure.
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(small, large, middling), noOracle(), false);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        String chosen = appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(message -> message.startsWith("wallet utxo for this cycle"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("the executor must say which utxo it picked: "
+                        + appender.list));
+        assertTrue(chosen.contains("22".repeat(32)),
+                "the LARGEST spendable utxo must be nominated, not the first listed: " + chosen);
+        assertTrue(chosen.contains("58384544"), "and its value must be reported: " + chosen);
+        assertTrue(chosen.contains("3 spendable"),
+                "the log must say how many were eligible, so an operator can see the choice: " + chosen);
+    }
+
+    /** A reference-script or datum-bearing utxo is still excluded, however large it is. */
+    @Test
+    void theLargestUtxoIsStillSubjectToEveryEligibilityRule() {
+        Utxo huge = Utxo.builder()
+                .txHash("44".repeat(32)).outputIndex(0).address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(900_000_000L))))
+                .referenceScriptHash("9ae63b26c98d90024a45f9cdb57e4154f72144d44325f0a261b8bc1d")
+                .build();
+        Utxo modest = LoanFixtures.adaUtxo("55".repeat(32), 0, ACCOUNT.baseAddress(), 60_000_000L);
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(huge, modest), noOracle(), false);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        String chosen = appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(message -> message.startsWith("wallet utxo for this cycle"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("expected a nomination: " + appender.list));
+        assertTrue(chosen.contains("55".repeat(32)),
+                "largest-first must not override the reference-script exclusion: " + chosen);
+    }
+
     // ======================================================================================
     // the vacuity fix: these three sites must surface a WRAPPED cause, not just toString()
     //

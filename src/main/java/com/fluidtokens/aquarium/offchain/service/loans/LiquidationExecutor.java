@@ -1112,12 +1112,22 @@ public class LiquidationExecutor {
             log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
             return Optional.empty();
         }
+        // LARGEST, not first. The nominated utxo is the only wallet input the builder declares, and
+        // cardano-client-lib evaluates script cost BEFORE balancing can add any more — so a remote
+        // evaluator is shown a transaction whose declared inputs must already cover its outputs.
+        // Blockfrost refuses such a transaction with EvaluationFailure and an EMPTY ScriptFailures
+        // map ("could not evaluate at all", not "a script said no"), which is unreadable as a funding
+        // problem. Measured on preview 2026-08-24: a wallet holding 776 ada across 14 utxos had a
+        // 5-ada one first in the list, and every convert liquidation failed on it while a 58-ada and
+        // a 38-ada ada-only utxo sat unused at the same address. Taking the largest makes the
+        // nominated utxo sufficient on its own wherever the wallet can cover the transaction at all,
+        // and never makes it worse.
         Optional<Utxo> walletUtxo = walletUtxos.stream()
                 .filter(utxo -> utxo.getAmount().size() == 1
                         && utxo.getReferenceScriptHash() == null
                         && utxo.getInlineDatum() == null
                         && utxo.getDataHash() == null)
-                .findFirst();
+                .max(Comparator.comparing(utxo -> utxo.getAmount().getFirst().getQuantity()));
         if (walletUtxo.isEmpty()) {
             // Say WHAT was rejected and WHY, not just that nothing qualified. The 2026-08-24 shadow
             // run cost a full diagnosis round to establish something this line would have stated
@@ -1131,9 +1141,13 @@ public class LiquidationExecutor {
                     walletUtxos.stream().map(LiquidationExecutor::whyNotSpendable)
                             .collect(java.util.stream.Collectors.joining("; ")));
         } else {
-            log.info("wallet utxo for this cycle: {}#{} ({} lovelace)",
+            log.info("wallet utxo for this cycle: {}#{} ({} lovelace, the largest of {} spendable)",
                     walletUtxo.get().getTxHash(), walletUtxo.get().getOutputIndex(),
-                    walletUtxo.get().getAmount().getFirst().getQuantity());
+                    walletUtxo.get().getAmount().getFirst().getQuantity(),
+                    walletUtxos.stream().filter(utxo -> utxo.getAmount().size() == 1
+                            && utxo.getReferenceScriptHash() == null
+                            && utxo.getInlineDatum() == null
+                            && utxo.getDataHash() == null).count());
         }
         return walletUtxo;
     }
