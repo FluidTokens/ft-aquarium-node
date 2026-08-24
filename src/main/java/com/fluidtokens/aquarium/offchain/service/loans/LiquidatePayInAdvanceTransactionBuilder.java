@@ -297,6 +297,93 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     /**
      * Assembles and completes the transaction: probe for the layout, rebuild with the observed
      * indexes, then re-derive and assert them against the finished body.
+     *
+     * <h2>Reviewer's orientation — what this transaction IS</h2>
+     * A pay-in-advance liquidation is not "sell the collateral". The bot <b>fronts the loan's
+     * principal out of its own wallet</b>, pays the lender the principal-currency (ADA) value of the
+     * collateral, takes the collateral tokens for itself, and keeps
+     * {@code liquidationFeePerMille} of them as its profit. That is why a wallet UTxO is an input at
+     * all: nothing in the loan pays for this, the bot advances the money.
+     *
+     * <h2>Why EIGHT redeemers — {@code Spend#1, Spend#2, Mint#0, Reward#0..#4}</h2>
+     * <ul>
+     *   <li><b>{@code Spend#1}</b> — the loan UTxO being spent, governed by {@code loan_spend}.</li>
+     *   <li><b>{@code Spend#2}</b> — the lender bond UTxO, governed by {@code lender_manager_spend}.
+     *       The bot's own wallet input needs no redeemer: it is a plain key input.</li>
+     *   <li><b>{@code Mint#0}</b> — the loan NFT is <b>burned</b>. Closing a loan retires its NFT
+     *       while the lender bond survives as the lender's separate claim ticket, withdrawn later
+     *       through {@code lmWithdrawBondsAction}. (That asymmetry is also why the scanner reports so
+     *       many {@code LOAN_NOT_FOUND} bonds — see that enum constant.)</li>
+     *   <li><b>{@code Reward#0..#4}</b> — five <b>withdraw-0</b> invocations, explained next.</li>
+     * </ul>
+     *
+     * <h2>The withdraw-0 pattern, which is genuinely non-obvious</h2>
+     * Four of the five validators here are never "spent" — they are <b>staking</b> scripts, invoked by
+     * placing a <b>withdrawal of zero lovelace</b> from their own reward account in the transaction.
+     * The ledger must run the script to authorise the withdrawal, so a zero withdrawal is simply a way
+     * to say "run this validator once for the whole transaction" without attaching it to any
+     * particular input. It is how the contract system runs one global rule-check per transaction
+     * instead of re-running it per input. The five are: the oracle, {@code loan.loan},
+     * {@code lm_liquidate_and_pay_in_advance_action}, {@code lender_manager}, and
+     * {@code loan_claim_action}. <b>Each one's stake credential must be registered on chain</b> or the
+     * ledger cannot resolve the withdrawal — verified registered for all five on preview 2026-08-24.
+     *
+     * <h2>Why the transaction is built TWICE</h2>
+     * Several redeemer fields name <b>absolute output positions</b> ({@code lenderBondOutputIndex},
+     * {@code assetOutputIndex}). Those positions cannot be written down in advance: cardano-client-lib
+     * inserts a dummy output for transactions carrying withdrawals and appends change afterwards, so
+     * where our outputs land is only knowable once the body exists. So the first pass — the
+     * <b>layout probe</b> — is assembled with placeholder indexes purely to be measured; the observed
+     * positions are then fed into a second, real assembly. <b>The probe's body is discarded and never
+     * returned.</b> Its redeemers name indexes no validator would accept, which is why it is
+     * deliberately not script-costed (see {@link LayoutProbeEvaluator}).
+     *
+     * <h2>What the ledger sorts, and what must therefore never be assumed</h2>
+     * The ledger orders <b>inputs</b> canonically (by transaction id, then index) and <b>withdrawals</b>
+     * by reward address — <em>not</em> in the order they were added here. A {@code Spend#n} redeemer
+     * points at position {@code n} of the SORTED input list, so changing which wallet UTxO is spent can
+     * move every index. Never read an index off insertion order; measure it off the finished body.
+     *
+     * <h2>Reference inputs, and why</h2>
+     * Six inputs are read but not spent: the two config UTxOs (protocol parameters the validators read
+     * live), three oracle UTxOs (the price feed, its script, the Charli3 provider), and the published
+     * {@code loan_claim_action} <b>reference script</b>. That last one exists purely for size: with
+     * every validator inline the body is ~23.5 kB against a 16,384-byte {@code maxTxSize}, and
+     * referencing the largest script brings it to ~14.8 kB. A script reached by reference must NOT
+     * also be attached to the witness set — see {@link #attachValidators}.
+     *
+     * <h2>How this differs from the plain {@code Liquidate} path</h2>
+     * The plain path requires {@code shouldLiquidationConvertToPrincipal == False} and pays the lender
+     * in collateral tokens. This path requires it {@code True}, advances ADA, and converts through the
+     * oracle. They are different on-chain actions with different script hashes; a convert bond is
+     * refused outright by the plain builder's V7 guard.
+     *
+     * <h2>⚠ WHERE THE BUILD CURRENTLY DIES (2026-08-24) — read before re-running experiments</h2>
+     * Against live preview this build fails inside {@link #complete}, at script-cost evaluation:
+     * Blockfrost answers {@code EvaluationFailure} with an <b>empty</b> {@code ScriptFailures} map,
+     * i.e. "the transaction could not be evaluated at all" — never "a validator said no". The
+     * following have each been ELIMINATED BY MEASUREMENT against the live chain, so please do not
+     * re-derive them:
+     * <ol>
+     *   <li><b>Funding</b> — the largest eligible wallet UTxO (58.4 ADA) is nominated; still fails.</li>
+     *   <li><b>Spent or unresolvable inputs</b> — all 3 inputs and all 6 reference inputs verified
+     *       unspent. A control transaction citing a genuinely non-existent input <em>succeeds</em>
+     *       at this endpoint, so this failure is not an input-resolution problem.</li>
+     *   <li><b>Transaction size</b> — was 23,459 bytes because a referenced script was also attached;
+     *       fixed, now 14,794 under a 16,384 limit; failure unchanged.</li>
+     *   <li><b>Serialisation era</b> — forcing Babbage instead of Conway changes nothing.</li>
+     *   <li><b>Withdrawal stake credentials</b> — all five registered on chain.</li>
+     *   <li><b>Mint purpose</b> — the burn policy {@code loan.loan} IS in the witness set.</li>
+     *   <li><b>Redeemer indexes</b> — verified against the canonically sorted body: correct.</li>
+     *   <li><b>Collateral</b> — the {@code collateralReturn}/{@code totalCollateral} triple is
+     *       inconsistent at evaluation time, but correcting it three different ways changes
+     *       nothing.</li>
+     * </ol>
+     * <b>Every offline test of this builder passes.</b> The offline rig does not enforce
+     * {@code maxTxSize}, evaluates unbalanced intermediates, and serves every script by hash — so a
+     * green suite here means "the deployed validators accept this shape", NOT "the chain will accept
+     * this transaction". Three separate defects this day were invisible offline and immediate on
+     * Blockfrost.
      */
     public Transaction build(Request request) {
         Numbers numbers = numbers(request);
