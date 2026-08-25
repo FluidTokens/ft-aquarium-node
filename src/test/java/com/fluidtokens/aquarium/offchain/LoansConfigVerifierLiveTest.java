@@ -54,8 +54,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <h2>What it still cannot tell you</h2>
  * Green means <em>the deployment we are pinned to is intact</em>. It does <b>not</b> mean that
  * deployment is the one anyone still uses — superseded config NFTs are never burnt, so a dead pin
- * verifies green forever (findings §12, §16.1). {@code DeploymentLivenessProbe} is what answers that,
- * and it deliberately shares no input with the pin.
+ * verifies green forever (findings §12, §16.1). <b>Nothing in the node answers that question</b> —
+ * {@code DeploymentLivenessProbe} did, and was removed 2026-08-25 (Giovanni's call). Treat a
+ * persistently empty world as a suspected redeploy and check the config policy id by hand.
  *
  * <p>Skipped unless {@code BLOCKFROST_KEY} is set, so it never breaks a keyless build:
  * <pre>{@code

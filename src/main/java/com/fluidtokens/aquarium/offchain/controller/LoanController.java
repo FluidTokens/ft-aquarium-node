@@ -10,7 +10,6 @@ import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanHealth;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
-import com.fluidtokens.aquarium.offchain.service.loans.DeploymentLivenessProbe;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanService;
@@ -56,8 +55,6 @@ public class LoanController {
 
     private final LiquidationCandidateScanner scanner;
 
-    private final DeploymentLivenessProbe livenessProbe;
-
     /**
      * One oracle's freshness. {@code usable_now} is the question that matters: a feed can be
      * present and recently fetched and still be unusable, because the validity window it carries
@@ -83,23 +80,6 @@ public class LoanController {
                                    int trackedAssets,
                                    int usableNow,
                                    List<OracleFeedView> feeds) {
-    }
-
-    /**
-     * Whether the deployment this node is pinned to still looks alive.
-     * <p>
-     * This exists because the state it reports is otherwise invisible: a node pinned to a superseded
-     * deployment boots clean, verifies clean, and reports zero candidates forever, which from the
-     * outside is exactly a quiet market. {@code /loans} returning {@code []} cannot tell the two
-     * apart; this can. See {@link DeploymentLivenessProbe} for why the config verifier structurally
-     * cannot answer it.
-     * <p>
-     * {@code suspected_redeploy} is a heuristic and says so: it is evidence to act on, not a verdict.
-     * {@code detail} is written to be pasted to a human.
-     */
-    @GetMapping("/deployment")
-    public DeploymentLivenessProbe.Status deployment() {
-        return livenessProbe.status();
     }
 
     /**

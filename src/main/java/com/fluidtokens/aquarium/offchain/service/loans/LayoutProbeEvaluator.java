@@ -9,6 +9,27 @@ import java.util.List;
 /**
  * The evaluator handed to the <b>layout-probe</b> assembly, which prices nothing and is discarded.
  *
+ * <h2>⛔ MARKED FOR DELETION (Giovanni, 2026-08-25)</h2>
+ * A stub evaluator does not belong in {@code src/main}. It goes when the evaluator architecture
+ * lands: <b>several real evaluators — scalus, aiken, Blockfrost — with Blockfrost as the fallback,
+ * and a startup failure if Blockfrost is not configured.</b> At that point the probe pass takes a
+ * real evaluator like every other path, or the two-pass probe is replaced outright, and this class
+ * is deleted rather than migrated. Any test that still needs a no-op gets a mock in {@code src/test}.
+ *
+ * <p><b>⚠ One correction to the rationale, because it changes what "replace this" means.</b> This
+ * class is <em>not</em> what prices a submitted transaction, and removing it does not unblock
+ * submission. Production already evaluates for real: {@code YaciConfig} hands both liquidation
+ * builders Blockfrost {@code /utils/txs/evaluate}, narrowed to the one-method
+ * {@link TransactionEvaluator} so it cannot submit, and the returned transaction's ex-units are
+ * measured and then asserted off the deserialised body. This stub is reached only by the discarded
+ * first assembly. So the work below is a <b>cleanup and a robustness upgrade</b>, not a fix for a
+ * broken submit path.
+ *
+ * <p><b>And the probe cannot simply be handed the real evaluator today.</b> Its claim redeemers name
+ * output indexes no validator accepts, so a real evaluation fails by construction and would refuse
+ * every batch. Deleting this class without also changing the probe therefore means going back to
+ * {@code null}, which is worse than either — see "Why null is nevertheless not usable" below.
+ *
  * <h2>Why a probe cannot have a real evaluator</h2>
  * Both liquidation builders assemble twice (CCL trap 1): once with placeholder output indexes purely
  * to read the finished layout off the body, then again with the observed indexes. The probe's claim
@@ -37,6 +58,7 @@ import java.util.List;
  * true, this class becomes a live instance of trap 8 — so it is deliberately package-private and
  * named for the one assembly it belongs to.
  */
+@Deprecated(forRemoval = true)
 final class LayoutProbeEvaluator {
 
     private LayoutProbeEvaluator() {

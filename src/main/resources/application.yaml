@@ -55,28 +55,6 @@ loans:
   oracle:
     enabled: ${LOANS_ORACLE_ENABLED:true}
     url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
-  # Is the deployment we are pinned to still the one the world uses? A node pinned to a superseded
-  # deployment boots clean, verifies clean and reports zero candidates FOREVER -- indistinguishable
-  # from a quiet market, and it has caught this project three times. LoansConfigVerifier cannot see
-  # it: it derives hashes from the pinned blueprint and compares them to the config datum it fetches
-  # with the pinned policy id, so both halves come from the pin and the check is self-consistent by
-  # construction. Measured 2026-08-25: superseded config NFTs are never burnt, so they keep verifying
-  # green indefinitely.
-  #
-  # DeploymentLivenessProbe asks a different question -- has anything new appeared at the credentials
-  # this pin derives? -- and reports it at GET {apiPrefix}/loans/deployment as well as in the log.
-  # It is a heuristic in one direction only: a genuinely dormant market eventually trips it. That is
-  # deliberate. A false alarm costs one check of the config policy id; a false silence has cost this
-  # project three investigations.
-  deployment-liveness:
-    # Seconds between readings. Cheap: one indexed query over the pinned credentials.
-    delay-seconds: ${LOANS_DEPLOYMENT_LIVENESS_DELAY_SECONDS:900}
-    # How long the pinned world may be silent before the alarm, in slots (1 slot = 1 second).
-    # 172800 = 48h. Generous on purpose: a dead pin is PERMANENT so its gap grows without bound and
-    # crosses any threshold eventually, whereas a tight threshold only buys false alarms during
-    # ordinary lulls. The gap is logged on every reading regardless, so the evidence to judge a
-    # suspicion is already there even if this number is wrong.
-    max-quiet-slots: ${LOANS_DEPLOYMENT_LIVENESS_MAX_QUIET_SLOTS:172800}
   # The auto-liquidation bot. `mode` is disabled / shadow / live; `enabled` is the separate arming
   # flag. Submitting requires BOTH mode==live AND enabled==true (isArmed) -- one switch is too easy
   # to flip by accident. This is not a drill: when armed and all eight submit-vetoes pass, the

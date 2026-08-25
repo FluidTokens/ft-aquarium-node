@@ -998,8 +998,15 @@ Unaffected by the retraction above, and the reason §12 is structural. Queried 2
 `quantity=1`, `mint_or_burn_count=1`, still sitting at their addresses.
 
 **A liveness or existence check on the pinned config UTxO therefore cannot ever fire.** That is the
-constraint `DeploymentLivenessProbe` (R2) was designed around: it asks whether anything *new* has
+constraint `DeploymentLivenessProbe` (R2) was designed around: it asked whether anything *new* had
 appeared at the credentials the pin derives, which shares no input with the pin's own contents.
+
+> **⛔ The probe was REMOVED 2026-08-25 (Giovanni's call).** The constraint above is unchanged and
+> still structural — **the node now has no detector for a dead pin at all.** `LoansConfigVerifier`
+> cannot acquire one: both halves of its comparison come from the pin. Until something replaces it,
+> **a persistently empty world is a suspected redeploy and the config policy id must be checked by
+> hand.** The cheap replacement, if one is ever wanted, is a single field on the healthcheck — the
+> newest indexed slot across `indexedPaymentCredentials()` and its age — not a scheduled service.
 
 ### 16.3 The two loans that prompted the repin
 
