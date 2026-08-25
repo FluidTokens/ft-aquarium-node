@@ -137,8 +137,9 @@ class LoansEndpointTest {
     }
 
     private static LoanController controller(List<Loan> loans, List<LiquidationAssessment> assessments) {
+        // liveness probe is null: these tests exercise /loans, which never consults it.
         return new LoanController(new FakeLoanService(loans), new StubHealthService(), null,
-                scannerReturning(assessments));
+                scannerReturning(assessments), null);
     }
 
     private static JsonNode json(List<LoanController.LoanView> views) {
