@@ -289,19 +289,26 @@ loans:
     # FOURTH preview deployment (14 Jul -> 5 Aug -> 17 Aug -> 25 Aug 2026). Both config NFTs are
     # minted in the single tx 8dd38e97...091c at outputs 0 and 1.
     #
-    # THE DEPLOYED CODE IS UNCHANGED: still ff005fb, the same commit as the third deployment, so
-    # loans-v4.plutus.json is NOT touched by this repin. Measured against the live chain 2026-08-25,
-    # as a discriminating pair rather than a single match:
-    #   ff005fb blueprint + these coordinates -> LoansConfigVerifierLiveTest GREEN
-    #   e0b818e blueprint + these coordinates -> FAILS on ConfigDatum[3]/[9]/[11]; the chain reports
-    #     requestPolicyId 88fa30db... (ff005fb's value), not e0b818e's b5a224f1...
-    # So this redeploy re-minted the config NFTs WITHOUT a code change, and e0b818e -- a later
-    # upstream commit that does touch request.ak -- has NOT been deployed to preview. An earlier
-    # note in PLAN.md identified the fourth deployment as e0b818e; that was wrong and is corrected
-    # here by direct measurement.
+    # THE DEPLOYED CODE IS e0b818e, and loans-v4.plutus.json is that commit's plutus.json copied
+    # byte-for-byte (sha256 a55a1c2e723a6d1222e464bb32adc1abe1d669ca6d00205d50459122adf7b98f).
+    # Blueprint and coordinates are a MATCHED PAIR: either half alone cannot boot.
     #
-    # The coordinates still matter on their own: the config NFT policy ids are applied as
-    # parameters, so 25 of 28 derived script hashes move even though the code did not.
+    # Measured against the live chain 2026-08-25, both arms against THESE coordinates, with the
+    # loaded blueprint's sha256 printed from the classpath on each run:
+    #   e0b818e + these coordinates -> 0 mismatches, GREEN
+    #   ff005fb + these coordinates -> 10 mismatches (ConfigDatum[3,9,11,12,14,15],
+    #                                  LMConfigDatum[2,3,4,6]) -- exactly the boot failure the
+    #                                  deployed image produced.
+    #
+    # An earlier revision of this comment claimed the reverse. It was wrong, and HOW it was wrong is
+    # worth keeping: the measurement behind it ran LoansConfigVerifierLiveTest, which HARDCODES the
+    # THIRD deployment's policy ids and never reads this file. Both of its arms were therefore
+    # scored against the third deployment, where ff005fb-green and e0b818e-red are simply correct
+    # and say nothing about the fourth. The blueprint variant was asserted by sha256; the COORDINATE
+    # variant was not -- and the unasserted input was the one that never propagated.
+    #
+    # The coordinates matter independently of the code: the config NFT policy ids are applied as
+    # parameters, so 25 of 28 derived script hashes move on a re-mint alone.
     ref-utxo-tx-hash: 8dd38e97b79cc7c8a3c59400944b7cd9f724876a1d49ea17ffb5e49b3785091c
     policy-id: d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e
   lm-config:
