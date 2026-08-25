@@ -345,6 +345,7 @@ public final class ReferenceScriptPublisher {
                                       String changeAddress, Mutation mutation) {
         Map<Validator, Long> expectedLovelace = new EnumMap<>(Validator.class);
         Tx tx = new Tx();
+        List<PlutusScript> attachedScripts = new ArrayList<>();
         for (int i = 0; i < group.size(); i++) {
             Validator validator = group.get(i);
             Validator attached = mutation.appliesTo(groupIndex, i) ? mutation.substitute() : validator;
@@ -355,13 +356,15 @@ public final class ReferenceScriptPublisher {
             // CBOR [scriptType, scriptBody] array that becomes field 3 (tag 24) of the output.
             // No datum overload is used, and none is wanted: a datum on these outputs would only
             // enlarge them and raise their min-ada.
+            PlutusScript attachedScript = scriptOf(attached);
+            attachedScripts.add(attachedScript);
             tx.payToAddress(destinationAddress, List.of(Amount.lovelace(BigInteger.valueOf(lovelace))),
-                    scriptOf(attached));
+                    attachedScript);
         }
         tx.from(funderAddress);
         tx.withChangeAddress(changeAddress);
 
-        Transaction completed = complete(tx, changeAddress, groupIndex);
+        Transaction completed = complete(tx, changeAddress, groupIndex, attachedScripts);
         return assertStructure(completed, group, groupIndex, destinationAddress, changeAddress,
                 expectedLovelace);
     }
@@ -372,7 +375,8 @@ public final class ReferenceScriptPublisher {
      *                      but the change output is what causes the swallowed-UTxO failure
      *                      documented on {@link #build(Plan, String, String, String)}
      */
-    private Transaction complete(Tx tx, String changeAddress, int groupIndex) {
+    private Transaction complete(Tx tx, String changeAddress, int groupIndex,
+                                 List<PlutusScript> attachedScripts) {
         try {
             // The third argument is the TransactionProcessor and it stays null; see the class
             // javadoc. There is no script being executed here, so no evaluator and no collateral
@@ -384,6 +388,85 @@ public final class ReferenceScriptPublisher {
                     // the reference inputs looking for scripts to fetch, and this builder has no
                     // remote source. There are no reference inputs here anyway.
                     .withScriptSupplier(scriptHash -> Optional.empty())
+                    // ⛔ NEVER SPEND A UTxO THAT CARRIES A REFERENCE SCRIPT.
+                    //
+                    // Added 2026-08-25 after this class did exactly that: the first real publish
+                    // consumed 48c102c0…#0, the 08-17 reference-script output, because tx.from()
+                    // hands input choice to cardano-client-lib's default selection and that selector
+                    // takes anything at the address. The script destroyed happened to be a DEAD one
+                    // from a superseded deployment, so the damage was nil and the locked ada came
+                    // back as change — but the same code would have destroyed a LIVE reference
+                    // script just as readily, and that is unrecoverable.
+                    //
+                    // The guard already existed: ReferenceScriptSafeUtxoSelection was written for
+                    // the liquidation builder, and its own javadoc records having MEASURED this very
+                    // UTxO being spent when only the strategy was guarded and not the selector. It
+                    // was simply never carried across to this sibling.
+                    .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
+                    .preBalanceTx((ctx, txn) ->
+                            ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                    // THE CONWAY REFERENCE-SCRIPT FEE, ON THE SCRIPT BEING PUBLISHED.
+                    //
+                    // cardano-client-lib will NOT charge this, and the reason is a gate rather than
+                    // an oversight: FeeCalculators (0.7.2, line ~126) wraps the whole reference-script
+                    // fee block in
+                    //     if (transaction.getBody().getReferenceInputs() != null
+                    //             && transaction.getBody().getReferenceInputs().size() > 0)
+                    // so the charge is only ever applied to scripts a transaction CONSUMES through
+                    // reference inputs. This transaction consumes none — it CREATES one in an output —
+                    // so the block never runs, and .withReferenceScripts(...) is inert here. The
+                    // Conway ledger charges for both.
+                    //
+                    // Measured against the preview ledger 2026-08-25, first real submission:
+                    //     FeeTooSmallUTxO {supplied: 554813, expected: 680255}
+                    //     155381 + 44*8976 + 15*8662 = 680255, to the lovelace.
+                    // A phase-1 rejection: nothing spent, nothing on chain (officina trap 11).
+                    //
+                    // So the fee is topped up here, after balancing, and the change output is reduced
+                    // by the same amount to keep the transaction balanced. The fee field's CBOR width
+                    // does not change at this magnitude, so the size the fee was computed over stays
+                    // correct.
+                    .postBalanceTx((ctx, txn) -> {
+                        long bodyBytes = attachedScripts.stream()
+                                .mapToLong(script -> {
+                                    try {
+                                        return script.serializeScriptBody().length;
+                                    } catch (Exception e) {
+                                        throw new IllegalStateException("cannot size a script", e);
+                                    }
+                                })
+                                .sum();
+                        // The tier ladder only bites above 25,600 bytes; below it the rate is flat,
+                        // and every validator here is far under. Asserted rather than assumed,
+                        // because a larger script would silently under-charge again.
+                        if (bodyBytes >= 25_600L) {
+                            throw new IllegalStateException("reference scripts total " + bodyBytes
+                                    + " bytes, which crosses the Conway tier ladder — the flat-rate "
+                                    + "fee below is no longer correct");
+                        }
+                        var perByte = ctx.getProtocolParams().getMinFeeRefScriptCostPerByte();
+                        if (perByte == null) {
+                            throw new IllegalStateException("minFeeRefScriptCostPerByte is absent "
+                                    + "from the protocol params; cannot price the published script");
+                        }
+                        // Round UP: the ledger's minimum is a floor, and paying a lovelace more is
+                        // accepted while paying one less is a phase-1 rejection.
+                        BigInteger refFee = perByte
+                                .multiply(java.math.BigDecimal.valueOf(bodyBytes))
+                                .setScale(0, java.math.RoundingMode.CEILING)
+                                .toBigIntegerExact();
+
+                        var body = txn.getBody();
+                        body.setFee(body.getFee().add(refFee));
+
+                        TransactionOutput change = body.getOutputs().stream()
+                                .filter(o -> changeAddress.equals(o.getAddress()) && o.getScriptRef() == null)
+                                .findFirst()
+                                .orElseThrow(() -> new IllegalStateException(
+                                        "no change output at " + changeAddress + " to take the "
+                                                + "reference-script fee from"));
+                        change.getValue().setCoin(change.getValue().getCoin().subtract(refFee));
+                    })
                     // Four outputs to the same address must stay four outputs: merging them would
                     // collapse four reference scripts into one output that can hold only one.
                     .mergeOutputs(false)
