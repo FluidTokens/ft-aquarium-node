@@ -949,3 +949,62 @@ iterated list is empty. `pm_update_pool_manager` is where it bites because it al
 empty (`length(poolInputs) == 0`). Other call sites are protected by an outer non-emptiness constraint or
 by being irrelevant when empty — a per-site accident, not a property of the helper. Worth an upstream
 audit note.
+
+## 16. The FOURTH redeploy changed no code — and the test that said otherwise could not have been right (measured 2026-08-25)
+
+**The fourth preview deployment is `ff005fb` re-minted, not `e0b818e`.** PLAN.md recorded it as
+`e0b818e` on 2026-08-24 and that stood, repeated by three sessions, for a day. It is wrong.
+
+**How it was settled — the same 2×2, but scored against the chain instead of a derived table:**
+
+| blueprint | fourth coordinates (`d46f626f…` / config UTxO `8dd38e97…`) | `LoansConfigVerifierLiveTest` |
+|---|---|---|
+| `ff005fb` (the committed blueprint) | yes | **GREEN** |
+| `e0b818e` | yes | **FAILS** `ConfigDatum[3]`, `[9]`, `[11]` |
+
+The chain reports `requestPolicyId` **`88fa30db…`**, which is `ff005fb`'s value — not `e0b818e`'s
+`b5a224f1…`. So the redeploy **re-minted the config NFTs with no code change**, and `e0b818e` (a
+later upstream commit that *does* touch `request.ak`) has never been deployed to preview.
+
+**Why the original 2×2 could not have been right.** It was scored against a hash table *derived
+from one of the two candidate blueprints*, so it could only ever confirm that candidate. The tell
+was already in the record: PLAN.md's own note that the first derivation table was wrong and that
+"the discrepancy on `requestPolicyId`" surfaced it — the very field that discriminates here. **An
+apparatus derived from the thing under test cannot test it.** Generalised in `fabbrica`
+`verification-harness` §9a-ii as the *common ancestor* mechanism.
+
+**Consequences, all favourable:** `loans-v4.plutus.json` is untouched by the repin (`aiken build`
+remains forbidden *and* unnecessary), and the repin cost **one** test rather than the 33 that a
+blueprint swap would have obsoleted.
+
+### 16.1 Superseded config NFTs are never burnt — measured, not assumed
+
+The reason §12 is structural rather than a bug. Queried 2026-08-25:
+
+| deployment | config NFT | lm-config NFT |
+|---|---|---|
+| THIRD (superseded) | `quantity=1`, `mint_or_burn_count=1`, still at its address | same |
+| FOURTH (live) | `quantity=1`, `mint_or_burn_count=1`, still at its address | same |
+
+**A liveness or existence check on the pinned config UTxO therefore cannot ever fire.** This is what
+`DeploymentLivenessProbe` (R2) was designed around: it asks whether anything *new* has appeared at
+the credentials the pin derives, which shares no ancestor with the pin's own contents.
+
+### 16.2 The two loans that prompted the repin
+
+`caa42146…` (slot 120990298) and `3d839207…` (slot 120991899), both from FluidTokens. Each
+references the fourth deployment's config as a reference input; **neither contains the third
+deployment's coordinates anywhere**. Output #1 of each is the loan UTxO and decodes as a 17-field
+`LoanDatum` matching `LoanDatumConverter` exactly:
+
+- `LiquidationMode.Liquidation(100, 125, 100, false)` — liquidatable, not either `NoLiquidation*`
+- `RepaymentMode.PerpetualLoan(28, 5)`
+- field 15 = `"POOL"` + pool id — pool-funded
+- collateral tFLDT, principal 40 ADA, principal and interest assets both ada
+
+Compared against all **56** real preview datums in `src/test/resources/loans-v4/preview-loan-datums.hex`,
+these are the **majority variant** — not a new shape. Note the naming trap: these are *pool-funded*
+loans, which is not the same as needing the *compound* liquidation action. `src/main` has no compound
+builder at all (`LiquidatePayInAdvanceAndCompoundTransactionBuilder` lives only in `src/test`), and
+the two real liquidations of 2026-08-24 were built by `LiquidatePayInAdvanceTransactionBuilder` — the
+convert path — on loans of exactly this shape.
