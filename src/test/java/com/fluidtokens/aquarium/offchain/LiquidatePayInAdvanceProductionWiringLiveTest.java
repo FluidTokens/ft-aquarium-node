@@ -35,6 +35,17 @@ import static org.junit.jupiter.api.Assumptions.abort;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
+ * <h2>⚠ EXPIRED FIXTURE — this test pins chain state that no longer exists</h2>
+ * Its target loan {@code f855d1b4…} was <b>liquidated by us on 2026-08-24</b>, and its seven pinned
+ * constants are the <b>THIRD</b> preview deployment's, superseded on 2026-08-25. It therefore
+ * <b>aborts</b>, and an abort carries no message in Gradle's XML — reached for on 2026-08-25 as the
+ * instrument to settle a transaction-size question, it looked like a pass to a summary that counted
+ * only failures.
+ * <p>
+ * Not fixed here: retargeting it overlaps the unresolved decision about the 37 held fixtures. It is
+ * inventoried with every other chain-pinned test in {@code docs/tests-pinned-to-chain-state.md}.
+ * <b>Do not read this class as evidence about the current deployment.</b>
+ *
  * <b>T-039 — the production-wired build.</b> Every other test of the pay-in-advance builder uses the
  * offline constructors and an offline rig. This one uses the <b>production</b> constructor against
  * <b>live preview</b>, because the delta between them cannot be reached offline and that delta is
