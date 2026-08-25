@@ -950,51 +950,62 @@ empty (`length(poolInputs) == 0`). Other call sites are protected by an outer no
 by being irrelevant when empty — a per-site accident, not a property of the helper. Worth an upstream
 audit note.
 
-## 16. The FOURTH redeploy changed no code — and the test that said otherwise could not have been right (measured 2026-08-25)
+## 16. The FOURTH deployment IS `e0b818e` — and the measurement that said otherwise never varied its variable (2026-08-25)
 
-**The fourth preview deployment is `ff005fb` re-minted, not `e0b818e`.** PLAN.md recorded it as
-`e0b818e` on 2026-08-24 and that stood, repeated by three sessions, for a day. It is wrong.
+**Confirming PLAN.md's original identification, and retracting the "correction" that briefly stood here.**
 
-**How it was settled — the same 2×2, but scored against the chain instead of a derived table:**
+Measured against live preview, **both arms against the FOURTH coordinates**, with the sha256 of the
+blueprint actually loaded printed from the classpath on each run:
 
-| blueprint | fourth coordinates (`d46f626f…` / config UTxO `8dd38e97…`) | `LoansConfigVerifierLiveTest` |
+| blueprint | fourth coordinates (`d46f626f…` / config UTxO `8dd38e97…`) | result |
 |---|---|---|
-| `ff005fb` (the committed blueprint) | yes | **GREEN** |
-| `e0b818e` | yes | **FAILS** `ConfigDatum[3]`, `[9]`, `[11]` |
+| **`e0b818e`** (`a55a1c2e…`) | yes | **0 mismatches — GREEN** |
+| `ff005fb` (`5b150c3d…`) | yes | **10 mismatches** — `ConfigDatum[3,9,11,12,14,15]` + `LMConfigDatum[2,3,4,6]` |
 
-The chain reports `requestPolicyId` **`88fa30db…`**, which is `ff005fb`'s value — not `e0b818e`'s
-`b5a224f1…`. So the redeploy **re-minted the config NFTs with no code change**, and `e0b818e` (a
-later upstream commit that *does* touch `request.ak`) has never been deployed to preview.
+The 10-mismatch arm is exactly the `@PostConstruct` failure the deployed image produced, reproduced
+locally. **Blueprint and coordinates are a matched pair; either half alone cannot boot.**
 
-**Why the original 2×2 could not have been right.** It was scored against a hash table *derived
-from one of the two candidate blueprints*, so it could only ever confirm that candidate. The tell
-was already in the record: PLAN.md's own note that the first derivation table was wrong and that
-"the discrepancy on `requestPolicyId`" surfaced it — the very field that discriminates here. **An
-apparatus derived from the thing under test cannot test it.** Generalised in `fabbrica`
-`verification-harness` §9a-ii as the *common ancestor* mechanism.
+### 16.1 How the wrong answer was produced — the part worth keeping
 
-**Consequences, all favourable:** `loans-v4.plutus.json` is untouched by the repin (`aiken build`
-remains forbidden *and* unnecessary), and the repin cost **one** test rather than the 33 that a
-blueprint swap would have obsoleted.
+An earlier revision of this section claimed the fourth deployment was `ff005fb` re-minted with no
+code change. That was wrong, and the mechanism is more useful than the conclusion:
 
-### 16.1 Superseded config NFTs are never burnt — measured, not assumed
+**`LoansConfigVerifierLiveTest` hardcoded the THIRD deployment's policy ids and never read
+`application.yaml`** — while its own javadoc cited it as the check for whether the coordinates in
+`application.yaml` had gone stale. `application.yaml` was repinned, that test was run, it came back
+green, and the green was read as evidence about the new coordinates. **Both arms of the 2×2 were
+therefore scored against the third deployment**, where `ff005fb`-green and `e0b818e`-red are simply
+correct and say nothing whatever about the fourth.
 
-The reason §12 is structural rather than a bug. Queried 2026-08-25:
+**The run did assert proof-of-variant — on the blueprint, by sha256, on both arms, deliberately. It
+did not assert it on the coordinates, and the unasserted input was the one that never propagated.**
+An experiment that does not manipulate the variable it claims to manipulate produces a real,
+reproducible, entirely meaningless result — and it is *more* convincing than a correct one, because
+both arms are clean and the numbers are stable.
 
-| deployment | config NFT | lm-config NFT |
-|---|---|---|
-| THIRD (superseded) | `quantity=1`, `mint_or_burn_count=1`, still at its address | same |
-| FOURTH (live) | `quantity=1`, `mint_or_burn_count=1`, still at its address | same |
+Fixed: the live test now reads the shipped coordinates out of the preview profile and prints them.
+There is no constant left in it to drift. Generalised in `fabbrica` `verification-harness` §9a-ii.
 
-**A liveness or existence check on the pinned config UTxO therefore cannot ever fire.** This is what
-`DeploymentLivenessProbe` (R2) was designed around: it asks whether anything *new* has appeared at
-the credentials the pin derives, which shares no ancestor with the pin's own contents.
+**The accusation this section previously levelled at the original 2×2 — that it was scored against a
+table derived from one of the candidates — is withdrawn.** It was a mechanism invented to explain a
+discrepancy that the broken measurement had itself manufactured. The original identification was
+right.
 
-### 16.2 The two loans that prompted the repin
+### 16.2 Superseded config NFTs are never burnt — measured, not assumed
+
+Unaffected by the retraction above, and the reason §12 is structural. Queried 2026-08-25: for
+**both** the third (superseded) and fourth (live) deployments, config and lm-config NFTs are all
+`quantity=1`, `mint_or_burn_count=1`, still sitting at their addresses.
+
+**A liveness or existence check on the pinned config UTxO therefore cannot ever fire.** That is the
+constraint `DeploymentLivenessProbe` (R2) was designed around: it asks whether anything *new* has
+appeared at the credentials the pin derives, which shares no input with the pin's own contents.
+
+### 16.3 The two loans that prompted the repin
 
 `caa42146…` (slot 120990298) and `3d839207…` (slot 120991899), both from FluidTokens. Each
-references the fourth deployment's config as a reference input; **neither contains the third
-deployment's coordinates anywhere**. Output #1 of each is the loan UTxO and decodes as a 17-field
+references the fourth deployment's config as a reference input; neither contains the third
+deployment's coordinates anywhere. Output #1 of each is the loan UTxO and decodes as a 17-field
 `LoanDatum` matching `LoanDatumConverter` exactly:
 
 - `LiquidationMode.Liquidation(100, 125, 100, false)` — liquidatable, not either `NoLiquidation*`
@@ -1008,3 +1019,9 @@ loans, which is not the same as needing the *compound* liquidation action. `src/
 builder at all (`LiquidatePayInAdvanceAndCompoundTransactionBuilder` lives only in `src/test`), and
 the two real liquidations of 2026-08-24 were built by `LiquidatePayInAdvanceTransactionBuilder` — the
 convert path — on loans of exactly this shape.
+
+**Corroboration worth recording:** deriving from `ff005fb` + fourth coordinates yields
+`loanSpendScriptHash=31e0dc1d…`, `poolSpendScriptHash=bf8c4378…`, `loanPolicyId=2f1aa941…` — all of
+which *do* appear in these two transactions. That is a reminder that partial agreement is not
+agreement: those three hashes are among the few that do not move on a re-mint, and reading them as
+confirmation is exactly how a wrong blueprint survives a spot check.
