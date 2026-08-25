@@ -6,3 +6,6 @@ build
 .env.*
 # ...but the templates are the point: they show what is needed without showing what it is.
 !.env.*.example
+
+# Session-local agent state; never belongs in the repo.
+.claude/
