@@ -1,5 +1,10 @@
 # Change split — keeping the bot's wallet spendable after a liquidation
 
+> **✅ IMPLEMENTED 2026-08-25, Shape A with the conservation assertion** (`LiquidateTransactionBuilder`,
+> `ChangeSplitTest`). **Not deployed** — nothing ships until Giovanni rules on the wallet.
+> Seven mutants were run against this guard and the collateral guard beside it, and every one was
+> caught by the test written for it. See findings §17 for the measured artefact.
+
 **The problem, measured 2026-08-25.** A successful liquidation returns the bot's change as a
 *single* output carrying both the ada and the collateral tokens it just received. That output fails
 `adaOnlyWalletUtxo()`'s `getAmount().size() == 1` test — correctly — so the bot's entire balance

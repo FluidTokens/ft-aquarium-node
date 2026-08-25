@@ -1025,3 +1025,91 @@ convert path — on loans of exactly this shape.
 which *do* appear in these two transactions. That is a reminder that partial agreement is not
 agreement: those three hashes are among the few that do not move on a re-mint, and reading them as
 confirmation is exactly how a wrong blueprint survives a spot check.
+
+## 17. A successful liquidation disables the bot, and a starved collateral input produces a transaction no node can parse (measured 2026-08-25)
+
+Two defects found on the same day, both **after** the first real liquidation
+(`49743a1e…`, block 4,603,278, `valid_contract=true`, ledger size 12,216, fee 1,133,033), and
+neither reachable by any test in the suite. Both were found by **decoding the artefact** —
+the same instrument that settled the reference-script question hours earlier.
+
+**Both are invisible to the builder's `assertStructure` (V5), and correctly so.** V5 checks
+reference-input ordering, bond echoes against bond inputs, and asset-manager outputs at their
+observed indexes — *everything the validators read*. It says nothing about the bot's own change
+output or its collateral, because **no validator looks there.** A defect in the parts of a
+transaction that only the ledger reads has no on-chain oracle to check it against.
+
+### 17.1 The change output — a successful action creates the condition that blocks the next
+
+The change came back as **one** output:
+
+```
+✅ 49743a1e…#0  1,000,000 lovelace  ada-only   ⇐ cardano-client-lib's withdrawal DUMMY, not ours
+❌ 49743a1e…#4  9,964,993,434 lovelace + 5,000,000 tFLDT
+```
+
+`adaOnlyWalletUtxo()` refuses `#4` — correctly, it holds two assets. The wallet held **9,966 ADA
+and could build nothing**; its only eligible input was a 1 ADA dummy CCL had emitted for its own
+reasons. The tank processor is starved by the same filter (`ScheduledTransactionService:169`,
+which takes `findFirst()` rather than largest, so it is more fragile still).
+
+**Fixed by splitting the change in `postBalanceTx`** — re-shaping what the balancer produced needs
+no knowledge of the payout economics, so it cannot drift from rule R the way a duplicated residual
+calculation would. Installed inside `complete()`, so it runs in **both** passes of the layout probe
+and the observed output indexes are computed against the post-split layout.
+
+> **⛔ The tempting fix is the wrong one.** Carving a fixed small ada output before balancing takes
+> the carve out of the *current* input, not out of the trapped pool: each liquidation leaves a fresh
+> small ada UTxO and a large token-bearing one, and **the large one stays unspendable forever.** The
+> working capital ratchets down to the carve size while the balance grows. It fixes the symptom for
+> exactly one cycle and permanently strands the rest.
+
+### 17.2 The collateral — a negative `MaryValue` is unrepresentable, so the transaction never exists
+
+```
+SUBMIT_FAILED   size 11,915
+backend: TxCmdTxReadError — SIX decoder failures across eras
+final:  DeserialiseFailure 1227  "MaryValue: expected array or int, got TypeNInt"
+
+decoded from the CBOR at BYTE OFFSET 1227, the exact position the ledger named:
+  body key 13  collateral_inputs = 49743a1e…#0   (the 1,000,000 ada-only utxo)
+  body key 17  total_collateral  =  1,670,285
+  body key 16  COLLATERAL_RETURN =   −670,285    ⇐ 1,000,000 − 1,670,285, exact
+```
+
+**The builder computed a collateral return from a collateral input that cannot cover the required
+collateral, and emitted the negative result instead of refusing.** A negative `MaryValue` has no
+encoding, so every era decoder rejected the CBOR **before any validation ran — not phase 2, not
+phase 1. It never became a transaction at all.**
+
+Three things are worth keeping:
+
+- **The binding constraint is the collateral input, not the balance.** The transaction has four
+  inputs and spends the collateral-carrying UTxO too, so the *body balances fine*. Collateral must
+  be pure ada, so capacity was capped at 1,000,000 no matter how much the wallet held. Any fix must
+  reason about **pure-ada capacity specifically.**
+- **The other negative in the body is legitimate.** Key 9, `mint`, value −1 — an NFT burn. The first
+  negative found is not automatically the culprit.
+- **Only the sixth of six decoder errors names the real field.** Which is the day's signature for the
+  third time: *`InsufficientCollateral` earlier was a symptom of a stale input; `DeserialiseFailure`
+  now is a symptom of insufficient collateral.* **Twice the loudest error was not the cause.**
+
+**Refused, not clamped.** Clamping the return to zero yields a transaction that *parses* and is still
+wrong — it over-collateralises and moves the failure somewhere quieter. The shortfall is a fact about
+the wallet, not a number to round.
+
+**⚠ The required collateral is a CEILING.** `1,113,523 × 150 / 100` is `1,670,284.5` and the ledger
+asked for `1,670,285`. Integer division understates it by one lovelace and rebuilds the same
+unparseable transaction.
+
+**Checked on the built body, not before building.** The requirement is a function of the fee and the
+fee is not known until balancing has run; the only sound pre-build bound, `minFeeB × collateral_percent`
+= 233,072, would have passed against a 1,000,000 capacity and **caught nothing**. Building is free —
+no signature, no submission, nothing on chain.
+
+### 17.3 The gap this exposes in the healthcheck
+
+`adaOnlyWalletUtxo()` accepted that UTxO **correctly**: it was ada-only, datum-free and script-free.
+It asks about **shape**. Nothing asked whether it was **large enough**, and `wallet_ok`'s 2 ADA floor
+— the only place in the node encoding the ledger's collateral relationship — **reports rather than
+gates**. This is that gap producing an unparseable artefact.
