@@ -300,6 +300,39 @@ public class LiquidationExecutor {
         this.converters = converters;
         this.submitter = submitter;
         guardMainnetNegativeMargin();
+        guardMainnetIgnoreProfitCheck();
+    }
+
+    /**
+     * ⛔ {@code ignore-profit-check} disables BOTH profitability gates. On mainnet that is a hard
+     * startup failure, never a warning.
+     * <p>
+     * Same reasoning as {@link #guardMainnetNegativeMargin()} and deliberately the same shape: this
+     * bean only exists when {@code loans.enabled=true}, so refusing construction refuses to arm the
+     * liquidation path at all on a mainnet node configured to liquidate at a loss. A WARN on that path
+     * is a comment, not a guard, and "copy the working preview config to mainnet" is the foreseeable
+     * operator action.
+     * <p>
+     * On preview it proceeds, and announces itself unconditionally at boot: a bot that will move
+     * someone's collateral at a loss has to say so where the operator already looks.
+     */
+    private void guardMainnetIgnoreProfitCheck() {
+        if (!configuration.isIgnoreProfitCheck()) {
+            return;
+        }
+        String networkName = network == null ? null : network.getNetwork();
+        // Fail-closed: anything that is not preview or preprod resolves to mainnet.
+        boolean mainnet = networkName == null
+                || (!"preview".equalsIgnoreCase(networkName) && !"preprod".equalsIgnoreCase(networkName));
+        if (mainnet) {
+            throw new IllegalStateException(("loans.liquidation.ignore-profit-check is TRUE on network "
+                    + "%s; it bypasses the absolute profit floor AND the margin, so the bot would "
+                    + "liquidate at an unbounded loss. It is a preview-only test switch and must never "
+                    + "be set on mainnet").formatted(networkName));
+        }
+        log.warn("⛔ loans.liquidation.ignore-profit-check is TRUE on network {} — BOTH profitability "
+                + "gates are bypassed and liquidations will be submitted AT A LOSS. This is a "
+                + "preview-only test switch.", networkName);
     }
 
     /**
@@ -766,7 +799,12 @@ public class LiquidationExecutor {
         //     the margin-EXCLUDED fee − txFee − minAdaFunded. Default floor 0: a floored loss is
         //     refused regardless of the margin. (O-2 seam: floorProfit's fee term is a mark-to-oracle
         //     token value, unchanged here — see record()'s javadoc.)
-        if (configuration.isCheckProfitability()
+        //     ⛔ ignore-profit-check bypasses this gate AND (c) below. It is checked in both places
+        //     rather than once around them because they are independent by construction, and a switch
+        //     that reached only one would be indistinguishable from a broken one: a candidate whose
+        //     floorProfit is negative is refused HERE whatever the margin does.
+        if (!configuration.isIgnoreProfitCheck()
+                && configuration.isCheckProfitability()
                 && floorProfit.compareTo(configuration.getMinProfitAbsoluteLovelace()) < 0) {
             return new Verdict(LiquidationDecision.Outcome.UNPROFITABLE, SubmitVeto.NOT_PROFITABLE,
                     detail);
@@ -778,9 +816,19 @@ public class LiquidationExecutor {
         // (c) The margin lever, exactly where it was: strictly positive over the operator's margin.
         //     Breaking even is not a reason to move someone's collateral. Kept separate from the floor
         //     so it stays an operator preference, not a defeater of the floor.
-        if (expectedProfit.signum() <= 0) {
+        if (!configuration.isIgnoreProfitCheck() && expectedProfit.signum() <= 0) {
             return new Verdict(LiquidationDecision.Outcome.UNPROFITABLE, SubmitVeto.NOT_PROFITABLE,
                     detail);
+        }
+        // Record WHAT WAS IGNORED, not merely that something was. A decision log saying only
+        // "proceeded" cannot answer "what would it have refused", which is the whole question an
+        // operator has about a bot running with its loss protection off.
+        if (configuration.isIgnoreProfitCheck()
+                && (floorProfit.compareTo(configuration.getMinProfitAbsoluteLovelace()) < 0
+                    || expectedProfit.signum() <= 0)) {
+            log.warn("⛔ ignore-profit-check BYPASSED the profit gates for {}: {} — this liquidation "
+                    + "would otherwise have been refused as unprofitable",
+                    assessment.loan().utxoRef(), detail);
         }
         // S5 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
         // from S4's arithmetic: a transaction can be handsomely profitable and still not fit.

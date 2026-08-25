@@ -556,16 +556,20 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         if (scripts.lenderManager() == null) {
             tx.attachRewardValidator(registry.getLenderManagerScript());
         }
-        // No ReferenceScripts field names the pay-in-advance action, so it always travels inline.
-        tx.attachRewardValidator(registry.getLmLiquidateAndPayInAdvanceActionScript());
+        // The convert path's own action validator, 7,051 bytes and the largest script left inline
+        // here. It had no ReferenceScripts field until 2026-08-25, so it ALWAYS travelled inline and
+        // no amount of publishing could move it — which is why a convert transaction measured 20,548
+        // bytes against a 16,384 limit with loan_claim_action already referenced and working.
+        if (scripts.lmLiquidateAndPayInAdvanceAction() == null) {
+            tx.attachRewardValidator(registry.getLmLiquidateAndPayInAdvanceActionScript());
+        }
     }
 
     /**
      * The scripts the caller says are published, paired with the registry object for each — only the
-     * five this builder attaches AND that the shared {@link LiquidateTransactionBuilder.ReferenceScripts}
-     * record can name. It deliberately IGNORES {@code lmLiquidateAction}: this builder attaches the
-     * pay-in-advance action {@code getLmLiquidateAndPayInAdvanceActionScript}, which has no
-     * {@code ReferenceScripts} field and so cannot be referenced. It also ignores {@code assetManager},
+     * six this builder attaches AND that the shared {@link LiquidateTransactionBuilder.ReferenceScripts}
+     * record can name. It deliberately IGNORES {@code lmLiquidateAction}, which is the PLAIN path's
+     * action validator and is never attached here. It also ignores {@code assetManager},
      * which this builder never attaches ({@link #attachValidators}). On preview only
      * {@code loanClaimAction} is set, which is the 8 665-byte biggest inline script and brings the
      * transaction under {@code maxTxSize}.
@@ -586,6 +590,9 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         }
         if (scripts.loanClaimAction() != null) {
             published.add(registry.getLoanClaimActionScript());
+        }
+        if (scripts.lmLiquidateAndPayInAdvanceAction() != null) {
+            published.add(registry.getLmLiquidateAndPayInAdvanceActionScript());
         }
         return published;
     }
@@ -916,7 +923,8 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         // assetManager are excluded here, exactly as in publishedScripts().
         LiquidateTransactionBuilder.ReferenceScripts scripts = request.referenceScripts();
         Stream.of(scripts.loan(), scripts.loanSpend(), scripts.lenderManager(),
-                        scripts.lenderManagerSpend(), scripts.loanClaimAction())
+                        scripts.lenderManagerSpend(), scripts.loanClaimAction(),
+                        scripts.lmLiquidateAndPayInAdvanceAction())
                 .filter(Objects::nonNull)
                 .forEach(refInputs::add);
         return refInputs.stream().sorted(new TransactionInputComparator()).toList();

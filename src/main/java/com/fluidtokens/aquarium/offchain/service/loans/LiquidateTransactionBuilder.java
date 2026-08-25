@@ -432,11 +432,27 @@ public final class LiquidateTransactionBuilder {
                                    TransactionInput lenderManagerSpend,
                                    TransactionInput loanClaimAction,
                                    TransactionInput lmLiquidateAction,
-                                   TransactionInput assetManager) {
+                                   TransactionInput assetManager,
+                                   TransactionInput lmLiquidateAndPayInAdvanceAction) {
+
+        /**
+         * The seven-slot form, for callers that predate {@code lmLiquidateAndPayInAdvanceAction}.
+         * Defaults it to unpublished, which is what every such caller meant.
+         */
+        public ReferenceScripts(TransactionInput loan,
+                                TransactionInput loanSpend,
+                                TransactionInput lenderManager,
+                                TransactionInput lenderManagerSpend,
+                                TransactionInput loanClaimAction,
+                                TransactionInput lmLiquidateAction,
+                                TransactionInput assetManager) {
+            this(loan, loanSpend, lenderManager, lenderManagerSpend, loanClaimAction,
+                    lmLiquidateAction, assetManager, null);
+        }
 
         /** Nothing published: every script travels in the witness set. */
         public static ReferenceScripts none() {
-            return new ReferenceScripts(null, null, null, null, null, null, null);
+            return new ReferenceScripts(null, null, null, null, null, null, null, null);
         }
     }
 

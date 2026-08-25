@@ -153,6 +153,9 @@ public class LoansReferenceScriptVerifier {
                 scripts.lmLiquidateAction(), registry.getLmLiquidateActionScriptHash());
         put(expected, "loans.liquidation.reference-scripts.asset-manager",
                 scripts.assetManager(), registry.getAssetManagerWithdrawScriptHash());
+        put(expected, "loans.liquidation.reference-scripts.lm-liquidate-and-pay-in-advance-action",
+                scripts.lmLiquidateAndPayInAdvanceAction(),
+                registry.getLmLiquidateAndPayInAdvanceActionScriptHash());
         return expected;
     }
 

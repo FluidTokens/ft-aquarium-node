@@ -226,14 +226,15 @@ class ShippedDefaultsTest {
             "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0";
 
     @Test
-    void thePreviewProfileShipsSixBlankedReferenceScriptKeys() throws IOException {
+    void thePreviewProfileShipsSevenBlankedReferenceScriptKeys() throws IOException {
         Object block = at(preview(documents()), "loans.liquidation.reference-scripts");
         assertTrue(block instanceof Map, "reference-scripts is not a block");
         @SuppressWarnings("unchecked")
         Map<String, Object> scripts = (Map<String, Object>) block;
 
         assertEquals(List.of("loan", "loan-spend", "lender-manager", "lender-manager-spend",
-                        "loan-claim-action", "lm-liquidate-action"),
+                        "loan-claim-action", "lm-liquidate-action",
+                        "lm-liquidate-and-pay-in-advance-action"),
                 List.copyOf(scripts.keySet()),
                 "asset-manager is deliberately absent on preview: a plain Liquidate never spends an "
                         + "asset-manager output, so its script is neither attached nor needed");

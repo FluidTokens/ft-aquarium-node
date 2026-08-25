@@ -213,6 +213,25 @@ public class AppConfig {
         @Value("${loans.liquidation.min-profit-absolute-lovelace:0}")
         private BigInteger minProfitAbsoluteLovelace;
 
+        /**
+         * ⛔ TEST-ONLY: bypass BOTH profitability gates and liquidate regardless of loss.
+         * <p>
+         * Not a third threshold — a boolean that skips the absolute floor
+         * ({@link #minProfitAbsoluteLovelace}) <em>and</em> the margin
+         * ({@link #profitMarginLovelace}) together. Reaching only one of the two would be worse than
+         * useless: a loan whose floored profit is negative is refused by the floor no matter what the
+         * margin says, so a flag that cleared only the margin would look enabled and change nothing.
+         * <p>
+         * It replaces the negative-margin idiom, which is a magic number that looks like it does this
+         * and does not. A named boolean says what it means and can be grepped for.
+         * <p>
+         * <b>Refused on mainnet at startup</b>, exactly as a negative margin is: this disables loss
+         * protection on someone else's collateral, and "copy the working preview config" is the
+         * foreseeable operator action.
+         */
+        @Value("${loans.liquidation.ignore-profit-check:false}")
+        private boolean ignoreProfitCheck;
+
         @Value("${loans.liquidation.decision-log-size:200}")
         private int decisionLogSize;
 
@@ -249,7 +268,17 @@ public class AppConfig {
         private String referenceScriptAssetManager;
 
         /**
-         * The parsed form of the seven keys above, as {@link LiquidateTransactionBuilder} wants
+         * The convert path's own action validator. Distinct from {@code lm-liquidate-action}, which
+         * is the PLAIN path's: measured on the fourth deployment this one is 7,051 bytes against that
+         * one's 4,227, and it is the largest script left inline on a convert liquidation. Until this
+         * key existed it could not be referenced at all, which is why a convert transaction sat at
+         * 20,548 bytes against a 16,384 limit with everything else already published.
+         */
+        @Value("${loans.liquidation.reference-scripts.lm-liquidate-and-pay-in-advance-action:}")
+        private String referenceScriptLmLiquidateAndPayInAdvanceAction;
+
+        /**
+         * The parsed form of the eight keys above, as {@link LiquidateTransactionBuilder} wants
          * them: a {@code null} field per validator that is not published.
          */
         private LiquidateTransactionBuilder.ReferenceScripts referenceScripts =
@@ -371,7 +400,9 @@ public class AppConfig {
                     referenceInput("loans.liquidation.reference-scripts.lm-liquidate-action",
                             referenceScriptLmLiquidateAction),
                     referenceInput("loans.liquidation.reference-scripts.asset-manager",
-                            referenceScriptAssetManager));
+                            referenceScriptAssetManager),
+                    referenceInput("loans.liquidation.reference-scripts.lm-liquidate-and-pay-in-advance-action",
+                            referenceScriptLmLiquidateAndPayInAdvanceAction));
             log.info("INIT - liquidation reference scripts: {}", referenceScripts);
         }
 

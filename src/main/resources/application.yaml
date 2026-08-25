@@ -105,6 +105,20 @@ loans:
     # fee. 1.5 ADA leaves headroom for either shape and still refuses dust liquidations, whose fee
     # slice would not repay the transaction that claims it.
     profit-margin-lovelace: ${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:1500000}
+
+    # ⛔ TEST-ONLY. Bypasses BOTH profitability gates -- the absolute floor
+    # (min-profit-absolute-lovelace) AND the margin (profit-margin-lovelace) -- and liquidates
+    # regardless of loss. It is a boolean rather than a third threshold on purpose: a switch that
+    # reached only one of the two gates would look enabled and change nothing, because a loan whose
+    # floored profit is negative is refused by the floor whatever the margin says.
+    #
+    # It replaces the negative-margin idiom, which is a magic number that looks like it does this and
+    # does not. LiquidationExecutor REFUSES TO START when this is true on mainnet -- the same hard
+    # failure a negative margin gets, for the same reason: it disables loss protection on someone
+    # else's collateral, and "copy the working preview config" is the foreseeable operator action.
+    # When enabled it announces itself at boot and logs every decision it lets through, with the
+    # profit figure it ignored.
+    ignore-profit-check: ${AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK:false}
     # THE ABSOLUTE FLOOR, and it is a SECOND gate that profit-margin-lovelace cannot reach.
     # S4 tests two independent things: (a) floorProfit = feeSlice - txFee - minAdaFunded against
     # min-profit-absolute-lovelace, and only then (b) the margin lever. The margin is deliberately
@@ -151,6 +165,13 @@ loans:
       lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:}
       loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
       lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
+      # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
+      # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
+      # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
+      # at all, so it could not be referenced however much else was published -- which is why a convert
+      # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
+      # referenced and working. Referencing this one alone sheds ~7,051 bytes.
+      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:}
       asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:}
 
 scheduling:
@@ -285,6 +306,13 @@ loans:
       # is republished under the fourth deployment. Scanning, health and pricing are unaffected.
       loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
       lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
+      # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
+      # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
+      # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
+      # at all, so it could not be referenced however much else was published -- which is why a convert
+      # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
+      # referenced and working. Referencing this one alone sheds ~7,051 bytes.
+      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:}
   config:
     # FOURTH preview deployment (14 Jul -> 5 Aug -> 17 Aug -> 25 Aug 2026). Both config NFTs are
     # minted in the single tx 8dd38e97...091c at outputs 0 and 1.
