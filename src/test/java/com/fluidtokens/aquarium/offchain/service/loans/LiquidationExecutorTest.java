@@ -1301,20 +1301,42 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * A wallet with nothing usable in it. The loop stops before the scan and records nothing, rather
-     * than scanning and then refusing every candidate it found — the difference between one warning
-     * an operator can act on and a decision log full of misleading refusals.
+     * A wallet with nothing usable in it still scans, prices and records the run — it just cannot
+     * build.
+     *
+     * <h2>Why this reversed</h2>
+     * This test previously asserted the opposite: that the loop stopped <em>before</em> the scan and
+     * recorded nothing. The stated reason was sound as far as it went — better one warning an
+     * operator can act on than a decision log full of misleading per-candidate refusals — but the
+     * position it defended made an unfunded wallet indistinguishable from a quiet market. Nothing
+     * scanned, nothing priced, no run recorded: the blind-bot shape this repo has now been bitten by
+     * three times.
+     * <p>
+     * It bites hardest in SHADOW mode, whose entire purpose is to prove the bot can see and price
+     * real loans <em>before</em> anyone funds a wallet or arms it. A gate that refuses to observe the
+     * world until it could act on it makes the observation-only mode useless exactly when it is
+     * wanted.
+     * <p>
+     * <b>The old concern is still honoured, and that is the point of the assertions below.</b> The
+     * cycle records the aggregate run and returns before the per-candidate build loop, so the
+     * decision log gains a run with counts — evidence the loans were seen and priced — and gains
+     * <em>zero</em> per-candidate decisions. Observability without the flood.
      */
     @Test
-    void aWalletWithNoCleanAdaUtxoStopsBeforeTheScan() {
+    void aWalletWithNoCleanAdaUtxoStillScansAndRecordsTheRun() {
         Wiring wiring = wiringWithWallet(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE),
                 List.of(WALLET_UTXO_WITH_DATUM, WALLET_UTXO_WITH_DATUM_HASH));
 
         wiring.executor().cycle(NOW);
 
-        assertEquals(0, wiring.scanner().scans);
-        assertEquals(0, wiring.log().size());
-        assertNull(wiring.log().lastRun().at());
+        // The world WAS observed: scanned once, and the run recorded with its counts.
+        assertEquals(1, wiring.scanner().scans, "an unfunded wallet must not suppress the scan");
+        assertNotNull(wiring.log().lastRun().at(), "the run must be recorded even when nothing builds");
+
+        // But no candidate was built, and no per-candidate refusal was logged.
+        assertEquals(0, wiring.log().size(),
+                "the build loop must not run, so the decision log must not fill with refusals that "
+                        + "say nothing except 'the wallet is empty'");
     }
 
     // ======================================================================================

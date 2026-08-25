@@ -357,12 +357,6 @@ public class LiquidationExecutor {
             return;
         }
 
-        Optional<Utxo> walletUtxoOpt = adaOnlyWalletUtxo();
-        if (walletUtxoOpt.isEmpty()) {
-            return;
-        }
-        Utxo walletUtxo = walletUtxoOpt.get();
-
         List<LiquidationAssessment> assessments = scanner.scan(now);
 
         // The oracle snapshot is taken once, in the same cycle as the scan, and reused for every
@@ -391,6 +385,26 @@ public class LiquidationExecutor {
         if (buildable.isEmpty()) {
             return;
         }
+
+        // The wallet gate sits HERE, below the scan, and that position is the point.
+        //
+        // It used to be the first thing the cycle did, which made an unfunded wallet indistinguishable
+        // from a quiet market: the cycle returned before scanning, so nothing was scanned, nothing was
+        // priced, and the decision log recorded no run at all. That is the blind-bot shape again, and
+        // it bites hardest in SHADOW mode -- the mode whose entire purpose is to prove the bot can see
+        // and price real loans BEFORE anyone funds a wallet or arms it. Requiring a spendable UTxO
+        // before observing the world made the observation-only mode useless exactly when it is wanted.
+        //
+        // Nothing is loosened for LIVE: a liquidation still cannot be built without a wallet input,
+        // and the refusal is now explicit and counted rather than a silent early return.
+        Optional<Utxo> walletUtxoOpt = adaOnlyWalletUtxo();
+        if (walletUtxoOpt.isEmpty()) {
+            log.warn("{} buildable candidate(s) found but no ada-only wallet utxo is available, so "
+                    + "none can be built; the scan above is still a complete record of what was seen "
+                    + "and priced", buildable.size());
+            return;
+        }
+        Utxo walletUtxo = walletUtxoOpt.get();
 
         Optional<Utxo> configUtxo = utxoResolver.resolveConfigUtxo();
         Optional<Utxo> lmConfigUtxo = utxoResolver.resolveLmConfigUtxo();
