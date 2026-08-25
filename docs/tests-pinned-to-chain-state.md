@@ -75,6 +75,32 @@ vacuous-pass mode**, and none has been checked for it.
 `LiquidateForRealTest`, `LiquidatePayInAdvanceProductionWiringLiveTest`. Most are harmless string
 fixtures; `ShippedDefaultsTest`'s is deliberate and should stay.
 
+## ⚑ NEW WEIGHT, 2026-08-25: the stale fixtures now cost VERIFICATION, not just noise
+
+**Until today the 37 were tolerable because they only failed loudly.** That is the whole argument for
+holding them: a false assertion is the *safe* expiry mode (see the table above), and regenerating them
+pre-empts a decision that is Giovanni's.
+
+**That argument has changed, and the change should reach him rather than sit here.** Three production
+guards landed today — the change split, the collateral-coverage refusal, and `Outcome.QUARANTINED` —
+and **not one of them could be proven end to end**, because the only rigs that drive
+`LiquidateTransactionBuilder.build()` or `LiquidationExecutor.consider()` build on `LoanFixtures` and
+are red against a superseded deployment.
+
+What that cost, concretely:
+
+| guard | proven | NOT proven |
+|---|---|---|
+| change split | the split itself, per-unit conservation, 3 mutants — all by calling the seam directly | that it runs inside a real `complete()`; **the two-pass claim is read off source, not measured** |
+| collateral refusal | the arithmetic, the ceiling, the artefact check, 4 mutants | that it fires on a real build |
+| `QUARANTINED` | that the outcome is wired to a call site, by discrimination | **reachability** — `EveryOutcomeIsReachableTest` reads source and says so in its own javadoc |
+
+**⇒ The 37 are no longer only withholding a signal. They are blocking the rigs that would verify
+production changes**, so every guard added while they are red ships with a gap that has to be written
+down instead of closed. **That is new weight on an open decision, not a new recommendation** — the
+choice between regenerating fixtures from fourth-deployment loans and disabling them pending new ones
+is still Giovanni's, and this file still fixes nothing.
+
 ## Deliberately not fixed
 
 **This list is an inventory, not a work item.** Fixing anything here would pre-empt the unresolved
