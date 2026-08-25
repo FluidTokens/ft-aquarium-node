@@ -100,6 +100,18 @@ class ReferenceScriptPublisherTest {
     private static final String CHANGE = LoanFixtures.entAddress(
             "88888888888888888888888888888888888888888888888888888888");
 
+    /**
+     * The validators the shipped plan publishes, taken FROM THE PLAN rather than from
+     * {@code Validator.values()}.
+     * <p>
+     * These tests are about the liquidation validator set and the measurements that follow from it.
+     * Driving them off the enum instead coupled them to its cardinality, so adding
+     * {@code LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION} on 2026-08-25 broke four of them at once, in the
+     * middle of unrelated work, with failures that named byte totals rather than the cause. The enum
+     * will grow again; the plan is the thing these assertions actually mean.
+     */
+    private static final List<Validator> PLANNED = Plan.minimumSplit().flattened();
+
     private static ReferenceScriptPublisher publisher(String funderAddress) {
         List<Utxo> wallet = List.of(
                 LoanFixtures.adaUtxo("aa".repeat(32), 0, funderAddress, 60_000_000L),
@@ -168,7 +180,8 @@ class ReferenceScriptPublisherTest {
 
         Set<Validator> distinct = new LinkedHashSet<>(covered);
         assertEquals(covered.size(), distinct.size(), "no validator is published twice");
-        assertEquals(Set.of(Validator.values()), distinct, "exactly the six are published");
+        assertEquals(Set.copyOf(PLANNED), distinct,
+                "exactly the validators the plan names are published, and no others");
 
         long totalFee = built.stream().mapToLong(BuiltTransaction::feeLovelace).sum();
         System.out.printf("TOTAL min-ada %d lovelace (%.6f ada); fees %d lovelace; sizes %s%n",
@@ -205,7 +218,7 @@ class ReferenceScriptPublisherTest {
 
         int total = 0;
         long totalMinAda = 0L;
-        for (Validator validator : Validator.values()) {
+        for (Validator validator : PLANNED) {
             int bytes = bodyBytes(publisher.scriptOf(validator));
             long minAda = publisher.minAdaFor(validator, DESTINATION);
             total += bytes;
@@ -228,7 +241,8 @@ class ReferenceScriptPublisherTest {
     @Test
     void aSingleTransactionForAllSixExceedsMaxTxSize() {
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> publisher(FUNDER).build(Plan.single(), DESTINATION, FUNDER));
+                () -> publisher(FUNDER).build(
+                        Plan.of(PLANNED.toArray(new Validator[0])), DESTINATION, FUNDER));
         System.out.println("single-transaction plan refused: " + e.getMessage());
         assertTrue(e.getMessage().contains("maxTxSize " + ReferenceScriptPublisher.MAX_TX_SIZE),
                 "the refusal must name the limit it broke: " + e.getMessage());
@@ -510,7 +524,7 @@ class ReferenceScriptPublisherTest {
         assertEquals(6, scriptOutputs, "six reference-script outputs across the two transactions");
 
         long expectedTotal = 0L;
-        for (Validator validator : Validator.values()) {
+        for (Validator validator : PLANNED) {
             expectedTotal += publisher.minAdaFor(validator, destination);
         }
         assertEquals(expectedTotal, totalMinAda,

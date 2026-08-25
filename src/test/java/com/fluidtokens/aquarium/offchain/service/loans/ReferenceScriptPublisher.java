@@ -80,7 +80,13 @@ public final class ReferenceScriptPublisher {
         LENDER_MANAGER("lender-manager"),
         LENDER_MANAGER_SPEND("lender-manager-spend"),
         LOAN_CLAIM_ACTION("loan-claim-action"),
-        LM_LIQUIDATE_ACTION("lm-liquidate-action");
+        LM_LIQUIDATE_ACTION("lm-liquidate-action"),
+        /**
+         * The CONVERT path's action validator — 7,051 bytes against the plain path's 4,227, and the
+         * largest script left inline on a convert liquidation. Added 2026-08-25 with the
+         * {@code ReferenceScripts} slot that finally lets it be referenced at all.
+         */
+        LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION("lm-liquidate-and-pay-in-advance-action");
 
         private final String configKey;
 
@@ -108,7 +114,8 @@ public final class ReferenceScriptPublisher {
             Validator.LENDER_MANAGER, 5_150_000L,
             Validator.LENDER_MANAGER_SPEND, 5_970_000L,
             Validator.LOAN_CLAIM_ACTION, 38_310_000L,
-            Validator.LM_LIQUIDATE_ACTION, 19_200_000L));
+            Validator.LM_LIQUIDATE_ACTION, 19_200_000L,
+            Validator.LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION, 31_300_000L));
 
     private static final double MIN_ADA_BAND = 0.20d;
 
@@ -322,6 +329,8 @@ public final class ReferenceScriptPublisher {
             case LENDER_MANAGER -> registry.getLenderManagerScript();
             case LENDER_MANAGER_SPEND -> registry.getLenderManagerSpendScript();
             case LOAN_CLAIM_ACTION -> registry.getLoanClaimActionScript();
+            case LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION ->
+                    registry.getLmLiquidateAndPayInAdvanceActionScript();
             case LM_LIQUIDATE_ACTION -> registry.getLmLiquidateActionScript();
         };
     }
@@ -334,6 +343,8 @@ public final class ReferenceScriptPublisher {
             case LENDER_MANAGER -> registry.getLenderManagerWithdrawScriptHash();
             case LENDER_MANAGER_SPEND -> registry.getLenderManagerSpendScriptHash();
             case LOAN_CLAIM_ACTION -> registry.getLoanClaimActionScriptHash();
+            case LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION ->
+                    registry.getLmLiquidateAndPayInAdvanceActionScriptHash();
             case LM_LIQUIDATE_ACTION -> registry.getLmLiquidateActionScriptHash();
         };
     }

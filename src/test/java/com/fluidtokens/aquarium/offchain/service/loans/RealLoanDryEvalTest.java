@@ -298,16 +298,43 @@ class RealLoanDryEvalTest {
      * {@link EvalFixtures#scriptSupplier} resolves on. The size figure is therefore exact, and the
      * evaluation is against the real applied code.
      */
-    private static final Map<Validator, TransactionInput> COORDINATES = new EnumMap<>(Map.of(
-            Validator.LOAN, new TransactionInput("a1".repeat(32), 0),
-            Validator.LOAN_SPEND, new TransactionInput("a2".repeat(32), 0),
-            Validator.LENDER_MANAGER, new TransactionInput("a3".repeat(32), 0),
-            Validator.LENDER_MANAGER_SPEND, new TransactionInput("a4".repeat(32), 0),
-            Validator.LOAN_CLAIM_ACTION, new TransactionInput("a5".repeat(32), 0),
-            Validator.LM_LIQUIDATE_ACTION, new TransactionInput("a6".repeat(32), 0)));
+    /**
+     * One synthetic coordinate per validator, DERIVED from the enum rather than listed against it.
+     * <p>
+     * It used to be a literal map of six. When a seventh validator was added on 2026-08-25 the map
+     * silently had no entry for it, {@code referenceScriptUtxos} dereferenced the null, and six tests
+     * in this class failed with an NPE that named neither the validator nor the map. Generating the
+     * map means the fixture cannot fall behind the enum again.
+     */
+    private static final Map<Validator, TransactionInput> COORDINATES;
+
+    static {
+        Map<Validator, TransactionInput> coordinates = new EnumMap<>(Validator.class);
+        for (Validator validator : Validator.values()) {
+            // Distinct, deterministic, and obviously synthetic. Nothing measured depends on the
+            // value: a reference input is 33 bytes on the wire whatever it points at.
+            String marker = String.format("%02x", 0xa1 + validator.ordinal());
+            coordinates.put(validator, new TransactionInput(marker.repeat(32), 0));
+        }
+        COORDINATES = Map.copyOf(coordinates);
+    }
+
+    /**
+     * The validators the PLAIN {@code Liquidate} path can reference — exactly the ones
+     * {@link #referenceScripts(Set)} maps into the record.
+     * <p>
+     * Deliberately NOT {@code EnumSet.allOf}. {@code LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION} belongs
+     * to the CONVERT path and this class evaluates the plain one, so "all validators" silently meant
+     * "one more than this path can ever carry" and the body-vs-published count went 6 against an
+     * expected 7. The set is named rather than counted because the distinction is real: these six are
+     * what a plain Liquidate can shed, and the seventh is not one of them.
+     */
+    private static final Set<Validator> PLAIN_PATH_REFERENCEABLE = EnumSet.of(
+            Validator.LOAN, Validator.LOAN_SPEND, Validator.LENDER_MANAGER,
+            Validator.LENDER_MANAGER_SPEND, Validator.LOAN_CLAIM_ACTION, Validator.LM_LIQUIDATE_ACTION);
 
     private static final LiquidateTransactionBuilder.ReferenceScripts REFERENCE_SCRIPTS =
-            referenceScripts(EnumSet.allOf(Validator.class));
+            referenceScripts(PLAIN_PATH_REFERENCEABLE);
 
     /**
      * The {@code ReferenceScripts} record for a chosen subset: a coordinate where the validator is
@@ -916,7 +943,7 @@ class RealLoanDryEvalTest {
         Fixture fixture = fixture();
 
         Map<String, Set<Validator>> subsets = new LinkedHashMap<>();
-        subsets.put("all six referenced", EnumSet.allOf(Validator.class));
+        subsets.put("all six referenced", PLAIN_PATH_REFERENCEABLE);
         subsets.put("none referenced (all six inline)", EnumSet.noneOf(Validator.class));
         subsets.put("loanClaimAction only", EnumSet.of(Validator.LOAN_CLAIM_ACTION));
         subsets.put("lmLiquidateAction only", EnumSet.of(Validator.LM_LIQUIDATE_ACTION));
@@ -924,8 +951,11 @@ class RealLoanDryEvalTest {
                 EnumSet.of(Validator.LOAN_CLAIM_ACTION, Validator.LM_LIQUIDATE_ACTION));
         subsets.put("the three largest (+ loan)",
                 EnumSet.of(Validator.LOAN_CLAIM_ACTION, Validator.LM_LIQUIDATE_ACTION, Validator.LOAN));
-        subsets.put("everything but lenderManager",
-                EnumSet.complementOf(EnumSet.of(Validator.LENDER_MANAGER)));
+        // Complement WITHIN the plain path, not within the enum: EnumSet.complementOf would include
+        // the convert path's action validator, which this path cannot reference at all.
+        Set<Validator> allButLenderManager = EnumSet.copyOf(PLAIN_PATH_REFERENCEABLE);
+        allButLenderManager.remove(Validator.LENDER_MANAGER);
+        subsets.put("everything but lenderManager", allButLenderManager);
 
         Map<String, Config> measured = new LinkedHashMap<>();
         for (Map.Entry<String, Set<Validator>> subset : subsets.entrySet()) {
@@ -1039,7 +1069,7 @@ class RealLoanDryEvalTest {
 
     /** Applied bytes of the largest validator this configuration still carries in the witness set. */
     private static int largestInlineScriptBytes(Set<Validator> published) {
-        return EnumSet.allOf(Validator.class).stream()
+        return PLAIN_PATH_REFERENCEABLE.stream()
                 .filter(validator -> !published.contains(validator))
                 .mapToInt(validator -> appliedBytes(scriptOf(validator)))
                 .max()
@@ -1113,7 +1143,7 @@ class RealLoanDryEvalTest {
      * the reference script only its script hash, the Charli3 provider its NFT and its inline datum.
      */
     private static List<Utxo> universe(Fixture fixture) {
-        return universe(fixture, EnumSet.allOf(Validator.class));
+        return universe(fixture, PLAIN_PATH_REFERENCEABLE);
     }
 
     /**
@@ -1172,6 +1202,8 @@ class RealLoanDryEvalTest {
             case LENDER_MANAGER_SPEND -> REGISTRY.getLenderManagerSpendScript();
             case LOAN_CLAIM_ACTION -> REGISTRY.getLoanClaimActionScript();
             case LM_LIQUIDATE_ACTION -> REGISTRY.getLmLiquidateActionScript();
+            case LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION ->
+                    REGISTRY.getLmLiquidateAndPayInAdvanceActionScript();
         };
     }
 

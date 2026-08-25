@@ -92,6 +92,22 @@ class ReferenceScriptPublishSubmitTest {
     private static final String EXPECTED_LOAN_CLAIM_ACTION_HASH =
             "c6e0c4395cf22e08f918ca996d7db49faba793dbd6b647160168ff39";
 
+    /**
+     * The CONVERT path's action validator, 7,051 bytes — the target of the second publish
+     * (2026-08-25). Derived from the shipped blueprint under the fourth deployment's coordinates.
+     */
+    private static final String EXPECTED_PAY_IN_ADVANCE_ACTION_HASH =
+            "00b8a30bd2f18962e527d7c03712e86077a688bfce7e2934ef70034d";
+
+    /** Which validator this run publishes. */
+    private static final Validator TARGET = Validator.LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION;
+
+    private static final String EXPECTED_TARGET_HASH = EXPECTED_PAY_IN_ADVANCE_ACTION_HASH;
+
+    private static String publisherHashOf(LoansContractRegistry registry) {
+        return registry.getLmLiquidateAndPayInAdvanceActionScriptHash();
+    }
+
     @Test
     void publishesLoanClaimActionForReal() throws Exception {
         String mnemonic = System.getenv("WALLET_MNEMONIC");   // never logged, never printed
@@ -110,6 +126,9 @@ class ReferenceScriptPublishSubmitTest {
         assertEquals(EXPECTED_LOAN_CLAIM_ACTION_HASH, registry.getLoanClaimActionScriptHash(),
                 "the derived loan_claim_action does not match the live ConfigDatum — wrong blueprint "
                         + "or wrong coordinates; do NOT publish");
+        assertEquals(EXPECTED_TARGET_HASH, publisherHashOf(registry),
+                "the derived " + TARGET.configKey() + " does not match what this run intends to "
+                        + "publish — wrong blueprint or wrong coordinates; do NOT publish");
 
         UnspendableDestination unspendable = UnspendableDestination.forNetwork(preview());
         String destination = unspendable.address();
@@ -117,15 +136,14 @@ class ReferenceScriptPublishSubmitTest {
         // Change to the FUNDER: see the class javadoc. The bot needs a clean ada-only utxo after this.
         ReferenceScriptPublisher publisher =
                 new ReferenceScriptPublisher(registry, utxoSupplier, paramsSupplier);
-        List<BuiltTransaction> built = publisher.build(Plan.of(Validator.LOAN_CLAIM_ACTION),
-                destination, funder);
+        List<BuiltTransaction> built = publisher.build(Plan.of(TARGET), destination, funder);
 
         assertEquals(1, built.size(), "one script must be one transaction");
         BuiltTransaction tx = built.getFirst();
         assertEquals(1, tx.published().size(), "exactly one script may be published here");
         PublishedScript published = tx.published().getFirst();
-        assertEquals(Validator.LOAN_CLAIM_ACTION, published.validator());
-        assertEquals(EXPECTED_LOAN_CLAIM_ACTION_HASH, published.scriptHash());
+        assertEquals(TARGET, published.validator());
+        assertEquals(EXPECTED_TARGET_HASH, published.scriptHash());
         assertTrue(tx.sizeBytes() < ReferenceScriptPublisher.MAX_TX_SIZE,
                 "publishing transaction is over maxTxSize: " + tx.sizeBytes());
 
@@ -158,7 +176,13 @@ class ReferenceScriptPublishSubmitTest {
         }
         String txHash = result.getValue();
         log.info("PUBLISH SUBMITTED txHash={}", txHash);
-        log.info("PUBLISH COORDINATE for AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION = {}#0", txHash);
+        // Derive the env var from the validator rather than hard-coding it: this line is copied
+        // straight into a deployment, and it named LOAN_CLAIM_ACTION while publishing a different
+        // validator the first time this runner was retargeted. A coordinate pasted into the wrong
+        // key configures a script that is not there and hard-fails the verifier at boot.
+        log.info("PUBLISH COORDINATE for AQUARIUM_LIQUIDATION_REF_{} = {}#0",
+                published.validator().configKey().toUpperCase(java.util.Locale.ROOT).replace('-', '_'),
+                txHash);
         log.info("PUBLISH the locked {} lovelace is at an always-fails address and is NOT recoverable",
                 published.lovelace());
     }
