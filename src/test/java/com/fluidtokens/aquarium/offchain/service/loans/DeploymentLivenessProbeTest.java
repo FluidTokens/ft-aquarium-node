@@ -122,6 +122,18 @@ class DeploymentLivenessProbeTest {
         assertEquals(0, status.indexedUtxos());
         assertTrue(status.detail().contains("NOT ONE unspent utxo"),
                 "an empty world must not be described as ordinary quiet, was: " + status.detail());
+
+        // The reading is a DISJUNCTION and the detail must keep saying so. A zero count has four
+        // causes and this probe cannot tell them apart; the failure mode being guarded here is a
+        // well-meaning edit that trims the list to the likeliest one, which turns an honest
+        // "cannot distinguish" into a confident wrong diagnosis. All four have to stay named.
+        assertTrue(status.detail().contains("CANNOT distinguish"),
+                "the detail must admit it cannot discriminate, was: " + status.detail());
+        for (String cause : List.of("superseded", "never been used", "SPENT", "index time")) {
+            assertTrue(status.detail().contains(cause),
+                    "the '" + cause + "' cause must stay enumerated; a zero count does not choose "
+                            + "between them. Detail was: " + status.detail());
+        }
     }
 
     /**

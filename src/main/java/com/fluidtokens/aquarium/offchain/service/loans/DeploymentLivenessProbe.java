@@ -201,12 +201,23 @@ public class DeploymentLivenessProbe {
                     + "across %d pinned credentials)".formatted(credentials);
         }
         if (lastActivitySlot == null) {
-            // Not "no data" — this IS the signal, in its strongest form. A live deployment that has
-            // ever been used keeps unspent UTxOs at these credentials; an empty set at tip means
-            // either the pin is dead or the deployment has never been used at all.
+            // This IS the signal, in its strongest form — but it is a DISJUNCTION, and the honest
+            // thing is to enumerate it rather than name the likeliest cause and let the reader take
+            // it as a diagnosis. This probe counts UNSPENT rows in the LOCAL INDEX, and there are
+            // four distinct worlds that produce a count of zero. It cannot tell them apart; saying
+            // so is what makes it useful, because each has a different fix and three of the four
+            // have bitten this project.
             return ("the node is at tip and there is NOT ONE unspent utxo at any of the %d pinned "
-                    + "credentials. Either the pinned deployment is superseded, or it has never been "
-                    + "used.").formatted(credentials);
+                    + "credentials. This reading CANNOT distinguish four causes: (1) the pinned "
+                    + "deployment is superseded and the world moved to new policy ids; (2) it has "
+                    + "never been used; (3) it was used and every utxo has since been SPENT -- a "
+                    + "count of unspent rows says nothing about a fully settled deployment; or "
+                    + "(4) the relevant blocks were indexed by a build whose TankUtxoStorage filter "
+                    + "did not include these credentials, so the rows were discarded at index time "
+                    + "and never written. (4) leaves no trace of any kind and is not fixed by "
+                    + "restarting: the cursor is already past those blocks, so it needs a re-index "
+                    + "from before them. Check the chain directly before concluding anything from "
+                    + "this line.").formatted(credentials);
         }
         return ("last activity at the %d pinned credentials was slot %d, %d slots (~%dh) before the "
                 + "current slot %d; %d unspent utxos indexed")
