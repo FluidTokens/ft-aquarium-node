@@ -4,6 +4,10 @@ import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
+import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptSafeUtxoSelection;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
@@ -57,6 +61,17 @@ public class ScheduledTransactionService {
 
     private final QuickTxBuilder quickTxBuilder;
 
+    /**
+     * Only used to build the reference-script-safe coin selection; see the guard at compose().
+     * <p>
+     * <b>Deliberately the backend and not the {@code UtxoSupplier} bean.</b> That bean is
+     * {@code @ConditionalOnProperty(loans.enabled=true)}, and this service is the Aquarium tank
+     * subsystem, which runs on mainnet where lending is disabled by default — injecting it here
+     * would have failed startup on exactly the production deployment this repo ships. The backend
+     * is unconditional, and this is the same construction {@code YaciConfig} performs.
+     */
+    private final BFBackendService bfBackendService;
+
     private final UtxoRepository utxoRepository;
 
     private final StakerService service;
@@ -84,6 +99,11 @@ public class ScheduledTransactionService {
         return new RefInputIndexes(BigInteger.valueOf(parametersRefInputIndex), BigInteger.valueOf(stakingRefInputIndex));
     }
 
+
+    /** The supplier the selection guard reads through; see the field javadoc for why it is built here. */
+    private UtxoSupplier referenceScriptSafeSupplier() {
+        return new DefaultUtxoSupplier(bfBackendService.getUtxoService());
+    }
 
     @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelayString = "${scheduling.transaction-processor.delay-minutes}")
     public void processPayments() {
@@ -192,6 +212,23 @@ public class ScheduledTransactionService {
                         .readFrom(tankContractRefInput);
 
                 quickTxBuilder.compose(tx)
+                        // ⛔ NEVER SPEND A UTxO CARRYING A REFERENCE SCRIPT.
+                        //
+                        // This service reaches coin selection through the SHARED QuickTxBuilder bean
+                        // (YaciConfig), so there is no tx.from(...) here to grep for — the hazard
+                        // arrives by injection and is invisible to a search for the dangerous call.
+                        // That is how it was missed: the two liquidation builders construct their own
+                        // builders and were guarded, and this third site was not.
+                        //
+                        // It spends from the same wallet as the liquidation bot. Nothing with a
+                        // scriptRef is in that wallet today, but a guard whose absence depends on a
+                        // wallet staying empty of a particular UTxO shape is not a guard -- and this
+                        // repo published a reference script to its own address on 2026-08-17 and had
+                        // it consumed by an unguarded builder on 2026-08-25.
+                        .withUtxoSelectionStrategy(
+                                ReferenceScriptSafeUtxoSelection.strategy(referenceScriptSafeSupplier()))
+                        .preBalanceTx((ctx, txn) -> ctx.setUtxoSelector(
+                                ReferenceScriptSafeUtxoSelection.selector(referenceScriptSafeSupplier())))
                         .withSigner(SignerProviders.signerFrom(account))
                         .withSigner(SignerProviders.stakeKeySignerFrom(account))
                         .withRequiredSigners(account.getBaseAddress().getDelegationCredentialHash().get())

@@ -49,6 +49,26 @@ import java.util.regex.Pattern;
 import static com.bloxbean.cardano.client.common.model.Networks.preview;
 
 /**
+ * <h2>⛔ WARNING — THIS RUNNER'S COIN SELECTION CAN SPEND A REFERENCE SCRIPT</h2>
+ * It builds through {@code new QuickTxBuilder(...)} with cardano-client-lib's <b>default</b> coin
+ * selection, which takes any UTxO at the funding address — <b>including one carrying a
+ * {@code scriptRef}</b>. It also submits for real when its gate is set.
+ * <p>
+ * On 2026-08-25 a sibling builder did exactly this and destroyed a published reference-script UTxO
+ * that had been explicitly preserved. That script was dead, so the damage was nil and the locked
+ * min-ada returned as change. <b>A live reference script destroyed this way is unrecoverable, and
+ * everything referencing it breaks at once.</b>
+ * <p>
+ * <b>Before running this against any wallet, check that the wallet holds no UTxO with a reference
+ * script.</b> The proper fix is {@code ReferenceScriptSafeUtxoSelection} — wired into
+ * {@code LiquidateTransactionBuilder}, {@code LiquidatePayInAdvanceTransactionBuilder},
+ * {@code ScheduledTransactionService} and {@code ReferenceScriptPublisher}, and <b>deliberately not
+ * yet</b> into this runner or the other five test-tree builders ({@code PoolCreate}, {@code PoolCancel},
+ * {@code PoolBorrow}, {@code RequestMint}, {@code RequestCancel},
+ * {@code LiquidatePayInAdvanceAndCompound}). That is a known, recorded gap rather than an oversight —
+ * but this runner is the one that submits, so it is the one that carries the warning.
+ *
+ * <h2>What it does</h2>
  * The T-016-X on-chain runner: the same {@link LoanFactory} origination pipeline as
  * {@link LoanFactoryRunnerTest}, but built against the <b>real preview chain</b> — real wallet UTxOs,
  * the real config reference input, the real published reference-script UTxOs, real protocol

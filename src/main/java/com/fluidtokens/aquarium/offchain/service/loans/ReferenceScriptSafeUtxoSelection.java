@@ -58,13 +58,13 @@ import com.bloxbean.cardano.client.coinselection.impl.LargestFirstUtxoSelectionS
  * design question (the pinned collateral input is then excluded from ordinary coin selection, so it
  * cannot also be the UTxO fronting the principal) and is deliberately not attempted here.
  */
-final class ReferenceScriptSafeUtxoSelection {
+public final class ReferenceScriptSafeUtxoSelection {
 
     private ReferenceScriptSafeUtxoSelection() {
     }
 
     /** A UTxO is spendable by the bot only if it is not carrying a published reference script. */
-    static boolean spendable(Utxo utxo) {
+    public static boolean spendable(Utxo utxo) {
         return utxo.getReferenceScriptHash() == null;
     }
 
@@ -74,7 +74,7 @@ final class ReferenceScriptSafeUtxoSelection {
      * by a caller-supplied predicate that does not know about reference scripts — which is exactly
      * what {@code ChangeOutputAdjustments} supplies.
      */
-    static UtxoSelector selector(UtxoSupplier utxoSupplier) {
+    public static UtxoSelector selector(UtxoSupplier utxoSupplier) {
         DefaultUtxoSelector delegate = new DefaultUtxoSelector(utxoSupplier);
         return new UtxoSelector() {
             @Override
@@ -114,7 +114,7 @@ final class ReferenceScriptSafeUtxoSelection {
     }
 
     /** The strategy to hand to {@code QuickTxBuilder.TxContext.withUtxoSelectionStrategy}. */
-    static UtxoSelectionStrategy strategy(UtxoSupplier utxoSupplier) {
+    public static UtxoSelectionStrategy strategy(UtxoSupplier utxoSupplier) {
         return new DefaultUtxoSelectionStrategyImpl(utxoSupplier) {
             @Override
             protected boolean accept(Utxo utxo) {
