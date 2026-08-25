@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -209,19 +210,23 @@ class ShippedDefaultsTest {
      * so does a key going missing.
      */
     /**
-     * The one reference script we published, on 2026-08-17, in preview block 4579719.
+     * The reference script we published on 2026-08-17 for the THIRD deployment, now <b>DEAD</b>.
      * <p>
-     * Its output holds 38.359 ADA of min-ada at a key address we control, and its on-chain
-     * {@code reference_script_hash} was read back and compared to the derived
-     * {@code loanClaimActionScriptHash} ({@code 9ae63b26c98d90024a45f9cdb57e4154f72144d44325f0a261b8bc1d})
-     * before this literal was written down — the coordinate is pinned because it was verified, not
-     * because a build printed it.
+     * It was pinned here because it had been verified — its on-chain {@code reference_script_hash}
+     * was read back and compared to the derived {@code loanClaimActionScriptHash} before the literal
+     * was written down. The fourth deployment (2026-08-25) re-minted the config NFTs, which moves the
+     * derived hash, which moves the script address, so the UTxO now holds a script this deployment
+     * never invokes. Exactly the fate its own comment predicted for "the next redeploy".
+     * <p>
+     * It is kept as a NEGATIVE pin: the test below asserts it does not reappear. That is a stronger
+     * guard than simply requiring blanks, because the realistic mistake is not inventing a
+     * coordinate — it is pasting this one back from a comment, a commit message, or an old .env.
      */
-    private static final String PUBLISHED_LOAN_CLAIM_ACTION =
+    private static final String DEAD_THIRD_DEPLOYMENT_LOAN_CLAIM_ACTION =
             "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0";
 
     @Test
-    void thePreviewProfileShipsOnePublishedCoordinateAndFiveBlankedKeys() throws IOException {
+    void thePreviewProfileShipsSixBlankedReferenceScriptKeys() throws IOException {
         Object block = at(preview(documents()), "loans.liquidation.reference-scripts");
         assertTrue(block instanceof Map, "reference-scripts is not a block");
         @SuppressWarnings("unchecked")
@@ -241,26 +246,23 @@ class ShippedDefaultsTest {
             assertTrue(value.startsWith("${") && value.endsWith("}"), key + " is '" + value + "'");
             String shippedDefault = value.substring(value.indexOf(':') + 1, value.length() - 1);
 
-            if (entry.getKey().equals("loan-claim-action")) {
-                assertEquals(PUBLISHED_LOAN_CLAIM_ACTION, shippedDefault,
-                        key + " must ship exactly the coordinate we published. If this changed, either "
-                                + "the script was republished — in which case verify the new utxo's "
-                                + "reference_script_hash against the derived hash before pinning it — or "
-                                + "someone pasted a coordinate from a dead deployment.");
-                assertNotNull(AppConfig.LiquidationConfiguration.referenceInput(key, shippedDefault),
-                        key + " must parse to a real coordinate");
-            } else {
-                assertEquals("", shippedDefault,
-                        key + " ships a coordinate. Only loan-claim-action is published, and that is "
-                                + "deliberate: shedding its 8,662 bytes alone brings the liquidation "
-                                + "under maxTxSize, so the other five travel inline and lock nothing. "
-                                + "If a second script has genuinely been published, verify its on-chain "
-                                + "reference_script_hash against the derived hash and pin it here.");
+            assertEquals("", shippedDefault,
+                    key + " ships a coordinate. All six are blank for the FOURTH deployment "
+                            + "(2026-08-25): re-minted config NFTs move every derived script hash, so "
+                            + "any previously published UTxO holds a script this deployment never "
+                            + "invokes. If one has genuinely been republished, verify its on-chain "
+                            + "reference_script_hash against the freshly derived hash and pin it here "
+                            + "— and rewrite this test rather than loosening it.");
 
-                // The empty case is the supported skip path: null, not an exception.
-                assertNull(AppConfig.LiquidationConfiguration.referenceInput(key, shippedDefault),
-                        key + " must resolve to 'nothing published' rather than a coordinate");
-            }
+            // The empty case is the supported skip path: null, not an exception.
+            assertNull(AppConfig.LiquidationConfiguration.referenceInput(key, shippedDefault),
+                    key + " must resolve to 'nothing published' rather than a coordinate");
+
+            // Negative pin: the realistic mistake is pasting the dead coordinate back, not inventing one.
+            assertNotEquals(DEAD_THIRD_DEPLOYMENT_LOAN_CLAIM_ACTION, shippedDefault,
+                    key + " ships the THIRD deployment's dead loan-claim-action coordinate. That UTxO "
+                            + "holds a script this deployment never invokes, and pinning it would "
+                            + "hard-fail LoansReferenceScriptVerifier at boot rather than degrade.");
         }
 
         // And blank is the *only* thing that skips silently: a malformed coordinate is still rejected
