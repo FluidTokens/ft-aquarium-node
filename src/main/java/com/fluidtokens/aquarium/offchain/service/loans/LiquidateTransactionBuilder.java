@@ -1523,7 +1523,7 @@ public final class LiquidateTransactionBuilder {
         // index was taken off the canonically sorted list.
         tx.readFrom(refInputs.toArray(TransactionInput[]::new));
 
-        attachValidators(tx);
+        attachValidators(tx, request.referenceScripts());
 
         return tx.withChangeAddress(request.changeAddress());
     }
@@ -1576,19 +1576,43 @@ public final class LiquidateTransactionBuilder {
      * asset-manager script is not among them, because this transaction only <em>creates</em>
      * asset-manager outputs and never spends one.
      * <p>
-     * They are attached unconditionally, including when the caller published reference scripts:
-     * those are read from in {@link #referenceInputs} and declared to {@code withReferenceScripts},
-     * and {@code removeDuplicateScriptWitnesses} then strips the witness copy of each one. Carrying
-     * a script that is also reachable by reference is {@code ExtraneousScriptWitnessesUTXOW}, so
-     * the strip is not an optimisation.
+     * <b>A script that travels by REFERENCE is not attached here.</b> This used to attach all six
+     * unconditionally and rely on {@code removeDuplicateScriptWitnesses(true)} to strip the witness
+     * copy — but that call sat inside {@code if (backendService == null && ...)}, alongside
+     * {@code withReferenceScripts}, which genuinely does need that guard for fee reasons. <b>The
+     * strip does not, and in production {@code backendService} is never null, so it never ran.</b>
+     * <p>
+     * Measured on preview 2026-08-25: a liquidation carried {@code loan_claim_action} as BOTH a
+     * reference input AND an 8,662-byte witness, so publishing the script made the transaction
+     * <em>larger</em> rather than smaller — 20,548 bytes against a 16,384 limit, where 20,342 was the
+     * all-inline estimate. Two coordinates verified clean at boot and the bytes never came off,
+     * because verification proves configuration and says nothing about use.
+     * <p>
+     * Skipping the attach, rather than stripping it afterwards, is the sibling
+     * {@code LiquidatePayInAdvanceTransactionBuilder}'s design (since {@code e11ccca}) and is the
+     * better one: the strip runs AFTER balancing, so a remote evaluator is still shown the oversized
+     * body. And a script both witnessed and referenced is {@code ExtraneousScriptWitnessesUTXOW},
+     * so this was a second, independent ledger rejection waiting behind the size one.
      */
-    private void attachValidators(ScriptTx tx) {
-        tx.attachSpendingValidator(registry.getLoanSpendScript());
-        tx.attachSpendingValidator(registry.getLenderManagerSpendScript());
-        tx.attachRewardValidator(registry.getLoanScript());
-        tx.attachRewardValidator(registry.getLoanClaimActionScript());
-        tx.attachRewardValidator(registry.getLenderManagerScript());
-        tx.attachRewardValidator(registry.getLmLiquidateActionScript());
+    private void attachValidators(ScriptTx tx, ReferenceScripts scripts) {
+        if (scripts.loanSpend() == null) {
+            tx.attachSpendingValidator(registry.getLoanSpendScript());
+        }
+        if (scripts.lenderManagerSpend() == null) {
+            tx.attachSpendingValidator(registry.getLenderManagerSpendScript());
+        }
+        if (scripts.loan() == null) {
+            tx.attachRewardValidator(registry.getLoanScript());
+        }
+        if (scripts.loanClaimAction() == null) {
+            tx.attachRewardValidator(registry.getLoanClaimActionScript());
+        }
+        if (scripts.lenderManager() == null) {
+            tx.attachRewardValidator(registry.getLenderManagerScript());
+        }
+        if (scripts.lmLiquidateAction() == null) {
+            tx.attachRewardValidator(registry.getLmLiquidateActionScript());
+        }
     }
 
     /** The scripts the caller says are published, paired with the registry object for each. */

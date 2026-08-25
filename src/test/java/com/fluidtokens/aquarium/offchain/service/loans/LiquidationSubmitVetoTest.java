@@ -907,6 +907,24 @@ class LiquidationSubmitVetoTest {
      * fee), so the entire shortfall is the min-ada rider.
      */
     @Test
+    // ⛔ RED SINCE 2026-08-25, DELIBERATELY, AND THE REASON IS NOT A DEFECT IN THIS TEST.
+    //
+    // It configures PUBLISHED reference scripts and asserts that the min-ada rider ALONE turns this
+    // candidate into a loss. Its numbers were calibrated against a transaction that carried ~18.7 KB
+    // of REDUNDANT WITNESSES: LiquidateTransactionBuilder attached every validator even when it also
+    // read it as a reference input, because removeDuplicateScriptWitnesses(true) sat behind
+    // `backendService == null` and so never ran in production. Fixing that removed the duplicate
+    // scripts, which lowered the fee, which lifted floorProfit above zero -- so the candidate now
+    // clears the profit gate and reaches the submitter, and this assertion fails.
+    //
+    // The property is still worth guarding; only the scenario's arithmetic has gone stale. It is NOT
+    // recalibrated here on purpose: re-tuning a scenario so a test keeps passing after a behaviour
+    // change is the shape of adjusting a test until it is green, and choosing the new numbers is a
+    // design decision that should not ride along in a production fix.
+    //
+    // ⚠ WHEN RECALIBRATING, THE PROPERTY-PRESERVING CHECK IS: the test must STILL FAIL if the
+    // min-ada rider is removed from the scenario. If it passes with the rider gone, it has been
+    // tuned into passing rather than into testing.
     void aTokenLiquidationRefusedSolelyByTheMinAdaRider() {
         Run run = new Rig()
                 .scenario(minAdaDrivenLossTokenScenario())
