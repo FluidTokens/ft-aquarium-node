@@ -468,8 +468,19 @@ public class LiquidationExecutor {
     private void consider(LiquidationAssessment assessment, long now, Utxo walletUtxo, Utxo configUtxo,
                           Utxo lmConfigUtxo, Map<String, OracleEntry> oraclesByUnit) {
         String loanUtxoRef = assessment.loan().utxoRef();
+        Long heldUntil = quarantine.get(loanUtxoRef);
         if (isQuarantined(loanUtxoRef, now)) {
-            log.debug("loan {} is quarantined until {}", loanUtxoRef, quarantine.get(loanUtxoRef));
+            // Recorded, not merely logged. This was the ONLY path out of consider() that returned
+            // without a decision, so a held loan was indistinguishable from one that was never
+            // considered — and the hold is the bot's own doing, which is exactly the fact an operator
+            // needs to see. The debug line stays: it is per-cycle and the record is what persists.
+            log.debug("loan {} is quarantined until {}", loanUtxoRef, heldUntil);
+            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.QUARANTINED,
+                    LiquidationDecision.Outcome.QUARANTINED.name(),
+                    heldUntil == null
+                            ? "held by an earlier failure; the hold lapses shortly"
+                            : "held by an earlier failure for another %d s (until epoch-millis %d)"
+                                    .formatted(Math.max(0L, (heldUntil - now) / 1000L), heldUntil)));
             return;
         }
 

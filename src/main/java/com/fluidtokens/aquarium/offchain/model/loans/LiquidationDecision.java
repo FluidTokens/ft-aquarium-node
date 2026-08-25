@@ -129,6 +129,22 @@ public record LiquidationDecision(long decidedAt,
         /** Signed and accepted by the backend. {@code txHash} is the hash that was submitted. */
         SUBMITTED,
         /** Signed and transmitted, and the backend rejected it. {@code detail} is its response. */
-        SUBMIT_FAILED
+        SUBMIT_FAILED,
+        /**
+         * Skipped because an earlier failure quarantined this loan UTxO and the quarantine has not
+         * yet lapsed. {@code detail} carries the remaining hold.
+         *
+         * <p>⚠ <b>This is the one outcome that says nothing about the candidate.</b> The other seven
+         * are judgements about the loan; this is a statement about the bot's own recent history, and
+         * an operator reading it as "not liquidatable" would be reading it wrong.
+         *
+         * <p>It exists because the quarantine skip was the <b>only silent exit</b> from
+         * {@code consider()} — five of the six paths recorded a decision and this one returned with a
+         * debug line. A held loan therefore looked exactly like a loan that was never a candidate,
+         * which is the same ambiguity a quiet market has with a dead deployment: <b>absence of a
+         * record is not a record of absence.</b> Confirmed 2026-08-25 by waiting out a real 30-minute
+         * quarantine and observing the first decision land at the first cycle past expiry.
+         */
+        QUARANTINED
     }
 }

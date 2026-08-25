@@ -682,6 +682,26 @@ class LiquidationSubmitVetoTest {
 
     private record Run(LiquidationDecisionLog log, RecordingSubmitter submitter) {
 
+        /**
+         * The two decisions a two-cycle quarantine run now leaves, newest first: the outcome that
+         * caused the hold, then the {@code QUARANTINED} record of the cycle that respected it.
+         *
+         * <p>These tests used to assert a decision count of one, reading the skip's SILENCE as proof
+         * that nothing was retried. The skip records now, so the proof is the record itself — which
+         * is stronger: a count of one was equally consistent with the candidate having dropped out of
+         * the scan, and could not tell the two apart.
+         */
+        LiquidationDecision heldOnTheSecondCycle(LiquidationDecision.Outcome causedBy) {
+            List<LiquidationDecision> decisions = log.newestFirst(10);
+            assertEquals(2, decisions.size(),
+                    "expected the outcome that quarantined the loan and the QUARANTINED record of "
+                            + "the cycle that respected it");
+            assertEquals(causedBy, decisions.get(1).outcome(), "the first cycle's outcome");
+            assertEquals(LiquidationDecision.Outcome.QUARANTINED, decisions.getFirst().outcome(),
+                    "the second cycle must say WHY it did nothing");
+            return decisions.get(1);
+        }
+
         LiquidationDecision onlyDecision() {
             List<LiquidationDecision> decisions = log.newestFirst(10);
             assertEquals(1, decisions.size(), "expected exactly one recorded decision");
@@ -1386,11 +1406,10 @@ class LiquidationSubmitVetoTest {
                 new IllegalStateException("connection reset"));
         Run run = new Rig().submitter(submitter).cycles(2).run();
 
-        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, run.onlyDecision().outcome());
+        run.heldOnTheSecondCycle(LiquidationDecision.Outcome.SUBMIT_FAILED);
         assertEquals(1, submitter.submitted.size(),
                 "a submission whose outcome is UNKNOWN was retried on the next cycle — that is the "
                         + "double-submit the quarantine exists to prevent");
-        assertEquals(1, run.log().size(), "and no second decision was even derived for it");
     }
 
     /**
@@ -1509,7 +1528,7 @@ class LiquidationSubmitVetoTest {
         RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
         Run run = new Rig().submitter(submitter).cycles(2).run();
 
-        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, run.onlyDecision().outcome());
+        run.heldOnTheSecondCycle(LiquidationDecision.Outcome.SUBMIT_FAILED);
         assertEquals(1, submitter.submitted.size(),
                 "a rejected submission was retried on the next cycle");
     }
@@ -1567,7 +1586,9 @@ class LiquidationSubmitVetoTest {
 
         assertEquals(1, submitter.submitted.size(),
                 "the same loan utxo was submitted twice — the quarantine is what has to stop that");
-        assertEquals(1, log.size(), "and no second decision was even derived for it");
+        assertEquals(2, log.size(), "the held cycle must leave a record of why it built nothing");
+        assertEquals(LiquidationDecision.Outcome.QUARANTINED, log.newestFirst(1).getFirst().outcome(),
+                "the second cycle was held by the quarantine the submission took, and says so");
     }
 
     // ======================================================================================

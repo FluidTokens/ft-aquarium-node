@@ -1424,8 +1424,16 @@ class LiquidationExecutorTest {
         // A minute later, well inside the 30-minute quarantine.
         wiring.executor().cycle(NOW + 60_000L);
 
-        assertEquals(1, wiring.log().size(),
+        // The skip now RECORDS (Outcome.QUARANTINED) instead of returning silently, so the proof of
+        // "not built again" is the second decision naming the hold — which is strictly stronger than
+        // the old count of one. A count of one was equally consistent with the loan having dropped
+        // out of the scan altogether; the record says which.
+        assertEquals(2, wiring.log().size(),
+                "the second cycle must leave a record of WHY it did nothing");
+        LiquidationDecision second = wiring.log().newestFirst(10).getFirst();
+        assertEquals(LiquidationDecision.Outcome.QUARANTINED, second.outcome(),
                 "the quarantined loan must not be built again while its quarantine holds");
+        assertEquals(first.loanUtxoRef(), second.loanUtxoRef(), "and it must be about the same loan");
         assertEquals(1, wiring.log().lastRun().bondsScanned(),
                 "it is still scanned and still counted — only the build attempt is skipped");
     }
@@ -1470,7 +1478,9 @@ class LiquidationExecutorTest {
         byRef.executor().quarantineUntil(TX_LOAN + "#0", NOW + 3_600_000L);
         byRef.executor().cycle(NOW);
 
-        assertEquals(0, byRef.log().size());
+        assertEquals(LiquidationDecision.Outcome.QUARANTINED, onlyDecision(byRef).outcome(),
+                "the ref-keyed quarantine must suppress the BUILD and say so — an unrecorded skip is "
+                        + "indistinguishable from a loan that was never a candidate");
         assertEquals(1, byRef.log().lastRun().bondsScanned(),
                 "still scanned and still counted, just not built");
     }
