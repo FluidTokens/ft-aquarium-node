@@ -11,6 +11,16 @@ java {
 	sourceCompatibility = '21'
 }
 
+// The Dockerfile does `ADD ./build/libs/*.jar /app/app.jar`, and Docker refuses a multi-source ADD
+// to a destination that is not a directory. Spring Boot's plugin otherwise emits TWO artifacts --
+// the executable boot jar and a `-plain` library jar -- so `docker build` fails on a clean tree with
+// "when using ADD with more than one source file, the destination must be a directory". Nothing here
+// consumes the plain jar, so the honest fix is to stop producing it rather than to delete it in a
+// build step somebody has to remember. See docker/README or the Dockerfile comment.
+tasks.named('jar') {
+	enabled = false
+}
+
 repositories {
 	mavenCentral()
 	mavenLocal()
