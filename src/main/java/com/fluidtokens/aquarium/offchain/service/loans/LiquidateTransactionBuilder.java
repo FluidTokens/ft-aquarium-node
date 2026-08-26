@@ -696,7 +696,7 @@ public final class LiquidateTransactionBuilder {
         // are not the real ones yet, so it is a transaction the validators refuse. See complete().
         Transaction probe = complete(request, assemble(request, loanOrder, bondOrder,
                 claims(loanOrder, refInputs, placeholders), lenderBondInputIndexes, placeholders,
-                oracles, refInputs, configRefIndex, lmConfigRefIndex), false);
+                oracles, refInputs, configRefIndex, lmConfigRefIndex), false, null);
 
         List<Long> bondOutputIndexes = locateBondOutputs(probe, loanOrder);
         List<ClaimData> claims = claims(loanOrder, refInputs, bondOutputIndexes);
@@ -706,14 +706,15 @@ public final class LiquidateTransactionBuilder {
 
         Transaction transaction = complete(request, assemble(request, loanOrder, bondOrder, claims,
                 lenderBondInputIndexes, assetOutputIndexes, oracles, refInputs, configRefIndex,
-                lmConfigRefIndex), true);
+                lmConfigRefIndex), true,
+                // V5 — everything above is re-derived from the finished body and compared, INSIDE the
+                // build pipeline. There is no separate call for a future path to forget.
+                (ctx, txn) -> assertStructure(txn, request, loanOrder, bondOrder, claims,
+                        lenderBondInputIndexes, assetOutputIndexes, refInputs, configRefIndex,
+                        lmConfigRefIndex, oracles));
 
         assertCollateralIsCoverable(protocolParamsSupplier.getProtocolParams(), transaction,
                 request.walletUtxo());
-
-        // V5 — everything above is re-derived from the finished body and compared.
-        assertStructure(transaction, request, loanOrder, bondOrder, claims, lenderBondInputIndexes,
-                assetOutputIndexes, refInputs, configRefIndex, lmConfigRefIndex, oracles);
 
         return transaction;
     }
@@ -1964,7 +1965,22 @@ public final class LiquidateTransactionBuilder {
      *                     re-derives that layout from the finished body anyway. It also means exactly
      *                     one evaluation — one remote round trip in production — per build.
      */
-    private Transaction complete(Request request, ScriptTx tx, boolean priceScripts) {
+    /**
+     * @param verify V5, installed as a {@code postBalanceTx} hook so it runs INSIDE the library's
+     *               build pipeline (v0.7.2 {@code QuickTxBuilder:478}) rather than after
+     *               {@code build()} returns. A path that forgets to call it cannot exist, because
+     *               there is no separate call to forget (T-054).
+     *               <p>⛔ <b>Not {@code withVerifier}</b>, despite the name: that hook is consulted at
+     *               {@code QuickTxBuilder:567-571}, inside {@code complete()} — <b>the SUBMIT path</b>
+     *               — and {@code build()}/{@code buildAndSign()} reference it nowhere. These builders
+     *               are deliberately submit-incapable and call {@code build()}, so
+     *               {@code withVerifier} is dead code here. It works on the tank, which submits.
+     *               <p>⚠ <b>Null on the probe pass.</b> The probe's claim redeemers carry placeholder
+     *               output indexes no validator accepts, so asserting against them would fail V5 for a
+     *               reason that is not a defect.
+     */
+    private Transaction complete(Request request, ScriptTx tx, boolean priceScripts,
+                                 TxBuilder verify) {
         TransactionEvaluator evaluator =
                 priceScripts && scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
         // The probe assembly is never priced — its claim redeemers carry placeholder output indexes
@@ -2047,6 +2063,10 @@ public final class LiquidateTransactionBuilder {
         // a PARTIAL list makes FeeCalculators price only what it was handed and skip the supplier
         // that would have priced every reference script. With a backend, declare nothing and let the
         // supplier do it. See LiquidatePayInAdvanceTransactionBuilder.complete for the measurement.
+        if (verify != null) {
+            context = context.postBalanceTx(verify);
+        }
+
         List<PlutusScript> published = publishedScripts(request.referenceScripts());
         if (backendService == null && !published.isEmpty()) {
             context = context.withReferenceScripts(published.toArray(PlutusScript[]::new))

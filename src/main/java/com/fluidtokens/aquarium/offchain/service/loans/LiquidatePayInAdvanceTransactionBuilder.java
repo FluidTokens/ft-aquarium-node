@@ -456,16 +456,16 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         // run against it would fail by construction and refuse every batch.
         Transaction probe = complete(request, assemble(request, numbers, configRefIndex, lmConfigRefIndex,
                 collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex, refInputs, 0L, 0L),
-                false);
+                false, null);
 
         long lenderBondOutputIndex = locateBondOutput(probe, request);
         long assetOutputIndex = locateLenderConvertedOutput(probe, request, numbers);
 
         Transaction transaction = complete(request, assemble(request, numbers, configRefIndex,
                 lmConfigRefIndex, collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex,
-                refInputs, lenderBondOutputIndex, assetOutputIndex), true);
-
-        assertStructure(transaction, request, numbers, lenderBondOutputIndex, assetOutputIndex);
+                refInputs, lenderBondOutputIndex, assetOutputIndex), true,
+                (ctx, txn) -> assertStructure(txn, request, numbers, lenderBondOutputIndex,
+                        assetOutputIndex));
         return transaction;
     }
 
@@ -605,7 +605,22 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      *                     ex-units. Only the final assembly is; the layout probe is not (see
      *                     {@link #build}).
      */
-    private Transaction complete(Request request, ScriptTx tx, boolean priceScripts) {
+    /**
+     * @param verify V5, installed as a {@code postBalanceTx} hook so it runs INSIDE the library's
+     *               build pipeline (v0.7.2 {@code QuickTxBuilder:478}) rather than after
+     *               {@code build()} returns. A path that forgets to call it cannot exist, because
+     *               there is no separate call to forget (T-054).
+     *               <p>⛔ <b>Not {@code withVerifier}</b>, despite the name: that hook is consulted at
+     *               {@code QuickTxBuilder:567-571}, inside {@code complete()} — <b>the SUBMIT path</b>
+     *               — and {@code build()}/{@code buildAndSign()} reference it nowhere. This builder
+     *               are deliberately submit-incapable and call {@code build()}, so
+     *               {@code withVerifier} is dead code here. It works on the tank, which submits.
+     *               <p>⚠ <b>Null on the probe pass.</b> The probe's claim redeemers carry placeholder
+     *               output indexes no validator accepts, so asserting against them would fail V5 for a
+     *               reason that is not a defect.
+     */
+    private Transaction complete(Request request, ScriptTx tx, boolean priceScripts,
+                                 TxBuilder verify) {
         TransactionEvaluator evaluator =
                 priceScripts && scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
         // The probe assembly is never priced — its claim redeemers carry placeholder output indexes
@@ -709,6 +724,10 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
             // removeDuplicateScriptWitnesses is no longer needed on either path: since e11ccca a
             // script that travels by reference is not attached in the first place, so there is no
             // duplicate to strip.
+            if (verify != null) {
+                context = context.postBalanceTx(verify);
+            }
+
             List<PlutusScript> published = publishedScripts(request.referenceScripts());
             if (backendService == null && !published.isEmpty()) {
                 context = context.withReferenceScripts(published.toArray(PlutusScript[]::new))
