@@ -622,10 +622,36 @@ including the parked ones. Building `LiquidateAndPayInAdvance` would not make su
 profitable. Our profitability gate (fee value − tx fee − margin) therefore models the right
 quantity.
 
-**Measured population, preview, 2026-08-16.** All ten live loans carry
-`liquidationFeePerMille = 0`; six also carry `shouldLiquidationConvertToPrincipal = true`.
-So no third-party liquidator can profit from any of them at any price. The open question this
-raises for the epic's value: **is zero also the default on mainnet?**
+**Measured population A — preview, 2026-08-16 (SUPERSEDED, see B).** All ten live loans carried
+`liquidationFeePerMille = 0`; six also carried `shouldLiquidationConvertToPrincipal = true`. So no
+third-party liquidator could profit from any of them at any price. The open question this raised:
+**is zero also the default on mainnet?**
+
+> ## ⛔ AMENDED 2026-08-26 — **THE POPULATION TURNED OVER AND THE CONCLUSION INVERTED**
+>
+> **Measured population B — preview, 2026-08-26.** Every one of the **seven live lender bonds** at
+> `addr_test1zrwj6lelm5x206nga9y39s7nxtcc9xdkajy9g4m5jtgqd6cu2cs6p5lhaegyrm8per6p48mpr26tegngjg7zrdk23hpsju03se`
+> carries **`liquidationFeePerMille = 50`**. **Zero of seven are zero-fee.** Read as field 3 of
+> `LenderManagerDatum` from each bond's inline datum — the field itself, not inferred from a split.
+>
+> **⇒ The paragraph above is not wrong; its POPULATION is gone.** Every loan measured on 08-16 has
+> been settled or superseded, and every bond alive today pays **5%**. *A measured claim whose
+> population has moved underneath it is the most dangerous kind of stale fact: **every word of it was
+> true when written.***
+>
+> **⇒ So "the liquidator's profit is exactly zero in every variant" holds of population A and is FALSE
+> of population B**, and the open question — *is zero the default?* — is answered **no** for every
+> preview loan now in existence.
+>
+> **Corroborated on chain by the first real liquidation**, `49743a1e9ef4b0e7756f2143f89fbb2e1a4e274d8a19068ae5d6f0e5244755f7`:
+> its 100,000,000 collateral tokens split **2,410,366 equity / 92,589,634 lender / 5,000,000 to the
+> bot** — conserved to the unit, matching `lender = collateral − equity − liquidationFee`, and
+> `5,000,000 / 100,000,000` is exactly **50 per mille**. **The datum read and the on-chain split agree.**
+>
+> ⚠ **Two consequences that are NOT this document's to decide.** (1) The `-2000000` profit margin was
+> set because liquidations looked structurally unprofitable — **that premise has moved.** (2) The bot's
+> take is now a *computed fee* rather than an unexplained residual, which is what makes paying it out
+> by name viable and may supersede the change split entirely. Both are Giovanni's.
 
 ## 11. Origination: three traps in the request path (verified at `bbe9c1a`, 2026-08-16)
 
