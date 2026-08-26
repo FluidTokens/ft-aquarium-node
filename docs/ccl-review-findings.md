@@ -506,3 +506,74 @@ and balanced."*** He proposed one of two and deserves to see that there are thre
 **Minor, recorded for the operator question:** `backend-services-api` notes `BFBackendService` is
 *"also compatible with Yaci Store"* — relevant to the open *"if Blockfrost is not configured the bot
 should not start"* item, since a node already running Yaci Store may not need Blockfrost at all.
+
+---
+
+# WIDENED PASS — Yaci corpora + officina, at the tx-building seam
+
+Giovanni: *"can the orchestrator double check both cardano-dev-skill and officina have plenty new docs
+about CCL and Yaci? these should both be injected into the investigation context."*
+
+**⚠ Scope held:** the brief is **transaction building**. 83 files of Yaci documentation is an
+invitation to audit the indexer, which is not what was asked. Used **only where indexing constrains
+what a builder can spend**, and the boundary is stated per item.
+
+**⛔ Read from the officina REPO (v0.21.2), not the installed plugin (v0.21.0).** The plugin is two
+versions behind and is missing **§14b — my own correction from last night**, the trap-8 instrument
+fix. Consulting the loaded skill would have re-applied the unqualified grep I measured at a
+three-in-four false-positive rate and then repaired. *Third variant this week of the same class:
+**reading a stale copy of your own correction.***
+
+## ⛔ Y-1 — THE WALLET VIEW IS INDEX-BACKED WITH A FALLBACK THAT ONLY FIRES ON EMPTY
+
+`AppUtxoService:28` is, line for line, the anti-pattern `officina:yaci-store-index-scoping` §5 exists
+to name:
+
+```java
+var walletUtxos = utxoRepository.findUnspentByOwnerAddr(account.baseAddress(), …);
+if (!walletUtxos.isEmpty()) { return walletUtxos; }        // ⛔ PARTIAL SET RETURNED SILENTLY
+else { … bfBackendService.getUtxoService().getUtxos(…) }   // fallback fires ONLY on empty
+```
+
+officina §5, verbatim: *"A start point that captures NONE of the wallet is safer than one that
+captures SOME. Empty triggers the fallback and you get the true balance; **partial returns quietly and
+every downstream decision — coin selection, fee headroom, 'can we afford this' — is made on an
+understated balance with no warning anywhere.**"*
+
+**⇒ IN SCOPE, AND IT FEEDS EVERYTHING:** `ScheduledTransactionService:163` (mainnet tank),
+`LiquidationExecutor:1183` (both liquidation paths), `Healthcheck:51`. **One partial read and all
+three builders plus the operator's health signal are wrong in the same direction, silently.**
+
+**⚑ And it composes with the findings above, which is why it belongs in a tx-building review:**
+- **T-044's `findFirst()`** with no size floor selects from **whatever subset the index happens to
+  hold** — not from the wallet.
+- **C1's measured claim** that the wallet has ~9,966 ADA of reachable collateral capacity **assumes
+  the index returns `49743a1e…#4`.** If the index holds only the 1 ADA output, the builder cannot
+  nominate the other one **even after the collateral roles are separated.**
+- **The 2026-08-25 diagnosis that the wallet held "one usable UTxO"** was read through this method.
+
+**Status: STRUCTURAL, not confirmed active.** Whether the index is currently partial is a live query
+against a node that is not running, and starting it is not mine to do. **The composition is the
+finding: a fix to C1 that leaves Y-1 in place may not restore the capacity it promises.**
+
+## What the Yaci corpora did NOT contribute — bounded, so nobody re-reads them
+
+| corpus | verdict |
+|---|---|
+| `yaci-store/ledger-state-mismatches` (4 versions) | **N/A** — entirely **DRep distribution, DRep expiry, treasury/reserves, governance-action status** vs DB Sync. **No UTxO semantics.** The directory name is the most tx-building-sounding thing in the corpus and it has nothing to do with it |
+| `yaci-store/tutorials/tracking-address-utxos`, `plugins/write-first-plugin` | **Confirms, indexer-side.** *"Your filter plugin runs for every UTXO before it's saved"* — the documented form of `TankUtxoStorage`'s write-time filter, and the upstream cause of Y-1. Already covered by officina §2 |
+| `yaci-devkit` (21 files) | **N/A to this brief** — local devnet operation. Relevant to *testing* the liquidation path offline, which is a different ticket |
+
+## ✅ officina WAS in scope in the first pass, and was used
+
+The seven-ticket matrix has no officina *row* because officina was never a **review target** — it was
+the **register findings were marked against**, per the deliberate circularity rule in
+`ccl-review-checklist.md:20`: *"officina was distilled from this repo, so it is a register of what we
+already know — never the standard."* **Nine items carry a KNOWN marker.** It was relayed, it was
+applied, and the absence of a row is a scoping decision rather than an omission.
+
+## Re-applied
+
+| finding | plain | convert | tank | scope |
+|---|---|---|---|---|
+| **Y-1** wallet view partial-silent | ⛔ via `LiquidationExecutor:1183` | ⛔ same | ⛔ via `:163` | **ALL THREE + healthcheck** |
