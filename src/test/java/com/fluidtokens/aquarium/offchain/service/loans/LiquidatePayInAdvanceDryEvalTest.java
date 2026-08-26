@@ -637,9 +637,10 @@ class LiquidatePayInAdvanceDryEvalTest {
     // Two defects meet here, both found from the pinned cardano-client-lib v0.7.2 source:
     //   (b) ScriptBalanceTxProviders.balanceTx re-runs script-cost evaluation whenever balancing
     //       added inputs, and throws "Transaction evaluator is not set" UNCONDITIONALLY on that
-    //       branch — ignoreScriptCostEvaluationError does not guard it. The layout probe has no
-    //       evaluator by design, so before LayoutProbeEvaluator any build whose wallet utxo did not
-    //       cover the whole transaction alone died in the probe.
+    //       branch — ignoreScriptCostEvaluationError does not guard it. This used to bite the layout
+    //       probe, which had no evaluator by design; T-051 deleted the probe (and with it
+    //       LayoutProbeEvaluator), so the single remaining assembly is the priced one and reaches
+    //       this branch with whatever evaluator the caller supplied.
     //   (a) DefaultUtxoSelectionStrategyImpl.accept() is `return true`: nothing stops the balancer
     //       spending the bot's own published reference script, which on preview sits at the bot's
     //       own operational address.
@@ -695,9 +696,11 @@ class LiquidatePayInAdvanceDryEvalTest {
      * balancing MUST add an input — which is the only way to reach either defect. The build has to
      * succeed, take the ordinary utxo, and leave the published reference script alone.
      * <p>
-     * Remove {@code LayoutProbeEvaluator} from {@code complete} and this fails with "Transaction
-     * evaluator is not set", thrown from the probe. That is the failure Giovanni's first funded
-     * attempt would have hit.
+     * Before T-051 this guarded the layout probe, which ran without an evaluator: removing
+     * {@code LayoutProbeEvaluator} made it fail with "Transaction evaluator is not set". The probe is
+     * gone and so is that class; what this now pins is that the single priced assembly survives a
+     * balancing input and still leaves the published reference script alone. That is the failure
+     * Giovanni's first funded attempt would have hit.
      */
     @Test
     void aBuildThatNeedsABalancingInputSucceedsAndSpendsAnOrdinaryUtxo() {

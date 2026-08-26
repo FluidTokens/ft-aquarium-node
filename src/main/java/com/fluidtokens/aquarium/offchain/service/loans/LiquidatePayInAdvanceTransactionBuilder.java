@@ -75,9 +75,9 @@ import java.util.stream.Stream;
  *   <li><b>Supplied</b> (the production wiring in {@code YaciConfig}) — it is set with
  *       {@code withTxEvaluator}, and {@code ignoreScriptCostEvaluationError(false)} turns a failed
  *       evaluation into a build failure the executor quarantines with its cause, instead of a
- *       {@code log.warn} followed by a transaction that would burn collateral. Only the final assembly
- *       is priced; the throwaway layout probe is not (its placeholder output indexes would make a real
- *       evaluator refuse every batch).</li>
+ *       {@code log.warn} followed by a transaction that would burn collateral. Since T-051 there is
+ *       exactly one assembly per build and it is always priced — the throwaway layout probe, which was
+ *       deliberately unpriced, is gone.</li>
  *   <li><b>Absent</b> — the offline test rigs, which have no network and evaluate separately against
  *       the real PlutusV3 machine ({@code LiquidatePayInAdvanceDryEvalTest}). Behaviour is then exactly
  *       as it was: placeholder ex-units, no throw.</li>
@@ -120,11 +120,11 @@ import java.util.stream.Stream;
  *
  * <h2>Every index is derived from the finished body</h2>
  * {@code lenderBondOutputIndex} (an absolute output position) and {@code assetOutputIndexes} (a
- * position in the asset-manager-credential-filtered output list) are things cardano-client-lib
- * decides, not this builder. As {@code LiquidateTransactionBuilder} does, the transaction is
- * assembled once with placeholder indexes purely to observe the finished layout (the <em>probe</em>),
- * the real indexes are read off that body, and it is assembled again; then {@link #assertStructure}
- * re-derives them from the finished body and refuses on any mismatch.
+ * position in the asset-manager-credential-filtered output list) are COMPUTED from the order this
+ * builder emits its three outputs in — outputs are a list and the ledger preserves that order, so the
+ * only unknown is {@link OutputLayout#CCL_PREPENDED_OUTPUTS}. As {@code LiquidateTransactionBuilder}
+ * does, the transaction is built ONCE (T-051); {@link #assertStructure} then re-derives both indexes
+ * from the finished body and refuses on any mismatch.
  */
 public final class LiquidatePayInAdvanceTransactionBuilder {
 
@@ -309,8 +309,8 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     }
 
     /**
-     * Assembles and completes the transaction: probe for the layout, rebuild with the observed
-     * indexes, then re-derive and assert them against the finished body.
+     * Assembles and completes the transaction ONCE: compute the output indexes from the emission
+     * order, build, then re-derive and assert them against the finished body.
      *
      * <h2>Reviewer's orientation — what this transaction IS</h2>
      * A pay-in-advance liquidation is not "sell the collateral". The bot <b>fronts the loan's
@@ -342,15 +342,23 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * {@code loan_claim_action}. <b>Each one's stake credential must be registered on chain</b> or the
      * ledger cannot resolve the withdrawal — verified registered for all five on preview 2026-08-24.
      *
-     * <h2>Why the transaction is built TWICE</h2>
-     * Several redeemer fields name <b>absolute output positions</b> ({@code lenderBondOutputIndex},
-     * {@code assetOutputIndex}). Those positions cannot be written down in advance: cardano-client-lib
-     * inserts a dummy output for transactions carrying withdrawals and appends change afterwards, so
-     * where our outputs land is only knowable once the body exists. So the first pass — the
-     * <b>layout probe</b> — is assembled with placeholder indexes purely to be measured; the observed
-     * positions are then fed into a second, real assembly. <b>The probe's body is discarded and never
-     * returned.</b> Its redeemers name indexes no validator would accept, which is why it is
-     * deliberately not script-costed (see {@link LayoutProbeEvaluator}).
+     * <h2>Why the transaction is built ONCE (T-051, 2026-08-26)</h2>
+     * Two redeemer fields name output positions: {@code lenderBondOutputIndex} (an absolute body
+     * index) and {@code assetOutputIndex} (an index into the asset-manager-filtered list). This
+     * builder used to discover them by assembling the whole transaction a first time purely to
+     * measure the layout, then assembling it again. <b>It no longer does.</b>
+     * <p>
+     * <b>Outputs are a LIST and the ledger preserves builder order exactly</b> — see
+     * {@code docs/ledger-index-ordering.md} — so an output's position IS the order it was added in.
+     * The only thing this builder does not control is what cardano-client-lib puts in front:
+     * {@link OutputLayout#CCL_PREPENDED_OUTPUTS}. Both indexes are therefore computed in
+     * {@link #build}, and the second assembly is gone — which also means exactly one script-cost
+     * evaluation, i.e. one remote round trip in production, per build.
+     * <p>
+     * <b>The probe was never the guarantee; V5 is.</b> {@code assertStructure} re-derives both indexes
+     * from the FINISHED body — through the same {@code locateBondOutput} and
+     * {@code locateLenderConvertedOutput} helpers the probe used — and refuses on any disagreement, so
+     * a layout mistake is a build-time refusal rather than a chain failure.
      *
      * <h2>What the ledger sorts, and what must therefore never be assumed</h2>
      * The ledger orders <b>inputs</b> canonically (by transaction id, then index) and <b>withdrawals</b>
@@ -451,19 +459,32 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         int providerRefIndex = refIndex(refInputs, request.oracle().charlieProviderReferenceInput(),
                 "charli3 provider");
 
-        // Probe with placeholder output indexes purely to observe the finished layout. Never priced:
-        // its claim redeemers carry placeholder output indexes no validator accepts, so a real evaluator
-        // run against it would fail by construction and refuse every batch.
-        Transaction probe = complete(request, assemble(request, numbers, configRefIndex, lmConfigRefIndex,
-                collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex, refInputs, 0L, 0L),
-                false, null);
-
-        long lenderBondOutputIndex = locateBondOutput(probe, request);
-        long assetOutputIndex = locateLenderConvertedOutput(probe, request, numbers);
+        // The output indexes, COMPUTED from the emission order rather than observed off a throwaway
+        // probe body (T-051, 2026-08-26). assemble() emits exactly three outputs, in this order:
+        //
+        //   1. the bond echo, at the LenderManager credential  -> absolute body index
+        //   2. the borrower's equity compensation              -> asset-manager filtered slot 0
+        //   3. the lender's paid-in-advance ada                -> asset-manager filtered slot 1
+        //
+        // The bond echo is the FIRST output this builder adds, so its absolute position is whatever
+        // cardano-client-lib prepended and nothing else — see OutputLayout.CCL_PREPENDED_OUTPUTS. The
+        // asset index is into the FILTERED list, so it needs no such offset: the prepended dummy and
+        // the appended change sit at the change address and the echo at the LenderManager credential,
+        // so none of them survives the asset-manager filter. loan_claim_action reads the borrower's
+        // compensation at the bare loan index, which pins it to slot 0 and leaves the lender's output
+        // at slot 1 — the constraint V5 re-asserts as `assetOutputIndex != 0`.
+        //
+        // ⚠ Unlike the plain path, this layout is NOT corroborated by an accepted transaction: no
+        // convert-path liquidation has ever been submitted. What makes it safe is the same thing that
+        // made the probe safe — V5 re-derives BOTH indexes from the FINISHED body, via the very same
+        // locateBondOutput / locateLenderConvertedOutput helpers the probe used, and refuses on any
+        // disagreement. A layout mistake is a build-time refusal, not a chain failure.
+        long lenderBondOutputIndex = OutputLayout.CCL_PREPENDED_OUTPUTS;
+        long assetOutputIndex = 1L;
 
         Transaction transaction = complete(request, assemble(request, numbers, configRefIndex,
                 lmConfigRefIndex, collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex,
-                refInputs, lenderBondOutputIndex, assetOutputIndex), true,
+                refInputs, lenderBondOutputIndex, assetOutputIndex),
                 (ctx, txn) -> assertStructure(txn, request, numbers, lenderBondOutputIndex,
                         assetOutputIndex));
         return transaction;
@@ -599,13 +620,14 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     }
 
     /**
-     * Assembles and balances one body. Mirrors {@link LiquidateTransactionBuilder#complete}.
+     * Assembles and balances one body — <b>once</b>. Mirrors {@link LiquidateTransactionBuilder#complete}.
      *
-     * @param priceScripts whether this assembly is the one whose redeemers must carry measured
-     *                     ex-units. Only the final assembly is; the layout probe is not (see
-     *                     {@link #build}).
-     */
-    /**
+     * <p>Since T-051 there is exactly one assembly per build: the layout probe is gone, because the
+     * two output indexes are computed from the emission order instead of observed off a throwaway
+     * body (see {@link #build} and docs/ledger-index-ordering.md). That assembly is always priced, so
+     * every redeemer carries measured ex-units, and it means exactly one evaluation — one remote
+     * round trip in production — per build.
+     *
      * @param verify V5, installed as a {@code postBalanceTx} hook so it runs INSIDE the library's
      *               build pipeline (v0.7.2 {@code QuickTxBuilder:478}) rather than after
      *               {@code build()} returns. A path that forgets to call it cannot exist, because
@@ -615,22 +637,10 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      *               — and {@code build()}/{@code buildAndSign()} reference it nowhere. This builder
      *               are deliberately submit-incapable and call {@code build()}, so
      *               {@code withVerifier} is dead code here. It works on the tank, which submits.
-     *               <p>⚠ <b>Null on the probe pass.</b> The probe's claim redeemers carry placeholder
-     *               output indexes no validator accepts, so asserting against them would fail V5 for a
-     *               reason that is not a defect.
      */
-    private Transaction complete(Request request, ScriptTx tx, boolean priceScripts,
-                                 TxBuilder verify) {
+    private Transaction complete(Request request, ScriptTx tx, TxBuilder verify) {
         TransactionEvaluator evaluator =
-                priceScripts && scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
-        // The probe assembly is never priced — its claim redeemers carry placeholder output indexes
-        // no validator accepts — but cardano-client-lib DEMANDS an evaluator the moment balancing
-        // adds an input, and throws "Transaction evaluator is not set" on that path regardless of
-        // ignoreScriptCostEvaluationError. Without this the build dies in the probe whenever the
-        // nominated wallet utxo does not cover the whole transaction alone. See LayoutProbeEvaluator.
-        TransactionEvaluator contextEvaluator = evaluator != null
-                ? evaluator
-                : (priceScripts ? null : LayoutProbeEvaluator.INSTANCE);
+                scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
         try {
             // Production: the one-argument constructor the library documents, which wires the utxo
             // supplier, protocol params, SCRIPT SUPPLIER and transaction processor from one backend —
@@ -697,10 +707,11 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                 // script to fetch and NPE on the missing supplier. The rig hands scripts in explicitly.
                 context = context.withScriptSupplier(scriptHash -> Optional.empty());
             }
-            if (contextEvaluator != null) {
-                // Keyed on contextEvaluator, but ignoreScriptCostEvaluationError above stays keyed on
-                // `evaluator`: a probe must never turn an evaluation failure into a build failure.
-                context = context.withTxEvaluator(contextEvaluator);
+            if (evaluator != null) {
+                // Keyed on evaluator, but ignoreScriptCostEvaluationError above stays keyed on
+                // `evaluator`: with one present, a failed evaluation stops the build rather than
+                // shipping placeholder ex-units (CCL trap 8).
+                context = context.withTxEvaluator(evaluator);
             }
 
             // ⚠ CCL TRAP: withReferenceScripts with a PARTIAL list makes the fee LESS complete.
@@ -972,8 +983,8 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     }
 
     /** The absolute output position of the lender-bond echo — matched on address, datum and NFT. */
-    private long locateBondOutput(Transaction probe, Request request) {
-        List<TransactionOutput> outputs = probe.getBody().getOutputs();
+    private long locateBondOutput(Transaction transaction, Request request) {
+        List<TransactionOutput> outputs = transaction.getBody().getOutputs();
         List<Integer> matches = new ArrayList<>();
         AssetType bondNft = new AssetType(registry.getLenderBondPolicyId(), request.loan().loanId());
         for (int i = 0; i < outputs.size(); i++) {
@@ -998,9 +1009,9 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * {@code converted_to_liquidity} datum so a reorder relative to the borrower compensation output is
      * caught rather than assumed.
      */
-    private long locateLenderConvertedOutput(Transaction probe, Request request, Numbers numbers) {
+    private long locateLenderConvertedOutput(Transaction transaction, Request request, Numbers numbers) {
         String convertedDatumHex = lenderConvertedDatum(request).serializeToHex();
-        List<TransactionOutput> filtered = assetManagerOutputs(probe);
+        List<TransactionOutput> filtered = assetManagerOutputs(transaction);
         List<Integer> matches = new ArrayList<>();
         for (int i = 0; i < filtered.size(); i++) {
             TransactionOutput output = filtered.get(i);
