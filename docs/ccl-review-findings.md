@@ -147,3 +147,73 @@ liquidation path. Morning decision.
 **Denominator: 18 items checked in both builders. 5 match the authors outright, 11 diverge in both,
 2 diverge between siblings.** Both sibling divergences are absences in the convert path, and both were
 introduced last night.
+
+---
+
+## T-044 — `ScheduledTransactionService` (the Aquarium tank processor, **the only builder that runs on mainnet**)
+
+### ✅ THE MAINNET PATH IS SAFE ON THE TRAP THAT CAUSED THE 2026-08-21 INCIDENT
+
+The sweep showed `withTxEvaluator` **0 hits** beside `ignoreScriptCostEvaluationError` **1** — the exact
+shape of trap 8, on the path that reaches operators. **It is not the trap.** Traced through v0.7.2:
+
+```
+YaciConfig:25         new QuickTxBuilder(bfBackendService)
+QuickTxBuilder:…      this.transactionProcessor = new DefaultTransactionProcessor(...)
+TransactionProcessor  public interface TransactionProcessor extends TransactionEvaluator   ⇐ the key line
+QuickTxBuilder:371    txBuilderContext.withTxnEvaluator(transactionProcessor)   ⇐ when none is set explicitly
+:240                  .ignoreScriptCostEvaluationError(false)
+```
+
+**⇒ A real Blockfrost evaluator, fail-closed. No escalation.** Worth stating plainly because the
+grep signature is indistinguishable from the incident's and would read as a finding to anyone who
+stopped at the sweep. *The evaluator arrives by injection, so there is no `withTxEvaluator` to find —
+the same invisibility that hid the reference-script hazard at this very call site.*
+
+### ⛔ C1 — THIS BUILDER DIVERGES FROM BOTH SIBLINGS, AND IN THE **BETTER** DIRECTION
+
+**No `withCollateralInputs` at all.** CCL selects collateral itself, so collateral here is **not welded
+to the spend input** the way it is in both liquidation builders. **⇒ The T-042 defect does not exist on
+the mainnet path**, and this is the shape the liquidation builders could adopt.
+
+### ⚠ THE WALLET FILTER IS WEAKER THAN THE LIQUIDATION GUARD — ON MAINNET
+
+`:171-173`
+```java
+.filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
+.findFirst();
+```
+Against `LiquidateTransactionBuilder:908`, which also rejects `inlineDatum` and `dataHash`, three gaps:
+
+1. **`findFirst()`, not largest.** It takes an arbitrary ada-only UTxO. **There is no minimum size**,
+   so it can select dust and fail to fund the transaction — the exact shape that starved the
+   liquidation path with a 1 ADA UTxO on 2026-08-25.
+2. **No datum check.** A datum-bearing ada-only UTxO passes here and is refused there. Low severity —
+   a datum on a key-locked output is inert — but the two filters answer the same question differently.
+3. **No floor**, where the healthcheck's `wallet_ok` uses 2,000,000 lovelace as its spendability
+   threshold. **Three places encode "a UTxO this builder can use" and none of them agree.**
+
+**Consequence:** a failed build — loud, free, nothing on chain. **Not a loss, and not urgent**, but it
+is on the path that reaches operators and it is the third instance of one rule living in three places.
+
+### The three-builder table
+
+| # | plain | convert | **tank (mainnet)** | scope |
+|---|---|---|---|---|
+| **A1** strip in the wrong guard | ⛔ | ⛔ | n/a — never declares | SOME |
+| **A2** reference-script idiom | (b) | (b) | **(b)** — tank contract travels by `readFrom`, not attached | ✅ **ALL MATCH** |
+| **A3** `withReferenceScripts` guarded | ⛔ | ⛔ | n/a — always has a backend supplier | SOME |
+| **B1** `withChangeAddress` explicit | ✅ | ✅ | ✅ `:209` | ✅ **ALL MATCH** |
+| **B3** residual paid out by name | ⛔ | ⛔ | ⛔ | **ALL** |
+| **B4** `mergeOutputs(false)` | ✅ | ✅ | ✅ `:239` | ✅ **ALL MATCH** |
+| **C1** collateral welded to spend input | ⛔ | ⛔ | ✅ **absent — CCL selects** | ⛔ **SOME — the tank is right** |
+| **C3** capacity guard | ✅ | ⛔ | ⛔ | ⛔ **ONE has it** |
+| **D1** fail-closed evaluation | ✅ | ✅ | ✅ `:240` | ✅ **ALL MATCH** |
+| **D2** every path gets an evaluator | ⛔ probe | ⛔ probe | ✅ no probe | SOME |
+| **E1** `withVerifier` | ⛔ | ⛔ | ⛔ | **ALL** |
+| **E2** `withTxInspector` | ⛔ | ⛔ | ⛔ | **ALL** |
+| **F1** indexes observed | ⛔ | ⛔ | n/a — redeemer carries no output index, so no probe is needed | SOME |
+| **change split** | ✅ | ⛔ | ⛔ | ⛔ **ONE has it** |
+
+**Denominator across three builders: 5 items match author usage everywhere · 4 diverge everywhere ·
+the rest split.** The tank is the only builder that gets C1 right and the only one that needs no probe.
