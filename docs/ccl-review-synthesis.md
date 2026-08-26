@@ -1,12 +1,18 @@
 # CCL transaction-building review — what to do
 
 **Read this first; `ccl-review-findings.md` is the evidence and `ccl-review-checklist.md` the standard.**
-Six builders reviewed against cardano-client-lib **v0.7.2** — our exact pin — and its 95
-author-written integration tests. Nothing was fixed in any liquidation path. **Nothing is deployed.**
+Six builders reviewed against cardano-client-lib **v0.7.2** — our exact pin — its 95 author-written
+integration tests, **and (second pass, 2026-08-26) the 66-file CCL documentation corpus, the Yaci
+corpora, and officina.** Nothing was fixed in any liquidation path. **Nothing is deployed.**
+
+> **⚠ The first pass ran without the docs** — a `find … | head -1` returned a README-only plugin
+> version (measured: 12 draws, 3 wrong versions, the right one **zero** times). Giovanni ordered it
+> re-run. **Nothing from the first pass was contradicted, and the second pass found a live latent
+> defect the first could not reach.** Decisions 1 and 3 below carry its results.
 
 ---
 
-# ⛔ TWO THINGS THAT CHANGE A DECISION YOU ARE ABOUT TO MAKE
+# ⛔ THREE THINGS THAT CHANGE A DECISION YOU ARE ABOUT TO MAKE
 
 ## 1. The wallet needs nothing. It was never short.
 
@@ -34,7 +40,18 @@ mean something. **The available capacity is ~5,965× the requirement.**
 nominates **no** collateral inputs at all and lets CCL choose. **It has never had this defect.** The
 proposal is not "invent a way to separate the two roles"; it is **"do what the tank already does."**
 
-> Funding the wallet still works and is zero-risk. This is about whether it is *necessary*. It is not.
+> Funding the wallet still works and is zero-risk. This is about whether it is *necessary*.
+
+**⚠ SECOND-PASS QUALIFICATION — read this before acting on the row above.** The collateral arithmetic
+was exercised directly against CCL's `CollateralBuilders` and **stands**. What is now in question is
+whether the **input set** it ran on was complete. `AppUtxoService:28` reads the wallet from the local
+index and falls back to the provider **only when the index returns EMPTY** — so a **partially indexed**
+wallet returns quietly, and every builder decides on an understated balance (finding **Y-1**). The
+"9,964 ADA is reachable" claim assumes the index returns `49743a1e…#4`.
+
+**⇒ Not "the measurement was wrong" — "the measurement's input may have been partial."** A fix that
+separates the collateral roles but leaves Y-1 in place **may not restore the capacity it promises.**
+Settling it means querying a running node, which is your call, not mine.
 
 ## 2. The convert path can still build the transaction no node can parse — and it is live
 
@@ -54,6 +71,33 @@ whenever `shouldLiquidationConvertToPrincipal == True` — **six of the ten meas
 **Not mainnet** (lending is disabled there). **But the next True-bond candidate takes this path.**
 
 ---
+
+## 3. ⛔ A latent defect that arms the moment you publish one more reference script
+
+Found **only** because the docs surfaced `mintAsset` semantics. **Both liquidation builders burn the
+loan NFT:**
+
+```
+LiquidateTransactionBuilder:1476             tx.mintAsset(registry.getLoanScript(), burns, …)
+LiquidatePayInAdvanceTransactionBuilder:487  tx.mintAsset(registry.getLoanScript(), …)
+```
+
+**`mintAsset(script, …)` ALWAYS attaches a witness copy of the policy script.** But `loan.loan` is
+also a reference-script candidate, and the attach-skip that implements our reference-script idiom
+guards a **different call**:
+
+```
+:1626  if (scripts.loan() == null) { tx.attachRewardValidator(…); }   ← skipped when referenced
+:1476  tx.mintAsset(registry.getLoanScript(), …)                      ← attaches ANYWAY
+```
+
+**⇒ Set `AQUARIUM_LIQUIDATION_REF_LOAN` — the config slot already exists — and the same script is a
+reference input AND a witness copy in one transaction:** `ExtraneousScriptWitnessesUTXOW` at phase 1,
+or the bytes paid for twice with evaluation seeing the bloated body. **And the safety net is disabled:**
+`removeDuplicateScriptWitnesses(true)` sits inside a guard that never fires in production.
+
+**Latent today** — `loan:` is unset. **But publishing `loan` is the obvious next step for
+transaction-size reduction, and it is exactly what arms this.**
 
 # THE STRUCTURAL FINDING — why these keep happening
 
@@ -118,6 +162,13 @@ question anyone has to remember to ask.*
 running outside it where a path can skip it silently. **Costs:** **three separate fixes, not one** —
 see the costing note below.
 
+### P8 — Guard the minted-and-referenced script before publishing `loan`. *Blocks a foot-gun.*
+**Buys:** publishing `loan` stops being able to produce a phase-1 rejection or a double-paid script.
+**Costs:** either skip the mint-side attach when the script is referenced, or move
+`removeDuplicateScriptWitnesses(true)` out of the guard that stops it running in production (**that
+guard is A1 and is non-idiomatic anyway** — the library's own tests call it standalone). **⚠ Do this
+BEFORE publishing another reference script, not after.**
+
 ### P6 — Compute output indexes instead of probing for them.
 **Buys:** deletes the two-pass layout probe, deletes `LayoutProbeEvaluator`, and **halves the build
 cost of every liquidation** — one full assembly and one evaluate call instead of two. An index that is
@@ -125,6 +176,12 @@ computed can be **asserted** and fails loudly; one that is observed accepts what
 **Costs:** touches the core of both liquidation builders. Composition order is fixed and verified
 (`AbstractTx.complete():304-328`; exactly one withdrawal dummy however many withdrawals,
 `StakeTx:291-295`; `ChangeOutputAdjustments` adds inputs without reordering outputs).
+
+**⚑ AND THE DOCS OFFER A THIRD OPTION NEITHER OF US CONSIDERED.** You proposed computing the indexes;
+I proposed compute-and-assert. The library documents a third: **drop these builders to the Composable
+Functions API**, which exists for *"deterministic, ordered control over how inputs/outputs are shaped
+and balanced."* Larger, but it is the layer built for this problem rather than a workaround on top of
+one that is not.
 
 ### P7 — `withTxInspector(...)` on the diagnostic paths. *Trivial.*
 **Buys:** reading a built body stops requiring hand re-serialisation — which is how three of
@@ -163,6 +220,34 @@ coin selection is reference-script blind, so there was no idiom to adopt, and it
 fallback trap that would have made it decorative.
 
 ---
+
+# FORWARD-LOOKING — from the docs, not urgent, not proposals
+
+- **`ScriptTx` is DEPRECATED in 0.8.0** and will be removed; migration is documented as drop-in
+  (`new ScriptTx()` → `new Tx()`). **All three production builders use it.** We are pinned at 0.7.2 and
+  0.8 is preview-only on a funds path, so **this is a roadmap item, not a task** — but it is the
+  clearest illustration of why the docs were worth re-running for: **a source tree pinned at 0.7.2
+  cannot tell you a class is going away.**
+- **`tx.mintAsset(policyId, …)`** in 0.8 mints via a *reference script*, which would dissolve P8's
+  cause rather than guard it.
+- **⚑ TxFlow BATCH is a CANDIDATE CLOSURE for a defect you have been carrying.** *"Transaction hashes
+  are computed client-side using Blake2b-256, so subsequent transactions can reference earlier outputs
+  before any are submitted."* That is the documented answer to **one wallet UTxO per cycle, the second
+  liquidation building against an input the first already spent.** ⚠ **Test it, do not adopt it** —
+  preview API on a funds path.
+
+# WHAT WAS READ AND RULED OUT — so nobody spends a turn re-reading it
+
+| corpus | verdict |
+|---|---|
+| `yaci-store/ledger-state-mismatches` (4 versions) | **N/A.** Entirely DRep distribution, DRep expiry, treasury/reserves and governance-action status vs DB Sync. **No UTxO semantics.** It has the most transaction-sounding directory name in the corpus, which is exactly how a scope drift starts |
+| `yaci-store/tracking-address-utxos`, `plugins/write-first-plugin` | **Confirms, indexer-side** — the documented form of our write-time filter, and the upstream cause of Y-1 |
+| `yaci-devkit` (21 files) | **N/A to this brief** — local devnet operation. **Worth its own ticket**: it is how the liquidation path could be exercised offline, which is the gap behind every "never run in a real `complete()`" caveat here |
+| `cardano-dev-skills` CCL corpus (66 files) | **Used.** Five behavioural terms remain at **zero** — `collateralReturn`, `totalCollateral`, `"collateral return"`, `"dummy output"`, `"after balancing"` — so every behavioural finding still rests on the source and its tests, and **none is contradicted** |
+
+**⇒ The two authorities are complementary: the docs say WHAT EXISTS, WHICH LAYER TO USE and WHAT IS
+GOING AWAY; the source and its tests say WHAT ACTUALLY HAPPENS. A review with only one is incomplete
+in a direction it cannot detect from inside.**
 
 # STANDING HAZARDS — named, not proposed
 
