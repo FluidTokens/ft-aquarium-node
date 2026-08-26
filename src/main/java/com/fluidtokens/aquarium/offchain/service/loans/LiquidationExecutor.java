@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
@@ -464,16 +465,38 @@ public class LiquidationExecutor {
         // anything else in the cycle and pre-empt the TX_TOO_LARGE veto — the one path whose whole job
         // is to report an unfetchable maxTxSize (LiquidationSubmitVetoTest S5). When it cannot be had,
         // selection degrades to the pre-T-052 behaviour, largest-nominable: never wrong, only wasteful.
-        Optional<BigInteger> ceiling;
+        // T-061 — the PARAMS are held, not just the fee ceiling, because a refusal has to size EVERY
+        // gate it can see and the collateral ceiling comes from the same object.
+        Optional<ProtocolParams> fetched;
         try {
-            ceiling = Optional.of(LedgerCeilings.maxPossibleFee(protocolParamsSupplier.getProtocolParams()));
+            ProtocolParams fresh = protocolParamsSupplier.getProtocolParams();
+            // ⛔ PROVE IT IS USABLE HERE, INSIDE THE CATCH THAT HANDLES IT.
+            //
+            // The fetch used to be `maxPossibleFee(getProtocolParams())` — one expression, one
+            // try/catch — so a params object with null fields degraded to "unavailable" like any
+            // other failure. Holding the raw object and deriving later moved that derivation OUTSIDE
+            // this catch, and LiquidationSubmitVetoTest S5 (whose supplier returns a deliberately
+            // partial object) went from a clean veto to a NullPointerException.
+            //
+            // ⚠ THAT IS THE THIRD TIME TODAY A COMPUTATION CROSSING AN ERROR BOUNDARY CHANGED A
+            // FAILURE MODE — T-050 moved two remote reads out of complete()'s try/catch, T-052 moved
+            // one to cycle start, and this moved a derivation past its own handler. The code was
+            // correct each time; only the REPORTING broke, which is why review does not catch it and
+            // a test asserting a failure mode does.
+            //
+            // Both ceilings and every field the diagnosis reads are exercised here, so anything
+            // unusable is caught as unavailable rather than surfacing later as an NPE.
+            LedgerCeilings.maxPossibleCollateral(fresh);
+            Math.max(1, fresh.getMaxCollateralInputs());
+            fetched = Optional.of(fresh);
         } catch (Exception e) {
-            ceiling = Optional.empty();
+            fetched = Optional.empty();
             log.warn("could not fetch protocol parameters to size the wallet input ({}); falling back "
                     + "to the largest nominable utxo for this cycle", causeChain(e));
         }
-        // Effectively final, so the per-candidate selector lambda can close over it.
-        final Optional<BigInteger> feeCeiling = ceiling;
+        // Effectively final, so the per-candidate selector lambda can close over them.
+        final Optional<ProtocolParams> params = fetched;
+        final Optional<BigInteger> feeCeiling = params.map(LedgerCeilings::maxPossibleFee);
 
         Optional<Utxo> configUtxo = utxoResolver.resolveConfigUtxo();
         Optional<Utxo> lmConfigUtxo = utxoResolver.resolveLmConfigUtxo();
@@ -485,7 +508,7 @@ public class LiquidationExecutor {
 
         for (LiquidationAssessment assessment : buildable) {
             try {
-                consider(assessment, now, walletUtxos, feeCeiling, configUtxo.get(), lmConfigUtxo.get(),
+                consider(assessment, now, walletUtxos, params, configUtxo.get(), lmConfigUtxo.get(),
                         oraclesByUnit);
             } catch (Exception e) {
                 // consider() already turns every expected failure into a decision; this is the last
@@ -503,8 +526,11 @@ public class LiquidationExecutor {
     // ---- one candidate ------------------------------------------------------------------------
 
     private void consider(LiquidationAssessment assessment, long now, List<Utxo> walletUtxos,
-                          Optional<BigInteger> feeCeiling, Utxo configUtxo, Utxo lmConfigUtxo,
+                          Optional<ProtocolParams> params, Utxo configUtxo, Utxo lmConfigUtxo,
                           Map<String, OracleEntry> oraclesByUnit) {
+        // Derived here rather than passed alongside, so the two can never disagree about which
+        // parameters they came from.
+        Optional<BigInteger> feeCeiling = params.map(LedgerCeilings::maxPossibleFee);
         String loanUtxoRef = assessment.loan().utxoRef();
         Long heldUntil = quarantine.get(loanUtxoRef);
         if (isQuarantined(loanUtxoRef, now)) {
@@ -549,12 +575,16 @@ public class LiquidationExecutor {
                         now - VALID_FROM_BACKDATE_MILLIS,
                         now + configuration.getValidityWindowSeconds() * 1000L);
             } catch (PayInAdvanceLiquidationRouter.WalletInputTooSmallException e) {
+                // T-061 — the router knows the lender payout and nothing about the wallet; THIS knows
+                // the wallet and the parameters. Neither can state every gate alone, so the message is
+                // completed here rather than left naming one of several.
                 // T-052. Same treatment as "not modelled": a clean statement about this candidate
                 // against this wallet. NOT quarantined — the wallet can be topped up between cycles,
                 // and quarantining would keep refusing a candidate that had become buildable.
+                String convertDetail = e.getMessage() + " " + collateralGate(walletUtxos, params);
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        "WALLET_INPUT_TOO_SMALL", e.getMessage()));
-                log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, e.getMessage());
+                        "WALLET_INPUT_TOO_SMALL", convertDetail));
+                log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, convertDetail);
                 return;
             } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
                 // A convert shape the seam cannot yet model (non-ada principal / non-positive equity):
@@ -595,12 +625,7 @@ public class LiquidationExecutor {
                 // feeCeiling is necessarily present here: with it absent, nominate() falls back to
                 // largest-nominable, and the cycle gate above already established that at least one
                 // nominable utxo exists — so the empty branch is unreachable without a ceiling.
-                String detail = ("no ada-only wallet utxo covers the %s lovelace this ledger could "
-                        + "charge in fees; largest nominable is %s. Fund the wallet with one ada-only "
-                        + "utxo of at least that amount.").formatted(
-                        feeCeiling.map(Object::toString).orElse("(unknown)"),
-                        WalletInputSelection.largestNominable(walletUtxos)
-                                .map(Object::toString).orElse("none at all"));
+                String detail = walletDiagnosis(walletUtxos, params, feeCeiling, BigInteger.ZERO);
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         "WALLET_INPUT_TOO_SMALL", detail));
                 log.warn("the liquidation of {} was refused: {}", loanUtxoRef, detail);
@@ -1309,6 +1334,70 @@ public class LiquidationExecutor {
                 feeCeiling.map(Object::toString).orElse("an unknown fee"), extraOutlay,
                 feeCeiling.isPresent() ? "" : " (largest, protocol params unavailable)"));
         return chosen;
+    }
+
+    /**
+     * T-061 — <b>every wallet requirement this cycle can evaluate, stated together.</b>
+     *
+     * <h2>Why this exists</h2>
+     * The refusal this replaced named ONE gate — the spend input's fee coverage — and told the
+     * operator to <i>"fund the wallet with one ada-only utxo of at least that amount"</i>. <b>Doing
+     * exactly that clears the spend gate and then fails the collateral one</b>, because T-050 made
+     * collateral inputs a separate selection with a separate ceiling. The operator spends a funding
+     * transaction and returns to the same refusal with the same confidence.
+     * <p>
+     * <b>A remedy is a claim.</b> If a message tells you what to do, doing it must be sufficient — or
+     * the message must say it is not.
+     *
+     * <h2>⚠ And it may only name gates it has actually evaluated</h2>
+     * Listing requirements this code has not checked would be a different lie, and a worse one:
+     * an operator cannot tell a computed figure from a plausible one. So each line below is
+     * <em>measured</em> here, and when the protocol parameters are unavailable the message says the
+     * gates could not be sized rather than guessing at them.
+     */
+    static String walletDiagnosis(List<Utxo> walletUtxos, Optional<ProtocolParams> params,
+                                   Optional<BigInteger> spendRequired, BigInteger extraOutlay) {
+        String largest = WalletInputSelection.largestNominable(walletUtxos)
+                .map(Object::toString).orElse("none at all");
+        if (params.isEmpty() || spendRequired.isEmpty()) {
+            return ("no ada-only wallet utxo could be nominated; largest nominable is %s. The "
+                    + "protocol parameters could not be fetched this cycle, so neither the fee nor the "
+                    + "collateral requirement could be sized — this names no figure rather than "
+                    + "guessing one.").formatted(largest);
+        }
+        BigInteger spend = spendRequired.get().add(extraOutlay);
+        return ("the wallet does not satisfy every requirement a liquidation has, and BOTH are listed "
+                + "because funding for one does not satisfy the other. (1) SPEND INPUT: one ada-only, "
+                + "datum-free, reference-script-free utxo holding at least %s lovelace (the most this "
+                + "ledger could charge in fees%s); largest nominable is %s. %s Fund the wallet so both "
+                + "hold, not just the first.")
+                .formatted(spend,
+                        extraOutlay.signum() > 0 ? " plus " + extraOutlay + " paid out" : "",
+                        largest, collateralGate(walletUtxos, params));
+    }
+
+    /**
+     * The second gate, which the spend gate masks. Collateral inputs are chosen separately from the
+     * nominated spend input (T-050) and are summed across at most {@code maxCollateralInputs} utxos,
+     * so this is a TOTAL rather than a single-utxo requirement — and an operator funding "one utxo of
+     * at least X" can satisfy the spend gate and still miss it.
+     */
+    static String collateralGate(List<Utxo> walletUtxos, Optional<ProtocolParams> params) {
+        if (params.isEmpty()) {
+            return "(2) COLLATERAL: could not be sized — protocol parameters unavailable this cycle.";
+        }
+        ProtocolParams p = params.get();
+        BigInteger required = LedgerCeilings.maxPossibleCollateral(p);
+        int limit = Math.max(1, p.getMaxCollateralInputs());
+        BigInteger available = walletUtxos.stream()
+                .filter(WalletInputSelection::nominable)
+                .map(LedgerCeilings::lovelaceOf)
+                .sorted(java.util.Comparator.reverseOrder())
+                .limit(limit)
+                .reduce(BigInteger.ZERO, BigInteger::add);
+        return ("(2) COLLATERAL: at least %s lovelace in TOTAL across at most %d nominable utxos, "
+                + "chosen separately from the spend input; available %s.")
+                .formatted(required, limit, available);
     }
 
     /** Why one wallet candidate cannot be spent, for the operator-facing rejection list. */

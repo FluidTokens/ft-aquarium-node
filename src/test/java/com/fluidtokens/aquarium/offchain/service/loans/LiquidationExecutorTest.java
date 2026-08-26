@@ -2273,4 +2273,85 @@ class LiquidationExecutorTest {
                 "a clean population must be stated, not merely left unmentioned: " + scanLine);
         assertFalse(scanLine.contains("CONTAMINATED"), scanLine);
     }
+
+    // ======================================================================================
+    // T-061 — a refusal names every gate it can see, and no gate it cannot
+    // ======================================================================================
+
+    /**
+     * ⛔ <b>The live refusal named ONE of TWO gates and offered a remedy that does not work.</b>
+     * <p>
+     * It said <i>"fund the wallet with one ada-only utxo of at least that amount"</i>, where "that
+     * amount" was the fee ceiling. Doing exactly that clears the spend gate and then fails the
+     * <b>collateral</b> one, which T-050 made a separate selection with a separate — and larger —
+     * ceiling, summed across several utxos rather than found in one. The operator spends a funding
+     * transaction and returns to the same message.
+     * <p>
+     * <b>A remedy is a claim.</b> If a message tells you what to do, doing it must be sufficient, or
+     * the message must say it is not.
+     */
+    @Test
+    void aWalletRefusalNamesBothTheSpendAndTheCollateralGate() {
+        Utxo tiny = LoanFixtures.adaUtxo("77".repeat(32), 0, ACCOUNT.baseAddress(), 1_000_000L);
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(tiny), noOracle(), false);
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        String detail = decision.detail();
+        assertTrue(detail.contains("(1) SPEND INPUT"),
+                "the spend gate must be named: " + detail);
+        assertTrue(detail.contains("(2) COLLATERAL"),
+                "THE COLLATERAL GATE MUST BE NAMED TOO — funding for the first does not satisfy it: "
+                        + detail);
+        assertTrue(detail.contains("TOTAL across"),
+                "and it must say the collateral requirement is a TOTAL across utxos, not a single "
+                        + "utxo like the spend gate — an operator who reads it as 'one more utxo of "
+                        + "that size' is back where they started: " + detail);
+        assertFalse(detail.contains("Fund the wallet with one ada-only utxo of at least that amount"),
+                "the old single-gate remedy must be gone, not merely supplemented: " + detail);
+    }
+
+    /**
+     * ⚠ The other half, and it is the one that keeps the message honest: <b>it may only name gates it
+     * has actually evaluated.</b> With the protocol parameters unavailable neither ceiling can be
+     * sized, so the refusal must say so rather than print a plausible figure. <b>Listing a
+     * requirement nobody computed is a worse failure than listing too few</b>, because an operator
+     * cannot tell a measured number from an invented one.
+     */
+    @Test
+    void withNoProtocolParametersTheRefusalNamesNoFiguresRatherThanGuessing() {
+        String detail = LiquidationExecutor.walletDiagnosis(
+                List.of(LoanFixtures.adaUtxo("88".repeat(32), 0, ACCOUNT.baseAddress(), 1_000_000L)),
+                Optional.empty(), Optional.empty(), BigInteger.ZERO);
+
+        assertTrue(detail.contains("could not be fetched")
+                        && detail.contains("names no figure rather than guessing one"),
+                "it must say WHY no figure is given, not merely omit one — an omission reads as "
+                        + "'no requirement', which is the opposite of the truth: " + detail);
+        assertTrue(detail.contains("1000000"),
+                "what it CAN see — the largest nominable holding — is still reported: " + detail);
+        assertFalse(detail.contains("(1) SPEND INPUT") || detail.contains("(2) COLLATERAL"),
+                "it must not present numbered gates whose figures it never computed: " + detail);
+    }
+
+    /**
+     * And the collateral gate states a TOTAL across a bounded number of utxos, because that is what
+     * {@code collateralInputsFor} actually does. Reporting it as a single-utxo requirement would be
+     * the same masking defect wearing a second gate's name.
+     */
+    @Test
+    void theCollateralGateIsReportedAsATotalAcrossABoundedNumberOfUtxos() {
+        String gate = LiquidationExecutor.collateralGate(
+                List.of(LoanFixtures.adaUtxo("99".repeat(32), 0, ACCOUNT.baseAddress(), 2_000_000L),
+                        LoanFixtures.adaUtxo("aa".repeat(32), 0, ACCOUNT.baseAddress(), 3_000_000L)),
+                Optional.of(LoanFixtures.protocolParams().getProtocolParams()));
+
+        assertTrue(gate.contains("TOTAL across"), gate);
+        assertTrue(gate.contains("5000000"),
+                "the available total must be the SUM of nominable utxos, not the largest: " + gate);
+    }
 }
