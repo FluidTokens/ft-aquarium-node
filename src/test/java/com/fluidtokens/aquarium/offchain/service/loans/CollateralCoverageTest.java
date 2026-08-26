@@ -40,10 +40,16 @@ class CollateralCoverageTest {
     private static final ProtocolParams PARAMS = LoanFixtures.protocolParams().getProtocolParams();
 
     /**
-     * The observed {@code total_collateral}. It also pins the rounding: {@code 1,113,523 × 150 / 100}
-     * is {@code 1,670,284.5}, and the ledger asked for {@code 1,670,285} — so the required collateral
-     * is a CEILING, and computing it with integer division would understate it by one lovelace and
-     * let through the exact class of transaction this guard exists to stop.
+     * The observed {@code total_collateral}. It pins the rounding: {@code 1,113,523 × 150 / 100} is
+     * {@code 1,670,284.5} and this is {@code 1,670,285}, so the declared collateral is a CEILING and
+     * integer division would understate it by one lovelace.
+     *
+     * <p>⚠ <b>This is cardano-client-lib's DECLARATION, not the ledger's minimum.</b> CIP-0040 gives
+     * the requirement as {@code quot(txfee × collateralPercent, 100)} — truncating, so
+     * {@code 1,670,284} — under a {@code ≥} rule, while
+     * {@code CollateralBuilders.balanceCollateralOutputs():129} rounds with
+     * {@link java.math.RoundingMode#CEILING}. Over-declaring by one lovelace is safe and is what the
+     * chain saw; do not "correct" it downward, and do not cite it as the ledger's figure.
      */
     private static final BigInteger OBSERVED_TOTAL_COLLATERAL = BigInteger.valueOf(1_670_285L);
     private static final BigInteger OBSERVED_FEE = BigInteger.valueOf(1_113_523L);
