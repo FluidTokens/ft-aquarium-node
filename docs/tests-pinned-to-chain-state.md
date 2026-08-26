@@ -45,6 +45,7 @@ exactly why it is not a small change.
 | `service/loans/LoanFactoryOnChainRunnerTest` | third config UTxO; **submits for real** | **THIRD** | abort/skip |
 | `service/loans/ReferenceScriptPublishRunnerTest` | via `LoanFixtures`; synthetic UTxOs, never submits | **THIRD** | false assertion |
 | `service/loans/ReferenceScriptPublishSubmitTest` | fourth coordinates, derived hashes asserted pre-build | **FOURTH** | false assertion |
+| `WalletSplitSubmitTest` | **nothing — reads the wallet live**; triple-gated, **submits for real** | n/a | abort/skip |
 | `PreviewTankTest`, `PreviewParametersTest`, `MainnetTankTest` | Aquarium deploy scripts, mnemonic-gated | Aquarium | abort/skip |
 | `LoansConfigVerifierLiveTest` | **nothing — reads the shipped coordinates** | n/a | ✅ **fixed 2026-08-25** |
 
