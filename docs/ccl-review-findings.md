@@ -217,3 +217,79 @@ is on the path that reaches operators and it is the third instance of one rule l
 
 **Denominator across three builders: 5 items match author usage everywhere · 4 diverge everywhere ·
 the rest split.** The tank is the only builder that gets C1 right and the only one that needs no probe.
+
+---
+
+## T-045 — `YaciConfig` + `ReferenceScriptSafeUtxoSelection` (the wiring seam)
+
+### ⛔ THE ANSWER IS NEGATIVE, AND IT SHAPES EVERY PROPOSAL IN T-047
+
+**Question: of the four items that diverge in all three builders, how many are decided at this seam
+and inherited — i.e. one fix rather than three?**
+
+**NONE OF THEM.** `withVerifier`, `withTxInspector`, paying residuals out by name, and the
+reference-script/witness handling are all `Tx`/`TxContext` calls made **inside each builder's own
+assembly**. The seam decides only *which supplier, which backend, which evaluator*. **⇒ Those four are
+three fixes, not one, and any T-047 proposal must be costed that way.**
+
+### ⚑ BUT THE SEAM IS WHY THEY DIVERGED — THE `TxContext` CHAIN IS WRITTEN THREE TIMES
+
+```
+plain    :1859-1869   feePayer · collateralPayer · mergeOutputs(false) · ignoreScriptCostEvaluationError(…)
+convert  :629-639     feePayer · collateralPayer · mergeOutputs(false) · ignoreScriptCostEvaluationError(…)
+tank     :237-240     feePayer · collateralPayer · mergeOutputs(false) · ignoreScriptCostEvaluationError(false)
+```
+
+**Three independent copies of one configuration decision.** Nothing forces them to agree, nothing
+notices when they stop agreeing, and **that is the structural cause of both the "diverges everywhere"
+column and the sibling absences in T-043.** It is the min-UTxO lesson at the wiring layer: *a rule
+written in three places has to be remembered three times.* **The fix shape is a shared configuration
+seam, not three edits — but creating one touches all three builders and is a morning decision.**
+
+### ⛔ AND THE EVALUATOR IS CHOSEN THREE DIFFERENT WAYS FOR ONE OUTCOME
+
+```
+YaciConfig:75   (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor)   ← plain
+YaciConfig:108  (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor)   ← convert, VERBATIM DUPLICATE
+YaciConfig:25   new QuickTxBuilder(bfBackendService)  ⇒ TransactionProcessor, which EXTENDS TransactionEvaluator  ← tank, implicit
+```
+
+All three reach the same Blockfrost `/utils/txs/evaluate`. **Two are a copy-paste of each other and
+the third arrives by injection.** Consequence: officina trap 8 says *"validate the evaluator's
+payload, not just its envelope — a successful response that omits redeemers leaves those redeemers on
+placeholders."* **Adding that check means finding all three sites, and one of them has no call to
+find.** ⇒ **The narrowing lambda is correct and deliberate** (it hands the builder something that
+provably cannot submit) — **the duplication is the finding, not the design.**
+
+### ✅ `ReferenceScriptSafeUtxoSelection` — HAND-ROLLED, AND CORRECTLY SO
+
+Checked against author usage as asked. **There is no library idiom to adopt: CCL's coin selection is
+reference-script blind** — zero hits for `referenceScriptHash` anywhere under `coinselection/src/main`.
+The guard is built on the library's own documented extension point, `DefaultUtxoSelectionStrategyImpl.accept(Utxo)`,
+which ships as `return true`.
+
+**And it already handles the trap that would have made it decorative:** `super.fallback()` returns a
+freshly-constructed `LargestFirstUtxoSelectionStrategy` **whose `accept` is again `return true`**, so
+overriding `accept` on the primary strategy alone leaves a guard that holds on the first path and
+lapses on the second. `:126-131` overrides both. **Recorded as a match-by-necessity — the hand-rolling
+was justified and the implementation is right.**
+
+### ⚑ AND ONE THING THE LIBRARY SHIPS THAT WE DO NOT USE
+
+`coinselection/impl/` provides `LargestFirstUtxoSelectionStrategy`, `RandomImproveUtxoSelectionStrategy`
+and `ExcludeUtxoSelectionStrategy`. **`ScheduledTransactionService:171-173` hand-rolls
+`findFirst()` over an ada-only filter with no size floor** (T-044). **A largest-first strategy is
+shipped by the library and would remove the dust-selection failure mode outright.** Also:
+`DefaultUtxoSelectionStrategyImpl` already skips datum-hash UTxOs by default
+(`ignoreUtxosWithDatumHash`, default **true**), which is one of the three things the tank's filter
+checks by hand and one of the three the three filters disagree about.
+
+### Seam scorecard
+
+| | verdict |
+|---|---|
+| Four cross-builder divergences fixable at the seam | **0 of 4** |
+| `TxContext` configuration chains | **3 copies, nothing reconciles them** |
+| Evaluator construction | **3 routes, 2 verbatim duplicates, 1 invisible** |
+| `ReferenceScriptSafeUtxoSelection` vs a library idiom | ✅ **no idiom exists; correctly hand-rolled, fallback trap handled** |
+| Library selection strategies available and unused | `LargestFirst`, `RandomImprove`, `ExcludeUtxo` |
