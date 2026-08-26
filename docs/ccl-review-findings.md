@@ -71,3 +71,79 @@ liquidation transaction is constructed. **Morning decision.** ONE so far; T-043 
 **CCL's declaration** (`RoundingMode.CEILING`), not the ledger's minimum — CIP-40 specifies
 `quot(fee × pct, 100)`, i.e. **floor**, = 1,670,284, with a `≥` rule. Over-declaring by one lovelace
 is safe and correct; the javadoc said it was the ledger's figure. Doc-only.
+
+---
+
+## T-043 — `LiquidatePayInAdvanceTransactionBuilder` (the convert path)
+
+### ✅ A2 — THE PREDICTED DIVERGENCE IS NOT THERE, AND THAT IS A RESULT
+
+The review was designed around this question: *does the sibling use reference-script idiom (a) where
+the plain path uses (b)?* **It does not. Both use (b) — a script that travels by reference is not
+attached.** `LiquidatePayInAdvanceTransactionBuilder.attachValidators` guards every attach on
+`scripts.X() == null`, identically to the plain path, and its javadoc records why (measured
+2026-08-24: an attached-and-referenced script left the body 8,665 bytes larger at *evaluation* time —
+23,459 against a 16,384 `maxTxSize` — because `removeDuplicateScriptWitnesses` runs only **after**
+balancing while script-cost evaluation runs **before** it).
+
+**Recorded as loudly as a finding: the sibling divergence we went looking for does not exist on A2.**
+The plain path was brought into line on 2026-08-25; this one has been correct since `e11ccca`.
+
+### ⛔⛔ BUT TWO NEW SIBLING DIVERGENCES APPEAR — AND BOTH ARE OUR OWN FIXES FROM LAST NIGHT
+
+```
+                                  plain   convert
+splitChangeSoAdaStaysSpendable      ✅       ⛔ ABSENT
+assertCollateralIsCoverable         ✅       ⛔ ABSENT
+assertChangeConserved               ✅       ⛔ ABSENT
+postBalanceTx                       ✅       ⛔ ABSENT
+```
+
+**Both fixes committed on 2026-08-25 (`80857b5`) landed in ONE builder.** And the convert path is not
+a lesser case of either:
+
+- **It takes the collateral by design.** Its own javadoc, `:57`: *"the bot pays the loan's principal
+  in advance (in ADA) and **takes the collateral**"*. **So it receives token value at least as
+  directly as the plain path**, and will produce the same single token-bearing change output that
+  `adaOnlyWalletUtxo()` correctly refuses — the failure that disabled the bot on 2026-08-25.
+- **It has NO collateral guard at all** — not a weaker one. `:664
+  .withCollateralInputs(inputOf(request.walletUtxo()))` nominates one input exactly as the plain path
+  does, but nothing checks capacity before CCL's unguarded subtract at `CollateralBuilders:137`.
+  **⇒ The convert path can still emit the negative `collateral_return` that no node can parse.** The
+  plain path now refuses; this one still builds it.
+- **It is live.** `LiquidationExecutor:500` routes here whenever
+  `shouldLiquidationConvertToPrincipal == True` — **six of the ten measured preview loans**
+  (findings §10). This is not a dormant path.
+
+**⚑ This is the defect shape the review exists to find, twenty-four hours old, created by the fix for
+that very lesson.** *"Sweep for the DEFECT, not for the FIX"* — and the sweep found our own.
+
+⛔ **Proposal, not a fix.** Porting either guard adds a refusal and a `postBalanceTx` hook to a
+liquidation path. Morning decision.
+
+### The full checklist, both builders, with scope
+
+| # | plain | convert | scope |
+|---|---|---|---|
+| **A1** strip bundled in the wrong guard | ⛔ | ⛔ `:700-701` | **ALL** |
+| **A2** reference-script idiom | (b) | (b) | ✅ **MATCH — predicted divergence absent** |
+| **A3** `withReferenceScripts` only when no backend | ⛔ | ⛔ `:700` | **ALL** |
+| **A4** declared list = published only | — | — | ALL, follows A3 |
+| **B1** `withChangeAddress` explicit | ✅ `:1550` | ✅ `:526` | ✅ **ALL MATCH** |
+| **B3** residual paid out by name | ⛔ | ⛔ | ALL — deliberate on the plain path, **untreated here** |
+| **B4** `mergeOutputs(false)` deliberate | ✅ `:1863` | ✅ `:633` | ✅ **ALL MATCH** |
+| **C1** one collateral input, welded to the spend input | ⛔ | ⛔ `:664` | **ALL** |
+| **C2** capacity over all inputs | one | **none** | ⛔ **ONE — convert computes nothing** |
+| **C3** guard before CCL's subtract | ✅ | ⛔ **ABSENT** | ⛔ **ONE** |
+| **C4** fee/collateral/change roles coincide | — | — | ALL |
+| **D1** `ignoreScriptCostEvaluationError(evaluator == null)` | ✅ | ✅ `:639` | ✅ **ALL MATCH** |
+| **D2** probe pass carries a no-op evaluator | ⛔ | ⛔ | **ALL** |
+| **D3** remote evaluator in prod, offline in rigs | ✅ | ✅ | ✅ **ALL MATCH** |
+| **E1** `withVerifier` unused | ⛔ | ⛔ | **ALL** |
+| **E2** `withTxInspector` unused | ⛔ | ⛔ | **ALL** |
+| **F1** indexes observed, not computed | ⛔ | ⛔ `:456` | **ALL** |
+| **change split** | ✅ | ⛔ **ABSENT** | ⛔ **ONE** |
+
+**Denominator: 18 items checked in both builders. 5 match the authors outright, 11 diverge in both,
+2 diverge between siblings.** Both sibling divergences are absences in the convert path, and both were
+introduced last night.
