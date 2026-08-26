@@ -520,6 +520,33 @@ public class LiquidationExecutor {
             log.warn("could not fetch protocol parameters to size the wallet input ({}); falling back "
                     + "to the largest nominable utxo for this cycle", causeChain(e));
         }
+        // ⛔ THE VALIDITY WINDOW IS ANCHORED TO THE CHAIN, NOT TO THE WALL CLOCK.
+        //
+        // The first live submission (2026-08-26, tx 8062f42d…) was rejected
+        // OutsideValidityIntervalUTxO with invalidBefore 127 slots past the node's current slot. The
+        // builder was CORRECT — invalidBefore was decided_at − 30s exactly, the intended backdate.
+        // THE NODE'S "CURRENT SLOT" IS THE LAST BLOCK IT APPLIED, NOT WALL CLOCK, and preview was
+        // sitting in a 182-slot block gap. Measured on chain from two independent sources: preview's
+        // mean gap is ~37s with a max of 182 in ~25 blocks, SO A 30-SECOND BACKDATE CANNOT COVER AN
+        // ORDINARY GAP.
+        //
+        // Anchoring to the last applied slot makes invalidBefore <= the node's position BY
+        // CONSTRUCTION at any gap length, instead of by a guess at how long a gap might be. Ask the
+        // chain where it is; do not infer it from a clock the chain cannot see.
+        //
+        // ⚠ min(), not the tip alone: if our indexer runs AHEAD of the submitting node we must still
+        // not outrun it, and if it runs behind we backdate more — which is the safe direction. And
+        // only the START moves: validTo stays wall-clock-based so the transaction keeps its full
+        // landing time, and because the oracle-window check reads validTo and is a SEPARATE
+        // constraint that this must not disturb.
+        long anchor = windowAnchorMillis(now, blockEventListener.getLastAppliedSlot().get(), converters);
+        if (anchor != now) {
+            log.info("validity window anchored to the last applied block ({} ms behind wall clock) — "
+                    + "invalidBefore would otherwise sit ahead of the node's current slot", now - anchor);
+        }
+        final long validFromMillis = anchor - VALID_FROM_BACKDATE_MILLIS;
+        final long validToMillis = now + configuration.getValidityWindowSeconds() * 1000L;
+
         // Effectively final, so the per-candidate selector lambda can close over them.
         final Optional<ProtocolParams> params = fetched;
         final Optional<BigInteger> feeCeiling = params.map(LedgerCeilings::maxPossibleFee);
@@ -534,7 +561,7 @@ public class LiquidationExecutor {
 
         for (LiquidationAssessment assessment : buildable) {
             try {
-                consider(assessment, now, walletUtxos, params, configUtxo.get(), lmConfigUtxo.get(),
+                consider(assessment, now, validFromMillis, validToMillis, walletUtxos, params, configUtxo.get(), lmConfigUtxo.get(),
                         oraclesByUnit);
             } catch (Exception e) {
                 // consider() already turns every expected failure into a decision; this is the last
@@ -551,7 +578,9 @@ public class LiquidationExecutor {
 
     // ---- one candidate ------------------------------------------------------------------------
 
-    private void consider(LiquidationAssessment assessment, long now, List<Utxo> walletUtxos,
+    private void consider(LiquidationAssessment assessment, long now,
+                          long validFromMillis, long validToMillis,
+                          List<Utxo> walletUtxos,
                           Optional<ProtocolParams> params, Utxo configUtxo, Utxo lmConfigUtxo,
                           Map<String, OracleEntry> oraclesByUnit) {
         // Derived here rather than passed alongside, so the two can never disagree about which
@@ -598,8 +627,8 @@ public class LiquidationExecutor {
                         // exact ada it must repay and asks for the SMALLEST input that covers that
                         // plus the fee.
                         lenderPayout -> nominate(walletUtxos, feeCeiling, lenderPayout, loanUtxoRef),
-                        now - VALID_FROM_BACKDATE_MILLIS,
-                        now + configuration.getValidityWindowSeconds() * 1000L);
+                        validFromMillis,
+                        validToMillis);
             } catch (PayInAdvanceLiquidationRouter.WalletInputTooSmallException e) {
                 // T-061 — the router knows the lender payout and nothing about the wallet; THIS knows
                 // the wallet and the parameters. Neither can state every gate alone, so the message is
@@ -667,8 +696,8 @@ public class LiquidationExecutor {
                     oraclesByUnit,
                     walletUtxo,
                     account.baseAddress(),
-                    now - VALID_FROM_BACKDATE_MILLIS,
-                    now + configuration.getValidityWindowSeconds() * 1000L,
+                    validFromMillis,
+                    validToMillis,
                     configuration.getOracleWindowMarginSeconds() * 1000L,
                     // Whatever loans.liquidation.reference-scripts.* names. Every unset one means that
                     // validator travels in the witness set instead, which is legal and much larger —
@@ -1424,6 +1453,23 @@ public class LiquidationExecutor {
         return ("(2) COLLATERAL: at least %s lovelace in TOTAL across at most %d nominable utxos, "
                 + "chosen separately from the spend input; available %s.")
                 .formatted(required, limit, available);
+    }
+
+    /**
+     * <b>Where the validity window starts from: the earlier of wall clock and the chain's own
+     * position.</b>
+     *
+     * @param lastAppliedSlot the last block this node applied, or {@code 0} if none has arrived yet —
+     *                        <b>zero means UNKNOWN, not "the epoch"</b>, and falls back to wall clock
+     *                        rather than anchoring a transaction at 1970
+     */
+    static long windowAnchorMillis(long nowMillis, long lastAppliedSlot, CardanoConverters converters) {
+        if (lastAppliedSlot <= 0) {
+            return nowMillis;
+        }
+        long tipMillis = converters.slot().slotToTime(lastAppliedSlot)
+                .toInstant(java.time.ZoneOffset.UTC).toEpochMilli();
+        return Math.min(nowMillis, tipMillis);
     }
 
     /** Why one wallet candidate cannot be spent, for the operator-facing rejection list. */

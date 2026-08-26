@@ -440,7 +440,8 @@ class LiquidationExecutorTest {
                           LiquidationDecisionLog log,
                           FakeScanner scanner,
                           FakeResolver resolver,
-                          CountingOracleProvider oracles) {
+                          CountingOracleProvider oracles,
+                          BlockEventListener blockEventListener) {
     }
 
     /**
@@ -540,7 +541,7 @@ class LiquidationExecutorTest {
                 payInAdvanceRouter, LoanFixtures.registry(), log, oracles,
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
-        return new Wiring(executor, log, scanner, resolver, oracles);
+        return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
     }
 
     /**
@@ -830,7 +831,7 @@ class LiquidationExecutorTest {
                 new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT, scanner, resolver, builder,
                 router, LoanFixtures.registry(), log, oracles, previewNetwork(),
                 LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
-        return new Wiring(executor, log, scanner, resolver, oracles);
+        return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
     }
 
     // ======================================================================================
@@ -2395,5 +2396,52 @@ class LiquidationExecutorTest {
                         + wiring.log().lastRun().exclusions());
         assertEquals(3, wiring.log().lastRun().bondsScanned() + wiring.log().lastRun().settled(),
                 "and NOTHING IS LOST: the settled bonds are still counted, just not as failures");
+    }
+
+    /**
+     * ⛔ <b>THE WIRING ASSERTION — and it exists because its absence was caught by a mutant that did
+     * NOT fire.</b>
+     * <p>
+     * {@code ValidityWindowAnchorTest} proves the anchor arithmetic, and reverting the executor to
+     * {@code anchor = now} — the exact behaviour that was rejected on chain — left it entirely GREEN,
+     * because it calls the helper directly and nothing asserted the executor USES it. <b>A correct
+     * function nobody calls is the shape this whole day has been about</b>, and it was in my own test.
+     * <p>
+     * So this drives a real {@code cycle()} with a lagging chain tip and reads
+     * {@code validityStartInterval} off the <b>built transaction's CBOR</b> — the artefact, not the
+     * arithmetic.
+     */
+    @Test
+    void theBuiltTransactionsWindowFollowsTheChainTipNotTheWallClock() throws Exception {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false);
+
+        // The chain sits 157 seconds behind wall clock — the measured gap that caused the first live
+        // rejection (tx 8062f42d…, OutsideValidityIntervalUTxO, a 182-slot preview block gap).
+        long laggingSlot = LoanFixtures.converters().time().toSlot(java.time.LocalDateTime.ofInstant(
+                java.time.Instant.ofEpochMilli(NOW - 157_000L), java.time.ZoneOffset.UTC));
+        wiring.blockEventListener().getLastAppliedSlot().set(laggingSlot);
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertNotNull(decision.txCborHex(), "a transaction must have been built: " + decision.detail());
+        var body = com.bloxbean.cardano.client.transaction.spec.Transaction
+                .deserialize(com.bloxbean.cardano.client.util.HexUtil
+                        .decodeHexString(decision.txCborHex())).getBody();
+
+        assertNotNull(body.getValidityStartInterval());
+        assertTrue(body.getValidityStartInterval() <= laggingSlot,
+                "invalidBefore " + body.getValidityStartInterval() + " must not outrun the chain's "
+                        + "last applied slot " + laggingSlot + " — that is the on-chain rejection, "
+                        + "reproduced");
+
+        // ⚠ And the fixture must reproduce the ORIGINAL failure, or this proves nothing: the OLD
+        // wall-clock anchor would have put invalidBefore comfortably past the chain.
+        long oldWallClockStart = LoanFixtures.converters().time().toSlot(java.time.LocalDateTime.ofInstant(
+                java.time.Instant.ofEpochMilli(NOW - 30_000L), java.time.ZoneOffset.UTC));
+        assertTrue(oldWallClockStart > laggingSlot,
+                "the fixture no longer reproduces the failure it was built from");
     }
 }
