@@ -5,6 +5,8 @@ import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
+import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
@@ -430,14 +432,32 @@ public class LiquidationExecutor {
         //
         // Nothing is loosened for LIVE: a liquidation still cannot be built without a wallet input,
         // and the refusal is now explicit and counted rather than a silent early return.
-        Optional<Utxo> walletUtxoOpt = adaOnlyWalletUtxo();
-        if (walletUtxoOpt.isEmpty()) {
+        List<Utxo> walletUtxos = nominableWalletUtxos();
+        if (walletUtxos.isEmpty()) {
             log.warn("{} buildable candidate(s) found but no ada-only wallet utxo is available, so "
                     + "none can be built; the scan above is still a complete record of what was seen "
                     + "and priced", buildable.size());
             return;
         }
-        Utxo walletUtxo = walletUtxoOpt.get();
+        // T-052 — the fee ceiling every liquidation must cover regardless of its shape. The
+        // principal-repaying path adds its lender payout on top; the fee-only path needs nothing more,
+        // which is the whole point: it must not be made to demand an input sized for the other case.
+        //
+        // ⚠ OPTIONAL, AND DELIBERATELY SO. This is a remote read, and a remote read that ALL selection
+        // depends on turns a parameter outage into a liquidation outage. Worse, it would fire before
+        // anything else in the cycle and pre-empt the TX_TOO_LARGE veto — the one path whose whole job
+        // is to report an unfetchable maxTxSize (LiquidationSubmitVetoTest S5). When it cannot be had,
+        // selection degrades to the pre-T-052 behaviour, largest-nominable: never wrong, only wasteful.
+        Optional<BigInteger> ceiling;
+        try {
+            ceiling = Optional.of(LedgerCeilings.maxPossibleFee(protocolParamsSupplier.getProtocolParams()));
+        } catch (Exception e) {
+            ceiling = Optional.empty();
+            log.warn("could not fetch protocol parameters to size the wallet input ({}); falling back "
+                    + "to the largest nominable utxo for this cycle", causeChain(e));
+        }
+        // Effectively final, so the per-candidate selector lambda can close over it.
+        final Optional<BigInteger> feeCeiling = ceiling;
 
         Optional<Utxo> configUtxo = utxoResolver.resolveConfigUtxo();
         Optional<Utxo> lmConfigUtxo = utxoResolver.resolveLmConfigUtxo();
@@ -449,7 +469,8 @@ public class LiquidationExecutor {
 
         for (LiquidationAssessment assessment : buildable) {
             try {
-                consider(assessment, now, walletUtxo, configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit);
+                consider(assessment, now, walletUtxos, feeCeiling, configUtxo.get(), lmConfigUtxo.get(),
+                        oraclesByUnit);
             } catch (Exception e) {
                 // consider() already turns every expected failure into a decision; this is the last
                 // net, so that one unexpected candidate does not cost the rest of the cycle.
@@ -465,8 +486,9 @@ public class LiquidationExecutor {
 
     // ---- one candidate ------------------------------------------------------------------------
 
-    private void consider(LiquidationAssessment assessment, long now, Utxo walletUtxo, Utxo configUtxo,
-                          Utxo lmConfigUtxo, Map<String, OracleEntry> oraclesByUnit) {
+    private void consider(LiquidationAssessment assessment, long now, List<Utxo> walletUtxos,
+                          Optional<BigInteger> feeCeiling, Utxo configUtxo, Utxo lmConfigUtxo,
+                          Map<String, OracleEntry> oraclesByUnit) {
         String loanUtxoRef = assessment.loan().utxoRef();
         Long heldUntil = quarantine.get(loanUtxoRef);
         if (isQuarantined(loanUtxoRef, now)) {
@@ -502,9 +524,22 @@ public class LiquidationExecutor {
             // window the plain path uses is handed to the router, which derives its own slots from it.
             try {
                 transaction = payInAdvanceRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
-                        bondUtxo.get(), configUtxo, lmConfigUtxo, oraclesByUnit, walletUtxo,
+                        bondUtxo.get(), configUtxo, lmConfigUtxo, oraclesByUnit,
+                        // T-052 — the router knows the lender payout, this knows the wallet and the
+                        // fee ceiling, and neither has to learn the other's job. It computes the
+                        // exact ada it must repay and asks for the SMALLEST input that covers that
+                        // plus the fee.
+                        lenderPayout -> nominate(walletUtxos, feeCeiling, lenderPayout, loanUtxoRef),
                         now - VALID_FROM_BACKDATE_MILLIS,
                         now + configuration.getValidityWindowSeconds() * 1000L);
+            } catch (PayInAdvanceLiquidationRouter.WalletInputTooSmallException e) {
+                // T-052. Same treatment as "not modelled": a clean statement about this candidate
+                // against this wallet. NOT quarantined — the wallet can be topped up between cycles,
+                // and quarantining would keep refusing a candidate that had become buildable.
+                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                        "WALLET_INPUT_TOO_SMALL", e.getMessage()));
+                log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, e.getMessage());
+                return;
             } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
                 // A convert shape the seam cannot yet model (non-ada principal / non-positive equity):
                 // a clean statement about this candidate, reproducible next cycle. Not quarantined, and
@@ -529,6 +564,34 @@ public class LiquidationExecutor {
                 return;
             }
         } else {
+            // T-052 — A FEE-ONLY LIQUIDATION MUST NOT BE MADE TO DEMAND A LARGE INPUT.
+            //
+            // On the plain path the bot pays no principal: the collateral it collects funds every
+            // output the transaction creates, so the only ada it must bring is the fee. Nominating
+            // the largest wallet utxo (what this did until now) is not wrong, it is wasteful in a way
+            // that compounds — the biggest input gets consumed by whichever candidate runs first, so
+            // a fee-only liquidation can spend the one input a principal-repaying candidate needed.
+            Optional<Utxo> plainWalletUtxo =
+                    nominate(walletUtxos, feeCeiling, BigInteger.ZERO, loanUtxoRef);
+            if (plainWalletUtxo.isEmpty()) {
+                // A refusal, not a failure: true of this candidate against this wallet, reproducible
+                // next cycle, and cured by a top-up. Never quarantined.
+                // feeCeiling is necessarily present here: with it absent, nominate() falls back to
+                // largest-nominable, and the cycle gate above already established that at least one
+                // nominable utxo exists — so the empty branch is unreachable without a ceiling.
+                String detail = ("no ada-only wallet utxo covers the %s lovelace this ledger could "
+                        + "charge in fees; largest nominable is %s. Fund the wallet with one ada-only "
+                        + "utxo of at least that amount.").formatted(
+                        feeCeiling.map(Object::toString).orElse("(unknown)"),
+                        WalletInputSelection.largestNominable(walletUtxos)
+                                .map(Object::toString).orElse("none at all"));
+                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                        "WALLET_INPUT_TOO_SMALL", detail));
+                log.warn("the liquidation of {} was refused: {}", loanUtxoRef, detail);
+                return;
+            }
+            Utxo walletUtxo = plainWalletUtxo.get();
+
             LiquidateTransactionBuilder.Request request = new LiquidateTransactionBuilder.Request(
                     List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loanUtxo.get(),
                             bondUtxo.get())),
@@ -1179,29 +1242,16 @@ public class LiquidationExecutor {
      * the loop out of it. Filtering it out here costs one clause; not filtering it costs the slice
      * its entire output, with no symptom louder than a repeated refusal reason.
      */
-    private Optional<Utxo> adaOnlyWalletUtxo() {
+    private List<Utxo> nominableWalletUtxos() {
         List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
         if (walletUtxos.isEmpty()) {
             log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
-            return Optional.empty();
+            return List.of();
         }
-        // LARGEST, not first. The nominated utxo is the only wallet input the builder declares, and
-        // cardano-client-lib evaluates script cost BEFORE balancing can add any more — so a remote
-        // evaluator is shown a transaction whose declared inputs must already cover its outputs.
-        // Blockfrost refuses such a transaction with EvaluationFailure and an EMPTY ScriptFailures
-        // map ("could not evaluate at all", not "a script said no"), which is unreadable as a funding
-        // problem. Measured on preview 2026-08-24: a wallet holding 776 ada across 14 utxos had a
-        // 5-ada one first in the list, and every convert liquidation failed on it while a 58-ada and
-        // a 38-ada ada-only utxo sat unused at the same address. Taking the largest makes the
-        // nominated utxo sufficient on its own wherever the wallet can cover the transaction at all,
-        // and never makes it worse.
-        Optional<Utxo> walletUtxo = walletUtxos.stream()
-                .filter(utxo -> utxo.getAmount().size() == 1
-                        && utxo.getReferenceScriptHash() == null
-                        && utxo.getInlineDatum() == null
-                        && utxo.getDataHash() == null)
-                .max(Comparator.comparing(utxo -> utxo.getAmount().getFirst().getQuantity()));
-        if (walletUtxo.isEmpty()) {
+        List<Utxo> nominable = walletUtxos.stream()
+                .filter(WalletInputSelection::nominable)
+                .toList();
+        if (nominable.isEmpty()) {
             // Say WHAT was rejected and WHY, not just that nothing qualified. The 2026-08-24 shadow
             // run cost a full diagnosis round to establish something this line would have stated
             // outright: the only UTxO at the bot's address was the published loan_claim_action
@@ -1214,15 +1264,35 @@ public class LiquidationExecutor {
                     walletUtxos.stream().map(LiquidationExecutor::whyNotSpendable)
                             .collect(java.util.stream.Collectors.joining("; ")));
         } else {
-            log.info("wallet utxo for this cycle: {}#{} ({} lovelace, the largest of {} spendable)",
-                    walletUtxo.get().getTxHash(), walletUtxo.get().getOutputIndex(),
-                    walletUtxo.get().getAmount().getFirst().getQuantity(),
-                    walletUtxos.stream().filter(utxo -> utxo.getAmount().size() == 1
-                            && utxo.getReferenceScriptHash() == null
-                            && utxo.getInlineDatum() == null
-                            && utxo.getDataHash() == null).count());
+            log.info("{} spendable wallet utxo(s) this cycle, {} lovelace in the largest — each "
+                            + "candidate nominates the SMALLEST that covers its own requirement",
+                    nominable.size(),
+                    WalletInputSelection.largestNominable(nominable).map(Object::toString).orElse("0"));
         }
-        return walletUtxo;
+        return nominable;
+    }
+
+    /**
+     * T-052 — nominate the wallet input for ONE candidate: the smallest that covers the fee ceiling
+     * plus whatever extra ada this liquidation itself must pay out.
+     *
+     * @param extraOutlay ada this transaction pays from the bot's own wallet beyond the fee — the
+     *                    lender payout on the principal-repaying path, and {@code ZERO} on the
+     *                    fee-only path, which is the distinction the whole ticket is about
+     */
+    private Optional<Utxo> nominate(List<Utxo> walletUtxos, Optional<BigInteger> feeCeiling,
+                                    BigInteger extraOutlay, String loanUtxoRef) {
+        Optional<Utxo> chosen = feeCeiling
+                .map(ceiling -> WalletInputSelection.smallestSufficient(
+                        walletUtxos, ceiling.add(extraOutlay)))
+                .orElseGet(() -> WalletInputSelection.largest(walletUtxos));
+        chosen.ifPresent(utxo -> log.info("{} nominates wallet utxo {}#{} ({} lovelace) for a "
+                        + "requirement of {} + {} outlay{}",
+                loanUtxoRef, utxo.getTxHash(), utxo.getOutputIndex(),
+                LedgerCeilings.lovelaceOf(utxo),
+                feeCeiling.map(Object::toString).orElse("an unknown fee"), extraOutlay,
+                feeCeiling.isPresent() ? "" : " (largest, protocol params unavailable)"));
+        return chosen;
     }
 
     /** Why one wallet candidate cannot be spent, for the operator-facing rejection list. */

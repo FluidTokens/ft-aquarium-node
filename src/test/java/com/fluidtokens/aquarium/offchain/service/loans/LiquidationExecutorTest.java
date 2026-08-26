@@ -1763,21 +1763,29 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * The nominated wallet utxo must be the LARGEST spendable one, not the first the wallet happens
-     * to list.
+     * <b>T-052 — a fee-only liquidation nominates the SMALL utxo, leaving the large ones for the
+     * candidates that need them.</b>
      * <p>
-     * It is the only wallet input the builder declares, and cardano-client-lib evaluates script cost
-     * BEFORE balancing can add any more — so a remote evaluator is shown a transaction whose declared
-     * inputs must already cover its outputs. Blockfrost refuses one that cannot with
+     * Giovanni's rule 5: <i>"the amount of ada a liquidator might spend might be little, just tx fee
+     * or something, so a 5 ada utxo would be perfect."</i> On the plain path the collateral funds
+     * every output, so the only ada the bot brings is the fee — measured here at 2,405,077 lovelace
+     * against the fixture's protocol parameters, which the 5-ada utxo covers comfortably.
+     * <p>
+     * ⚠ <b>This test used to assert the opposite</b> — that the LARGEST was nominated — and the
+     * reason it did is still true and still guarded: the nominated utxo is the only wallet input the
+     * builder declares, and cardano-client-lib evaluates script cost BEFORE balancing can add any
+     * more, so it must cover the transaction alone. Blockfrost refuses one that cannot with
      * {@code EvaluationFailure} and an EMPTY {@code ScriptFailures} map, which reads as anything but
-     * a funding problem.
+     * a funding problem (measured on preview 2026-08-24: a 776-ada wallet across 14 utxos with a
+     * 5-ada one listed first, and every CONVERT liquidation failing on it).
      * <p>
-     * Measured on preview 2026-08-24: the bot's wallet held 776 ada across 14 utxos, a 5-ada one came
-     * first, and every convert liquidation failed on it while a 58-ada and a 38-ada ada-only utxo sat
-     * unused at the same address. Revert {@code max(...)} to {@code findFirst()} and this fails.
+     * <b>T-052 keeps that guarantee and stops paying for it with the biggest input:</b> the
+     * requirement is computed instead of over-provisioned. The convert half — where the requirement
+     * really is large — is asserted in {@code PayInAdvanceLiquidationRouterTest}, and the selection
+     * arithmetic in {@code WalletInputSelectionTest}.
      */
     @Test
-    void theWalletUtxoIsTheLargestSpendableOneNotTheFirstListed() {
+    void aFeeOnlyLiquidationNominatesTheSmallestSufficientUtxo() {
         Utxo small = LoanFixtures.adaUtxo("11".repeat(32), 0, ACCOUNT.baseAddress(), 5_000_000L);
         Utxo large = LoanFixtures.adaUtxo("22".repeat(32), 0, ACCOUNT.baseAddress(), 58_384_544L);
         Utxo middling = LoanFixtures.adaUtxo("33".repeat(32), 0, ACCOUNT.baseAddress(), 38_839_574L);
@@ -1799,15 +1807,23 @@ class LiquidationExecutorTest {
 
         String chosen = appender.list.stream()
                 .map(ILoggingEvent::getFormattedMessage)
-                .filter(message -> message.startsWith("wallet utxo for this cycle"))
+                .filter(message -> message.contains("nominates wallet utxo"))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("the executor must say which utxo it picked: "
                         + appender.list));
-        assertTrue(chosen.contains("22".repeat(32)),
-                "the LARGEST spendable utxo must be nominated, not the first listed: " + chosen);
-        assertTrue(chosen.contains("58384544"), "and its value must be reported: " + chosen);
-        assertTrue(chosen.contains("3 spendable"),
-                "the log must say how many were eligible, so an operator can see the choice: " + chosen);
+        assertTrue(chosen.contains("11".repeat(32)),
+                "a fee-only liquidation must take the small sufficient utxo: " + chosen);
+        assertFalse(chosen.contains("22".repeat(32)) || chosen.contains("33".repeat(32)),
+                "the large utxos must be left for candidates that need them: " + chosen);
+
+        // ⇒ AND IT MUST STILL COVER WHAT IT WAS CHOSEN AGAINST. This is the half the old
+        // largest-first rule bought by over-provisioning; asserting it here keeps the guarantee
+        // attached to the new mechanism instead of to a heuristic that happened to imply it.
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\\((\\d+) lovelace\\) for a requirement of (\\d+)").matcher(chosen);
+        assertTrue(m.find(), "the nomination line must state both figures: " + chosen);
+        assertTrue(Long.parseLong(m.group(1)) >= Long.parseLong(m.group(2)),
+                "the nominated utxo does not cover the requirement it was chosen against: " + chosen);
     }
 
     /** A reference-script or datum-bearing utxo is still excluded, however large it is. */
@@ -1836,7 +1852,7 @@ class LiquidationExecutorTest {
 
         String chosen = appender.list.stream()
                 .map(ILoggingEvent::getFormattedMessage)
-                .filter(message -> message.startsWith("wallet utxo for this cycle"))
+                .filter(message -> message.contains("nominates wallet utxo"))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("expected a nomination: " + appender.list));
         assertTrue(chosen.contains("55".repeat(32)),

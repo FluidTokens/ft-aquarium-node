@@ -291,20 +291,35 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * {@code ceil(collateralReceive priced in lovelace)}.
      */
     public Numbers numbers(Request request) {
-        LoanDatum datum = request.loan().datum();
-        LiquidationMode.Liquidation mode = (LiquidationMode.Liquidation) datum.liquidationMode();
-        BigInteger collateralAmount = request.loan().collateralAmount();
+        return numbers(request.loan(), request.bond(), request.oracle(), request.validFromMillis());
+    }
 
-        BigInteger remainingDebt = LoanFinance.remainingDebt(datum, request.validFromMillis());
+    /**
+     * The same five numbers, computed from the four things they actually depend on — <b>and notably
+     * NOT from the wallet UTxO.</b>
+     * <p>
+     * That is what makes T-052 possible: the ada this liquidation will ask the bot to pay the lender
+     * ({@code convertedLoanCollateralToPrincipalAmount}) is knowable <em>before</em> a wallet input has
+     * been chosen, so the input can be selected to cover it instead of being picked blind and hoped
+     * over. Every field below reads the loan, the bond, the oracle or the instant; none reads the
+     * wallet. <b>Keep it that way</b> — a wallet read here would make the requirement depend on the
+     * answer it is being used to compute.
+     */
+    public Numbers numbers(Loan loan, LenderBond bond, OracleEntry oracle, long validFromMillis) {
+        LoanDatum datum = loan.datum();
+        LiquidationMode.Liquidation mode = (LiquidationMode.Liquidation) datum.liquidationMode();
+        BigInteger collateralAmount = loan.collateralAmount();
+
+        BigInteger remainingDebt = LoanFinance.remainingDebt(datum, validFromMillis);
         BigInteger equity = LoanFinance.redeemerEquity(mode, Rational.fromInt(collateralAmount),
-                Rational.fromInt(remainingDebt), OraclePriceFeed.unit(), request.oracle().feed());
+                Rational.fromInt(remainingDebt), OraclePriceFeed.unit(), oracle.feed());
         BigInteger liquidationFee = Rational.required(
-                        collateralAmount.multiply(request.bond().datum().liquidationFeePerMille()),
+                        collateralAmount.multiply(bond.datum().liquidationFeePerMille()),
                         BigInteger.valueOf(1000))
                 .floor();
         BigInteger collateralLenderShouldReceive = collateralAmount.subtract(equity).subtract(liquidationFee);
         BigInteger converted = LoanFinance.toLovelace(
-                Rational.fromInt(collateralLenderShouldReceive), request.oracle().feed()).ceil();
+                Rational.fromInt(collateralLenderShouldReceive), oracle.feed()).ceil();
         return new Numbers(remainingDebt, equity, liquidationFee, collateralLenderShouldReceive, converted);
     }
 

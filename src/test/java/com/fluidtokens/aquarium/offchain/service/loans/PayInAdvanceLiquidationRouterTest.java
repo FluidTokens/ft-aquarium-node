@@ -27,6 +27,8 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Optional;
+import java.util.function.Function;
 import java.util.List;
 import java.util.Map;
 
@@ -152,6 +154,11 @@ class PayInAdvanceLiquidationRouterTest {
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 60_000_000L);
 
+    /** A selector that supplies the fixture wallet whatever the payout — for tests not about T-052. */
+    private static Function<BigInteger, Optional<Utxo>> anyWallet() {
+        return payout -> Optional.of(WALLET_UTXO);
+    }
+
     // ======================================================================================
     // (1) the deliverable — a convert loan routed to the pay-in-advance builder
     // ======================================================================================
@@ -167,7 +174,7 @@ class PayInAdvanceLiquidationRouterTest {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
 
         Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), WALLET_UTXO, NOW, VALID_TO_MILLIS);
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), anyWallet(), NOW, VALID_TO_MILLIS);
 
         // The parent LenderManager redeemer carries LiquidateAndPayInAdvance (constructor index 3).
         String parentReward = LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash());
@@ -216,7 +223,7 @@ class PayInAdvanceLiquidationRouterTest {
         PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
                 PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), WALLET_UTXO, NOW, VALID_TO_MILLIS));
+                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), anyWallet(), NOW, VALID_TO_MILLIS));
         assertEquals("pay-in-advance not yet modelled for non-positive equity", refusal.getMessage());
     }
 
@@ -228,7 +235,7 @@ class PayInAdvanceLiquidationRouterTest {
         PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
                 PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), WALLET_UTXO, NOW, VALID_TO_MILLIS));
+                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), anyWallet(), NOW, VALID_TO_MILLIS));
         assertEquals("pay-in-advance not yet modelled for non-ada principal", refusal.getMessage());
     }
 
@@ -374,5 +381,84 @@ class PayInAdvanceLiquidationRouterTest {
     private static String paymentCredentialOf(String address) {
         return new com.bloxbean.cardano.client.address.Address(address)
                 .getPaymentCredentialHash().map(HexUtil::encodeHexString).orElse("");
+    }
+
+    // ======================================================================================
+    // T-052 — the wallet input is selected to cover THIS liquidation's lender payout
+    // ======================================================================================
+
+    /**
+     * <b>The router asks for the exact ada it is about to pay the lender.</b>
+     * <p>
+     * This is the half of T-052's acceptance that says a principal-repaying liquidation is never
+     * built against an input too small to fund it. The figure handed to the selector must be
+     * {@code convertedLoanCollateralToPrincipalAmount} — the ada that leaves the bot's wallet — and
+     * not a proxy.
+     */
+    @Test
+    void theSelectorIsAskedForTheExactLenderPayout() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
+        List<BigInteger> asked = new ArrayList<>();
+
+        Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(),
+                payout -> {
+                    asked.add(payout);
+                    return Optional.of(WALLET_UTXO);
+                },
+                NOW, VALID_TO_MILLIS);
+
+        assertEquals(1, asked.size(), "the selector must be consulted exactly once");
+        // Re-derived from the BUILT body rather than from the router's own arithmetic: the lender's
+        // paid-in-advance output is the ada the wallet has to fund, so the amount demanded of the
+        // wallet and the amount paid out must be the same number. Comparing the router against itself
+        // would be an assertion structurally incapable of failing.
+        BigInteger paidToLender = tx.getBody().getOutputs().stream()
+                .filter(o -> o.getValue().getMultiAssets() == null
+                        || o.getValue().getMultiAssets().isEmpty())
+                .map(o -> o.getValue().getCoin())
+                .max(BigInteger::compareTo)
+                .orElseThrow();
+        assertEquals(paidToLender, asked.getFirst(),
+                "the wallet was asked to cover an amount that is not what the lender is paid");
+    }
+
+    /**
+     * ⚠ <b>A wallet that cannot fund the payout is a REFUSAL, not a crash and not a built
+     * transaction.</b> Before T-052 the executor nominated one utxo per cycle and this candidate
+     * would have been built against it regardless, failing at evaluation with an empty
+     * {@code ScriptFailures} map — the unreadable shape measured on preview 2026-08-24.
+     */
+    @Test
+    void aWalletThatCannotFundTheLenderPayoutIsRefusedCleanly() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
+
+        PayInAdvanceLiquidationRouter.WalletInputTooSmallException refusal = assertThrows(
+                PayInAdvanceLiquidationRouter.WalletInputTooSmallException.class,
+                () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
+                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(),
+                        payout -> Optional.empty(), NOW, VALID_TO_MILLIS));
+
+        assertTrue(refusal.getMessage().contains("repays the lender"),
+                "the refusal must say what the wallet was short of, not merely that it was short: "
+                        + refusal.getMessage());
+    }
+
+    /**
+     * Positive control: the selection is real, not decorative. Handing back a different wallet UTxO
+     * must reach the built transaction's inputs — otherwise the test above proves only that a lambda
+     * was invoked.
+     */
+    @Test
+    void theSelectedUtxoIsTheOneActuallySpent() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
+
+        Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), anyWallet(), NOW, VALID_TO_MILLIS);
+
+        assertTrue(tx.getBody().getInputs().stream()
+                        .anyMatch(i -> i.getTransactionId().equals(WALLET_UTXO.getTxHash())
+                                && i.getIndex() == WALLET_UTXO.getOutputIndex()),
+                "the utxo the selector returned is not among the transaction's inputs");
     }
 }

@@ -1,6 +1,9 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.api.model.Utxo;
+import java.util.function.Function;
+import java.util.Optional;
+import java.math.BigInteger;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
@@ -58,6 +61,18 @@ public class PayInAdvanceLiquidationRouter {
         }
     }
 
+    /**
+     * No nominable wallet UTxO can fund this convert liquidation's lender payout. A <b>refusal</b>,
+     * not a machinery failure: it is a true statement about this candidate against this wallet, it is
+     * reproducible next cycle, and it becomes buildable the moment the wallet is topped up — so it is
+     * neither quarantined nor logged as an error.
+     */
+    public static class WalletInputTooSmallException extends RuntimeException {
+        public WalletInputTooSmallException(String message) {
+            super(message);
+        }
+    }
+
     private final LoansContractRegistry registry;
 
     private final CardanoConverters converters;
@@ -84,6 +99,8 @@ public class PayInAdvanceLiquidationRouter {
      *                        plain path passes; clamped inwards to a whole slot here
      * @param validToMillis   the requested window upper bound — the same {@code now + window} the plain
      *                        path passes
+     * @throws WalletInputTooSmallException      when no nominable wallet utxo covers the lender
+     *                                          payout this liquidation must fund
      * @throws PayInAdvanceNotModelledException when the principal is not ada, or the equity is not
      *                                          strictly positive — a clean refusal, no transaction built
      */
@@ -93,7 +110,7 @@ public class PayInAdvanceLiquidationRouter {
                                         Utxo configUtxo,
                                         Utxo lmConfigUtxo,
                                         Map<String, OracleEntry> oraclesByUnit,
-                                        Utxo walletUtxo,
+                                        Function<BigInteger, Optional<Utxo>> walletSelector,
                                         long validFromMillis,
                                         long validToMillis) {
         LoanDatum datum = assessment.loan().datum();
@@ -126,6 +143,31 @@ public class PayInAdvanceLiquidationRouter {
         // The upper bound the same way: the builder's V3 oracle-window check must be made against the
         // window the LEDGER will see, which is the slot-derived pair, not the caller's raw millis.
         long slotToMillis = millisOf(converters.slot().slotToTime(slots[1]));
+
+        // T-052 — THE WALLET INPUT IS CHOSEN TO COVER THIS LIQUIDATION, NOT PICKED BLIND.
+        //
+        // This is the principal-repaying path: the collateral is a token, so the ada the lender is
+        // paid comes out of the BOT'S OWN WALLET. That amount is
+        // convertedLoanCollateralToPrincipalAmount, and it is knowable here because numbers() reads
+        // the loan, the bond, the oracle and the instant — NEVER the wallet. The caller hands in a
+        // selector rather than a UTxO, so the choice is made where the amount is known, and the
+        // builder still knows nothing about liquidation types.
+        //
+        // ⚠ remainingDebt is NOT used as a proxy for this figure, though it is the intuitive one and
+        // the executor already holds it. LoanFinance.redeemerEquity returns ZERO OUTRIGHT when
+        // partialLiquidationPenaltyPerMille is negative, so equity is not always the surplus and the
+        // lender's converted share is not bounded by the debt. The exact number costs nothing here;
+        // a wrong bound costs the candidate, and fails at evaluation with an EMPTY ScriptFailures map
+        // that reads as "a script refused" rather than "you are short" (measured 2026-08-24).
+        LiquidatePayInAdvanceTransactionBuilder.Numbers numbers =
+                builder.numbers(assessment.loan(), assessment.bond(), collateralOracle, slotFromMillis);
+        BigInteger lenderPayout = numbers.convertedLoanCollateralToPrincipalAmount();
+        Utxo walletUtxo = walletSelector.apply(lenderPayout)
+                .orElseThrow(() -> new WalletInputTooSmallException(
+                        ("no ada-only wallet utxo can fund this convert liquidation: it repays the "
+                                + "lender %s lovelace on top of the fee, and no single nominable utxo "
+                                + "covers that. Fund the wallet with one ada-only utxo of at least "
+                                + "that amount plus fee headroom.").formatted(lenderPayout)));
 
         LiquidatePayInAdvanceTransactionBuilder.Request request =
                 new LiquidatePayInAdvanceTransactionBuilder.Request(
