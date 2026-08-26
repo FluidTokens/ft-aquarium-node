@@ -357,3 +357,82 @@ correct (the publisher needs no collateral payer and no evaluation, because it i
 some are the T-043 defect. **And nothing distinguishes the two cases at a glance**, which is precisely
 why the convert path's missing `postBalanceTx` read as normal for a day. **The spine finding is
 stronger, not weaker: there is no canonical shape to diff against.**
+
+---
+
+# SECOND PASS — re-run against the real CCL docs (2026-08-26)
+
+**Giovanni: *"so the investigation was carried w/o any CCL docs right? if that's the case pleae run it
+again."*** He was right, and the first pass's verdict was wrong.
+
+**Why the first pass had no docs.** T-041 resolved the corpus with `find … -name sources | head -1`
+over four sibling plugin-version directories. **Measured: 12 draws returned 3 distinct WRONG versions
+and the correct one ZERO times.** The docs landed 2026-08-25 23:59 — but the timing is a coincidence;
+**that command essentially never returns the newest version**, so T-041 would have read a
+README-only corpus whenever they landed. Every path in this pass is pinned explicitly.
+
+> **⚠ And the reasoning error, stated because it is the same one this review distilled.** I swept 66
+> files for five **behavioural** terms, found them all at zero, and concluded *"the docs change
+> nothing."* The sound conclusion was **"the docs contain nothing that CONTRADICTS the behavioural
+> findings."** A negative result on the terms I chose to grep is not a negative result on the corpus —
+> **an absence I could not interpret**, one turn after writing that rule into `fabbrica` §7e.
+
+## ⛔ WHAT THE DOCS MOVED — four items no source at our pin could carry
+
+**D-1. `ScriptTx` IS DEPRECATED.** *"Starting in 0.8.0, all `ScriptTx` operations are now available
+directly on `Tx`. The `ScriptTx` class is deprecated and will be removed in a future release."*
+Migration is documented as **drop-in** — `new ScriptTx()` → `new Tx()`.
+**⇒ All three production builders are built on `ScriptTx`.** We are pinned at 0.7.2 and CCL 0.8 is
+preview-only on a funds path, so this is **not urgent** — but it is a migration the roadmap now has,
+and **source at 0.7.2 structurally cannot tell you a class is deprecated in the next version.**
+
+**D-2. The Composable Functions API is the documented layer for deterministic output ordering.**
+*"Choose Composable Functions directly if you need to handcraft every step"* · *"You need
+deterministic, ordered control over how inputs/outputs are shaped and balanced."*
+**⇒ That is exactly why the two-pass layout probe exists.** F1/P6 offered two options — observe, or
+compute-and-assert. **The library documents a third: drop to the layer built for it.** Neither the
+ITs (which use QuickTx) nor the source could have surfaced this — **it is layer-choice guidance, and
+guidance is what source cannot carry.**
+
+**D-3. `tx.mintAsset(policyId, asset, redeemer)` — Plutus minting via a REFERENCE SCRIPT, by policy id**
+(0.8). Trap 9's whole problem is that `mintAsset(script, …)` **always** attaches a witness copy. A
+policy-id overload dissolves it. Not applicable at 0.7.2; relevant the moment 0.8 is taken.
+
+**D-4. TxFlow BATCH answers our deferred defect 2.** *"Transaction hashes are computed client-side
+using Blake2b-256, so subsequent transactions can reference earlier outputs before any are submitted."*
+**⇒ That is precisely the second-liquidation-in-one-cycle problem** — the executor resolves one wallet
+UTxO per cycle and the second candidate builds against an input the first already spent. TxStream
+additionally describes FIFO lanes so *"contended UTXOs are settled FIFO instead of racing."*
+**Preview API, funds path — recorded as a direction, not a proposal.**
+
+## ✅ WHAT THE DOCS CONFIRMED — same verdicts, now doubly sourced
+
+| finding | doc citation |
+|---|---|
+| **C1** — the tank is right, the liquidation builders opted out | `quicktx-api`: *"Collateral is **auto-selected** for script transactions **unless** you set explicit inputs via `withCollateralInputs(...)`"* |
+| **P1** — adopt largest-first | `quicktx-api`'s canonical `compose` example **is** `new LargestFirstUtxoSelectionStrategy(utxoSupplier)`; `coin-selection-api` documents `setIgnoreUtxosWithDatumHash` **default true** |
+| **T-045** — our double `accept()` override is the right shape | `coin-selection-api` lists **`fallback()` in the core interface** ⇒ the fallback is first-class, so overriding it is the expected extension point, not a workaround. **And there is still no reference-script-aware selector** — the only such line is a `UtxoSelector.findFirst` *positive* predicate |
+| **E1 / E2** | `withVerifier(...)`, `withTxInspector(...)` both documented |
+| **A1** | `removeDuplicateScriptWitnesses(boolean)` documented |
+| **D2** — the tank's evaluator arrives by injection | `supplier-interfaces-api`: `DefaultTransactionProcessor` is *"instantiated automatically when using `new QuickTxBuilder(backendService)`"* |
+
+**✅ AND ONE NEW MATCH the first pass never checked.** The docs prescribe
+`AikenScriptUtil.applyParamToScript(...)` then
+`PlutusBlueprintUtil.getPlutusScriptFromCompiledCode(...)` (*"compiledCode is single-encoded CBOR;
+CCL's PlutusScript objects require double-encoded"*). **`LoansContractRegistry:531,504` and
+`ContractRegistry:107-108` already do exactly that.** Recorded because a match found by a check that
+could have failed is a result.
+
+## ⛔ WHAT THE DOCS DID NOT MOVE
+
+The five behavioural terms remain at **zero across all 66 files**: `collateralReturn`,
+`totalCollateral`, `"collateral return"`, `"dummy output"`, `"after balancing"`.
+
+**⇒ Every behavioural finding still rests on the source and the ITs, and none of them is contradicted:**
+the unguarded subtract at `CollateralBuilders:137` · `ignoreScriptCostEvaluationError` honoured at one
+call site and not the other · `removeDuplicateScriptWitnesses` running *after* balancing while
+evaluation runs before it · exactly one withdrawal dummy however many withdrawals.
+
+**⇒ The two authorities are complementary, and that is the durable lesson: the docs say WHAT EXISTS,
+WHICH LAYER TO USE, and WHAT IS GOING AWAY. The source and its tests say WHAT ACTUALLY HAPPENS.
+A review with only one of them is incomplete in a direction it cannot detect from inside.**
