@@ -3,22 +3,32 @@
 > **Status: A LIST, NOT AN ACTION.** Nothing here has been built, pushed to a registry, or
 > deployed. Sequencing is Giovanni's and the Steward's.
 
-## 0. ⛔ The one thing I could not establish, and it changes the rest
+## 0. ⛔ CORRECTED 2026-08-26 — my finding here was WRONG, and the real gap is worse
 
-**I cannot determine which commit the running pod is on.** There is no chart, no deployment
-manifest and no registry reference in this repository — only a `Dockerfile` and
-`docker/docker-compose.yaml`, whose image is `${AQUARIUM_DOCKER_IMAGE_NAME}:${AQUARIUM_DOCKER_IMAGE_VERSION}`
-with `.env.example` defaulting the tag to **`latest`**.
+**What I wrote:** that "which code is running?" was unanswerable, because `.env.example` defaults
+the image tag to `latest`.
 
-**A mutable tag is why this question has no answer.** "Which code is running?" should be readable
-off the cluster, and with `latest` it is not — it is whatever was pushed last. **This is the first
-thing the redeploy should fix**, and it costs nothing: tag the image with the **git short SHA**
-(optionally *also* moving `latest`). Rollback then means naming a SHA rather than rebuilding and
-hoping.
+**What is actually true, measured from the cluster:**
 
-⇒ **Before deciding what this redeploy delivers, someone with cluster access must report the tag
-and digest the pod is running.** Everything in §1 assumes the answer is "something older than
-today".
+```
+image  : localhost:5000/ft-aquarium-node:lending-v4-2eeb52e
+imageID: ...@sha256:723fa15bcc81622e691a87f55a1f9aae894ded9e0107bdd3657e779f890e4328
+```
+
+**Commit `2eeb52e`, pinned by BOTH a commit-bearing tag and a digest**, with Argo passing
+`tag=lending-v4-2eeb52e` explicitly. SHA tagging is already the practice.
+
+**⚠ How I got it wrong is the instructive part.** `.env.example` describes the **compose** path —
+the one operators run — not the **deployed** path. I read the artefact that was *convenient to
+read* and reported it as the state of a system that does not consume it. **A file in this repo is
+not evidence about a cluster**, and the fix was to ask, which nobody had.
+
+**⇒ The real gap, which I could not have seen and which stands:** the Argo Application lives in
+`steward/clusters/ryzen/apps/`, carrying the digest and the rationale — but **Argo cannot read that
+repo, so every Application is applied imperatively.** *The deployment record lives in a third
+repository that neither this repo nor Argo reads.* That is the true version of what §0 was reaching
+for: not "the tag is mutable", but **"the intent and the running state are recorded in different
+places, and only one of them is enforced."**
 
 ## 1. What is actually being delivered
 
@@ -100,31 +110,68 @@ docker build -t <registry>/ft-aquarium-node:$(git rev-parse --short HEAD) .
 `AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK=true`, not a negative margin.** ⛔ **But not in the same
 change as the new image** — it changes which candidates are eligible, and confounds §6.
 
-## 6. ⚠ The honest risk
+## 6. ⛔⛔ THE RISK — AND THE MITIGATION I CLAIMED HERE DOES NOT EXIST
 
-**Eleven commits of structural change to the transaction builders, and no green rig drives
-`build()` end to end.** Every rig that does is built on `LoanFixtures` and is among the 37 failing
-against a superseded deployment. The suite is 73 files / 678 tests / **38 failures**, and that
-number is *expected* — but it means **the suite passing is not the signal here, and it cannot be.**
+> **This section originally argued: "the mitigation is the mode, not the tests — in `shadow`,
+> `MODE_NOT_LIVE` stops every submission, so everything in §7 is observable with nothing on chain."
+> THAT IS VOID. Measured on the cluster: `AQUARIUM_LIQUIDATION_MODE=live`,
+> `AQUARIUM_LIQUIDATION_ENABLED=true`, and the app confirms it at boot —
+> `INIT - liquidation mode: LIVE, armed: true`. THERE IS NO SHADOW.**
 
-**Do I still believe V5 covers it? For what it covers, yes — and it does not cover everything.**
+**And the situation is sharper than "the flag is on".**
 
-- ✅ **What V5 does cover:** every index a validator reads is re-derived from the **finished body**
+```
+50 decisions buffered:  SUBMIT_FAILED ×38 · REFUSED ×12 · SUBMITTED ×0
+scan now reads:         7 bonds, 2 BUILDABLE, exclusions {LOAN_NOT_FOUND=5}
+```
+
+**⇒ The bot has been trying, live and armed, every 30 minutes for 22 hours. Nothing reached the
+chain because THE BUILDER COULD NOT PRODUCE A VALID TRANSACTION — the defect has been the safety
+net.** And **eleven of today's commits fix exactly that.**
+
+**⇒ So this is not "ship and observe". It is: take a bot that has been failing safely for 22 hours,
+make it succeed, and point it at TWO LIVE CANDIDATES — with no green rig driving `build()` end to
+end.**
+
+### What the coverage actually is
+
+- ✅ **V5 covers structure:** every index a validator reads is re-derived from the **finished body**
   and compared. A wrong output index, a wrong reference-input index, a bond echo that is not an
-  echo — each is a `STRUCTURAL_ASSERTION_FAILED` **at build time**: loud, free, nothing on chain,
-  no collateral at risk. That is genuinely most of what T-051 changed.
-- ⛔ **What V5 does not cover, and I will not pretend otherwise:**
-  - **Ledger rules.** V5 asserts *structure*, not fees, min-ada, value conservation or collateral
-    adequacy. A phase-1 rejection is cheap and loud, but it is the *chain* telling us, not us.
-  - **The convert path has no accepted transaction at all**, so
-    `OutputLayout.CCL_PREPENDED_OUTPUTS` is inherited there **by argument, not observation**.
-  - **T-052's selection** decides which UTxO is nominated *before* any assertion runs. Nominating
-    one that cannot cover the transaction fails at *evaluation* with an empty `ScriptFailures` map
-    — which reads as "a script refused", not "you are short".
+  echo — each is a `STRUCTURAL_ASSERTION_FAILED` **at build time**: loud, free, nothing on chain.
+- ⛔ **V5 does not cover ledger rules** — fees, min-ada, value conservation, collateral adequacy.
+- ⛔ **The convert path's `OutputLayout.CCL_PREPENDED_OUTPUTS` is inherited by argument, not
+  observation** — no convert liquidation has ever been submitted.
+- ⛔ **T-052's selection runs before any assertion**, and a nomination that cannot cover the
+  transaction fails at *evaluation* with an empty `ScriptFailures` map.
 
-**⇒ The mitigation is the mode, not the tests.** In `shadow`, the bot builds and records and the
-`MODE_NOT_LIVE` veto stops every submission. **Everything in §7 is observable in shadow mode with
-nothing on chain.** That is what makes this redeploy safe to do before the coverage exists.
+### ⚠ And the failure DIRECTION changes, which is the part that matters
+
+The 38 `SUBMIT_FAILED` are **phase-1 rejections: free, loud, nothing on chain, no collateral at
+risk.** That is the cheapest failure mode there is. **A transaction that now gets *further* can
+fail in phase 2 instead — where the collateral input is consumed and the fee is forfeit.** We are
+deliberately moving transactions past the gate that has been protecting us.
+
+What stands against that is real but is not a test: ex-units come from a **live Blockfrost
+evaluator** whose parameters are the chain's by construction, and
+`ignoreScriptCostEvaluationError(false)` makes a failed evaluation **abort the build** rather than
+ship placeholders (CCL trap 8, and measured working on `8609fa37…`).
+
+### ⇒ Recommendation: DEPLOY INTO `shadow`, ARM SEPARATELY
+
+**The redeploy's guaranteed payoff — reading the census — does not need `live` at all.** Set
+`AQUARIUM_LIQUIDATION_MODE=shadow` **with or before** the new image; read the delta and watch the
+builder against two real candidates with nothing on chain; then arm as its own change once the
+builds look right.
+
+**One variable at a time, and the safe direction first.** ⛔ **Whether to accept the live risk
+instead is Giovanni's decision, not a default to fall into because the flag happens to be set.**
+
+### ⚠ The question that should be answered before either path
+
+**What are the 38 `SUBMIT_FAILED` details?** If they name a fault today's commits fix, we know what
+will now succeed. **If they name something else, the redeploy may change nothing** — and the whole
+risk would have been taken for no gain. That is one query against the decision log and it should
+precede the build.
 
 ## 7. What I would watch, in order, over the first three cycles
 
@@ -166,11 +213,18 @@ nothing on chain.** That is what makes this redeploy safe to do before the cover
 | **`0 bonds`** where there were 7 | The index stopped seeing the world. This is the redeploy trap and it is not diagnosable in place. |
 | **`STRUCTURAL_ASSERTION_FAILED` on every candidate** | V5 refusing everything means the computed layout is wrong — exactly what T-051 risked. Nothing on chain, but the bot is inert and the cause is today's change. |
 | **A boot failure naming a loans bean** | T-058's guard firing in production wiring. |
-| **Any submission at all while in `shadow`** | The veto stack has a hole. Immediate, unconditional. |
+| **Any submission while in `shadow`** | The veto stack has a hole. Immediate, unconditional. ⚠ **Only meaningful if the mode is actually `shadow` — it is currently `live`, see §6.** |
+| **A submitted transaction that fails in PHASE 2** | Collateral forfeit. This is the failure the 38 phase-1 rejections have been preventing, and the one the redeploy makes reachable. |
 | **`unreadable` > 0 that was 0 before** | Would mean *this build* lost the ability to read loans it used to read. (If it is non-zero from the first cycle, that is the **finding**, not a regression — the instrument is new.) |
 
-**Not a rollback:** `0 buildable`, `COLLATERAL_ORACLE_UNUSABLE` (preview has a real ~60–80s price
-blackout every 5 minutes, upstream of us), or `LOAN_NOT_FOUND` on settled loans.
+**Not a rollback:** `COLLATERAL_ORACLE_UNUSABLE` (preview has a real ~60–80s price blackout every
+five minutes, upstream of us), or `LOAN_NOT_FOUND` on settled loans.
+
+⚠ **`0 buildable` has been struck from this list.** When it was written the scan read
+`0 buildable`; it now reads **`2 buildable`**, and a seventh bond appeared overnight. **A drop back
+to `0 buildable` after the redeploy would therefore be a REGRESSION, not the quiet market it would
+have been yesterday** — the population moved under the analysis, which is exactly why a measurement
+in a document needs a date on it.
 
 ## 8. What this redeploy is worth
 
