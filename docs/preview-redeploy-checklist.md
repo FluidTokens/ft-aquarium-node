@@ -156,6 +156,44 @@ evaluator** whose parameters are the chain's by construction, and
 `ignoreScriptCostEvaluationError(false)` makes a failed evaluation **abort the build** rather than
 ship placeholders (CCL trap 8, and measured working on `8609fa37…`).
 
+### ✅ ANSWERED — what the 38 `SUBMIT_FAILED` are, and why it changes the framing
+
+Measured from the decision log by `steward-d0`:
+
+```
+38 / 38   DecoderErrorDeserialiseFailure + "MaryValue: expected array or int, got TypeNInt"
+distinct detail strings : 1
+tx sizes                : {11915: 38}      ← byte-identical, every one
+loans                   : ff427de582c8 ×31 · 780bc25bff10 ×7
+```
+
+**One fault, and it is the negative collateral return.** `total_collateral 1,670,285` against a
+`1,000,000` collateral input ⇒ `collateral_return = −670,285`, and **a negative `MaryValue` is
+unrepresentable**, so the node cannot *read* the transaction.
+
+**⛔ Which means the framing everywhere above was too generous, including mine.** These are **not
+phase-1 rejections**. They die in the **decoder, before the ledger validates anything**:
+
+> **The gate that has protected us is a malformed-CBOR error. That is not a safety mechanism; it is
+> a bug that happens to sit upstream of every risk.**
+
+That is the argument for `shadow` stated without any appeal to caution.
+
+**My half of the join, verified rather than asserted** (the fault is `steward-d0`'s measurement;
+that today's commits fix it is this repo's claim, and the two should not be signed by the same
+party):
+
+- `collateralInputsFor` accumulates inputs until `capacity ≥ maxPossibleCollateral(params)` —
+  **≈ 3,607,616 lovelace on preview**, comfortably above the 1,670,285 that produced the negative
+  return. Input ≥ requirement ⇒ the return is non-negative.
+- And if the wallet *cannot* reach it, `assertCollateralIsCoverable` reads
+  **`collateralReturn` off the built artefact** and refuses `INSUFFICIENT_COLLATERAL` at build
+  time. **So the worst case is a refusal, not another unparseable transaction.**
+
+**⚠ The limit on "no second fault", which is the half that matters to us:** these died at the
+decoder, so *nothing downstream of it has ever run*. **Script execution, collateral consumption and
+phase 2 are UNTESTED, not proven clean** — and that is precisely the territory the redeploy opens.
+
 ### ⇒ Recommendation: DEPLOY INTO `shadow`, ARM SEPARATELY
 
 **The redeploy's guaranteed payoff — reading the census — does not need `live` at all.** Set
@@ -205,6 +243,26 @@ precede the build.
 7. Ex-units on any built body are **real, not 10000/1000** (CCL trap 8).
 8. No `WALLET_INPUT_TOO_SMALL` storm — one or two is information; every candidate means the
    requirement is being over-computed.
+
+### ⚑ PRE-LABELLED EXPECTED OUTCOMES — none of these is a regression
+
+**Write these down before the first cycle, because an accepted defect that is not pre-labelled is
+indistinguishable from a new one at 3am.**
+
+| Expected | Why it is not a regression |
+|---|---|
+| **The SECOND liquidation fails `BadInputsUTxO` on the same cycle** | **Two loans are queued** (`ff427de582c8`, `780bc25bff10`). The executor resolves wallet UTxOs once per cycle, so the first transaction to succeed consumes the input the second was built against. **Giovanni already ruled on this and accepted it with rationale** — *"1 liquidation per block might be enough to begin with."* Expect it on the very first successful cycle. |
+| **`LOAN_NOT_FOUND = 5`** | Settled loans, unless the census says otherwise — that is what the census is for. |
+| **`COLLATERAL_ORACLE_UNUSABLE` appearing and vanishing** | The real ~60–80s preview blackout every five minutes, upstream of us. |
+
+**⚠ One interaction nothing tests, worth watching rather than predicting.**
+`assertCollateralIsCoverable`'s *secondary* capacity term reads the **nominated wallet UTxO**
+(`adaOnly(walletUtxo)`), while T-050 now chooses collateral inputs **separately and possibly
+several of them**, and T-052 now nominates the **smallest sufficient** UTxO rather than the largest.
+If that nominated UTxO is small enough, the secondary check could refuse a candidate whose actual
+collateral inputs are ample. **It fails in the safe direction — a refusal, nothing on chain — but
+it would look like the bot rejecting good candidates.** The authoritative check (negative return on
+the artefact) is unaffected. A run of `INSUFFICIENT_COLLATERAL` refusals is the signature.
 
 ### ⇒ What would make me say ROLL BACK
 
