@@ -414,7 +414,7 @@ class PoolBorrowDryEvalTest {
                 new FakeLenderBondService(List.of(bond)), new FakeLoanService(List.of(loan)),
                 provider(oracleClient(atMillis)));
 
-        LiquidationAssessment assessment = scanner.scan(atMillis).stream()
+        LiquidationAssessment assessment = scanner.scan(atMillis).assessments().stream()
                 .filter(a -> BOND_ASSET_NAME.equals(a.bond().loanId()))
                 .findFirst().orElseThrow();
 
@@ -684,9 +684,12 @@ class PoolBorrowDryEvalTest {
             this.loans = loans;
         }
 
+        // census(), not findAll(): the scanner asks for the census so the T-060 blindness signal
+        // travels with the assessments. Overriding findAll() alone leaves this fake BYPASSED — which
+        // is exactly what happened when the seam moved, in three fakes at once.
         @Override
-        public List<Loan> findAll() {
-            return loans;
+        public Census census() {
+            return new Census(loans, loans.size(), 0, 0);
         }
     }
 

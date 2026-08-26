@@ -110,9 +110,12 @@ class LoansEndpointTest {
             this.loans = loans;
         }
 
+        // census(), not findAll(): the scanner asks for the census so the T-060 blindness signal
+        // travels with the assessments. Overriding findAll() alone leaves this fake BYPASSED — which
+        // is exactly what happened when the seam moved, in three fakes at once.
         @Override
-        public List<Loan> findAll() {
-            return loans;
+        public Census census() {
+            return new Census(loans, loans.size(), 0, 0);
         }
     }
 
@@ -130,8 +133,8 @@ class LoansEndpointTest {
     private static LiquidationCandidateScanner scannerReturning(List<LiquidationAssessment> assessments) {
         return new LiquidationCandidateScanner(null, null, null) {
             @Override
-            public List<LiquidationAssessment> scan(long atTimeMillis) {
-                return assessments;
+            public Scan scan(long atTimeMillis) {
+                return new Scan(assessments, readableCensus(assessments));
             }
         };
     }
@@ -213,5 +216,14 @@ class LoansEndpointTest {
         assertTrue(filtered.getFirst().botLiquidatable());
 
         assertEquals(2, controller.loans(false).size(), "without the filter both loans are returned");
+    }
+
+    /**
+     * A census reporting <b>nothing unreadable</b> — the healthy world these fakes model. T-060: a
+     * non-zero {@code unreadable} would mean some bond's LOAN_NOT_FOUND is a loan we cannot read
+     * rather than one that is gone, and no fake here is exercising that.
+     */
+    private static LoanService.Census readableCensus(List<LiquidationAssessment> assessments) {
+        return new LoanService.Census(List.of(), assessments.size(), 0, 0);
     }
 }

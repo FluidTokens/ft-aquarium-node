@@ -179,15 +179,18 @@ class LiquidationExecutorTest {
 
         private int scans;
 
+        private int unreadable;
+
         FakeScanner(List<LiquidationAssessment> assessments) {
             super(null, null, null);
             this.assessments = assessments;
         }
 
         @Override
-        public List<LiquidationAssessment> scan(long atTimeMillis) {
+        public Scan scan(long atTimeMillis) {
             scans++;
-            return assessments;
+            return new Scan(assessments,
+                    new LoanService.Census(List.of(), assessments.size() + unreadable, unreadable, 0));
         }
     }
 
@@ -2189,5 +2192,85 @@ class LiquidationExecutorTest {
                 LiquidationDecision.VARIANT, LiquidationDecision.Outcome.NO_UTXO, "NO_UTXO", "detail",
                 null, null, null, null, AssetType.LOVELACE,
                 null, null, null, null, null, null, null, null, null, null, null, null);
+    }
+
+    /**
+     * A census reporting <b>nothing unreadable</b> — the healthy world these fakes model. T-060: a
+     * non-zero {@code unreadable} would mean some bond's LOAN_NOT_FOUND is a loan we cannot read
+     * rather than one that is gone, and no fake here is exercising that.
+     */
+
+    // ======================================================================================
+    // T-060 — a settled loan and an unreadable one must not read the same
+    // ======================================================================================
+
+    /**
+     * ⛔ <b>When a loan is present but unreadable, the scan line says the histogram is
+     * CONTAMINATED.</b>
+     * <p>
+     * {@code LOAN_NOT_FOUND} is raised whenever no loan in our index matches the bond, which
+     * collapses "the loan was settled and its NFT burned" together with "the loan is alive, indexed,
+     * and this node cannot decode it". The second is blindness — and the loans datum decoder is
+     * hand-written, so an unmodelled shape produces exactly it. Without this line, the fix Giovanni
+     * asked for (stop counting them) would hide it permanently.
+     */
+    @Test
+    void anUnreadableLoanMakesTheScanLineSayTheHistogramIsContaminated() {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false);
+        wiring.scanner().unreadable = 2;
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        String scanLine = appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.startsWith("liquidation scan:"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no scan line: " + appender.list));
+        assertTrue(scanLine.contains("2 LOAN UTXO(S) UNREADABLE"),
+                "the count of loans we cannot read must be ON the scan line, beside the exclusions "
+                        + "it contaminates — not in a separate message an operator may never "
+                        + "correlate: " + scanLine);
+        assertTrue(scanLine.contains("CONTAMINATED"),
+                "and it must say what that MEANS for the LOAN_NOT_FOUND count: " + scanLine);
+    }
+
+    /**
+     * ⇒ And the converse, which is the half that makes the fix safe: with nothing unreadable, the
+     * line says so <b>positively</b>. The absence of a warning is not evidence; an explicit zero is.
+     * This is the reading that licenses treating {@code LOAN_NOT_FOUND} as settled loans.
+     */
+    @Test
+    void aFullyReadableLoanPopulationSaysSoPositively() {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        String scanLine = appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.startsWith("liquidation scan:"))
+                .findFirst().orElseThrow();
+        assertTrue(scanLine.contains("were readable"),
+                "a clean population must be stated, not merely left unmentioned: " + scanLine);
+        assertFalse(scanLine.contains("CONTAMINATED"), scanLine);
     }
 }

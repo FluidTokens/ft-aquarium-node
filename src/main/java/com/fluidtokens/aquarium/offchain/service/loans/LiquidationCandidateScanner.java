@@ -100,11 +100,29 @@ public class LiquidationCandidateScanner {
 
     private final ObjectProvider<FluidOracleClient> oracleClient;
 
-    public List<LiquidationAssessment> scan(long atTimeMillis) {
+    /**
+     * One scan: what every bond assessed to, <b>and what the loan population could not tell us</b>.
+     *
+     * <p>The two must travel together (T-060). {@code assessments} carries a {@code LOAN_NOT_FOUND}
+     * for every bond whose loan is missing, and {@code loanCensus.unreadable()} says how many loans
+     * are missing <em>because this node could not read them</em> rather than because they are gone.
+     * Reading the first without the second is how a decoder gap gets mistaken for a settled market.
+     */
+    public record Scan(List<LiquidationAssessment> assessments, LoanService.Census loanCensus) {
+    }
+
+    /**
+     * ⚠ <b>ONE method, deliberately.</b> An earlier shape kept {@code scan()} returning a bare list
+     * alongside a census-carrying variant — and every test fake overrode the bare one, so the
+     * executor's call to the other silently bypassed all of them and 52 tests went red at once.
+     * <b>Two entry points where only one is overridden is how a fake stops being consulted.</b>
+     */
+    public Scan scan(long atTimeMillis) {
         // A duplicate loanId (e.g. transient duplicate unspent UTxOs sharing an asset name) must
         // not blank the whole scan — same "one bad input must not blank the endpoint" posture as
         // LoanService/LenderBondService. Keep the first, log and drop the rest.
-        Map<String, Loan> loansByLoanId = loanService.findAll().stream()
+        LoanService.Census census = loanService.census();
+        Map<String, Loan> loansByLoanId = census.loans().stream()
                 .collect(Collectors.toMap(Loan::loanId, Function.identity(), (first, duplicate) -> {
                     log.warn("duplicate loanId {}: keeping {}#{}, dropping {}#{} from this scan",
                             first.loanId(), first.txHash(), first.outputIndex(),
@@ -113,9 +131,10 @@ public class LiquidationCandidateScanner {
                 }));
         FluidOracleClient client = oracleClient.getIfAvailable();
 
-        return lenderBondService.findAll().stream()
+        List<LiquidationAssessment> assessments = lenderBondService.findAll().stream()
                 .map(bond -> assess(bond, loansByLoanId.get(bond.loanId()), client, atTimeMillis))
                 .toList();
+        return new Scan(assessments, census);
     }
 
     private LiquidationAssessment assess(LenderBond bond, Loan loan, FluidOracleClient client, long atTimeMillis) {

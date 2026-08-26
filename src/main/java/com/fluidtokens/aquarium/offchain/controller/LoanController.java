@@ -228,7 +228,7 @@ public class LoanController {
         // One scan per request, joined loan-side by loanId. A duplicate bond loanId must not blank the
         // endpoint — same "one bad input must not blank the endpoint" posture as the scanner/LoanService:
         // keep the first, log and drop the rest.
-        Map<String, LiquidationAssessment> assessmentsByLoanId = scanner.scan(now).stream()
+        Map<String, LiquidationAssessment> assessmentsByLoanId = scanner.scan(now).assessments().stream()
                 .collect(Collectors.toMap(a -> a.bond().loanId(), Function.identity(), (first, duplicate) -> {
                     log.warn("duplicate bond loanId {} in liquidation scan: keeping {}, dropping {}",
                             first.bond().loanId(), first.bond().utxoRef(), duplicate.bond().utxoRef());

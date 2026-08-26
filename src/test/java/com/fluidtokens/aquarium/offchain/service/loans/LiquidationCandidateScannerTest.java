@@ -245,15 +245,24 @@ class LiquidationCandidateScannerTest {
 
     private static final class FakeLoanService extends LoanService {
         private final List<Loan> loans;
+        private final int unreadable;
 
         FakeLoanService(List<Loan> loans) {
-            super(null, null);
-            this.loans = loans;
+            this(loans, 0);
         }
 
+        /** @param unreadable loan-bearing utxos this node could see but could not read (T-060) */
+        FakeLoanService(List<Loan> loans, int unreadable) {
+            super(null, null);
+            this.loans = loans;
+            this.unreadable = unreadable;
+        }
+
+        // census(), not findAll(): the scanner asks for the census so the blindness signal travels
+        // with the assessments. Overriding findAll() alone would leave this fake silently bypassed.
         @Override
-        public List<Loan> findAll() {
-            return loans;
+        public Census census() {
+            return new Census(loans, loans.size() + unreadable, unreadable, 0);
         }
     }
 
@@ -275,7 +284,7 @@ class LiquidationCandidateScannerTest {
                                                  FluidOracleClient client) {
         var scanner = new LiquidationCandidateScanner(
                 new FakeLenderBondService(bonds), new FakeLoanService(loans), provider(client));
-        List<LiquidationAssessment> results = scanner.scan(NOW);
+        List<LiquidationAssessment> results = scanner.scan(NOW).assessments();
         assertEquals(1, results.size());
         return results.getFirst();
     }
@@ -766,7 +775,7 @@ class LiquidationCandidateScannerTest {
                 new FakeLoanService(List.of(duplicateLoanA, duplicateLoanB, otherLoan)),
                 provider(null));
 
-        List<LiquidationAssessment> results = scanner.scan(NOW);
+        List<LiquidationAssessment> results = scanner.scan(NOW).assessments();
 
         assertEquals(2, results.size(), "a duplicate loanId must not blank assessments for other bonds");
         var otherAssessment = results.stream()

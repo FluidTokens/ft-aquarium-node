@@ -213,8 +213,8 @@ class LiquidationSubmitVetoTest {
         }
 
         @Override
-        public List<LiquidationAssessment> scan(long atTimeMillis) {
-            return assessments;
+        public Scan scan(long atTimeMillis) {
+            return new Scan(assessments, readableCensus(assessments));
         }
     }
 
@@ -1630,5 +1630,14 @@ class LiquidationSubmitVetoTest {
         // of the two got there first.
         run.assertNothingWasSubmitted();
         assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, run.onlyDecision().outcome());
+    }
+
+    /**
+     * A census reporting <b>nothing unreadable</b> — the healthy world these fakes model. T-060: a
+     * non-zero {@code unreadable} would mean some bond's LOAN_NOT_FOUND is a loan we cannot read
+     * rather than one that is gone, and no fake here is exercising that.
+     */
+    private static LoanService.Census readableCensus(List<LiquidationAssessment> assessments) {
+        return new LoanService.Census(List.of(), assessments.size(), 0, 0);
     }
 }

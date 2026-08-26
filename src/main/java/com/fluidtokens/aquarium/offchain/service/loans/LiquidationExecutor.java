@@ -392,7 +392,8 @@ public class LiquidationExecutor {
             return;
         }
 
-        List<LiquidationAssessment> assessments = scanner.scan(now);
+        LiquidationCandidateScanner.Scan scan = scanner.scan(now);
+        List<LiquidationAssessment> assessments = scan.assessments();
 
         // The oracle snapshot is taken once, in the same cycle as the scan, and reused for every
         // candidate. Re-reading the registry between scanning and building would let a candidate be
@@ -408,8 +409,23 @@ public class LiquidationExecutor {
         // of them, so every scanned bond is accounted for without the ring buffer being flooded by
         // the healthy majority.
         decisionLog.recordRun(now, assessments.size(), buildable.size(), exclusions);
-        log.info("liquidation scan: {} bonds, {} buildable, exclusions {}",
-                assessments.size(), buildable.size(), exclusions);
+        // T-060 — the LOAN_NOT_FOUND count and the unreadable-loan count are reported TOGETHER,
+        // because either one alone is misleading. A bond whose loan is settled and a bond whose loan
+        // this node cannot read are indistinguishable in the histogram; `unreadable` is what tells
+        // them apart, and while it is non-zero the histogram must not be read as a settled market.
+        int unreadable = scan.loanCensus().unreadable();
+        log.info("liquidation scan: {} bonds, {} buildable, exclusions {}{}",
+                assessments.size(), buildable.size(), exclusions,
+                unreadable == 0
+                        // Stated positively and only when it is true: the ABSENCE of a warning is not
+                        // evidence, but an explicit zero is. It is what makes LOAN_NOT_FOUND readable
+                        // as "settled" rather than merely assumed to be.
+                        ? " (all %d loan utxos at the credential were readable)"
+                                .formatted(scan.loanCensus().utxosAtCredential()
+                                        - scan.loanCensus().notALoan())
+                        : " ⚠ %d LOAN UTXO(S) UNREADABLE — the LOAN_NOT_FOUND count above is "
+                                .formatted(unreadable)
+                                + "CONTAMINATED and must not be read as settled loans");
 
         // Before the early return, not after it: a cycle that finds nothing buildable is exactly the
         // cycle in which every quarantined loan was already skipped by the scanner, and letting the
