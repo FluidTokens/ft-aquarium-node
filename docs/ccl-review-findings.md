@@ -436,3 +436,73 @@ evaluation runs before it · exactly one withdrawal dummy however many withdrawa
 **⇒ The two authorities are complementary, and that is the durable lesson: the docs say WHAT EXISTS,
 WHICH LAYER TO USE, and WHAT IS GOING AWAY. The source and its tests say WHAT ACTUALLY HAPPENS.
 A review with only one of them is incomplete in a direction it cannot detect from inside.**
+
+## ⛔ D-5 — A LATENT DEFECT THE DOCS UNCOVERED, ARMED BY A CONFIG CHANGE WE ARE LIKELY TO MAKE
+
+Checking whether D-3 applied at all (*"do we mint?"*) turned up something the first pass missed
+entirely. **Both liquidation builders mint** — they burn the loan NFT:
+
+```
+LiquidateTransactionBuilder:1476            tx.mintAsset(registry.getLoanScript(), burns, …)
+LiquidatePayInAdvanceTransactionBuilder:487 tx.mintAsset(registry.getLoanScript(), …)
+```
+
+**`mintAsset(script, …)` ALWAYS attaches a witness copy of the policy script** — trap 9, verified in
+the 0.7.2 source. But `loan.loan` is *also* a reference-script candidate, and the attach-skip that
+implements idiom (b) guards a **different** call:
+
+```
+:1626  if (scripts.loan() == null) { tx.attachRewardValidator(registry.getLoanScript()); }   ← skipped when referenced
+:1476  tx.mintAsset(registry.getLoanScript(), …)                                             ← attaches ANYWAY
+```
+
+**⇒ Set `AQUARIUM_LIQUIDATION_REF_LOAN` — the config slot exists at `application.yaml:140` — and the
+same script is a reference input AND a witness copy in one transaction.** That is
+`ExtraneousScriptWitnessesUTXOW` at phase 1, and short of that the bytes are paid for twice and
+script-cost evaluation sees the bloated body.
+
+**⚠ And A1 removes the safety net:** `removeDuplicateScriptWitnesses(true)` sits inside
+`if (backendService == null && …)`, so **in production it never runs to strip the copy.**
+
+**Status: LATENT, not active** — `loan:` is currently unset. **But publishing `loan` is the natural
+next step for transaction-size reduction**, and it is the one that arms this. **A1 + A2 + D-3 compose:
+the single script that is both a minting policy and a reference candidate defeats idiom (b), and the
+strip that would repair it is behind a guard that never fires.** Scope: **both liquidation builders.**
+
+## Re-applied to the three production builders
+
+| finding | plain | convert | tank | scope |
+|---|---|---|---|---|
+| **D-1** `ScriptTx` deprecated in 0.8 | `1 ×` | `1 ×` | `1 ×` | **ALL THREE** |
+| **D-2** Composable Functions for deterministic ordering | applies (probes) | applies (probes) | n/a (no probe) | SOME |
+| **D-3** mint-by-policy-id (0.8) | applies | applies | n/a | SOME |
+| **D-5** minted script defeats the attach-skip | ⛔ latent | ⛔ latent | n/a | SOME |
+| **D-4** TxFlow BATCH | cross-cutting — the executor's cycle, not a builder | | | — |
+
+## ⚑ THE RECONCILIATION — how both passes are right
+
+**The first pass substituted the library's source and its 95 integration tests for the docs. That was
+a STRICTER authority on behaviour and a BLIND one on direction.** Source and tests describe **what
+is**; only documentation describes **what is changing, which layer to reach for, and what is going
+away.** `ScriptTx` being deprecated is the argument for the docs made *by* the docs — no source tree
+pinned at 0.7.2 can carry it.
+
+**⇒ Nothing in the first pass has been contradicted.** Its behavioural findings stand, six are now
+doubly sourced, and one hand-rolled component was confirmed correct twice over. **What it could not
+see was direction — and D-5 shows that blindness had a live cost, not merely a roadmap one.**
+
+## Two flagged for Giovanni by name
+
+**⚑ D-4 IS A CANDIDATE CLOSURE, not an observation.** TxFlow BATCH computes transaction hashes
+client-side (Blake2b-256) so later transactions can reference earlier outputs **before any are
+submitted** — the documented answer to *one wallet UTxO per cycle, the second liquidation building
+against an input the first already spent*. **⚠ Test it, do not adopt it: preview API, funds path.**
+
+**⚑ D-2 IS A THIRD ANSWER TO F1.** Giovanni proposed computing the indexes; I proposed
+compute-and-assert. **The library documents a third: drop the liquidation builders to the Composable
+Functions layer, which exists for *"deterministic, ordered control over how inputs/outputs are shaped
+and balanced."*** He proposed one of two and deserves to see that there are three.
+
+**Minor, recorded for the operator question:** `backend-services-api` notes `BFBackendService` is
+*"also compatible with Yaci Store"* — relevant to the open *"if Blockfrost is not configured the bot
+should not start"* item, since a node already running Yaci Store may not need Blockfrost at all.
