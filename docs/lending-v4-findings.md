@@ -1187,3 +1187,33 @@ been an inference about what the ledger accepted, and **only the ledger witnesse
 still puts it in the witness set, and **`ExtraneousScriptWitnessesUTXOW` needs one copy, not two.**
 Dedupe cannot help. **`loan_claim_action` (8,662 bytes) is correctly absent from the table above** —
 it travelled as a reference input, which is what the 2026-08-25 publication bought.
+
+## 18. ⛔ OPEN QUESTION FOR THE PROTOCOL: a loan can be made permanently unliquidatable by a stranger
+
+**Not a builder finding, and not fixable off-chain.** Recorded separately from the mitigation for that
+reason.
+
+**Anyone can send a token to a loan script address.** `loan_claim_action` governs how the collateral is
+split, and the off-chain builder emits outputs for exactly three things: the borrower's equity, the
+lender's share, and (now) the liquidator's fee — **all denominated in the loan's DECLARED collateral
+asset.** Nothing pays out an asset the loan datum does not mention.
+
+**⇒ So a loan UTxO carrying an unexpected token cannot be liquidated by this bot at all.** Cost to
+whoever does it: **one min-UTxO and a transaction fee.**
+
+**What we did about it (2026-08-26, T-056).** The builder now refuses such a loan by name and names the
+offending unit. **That is a blast-radius reduction, not a fix:** before the refusal, the stray asset
+reached the bot's change output, `adaOnlyWalletUtxo()` refused the resulting wallet UTxO, and **the
+whole bot stopped** — the 2026-08-25 outage, reproduced by a stranger. After it, **that one loan is
+skipped and the bot keeps running.**
+
+**⇒ The loan remains unliquidatable either way.** Whether it is recoverable — whether the validators
+permit a liquidation that ignores or sweeps an undeclared asset, or whether the borrower can withdraw
+it — **is a question about the on-chain contracts, and this repo only consumes them.** It has not been
+asked upstream.
+
+**⚠ Provenance: DERIVED, not observed.** No loan has ever carried a stray asset; the measured
+liquidation's UTxO was clean (`lovelace 3,000,000 · collateral 100,000,000 · loan NFT 1`). The
+reachability argument is that a script address accepts any payment, which is a property of Cardano
+rather than of these validators. **It has not been demonstrated on chain, and doing so deliberately
+against FluidTokens' preview deployment would be a hostile act, not a test.**

@@ -388,6 +388,24 @@ public final class LiquidateTransactionBuilder {
          * artefact passed the first and failed the second.
          */
         INSUFFICIENT_COLLATERAL,
+        /**
+         * The loan UTxO carries an asset that is neither its declared collateral nor its loan NFT.
+         *
+         * <p>⛔ <b>This is a griefing vector, and refusing is a blast-radius reduction rather than a
+         * fix.</b> Nothing pays out an undeclared asset — {@code assetManagerAmounts} emits only
+         * {@code loan.datum().collateral().assetType()} — so it would flow to the bot's change output,
+         * which {@code adaOnlyWalletUtxo()} then correctly refuses. <b>The wallet's only fresh output
+         * would be token-bearing and the WHOLE BOT would stop</b>, which is the 2026-08-25 outage
+         * reproduced by a stranger for the price of one min-UTxO and a fee.
+         *
+         * <p><b>After this refusal that one loan is skipped and the bot keeps running.</b> It is still
+         * unliquidatable by us either way — <b>whether a griefed loan is recoverable at all is a
+         * CONTRACT question</b>, recorded in the findings as an open question for the protocol.
+         *
+         * <p>The detail names the offending unit, because <em>"something is wrong with that loan"</em>
+         * and <em>"someone sent this token to that address"</em> lead to different actions.
+         */
+        LOAN_UTXO_CARRIES_UNDECLARED_ASSET,
         STRUCTURAL_ASSERTION_FAILED,
         /**
          * The script-cost evaluator could not price the transaction, so its redeemers would have kept
@@ -607,7 +625,7 @@ public final class LiquidateTransactionBuilder {
      * @throws RefusedException whenever anything about the batch is not certain
      */
     public Transaction build(Request request) {
-        checkRequestShape(request);
+        checkRequestShape(request, registry.getLoanPolicyId());
 
         // The instant every time-dependent redeemer figure is derived from is chosen FIRST, and
         // everything below is derived from it — because `validFrom` is not an observation, it is a
@@ -884,7 +902,7 @@ public final class LiquidateTransactionBuilder {
 
     // ---- request shape ---------------------------------------------------------------------
 
-    private static void checkRequestShape(Request request) {
+    private static void checkRequestShape(Request request, String loanPolicyId) {
         Objects.requireNonNull(request, "request");
         if (request.liquidations() == null || request.liquidations().isEmpty()) {
             throw refuse(Refusal.EMPTY_BATCH, "no liquidations supplied");
@@ -913,6 +931,10 @@ public final class LiquidateTransactionBuilder {
                 || wallet.getReferenceScriptHash() != null) {
             throw refuse(Refusal.WALLET_UTXO_NOT_ADA_ONLY,
                     "wallet utxo " + utxoRef(wallet) + " must hold ada only, with no datum or script");
+        }
+
+        for (LoanLiquidation liquidation : request.liquidations()) {
+            refuseIfLoanCarriesAnUndeclaredAsset(liquidation, loanPolicyId);
         }
 
         Set<String> loanIds = new HashSet<>();
@@ -1523,6 +1545,33 @@ public final class LiquidateTransactionBuilder {
             }
         }
 
+        // THE LIQUIDATION FEE, PAID OUT BY NAME (T-056).
+        //
+        // The bot's share used to be whatever the balancer had left over — collateral minus equity
+        // minus payout — and it arrived as a token-bearing CHANGE output that adaOnlyWalletUtxo()
+        // correctly refuses, disabling the wallet after a SUCCESSFUL liquidation. That was repaired
+        // afterwards by a postBalanceTx split, because the residual was UNEXPLAINED.
+        //
+        // It is explained: measured 2026-08-26, it is the liquidation fee. liquidationFeePerMille = 50
+        // on all seven live bonds, read from the datum and corroborated by 49743a1e…'s split
+        // (2,410,366 equity / 92,589,634 lender / 5,000,000 bot, summing to the collateral exactly).
+        // A COMPUTED FEE CAN BE PAID OUT BY NAME; AN UNEXPLAINED RESIDUAL CANNOT.
+        //
+        // Naming it before balancing lets cardano-client-lib balance correctly instead of us repairing
+        // afterwards, so change comes back ada-only BY CONSTRUCTION. Every other route by which a token
+        // could reach change is closed by construction too — see docs/change-output-enumeration.md,
+        // whose route 8 is the one that survives and is refused at the door instead.
+        //
+        // Skipped when the collateral is ada (the "fee" is then lovelace and change is ada-only
+        // anyway) and when the fee is zero (a lender may set liquidationFeePerMille = 0, and an empty
+        // output is not a payment).
+        for (VettedLoan loan : loanOrder) {
+            BigInteger fee = loan.assessment().liquidationFee();
+            if (!loan.loan().datum().collateral().isAda() && fee.signum() > 0) {
+                tx.payToAddress(request.changeAddress(), assetManagerAmounts(loan, fee));
+            }
+        }
+
         // Withdraw-0 invocations. The main config authorises loan/claim/lm-liquidate; the
         // LenderManager validator reads the LM config instead.
         List<String> bondAssetNames = loanOrder.stream().map(loan -> loan.loan().loanId()).toList();
@@ -1638,126 +1687,6 @@ public final class LiquidateTransactionBuilder {
         }
     }
 
-    /**
-     * Splits the change output so the bot keeps a spendable ada-only utxo.
-     *
-     * <p>Takes the change output carrying native assets and leaves the assets in it at exactly their
-     * min-ada, moving the rest into a new ada-only output at the same address. Both outputs belong to
-     * the bot, so nothing here can send value anywhere new — the worst an error can do is misallocate
-     * between two of its own outputs, and the ledger refuses that at phase 1.
-     *
-     * <h2>⚠ The conservation check is not decoration</h2>
-     * {@code assertStructure} is thorough about everything the VALIDATORS read — reference-input
-     * ordering, bond echoes, asset-manager outputs at their observed indexes — and says nothing about
-     * the change output, because no validator reads it. <b>A mis-shaped change output is invisible to
-     * V5.</b> So this asserts its own invariant: after the split, the totals at the change address
-     * must equal the totals before it, <b>lovelace and every asset unit independently</b>. A
-     * lovelace-only check would pass a split that dropped the collateral entirely, which is the exact
-     * value being protected.
-     */
-    static void splitChangeSoAdaStaysSpendable(ProtocolParams params, Transaction txn,
-                                               String changeAddress) {
-        var body = txn.getBody();
-        List<TransactionOutput> outputs = body.getOutputs();
-        Map<String, BigInteger> before = changeAddressCensus(outputs, changeAddress);
-        BigInteger feeBefore = body.getFee();
-
-        TransactionOutput tokenBearing = null;
-        for (TransactionOutput output : outputs) {
-            if (!changeAddress.equals(output.getAddress())) {
-                continue;
-            }
-            List<MultiAsset> assets = output.getValue().getMultiAssets();
-            if (assets == null || assets.isEmpty()) {
-                continue;
-            }
-            // Two token-bearing change outputs is not a shape this models. Leave the body untouched
-            // rather than guess which one to split.
-            if (tokenBearing != null) {
-                return;
-            }
-            tokenBearing = output;
-        }
-        if (tokenBearing == null) {
-            return;
-        }
-
-        // min-ada from live protocol params for an output carrying exactly these assets — never a
-        // constant. Measured comparables on preview: 1_655_040 and 1_771_410.
-        TransactionOutput tokenOnly = TransactionOutput.builder()
-                .address(changeAddress)
-                .value(Value.builder().coin(BigInteger.ZERO)
-                        .multiAssets(tokenBearing.getValue().getMultiAssets()).build())
-                .build();
-        BigInteger minAda = new MinAdaCalculator(params).calculateMinAda(tokenOnly);
-        BigInteger available = tokenBearing.getValue().getCoin();
-        if (available.compareTo(minAda) <= 0) {
-            // Nothing to carve: the change is already at or below what its assets require.
-            return;
-        }
-
-        int sizeBefore = serializedLength(txn);
-        TransactionOutput adaOnly = TransactionOutput.builder()
-                .address(changeAddress)
-                .value(Value.builder().coin(available.subtract(minAda))
-                        .multiAssets(new ArrayList<>()).build())
-                .build();
-        tokenBearing.getValue().setCoin(minAda);
-        outputs.add(adaOnly);
-
-        // Balancing has already run, so the new output's bytes are unpaid. Measure the growth and
-        // charge for it, taking the charge out of the ada-only output so value stays conserved.
-        // Iterated because raising the fee can itself widen the fee field; it converges immediately
-        // in practice and refuses rather than looping if it does not.
-        BigInteger perByte = BigInteger.valueOf(params.getMinFeeA());
-        BigInteger charged = BigInteger.ZERO;
-        for (int round = 0; ; round++) {
-            BigInteger needed = perByte.multiply(
-                    BigInteger.valueOf(serializedLength(txn) - (long) sizeBefore));
-            if (needed.compareTo(charged) <= 0) {
-                break;
-            }
-            structural(round < 4, "the change split's fee did not converge after " + round
-                    + " rounds; refusing rather than iterating");
-            BigInteger delta = needed.subtract(charged);
-            body.setFee(body.getFee().add(delta));
-            adaOnly.getValue().setCoin(adaOnly.getValue().getCoin().subtract(delta));
-            charged = needed;
-        }
-
-        assertChangeConserved(before, changeAddressCensus(outputs, changeAddress),
-                body.getFee().subtract(feeBefore));
-    }
-
-    /**
-     * The split's own invariant: nothing at the change address may appear or disappear.
-     *
-     * <p>Separate and package-private because an assertion that has never been seen to FAIL is not
-     * known to discriminate. This one can be handed a deliberately broken pair.
-     *
-     * <p><b>Every unit is checked independently.</b> A lovelace-only check would pass a split that
-     * dropped the collateral entirely — which is the exact value being protected here.
-     */
-    static void assertChangeConserved(Map<String, BigInteger> before, Map<String, BigInteger> after,
-                                      BigInteger feeDelta) {
-        structural(after.getOrDefault(LOVELACE, BigInteger.ZERO).add(feeDelta)
-                        .equals(before.getOrDefault(LOVELACE, BigInteger.ZERO)),
-                ("the change split did not conserve lovelace: %s before, %s after, %s to fee")
-                        .formatted(before.get(LOVELACE), after.get(LOVELACE), feeDelta));
-        Set<String> units = new LinkedHashSet<>(before.keySet());
-        units.addAll(after.keySet());
-        for (String unit : units) {
-            if (LOVELACE.equals(unit)) {
-                continue;
-            }
-            structural(before.getOrDefault(unit, BigInteger.ZERO)
-                            .equals(after.getOrDefault(unit, BigInteger.ZERO)),
-                    ("the change split did not conserve %s: %s before, %s after")
-                            .formatted(unit, before.getOrDefault(unit, BigInteger.ZERO),
-                                    after.getOrDefault(unit, BigInteger.ZERO)));
-        }
-    }
-
     /** The transaction's serialised length, for measuring growth the balancer has not paid for. */
     private static int serializedLength(Transaction txn) {
         try {
@@ -1768,29 +1697,6 @@ public final class LiquidateTransactionBuilder {
     }
 
     private static final String LOVELACE = "lovelace";
-
-    /** Every unit held across all outputs at one address, keyed policy+name, with lovelace apart. */
-    static Map<String, BigInteger> changeAddressCensus(List<TransactionOutput> outputs,
-                                                               String address) {
-        Map<String, BigInteger> census = new LinkedHashMap<>();
-        for (TransactionOutput output : outputs) {
-            if (!address.equals(output.getAddress())) {
-                continue;
-            }
-            census.merge(LOVELACE, output.getValue().getCoin(), BigInteger::add);
-            List<MultiAsset> multiAssets = output.getValue().getMultiAssets();
-            if (multiAssets == null) {
-                continue;
-            }
-            for (MultiAsset multiAsset : multiAssets) {
-                for (Asset asset : multiAsset.getAssets()) {
-                    census.merge(multiAsset.getPolicyId() + "." + asset.getName(),
-                            asset.getValue(), BigInteger::add);
-                }
-            }
-        }
-        return census;
-    }
 
     /**
      * Removes from the witness set every script that travels as a REFERENCE INPUT (rule 3, T-048).
@@ -1972,6 +1878,50 @@ public final class LiquidateTransactionBuilder {
         return com.fluidtokens.aquarium.offchain.util.LedgerCeilings.maxPossibleCollateral(params);
     }
 
+    /**
+     * Refuses a loan whose UTxO carries anything beyond lovelace, its declared collateral and its
+     * loan NFT (T-056, route 8 of {@code docs/change-output-enumeration.md}).
+     *
+     * <p>Nothing in this builder pays out an undeclared asset, so it would reach the change output and
+     * make the bot's own wallet unusable. <b>Refusing narrows the blast radius from every liquidation
+     * to this one.</b>
+     */
+    private static void refuseIfLoanCarriesAnUndeclaredAsset(LoanLiquidation liquidation,
+                                                             String loanPolicyId) {
+        Utxo loanUtxo = liquidation.loanUtxo();
+        if (loanUtxo == null || loanUtxo.getAmount() == null) {
+            return;
+        }
+        var loan = liquidation.assessment().loan();
+        AssetType collateral = loan.datum().collateral().assetType();
+        refuseUndeclaredAssets(loanUtxo.getAmount(),
+                collateral.isAda() ? AssetType.LOVELACE : unitOf(collateral),
+                loanPolicyId + loan.loanId(), loan.loanId(), utxoRef(loanUtxo));
+    }
+
+    /**
+     * The predicate itself, taking only what it uses so it is testable without a whole request.
+     *
+     * <p>Permitted: lovelace, the declared collateral, and the loan NFT. <b>Anything else is paid out
+     * by no output</b> — {@code assetManagerAmounts} emits only the declared collateral — so it would
+     * reach the bot's change and disable the wallet.
+     */
+    static void refuseUndeclaredAssets(List<Amount> amounts, String collateralUnit,
+                                       String loanNftUnit, String loanId, String loanUtxoRef) {
+        for (Amount amount : amounts) {
+            String unit = amount.getUnit();
+            if (AssetType.LOVELACE.equals(unit) || collateralUnit.equalsIgnoreCase(unit)
+                    || loanNftUnit.equalsIgnoreCase(unit)) {
+                continue;
+            }
+            throw refuse(Refusal.LOAN_UTXO_CARRIES_UNDECLARED_ASSET,
+                    ("loan %s at %s carries %s, which is neither its declared collateral (%s) nor its "
+                            + "loan NFT (%s). Nothing pays it out, so it would land in the bot's change "
+                            + "and disable the wallet. Someone sent this token to that address.")
+                            .formatted(loanId, loanUtxoRef, unit, collateralUnit, loanNftUnit));
+        }
+    }
+
     /** The scripts the caller says are published, paired with the registry object for each. */
     private List<PlutusScript> publishedScripts(ReferenceScripts scripts) {
         List<PlutusScript> published = new ArrayList<>();
@@ -2081,20 +2031,6 @@ public final class LiquidateTransactionBuilder {
                         // nothing here precisely because it was never selected: it is handed in.
                         .withCollateralInputs(collateralInputsFor(request));
 
-        // THE CHANGE SPLIT. Keeps the bot able to act after a liquidation.
-        //
-        // A liquidation returns the bot's change as ONE output carrying both the ada and the
-        // collateral it just received, and that output fails adaOnlyWalletUtxo()'s single-asset test
-        // -- correctly. Measured 2026-08-25: after 49743a1e… the wallet held 9,966 ADA and could
-        // build nothing, its only eligible utxo being a 1 ADA withdrawal dummy cardano-client-lib
-        // had emitted for its own reasons. A SUCCESSFUL LIQUIDATION DISABLED THE BOT.
-        //
-        // postBalanceTx, not assemble(): re-shaping what the balancer produced needs no knowledge of
-        // the payout economics, so it cannot drift from rule R the way a second residual calculation
-        // would. It is installed here, so it runs in BOTH passes of the layout probe -- the probe
-        // therefore observes the post-split layout and the output indexes are computed against it.
-        context = context.postBalanceTx((ctx, txn) ->
-                splitChangeSoAdaStaysSpendable(ctx.getProtocolParams(), txn, request.changeAddress()));
 
         if (backendService == null) {
             // Offline: cardano-client-lib would otherwise walk every reference input looking for a
