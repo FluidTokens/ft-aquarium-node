@@ -10,6 +10,9 @@ import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptSafeUtxoSelection;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
+import java.util.Comparator;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
+import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
@@ -60,6 +63,7 @@ public class ScheduledTransactionService {
     private final Account account;
 
     private final QuickTxBuilder quickTxBuilder;
+
 
     /**
      * Only used to build the reference-script-safe coin selection; see the guard at compose().
@@ -166,14 +170,41 @@ public class ScheduledTransactionService {
                     return;
                 }
 
-                // Ensure to use utxo with just ada
+                // The wallet input must be ada-only, must not carry a reference script, and must
+                // PROVABLY COVER what this transaction can cost (T-053).
+                //
+                // It used to be `findFirst()` with no size floor, which takes an ARBITRARY ada-only
+                // utxo — dust included. That is the shape that starved the liquidation path on a
+                // 1 ADA output on 2026-08-25.
+                //
+                // ⚠ SMALLEST THAT SUFFICES, not largest-first. Largest-first would spend the biggest
+                // utxo to pay a fee and fragment the wallet against the case where a large one is
+                // genuinely needed; Giovanni's own words are "a 5 ada utxo would be perfect". The
+                // requirement is DERIVED from the protocol parameters, never assumed — see
+                // LedgerCeilings, which exists because cardano-client-lib answers this same question
+                // with a hardcoded Amount.ada(5.0).
+                // ⚠ Derived from the BACKEND, not from a ProtocolParamsSupplier bean: that bean is
+                // @ConditionalOnProperty(loans.enabled) and lending is DISABLED ON MAINNET, so
+                // depending on it here would break the context on the one path operators run.
+                var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
+                        .getProtocolParams();
+                var required = LedgerCeilings.maxPossibleFee(protocolParams);
+
                 var walletUtxoOpt = walletUtxos
                         .stream()
                         .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
-                        .findFirst();
+                        .filter(utxo -> LedgerCeilings.lovelaceOf(utxo).compareTo(required) >= 0)
+                        .min(Comparator.comparing(LedgerCeilings::lovelaceOf));
 
                 if (walletUtxoOpt.isEmpty()) {
-                    log.warn("no valid utxos found. please ensure wallet has at least one utxo which contains ONLY ADA");
+                    var largest = walletUtxos.stream()
+                            .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
+                            .map(LedgerCeilings::lovelaceOf)
+                            .max(java.math.BigInteger::compareTo);
+                    log.warn("no ada-only wallet utxo covers the {} lovelace this ledger could charge; "
+                                    + "largest available is {}. Fund the wallet with a single ada-only "
+                                    + "utxo of at least that amount.",
+                            required, largest.map(Object::toString).orElse("none at all"));
                     return;
                 }
 

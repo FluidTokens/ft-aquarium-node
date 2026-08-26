@@ -1969,14 +1969,7 @@ public final class LiquidateTransactionBuilder {
      * {@code assertCollateralIsCoverable}. <b>Select generously; assert exactly.</b>
      */
     static BigInteger maxPossibleCollateral(ProtocolParams params) {
-        BigInteger maxFee = BigInteger.valueOf((long) params.getMinFeeA() * params.getMaxTxSize())
-                .add(BigInteger.valueOf(params.getMinFeeB()))
-                .add(params.getPriceMem().multiply(new java.math.BigDecimal(params.getMaxTxExMem()))
-                        .setScale(0, java.math.RoundingMode.CEILING).toBigInteger())
-                .add(params.getPriceStep().multiply(new java.math.BigDecimal(params.getMaxTxExSteps()))
-                        .setScale(0, java.math.RoundingMode.CEILING).toBigInteger());
-        return maxFee.multiply(params.getCollateralPercent().toBigInteger())
-                .add(BigInteger.valueOf(99)).divide(BigInteger.valueOf(100));
+        return com.fluidtokens.aquarium.offchain.util.LedgerCeilings.maxPossibleCollateral(params);
     }
 
     /** The scripts the caller says are published, paired with the registry object for each. */
