@@ -1120,3 +1120,44 @@ no signature, no submission, nothing on chain.
 It asks about **shape**. Nothing asked whether it was **large enough**, and `wallet_ok`'s 2 ADA floor
 — the only place in the node encoding the ledger's collateral relationship — **reports rather than
 gates**. This is that gap producing an unparseable artefact.
+
+### 17.4 The first real liquidation — the full artefact, and the witness set measured on chain
+
+> **⚠ RULE, learned the hard way 2026-08-26: an identifier that cannot be pasted into a query is a
+> citation, not a reference.** `49743a1e…` is quoted correctly in three documents and a dozen
+> messages, and **every one of those citations is useless for the only thing a hash is for.** It was
+> never lost — it was *truncated*, consistently, at every site, which is why nobody noticed. A session
+> spent a turn trying to query it and could not. **Write identifiers out in full the first time.**
+
+```
+tx        49743a1e9ef4b0e7756f2143f89fbb2e1a4e274d8a19068ae5d6f0e5244755f7
+block     4,603,278     ledger size 12,216 bytes     fee 1,133,033     valid_contract / is_valid TRUE
+```
+
+**Witness set, decoded from the accepted transaction (Blockfrost `/txs/{hash}/cbor`, 2026-08-26).**
+Body keys present: `0,1,2,3,5,8,9,11,13,16,17,18`. Witness keys: `0` (vkey), `5` (redeemers), `7`
+(PlutusV3). **Five PlutusV3 scripts, and NO duplicates:**
+
+| bytes | script hash | what it is |
+|---:|---|---|
+| 2,547 | `2f1aa941f437e351e3870f7247d735b2bc2952f1c7977426e8960d17` | **`loan.loan`** — the loan policy id (§16 corroboration) |
+| 1,158 | `31e0dc1d75076e4f7795b24c4cc4b5515791bb4eff4af7961e404f3e` | `loanSpend` (§16 corroboration) |
+| 1,158 | `dd2d7f3fdd0ca7ea68e94912c3d332f18299b6ec8854577492d006eb` | |
+| 968 | `777aa0f117733d2c504c8ae56618b4196aa322fb75f9e2d67a6b85e6` | |
+| 4,227 | `e0a13838d176cea9de466afe2075f38f682603013604021a3959700f` | |
+
+**⇒ THE MEASUREMENT THIS SETTLES.** `loan.loan` is added to the witness set by **two independent
+paths** in this builder — `attachRewardValidator` (`LiquidateTransactionBuilder:1626`, taken because
+`loan` is not referenced) **and** `mintAsset` (`:1476`, which always attaches). **It appears exactly
+once.** cardano-client-lib deduplicates at both add sites — `MintCreators:81-83` and
+`ScriptCallContextProviders:173-174`, the latter commented *"To avoid duplicate script in list"* — and
+the comparison is value-based, since `PlutusScript` is Lombok `@Data` over `(type, cborHex)`.
+
+**⇒ Source and chain agree. Not double-attached.** Recorded because the source read alone would have
+been an inference about what the ledger accepted, and **only the ledger witnesses that.**
+
+**⚠ And it does NOT dissolve the latent defect it was checked against.** That defect is about the
+*referenced* case: when `loan` travels as a reference input the attach is skipped but `mintAsset`
+still puts it in the witness set, and **`ExtraneousScriptWitnessesUTXOW` needs one copy, not two.**
+Dedupe cannot help. **`loan_claim_action` (8,662 bytes) is correctly absent from the table above** —
+it travelled as a reference input, which is what the 2026-08-25 publication bought.
