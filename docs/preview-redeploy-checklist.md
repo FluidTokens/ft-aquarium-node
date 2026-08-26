@@ -184,8 +184,9 @@ that today's commits fix it is this repo's claim, and the two should not be sign
 party):
 
 - `collateralInputsFor` accumulates inputs until `capacity ≥ maxPossibleCollateral(params)` —
-  **≈ 3,607,616 lovelace on preview**, comfortably above the 1,670,285 that produced the negative
-  return. Input ≥ requirement ⇒ the return is non-negative.
+  **3,910,541 lovelace from LIVE preview parameters** (corrected 2026-08-26 — the 3,607,616 first
+  written here was fixture-derived, see `LedgerCeilings`), comfortably above the 1,670,285 that
+  produced the negative return. Input ≥ requirement ⇒ the return is non-negative.
 - And if the wallet *cannot* reach it, `assertCollateralIsCoverable` reads
   **`collateralReturn` off the built artefact** and refuses `INSUFFICIENT_COLLATERAL` at build
   time. **So the worst case is a refusal, not another unparseable transaction.**

@@ -2305,10 +2305,17 @@ public final class LiquidateTransactionBuilder {
         // quantity this check is about — and T-052 then made it SYSTEMATICALLY SMALLER by nominating
         // the smallest input that covers the FEE ceiling rather than the largest available.
         //
-        // Measured: it could fire. capacity was >= maxPossibleFee (2,405,077 on preview) by T-052's
-        // rule, and required is fee x 150%, so a FALSE refusal needed only fee > 1,603,385 — against
-        // an observed liquidation fee of 1,113,523. A 44% margin is not a proof, and reference-script
-        // fees (which maxPossibleFee does not model at all) and batching both eat into it.
+        // Measured: it could fire. capacity was >= maxPossibleFee (2,607,027 from LIVE preview
+        // parameters) by T-052's rule, and required is fee x 150%, so a FALSE refusal needed only
+        // fee > 1,738,018 — against an observed liquidation fee of 1,113,523. A 56% margin is not a
+        // proof, and reference-script fees (which maxPossibleFee does not model at all) and batching
+        // both eat into it.
+        //
+        // ⚠ Those figures were first written as 2,405,077 / 1,603,385 / "44%", all derived from
+        // LoanFixtures' pinned maxTxExMem of 14,000,000 — cardano-client-lib's built-in value, not
+        // preview's 17,500,000 (officina CCL trap 7). The margin was WIDER than stated, and the
+        // conclusion is unchanged: a margin is not a proof, and this guard was measuring the wrong
+        // quantity regardless of how much room it happened to have.
         //
         // ⇒ The right quantity is what the TRANSACTION DECLARES, not what some utxo holds. Read off
         // the artefact, so it needs no extra remote read — twice today a moved remote read has
