@@ -72,7 +72,7 @@ whenever `shouldLiquidationConvertToPrincipal == True` — **six of the ten meas
 
 ---
 
-## 3. ⛔ A latent defect that arms the moment you publish one more reference script
+## 3. ⛔ A latent defect that arms the moment you publish one more reference script  *(D-5)*
 
 Found **only** because the docs surfaced `mintAsset` semantics. **Both liquidation builders burn the
 loan NFT:**
@@ -91,7 +91,7 @@ guards a **different call**:
 :1476  tx.mintAsset(registry.getLoanScript(), …)                      ← attaches ANYWAY
 ```
 
-**⇒ Set `AQUARIUM_LIQUIDATION_REF_LOAN` — the config slot already exists — and the same script is a
+**⇒ Set `AQUARIUM_LIQUIDATION_REF_LOAN` — the config slot already exists at `application.yaml:140` — and the same script is a
 reference input AND a witness copy in one transaction:** `ExtraneousScriptWitnessesUTXOW` at phase 1,
 or the bytes paid for twice with evaluation seeing the bloated body. **And the safety net is disabled:**
 `removeDuplicateScriptWitnesses(true)` sits inside a guard that never fires in production.
