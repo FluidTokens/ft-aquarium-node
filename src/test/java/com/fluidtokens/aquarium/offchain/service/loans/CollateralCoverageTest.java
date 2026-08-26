@@ -69,17 +69,30 @@ class CollateralCoverageTest {
     }
 
     private static Transaction txWith(BigInteger fee, BigInteger collateralReturnOrNull) {
+        return txWith(fee, collateralReturnOrNull, OBSERVED_TOTAL_COLLATERAL);
+    }
+
+    /**
+     * ⚠ {@code totalCollateral} is declarable independently of the return since 2026-08-26, because
+     * <b>it is now the quantity the guard's arithmetic reads</b>. It used to read the nominated
+     * wallet utxo, which stopped being the collateral source when T-050 began choosing collateral
+     * inputs separately.
+     */
+    private static Transaction txWith(BigInteger fee, BigInteger collateralReturnOrNull,
+                                      BigInteger totalCollateralOrNull) {
         TransactionBody.TransactionBodyBuilder body = TransactionBody.builder()
                 .inputs(new ArrayList<>())
                 .outputs(new ArrayList<>())
                 .fee(fee);
         if (collateralReturnOrNull != null) {
             body.collateralReturn(TransactionOutput.builder()
-                            .address(ADDRESS)
-                            .value(Value.builder().coin(collateralReturnOrNull)
-                                    .multiAssets(new ArrayList<>()).build())
-                            .build())
-                    .totalCollateral(OBSERVED_TOTAL_COLLATERAL);
+                    .address(ADDRESS)
+                    .value(Value.builder().coin(collateralReturnOrNull)
+                            .multiAssets(new ArrayList<>()).build())
+                    .build());
+        }
+        if (totalCollateralOrNull != null) {
+            body.totalCollateral(totalCollateralOrNull);
         }
         return Transaction.builder().body(body.build()).build();
     }
@@ -111,12 +124,21 @@ class CollateralCoverageTest {
     @Test
     void theSameShortfallIsCaughtByArithmeticWhenNoReturnWasEmitted() {
         var thrown = assertThrows(LiquidateTransactionBuilder.RefusedException.class,
-                () -> check(txWith(OBSERVED_FEE, null), STARVED_CAPACITY));
+                () -> check(txWith(OBSERVED_FEE, null, STARVED_CAPACITY), STARVED_CAPACITY));
 
         assertEquals(LiquidateTransactionBuilder.Refusal.INSUFFICIENT_COLLATERAL, thrown.getReason());
         assertTrue(thrown.getMessage().contains("1000000")
                         && thrown.getMessage().contains(OBSERVED_TOTAL_COLLATERAL.toString()),
                 "the refusal must state what it had and what it needed, was: " + thrown.getMessage());
+    }
+
+    /** A transaction that declares no {@code total_collateral} cannot be verified, so it is refused. */
+    @Test
+    void aTransactionDeclaringNoTotalCollateralIsRefusedRatherThanAssumedFine() {
+        var thrown = assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                () -> check(txWith(OBSERVED_FEE, null, null), BigInteger.valueOf(10_000_000L)));
+        assertEquals(LiquidateTransactionBuilder.Refusal.INSUFFICIENT_COLLATERAL, thrown.getReason());
+        assertTrue(thrown.getMessage().contains("declares no total_collateral"), thrown.getMessage());
     }
 
     // ---- the boundary, pinned against the ledger's own number -----------------------------------
@@ -128,11 +150,31 @@ class CollateralCoverageTest {
      */
     @Test
     void exactlyTheLedgersRequiredCollateralIsEnoughAndOneLovelaceLessIsNot() {
-        check(txWith(OBSERVED_FEE, null), OBSERVED_TOTAL_COLLATERAL);
+        check(txWith(OBSERVED_FEE, null, OBSERVED_TOTAL_COLLATERAL), STARVED_CAPACITY);
 
         var thrown = assertThrows(LiquidateTransactionBuilder.RefusedException.class,
-                () -> check(txWith(OBSERVED_FEE, null), OBSERVED_TOTAL_COLLATERAL.subtract(BigInteger.ONE)));
+                () -> check(txWith(OBSERVED_FEE, null, OBSERVED_TOTAL_COLLATERAL.subtract(BigInteger.ONE)),
+                        STARVED_CAPACITY));
         assertEquals(LiquidateTransactionBuilder.Refusal.INSUFFICIENT_COLLATERAL, thrown.getReason());
+    }
+
+    /**
+     * ⛔ <b>THE PAIR — T-050 AND T-052 TOGETHER, WHICH NEITHER TICKET'S TESTS COVERED.</b>
+     * <p>
+     * T-050 made the builder choose collateral inputs <b>separately</b> from the nominated wallet
+     * utxo, sized to {@code maxPossibleCollateral}. T-052 then made that nominated utxo the
+     * <b>smallest</b> one covering the FEE ceiling rather than the largest available. Until this was
+     * fixed, the guard's arithmetic still measured the wallet utxo — so a transaction with ample
+     * collateral could be refused because the <em>unrelated</em> input it nominated was small.
+     * <p>
+     * Both figures below are the real ones: collateral ample at the observed declaration, and a
+     * nominated input of 1,000,000 lovelace — the exact value that produced the −670,285 return on
+     * chain. <b>This must PASS.</b> Restore {@code capacity = adaOnly(walletUtxo)} and it fails.
+     */
+    @Test
+    void anAmpleCollateralDeclarationIsNotRefusedBecauseTheNominatedWalletUtxoIsSmall() {
+        check(txWith(OBSERVED_FEE, BigInteger.valueOf(8_329_715L), OBSERVED_TOTAL_COLLATERAL),
+                STARVED_CAPACITY);
     }
 
     @Test
@@ -146,7 +188,7 @@ class CollateralCoverageTest {
      */
     @Test
     void aZeroCollateralReturnIsExactFitNotAFailure() {
-        check(txWith(OBSERVED_FEE, BigInteger.ZERO), OBSERVED_TOTAL_COLLATERAL);
+        check(txWith(OBSERVED_FEE, BigInteger.ZERO), STARVED_CAPACITY);
     }
 
     /**
@@ -158,11 +200,13 @@ class CollateralCoverageTest {
         ProtocolParams doubled = LoanFixtures.protocolParams().getProtocolParams();
         doubled.setCollateralPercent(new java.math.BigDecimal("200"));
 
-        check(txWith(OBSERVED_FEE, null), BigInteger.valueOf(2_500_000L));   // 200% needs 2,227,046
+        // 200% needs 2,227,046, and the observed declaration of 1,670,285 does not reach it.
+        check(txWith(OBSERVED_FEE, null, BigInteger.valueOf(2_500_000L)), STARVED_CAPACITY);
 
         var thrown = assertThrows(LiquidateTransactionBuilder.RefusedException.class, () ->
                 LiquidateTransactionBuilder.assertCollateralIsCoverable(
-                        doubled, txWith(OBSERVED_FEE, null), walletHolding(BigInteger.valueOf(2_000_000L))));
+                        doubled, txWith(OBSERVED_FEE, null, OBSERVED_TOTAL_COLLATERAL),
+                        walletHolding(STARVED_CAPACITY)));
         assertTrue(thrown.getMessage().contains("200"),
                 "the refusal must quote the percent it applied, was: " + thrown.getMessage());
     }

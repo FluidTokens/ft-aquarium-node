@@ -2261,10 +2261,17 @@ public final class LiquidateTransactionBuilder {
      * the real fee).</b> A guard that no longer fires for the original reason is not dead — it is the
      * one that catches the case the new mechanism cannot.
      *
-     * <p>Both readings are asserted — the artefact's own {@code collateral_return}, and the
-     * arithmetic that produced it — because they can disagree: cardano-client-lib chooses the
-     * collateral set, and if it ever chooses differently from what this builder nominated, the
-     * artefact is the one telling the truth.
+     * <p>Both readings are asserted, and <b>both now come from the artefact</b>: its own
+     * {@code collateral_return} must not be negative, and its declared {@code total_collateral} must
+     * reach what the ledger demands. They can disagree — cardano-client-lib chooses the collateral
+     * set, and if it ever chooses differently from what this builder nominated, the artefact is the
+     * one telling the truth.
+     *
+     * <p>⚠ <b>The second reading used to measure the NOMINATED WALLET UTXO, and that was wrong after
+     * T-050.</b> Collateral inputs are chosen separately now, so the wallet utxo is not the quantity
+     * this guard is about; T-052 then shrank it further. See the comment at that line — it is the
+     * half of T-050's re-examination that did not happen, and it could have produced FALSE
+     * {@code INSUFFICIENT_COLLATERAL} refusals on good candidates.
      */
     static void assertCollateralIsCoverable(ProtocolParams params, Transaction transaction,
                                             Utxo walletUtxo) {
@@ -2289,13 +2296,36 @@ public final class LiquidateTransactionBuilder {
         // one-lovelace shortfall through the very guard that exists to stop it.
         BigInteger required = fee.multiply(percent)
                 .add(BigInteger.valueOf(99)).divide(BigInteger.valueOf(100));
-        BigInteger capacity = adaOnly(walletUtxo);
-        if (capacity.compareTo(required) < 0) {
+
+        // ⚠ THIS TERM READ `adaOnly(walletUtxo)` UNTIL 2026-08-26, AND THAT WAS T-050's UNFINISHED HALF.
+        //
+        // It was correct while the NOMINATED WALLET UTXO WAS THE COLLATERAL SOURCE. T-050 made the
+        // builder choose collateral inputs SEPARATELY (withCollateralInputs, sized to
+        // maxPossibleCollateral, possibly several utxos), so the wallet utxo stopped being the
+        // quantity this check is about — and T-052 then made it SYSTEMATICALLY SMALLER by nominating
+        // the smallest input that covers the FEE ceiling rather than the largest available.
+        //
+        // Measured: it could fire. capacity was >= maxPossibleFee (2,405,077 on preview) by T-052's
+        // rule, and required is fee x 150%, so a FALSE refusal needed only fee > 1,603,385 — against
+        // an observed liquidation fee of 1,113,523. A 44% margin is not a proof, and reference-script
+        // fees (which maxPossibleFee does not model at all) and batching both eat into it.
+        //
+        // ⇒ The right quantity is what the TRANSACTION DECLARES, not what some utxo holds. Read off
+        // the artefact, so it needs no extra remote read — twice today a moved remote read has
+        // changed a failure mode.
+        BigInteger declared = body.getTotalCollateral();
+        if (declared == null) {
             throw refuse(Refusal.INSUFFICIENT_COLLATERAL,
-                    ("collateral input %s holds %s lovelace but this transaction needs %s "
-                            + "(fee %s × collateral_percent %s%%); the wallet needs a larger ada-only "
-                            + "utxo before this loan can be liquidated")
-                            .formatted(utxoRef(walletUtxo), capacity, required, fee, percent));
+                    ("the transaction declares no total_collateral, so its collateral coverage cannot "
+                            + "be verified from the artefact at all. fee %s, collateral_percent %s%%, "
+                            + "required %s").formatted(fee, percent, required));
+        }
+        if (declared.compareTo(required) < 0) {
+            throw refuse(Refusal.INSUFFICIENT_COLLATERAL,
+                    ("the transaction declares %s lovelace of total_collateral but the ledger requires "
+                            + "%s (fee %s × collateral_percent %s%%), so it would be rejected. "
+                            + "nominated wallet input %s")
+                            .formatted(declared, required, fee, percent, utxoRef(walletUtxo)));
         }
     }
 
