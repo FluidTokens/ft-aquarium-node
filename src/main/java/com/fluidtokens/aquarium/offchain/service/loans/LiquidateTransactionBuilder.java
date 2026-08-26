@@ -1709,14 +1709,6 @@ public final class LiquidateTransactionBuilder {
         }
     }
 
-    /** The transaction's serialised length, for measuring growth the balancer has not paid for. */
-    private static int serializedLength(Transaction txn) {
-        try {
-            return txn.serialize().length;
-        } catch (Exception e) {
-            throw new IllegalStateException("cannot measure the transaction while splitting change", e);
-        }
-    }
 
     private static final String LOVELACE = "lovelace";
 

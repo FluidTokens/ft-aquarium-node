@@ -1,9 +1,24 @@
 # Change split — keeping the bot's wallet spendable after a liquidation
 
-> **✅ IMPLEMENTED 2026-08-25, Shape A with the conservation assertion** (`LiquidateTransactionBuilder`,
-> `ChangeSplitTest`). **Not deployed** — nothing ships until Giovanni rules on the wallet.
-> Seven mutants were run against this guard and the collateral guard beside it, and every one was
-> caught by the test written for it. See findings §17 for the measured artefact.
+> # ⛔ SUPERSEDED 2026-08-26 — THE SPLIT NO LONGER EXISTS. READ THIS FIRST.
+>
+> Shape A was implemented on 2026-08-25 and **deleted on 2026-08-26 by T-056**, along with
+> `ChangeSplitTest`, `splitChangeSoAdaStaysSpendable`, `assertChangeConserved` and the whole
+> `postBalanceTx` hook. `serializedLength`, its last orphan, went with this note.
+>
+> **Why it went, and why that is not a regression.** The split existed to repair a token-bearing
+> change output *after* balancing, because the residual it carried was **unexplained**. It is
+> explained: it is the liquidation fee, `liquidationFeePerMille = 50` on all seven live bonds,
+> corroborated by `49743a1e…`'s exact three-way split. **A computed fee can be paid out by name; an
+> unexplained residual cannot.** Naming it before balancing lets cardano-client-lib balance
+> correctly, so change comes back ada-only **by construction** rather than by post-hoc surgery — and
+> the conservation assertion the split needed is moot because nothing is redistributed.
+>
+> `docs/change-output-enumeration.md` is the current record: eight routes by which a token could
+> reach change, seven closed by construction, and **route 8 refused at the door**.
+>
+> Everything below is kept as the reasoning that led there — in particular the Shape C rejection,
+> which is still the argument against carving a fixed ada output. **Do not implement any of it.**
 
 **The problem, measured 2026-08-25.** A successful liquidation returns the bot's change as a
 *single* output carrying both the ada and the collateral tokens it just received. That output fails
