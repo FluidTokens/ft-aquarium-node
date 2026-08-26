@@ -4,6 +4,7 @@ import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.function.TxBuilder;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
@@ -646,8 +647,15 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                     // The strategy above guards only the path ChangeOutputAdjustments tries SECOND. The
                     // UtxoSelector it tries FIRST has no withUtxoSelector on TxContext, so it is installed
                     // here — preBalanceTx hands over the TxBuilderContext itself and runs before balancing.
-                    .preBalanceTx((ctx, txn) ->
+                    //
+                    // ⛔ COMPOSED, NOT ADDED — QuickTxBuilder.preBalanceTx is a SETTER (:262-263), so a
+                    // second call would silently delete the selector above. Mirrored from the plain
+                    // path deliberately: T-043 found that BOTH of 80857b5's fixes landed in one sibling
+                    // only, and this is the same class of edit.
+                    .preBalanceTx(((TxBuilder) (ctx, txn) ->
                             ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                            .andThen(LiquidateTransactionBuilder.stripReferencedScriptsFromWitnessSet(
+                                    publishedScripts(request.referenceScripts()))))
                     // COLLATERAL is chosen by neither of the above: QuickTxBuilder.buildCollateralOutput
                     // (:507) builds its OWN DefaultUtxoSelectionStrategyImpl rather than reading the
                     // context's, so withUtxoSelectionStrategy and the selector alike are invisible to it.

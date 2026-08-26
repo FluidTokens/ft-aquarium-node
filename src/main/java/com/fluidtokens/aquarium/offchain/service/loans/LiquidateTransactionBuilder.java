@@ -5,6 +5,7 @@ import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.MinAdaCalculator;
 import com.bloxbean.cardano.client.api.model.ProtocolParams;
+import com.bloxbean.cardano.client.function.TxBuilder;
 import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.bloxbean.cardano.client.transaction.spec.MultiAsset;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
@@ -1791,6 +1792,62 @@ public final class LiquidateTransactionBuilder {
         return census;
     }
 
+    /**
+     * Removes from the witness set every script that travels as a REFERENCE INPUT (rule 3, T-048).
+     *
+     * <h2>Why a hook is required at all</h2>
+     * {@code attachValidators} already declines to attach a referenced script — but
+     * {@code ScriptTx.mintAsset(script, …)} calls a <b>private</b> {@code attachMintValidator(script)}
+     * unconditionally (v0.7.2 {@code ScriptTx:309}), and <b>every</b> {@code mintAsset} overload at this
+     * version takes a {@code PlutusScript}. There is no policy-id form until 0.8.0. So the one script
+     * this transaction both <em>mints with</em> and <em>may reference</em> — {@code loan.loan}, burned
+     * to retire the loan NFT — re-enters the witness set behind the attach-skip's back.
+     *
+     * <h2>⚠ Why {@code preBalanceTx} and not {@code removeDuplicateScriptWitnesses}</h2>
+     * The pipeline order, read from {@code QuickTxBuilder} v0.7.2:
+     * <pre>
+     *   :401  preBalanceTrasformer          ⇐ THIS HOOK
+     *   :455  ScriptCostEvaluators.evaluateScriptCost()
+     *   :470  ScriptBalanceTxProviders.balanceTx(...)
+     *   :474  DuplicateScriptWitnessChecker.removeDuplicateScriptWitnesses()
+     *   :478  postBalanceTrasformer
+     * </pre>
+     * {@code removeDuplicateScriptWitnesses} runs at <b>:474 — after evaluation AND after balancing</b>.
+     * It would strip the copy from the submitted body while the <em>evaluator</em> still priced the
+     * bloated one. Measured on preview 2026-08-24: an attached-and-referenced script left the body
+     * <b>8,665 bytes larger at evaluation time</b> — 23,459 against a 16,384 {@code maxTxSize} — and
+     * Blockfrost answered {@code EvaluationFailure} with an EMPTY {@code ScriptFailures} map.
+     * <b>:401 is the only seam that removes it before anything reads it.</b>
+     *
+     * <h2>Both directions matter</h2>
+     * Rule 3 is <em>"liquidation should be possible with a combination of reference script or attached
+     * scripts (ensure only required scripts are attached)"</em> — <b>both modes must work</b>. Referenced
+     * and also attached is {@code ExtraneousScriptWitnessesUTXOW}; not referenced and not attached is a
+     * missing-script failure. This removes only what is provably supplied elsewhere.
+     */
+    static TxBuilder stripReferencedScriptsFromWitnessSet(List<PlutusScript> referenced) {
+        return (ctx, txn) -> {
+            if (referenced.isEmpty() || txn.getWitnessSet() == null
+                    || txn.getWitnessSet().getPlutusV3Scripts() == null) {
+                return;
+            }
+            Set<String> referencedHashes = referenced.stream()
+                    .map(LiquidateTransactionBuilder::scriptHashHex)
+                    .collect(java.util.stream.Collectors.toSet());
+            txn.getWitnessSet().getPlutusV3Scripts()
+                    .removeIf(script -> referencedHashes.contains(scriptHashHex(script)));
+        };
+    }
+
+    /** A script's hash as hex. Identity here is the hash, never object equality. */
+    private static String scriptHashHex(PlutusScript script) {
+        try {
+            return HexUtil.encodeHexString(script.getScriptHash());
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot hash a script while stripping referenced witnesses", e);
+        }
+    }
+
     /** The scripts the caller says are published, paired with the registry object for each. */
     private List<PlutusScript> publishedScripts(ReferenceScripts scripts) {
         List<PlutusScript> published = new ArrayList<>();
@@ -1875,8 +1932,16 @@ public final class LiquidateTransactionBuilder {
                         // The strategy above guards only the path ChangeOutputAdjustments tries SECOND. The
                         // UtxoSelector it tries FIRST has no withUtxoSelector on TxContext, so it is installed
                         // here — preBalanceTx hands over the TxBuilderContext itself and runs before balancing.
-                        .preBalanceTx((ctx, txn) ->
+                        //
+                        // ⛔ AND IT IS COMPOSED, NOT ADDED. QuickTxBuilder.preBalanceTx is a SETTER
+                        // (:262-263, `this.preBalanceTrasformer = txBuilder`), not an adder: a second
+                        // call SILENTLY REPLACES the first. Calling it again for the witness strip
+                        // below would have deleted this selector — the guard written after an
+                        // unguarded builder consumed a published reference script (6c5ee75).
+                        .preBalanceTx(((TxBuilder) (ctx, txn) ->
                                 ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                                .andThen(stripReferencedScriptsFromWitnessSet(
+                                        publishedScripts(request.referenceScripts()))))
                         // COLLATERAL is chosen by neither of the above: QuickTxBuilder.buildCollateralOutput
                         // (:507) builds its OWN DefaultUtxoSelectionStrategyImpl rather than reading the
                         // context's, so withUtxoSelectionStrategy and the selector alike are invisible to it.
