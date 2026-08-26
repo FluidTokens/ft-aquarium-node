@@ -669,7 +669,13 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                     // serve as both spend input and collateral (CCL trap 12 — a collateral return is
                     // emitted). Pinning also excludes it from ordinary coin selection, which changes
                     // nothing here precisely because it was never selected: it is handed in.
-                    .withCollateralInputs(inputOf(request.walletUtxo()));
+                    // T-050, mirrored from the plain path: collateral is chosen by OUR selection,
+                    // not nominated as the spend input and not left to CCL — whose own collateral
+                    // selector (QuickTxBuilder:507) is invisible to both of our guards and has no
+                    // reference-script exclusion. Amount DERIVED from protocol params, never assumed.
+                    .withCollateralInputs(LiquidateTransactionBuilder.collateralInputsFor(
+                            utxoSupplier, protocolParamsSupplier,
+                            request.changeAddress(), request.walletUtxo()));
 
             if (backendService == null) {
                 // Offline: cardano-client-lib would otherwise walk every reference input looking for a

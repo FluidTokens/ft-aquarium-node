@@ -1848,6 +1848,137 @@ public final class LiquidateTransactionBuilder {
         }
     }
 
+    /**
+     * The collateral inputs, chosen by <b>our own</b> selection rather than nominated as the spend
+     * input (T-050).
+     *
+     * <h2>⛔ Why not CCL's auto-selection, despite the "use auto features" guideline</h2>
+     * {@code QuickTxBuilder.buildCollateralOutput} (v0.7.2 {@code :507}) constructs its <b>own</b>
+     * {@code DefaultUtxoSelectionStrategyImpl} from the raw {@code utxoSupplier}. It never reads
+     * {@code txBuilderContext.getUtxoSelectionStrategy()}, so {@code withUtxoSelectionStrategy} and
+     * the {@code preBalanceTx} selector are <b>both invisible to it</b>, and that strategy has no
+     * reference-script exclusion — its {@code accept()} is {@code return true}. The paying address is
+     * the bot's own, which is where a published reference script can sit. <b>One did, and an
+     * unguarded builder consumed it on 2026-08-25.</b> Measured, not reasoned: with both selection
+     * guards installed and this method absent, a build still pledged the published
+     * {@code loan_claim_action} as collateral — <b>and collateral is what a PHASE-2 failure
+     * consumes.</b>
+     *
+     * <p>⚠ It also <b>assumes</b> the amount rather than deriving it: {@code DEFAULT_COLLATERAL_AMT}
+     * is a hardcoded {@code Amount.ada(5.0)} at {@code QuickTxBuilder:65}.
+     *
+     * <h2>What this does instead</h2>
+     * <ul>
+     *   <li><b>Not the spend input.</b> Un-welding the two roles is the whole point: the ada-only rule
+     *       the spend input must satisfy was written for spending, and it was silently governing
+     *       collateral capacity.</li>
+     *   <li><b>Native assets are allowed.</b> CIP-0040: collateral may carry tokens <em>provided a
+     *       collateral output is specified</em>, and {@code collateralPayer(...)} specifies one.
+     *       Measured 2026-08-26 against CCL's real {@code CollateralBuilders}: the tokens come back in
+     *       {@code collateral_return} and min-ada is satisfied.</li>
+     *   <li><b>Reference scripts are excluded</b>, which is the guard CCL cannot apply.</li>
+     *   <li><b>The amount is DERIVED, never assumed</b> — see {@link #maxPossibleCollateral}.</li>
+     * </ul>
+     */
+    private TransactionInput[] collateralInputsFor(Request request) {
+        return collateralInputsFor(utxoSupplier, protocolParamsSupplier,
+                request.changeAddress(), request.walletUtxo());
+    }
+
+    /**
+     * Shared by both liquidation builders, and <b>it takes the SUPPLIER, not the params</b>.
+     *
+     * <p>⚠ That signature is load-bearing. This runs before {@code complete()}'s try/catch, so any
+     * remote read here escapes as a raw exception instead of the builder's named refusal — measured:
+     * introducing this method turned T-040's cause-chain test from {@code TRANSACTION_NOT_BUILDABLE}
+     * into {@code SocketTimeoutException}, because a throwing protocol-params supplier is <em>the</em>
+     * natural way into that branch. Taking the supplier lets both remote reads — params and wallet —
+     * be guarded in one place. Handing in already-fetched params would move the hazard to every caller.
+     */
+    static TransactionInput[] collateralInputsFor(UtxoSupplier utxoSupplier,
+                                                  ProtocolParamsSupplier protocolParamsSupplier,
+                                                  String changeAddress, Utxo fallback) {
+        ProtocolParams params;
+        try {
+            params = protocolParamsSupplier.getProtocolParams();
+        } catch (Exception e) {
+            throw refuse(Refusal.TRANSACTION_NOT_BUILDABLE,
+                    "could not read protocol parameters to size the collateral", e);
+        }
+        return collateralInputsFor(utxoSupplier, params, changeAddress, fallback);
+    }
+
+    /** Shared by both liquidation builders — one shape, not two copies (the T-043 lesson). */
+    static TransactionInput[] collateralInputsFor(UtxoSupplier utxoSupplier, ProtocolParams params,
+                                                  String changeAddress, Utxo fallback) {
+        BigInteger required = maxPossibleCollateral(params);
+        // ⚠ The supplier call sits OUTSIDE complete()'s try/catch, so a transport failure here would
+        // escape as a raw exception name instead of the builder's named refusal — measured: the T-037
+        // cause-chain test went from TRANSACTION_NOT_BUILDABLE to SocketTimeoutException the moment
+        // this method was introduced. Wrapped so the error taxonomy is unchanged, and NOT silently
+        // degraded to the nominated utxo: a transient network fault must not quietly reinstate the
+        // welded behaviour this ticket exists to remove.
+        List<Utxo> wallet;
+        try {
+            wallet = utxoSupplier.getAll(changeAddress);
+        } catch (Exception e) {
+            throw refuse(Refusal.TRANSACTION_NOT_BUILDABLE,
+                    "could not read the wallet to choose collateral inputs", e);
+        }
+        List<Utxo> candidates = wallet.stream()
+                .filter(ReferenceScriptSafeUtxoSelection::spendable)
+                .filter(utxo -> utxo.getInlineDatum() == null && utxo.getDataHash() == null)
+                .sorted(java.util.Comparator.comparing(LiquidateTransactionBuilder::adaOnly).reversed())
+                .toList();
+
+        int limit = Math.max(1, params.getMaxCollateralInputs());
+        List<TransactionInput> chosen = new ArrayList<>();
+        BigInteger capacity = BigInteger.ZERO;
+        for (Utxo utxo : candidates) {
+            if (chosen.size() >= limit || capacity.compareTo(required) >= 0) {
+                break;
+            }
+            chosen.add(inputOf(utxo));
+            capacity = capacity.add(adaOnly(utxo));
+        }
+
+        if (chosen.isEmpty()) {
+            // Fall back to the nominated wallet utxo rather than hand CCL an empty array, which would
+            // silently re-enable its own unguarded selector — the exact defect this method exists for.
+            return new TransactionInput[]{inputOf(fallback)};
+        }
+        return chosen.toArray(TransactionInput[]::new);
+    }
+
+    /**
+     * The most collateral any transaction this ledger accepts could ever require — <b>derived from the
+     * protocol parameters, never assumed.</b>
+     *
+     * <p>The requirement is {@code fee × collateral_percent}, and the fee is not known until balancing
+     * has run — so selection, which happens before, needs an upper bound rather than a guess. The
+     * ledger supplies one: a transaction cannot exceed {@code maxTxSize} bytes, nor
+     * {@code maxTxExMem}/{@code maxTxExSteps} of execution budget, so
+     * {@code minFeeA·maxTxSize + minFeeB + priceMem·maxTxExMem + priceStep·maxTxExSteps} is a ceiling
+     * on any fee it will accept.
+     *
+     * <p><b>This is the difference between this method and CCL's hardcoded 5 ADA:</b> the number moves
+     * when the chain's parameters move, and it is provably sufficient rather than conventionally so.
+     * On preview 2026-08 it lands near 3.6 ADA — below CCL's constant, and for a reason.
+     *
+     * <p>The exact requirement is still checked after building, against the real fee, by
+     * {@code assertCollateralIsCoverable}. <b>Select generously; assert exactly.</b>
+     */
+    static BigInteger maxPossibleCollateral(ProtocolParams params) {
+        BigInteger maxFee = BigInteger.valueOf((long) params.getMinFeeA() * params.getMaxTxSize())
+                .add(BigInteger.valueOf(params.getMinFeeB()))
+                .add(params.getPriceMem().multiply(new java.math.BigDecimal(params.getMaxTxExMem()))
+                        .setScale(0, java.math.RoundingMode.CEILING).toBigInteger())
+                .add(params.getPriceStep().multiply(new java.math.BigDecimal(params.getMaxTxExSteps()))
+                        .setScale(0, java.math.RoundingMode.CEILING).toBigInteger());
+        return maxFee.multiply(params.getCollateralPercent().toBigInteger())
+                .add(BigInteger.valueOf(99)).divide(BigInteger.valueOf(100));
+    }
+
     /** The scripts the caller says are published, paired with the registry object for each. */
     private List<PlutusScript> publishedScripts(ReferenceScripts scripts) {
         List<PlutusScript> published = new ArrayList<>();
@@ -1955,7 +2086,7 @@ public final class LiquidateTransactionBuilder {
                         // serve as both spend input and collateral (CCL trap 12 — a collateral return is
                         // emitted). Pinning also excludes it from ordinary coin selection, which changes
                         // nothing here precisely because it was never selected: it is handed in.
-                        .withCollateralInputs(inputOf(request.walletUtxo()));
+                        .withCollateralInputs(collateralInputsFor(request));
 
         // THE CHANGE SPLIT. Keeps the bot able to act after a liquidation.
         //
@@ -2175,6 +2306,16 @@ public final class LiquidateTransactionBuilder {
      * over-collateralise, and the failure would move somewhere quieter. The shortfall is real: the
      * wallet does not hold enough pure ada to back this script transaction, and that is a fact about
      * the wallet, not a number to round.
+     *
+     * <h2>Re-examined under T-050 — KEPT, with its role restated</h2>
+     * Selection now covers {@link #maxPossibleCollateral}, the ledger's own ceiling on any fee it will
+     * accept, so this should never fire because of a <em>builder</em> mistake. <b>That is exactly why
+     * it stays.</b> What it now reports is the one thing selection cannot fix: <b>the wallet does not
+     * hold enough pure-ada-equivalent collateral to fund a liquidation at all.</b> It converts that
+     * from an unparseable artefact into a named refusal with a recorded decision.
+     * <b>Select generously (before the build, from a derived ceiling); assert exactly (after, against
+     * the real fee).</b> A guard that no longer fires for the original reason is not dead — it is the
+     * one that catches the case the new mechanism cannot.
      *
      * <p>Both readings are asserted — the artefact's own {@code collateral_return}, and the
      * arithmetic that produced it — because they can disagree: cardano-client-lib chooses the
