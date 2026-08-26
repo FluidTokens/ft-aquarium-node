@@ -1042,10 +1042,14 @@ class LiquidationExecutorTest {
                 List.of(scenario.assessment(), healthy, orphan), List.of(scenario), false);
         wiring.executor().cycle(NOW);
 
-        assertEquals(3, wiring.log().lastRun().bondsScanned(), "every scanned bond is accounted for");
+        // T-060 part 2: the orphan is SETTLED, not excluded. It leaves the live denominator and the
+        // exclusions map, and lands in its own count — so the totals still reconcile to 3.
+        assertEquals(2, wiring.log().lastRun().bondsScanned(), "only bonds with a LIVE loan count");
+        assertEquals(1, wiring.log().lastRun().settled(), "the orphan is settled, not excluded");
+        assertEquals(3, wiring.log().lastRun().bondsScanned() + wiring.log().lastRun().settled(),
+                "every scanned bond is still accounted for — reclassified, not dropped");
         assertEquals(1, wiring.log().lastRun().buildable());
-        assertEquals(Map.of(LiquidationExclusion.NOT_LIQUIDATABLE, 1,
-                        LiquidationExclusion.LOAN_NOT_FOUND, 1),
+        assertEquals(Map.of(LiquidationExclusion.NOT_LIQUIDATABLE, 1),
                 wiring.log().lastRun().exclusions());
 
         assertEquals(1, wiring.log().size(), "only the buildable candidate produced a decision");
@@ -2353,5 +2357,43 @@ class LiquidationExecutorTest {
         assertTrue(gate.contains("TOTAL across"), gate);
         assertTrue(gate.contains("5000000"),
                 "the available total must be the SUM of nominable utxos, not the largest: " + gate);
+    }
+
+    /**
+     * ⛔ <b>T-060 part 2 — a bond whose loan is gone is not a fault, and must not be reported as one.</b>
+     * <p>
+     * Giovanni, from the logs: <i>"what's this 7 bonds and 5 not found... if it's related to a utxo
+     * being spent, the loan does not exist anymore. so we should stop counting both as a bond in the
+     * first place and as not found in the brackets."</i> He is right, and the reason is structural:
+     * closing a loan <b>burns the loan NFT while the lender bond survives</b> as the lender's
+     * separate claim ticket. One stale row was inflating the denominator <em>and</em> manufacturing
+     * an alarming exclusion.
+     * <p>
+     * ⚠ <b>Reclassified, not deleted</b> — a deliberate departure from "stop counting". Delete the
+     * number and the day a loan is absent for a reason that is <em>not</em> "settled", the line that
+     * would have said so is the line we removed. <b>A metric that goes quiet because the population
+     * left and one that goes quiet because the reader broke look identical.</b>
+     */
+    @Test
+    void aBondWhoseLoanIsGoneIsSettledRatherThanAnExclusion() {
+        Scenario scenario = scenario(FAT_FEE_PER_MILLE);
+        LiquidationAssessment orphanA = LiquidationAssessment.excluded(scenario.bond().bond(), null,
+                LiquidationExclusion.LOAN_NOT_FOUND, "no loan shares this bond's asset name");
+        LiquidationAssessment orphanB = LiquidationAssessment.excluded(scenario.bond().bond(), null,
+                LiquidationExclusion.LOAN_NOT_FOUND, "no loan shares this bond's asset name");
+
+        Wiring wiring = wiring(shadow(SMALL_MARGIN),
+                List.of(scenario.assessment(), orphanA, orphanB), List.of(scenario), false);
+        wiring.executor().cycle(NOW);
+
+        assertEquals(1, wiring.log().lastRun().bondsScanned(),
+                "two of the three bonds have no loan, so only one is a live candidate");
+        assertEquals(2, wiring.log().lastRun().settled());
+        assertFalse(wiring.log().lastRun().exclusions()
+                        .containsKey(LiquidationExclusion.LOAN_NOT_FOUND),
+                "LOAN_NOT_FOUND must not appear in the exclusions — it is not a fault: "
+                        + wiring.log().lastRun().exclusions());
+        assertEquals(3, wiring.log().lastRun().bondsScanned() + wiring.log().lastRun().settled(),
+                "and NOTHING IS LOST: the settled bonds are still counted, just not as failures");
     }
 }

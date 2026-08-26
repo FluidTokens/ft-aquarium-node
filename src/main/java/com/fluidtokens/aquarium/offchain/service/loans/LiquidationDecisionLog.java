@@ -45,18 +45,25 @@ public class LiquidationDecisionLog {
      * What one cycle saw, whether or not it built anything.
      *
      * @param at            epoch millis the run started, or {@code null} if no run has finished yet
-     * @param bondsScanned  every bond the scanner looked at — excluded ones included, so the counts
-     *                      always reconcile
-     * @param buildable     how many of them the scanner passed
+     * @param bondsScanned  bonds with a LIVE loan — the population a liquidator can act on. ⚠ Since
+     *                      T-060 this EXCLUDES bonds whose loan no longer exists; those are counted
+     *                      in {@code settled} instead, and the two still reconcile to what the
+     *                      scanner saw
+     * @param settled       bonds whose loan is gone. <b>Reported, not suppressed:</b> a bond outliving
+     *                      its loan is the ordinary post-settlement state and belongs nowhere near
+     *                      the exclusions, but dropping the number entirely would make "the market
+     *                      moved on" and "we stopped being able to see them" look identical
+     * @param buildable     how many live-loan bonds the scanner passed
      * @param exclusions    why the rest were dropped, one count per reason
      */
     public record RunSummary(Long at,
                              int bondsScanned,
+                             int settled,
                              int buildable,
                              Map<LiquidationExclusion, Integer> exclusions) {
 
         public static RunSummary empty() {
-            return new RunSummary(null, 0, 0, Map.of());
+            return new RunSummary(null, 0, 0, 0, Map.of());
         }
     }
 
@@ -74,9 +81,9 @@ public class LiquidationDecisionLog {
     }
 
     /** Records one cycle's summary, replacing the previous one. */
-    public synchronized void recordRun(long at, int bondsScanned, int buildable,
+    public synchronized void recordRun(long at, int bondsScanned, int settled, int buildable,
                                        Map<LiquidationExclusion, Integer> exclusions) {
-        this.lastRun = new RunSummary(at, bondsScanned, buildable,
+        this.lastRun = new RunSummary(at, bondsScanned, settled, buildable,
                 Map.copyOf(exclusions == null ? new EnumMap<>(LiquidationExclusion.class) : exclusions));
     }
 

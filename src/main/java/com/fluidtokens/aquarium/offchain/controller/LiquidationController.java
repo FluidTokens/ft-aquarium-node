@@ -93,6 +93,7 @@ public class LiquidationController {
                                    boolean armed,
                                    String lastRunAt,
                                    int bondsScanned,
+                                   int settled,
                                    int buildable,
                                    Map<String, Integer> exclusions,
                                    List<DecisionView> decisions) {
@@ -117,6 +118,7 @@ public class LiquidationController {
                 configuration.isArmed(),
                 lastRun.at() == null ? null : Instant.ofEpochMilli(lastRun.at()).toString(),
                 lastRun.bondsScanned(),
+                lastRun.settled(),
                 lastRun.buildable(),
                 exclusions(lastRun),
                 decisions);

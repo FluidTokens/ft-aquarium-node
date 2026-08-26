@@ -406,27 +406,53 @@ public class LiquidationExecutor {
                 .filter(LiquidationAssessment::buildable)
                 .toList();
         Map<LiquidationExclusion, Integer> exclusions = histogram(assessments);
+
+        // T-060 PART 2 — A BOND WHOSE LOAN NO LONGER EXISTS IS NOT AN EXCLUSION.
+        //
+        // Giovanni, from the logs: "okay oracle unusable as metric, but what's this 7 bonds and 5 not
+        // found... if it's related to a utxo being spent, the loan does not exist anymore. so we
+        // should stop counting both as a bond in the first place and as not found in the brackets."
+        // He is right, and the reason is structural: CLOSING A LOAN BURNS THE LOAN NFT WHILE THE
+        // LENDER BOND SURVIVES as the lender's separate claim ticket. A bond outliving its loan is
+        // the ordinary post-settlement state, so counting it as a live candidate inflates the
+        // denominator AND manufactures an alarming-looking exclusion out of one stale row.
+        //
+        // ⚠ BUT IT IS RECLASSIFIED, NOT DELETED — and that is a deliberate departure from "stop
+        // counting". If the number vanished entirely, then the day a loan is absent for a reason
+        // that is NOT "settled", THE LINE THAT WOULD HAVE TOLD US IS THE LINE WE REMOVED. A metric
+        // that goes quiet because the population left and one that goes quiet because the reader
+        // broke look identical. So `settled` is reported beside the live count, out of the
+        // exclusions bracket where it read as a fault.
+        int settled = exclusions.getOrDefault(LiquidationExclusion.LOAN_NOT_FOUND, 0);
+        Map<LiquidationExclusion, Integer> liveExclusions = exclusions.entrySet().stream()
+                .filter(e -> e.getKey() != LiquidationExclusion.LOAN_NOT_FOUND)
+                .collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+        int liveBonds = assessments.size() - settled;
+
         // Excluded bonds are counted, never logged as decisions: the histogram is the whole record
         // of them, so every scanned bond is accounted for without the ring buffer being flooded by
         // the healthy majority.
-        decisionLog.recordRun(now, assessments.size(), buildable.size(), exclusions);
-        // T-060 — the LOAN_NOT_FOUND count and the unreadable-loan count are reported TOGETHER,
-        // because either one alone is misleading. A bond whose loan is settled and a bond whose loan
-        // this node cannot read are indistinguishable in the histogram; `unreadable` is what tells
-        // them apart, and while it is non-zero the histogram must not be read as a settled market.
+        decisionLog.recordRun(now, liveBonds, settled, buildable.size(), liveExclusions);
+
+        // ⛔ AND THE CENSUS CLAUSE STAYS, BECAUSE SUPPRESSING LOAN_NOT_FOUND IS ONLY SAFE WHILE IT
+        // READS ZERO. "settled" now asserts that those bonds' loans are GONE; `unreadable` is the
+        // only thing that can contradict it, by showing a loan that is present and simply not
+        // legible to us. The moment it is non-zero, the settled count is not trustworthy either.
         int unreadable = scan.loanCensus().unreadable();
-        log.info("liquidation scan: {} bonds, {} buildable, exclusions {}{}",
-                assessments.size(), buildable.size(), exclusions,
+        log.info("liquidation scan: {} live bonds{}, {} buildable, exclusions {}{}",
+                liveBonds,
+                settled == 0 ? "" : " (%d settled — the bond outlives its loan)".formatted(settled),
+                buildable.size(), liveExclusions,
                 unreadable == 0
                         // Stated positively and only when it is true: the ABSENCE of a warning is not
-                        // evidence, but an explicit zero is. It is what makes LOAN_NOT_FOUND readable
-                        // as "settled" rather than merely assumed to be.
+                        // evidence, but an explicit zero is. It is what licenses reading the settled
+                        // count as settled rather than as loans we merely cannot see.
                         ? " (all %d loan utxos at the credential were readable)"
                                 .formatted(scan.loanCensus().utxosAtCredential()
                                         - scan.loanCensus().notALoan())
-                        : " ⚠ %d LOAN UTXO(S) UNREADABLE — the LOAN_NOT_FOUND count above is "
+                        : " ⚠ %d LOAN UTXO(S) UNREADABLE — the settled count above is CONTAMINATED "
                                 .formatted(unreadable)
-                                + "CONTAMINATED and must not be read as settled loans");
+                                + "and must not be read as loans that are simply gone");
 
         // Before the early return, not after it: a cycle that finds nothing buildable is exactly the
         // cycle in which every quarantined loan was already skipped by the scanner, and letting the

@@ -55,7 +55,7 @@ class LiquidationDecisionsEndpointTest {
                                                   int bondsScanned, int buildable) {
         LiquidationDecisionLog log = new LiquidationDecisionLog(
                 config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false));
-        log.recordRun(NOW, bondsScanned, buildable, exclusions);
+        log.recordRun(NOW, bondsScanned, 0, buildable, exclusions);
         decisions.forEach(log::record);
         return log;
     }
