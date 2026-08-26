@@ -293,3 +293,67 @@ checks by hand and one of the three the three filters disagree about.
 | Evaluator construction | **3 routes, 2 verbatim duplicates, 1 invisible** |
 | `ReferenceScriptSafeUtxoSelection` vs a library idiom | ✅ **no idiom exists; correctly hand-rolled, fallback trap handled** |
 | Library selection strategies available and unused | `LargestFirst`, `RandomImprove`, `ExcludeUtxo` |
+
+---
+
+## T-046 — the test-tree builders (`ReferenceScriptPublisher`, `LoanFactory`)
+
+### ⚠ TWO PREMISES CORRECTED BEFORE ANY FINDING
+
+**`LoanFactory` does not submit.** Its javadoc `:69-75` is explicit and the sweep confirms it: each of
+its three builders constructs `QuickTxBuilder` with a **null `TransactionProcessor`** — the only thing
+in cardano-client-lib that can put a transaction on a network — and it *"holds none of its own, opens no
+backend, signs nothing, and returns unsigned transactions."* **The submitting lives in
+`LoanFactoryOnChainRunnerTest`, not in the factory.** Scoped accordingly.
+
+**`ReferenceScriptPublisher` needs no evaluator.** Its sweep shows `withTxEvaluator` **0** and
+`ignoreScriptCostEvaluationError` **0** — the trap-8 signature for the third time tonight. It builds a
+plain `new Tx()` with **no `attachSpendingValidator`, no `mintAsset`, no `collectFrom`** — no script is
+invoked, so the witness set carries **no redeemers**, and `ScriptCostEvaluators.evaluateScriptCost()`
+returns early on exactly that condition (*"non-script transaction"*). **The absence is correct, not a gap.**
+
+> **⚑ Methodological finding, and it is now the third instance: `withTxEvaluator: 0` IS NOT DIAGNOSTIC
+> ON ITS OWN.** Tonight it appeared on the tank (evaluator arrives by *injection*), on the publisher
+> (transaction has *no redeemers*) and on `LoanFactory` (build-only *by design*). **Three benign
+> instances of the signature that flagged a real production incident.** The signature must always be
+> qualified by *how the builder was constructed* and *whether the transaction has redeemers* —
+> otherwise it produces exactly the "defensible and wrong" alarm that trains the next one to be discounted.
+
+### ✅ THE SELECTION GUARD IS ON THE PATH, NOT MERELY PRESENT
+
+Checked as the distinction that mattered before the second publish. `:416-417`, **on the actual
+`compose(tx)` chain**:
+```java
+.withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
+.preBalanceTx((ctx, txn) -> ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(...)))
+```
+**Both routes guarded** — the strategy `ChangeOutputAdjustments` tries second *and* the selector it
+tries first. The comment at `:405` records why: `tx.from()` with CCL's default selector **consumed
+`48c102c0…#0`, the 2026-08-17 reference-script output**. ✅
+
+### ⛔ THE PROMOTION HAZARD OF 2026-08-21 STILL EXISTS, IN A DIFFERENT CLASS
+
+`LoanFactory` is a **build-only builder with a null `TransactionProcessor` and an optional evaluator,
+living in the test tree** — **structurally what `LiquidatePayInAdvanceTransactionBuilder` was before it
+was promoted to `src/main` and shipped the null-evaluator defect.** The shape that caused the incident
+has not been removed from the repo; it has been *documented*. CLAUDE.md's rule — *"promoting test code
+to `src/main` requires a production-wiring test; byte-identity is never the sole gate"* — is the only
+thing standing between this class and a repeat. **Not a defect. A standing hazard, named.**
+
+### ⚑ AND THE CONFIGURATION BLOCK IS WORSE THAN "THREE COPIES"
+
+T-045 found three copies of the `TxContext` chain. With the publisher there are **four sites, and no
+two are identical** — each carries a *different subset*:
+
+| | feePayer | collateralPayer | mergeOutputs | ignoreScriptCost | preBalance | postBalance | selection guard |
+|---|---|---|---|---|---|---|---|
+| plain | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| convert | ✅ | ✅ | ✅ | ✅ | ✅ | ⛔ | ✅ |
+| tank | ✅ | ✅ | ✅ | ✅ | ✅ | ⛔ | ✅ |
+| publisher | ✅ | ⛔ | ✅ | ⛔ | ✅ | ✅ | ✅ |
+
+**⇒ Not three identical copies drifting — FOUR PARTIAL COPIES, NO TWO ALIKE.** Some absences are
+correct (the publisher needs no collateral payer and no evaluation, because it invokes no script);
+some are the T-043 defect. **And nothing distinguishes the two cases at a glance**, which is precisely
+why the convert path's missing `postBalanceTx` read as normal for a day. **The spine finding is
+stronger, not weaker: there is no canonical shape to diff against.**
