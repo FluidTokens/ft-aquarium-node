@@ -89,4 +89,58 @@ class ContractRegistryTest {
         assertEquals(MAINNET_EXPECTED_PARAMETERS_HASH, registry.getConfigNftPolicyId());
         assertEquals(registry.getParametersScriptHashHex(), registry.getConfigNftPolicyId());
     }
+
+    /**
+     * ⇑ T-066 ROUTE B — the query key, derived and pinned so the measurement is one step whenever it
+     * is authorised.
+     *
+     * <h2>What this is for</h2>
+     * T-066 asks whether {@code ScheduledTransactionService:216}'s hardcoded
+     * {@code setInputtankindex(ZERO)} is correct, given the ledger re-sorts inputs lexicographically.
+     * The measurement that would settle it is a correlation over <b>historical mainnet tank
+     * transactions</b>: if the successful ones cluster where {@code wallet.txHash > tank.txHash},
+     * the defect is real. That needs one thing this repo had never written down — <b>which address to
+     * ask about.</b>
+     *
+     * <h2>Why there is exactly ONE address</h2>
+     * The tank is paid at an <b>enterprise</b> address ({@code AddressProvider.getEntAddress}, see
+     * {@code MainnetTankTest:114}) — no staking part, so the script does not spread across a family
+     * of addresses the way a base-address contract would. One credential, one address, and every
+     * public chain API can be asked about it directly.
+     *
+     * <h2>⚠ This is arithmetic, not an action</h2>
+     * Derived entirely from {@code aquarium-sc.plutus.json} and the four mainnet values in
+     * {@code application.yaml}, both already committed. <b>No socket is opened, no endpoint is named,
+     * no profile is set.</b> Recording it is PREPARATION; running the query against mainnet data is a
+     * separate decision that is Giovanni's, and nothing here performs it.
+     */
+    @Test
+    void mainnetTankEnterpriseAddressIsTheT066QueryKey() {
+        AppConfig.AquariumConfiguration cfg = configFor(MAINNET_GENESIS_TX_HASH, MAINNET_GENESIS_OUTPUT_INDEX,
+                MAINNET_STAKING_TOKEN_POLICY, MAINNET_STAKING_TOKEN_NAME);
+
+        ContractRegistry registry = new ContractRegistry(cfg);
+
+        String address = com.bloxbean.cardano.client.address.AddressProvider.getEntAddress(
+                        com.bloxbean.cardano.client.address.Credential.fromScript(
+                                registry.getTankScriptHash()),
+                        com.bloxbean.cardano.client.common.model.Networks.mainnet())
+                .getAddress();
+
+        // The address is not an independent fact — it is the tank hash in another encoding. Asserting
+        // BOTH, and that one contains the other, is what makes a transcription error here impossible
+        // to mistake for a derivation change.
+        assertEquals(MAINNET_EXPECTED_TANK_HASH, registry.getTankScriptHashHex(), "mainnet H_tank");
+        assertEquals(MAINNET_TANK_ENTERPRISE_ADDRESS, address,
+                "the mainnet tank enterprise address changed — if H_tank is unchanged above, this is a "
+                        + "transcription error, not a derivation one");
+    }
+
+    /**
+     * The bech32 form of {@link #MAINNET_EXPECTED_TANK_HASH} as an enterprise address. Pinned rather
+     * than only computed, so the value can be read straight out of this file by whoever runs the
+     * T-066 correlation without needing to execute anything.
+     */
+    private static final String MAINNET_TANK_ENTERPRISE_ADDRESS =
+            "addr1w8uhynz89x08gh95758e6dkthtwdlplqzk5an8vj0hzwsesq3894w";
 }
