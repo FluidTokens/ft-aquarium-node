@@ -161,7 +161,20 @@ public class FluidOracleClient {
         var tokens = new HashMap<AssetType, OracleEntry>();
         var oracleTokens = new HashMap<AssetType, OracleEntry>();
         array.forEach(node -> parse(node).ifPresent(entry -> {
-            tokens.put(entry.token(), entry);
+            // ⚠ put(), so a duplicate token silently takes the LAST entry — and the registry's
+            // contract is one feed per asset. If that contract ever breaks we would pick an
+            // arbitrary one and never know, so say so rather than resolving it quietly. Keeping
+            // last-wins is deliberate: changing it to first-wins would be an equally arbitrary
+            // choice made without knowing which the registry intends.
+            OracleEntry displaced = tokens.put(entry.token(), entry);
+            if (displaced != null) {
+                log.warn("oracle registry returned TWO feeds for {} — keeping the last "
+                                + "([{},{}]) and discarding ([{},{}]). One feed per asset is the "
+                                + "assumed contract; if it no longer holds, the choice below is "
+                                + "arbitrary and needs a rule.",
+                        entry.token().toUnit(), entry.feed().validFrom(), entry.feed().validTo(),
+                        displaced.feed().validFrom(), displaced.feed().validTo());
+            }
             oracleTokens.put(entry.oracleToken(), entry);
         }));
         byToken.set(Map.copyOf(tokens));

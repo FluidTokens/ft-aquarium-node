@@ -61,6 +61,18 @@ public class LoanController {
      * has passed.
      */
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+    /**
+     * @param ageSeconds       how long ago this feed's window OPENED — {@code now − validFrom}.
+     *                         <b>The number that was one subtraction away and nobody printed.</b> A
+     *                         five-minute-old feed and a fresh one were indistinguishable in our own
+     *                         reporting, which is why upstream staleness had to be found by an
+     *                         outside sampler and three competing hypotheses. Feeds are published on
+     *                         a cadence roughly half their width, so a healthy age is well under
+     *                         half the window; a large one means <b>the registry API is serving us a
+     *                         window that is already old</b>, and that is upstream of us.
+     * @param remainingSeconds how long this feed stays usable — {@code validTo − now}. Negative means
+     *                         expired. This is what the liquidation window is actually competing for.
+     */
     public record OracleFeedView(String token,
                                  String oracleToken,
                                  String variant,
@@ -68,6 +80,8 @@ public class LoanController {
                                  BigInteger priceDenominator,
                                  String validFrom,
                                  String validTo,
+                                 long ageSeconds,
+                                 long remainingSeconds,
                                  boolean usableNow,
                                  int signatures,
                                  int threshold,
@@ -118,6 +132,8 @@ public class LoanController {
                 feed.priceDenominator(),
                 Instant.ofEpochMilli(feed.validFrom()).toString(),
                 Instant.ofEpochMilli(feed.validTo()).toString(),
+                (now - feed.validFrom()) / 1000L,
+                (feed.validTo() - now) / 1000L,
                 feed.usableAt(now),
                 entry.signatures().size(),
                 entry.threshold(),

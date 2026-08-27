@@ -1218,9 +1218,28 @@ public final class LiquidateTransactionBuilder {
         // V3 — tx-grade window checks. usableOver, never usableAt.
         OraclePriceFeed feed = entry.feed();
         if (!feed.usableOver(validFrom, validTo)) {
+            // ⛔ SAY WHICH END FAILED AND HOW OLD THE FEED ALREADY WAS.
+            //
+            // "does not cover" alone cannot tell an operator apart two very different worlds: the
+            // window genuinely lapsed, or OUR SUPPLIER IS BEHIND. Measured 2026-08-27: the registry
+            // API serves entries whose window opened ~5 minutes earlier, against a 600s width
+            // published every ~300s — so roughly a third of each feed's usable life is gone before
+            // we ever see it, and no arithmetic on our side can recover it.
+            // Same distinction as LOAN_NOT_FOUND: one reading is nothing to do, the other is a fault
+            // somebody else has to fix, and they were indistinguishable in the same string.
+            long ageAtBuild = validFrom - feed.validFrom();
             throw refuse(Refusal.ORACLE_FEED_NOT_USABLE_OVER_WINDOW,
-                    "loan %s %s leg: feed window [%d,%d] does not cover tx window [%d,%d]"
-                            .formatted(loanId, which, feed.validFrom(), feed.validTo(), validFrom, validTo));
+                    ("loan %s %s leg: feed window [%d,%d] does not cover tx window [%d,%d] — %s. "
+                            + "The feed was already %ds old when this transaction was built; if that "
+                            + "is a large fraction of its width, the registry API is serving us a "
+                            + "stale window and the shortfall is UPSTREAM, not ours.")
+                            .formatted(loanId, which, feed.validFrom(), feed.validTo(),
+                                    validFrom, validTo,
+                                    validFrom < feed.validFrom()
+                                            ? "the tx opens BEFORE the feed does"
+                                            : "the tx runs PAST the feed's end by "
+                                                    + (validTo - feed.validTo()) + "ms",
+                                    ageAtBuild / 1000L));
         }
         long remainingWindow = feed.validTo() - validTo;
         if (remainingWindow < request.oracleWindowMarginMillis()) {
