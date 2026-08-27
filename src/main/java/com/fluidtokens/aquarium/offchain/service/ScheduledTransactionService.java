@@ -269,6 +269,23 @@ public class ScheduledTransactionService {
                         .collateralPayer(account.baseAddress())
                         .mergeOutputs(false)
                         .ignoreScriptCostEvaluationError(false)
+                        // T-059 — THE ONLY MAINNET PATH NOW ASSERTS ITS OWN STRUCTURE.
+                        //
+                        // Every guarantee the lending-v4 review added lives on the PREVIEW paths;
+                        // this one had none. And `withVerifier` is genuinely reached here because the
+                        // tank submits through completeAndWait() — the one place in that whole arc
+                        // where the obviously-named API is the right one, after three that were not.
+                        //
+                        // ⚠ It COMPOSES (QuickTxBuilder:863-868 uses andThen), unlike preBalanceTx
+                        // above, which is a SETTER whose second call silently discards the first.
+                        // Two hooks on one builder with opposite semantics.
+                        .withVerifier(TankStructureVerifier.of(
+                                tankPaymentUtxo,
+                                parametersRefInput, stakerRefInput,
+                                refInputIndexes.paramsIndex(), refInputIndexes.stakingIndex(),
+                                ZERO,
+                                payeeAddress.getAddress(), amountToSend.getCoin(),
+                                rewardsAddress.getAddress(), reward.getCoin()))
                         .completeAndWait();
 
             } catch (Exception e) {
