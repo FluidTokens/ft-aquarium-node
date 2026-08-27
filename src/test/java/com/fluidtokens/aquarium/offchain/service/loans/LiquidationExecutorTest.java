@@ -889,6 +889,8 @@ class LiquidationExecutorTest {
         LiquidationDecision decision = onlyDecision(wiring);
         assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, decision.outcome(), decision.detail());
         assertEquals(LiquidationDecision.VARIANT, decision.variant());
+
+
         assertEquals(LOAN_ID, decision.loanId());
         assertEquals(TX_LOAN + "#0", decision.loanUtxoRef());
         assertEquals(TX_BOND + "#0", decision.bondUtxoRef());
@@ -1553,7 +1555,9 @@ class LiquidationExecutorTest {
 
         assertNotNull(decision.txHash(), decision.detail());
         assertNotNull(decision.txCborHex());
-        assertEquals(LiquidationDecision.VARIANT, decision.variant());
+        assertEquals(LiquidationDecision.VARIANT_CONVERT, decision.variant(),
+                "a convert loan must record its OWN variant — this assertion said Liquidate until "
+                        + "2026-08-27 and was pinning the defect in place");
         assertEquals(F855.LOAN_ID, decision.loanId());
         // Shadow mode: a priced verdict (WOULD_SUBMIT or UNPROFITABLE), never a submit or a refusal.
         assertTrue(decision.outcome() == LiquidationDecision.Outcome.WOULD_SUBMIT
@@ -2443,5 +2447,48 @@ class LiquidationExecutorTest {
                 java.time.Instant.ofEpochMilli(NOW - 30_000L), java.time.ZoneOffset.UTC));
         assertTrue(oldWallClockStart > laggingSlot,
                 "the fixture no longer reproduces the failure it was built from");
+    }
+
+    /**
+     * ⛔ <b>A convert liquidation must not record itself as a plain one.</b>
+     * <p>
+     * The two paths have OPPOSITE SIGNS: on {@code Liquidate} the bot earns a fee slice and keeps
+     * the collateral; on {@code LiquidateAndPayInAdvance} it <b>pays the lender in ada out of its
+     * own wallet</b> and acquires the collateral token. That is a purchase, not a fee.
+     * <p>
+     * {@code LiquidationDecision.variant} was hardcoded to the plain value for the entire time the
+     * convert path was live — <b>so every convert decision would have been stored as a plain
+     * Liquidate.</b> The field's own javadoc said it existed <i>"so a second action can be added
+     * later without every stored decision becoming ambiguous"</i>. The second action was added; the
+     * field was not. <b>The ambiguity landed in the field that existed to prevent it.</b>
+     * <p>
+     * Found because a peer went looking for a convert log signature on the running pod and found
+     * none — the path was armed, executable, and observable only as a FALLING wallet balance
+     * inferred from chain.
+     */
+    @Test
+    void aConvertCandidateIsRecordedAsConvertAndNotAsAPlainLiquidate() {
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(convert.assessment()), List.of(convert),
+                allUnspent(List.of(convert)), List.of(WALLET_UTXO), noOracle(), false);
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.VARIANT_CONVERT, decision.variant(),
+                "a convert liquidation stored as \"" + decision.variant() + "\" is indistinguishable "
+                        + "from a plain one in the durable record, and the two have opposite signs");
+    }
+
+    /** And the plain path keeps its own label — the positive control for the test above. */
+    @Test
+    void aPlainCandidateIsStillRecordedAsAPlainLiquidate() {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false);
+
+        wiring.executor().cycle(NOW);
+
+        assertEquals(LiquidationDecision.VARIANT, onlyDecision(wiring).variant());
     }
 }

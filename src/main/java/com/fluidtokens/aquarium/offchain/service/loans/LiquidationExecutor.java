@@ -617,6 +617,15 @@ public class LiquidationExecutor {
 
         Transaction transaction;
         if (assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
+            // ⛔ ANNOUNCE IT. On this path the bot PAYS the lender ada out of its own wallet and
+            // acquires the collateral token — the opposite sign to the plain path, and a trade
+            // nobody has specified the intended end state for. It emitted NO log line of any kind
+            // until now, so the only way to notice one had happened was a FALLING wallet balance
+            // read off chain. An armed, unspecified and unobservable behaviour is three problems,
+            // and the cheapest of them to fix is the third.
+            log.info("{} is a CONVERT liquidation (LiquidateAndPayInAdvance): the bot PAYS the "
+                            + "lender in ada and acquires the collateral, rather than earning a fee",
+                    loanUtxoRef);
             // Convert loan: routed to the promoted, submit-incapable pay-in-advance builder. The same
             // window the plain path uses is handed to the router, which derives its own slots from it.
             try {
@@ -892,7 +901,7 @@ public class LiquidationExecutor {
                 assessment.loan().loanId(),
                 assessment.loan().utxoRef(),
                 assessment.bond().utxoRef(),
-                LiquidationDecision.VARIANT,
+                variantOf(assessment),
                 verdict.outcome(),
                 verdict.outcome().name(),
                 verdict.detail(),
@@ -1294,6 +1303,24 @@ public class LiquidationExecutor {
         return entry.feed();
     }
 
+    /**
+     * Which action this candidate is routed to — read from the SAME predicate {@code consider()}
+     * routes on, so the record cannot disagree with what was built.
+     *
+     * <p>⚠ This was {@code LiquidationDecision.VARIANT}, hardcoded, for the entire time the convert
+     * path was live: <b>every convert liquidation would have been recorded as a plain
+     * {@code Liquidate}</b>. The field's own javadoc said it existed "so a second action can be
+     * added later without every stored decision becoming ambiguous" — <b>the second action was
+     * added and the field was not.</b> The convert path also emits no log line of its own, so
+     * between the two it was armed, executable, and invisible except by inferring a FALLING wallet
+     * balance from chain.
+     */
+    private static String variantOf(LiquidationAssessment assessment) {
+        return assessment.bond().datum().shouldLiquidationConvertToPrincipal()
+                ? LiquidationDecision.VARIANT_CONVERT
+                : LiquidationDecision.VARIANT;
+    }
+
     private LiquidationDecision decision(LiquidationAssessment assessment, long now,
                                          LiquidationDecision.Outcome outcome, String reason,
                                          String detail) {
@@ -1308,7 +1335,12 @@ public class LiquidationExecutor {
                 assessment.loan().loanId(),
                 assessment.loan().utxoRef(),
                 assessment.bond().utxoRef(),
-                LiquidationDecision.VARIANT,
+                // ⚠ BOTH construction sites, not one. This helper and the verdict path at ~899 each
+                // build a LiquidationDecision, and fixing only the first left every REFUSAL on the
+                // convert path still labelled "Liquidate" while successes were labelled correctly —
+                // which is worse than the original defect, because the record would then be
+                // inconsistent with itself rather than uniformly wrong.
+                variantOf(assessment),
                 outcome,
                 reason,
                 detail,

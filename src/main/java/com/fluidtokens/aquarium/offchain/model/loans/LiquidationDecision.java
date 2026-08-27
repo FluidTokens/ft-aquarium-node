@@ -18,9 +18,13 @@ import java.math.BigInteger;
  * @param decidedAt              epoch millis at which the decision was taken
  * @param loanUtxoRef            {@code txHash#index} of the loan UTxO
  * @param bondUtxoRef            {@code txHash#index} of the lender-bond UTxO
- * @param variant                always {@link #VARIANT} — the action this bot builds. A field
- *                               rather than an implicit fact so a second action (convert, compound)
- *                               can be added later without every stored decision becoming ambiguous
+ * @param variant                which action this decision is about — {@link #VARIANT} or
+ *                               {@link #VARIANT_CONVERT}. A field rather than an implicit fact so a
+ *                               second action can be added without every stored decision becoming
+ *                               ambiguous. ⚠ <b>It was hardcoded to the plain value for the whole
+ *                               time the convert path was live</b>, so every convert decision would
+ *                               have recorded itself as a plain Liquidate — the exact ambiguity this
+ *                               field exists to prevent, in the field that exists to prevent it
  * @param reason                 the machine-readable half: a {@code Refusal} name, an exception
  *                               class name, or the outcome's own name
  * @param detail                 the human half
@@ -70,8 +74,15 @@ public record LiquidationDecision(long decidedAt,
                                   Integer redeemers,
                                   String submitVeto) {
 
-    /** The only action this bot builds: the plain {@code Liquidate} of design §8. */
+    /** The plain {@code Liquidate} of design §8: the bot EARNS a fee slice and keeps the collateral. */
     public static final String VARIANT = "Liquidate";
+
+    /**
+     * {@code LiquidateAndPayInAdvance}: the bot <b>PAYS the lender in ada out of its own wallet</b>
+     * and acquires the collateral token. <b>The opposite sign to {@link #VARIANT}</b> — a purchase,
+     * not a fee — which is why the two must never share a label in the durable record.
+     */
+    public static final String VARIANT_CONVERT = "LiquidateAndPayInAdvance";
 
     /**
      * <b>Temporary back-compatibility. Remove at T-010.</b>
