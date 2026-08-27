@@ -40,6 +40,38 @@ import java.util.List;
  * a certain one. <b>So it logs and does not throw</b> — and in doing so it becomes the instrument
  * that settles T-066 from the inside, reporting on every real transaction whether index zero was in
  * fact the tank input.
+ *
+ * <h2>⛔ MEASURED 2026-08-27: THIS CLASS HAS NEVER EXECUTED, AND ON PREVIEW IT CANNOT</h2>
+ * The sentence above — "reporting on every real transaction" — describes an instrument that has so
+ * far reported on <b>nothing</b>, and the qualification belongs next to the claim rather than in a
+ * ticket nobody reads first.
+ * <p>
+ * {@code processPayments()} returns at its <b>second guard</b> on every cycle: {@code
+ * findStakerRefInput()} is empty because the bot's wallet holds no 30k-FLDT stake position on
+ * preview, so it logs {@code "Cannot find stake for …"} and returns at
+ * {@code ScheduledTransactionService:126}. Measured across two pods: {@code
+ * "It was not possible to find staked tokens."} × <b>121 over ten hours</b> — every cycle at a
+ * 5-minute cadence, all night — and {@code "Found {} Tank Utxos …"} (line 155, <b>unconditional</b>)
+ * printed <b>zero</b> times. This verifier is installed 127 lines below that line, inside the
+ * {@code forEach} it never reaches.
+ * <p>
+ * ⇒ <b>Every test of this class drives a hand-built {@code Transaction.builder()} body, authored
+ * alongside the verifier and shaped to the same reading of the tank builder.</b> If that reading is
+ * wrong in any respect, the fixtures are wrong the same way and the suite is green. Its <b>first
+ * execution against a body this codebase actually built</b> would be on an operator's mainnet node.
+ * <p>
+ * ⚠ What a false refusal would cost there, so the risk is sized rather than implied: a {@code
+ * VerifierException} is caught by {@code ScheduledTransactionService:291}, which adds the utxo to
+ * {@code unprocessableScheduledTransactions} — a {@code Vector} that is <b>never cleared</b>, with
+ * no {@code remove} and no {@code clear} anywhere in the class. <b>The skip is permanent for the
+ * lifetime of the process</b>, and it presents in the log as {@code "Could not process Tank utxo"},
+ * indistinguishable from a build or submit failure. A systematic false positive would blacklist that
+ * whole class of transaction on every node running the build.
+ * <p>
+ * ⇒ <b>The instrument is correct as far as it has been driven, and it is pointed at a dead path.
+ * Do not read a green suite, or a quiet preview, as evidence that it works.</b> That is precisely
+ * the failure this file was written to catch, one level up: <b>a monitor that never runs is
+ * indistinguishable from a monitor that runs and finds nothing wrong.</b>
  */
 @Slf4j
 public final class TankStructureVerifier {
