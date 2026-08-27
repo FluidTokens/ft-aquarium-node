@@ -281,6 +281,84 @@ class ShippedDefaultsTest {
                 "a coordinate with no output index must be rejected, not treated as unpublished");
     }
 
+    /**
+     * ⛔ EVERY operator-facing default in the base document, pinned BY VALUE.
+     *
+     * <h2>Why this exists, and it is not hypothetical</h2>
+     * On 2026-08-27 {@code profit-margin-lovelace} was changed from {@code 1500000} to
+     * {@code 5000000} — a <b>3.3× move in the number that decides whether the bot will move
+     * someone's collateral</b> — and the suite reported <b>79 files / 712 tests / 38 failures /
+     * 20 skipped / 0 errors, identical before and after</b>. Nothing owned that value. The two
+     * gating flags above were pinned because someone reasoned about arming; the economics were not,
+     * and they are the same class of promise.
+     * <p>
+     * <b>A default is a promise to an operator you will never meet.</b> They will run the image
+     * without reading this file, and every number here is a decision made on their behalf.
+     *
+     * <h2>Pinned by literal, deliberately</h2>
+     * The whole {@code ${VAR:default}} string is pinned, not just the default, so that renaming the
+     * environment variable — which silently breaks every operator's existing deployment while
+     * leaving the shipped behaviour identical — also fails here.
+     */
+    private static final Map<String, String> SHIPPED_LIQUIDATION_DEFAULTS = Map.ofEntries(
+            Map.entry("mode", "${AQUARIUM_LIQUIDATION_MODE:disabled}"),
+            Map.entry("enabled", "${AQUARIUM_LIQUIDATION_ENABLED:false}"),
+            Map.entry("delay-seconds", "${AQUARIUM_LIQUIDATION_DELAY_SECONDS:60}"),
+            Map.entry("validity-window-seconds", "${AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS:120}"),
+            Map.entry("oracle-window-margin-seconds", "${AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS:30}"),
+            Map.entry("profit-margin-lovelace", "${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:5000000}"),
+            Map.entry("ignore-profit-check", "${AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK:false}"),
+            Map.entry("min-profit-absolute-lovelace", "${AQUARIUM_LIQUIDATION_MIN_PROFIT_ABSOLUTE_LOVELACE:0}"),
+            Map.entry("check-profitability", "${AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY:true}"),
+            Map.entry("decision-log-size", "${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}"),
+            Map.entry("quarantine-minutes", "${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}"));
+
+    /**
+     * ⚠ {@code mode} and {@code enabled} are pinned again here on purpose. They have their own tests
+     * above, for their own reasons, but the completeness check below is only exhaustive if this table
+     * is the whole set — and an exemption list is exactly how a set stops being exhaustive.
+     */
+    @Test
+    void everyShippedLiquidationDefaultIsPinnedByValue() throws IOException {
+        Map<String, Object> base = base(documents());
+        for (Map.Entry<String, String> pinned : SHIPPED_LIQUIDATION_DEFAULTS.entrySet()) {
+            assertEquals(pinned.getValue(), at(base, "loans.liquidation." + pinned.getKey()),
+                    "the shipped default for loans.liquidation." + pinned.getKey() + " moved. If that "
+                            + "was deliberate, change it here and say in the commit what an operator "
+                            + "running the image will now do differently.");
+        }
+    }
+
+    /**
+     * ⛔ THE HALF THAT MAKES THE TABLE ABOVE MEAN SOMETHING.
+     *
+     * <p>A table pins what its author remembered. This asserts the table is the <b>whole set</b>: every
+     * scalar under {@code loans.liquidation} must appear in it, so <b>adding a new operator knob
+     * without pinning it fails here</b> rather than shipping unasserted. Nested blocks
+     * ({@code reference-scripts}) are excluded — they have their own test above.
+     *
+     * <p>⚑ Set equality in <b>both</b> directions, not {@code containsAll}: a key removed from the
+     * yaml but left in the table would otherwise pass while pinning something that no longer ships.
+     */
+    @Test
+    void noLiquidationDefaultShipsWithoutAPin() throws IOException {
+        Object block = liquidationBlockOf(base(documents()));
+        assertTrue(block instanceof Map, "loans.liquidation is not a block in the base document");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> liquidation = (Map<String, Object>) block;
+
+        java.util.Set<String> shipped = new java.util.TreeSet<>();
+        for (Map.Entry<String, Object> entry : liquidation.entrySet()) {
+            if (!(entry.getValue() instanceof Map)) {
+                shipped.add(entry.getKey());
+            }
+        }
+        assertEquals(new java.util.TreeSet<>(SHIPPED_LIQUIDATION_DEFAULTS.keySet()), shipped,
+                "the set of operator-facing liquidation defaults changed. A new knob must be pinned in "
+                        + "SHIPPED_LIQUIDATION_DEFAULTS, and a removed one deleted from it — otherwise "
+                        + "the pins above stop being exhaustive and start being a sample.");
+    }
+
     private static Object liquidationBlockOf(Map<String, Object> document) {
         Object loans = document.get("loans");
         if (!(loans instanceof Map<?, ?> loansMap)) {
