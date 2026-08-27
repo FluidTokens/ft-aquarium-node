@@ -79,12 +79,31 @@ loans:
     # feed-staleness finding (T-065/T-067) makes tempting — the registry serves windows ~323 s after
     # their own validFrom, so shrinking our 150 s would widen the usable stretch — and there is now
     # empirical cost data against it, from outside this codebase. Measured on preview by steward-d0,
-    # 2026-08-26/27: FOUR independent OutsideValidityIntervalUTxO rejections belonging to some other
-    # actor, all EXACTLY 58 slots wide, overshooting inclusion by 42 to 161 slots. Ours is ~149 slots
-    # (30 s backdate + 120 s) and has never failed. Four failures at 58 and none at 149 is not a
-    # threshold and nobody should quote it as one — but it is the only real evidence anyone has, and
-    # it points the same way as the block-gap arithmetic behind the anchor fix: preview's gaps reach
-    # 182 s, so a window narrower than the tail is a bet on gap length. WIDER, NOT TIGHTER.
+    # 2026-08-26/27: FIVE independent OutsideValidityIntervalUTxO rejections belonging to some other
+    # actor, all EXACTLY 58 slots wide — distinct widths [58], a signature rather than a coincidence.
+    #
+    #   overshoot   total delay   inside our ~149?
+    #        +161           219   no
+    #        +124           182   no
+    #         +42           100   yes
+    #         +53           111   yes
+    #         +19            77   yes
+    #
+    # ⇒ THE HONEST CLAIM IS "149 IS BETTER, NOT SUFFICIENT": it would have caught 3 of 5. The two
+    # survivors needed 182 and 219 slots, i.e. ~3.8x the current window, which this data does NOT
+    # settle. ⚠ And the counterfactual assumes widening extends the UPPER bound with invalidBefore
+    # unmoved — which is what validity-window-seconds does. If a change also moved the start, every
+    # number above is void.
+    #
+    # ⛔ DO NOT READ OUR 149 AS VALIDATED. It is UNEXERCISED: the bot has built nothing since
+    # 2026-08-26 23:20, so "ours has never failed" is equally consistent with having submitted no
+    # transactions at all — which is the actual case. "Ours has not failed" and "ours would have
+    # survived these" are different claims and only the second is about the width.
+    #
+    # What survives all of that is the DIRECTION, and only the direction: narrowing moves us toward
+    # the one width that demonstrably fails on this network, and 3-of-5 beats 0-of-5. It agrees with
+    # the block-gap arithmetic behind the anchor fix — preview gaps reach 182 s, so a window narrower
+    # than the tail is a bet on gap length. WIDER, NOT TIGHTER — but "wide enough" is unmeasured.
     validity-window-seconds: ${AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS:120}
     oracle-window-margin-seconds: ${AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS:30}
     # Expected profit = fee value - tx fee - this. The reference-script surcharge is the dominant
