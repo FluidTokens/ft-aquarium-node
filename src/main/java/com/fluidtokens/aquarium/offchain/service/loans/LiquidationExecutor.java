@@ -304,6 +304,47 @@ public class LiquidationExecutor {
         this.submitter = submitter;
         guardMainnetNegativeMargin();
         guardMainnetIgnoreProfitCheck();
+        announceEffectiveSettings();
+    }
+
+    /**
+     * ⛔ The settings actually in force, printed once at boot.
+     *
+     * <h2>Why this is not redundant with {@code ShippedDefaultsTest}</h2>
+     * That test pins what the <b>file</b> ships. <b>It is completely blind to an environment
+     * override</b>, which is how every one of these values is meant to be changed — so the two are
+     * complementary rather than overlapping: the pins protect the promise, this reports the reality.
+     *
+     * <h2>What made it necessary</h2>
+     * Asked by {@code steward-d0} on 2026-08-27, after it checked whether it could observe a change
+     * to the validity window from outside and found it could not: <b>absent from the environment,
+     * absent from the manifest, absent from every boot line</b> — verified by reading the whole INIT
+     * block rather than by one keyword grep. <b>The only observable was the CBOR width of a built
+     * transaction, and with zero loans nothing builds.</b> ⇒ A narrowing could land and stay
+     * invisible until the liquidation that paid for it, which is the wrong moment to discover the
+     * risk was taken.
+     * <p>
+     * ⚑ Same defect class as the loan census (T-060), the feed age (T-067) and the tank traffic line:
+     * <b>a number that governs behaviour, already known, never printed.</b>
+     */
+    private void announceEffectiveSettings() {
+        log.info("LIQUIDATION SETTINGS mode={} enabled={} network={}",
+                configuration.getMode(), configuration.isEnabled(),
+                network == null ? "unknown" : network.getNetwork());
+        // The window is stated as its three parts AND its total: the total is what the ledger sees,
+        // and the backdate is a code constant an operator cannot change, so a report of the total
+        // alone would look configurable when half of it is not.
+        log.info("LIQUIDATION WINDOW validity-window={}s + backdate={}s = {}s total; oracle-margin={}s",
+                configuration.getValidityWindowSeconds(),
+                VALID_FROM_BACKDATE_MILLIS / 1000L,
+                configuration.getValidityWindowSeconds() + VALID_FROM_BACKDATE_MILLIS / 1000L,
+                configuration.getOracleWindowMarginSeconds());
+        log.info("LIQUIDATION ECONOMICS profit-margin={} lovelace; min-profit-absolute={} lovelace; "
+                        + "check-profitability={}; ignore-profit-check={}",
+                configuration.getProfitMarginLovelace(),
+                configuration.getMinProfitAbsoluteLovelace(),
+                configuration.isCheckProfitability(),
+                configuration.isIgnoreProfitCheck());
     }
 
     /**
