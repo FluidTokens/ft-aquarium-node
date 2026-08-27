@@ -121,16 +121,22 @@ class TxContextDeclarationTest {
         }
 
         // ---- the two hooks that do not work on a build() path (T-054, T-055) ------------------
-        for (String knob : List.of("withVerifier", "withTxInspector")) {
-            d.put(knob, new LinkedHashMap<>(Map.of(
-                    LIQ, Entry.omitted("consulted only inside complete() — the SUBMIT path — and this "
-                            + "builder calls build(). It would be dead code, not a safeguard"),
-                    CONVERT, Entry.omitted("as LIQ — dead on a build() path"),
-                    // ⚠ AND HERE IT WOULD ACTUALLY WORK: the tank calls completeAndWait().
-                    TANK, Entry.omitted("AVAILABLE HERE and not used: completeAndWait() IS the submit "
-                            + "path, so this is the one place the obviously-named API is the right one. "
-                            + "Left for T-059, whose mechanism is open"))));
-        }
+        d.put("withVerifier", new LinkedHashMap<>(Map.of(
+                LIQ, Entry.omitted("consulted only inside complete() — the SUBMIT path — and this "
+                        + "builder calls build(). It would be dead code, not a safeguard"),
+                CONVERT, Entry.omitted("as LIQ — dead on a build() path"),
+                // ✅ T-059 slice 1: NOW SET. The tank submits through completeAndWait(), so this is
+                // reached — the one place in this arc where the obviously-named API is the right one.
+                // This entry was OMITTED with the reason "available here and not used, left for
+                // T-059", and THIS TEST IS WHAT CAUGHT THE DECLARATION GOING STALE when the hook was
+                // added: the change was made, the suite went red, and the fix was to say so here.
+                TANK, Entry.set())));
+        d.put("withTxInspector", new LinkedHashMap<>(Map.of(
+                LIQ, Entry.omitted("consulted only inside complete() — dead on a build() path"),
+                CONVERT, Entry.omitted("as LIQ — dead on a build() path"),
+                TANK, Entry.omitted("AVAILABLE HERE and still not used: completeAndWait() reaches it, "
+                        + "but withVerifier already carries the structural assertion and an inspector "
+                        + "that only logs would duplicate it. Deliberate, not overlooked"))));
         return d;
     }
 
