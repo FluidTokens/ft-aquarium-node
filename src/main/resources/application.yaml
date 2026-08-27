@@ -82,7 +82,13 @@ loans:
     # costs ~0.28 ADA. On top of that come the size and execution-unit components of the ordinary
     # fee. 1.5 ADA leaves headroom for either shape and still refuses dust liquidations, whose fee
     # slice would not repay the transaction that claims it.
-    profit-margin-lovelace: ${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:1500000}
+    #
+    # ⇑ RAISED 1.5 -> 5 ADA on Giovanni's instruction (2026-08-27, relayed): the bot must clear
+    # "at least 5 ADA of profit" per liquidation, not merely cover its costs. The analysis above is
+    # what the transaction COSTS; this is what the operator wants to EARN, and they are different
+    # questions. The cost figures are kept because they are measured rather than chosen, and because
+    # they are the floor below which this number must never be set.
+    profit-margin-lovelace: ${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:5000000}
 
     # ⛔ TEST-ONLY. Bypasses BOTH profitability gates -- the absolute floor
     # (min-profit-absolute-lovelace) AND the margin (profit-margin-lovelace) -- and liquidates
