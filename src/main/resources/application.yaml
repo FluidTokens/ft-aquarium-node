@@ -74,6 +74,17 @@ loans:
     # margin shortens that usable stretch one second for one; a margin near 600 silently disables
     # the bot for most of every window while every candidate simply reports
     # ORACLE_WINDOW_MARGIN_TOO_SMALL.
+    #
+    # ⛔ AND DO NOT NARROW validity-window-seconds TO BUY BACK ORACLE HEADROOM. That is the move the
+    # feed-staleness finding (T-065/T-067) makes tempting — the registry serves windows ~323 s after
+    # their own validFrom, so shrinking our 150 s would widen the usable stretch — and there is now
+    # empirical cost data against it, from outside this codebase. Measured on preview by steward-d0,
+    # 2026-08-26/27: FOUR independent OutsideValidityIntervalUTxO rejections belonging to some other
+    # actor, all EXACTLY 58 slots wide, overshooting inclusion by 42 to 161 slots. Ours is ~149 slots
+    # (30 s backdate + 120 s) and has never failed. Four failures at 58 and none at 149 is not a
+    # threshold and nobody should quote it as one — but it is the only real evidence anyone has, and
+    # it points the same way as the block-gap arithmetic behind the anchor fix: preview's gaps reach
+    # 182 s, so a window narrower than the tail is a bet on gap length. WIDER, NOT TIGHTER.
     validity-window-seconds: ${AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS:120}
     oracle-window-margin-seconds: ${AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS:30}
     # Expected profit = fee value - tx fee - this. The reference-script surcharge is the dominant
