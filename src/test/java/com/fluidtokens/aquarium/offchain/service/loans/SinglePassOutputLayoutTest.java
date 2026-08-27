@@ -121,4 +121,62 @@ class SinglePassOutputLayoutTest {
         assertNotEquals(bondOutputIndexes(List.of(0L, 1L)), bondOutputIndexes(List.of(1L, 0L)),
                 "bond pairing must reach the echo index");
     }
+
+    /**
+     * ⚠ EXHAUSTIVE, because every other case here is hand-picked and a hand-picked case can only
+     * confirm the shape its author already had in mind.
+     *
+     * <p>The invariant is <b>tiling</b>, which no single example states: the two rows together must
+     * cover {@code [0, n + d)} exactly once, where {@code d} is the number of displaced loans. A
+     * non-displaced loan {@code i} holds slot {@code i} with its collateral; a displaced loan holds
+     * slot {@code i} with its <em>compensation</em> and takes {@code n + rank} for its collateral. So
+     * the collateral indexes and the compensation slots partition the filtered list with no gap and
+     * no overlap — and an off-by-one anywhere in the second row breaks the partition even when it
+     * leaves uniqueness and the range bound intact.
+     *
+     * <p>Covers all 364 sign patterns for {@code n = 0..5} over {-1, 0, +1}, so it includes the empty
+     * vector and both saturated ends, none of which the examples above reach.
+     */
+    @Test
+    void everyEquityPatternTilesTheFilteredOutputList() {
+        for (int n = 0; n <= 5; n++) {
+            int patterns = (int) Math.pow(3, n);
+            for (int p = 0; p < patterns; p++) {
+                long[] values = new long[n];
+                int rest = p;
+                for (int i = 0; i < n; i++) {
+                    values[i] = rest % 3 - 1;   // -1, 0, +1
+                    rest /= 3;
+                }
+                List<BigInteger> equity = equities(values);
+                String what = "n=" + n + " equity=" + java.util.Arrays.toString(values);
+
+                List<Long> collateral = assetOutputIndexesForEquities(equity);
+                assertEquals(n, collateral.size(), "one collateral index per loan: " + what);
+
+                long displaced = equity.stream().filter(e -> e.signum() > 0).count();
+                long filteredSize = n + displaced;
+
+                // The compensation slots: exactly the first-row positions of the displaced loans.
+                java.util.Set<Long> slots = new java.util.HashSet<>(collateral);
+                for (int i = 0; i < n; i++) {
+                    if (equity.get(i).signum() > 0) {
+                        assertNotEquals((long) i, collateral.get(i).longValue(),
+                                "a displaced loan must not keep its own slot: " + what);
+                        org.junit.jupiter.api.Assertions.assertTrue(slots.add((long) i),
+                                "compensation slot " + i + " collides with a collateral index: " + what);
+                    } else {
+                        assertEquals((long) i, collateral.get(i).longValue(),
+                                "an undisplaced loan keeps its own slot: " + what);
+                    }
+                }
+
+                assertEquals(filteredSize, slots.size(),
+                        "the two rows must tile [0," + filteredSize + ") with no gap or overlap: " + what);
+                assertEquals(java.util.stream.LongStream.range(0, filteredSize).boxed()
+                                .collect(java.util.stream.Collectors.toSet()),
+                        slots, "the tiled set is not the contiguous range: " + what);
+            }
+        }
+    }
 }
