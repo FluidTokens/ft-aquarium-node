@@ -139,7 +139,20 @@ import static com.bloxbean.cardano.client.common.model.Networks.preview;
         disabledReason = "needs a preview Blockfrost key: every UTxO here is resolved from chain")
 public class LoanFactoryOnChainRunnerTest {
 
-    private static final LoansContractRegistry REGISTRY = LoanFixtures.registry();
+    /**
+     * ⛔ {@code shippedPreviewRegistry()}, NOT {@code registry()}.
+     * <p>
+     * This runner creates REAL loans on preview, so it must use the coordinates the running node is
+     * pinned to. It was on {@code LoanFixtures.registry()} — the THIRD deployment, superseded
+     * 2026-08-25 — which meant every loan it created would have landed at credentials
+     * {@code TankUtxoStorage} does not index. <b>The bot would have reported {@code 0 live bonds} and
+     * that reads as "the experiment failed" or "the indexer is broken", neither of which is true.</b>
+     * Caught 2026-08-27 before any ada was spent.
+     * <p>
+     * The fixture registry deliberately stays on the third deployment: 25 test files replay recorded
+     * third-deployment data through it, and re-pointing THAT is the open decision about the 37.
+     */
+    private static final LoansContractRegistry REGISTRY = LoanFixtures.shippedPreviewRegistry();
 
     private static final String PREVIEW_BLOCKFROST_URL = "https://cardano-preview.blockfrost.io/api/v0/";
 
@@ -634,7 +647,7 @@ public class LoanFactoryOnChainRunnerTest {
      * pinned one.
      */
     private Utxo resolveConfigUtxo(UtxoSupplier utxoSupplier) {
-        String unit = LoanFixtures.CONFIG_POLICY_ID + LoanFixtures.CONFIG_ASSET_NAME;
+        String unit = REGISTRY.getConfigPolicyId() + LoanFixtures.CONFIG_ASSET_NAME;
         for (int index = 0; index <= 1; index++) {
             Optional<Utxo> candidate = utxoSupplier.getTxOutput(CONFIG_MINT_TX, index);
             if (candidate.isEmpty()

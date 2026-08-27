@@ -108,6 +108,61 @@ public final class LoanFixtures {
     private static final LoansContractRegistry REGISTRY = new LoansContractRegistry(
             CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
 
+    /**
+     * <b>A registry built from the coordinates {@code application.yaml} ACTUALLY SHIPS for preview —
+     * read from the file, never typed here.</b>
+     *
+     * <p>⛔ <b>Distinct from {@link #registry()} on purpose.</b> That one is pinned to the THIRD
+     * deployment and 25 test files depend on it; re-pointing it would pre-empt an open decision about
+     * the 37 red fixtures that is Giovanni's, not this method's. <b>Anything that must talk to the
+     * LIVE chain uses this; anything replaying recorded third-deployment data keeps that.</b>
+     *
+     * <h2>Why it parses the file instead of holding constants</h2>
+     * The on-chain loan factory silently targeted the third deployment after the 2026-08-25 redeploy,
+     * so a loan it created would have landed at credentials {@code TankUtxoStorage} does not index —
+     * <b>the bot would have reported {@code 0 live bonds} and the natural readings would have been
+     * "the experiment failed" or "the indexer is broken".</b> A constant typed here would drift the
+     * same way at the next redeploy. <b>A value read from the shipped config cannot disagree with what
+     * ships</b> — the generator, not the reminder.
+     */
+    public static LoansContractRegistry shippedPreviewRegistry() {
+        String yaml;
+        try (InputStream is = LoanFixtures.class.getResourceAsStream("/application.yaml")) {
+            if (is == null) {
+                throw new IllegalStateException("application.yaml is not on the test classpath");
+            }
+            yaml = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("could not read application.yaml", e);
+        }
+        // The preview profile is the LAST document; take everything after its on-profile marker so a
+        // mainnet value can never be picked up by accident.
+        int preview = yaml.indexOf("on-profile: preview");
+        if (preview < 0) {
+            throw new IllegalStateException("no preview profile in application.yaml");
+        }
+        String section = yaml.substring(preview);
+        return new LoansContractRegistry(
+                yamlValue(section, "policy-id", 1),
+                yamlValue(section, "policy-id", 2),
+                "706172616d6574657273",   // loans.config.asset-name default, AppConfig:102
+                yamlValue(section, "smart-tokens-spend-script-hash", 1));
+    }
+
+    /** The {@code n}-th occurrence of {@code key:} in {@code section}, hex value only. */
+    private static String yamlValue(String section, String key, int occurrence) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?m)^\\s*" + key + ":\\s*([0-9a-f]{40,})\\s*$").matcher(section);
+        for (int i = 0; i < occurrence; i++) {
+            if (!m.find()) {
+                throw new IllegalStateException(
+                        "application.yaml preview section has fewer than " + occurrence
+                                + " '" + key + "' values");
+            }
+        }
+        return m.group(1);
+    }
+
     public static LoansContractRegistry registry() {
         return REGISTRY;
     }
