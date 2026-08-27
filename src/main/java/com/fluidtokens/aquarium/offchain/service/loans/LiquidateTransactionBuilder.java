@@ -2224,6 +2224,19 @@ public final class LiquidateTransactionBuilder {
      * lands on the requested instant, and rounding outwards would hand the chain a wider interval
      * than the one V3 and V4 were checked against — the interval the guards proved safe must
      * contain the interval the transaction actually claims, not the other way round.
+     *
+     * <p>⚠ <b>The {@code slotFrom} clamp is now INERT on the common production path, and that is
+     * correct rather than dead.</b> Since T-064 anchored the window
+     * ({@code LiquidationExecutor.windowAnchorMillis}), {@code validFromMillis} is
+     * {@code min(now, tipMillis) - 30_000}. Whenever the chain is in a block gap — the case the
+     * anchor exists for — that is {@code tipMillis}, which is <b>slot-aligned</b>, minus a whole
+     * number of slots, so the guard condition is simply false and no correction is needed. It still
+     * fires when {@code now < tipMillis}, and a mutant deleting it still fails one test.
+     * <b>Do not delete it as unreachable, and do not assume it stays inert:</b> change the backdate
+     * to anything that is not a whole multiple of the slot length and it starts mattering again,
+     * silently. (officina {@code ccl-transaction-building-traps} trap 20, closing paragraph — <i>"a
+     * conditional correction that silently stops firing is indistinguishable from one that was never
+     * needed — expect it to vanish, and notice that it did."</i>)
      */
     private long[] validitySlots(Request request) {
         long from = request.validFromMillis();
