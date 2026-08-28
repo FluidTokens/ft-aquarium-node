@@ -387,6 +387,22 @@ All green, including the live one.
 
 ## 7. README "Bots logic" vs the validators ✅ DIFFED
 
+> **SUPERSEDED 2026-08-28. The sha below is no longer the deployed one, and this paragraph
+> misled a later reader into enumerating validator types from a seven-week-old version.**
+>
+> **The deployed commit is `e0b818e` (2026-08-19, "fixed R-03 and rewritten assetManager to
+> avoid using input indexes"), sha256 `a55a1c2e723a6d1222e464bb32adc1abe1d669ca6d00205d50459122adf7b98f`.**
+> Verified by hashing our vendored artifact and every upstream `plutus.json`: ours matches
+> `e0b818e` and no other commit.
+>
+> The artifact has moved twice since this paragraph was written — `8a57b61` (2026-08-17, third
+> deployment) and `349a054` (2026-08-25, fourth) — and **the local clone's HEAD is `bbe9c1a`,
+> which is OLDER than the deployed commit.** So `git show HEAD:<path>` in that clone reads a
+> version the chain is not running, silently. Always address it as
+> `git show e0b818e:<path>`, and re-derive the sha rather than trusting this line: the way to
+> find the deployed commit is to hash the vendored artifact and search upstream for the match,
+> which takes one command and cannot go stale.
+
 Upstream repo cloned at `../ft-cardano-loans-v4`, HEAD `5cc99a4` (2026-07-07,
 "Update: readme"). Its `plutus.json` is **byte-identical** to our bundled
 `loans-v4.plutus.json` (`sha256 29712aa5169f6e09c13199f2e0d6b9eb0959a0ebdd2e56a463c99a1562c5f478`),
