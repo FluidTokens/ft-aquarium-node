@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -295,5 +296,96 @@ class LiquidationUtxoResolverTest {
 
         assertEquals(TX_A, resolver.resolveConfigUtxo().orElseThrow().getTxHash());
         assertEquals(TX_B, resolver.resolveLmConfigUtxo().orElseThrow().getTxHash());
+    }
+
+    // ======================================================================================
+    // T-070 — resolving a bond's pool by poolId
+    // ======================================================================================
+
+    private static final String POOL_ID = "00183f8ba4d1e645b1e26e9caf56f802b129b50d833689727c920abe11";
+    private static final String OTHER_POOL_ID = "00993f8ba4d1e645b1e26e9caf56f802b129b50d833689727c920abe99";
+
+    private static Map<String, List<AddressUtxoEntity>> poolIndex(String poolIdOnPool,
+                                                                  String poolIdOnManager) {
+        Map<String, List<AddressUtxoEntity>> unspent = new java.util.HashMap<>();
+        if (poolIdOnPool != null) {
+            unspent.put(REGISTRY.getPoolSpendScriptHash(), List.of(row(TX_A, 0,
+                    LoanFixtures.entAddress(REGISTRY.getPoolSpendScriptHash()),
+                    List.of(lovelace(5_000_000), amt(REGISTRY.getPoolPolicyId() + poolIdOnPool, 1L)))));
+        }
+        if (poolIdOnManager != null) {
+            unspent.put(REGISTRY.getPoolManagerSpendScriptHash(), List.of(row(TX_B, 1,
+                    LoanFixtures.entAddress(REGISTRY.getPoolManagerSpendScriptHash()),
+                    List.of(lovelace(3_000_000),
+                            amt(REGISTRY.getPoolManagerPolicyId() + poolIdOnManager, 1L)))));
+        }
+        return unspent;
+    }
+
+    @Test
+    void aPoolAndItsManagerCarryingTheSamePoolIdResolveAsThePair() {
+        LiquidationUtxoResolver.PoolPair pair =
+                resolver(poolIndex(POOL_ID, POOL_ID)).resolvePool(POOL_ID);
+
+        assertEquals(LiquidationUtxoResolver.PoolLookup.RESOLVED, pair.outcome(), pair.detail());
+        assertEquals(TX_A, pair.pool().getTxHash());
+        assertEquals(TX_B, pair.poolManager().getTxHash());
+    }
+
+    /**
+     * ⛔ The finding this ticket was revised for (M-1). A node with more than one pool indexed holds a
+     * UTxO at the pool credential and a UTxO at the pool-manager credential that belong to
+     * <b>different pools</b>. "Both were located" is satisfied; the pair is wrong. Matching on the
+     * NFT whose asset name IS the {@code poolId} is what makes it a pair rather than a coincidence.
+     */
+    @Test
+    void aPoolAndAManagerFromDIFFERENTPoolsAreNotThePair() {
+        LiquidationUtxoResolver.PoolPair pair =
+                resolver(poolIndex(POOL_ID, OTHER_POOL_ID)).resolvePool(POOL_ID);
+
+        assertEquals(LiquidationUtxoResolver.PoolLookup.HALF_VISIBLE, pair.outcome(),
+                "a manager belonging to another pool must not be accepted as this pool's: "
+                        + pair.detail());
+        assertNull(pair.poolManager(), "the other pool's manager must not be returned");
+    }
+
+    /**
+     * The one case the index CAN settle: something minted this pool's NFT, so the pool exists and the
+     * missing half is a gap rather than a non-existent pool. Distinguished from
+     * {@link LiquidationUtxoResolver.PoolLookup#NOT_VISIBLE} on purpose (M-2) — one refusal for both
+     * would be the repeating-quarantine shape this epic refuses elsewhere.
+     */
+    @Test
+    void aVisiblePoolWithNoManagerIsHalfVisibleRatherThanAbsent() {
+        LiquidationUtxoResolver.PoolPair pair =
+                resolver(poolIndex(POOL_ID, null)).resolvePool(POOL_ID);
+
+        assertEquals(LiquidationUtxoResolver.PoolLookup.HALF_VISIBLE, pair.outcome(), pair.detail());
+        assertTrue(pair.detail().contains("index gap"),
+                "the detail must say the pool exists, not merely that something is missing: "
+                        + pair.detail());
+    }
+
+    /**
+     * ⚠ And the honest negative: with neither half visible the index cannot tell "no such pool" from
+     * "not indexed yet", and the outcome says so rather than guessing. A resolver that claimed
+     * "transient, retry" here would be inventing a distinction its data cannot support.
+     */
+    @Test
+    void neitherHalfVisibleIsNotClaimedToBeTransient() {
+        LiquidationUtxoResolver.PoolPair pair =
+                resolver(poolIndex(null, null)).resolvePool(POOL_ID);
+
+        assertEquals(LiquidationUtxoResolver.PoolLookup.NOT_VISIBLE, pair.outcome(), pair.detail());
+        assertTrue(pair.detail().contains("indistinguishable"),
+                "the detail must not claim to know which case this is: " + pair.detail());
+    }
+
+    @Test
+    void aBondNamingNoPoolResolvesToNothingWithoutTouchingTheIndex() {
+        LiquidationUtxoResolver.PoolPair pair = resolver(Map.of()).resolvePool("");
+
+        assertEquals(LiquidationUtxoResolver.PoolLookup.NOT_VISIBLE, pair.outcome());
+        assertTrue(pair.detail().contains("names no pool"), pair.detail());
     }
 }

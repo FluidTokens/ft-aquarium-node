@@ -93,6 +93,86 @@ public class LiquidationUtxoResolver {
                 .findFirst();
     }
 
+    /**
+     * T-070 — what a {@code poolId} lookup found, and how far it got.
+     *
+     * <h2>Three outcomes, because two would be a lie</h2>
+     * The obvious shape is found / not-found, with not-found treated as "the index is behind, retry".
+     * <b>The index cannot support that distinction:</b> it is a cache of the chain, and an absent row
+     * means either the pool does not exist or we have not seen it yet. Those are indistinguishable
+     * from here and pretending otherwise would put a guess in a refusal message.
+     * <p>
+     * What the index <em>can</em> settle is {@link #HALF_VISIBLE}: if exactly one of the pool and its
+     * manager is present, <b>the pool provably exists</b> — something minted its NFT — so the missing
+     * half is a real gap rather than a non-existent pool. That is the one case where "wait and retry"
+     * is a claim rather than a hope.
+     */
+    public enum PoolLookup {
+        /** Both found, both carrying the {@code poolId} NFT, so they are provably the pair. */
+        RESOLVED,
+        /** Exactly one found. The pool exists; the other half is missing. Transient or unmodelled. */
+        HALF_VISIBLE,
+        /** Neither found. Cannot distinguish "no such pool" from "index behind" — do not claim to. */
+        NOT_VISIBLE
+    }
+
+    /** The result of {@link #resolvePool}. {@code pool} and {@code poolManager} may be null. */
+    public record PoolPair(PoolLookup outcome, Utxo pool, Utxo poolManager, String detail) {
+    }
+
+    /**
+     * Resolves the pool and pool-manager UTxOs a lender bond's {@code poolId} names.
+     *
+     * <h2>⚠ What makes them THE PAIR rather than two UTxOs (T-070, finding M-1)</h2>
+     * Locating one UTxO at the pool credential and one at the pool-manager credential is <b>not</b>
+     * enough: a node with several pools indexed would happily return two that belong to different
+     * ones. Both are matched on the NFT whose <b>asset name is the {@code poolId} itself</b>, under
+     * their respective policies, so a mismatched pair cannot be returned as a match.
+     *
+     * <h2>Unspentness is asserted by the query, not assumed — with one caveat that must be stated</h2>
+     * {@link #unspentAt} reads only unspent rows, so both are unspent <em>as far as the index knows</em>.
+     * <b>The index is a cache of the chain</b>, and these UTxOs travel as REFERENCE INPUTS, where a
+     * stale one is not caught at build time — it fails at submission. This method cannot close that
+     * gap and does not claim to; the freshness of the index is the executor's problem, as it already
+     * is for the loan and bond UTxOs.
+     */
+    public PoolPair resolvePool(String poolId) {
+        if (poolId == null || poolId.isBlank()) {
+            return new PoolPair(PoolLookup.NOT_VISIBLE, null, null,
+                    "the bond names no pool, so there is nothing to resolve");
+        }
+        Optional<Utxo> pool = holderOf(registry.getPoolSpendScriptHash(),
+                registry.getPoolPolicyId() + poolId);
+        Optional<Utxo> manager = holderOf(registry.getPoolManagerSpendScriptHash(),
+                registry.getPoolManagerPolicyId() + poolId);
+
+        if (pool.isPresent() && manager.isPresent()) {
+            return new PoolPair(PoolLookup.RESOLVED, pool.get(), manager.get(),
+                    "pool " + pool.get().getTxHash() + "#" + pool.get().getOutputIndex()
+                            + " and manager " + manager.get().getTxHash() + "#"
+                            + manager.get().getOutputIndex() + " both carry poolId " + poolId);
+        }
+        if (pool.isPresent() || manager.isPresent()) {
+            String found = pool.isPresent() ? "pool" : "pool manager";
+            String missing = pool.isPresent() ? "pool manager" : "pool";
+            return new PoolPair(PoolLookup.HALF_VISIBLE, pool.orElse(null), manager.orElse(null),
+                    "poolId " + poolId + " has a visible " + found + " but no " + missing
+                            + " in the index; the pool exists, so this is an index gap rather than a "
+                            + "missing pool");
+        }
+        return new PoolPair(PoolLookup.NOT_VISIBLE, null, null,
+                "poolId " + poolId + " has neither a pool nor a pool manager in the index; this is "
+                        + "indistinguishable from a pool that does not exist");
+    }
+
+    /** One unspent UTxO at a credential carrying a specific unit, if the index holds one. */
+    private Optional<Utxo> holderOf(String paymentCredential, String unit) {
+        return unspentAt(paymentCredential)
+                .filter(utxo -> utxo.getAmount() != null
+                        && utxo.getAmount().stream().map(Amount::getUnit).anyMatch(unit::equals))
+                .findFirst();
+    }
+
     private Optional<Utxo> resolveConfigHolder(String policyId, String what) {
         String unit = policyId + registry.getConfigAssetName();
         Optional<Utxo> configUtxo = unspentAt(policyId)
