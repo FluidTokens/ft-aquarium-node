@@ -4,6 +4,7 @@ import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
@@ -54,20 +55,24 @@ import java.util.Optional;
  * and the FluidTokens oracle accept under the real PlutusV3 machine, for <b>one</b> loan compounded
  * into <b>one</b> pool.
  *
- * <h2>⚠ DO NOT PROMOTE THIS TO {@code src/main} AS IT STANDS — CCL TRAP 8 IS STILL IN IT</h2>
- * {@link #complete} builds with {@code new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)}
- * and {@code ignoreScriptCostEvaluationError(true)}. That third {@code null} is <b>not only</b> the
- * {@code TransactionProcessor} — <b>the same argument becomes the {@code TransactionEvaluator}</b>, so
- * the script-cost step is never run and every transaction this builds declares cardano-client-lib's
- * <b>placeholder ex-units</b> (10000 mem / 10000-or-1000 steps) against real costs 2–5 orders of
- * magnitude larger. Under-declared ex-units are not rejected at the mempool: the transaction lands and
- * exhausts its budget on chain, <b>in phase two, collateral forfeit</b>.
+ * <h2>✅ CCL TRAP 8 IS FIXED (T-069, 2026-08-28) — BUT THIS IS STILL NOT PROMOTABLE AS IT STANDS</h2>
+ * {@link #complete} previously built with {@code new QuickTxBuilder(utxoSupplier,
+ * protocolParamsSupplier, null)} and {@code ignoreScriptCostEvaluationError(true)}. That third
+ * {@code null} is <b>not only</b> the {@code TransactionProcessor} — <b>the same argument becomes the
+ * {@code TransactionEvaluator}</b>, so the script-cost step never ran and every transaction this built
+ * declared cardano-client-lib's <b>placeholder ex-units</b> (10000 mem / 10000-or-1000 steps) against
+ * real costs 2–5 orders of magnitude larger. Under-declared ex-units are not rejected at the mempool:
+ * the transaction lands and exhausts its budget on chain, <b>in phase two, collateral forfeit</b>.
+ * That is the defect that took down the production convert path on <b>2026-08-21</b>.
  * <p>
- * This is exactly the defect that took down the production convert path on <b>2026-08-21</b> and was
- * fixed for the sibling builder by {@code 5b439da} ({@code withTxEvaluator(...)} +
- * {@code ignoreScriptCostEvaluationError(evaluator == null)}). It survives here only because this
- * builder has <b>no production caller</b> — the dry-eval test supplies its own evaluator through the
- * offline rig, which is why the tests are green and prove nothing about this.
+ * An evaluator is now an explicit constructor argument, installed with {@code withTxEvaluator} and
+ * paired with {@code ignoreScriptCostEvaluationError(evaluator == null)} — the sibling's {@code 5b439da}
+ * shape. <b>The null no longer decides whether the transaction is priced.</b>
+ * <p>
+ * ⛔ <b>What is NOT fixed, and is the whole of T-071:</b> this class still has no production caller and
+ * no Spring-wired build. Its dry-eval test supplies an evaluator through the offline rig, which is
+ * precisely the fixture supplying what production must earn. <b>A green suite here still says nothing
+ * about a production build.</b>
  * <p>
  * <b>Corrective #2 (in force since 2026-08-21) applies directly: a test→{@code src/main} promotion
  * REQUIRES a production-wiring test; byte-identity is NEVER the sole gate.</b> Promoting this file
@@ -142,14 +147,36 @@ public final class LiquidatePayInAdvanceAndCompoundTransactionBuilder {
     private final UtxoSupplier utxoSupplier;
     private final ProtocolParamsSupplier protocolParamsSupplier;
 
+    /**
+     * Optional, and load-bearing exactly as on the sibling builders (T-069). When present the build is
+     * priced and a failed evaluation aborts it; when absent the redeemers keep cardano-client-lib's
+     * placeholders and the offline rig prices the transaction itself.
+     *
+     * <p>{@link TransactionEvaluator} is a one-method interface with no way to submit, so supplying it
+     * grants costing without granting submission. That is what makes it safe to fix this trap without
+     * weakening the no-submit property this builder relies on.
+     */
+    private final TransactionEvaluator scriptCostEvaluator;
+
+    /** Unpriced: no evaluator, so redeemers keep placeholder ex-units. */
     public LiquidatePayInAdvanceAndCompoundTransactionBuilder(LoansContractRegistry registry,
                                                               Network network,
                                                               UtxoSupplier utxoSupplier,
                                                               ProtocolParamsSupplier protocolParamsSupplier) {
+        this(registry, network, utxoSupplier, protocolParamsSupplier, null);
+    }
+
+    /** Priced: the evaluator measures every redeemer, and a failed evaluation aborts the build. */
+    public LiquidatePayInAdvanceAndCompoundTransactionBuilder(LoansContractRegistry registry,
+                                                              Network network,
+                                                              UtxoSupplier utxoSupplier,
+                                                              ProtocolParamsSupplier protocolParamsSupplier,
+                                                              TransactionEvaluator scriptCostEvaluator) {
         this.registry = registry;
         this.network = network;
         this.utxoSupplier = utxoSupplier;
         this.protocolParamsSupplier = protocolParamsSupplier;
+        this.scriptCostEvaluator = scriptCostEvaluator;
     }
 
     /**
@@ -389,24 +416,31 @@ public final class LiquidatePayInAdvanceAndCompoundTransactionBuilder {
 
     private Transaction complete(Request request, ScriptTx tx) {
         try {
-            // ⚠ CCL TRAP 8 — the third argument is NOT only the TransactionProcessor. The same null
-            // becomes the TransactionEvaluator, so the two lines below ship PLACEHOLDER ex-units.
-            // Harmless while this builder is test-only; a phase-2 failure with collateral forfeit the
-            // moment it is promoted. DO NOT PROMOTE WITHOUT FIXING THIS — see the class javadoc's
-            // "DO NOT PROMOTE" section, corrective #2, and the 5b439da fix for the sibling builder.
-            return new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
+            // T-069 — CCL trap 8 is FIXED here. The third argument is still null, and it still becomes
+            // the TransactionEvaluator as well as the TransactionProcessor; what changed is that an
+            // evaluator is now installed explicitly when one is supplied, so the null no longer decides
+            // whether the transaction is priced. TransactionEvaluator has one method and cannot submit,
+            // so the no-submit property is unchanged. Mirrors 5b439da on the sibling builder.
+            QuickTxBuilder.TxContext context =
+                    new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null)
                     .compose(tx)
                     .feePayer(request.changeAddress())
                     .collateralPayer(request.changeAddress())
                     .validFrom(request.validFromSlot())
                     .validTo(request.validToSlot())
                     .mergeOutputs(false)
-                    // No evaluator here: the redeemers keep placeholder ex-units and the offline rig
-                    // prices them itself. Nothing must be fetched — the rig hands every script in.
-                    // This is the fixture supplying what production would have to earn: see above.
-                    .ignoreScriptCostEvaluationError(true)
-                    .withScriptSupplier(scriptHash -> Optional.empty())
-                    .build();
+                    // With an evaluator, a failed evaluation must STOP the build. The library default
+                    // (true) turns it into a log.warn and hands back a transaction whose redeemers
+                    // still carry placeholders — 10000 mem and 10000-or-1000 steps against real costs
+                    // two to five orders of magnitude larger, accepted by the mempool and failed in
+                    // phase 2 with the collateral forfeit. Without an evaluator the flag stays true,
+                    // because there is nothing to evaluate with and the offline rig prices it itself.
+                    .ignoreScriptCostEvaluationError(scriptCostEvaluator == null)
+                    .withScriptSupplier(scriptHash -> Optional.empty());
+            if (scriptCostEvaluator != null) {
+                context = context.withTxEvaluator(scriptCostEvaluator);
+            }
+            return context.build();
         } catch (Exception e) {
             throw new IllegalStateException("cannot build the pay-in-advance-and-compound transaction", e);
         }

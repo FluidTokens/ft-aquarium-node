@@ -1,7 +1,10 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
+import com.bloxbean.cardano.client.api.model.Result;
+import com.bloxbean.cardano.client.plutus.spec.ExUnits;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil;
 import com.bloxbean.cardano.client.plutus.blueprint.model.PlutusVersion;
@@ -785,5 +788,105 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
         pm.setData(ConstrPlutusData.of(0,
                 BigIntPlutusData.of(lenderManagerWithdrawRedeemerIndex),
                 BigIntPlutusData.of(lenderManagerWithdrawRedeemerIndex)));
+    }
+
+    // ======================================================================================
+    // T-069 — the evaluator reaches the built transaction (CCL trap 8)
+    // ======================================================================================
+
+    /**
+     * A stub that costs every redeemer with a value derived from its own position, so the numbers on
+     * the finished body can only have come from here. Deliberately NOT the real Aiken evaluator: this
+     * test is about whether an evaluator's output reaches the artefact, not about what the validators
+     * cost — and the real one cannot run against these fixtures while they pin a superseded deployment.
+     */
+    private static final class PositionalStubEvaluator implements TransactionEvaluator {
+
+        private int calls;
+
+        @Override
+        public Result<List<EvaluationResult>> evaluateTx(byte[] cbor, java.util.Set<Utxo> inputUtxos) {
+            calls++;
+            List<EvaluationResult> results = new ArrayList<>();
+            try {
+                for (Redeemer redeemer : Transaction.deserialize(cbor).getWitnessSet().getRedeemers()) {
+                    int index = redeemer.getIndex().intValue();
+                    results.add(EvaluationResult.builder()
+                            .redeemerTag(redeemer.getTag())
+                            .index(index)
+                            .exUnits(ExUnits.builder()
+                                    .mem(BigInteger.valueOf(7_000_000L + index))
+                                    .steps(BigInteger.valueOf(3_000_000_000L + index))
+                                    .build())
+                            .build());
+                }
+            } catch (Exception e) {
+                throw new AssertionError("the builder handed the evaluator undeserialisable bytes", e);
+            }
+            return Result.success("ok").withValue(results);
+        }
+    }
+
+    /** cardano-client-lib's placeholders: 10000 mem, and 10000 or 1000 steps by redeemer tag. */
+    private static boolean isPlaceholder(Redeemer redeemer) {
+        BigInteger mem = redeemer.getExUnits().getMem();
+        BigInteger steps = redeemer.getExUnits().getSteps();
+        return mem.equals(BigInteger.valueOf(10_000L))
+                && (steps.equals(BigInteger.valueOf(10_000L)) || steps.equals(BigInteger.valueOf(1_000L)));
+    }
+
+    /**
+     * T-069. The measured ex-units reach the FINISHED, RE-DESERIALISED transaction.
+     *
+     * <p>Read off the bytes, never off {@code EvaluationResult}: a suite of 307 tests once missed this
+     * exact defect because every ex-units assertion in it read the evaluator's report, which is correct
+     * whether or not the builder ever applied it. The report is the rig's; the transaction is what gets
+     * submitted.
+     */
+    @Test
+    void anEvaluatorsMeasuredExUnitsReachTheBuiltTransaction() throws Exception {
+        Fixture fixture = fixture();
+        PositionalStubEvaluator evaluator = new PositionalStubEvaluator();
+
+        Transaction built = new LiquidatePayInAdvanceAndCompoundTransactionBuilder(
+                REGISTRY, LoanFixtures.NETWORK, LoanFixtures.utxoSupplier(universe(fixture)),
+                EvalFixtures.protocolParams(), evaluator)
+                .build(fixture.request());
+
+        assertTrue(evaluator.calls > 0, "the evaluator was never consulted — trap 8 is back");
+
+        Transaction reread = Transaction.deserialize(built.serialize());
+        List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
+        assertFalse(redeemers.isEmpty(), "a compound liquidation has redeemers");
+        for (Redeemer redeemer : redeemers) {
+            int index = redeemer.getIndex().intValue();
+            assertEquals(BigInteger.valueOf(7_000_000L + index), redeemer.getExUnits().getMem(),
+                    "redeemer " + redeemer.getTag() + "/" + index + " did not take the measured mem");
+            assertEquals(BigInteger.valueOf(3_000_000_000L + index), redeemer.getExUnits().getSteps(),
+                    "redeemer " + redeemer.getTag() + "/" + index + " did not take the measured steps");
+        }
+    }
+
+    /**
+     * The negative control, and the assertion above is worthless without it. With no evaluator the
+     * builder must still produce a transaction, and its redeemers must still carry the placeholders —
+     * which is what makes "the measured values arrived" a discriminating claim rather than a
+     * restatement of whatever the builder happened to emit.
+     */
+    @Test
+    void withoutAnEvaluatorTheRedeemersKeepTheirPlaceholders() throws Exception {
+        Fixture fixture = fixture();
+
+        Transaction built = build(fixture);
+
+        Transaction reread = Transaction.deserialize(built.serialize());
+        List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
+        assertFalse(redeemers.isEmpty(), "a compound liquidation has redeemers");
+        for (Redeemer redeemer : redeemers) {
+            assertTrue(isPlaceholder(redeemer),
+                    "unpriced build: redeemer " + redeemer.getTag() + "/" + redeemer.getIndex()
+                            + " carries " + redeemer.getExUnits().getMem() + "/"
+                            + redeemer.getExUnits().getSteps() + " rather than a placeholder");
+        }
     }
 }
