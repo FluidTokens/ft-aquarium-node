@@ -309,6 +309,9 @@ class ShippedDefaultsTest {
             Map.entry("profit-margin-lovelace", "${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:5000000}"),
             Map.entry("ignore-profit-check", "${AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK:false}"),
             Map.entry("min-profit-absolute-lovelace", "${AQUARIUM_LIQUIDATION_MIN_PROFIT_ABSOLUTE_LOVELACE:0}"),
+            // Must ship at 0. A negative default would make every node loss-tolerant on upgrade,
+            // which is the opposite of "not the default setting but it must be possible".
+            Map.entry("min-expected-profit-lovelace", "${AQUARIUM_LIQUIDATION_MIN_EXPECTED_PROFIT_LOVELACE:0}"),
             Map.entry("check-profitability", "${AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY:true}"),
             Map.entry("decision-log-size", "${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}"),
             Map.entry("quarantine-minutes", "${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}"));

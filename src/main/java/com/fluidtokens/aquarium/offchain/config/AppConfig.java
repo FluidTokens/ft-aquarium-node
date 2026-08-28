@@ -214,6 +214,31 @@ public class AppConfig {
         private BigInteger minProfitAbsoluteLovelace;
 
         /**
+         * The floor the <em>margin-adjusted</em> profit ({@code expectedProfit = floorProfit − margin})
+         * must exceed. Default 0, which is exactly the behaviour this replaced: a liquidation must
+         * clear the operator's margin strictly.
+         *
+         * <p><b>It may be negative, and that is the point.</b> Giovanni, 2026-08-27: <i>"we need to
+         * allow operating at a loss on mainnet. not the default setting but it must be possible. or
+         * the bot is unusable."</i> The intended operator is a team clearing bad debt to protect
+         * their own platform, for whom a liquidation that loses ada is still worth making.
+         *
+         * <p>A negative value here is a number the operator <b>states</b>, not a protection they
+         * <b>switch off</b>. That distinction is the whole design: {@code ignore-profit-check} is a
+         * boolean that disables both gates and hard-fails on mainnet, and a switched-off protection
+         * is indistinguishable from a misconfiguration. A stated negative bound is an intention
+         * nobody reaches by copying a preview config, and it still bounds the loss — a liquidation
+         * worse than the stated figure is refused.
+         *
+         * <p>⚠ To actually run at a loss, BOTH floors must be moved: this one and
+         * {@link #minProfitAbsoluteLovelace}, which tests the margin-excluded number and refuses a
+         * negative {@code floorProfit} independently. That is deliberate, not an oversight — see the
+         * gate comments in {@code LiquidationExecutor}.
+         */
+        @Value("${loans.liquidation.min-expected-profit-lovelace:0}")
+        private BigInteger minExpectedProfitLovelace;
+
+        /**
          * ⛔ TEST-ONLY: bypass BOTH profitability gates and liquidate regardless of loss.
          * <p>
          * Not a third threshold — a boolean that skips the absolute floor
@@ -318,6 +343,24 @@ public class AppConfig {
                                         long quarantineMinutes, boolean checkProfitability,
                                         BigInteger minProfitAbsoluteLovelace,
                                         LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
+            this(mode, enabled, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
+                    profitMarginLovelace, decisionLogSize, quarantineMinutes, checkProfitability,
+                    minProfitAbsoluteLovelace, BigInteger.ZERO, referenceScripts);
+        }
+
+        /**
+         * As above, with the margin-adjusted floor stated too. The only constructor that can express
+         * a loss-tolerant configuration; every other overload pins {@code minExpectedProfitLovelace}
+         * to zero, so a test that does not ask for loss tolerance cannot acquire it by accident.
+         */
+        public LiquidationConfiguration(Mode mode, boolean enabled, long delaySeconds,
+                                        long validityWindowSeconds, long oracleWindowMarginSeconds,
+                                        BigInteger profitMarginLovelace, int decisionLogSize,
+                                        long quarantineMinutes, boolean checkProfitability,
+                                        BigInteger minProfitAbsoluteLovelace,
+                                        BigInteger minExpectedProfitLovelace,
+                                        LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
+            this.minExpectedProfitLovelace = minExpectedProfitLovelace;
             this.mode = mode;
             this.modeName = mode.name();
             this.enabled = enabled;

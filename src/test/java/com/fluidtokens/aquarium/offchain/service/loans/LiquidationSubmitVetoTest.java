@@ -41,6 +41,7 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -908,6 +909,84 @@ class LiquidationSubmitVetoTest {
                 "this zero-equity fixture emits a single output the loan UTxO's own ada covers, so FIX 1 "
                         + "funds nothing (" + minAdaFunded + ") and the loss is fee-driven, not "
                         + "min-ada-driven: " + decision.detail());
+    }
+
+    // ======================================================================================
+    // Operating at a loss on purpose — Giovanni's 2026-08-27 ruling
+    // ======================================================================================
+
+    /**
+     * A loss-tolerant configuration: both floors stated below the loss the fixture makes. The only
+     * constructor that can express this is the one that names {@code minExpectedProfitLovelace}.
+     */
+    private static AppConfig.LiquidationConfiguration lossTolerant(BigInteger absoluteFloor,
+                                                                  BigInteger expectedFloor) {
+        return new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.LIVE, true, 60, 120, 30,
+                BigInteger.ZERO, 200, 30, true, absoluteFloor, expectedFloor, PUBLISHED);
+    }
+
+    /** Far below anything this fixture can lose, so the floor is never the binding constraint. */
+    private static final BigInteger TOLERATED_LOSS = BigInteger.valueOf(-50_000_000L);
+
+    /**
+     * The shipped default still refuses a loss. This is the control for the two tests below: without
+     * it, "a negative floor lets a loss through" would be equally consistent with the gate having been
+     * removed altogether.
+     */
+    @Test
+    void theShippedFloorsStillRefuseALossMakingLiquidation() {
+        Run run = new Rig()
+                .scenario(lossMakingTokenScenario())
+                .oracle(new FakeOracleClient(List.of(collateralOracle())))
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                        BigInteger.ZERO, PUBLISHED))
+                .run();
+
+        vetoed(run, LiquidationExecutor.SubmitVeto.NOT_PROFITABLE,
+                LiquidationDecision.Outcome.UNPROFITABLE);
+    }
+
+    /**
+     * Both floors stated negative: the same loss is no longer refused as unprofitable.
+     *
+     * <p>The assertion is that {@code NOT_PROFITABLE} is gone, not that the transaction submits — the
+     * rest of the veto chain is unchanged and is not what this ruling touched. Asserting a submission
+     * here would make the test fail for reasons that have nothing to do with the floors.
+     */
+    @Test
+    void bothFloorsStatedNegativeLetTheSameLossThrough() {
+        Run run = new Rig()
+                .scenario(lossMakingTokenScenario())
+                .oracle(new FakeOracleClient(List.of(collateralOracle())))
+                .configuration(lossTolerant(TOLERATED_LOSS, TOLERATED_LOSS))
+                .run();
+
+        LiquidationDecision decision = run.onlyDecision();
+        assertNotEquals(LiquidationExecutor.SubmitVeto.NOT_PROFITABLE.name(), decision.submitVeto(),
+                "both floors are stated below this fixture's loss, so profitability must no longer be "
+                        + "the veto: " + decision.detail());
+    }
+
+    /**
+     * Moving only the margin-adjusted floor changes nothing, because the absolute floor tests a
+     * different number and refuses independently.
+     *
+     * <p>This is not an incidental case. {@code LiquidationExecutor.announceLossTolerance()} tells an
+     * operator at boot that <b>both</b> floors must be moved, and that warning is a claim about
+     * behaviour. If this test ever goes green the log is lying, which is worse than the log being
+     * absent.
+     */
+    @Test
+    void movingOnlyTheMarginAdjustedFloorStillRefusesTheLoss() {
+        Run run = new Rig()
+                .scenario(lossMakingTokenScenario())
+                .oracle(new FakeOracleClient(List.of(collateralOracle())))
+                .configuration(lossTolerant(BigInteger.ZERO, TOLERATED_LOSS))
+                .run();
+
+        vetoed(run, LiquidationExecutor.SubmitVeto.NOT_PROFITABLE,
+                LiquidationDecision.Outcome.UNPROFITABLE);
     }
 
     /**

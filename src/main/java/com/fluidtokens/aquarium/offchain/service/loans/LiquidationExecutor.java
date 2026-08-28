@@ -340,11 +340,58 @@ public class LiquidationExecutor {
                 configuration.getValidityWindowSeconds() + VALID_FROM_BACKDATE_MILLIS / 1000L,
                 configuration.getOracleWindowMarginSeconds());
         log.info("LIQUIDATION ECONOMICS profit-margin={} lovelace; min-profit-absolute={} lovelace; "
-                        + "check-profitability={}; ignore-profit-check={}",
+                        + "min-expected-profit={} lovelace; check-profitability={}; "
+                        + "ignore-profit-check={}",
                 configuration.getProfitMarginLovelace(),
                 configuration.getMinProfitAbsoluteLovelace(),
+                configuration.getMinExpectedProfitLovelace(),
                 configuration.isCheckProfitability(),
                 configuration.isIgnoreProfitCheck());
+        announceLossTolerance();
+    }
+
+    /**
+     * The startup guardrail for a loss-tolerant configuration, which Giovanni asked for by name when
+     * authorising it: <i>"feel free to implement guardrails at startup time like printing logs etc."</i>
+     *
+     * <p>It states what the setting MEANS rather than echoing what it says. An operator who reads
+     * {@code min-expected-profit-lovelace=-5000000} in a config dump has to work out that the bot will
+     * now spend their ada to move someone else's collateral; an operator who reads this line does not.
+     *
+     * <p>Deliberately NOT a refusal on mainnet. That is the whole ruling — the capability has to exist
+     * there or the bot is unusable for the operator it is meant for. The two {@code guardMainnet*}
+     * hard failures are untouched and still cover the cases that are a misconfiguration rather than an
+     * intention.
+     */
+    private void announceLossTolerance() {
+        boolean expectedFloorNegative = configuration.getMinExpectedProfitLovelace().signum() < 0;
+        boolean absoluteFloorNegative = configuration.getMinProfitAbsoluteLovelace().signum() < 0;
+        if (!expectedFloorNegative && !absoluteFloorNegative) {
+            return;
+        }
+        // Both floors must be negative for a loss to actually get through. Saying which one is set
+        // turns "why is it still refusing" into a one-line answer instead of an investigation.
+        if (expectedFloorNegative && absoluteFloorNegative) {
+            log.warn("LIQUIDATION WILL OPERATE AT A LOSS. Both profit floors are negative, so this bot "
+                            + "will spend up to {} lovelace of its own ada, per liquidation, to move a "
+                            + "borrower's collateral. Losses worse than that are still refused. This is "
+                            + "a deliberate setting and it is not the shipped default.",
+                    configuration.getMinExpectedProfitLovelace().abs());
+        } else if (expectedFloorNegative) {
+            log.warn("LIQUIDATION loss tolerance is set on the margin-adjusted floor ({} lovelace) but "
+                            + "min-profit-absolute-lovelace is still {}. NO LIQUIDATION WILL RUN AT A "
+                            + "LOSS: the absolute floor refuses a negative floorProfit independently. "
+                            + "Both floors must be moved for the intended effect.",
+                    configuration.getMinExpectedProfitLovelace(),
+                    configuration.getMinProfitAbsoluteLovelace());
+        } else {
+            log.warn("LIQUIDATION loss tolerance is set on the absolute floor ({} lovelace) but "
+                            + "min-expected-profit-lovelace is still {}. NO LIQUIDATION WILL RUN AT A "
+                            + "LOSS: the margin-adjusted gate refuses anything that does not clear the "
+                            + "margin. Both floors must be moved for the intended effect.",
+                    configuration.getMinProfitAbsoluteLovelace(),
+                    configuration.getMinExpectedProfitLovelace());
+        }
     }
 
     /**
@@ -1033,10 +1080,23 @@ public class LiquidationExecutor {
         //     Liquidate mode (SPEC S8): "percent of the principal advanced" has no advanced principal
         //     to apply to until a fronting mode (E1) exists. Left as a marked hook, wired then.
         //
-        // (c) The margin lever, exactly where it was: strictly positive over the operator's margin.
-        //     Breaking even is not a reason to move someone's collateral. Kept separate from the floor
-        //     so it stays an operator preference, not a defeater of the floor.
-        if (!configuration.isIgnoreProfitCheck() && expectedProfit.signum() <= 0) {
+        // (c) The margin lever. Until 2026-08-27 this was a hardcoded `expectedProfit > 0` and the
+        //     comment said "breaking even is not a reason to move someone's collateral". That is still
+        //     the DEFAULT — min-expected-profit-lovelace ships at 0, so the comparison below is exactly
+        //     the old one — but it is no longer the only possibility.
+        //
+        //     ⇒ Giovanni, 2026-08-27: "we need to allow operating at a loss on mainnet. not the
+        //     default setting but it must be possible. or the bot is unusable." A team clearing bad
+        //     debt to protect their own platform is the intended operator, and the hardcoded zero made
+        //     that impossible by construction on mainnet: ignore-profit-check hard-fails there, a
+        //     negative margin hard-fails there, and check-profitability=false does not reach this gate.
+        //
+        //     A negative floor here is a number the operator STATES, not a protection they SWITCH OFF.
+        //     The loss stays bounded — a liquidation worse than the stated figure is still refused —
+        //     which is why this is a floor and not another boolean. Both guardMainnet* refusals are
+        //     untouched, deliberately: this adds an expressible intention rather than relaxing a guard.
+        if (!configuration.isIgnoreProfitCheck()
+                && expectedProfit.compareTo(configuration.getMinExpectedProfitLovelace()) <= 0) {
             return new Verdict(LiquidationDecision.Outcome.UNPROFITABLE, SubmitVeto.NOT_PROFITABLE,
                     detail);
         }
@@ -1045,7 +1105,7 @@ public class LiquidationExecutor {
         // operator has about a bot running with its loss protection off.
         if (configuration.isIgnoreProfitCheck()
                 && (floorProfit.compareTo(configuration.getMinProfitAbsoluteLovelace()) < 0
-                    || expectedProfit.signum() <= 0)) {
+                    || expectedProfit.compareTo(configuration.getMinExpectedProfitLovelace()) <= 0)) {
             log.warn("⛔ ignore-profit-check BYPASSED the profit gates for {}: {} — this liquidation "
                     + "would otherwise have been refused as unprofitable",
                     assessment.loan().utxoRef(), detail);

@@ -149,6 +149,22 @@ loans:
     # DELIBERATE statement that mark-to-oracle economics are accepted for these liquidations, not a
     # tuning knob. Default 0 is unchanged.
     min-profit-absolute-lovelace: ${AQUARIUM_LIQUIDATION_MIN_PROFIT_ABSOLUTE_LOVELACE:0}
+    # THE MARGIN-ADJUSTED FLOOR, gate (c). expectedProfit = floorProfit - profit-margin-lovelace must
+    # exceed this. Default 0, which is exactly the hardcoded `expectedProfit > 0` it replaced.
+    #
+    # It MAY BE NEGATIVE, and that is why it exists. Giovanni, 2026-08-27: "we need to allow operating
+    # at a loss on mainnet. not the default setting but it must be possible. or the bot is unusable."
+    # The intended operator is a team clearing bad debt to protect their own platform, for whom a
+    # liquidation that loses ada is still worth making.
+    #
+    # A negative value is a number the operator STATES, not a protection they SWITCH OFF -- unlike
+    # ignore-profit-check, which is a boolean, disables both gates and hard-fails on mainnet. The loss
+    # stays bounded: a liquidation worse than this figure is still refused.
+    #
+    # To actually run at a loss BOTH floors must be moved, this one and min-profit-absolute-lovelace
+    # above, because they test different numbers. Setting only one leaves the bot refusing exactly as
+    # before; LiquidationExecutor says so by name at boot rather than leaving it to be discovered.
+    min-expected-profit-lovelace: ${AQUARIUM_LIQUIDATION_MIN_EXPECTED_PROFIT_LOVELACE:0}
     # Whether the absolute floor above is applied at all. Turning it off removes gate (a) entirely
     # and leaves only the margin lever.
     check-profitability: ${AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY:true}
