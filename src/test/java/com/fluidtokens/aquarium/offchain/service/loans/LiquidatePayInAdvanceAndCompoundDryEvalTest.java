@@ -868,6 +868,62 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
     }
 
     /**
+     * T-075 SPIKE — is a compound liquidation approvable under the current gate?
+     *
+     * <p><b>Falsifying result, fixed before this was written:</b> if the bot's outlay is zero, it
+     * funds nothing, and the suspicion dies on the spot.
+     *
+     * <p><b>Rewritten after review (A-1).</b> The first design measured {@code poolOutput − poolInput}
+     * and called it the bot's cost. That is the POOL'S GAIN, and the two are equal only if the bot is
+     * the sole source of the increase — which is the load-bearing claim and was the one thing the
+     * method did not measure. This traces the BOT'S OWN value instead: what its wallet input carried,
+     * minus what came back to its address.
+     *
+     * <p><b>Reports a THRESHOLD, not a floor (A-3).</b> {@code expectedFee} cannot be read off the
+     * artefact, and computing it from the executor's fee model would contaminate a third of the
+     * answer. Since {@code floor ≥ 0 ⟺ expectedFee ≥ txFee + outlay}, both right-hand terms ARE
+     * measurable, so the spike reports the break-even threshold and leaves the fee question beside
+     * the measurement rather than inside it.
+     *
+     * <p>⚠ <b>Known contamination, stated rather than hidden (A-2):</b> {@code txFee} follows ex-units,
+     * ex-units follow the evaluator, and this body is built by the TEST path. A fee measured under the
+     * rig is not the fee production pays, and if understated the threshold looks BETTER than reality.
+     * Re-measure after the promotion wires a real evaluator.
+     */
+    @Test
+    void t075IsACompoundLiquidationApprovable() throws Exception {
+        Fixture fixture = fixture();
+        Transaction built = Transaction.deserialize(build(fixture).serialize());
+        String bot = LoanFixtures.botAddress();
+
+        BigInteger botIn = WALLET_UTXO.getAmount().stream()
+                .filter(a -> "lovelace".equals(a.getUnit()))
+                .map(com.bloxbean.cardano.client.api.model.Amount::getQuantity)
+                .findFirst().orElse(BigInteger.ZERO);
+        BigInteger botBack = built.getBody().getOutputs().stream()
+                .filter(o -> bot.equals(o.getAddress()))
+                .map(o -> o.getValue().getCoin())
+                .reduce(BigInteger.ZERO, BigInteger::add);
+        BigInteger outlay = botIn.subtract(botBack);
+
+        BigInteger txFee = built.getBody().getFee();
+        BigInteger threshold = txFee.add(outlay);
+
+        // What the bot could earn at its ceiling, for scale only — NOT an input to the threshold.
+        BigInteger feePerMille = fixture.bond().datum().liquidationFeePerMille();
+
+        log.info("T-075 bot input={} returned={} OUTLAY={}", botIn, botBack, outlay);
+        log.info("T-075 txFee={} (rig evaluator — see A-2) feePerMille={}", txFee, feePerMille);
+        log.info("T-075 THRESHOLD: approvable iff expectedFee >= {} lovelace", threshold);
+        log.info("T-075 outlay is {} => {}", outlay.signum() > 0 ? "POSITIVE" : "zero or negative",
+                outlay.signum() > 0
+                        ? "the bot funds this liquidation; the threshold is what it must earn back"
+                        : "REFUTED — the bot funds nothing, so the suspicion does not hold");
+
+        assertTrue(botIn.signum() > 0, "the spike must see the bot's own input to measure its outlay");
+    }
+
+    /**
      * The negative control, and the assertion above is worthless without it. With no evaluator the
      * builder must still produce a transaction, and its redeemers must still carry the placeholders —
      * which is what makes "the measured values arrived" a discriminating claim rather than a
