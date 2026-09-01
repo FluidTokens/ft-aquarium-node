@@ -1233,3 +1233,129 @@ liquidation's UTxO was clean (`lovelace 3,000,000 · collateral 100,000,000 · l
 reachability argument is that a script address accepts any payment, which is a property of Cardano
 rather than of these validators. **It has not been demonstrated on chain, and doing so deliberately
 against FluidTokens' preview deployment would be a hostile act, not a test.**
+
+---
+
+## 19. ⛔ A FIFTH DEPLOYMENT IS LIVE, the config policy id DID NOT CHANGE, and the bot is blind to every loan (measured 2026-09-01)
+
+**Trigger.** Giovanni pointed at preview tx
+`9088270f2d941354cb52594a33a6aba0dc29eb34a2d85fa6a852256d6ceefa59` (block 4,622,348,
+2026-09-01 11:22:05Z) as "a loan w/ compound I think". Decoding it produced three findings, of
+which the third outranks the request that prompted it.
+
+### 19.1 The transaction CLOSED a loan; it did not create one
+
+`/assets/{loanNft}/history` for
+`2f1aa941…172e2048fcc960c6ee63c11fb4f231eac6e197a7c15a2585c3205de35e`:
+
+```
+minted  1281429c1ab09ef78894b3f67f47dcb7c80cb2f9a60128e84e143639c395f461
+burned  9088270f2d941354cb52594a33a6aba0dc29eb34a2d85fa6a852256d6ceefa59   ← the named tx
+quantity 0 · held by nobody
+```
+
+The spent input at `31e0dc1d…` carried the loan NFT, 3,000,000 lovelace and 200,000,000 tFLDT of
+collateral; the collateral returned to the borrower and the loan NFT was burned. **There is no loan
+at these coordinates to liquidate, and there never will be again.**
+
+**Under the live loan policy `2f1aa941…`, nine loan NFTs have ever been minted and all nine are
+burned. ZERO live loans exist on preview.** So no test can be pinned to a live loan today — not for
+want of a builder, but for want of a loan.
+
+### 19.2 It was a PERPETUAL loan, and "compound" is a different axis entirely
+
+The spent loan's datum decodes to `repaidInstallments = 0`, `totalInstallments = 0`,
+`principalAmount = 40,000,000`, `interestRate = 400`, `principalAsset = ADA`, and
+`RepaymentMode = PerpetualLoan(28, 5)` (constructor alternative **2**). It is **not** a
+compound-interest loan and **not** an installment loan.
+
+**The word that caused the confusion is `installment_repayment`, and it is not on the loan.** It is
+an ASCII tag inside the datum of output #0, which sits at `de8f8186…` — **config field 15**, a script
+this repo had never recorded. That output is a *scheduled action*, and the tag names the action, not
+the loan's repayment mode.
+
+> **⚑ Terminology, because two different things are called "compound" and only one of them is a loan
+> property.** In lending v4, *compound* names a **liquidation action that recycles proceeds into a
+> lending pool** (`lm_compound_action`, `lm_liquidate_pay_in_advance_and_compound_action`,
+> `lm_liquidate_convert_and_compound_action`). It is **not** compound interest. No `RepaymentMode`
+> constructor expresses compound interest at all — the three are `InterestOnRemainingPrincipal`,
+> `PrincipalAndInterestOnInstallments` and `PerpetualLoan` (§5). **A request to "liquidate the
+> compound loan" is therefore two separate questions**, and the compound one is already answered:
+> T-075 established algebraically that **no compound candidate is approvable at any loan size for any
+> valid fee rate**, and `LiquidateConvertAndCompound` is a hard-`False` stub (§18 note, T-077).
+> `src/main` contains **no compound builder at all**.
+
+### 19.3 ⛔ THE FINDING THAT OUTRANKS THE REQUEST: the runtime derivation no longer matches the chain
+
+The config UTxO at the **pinned** coordinates (`loans.config.policy-id = d46f626f…`,
+`ref-utxo-tx-hash = 8dd38e97…`) is **current** — its datum lists the hashes the 09-01 transaction
+actually used. What no longer matches is **our derivation**. Runtime `derivedHashes()` versus the
+live config datum, same config policy id, same ref UTxO:
+
+| field | derived by `LoansContractRegistry` | live on chain | |
+|---|---|---|---|
+| `loanPolicyId` | `4f84c6e3f4a7812d…` | `2f1aa941f437e351…` | ✗ |
+| `loanSpendScriptHash` | `86356f7e64dc284e…` | `31e0dc1d75076e4f…` | ✗ |
+| `poolPolicyId` | `65a0bc5e6e5152fb…` | `a33aee4034165f17…` | ✗ |
+| `poolSpendScriptHash` | `c0be04e50016c124…` | `bf8c4378bab7de15…` | ✗ |
+| `requestPolicyId` | `b5a224f1c7bdec3e…` | `39bef32eb5f696f6…` | ✗ |
+| `requestSpendScriptHash` | `f02a3931f5b6a5f3…` | `978934c46206696e…` | ✗ |
+| `borrowerBondPolicyId` | `eadc69a5d2d1357a…` | `eadc69a5d2d1357a…` | ✓ |
+| `lenderBondPolicyId` | `bcd713bb7858d4b0…` | `bcd713bb7858d4b0…` | ✓ |
+
+**19 of the config datum's 23 credential fields differ from `src/test/resources/loans-v4/preview-config-datum.hex`.**
+Only the two bond policies survive, and the reason is diagnostic: they are derived with an integer
+index (`bond.bond` applied to `i(1)`), not from the vendored compiled code, so **they are the two
+that a validator rebuild cannot move.** Everything derived from `loans-v4.plutus.json` moved;
+everything not derived from it did not.
+
+**⇒ THE VENDORED `loans-v4.plutus.json` IS STALE. The validators were rebuilt upstream and the config
+datum was updated IN PLACE, at the same config NFT, at the same ref UTxO.**
+
+### 19.4 Why nothing detected it, and how this is WORSE than the §12 redeploy
+
+§12 established that `LoansConfigVerifier` cannot detect a redeploy because a redeploy **mints new
+config NFTs under a new policy id** while the old ones linger. **This deployment did not do that.**
+The policy id and the ref UTxO are unchanged, so the verifier is not merely blind here — it is
+looking at *the correct, current* config UTxO and **passing honestly**. The mismatch is not between
+pinned and live coordinates; it is between the live config's **contents** and what our vendored
+artefact **derives**. No amount of coordinate-checking finds it.
+
+The consequence runs through the write-time filter, exactly as `officina:yaci-store-index-scoping`
+describes: `indexedPaymentCredentials()` (`LoansContractRegistry:309`) includes
+`loanSpendScriptHash`, which is the **stale** `86356f7e…`. Live loans sit at `31e0dc1d…`.
+**`TankUtxoStorage` therefore discards every real loan UTxO at write time, leaving no trace one was
+ever offered.** A node on this branch boots clean, verifies clean, derives 26 self-consistent hashes,
+and reports zero candidates — **and today zero candidates also happens to be the truth (19.1), which
+is precisely what would keep this hidden.**
+
+> **⚑ THE GENERAL LESSON, and it is the same shape as the 08-31 `db-password` finding one layer up:
+> the check that passes is not the check you need.** `LoansConfigVerifier` asks "is the deployment I
+> am pinned to still intact?" and the answer is yes. **Nobody was asking "do the hashes I DERIVE still
+> equal the hashes the config PUBLISHES?"** — and the config datum has been publishing the answer, in
+> a field we read past, the whole time. **The two numbers were never compared, so agreement was never
+> evidence.**
+
+### 19.5 It has been observable in this repo since 2026-08-26
+
+§16's witness-set table already records `2f1aa941…` as `loan.loan` and `31e0dc1d…` as `loanSpend`,
+read off an accepted transaction on 2026-08-26 — **while `LoansContractDerivationTest` asserted
+`4f84c6e3…` and `86356f7e…` for the same two fields.** The contradiction has been sitting in the
+repo, in two documents, for six days. It was invisible because the derivation suite was already red
+and the redness was attributed to fixture debt.
+
+**⇒ A RED SUITE IS NOT A BACKLOG, IT IS A DISABLED ALARM.** The 38 failures were being read as
+"fixtures need regenerating" — a chore. At least four of them were the chain telling us the
+deployment had moved. *A failing test that is expected to fail conveys nothing when it starts
+failing for a new reason.*
+
+### 19.6 What this does NOT establish
+
+- **Not** that the upstream source changed semantically. Only that the compiled artefact differs.
+  Which upstream commit the live validators correspond to is **unresolved** — `e0b818e` is the sha
+  §16 proved for the *fourth* deployment and it must be re-derived, not assumed, for this one.
+- **Not** that re-vendoring is safe or sufficient. `loans-v4.plutus.json` must never be rebuilt
+  locally (CLAUDE.md); the replacement must be fetched byte-identically from the upstream commit that
+  the live hashes actually derive from, and that commit must be *identified by derivation*, not by
+  tag or date.
+- **Not** a mainnet statement. Lending is `enabled: false` on mainnet.
