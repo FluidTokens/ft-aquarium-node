@@ -175,6 +175,29 @@ long-running node.** Watch and adjust; I would not treat them as tuned.
 6. **Postgres must be reachable before the app starts.** Compose gates on a `pg_isready`
    healthcheck; the k8s equivalent matters because Flyway runs at startup.
 7. **`AQUARIUM_X_SUBMIT` is not an app setting** — ignore it (§3).
+8. **A Secret key the pod's volume names is a hard *startup* dependency, and the `optional:` in
+   `optional:configtree:` does not soften it.** That `optional:` is a **Spring** fallback: it only
+   ever runs once the process does. If the Secret is missing a key the volume projects, the
+   **kubelet** fails the *whole volume* and the container never starts —
+   `MountVolume.SetUp failed for volume "secrets": references non-existent secret key: db-password`,
+   and the pod sits in `ContainerCreating` indefinitely. `db-password` is the sharp case precisely
+   because it must be projected **twice** (§9.2): one absent key takes out both properties and the
+   pod with them. Project each key with `optional: true` only if the application can genuinely boot
+   without it — this one cannot, so the correct answer is to make the key's *source* durable (item 9),
+   not to soften the mount.
+9. **Whoever creates the Secret must create it whole — never hand-add a key to a Secret a controller
+   owns.** With sealed-secrets (the mechanism in use), the `Secret` carries `ownerReferences` back to
+   its `SealedSecret` and is **reconciled to match it**. A key added out of band with `kubectl` works
+   immediately, survives restarts, and is then silently removed at the controller's next full
+   reconcile. **The failure surfaces days later, disconnected in time from the act that caused it**,
+   and it surfaces as an *unstartable* pod rather than a failing one — a running pod keeps running on
+   the tmpfs copy it mounted before the key vanished, so the damage is invisible until the next
+   recreation. Every key the volume names belongs in the sealed source.
+
+> **Measured, `cardano-pv`, 2026-08-31 → 09-01:** `db-password` was hand-added to a controller-owned
+> Secret on 08-25 and reconciled away on 08-31. 765 `FailedMount` events over 25 hours, against a pod
+> that stayed `Running 1/1` and fully functional the entire time on a 5-day-old tmpfs mount. Nothing
+> was degraded; the pod was simply no longer *recreatable*. Items 8 and 9 are the two halves of that.
 
 ---
 
@@ -215,6 +238,11 @@ to chase a redeploy would be the wrong shape.
 
 *(Note Flyway has its own url/user/password properties, separate from the datasource. `DB_PASSWORD`
 feeds both.)*
+
+> **Consequence for a file-based mount, and it has already bitten once:** feeding both properties
+> from one key means the volume projects `db-password` **twice**, to `spring.datasource.password`
+> and `spring.flyway.password`. That doubles the blast radius of the key going missing without
+> doubling anything that would make it noticed — see §8 items 8 and 9.
 
 **File-based secrets work today with no application change**, via Spring Boot **config trees**.
 Mount the Secret at a directory and set:
