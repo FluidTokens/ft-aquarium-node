@@ -1845,3 +1845,59 @@ can never succeed as built.
 
 ⚠ And per CCL trap 9a, the *publishing* transactions are themselves under-fee'd by cardano-client-lib
 and need the `postBalanceTx` top-up — a known trap on the way in, not a surprise.
+
+### 22.10 PUBLICATION RECORD — four compound validators, preview, 2026-09-02
+
+Authorised first-hand by Giovanni ("publish the 4 reference scripts, go"). Chain writes from this
+session, funded by the bot's own preview wallet.
+
+| validator | script hash | coordinate | locked |
+|---|---|---|---:|
+| `lm_compound_action` | `dd4709091734af2d…` | `9e915e60cf643362c3d2b52f7117360385388611e6ec20c502f95bf0936e24fc#0` | 23,015,400 |
+| `pool_compound_action` | `33128ca352b5472f…` | `2ef25730a349944e001d5929b4e0c7967358e920ee089c0088ec3bcf14358b3b#0` | 17,110,700 |
+| `asset_manager` | `19d8576594820b4c…` | `d779005e19f0526bf17b23bc9a36d4a144cc796da455e60f2f2b5f723e49cd98#0` | 15,072,070 |
+| `pool_manager` | `45ce890c9bcf70f6…` | `8eaffac0ae8204d9d7828443f9b1b676e44e495f8fb11ef303d150fbc18bbd7b#0` | 11,330,990 |
+
+**Total locked 66,529,160 lovelace (66.53 ADA); fees ~1.58 ADA.** All four verified present at the
+destination after publication, hashes matched against what the live config datums publish
+(main config fields 7/25/27, LM config field 3) **before** anything was built — a wrong publication
+is ada locked behind a coordinate no verifier will ever accept.
+
+**Destination `addr_test1wzv5kdz…` — an enterprise SCRIPT address** (`UnspendableDestination`), the
+same one the liquidation publications used. **Coin selection cannot spend it because there is no key
+to sign with**, so CCL trap 9b is closed structurally rather than by a guard someone must remember.
+
+**Four and not eleven**, because margin costs money: four buys 5,970 bytes for 66.53 ADA; eleven
+would buy 13,799 for ~105. Two would have fit at 324 bytes — about nine extra transaction inputs,
+which a thin wallet produces routinely.
+
+### 22.11 ⚠ "Confirmed" is not "the UTxO index has caught up"
+
+Two of the four publications first failed with
+`ConwayMempoolFailure "All inputs are spent. Transaction has probably already been included"`.
+
+The cause is a lag between two Blockfrost endpoints. The first attempt slept a flat 45 s between
+publications; the second replaced that with **polling `getTransaction` until the submission
+confirmed** — and *still* failed, because `getTransaction` reports a transaction before
+`getUtxos(address)` stops returning the input it consumed. **Confirmation and index freshness are
+different facts, and the stricter-looking check was not the sufficient one.**
+
+**⇒ The fix that actually worked is idempotence, not waiting.** The runner now reads the destination
+first and skips any script already published, so a re-run cannot double-publish — which matters
+because a duplicate publication is a second min-ada locked behind a coordinate nothing would flag.
+*A retry-safe operation beats a better-timed one: the first tries to avoid the race, the second
+survives it.*
+
+### 22.12 Measured after publication — the size problem is closed
+
+| | bytes | fee |
+|---|---:|---:|
+| all eleven inline | 24,912 | 1,473,195 |
+| four referenced | **10,414** | **843,852** |
+| `max_tx_size` | 16,384 | |
+| **margin** | **5,970** | saving 629,343 |
+
+Measured on a **built body**, not arithmetic — the gap §22.9 flagged is closed. The build is done
+without an evaluator (size needs none, and the rig still cannot *evaluate* a referenced build per CCL
+trap 13); placeholder ex-units encode slightly smaller than real ones, so this **under**-estimates and
+the margin is conservative rather than optimistic. Arithmetic had predicted 10,426 — within 12 bytes.

@@ -16,7 +16,6 @@ import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import lombok.extern.slf4j.Slf4j;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;
@@ -97,7 +96,23 @@ class CompoundReferenceScriptTest {
     private record Built(Transaction tx, int size) {
     }
 
+    private static Built buildSizeOnly(List<PlutusScript> referenced) throws Exception {
+        return build(referenced, false);
+    }
+
     private static Built build(List<PlutusScript> referenced) throws Exception {
+        return build(referenced, true);
+    }
+
+    /**
+     * @param evaluate whether to wire an evaluator. SIZE does not need one: with no evaluator the
+     *                 redeemers keep cardano-client-lib's placeholder ex-units, which encode a few
+     *                 bytes SMALLER than real ones — so a size measured this way is a slight
+     *                 UNDER-estimate, and the margin assertions below are correspondingly
+     *                 conservative rather than optimistic. That asymmetry is what makes it a usable
+     *                 measurement while the rig still cannot evaluate a referenced build.
+     */
+    private static Built build(List<PlutusScript> referenced, boolean evaluate) throws Exception {
         List<Utxo> universe = new ArrayList<>(List.of(utxo("escrow"), utxo("bond"), utxo("pool"),
                 utxo("poolManager"), utxo("config"), utxo("lmConfig"), wallet()));
         Map<String, TransactionInput> refs = new LinkedHashMap<>();
@@ -108,9 +123,11 @@ class CompoundReferenceScriptTest {
             refs.put(published.getReferenceScriptHash(),
                     new TransactionInput(published.getTxHash(), published.getOutputIndex()));
         }
-        TransactionEvaluator evaluator = new AikenTransactionEvaluator(
-                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
-                EvalFixtures.scriptSupplier(REGISTRY), SlotConfigs.preview());
+        TransactionEvaluator evaluator = evaluate
+                ? new AikenTransactionEvaluator(LoanFixtures.utxoSupplier(universe),
+                        EvalFixtures.protocolParams(), EvalFixtures.scriptSupplier(REGISTRY),
+                        SlotConfigs.preview())
+                : null;
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), evaluator);
         Transaction tx = builder.build(new CompoundTransactionBuilder.Request(candidate(), refs,
@@ -133,22 +150,15 @@ class CompoundReferenceScriptTest {
      * ⛔ THE FIX, MEASURED. Referencing the four largest validators is what brings the transaction
      * under the limit, and the margin is stated rather than assumed.
      */
-    @Disabled("""
-            ⛔ RIG GAP, not a builder defect — CCL trap 13's two facts, and the offline rig only has one.
-            A reference script resolves when the UTxO PUBLISHES its hash AND the evaluator can obtain
-            the script's BYTES. The synthetic UTxO here carries referenceScriptHash, and
-            EvalFixtures.scriptSupplier holds the bytes, but AikenTransactionEvaluator still fails with
-            a bare 'Error while evaluating script cost' and no cause — the same shape trap 13 records
-            for offline rigs moving a validator from the witness set to a reference input.
-            The BUILDER wiring it exercises is done and compiles; what is missing is a rig that can
-            evaluate a referenced build. Until then the size claim rests on arithmetic
-            (24,912 measured inline, minus 14,596 bytes of the four largest validators) rather than on
-            a built body, and that distinction is exactly why this is disabled rather than deleted.
-            Re-enable with the rig fix, or replace with a live preview submission once published.
-            """)
+    /**
+     * ⛔ THE FIX, MEASURED ON A BUILT BODY — not arithmetic. Built without an evaluator, because SIZE
+     * needs none and the rig still cannot EVALUATE a referenced build (CCL trap 13). Placeholder
+     * ex-units encode slightly smaller than real ones, so this under-estimates and the margin below
+     * is conservative.
+     */
     @Test
     void referencingTheFourLargestBringsItUnderTheLimitWithMargin() throws Exception {
-        Built b = build(List.of(REGISTRY.getLmCompoundActionScript(),
+        Built b = buildSizeOnly(List.of(REGISTRY.getLmCompoundActionScript(),
                 REGISTRY.getPoolCompoundActionScript(), REGISTRY.getAssetManagerScript(),
                 REGISTRY.getPoolManagerScript()));
 
@@ -163,27 +173,15 @@ class CompoundReferenceScriptTest {
     }
 
     /**
-     * ⚠ And exactly one route per validator. A script both witnessed and referenced is
-     * {@code ExtraneousScriptWitnessesUTXOW} — a phase-1 rejection, and the reason the builder
-     * attaches a referenced validator not at all rather than attaching it and deduplicating.
+     * ⚠ Exactly one route per validator. A script both witnessed AND referenced is
+     * {@code ExtraneousScriptWitnessesUTXOW} — phase 1 — which is why the builder attaches a
+     * referenced validator not at all rather than attaching it and deduplicating afterwards.
+     * Built without an evaluator: this inspects the witness set, which needs no ex-units.
      */
-    @Disabled("""
-            ⛔ RIG GAP, not a builder defect — CCL trap 13's two facts, and the offline rig only has one.
-            A reference script resolves when the UTxO PUBLISHES its hash AND the evaluator can obtain
-            the script's BYTES. The synthetic UTxO here carries referenceScriptHash, and
-            EvalFixtures.scriptSupplier holds the bytes, but AikenTransactionEvaluator still fails with
-            a bare 'Error while evaluating script cost' and no cause — the same shape trap 13 records
-            for offline rigs moving a validator from the witness set to a reference input.
-            The BUILDER wiring it exercises is done and compiles; what is missing is a rig that can
-            evaluate a referenced build. Until then the size claim rests on arithmetic
-            (24,912 measured inline, minus 14,596 bytes of the four largest validators) rather than on
-            a built body, and that distinction is exactly why this is disabled rather than deleted.
-            Re-enable with the rig fix, or replace with a live preview submission once published.
-            """)
     @Test
     void aReferencedValidatorIsNotAlsoInTheWitnessSet() throws Exception {
         PlutusScript referenced = REGISTRY.getLmCompoundActionScript();
-        Built b = build(List.of(referenced));
+        Built b = buildSizeOnly(List.of(referenced));
 
         List<PlutusScript> witnessed = b.tx().getWitnessSet().getPlutusV3Scripts()
                 .stream().map(s -> (PlutusScript) s).toList();

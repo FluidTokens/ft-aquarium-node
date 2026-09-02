@@ -85,6 +85,18 @@ loans:
     #
     # Negative on mainnet is a hard startup failure, exactly as the liquidation margin is.
     profit-margin-lovelace: ${AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE:0}
+    # Published reference scripts: a comma-separated list of txHash#index coordinates.
+    #
+    # NOT one named key per validator. The `liquidation.reference-scripts` block above has eight of
+    # those, and a key named for a validator holds a COORDINATE -- nothing checks the two agree. Here
+    # the node reads referenceScriptHash off the chain, so a mislabelled coordinate is not expressible.
+    #
+    # Empty (the default) means every validator travels inline, which is correct and TOO BIG TO
+    # SUBMIT: eleven inline validators build a 24,912-byte transaction against a 16,384 max_tx_size.
+    # Referencing the four largest measures 10,414 bytes, 5,970 of margin (findings section 22.9).
+    #
+    # Deployment-specific, so it is set in the deployment's own values, never defaulted in this image.
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}
 
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}

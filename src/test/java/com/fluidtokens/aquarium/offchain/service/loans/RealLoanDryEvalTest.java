@@ -1204,6 +1204,12 @@ class RealLoanDryEvalTest {
             case LM_LIQUIDATE_ACTION -> REGISTRY.getLmLiquidateActionScript();
             case LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION ->
                     REGISTRY.getLmLiquidateAndPayInAdvanceActionScript();
+            // The compound path's four; this rig publishes only liquidation validators, but the
+            // switch must stay exhaustive or the enum cannot grow.
+            case LM_COMPOUND_ACTION -> REGISTRY.getLmCompoundActionScript();
+            case POOL_COMPOUND_ACTION -> REGISTRY.getPoolCompoundActionScript();
+            case ASSET_MANAGER -> REGISTRY.getAssetManagerScript();
+            case POOL_MANAGER -> REGISTRY.getPoolManagerScript();
         };
     }
 

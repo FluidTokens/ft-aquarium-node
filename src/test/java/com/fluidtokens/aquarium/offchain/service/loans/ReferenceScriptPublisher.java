@@ -86,7 +86,21 @@ public final class ReferenceScriptPublisher {
          * largest script left inline on a convert liquidation. Added 2026-08-25 with the
          * {@code ReferenceScripts} slot that finally lets it be referenced at all.
          */
-        LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION("lm-liquidate-and-pay-in-advance-action");
+        LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION("lm-liquidate-and-pay-in-advance-action"),
+
+        // ---- the COMPOUND path (findings §22.9) ------------------------------------------------
+        // A compound invokes ELEVEN validators, 22,689 bytes of them, in a 24,878-byte transaction
+        // against a 16,384 max_tx_size. Referencing these four — the largest — brings it to ~10,400
+        // with ~5,958 bytes of margin. The remaining seven stay inline: they are small, and each
+        // publication locks min-ada permanently, so buying margin nobody needs is a real cost.
+        /** {@code lm_compound_action} — 5,130 bytes, the largest validator on the compound path. */
+        LM_COMPOUND_ACTION("lm-compound-action"),
+        /** {@code pool_compound_action} — 3,760 bytes. */
+        POOL_COMPOUND_ACTION("pool-compound-action"),
+        /** {@code asset_manager} — 3,287 bytes; the withdraw script that releases the escrow. */
+        ASSET_MANAGER("asset-manager"),
+        /** {@code pool_manager} — 2,419 bytes. */
+        POOL_MANAGER("pool-manager");
 
         private final String configKey;
 
@@ -108,14 +122,19 @@ public final class ReferenceScriptPublisher {
      * than a silently different transaction. The band is deliberately loose (±20%): it is a
      * "same order of magnitude, same script" check, not a pin. The pin is in the test.
      */
-    private static final Map<Validator, Long> ESTIMATED_MIN_ADA_LOVELACE = new EnumMap<>(Map.of(
-            Validator.LOAN, 11_960_000L,
-            Validator.LOAN_SPEND, 5_970_000L,
-            Validator.LENDER_MANAGER, 5_150_000L,
-            Validator.LENDER_MANAGER_SPEND, 5_970_000L,
-            Validator.LOAN_CLAIM_ACTION, 38_310_000L,
-            Validator.LM_LIQUIDATE_ACTION, 19_200_000L,
-            Validator.LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION, 31_300_000L));
+    private static final Map<Validator, Long> ESTIMATED_MIN_ADA_LOVELACE = new EnumMap<>(Map.ofEntries(
+            Map.entry(Validator.LOAN, 11_960_000L),
+            Map.entry(Validator.LOAN_SPEND, 5_970_000L),
+            Map.entry(Validator.LENDER_MANAGER, 5_150_000L),
+            Map.entry(Validator.LENDER_MANAGER_SPEND, 5_970_000L),
+            Map.entry(Validator.LOAN_CLAIM_ACTION, 38_310_000L),
+            Map.entry(Validator.LM_LIQUIDATE_ACTION, 19_200_000L),
+            Map.entry(Validator.LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION, 31_300_000L),
+            // (160 + scriptBodyBytes) x coins_per_utxo_size 4310, measured on preview 2026-09-02.
+            Map.entry(Validator.LM_COMPOUND_ACTION, 22_800_000L),
+            Map.entry(Validator.POOL_COMPOUND_ACTION, 16_900_000L),
+            Map.entry(Validator.ASSET_MANAGER, 14_860_000L),
+            Map.entry(Validator.POOL_MANAGER, 11_120_000L)));
 
     private static final double MIN_ADA_BAND = 0.20d;
 
@@ -332,6 +351,10 @@ public final class ReferenceScriptPublisher {
             case LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION ->
                     registry.getLmLiquidateAndPayInAdvanceActionScript();
             case LM_LIQUIDATE_ACTION -> registry.getLmLiquidateActionScript();
+            case LM_COMPOUND_ACTION -> registry.getLmCompoundActionScript();
+            case POOL_COMPOUND_ACTION -> registry.getPoolCompoundActionScript();
+            case ASSET_MANAGER -> registry.getAssetManagerScript();
+            case POOL_MANAGER -> registry.getPoolManagerScript();
         };
     }
 
@@ -346,6 +369,12 @@ public final class ReferenceScriptPublisher {
             case LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION ->
                     registry.getLmLiquidateAndPayInAdvanceActionScriptHash();
             case LM_LIQUIDATE_ACTION -> registry.getLmLiquidateActionScriptHash();
+            case LM_COMPOUND_ACTION -> registry.getLmCompoundActionScriptHash();
+            case POOL_COMPOUND_ACTION -> registry.getPoolCompoundActionScriptHash();
+            // asset_manager and pool_manager each double as a minting policy and a withdraw script,
+            // so the policy id IS the script hash (the Tier-1 "doubles as" shape).
+            case ASSET_MANAGER -> registry.getAssetManagerWithdrawScriptHash();
+            case POOL_MANAGER -> registry.getPoolManagerPolicyId();
         };
     }
 
