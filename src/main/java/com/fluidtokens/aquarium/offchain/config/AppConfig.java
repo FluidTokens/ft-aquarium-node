@@ -500,4 +500,69 @@ public class AppConfig {
         return ClasspathConversionsFactory.createConverters(networkType);
     }
 
+    /**
+     * The repayment-escrow <b>compound</b> path — {@code lm_compound_action}, which collects a repaid
+     * loan's principal from the asset manager and delivers it into the lender's pool, keeping the
+     * pool owner's stated compounding fee (findings §20).
+     *
+     * <p>Deliberately a separate block from {@link LiquidationConfiguration} rather than more keys on
+     * it. The two actions share a word and almost nothing else: liquidation advances the collateral's
+     * value and is priced against an oracle; compound advances nothing and its entire outlay is the
+     * transaction fee (findings §20.3). Sharing a margin key would let a number reasoned about for one
+     * silently govern the other.
+     */
+    @Component
+    @Getter
+    @NoArgsConstructor
+    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
+    public static class CompoundConfiguration {
+
+        /**
+         * The arming flag. Default {@code false}: the node indexes and assesses compound candidates
+         * but builds nothing until an operator turns this on, exactly as the liquidation path does.
+         */
+        @Value("${loans.compound.enabled:false}")
+        private boolean enabled;
+
+        @Value("${loans.compound.delay-seconds:60}")
+        private long delaySeconds;
+
+        /**
+         * What {@code expectedFee - txFee} must reach for a compound to be built, in lovelace.
+         *
+         * <p><b>Default {@code 0} refuses every net loss</b> while allowing exact break-even. That is
+         * the safe default and it is what makes a zero-fee pool refused out of the box: such a pool
+         * pays nothing, so the net is exactly minus the transaction fee and the floor rejects it.
+         *
+         * <p>⚠ <b>Why the default is 0 here and 1_500_000 on the liquidation path.</b> That margin
+         * demands a premium over cost because a liquidation moves someone else's collateral against an
+         * oracle price and carries real risk. A compound moves already-repaid principal into the pool
+         * that is owed it; the bot advances nothing and risks only its own fee, so requiring a premium
+         * would refuse sound work for no reason. The floors differ because the actions differ.
+         *
+         * <p><b>A negative value is a number the operator STATES, not a protection they switch off</b>
+         * — the same distinction the liquidation margin draws, and the reason there is no
+         * {@code ignore-profit-check} twin here. Giovanni's ruling, 2026-09-02: <i>"there should be a
+         * check compoudingFeePerMille in the bot to accept to process if zero … as long as operator
+         * checks this himself and owns it."</i> Setting this negative IS that act of owning it: it
+         * arms compounding for pools that pay nothing, and it still bounds the loss, because a
+         * candidate worse than the stated figure is refused.
+         *
+         * <p>The fee is set by the <b>pool owner</b> in the live {@code PoolManagerDatum} — not by
+         * this node, not by Giovanni, and not fixed by the protocol. Measured 2026-09-02: the only
+         * live preview pool published {@code compoudingFeePerMille = 0}.
+         *
+         * <p>Refused on mainnet at startup when negative, exactly as the liquidation margin is.
+         */
+        @Value("${loans.compound.profit-margin-lovelace:0}")
+        private BigInteger profitMarginLovelace;
+
+        /** Test seam: {@code @Value} owns these in production. */
+        public CompoundConfiguration(boolean enabled, long delaySeconds, BigInteger profitMarginLovelace) {
+            this.enabled = enabled;
+            this.delaySeconds = delaySeconds;
+            this.profitMarginLovelace = profitMarginLovelace;
+        }
+    }
+
 }

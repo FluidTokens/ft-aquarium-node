@@ -62,6 +62,30 @@ loans:
   # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
   # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely. Preview only:
   # SUBMITTABLE_NETWORK is hard-coded to preview, so mainnet stays fail-closed regardless of flags.
+  # The repayment-escrow COMPOUND path (lm_compound_action): collect a repaid loan's principal from
+  # the asset manager and deliver it into the lender's pool, keeping the pool owner's compounding fee.
+  # A different action from every `liquidation:` key above -- see docs/lending-v4-findings.md section 20.
+  compound:
+    enabled: ${AQUARIUM_COMPOUND_ENABLED:false}
+    delay-seconds: ${AQUARIUM_COMPOUND_DELAY_SECONDS:60}
+    # What `expectedFee - txFee` must reach, in lovelace, for a compound to be built.
+    #
+    # 0 (the default) refuses every net loss while allowing exact break-even. That is what makes a
+    # ZERO-FEE POOL refused out of the box: it pays nothing, so the net is exactly minus the tx fee.
+    #
+    # The fee rate is `compoudingFeePerMille` in the live PoolManagerDatum -- set by the POOL OWNER,
+    # not by this node and not fixed by the protocol. Measured 2026-09-02: the only live preview pool
+    # published 0, so out of the box that work pays nothing and is declined.
+    #
+    # A NEGATIVE value is a number the operator STATES, not a protection they switch off -- the same
+    # distinction `liquidation.profit-margin-lovelace` draws, and the reason there is no
+    # `ignore-profit-check` twin here. Setting it negative arms compounding for pools that pay
+    # nothing, and still bounds the loss: a candidate worse than the stated figure is refused.
+    # Giovanni's ruling, 2026-09-02: acceptable "as long as operator checks this himself and owns it".
+    #
+    # Negative on mainnet is a hard startup failure, exactly as the liquidation margin is.
+    profit-margin-lovelace: ${AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE:0}
+
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
     enabled: ${AQUARIUM_LIQUIDATION_ENABLED:false}
@@ -265,6 +289,22 @@ loans:
   # Preview is where the bot is exercised, so the loop runs by default here — in shadow, which
   # scans, builds, prices and records without ever signing or submitting. Every other liquidation
   # key keeps its base-document value.
+  # Preview is the only place the compound path is exercised, and it STAYS DISARMED HERE.
+  #
+  # This file ships inside the public operator image: anyone running it with the preview profile gets
+  # these values, so arming here would arm it for every operator, not for us. That is the same rule
+  # that keeps `liquidation.enabled` false in this document while the preview bot runs armed --
+  # arming is a deliberate act in the deployment's own values (the Steward's Argo application),
+  # never a default anybody inherits by choosing a profile. See docs/k8s-deployment-requirements.md
+  # section 3 and section 8.
+  #
+  # To arm OUR preview deployment, set these in the Argo values, not here:
+  #     AQUARIUM_COMPOUND_ENABLED: "true"
+  #     AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE: "-2000000"
+  # which mirrors the liquidation side's stated -2000000 bound.
+  compound:
+    enabled: ${AQUARIUM_COMPOUND_ENABLED:false}
+
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
     # Six of the seven, verified on chain: each of these UTxOs publishes a reference_script_hash
