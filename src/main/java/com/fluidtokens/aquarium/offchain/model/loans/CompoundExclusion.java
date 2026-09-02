@@ -38,6 +38,42 @@ public enum CompoundExclusion {
     PRINCIPAL_NOT_ADA,
 
     /**
+     * ⛔ The escrow UTxO carries assets the validator will not accept.
+     *
+     * <p>{@code lm_compound_action} constrains the SHAPE of every asset-manager input it consumes:
+     * <pre>
+     *   if principalAsset is ada  -> flatten(value).length == 1 + receiptNFTCount
+     *   else                      -> flatten(value).length == 2 + receiptNFTCount
+     * </pre>
+     * so an ADA-principal escrow must hold <b>lovelace and nothing else</b>, save any number of
+     * repayment receipt NFTs. This is an {@code expect}, so a violation <b>aborts</b> the validator
+     * rather than returning false.
+     *
+     * <p>⚑ This is why "preserve the escrow's other assets in the pool output" is not a thing the
+     * builder can do: such an escrow is not compoundable at all. Measured 2026-09-02: five of the
+     * eight unspent preview escrows carry tFLDT beside their lovelace and are excluded here, quite
+     * apart from their pools also being burned.
+     */
+    ESCROW_SHAPE_REJECTED,
+
+    /**
+     * The escrow is owned by a borrower bond rather than a lender bond, so
+     * {@code lm_compound_action}'s lender-bond lookup does not apply to it. Two of the eight unspent
+     * preview escrows are this (measured 2026-09-02) — a structural exclusion, not an economic one.
+     */
+    NOT_LENDER_OWNED,
+
+    /**
+     * The escrow's datum is {@code AssetManagerDatumWithHash}. A legitimate variant that no
+     * token-owned action can collect: the validator does {@code expect AssetManagerDatumWithToken}
+     * and aborts. Classified rather than treated as a decode failure.
+     */
+    ESCROW_NOT_TOKEN_OWNED,
+
+    /** No unspent lender bond carrying the escrow's {@code ownerAsset} is in the index. */
+    BOND_NOT_FOUND,
+
+    /**
      * The net result does not clear the operator's stated floor.
      *
      * <p>This is the ordinary outcome for a pool whose {@code compoudingFeePerMille} is zero: the
