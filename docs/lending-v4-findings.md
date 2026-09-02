@@ -1359,3 +1359,63 @@ failing for a new reason.*
   the live hashes actually derive from, and that commit must be *identified by derivation*, not by
   tag or date.
 - **Not** a mainnet statement. Lending is `enabled: false` on mainnet.
+
+### 19.7 The redeemers settle it: a borrower's FINAL REPAYMENT, no pool, no liquidation (2026-09-02)
+
+§19.1 inferred closure from the burn. The redeemers prove it, and name the action.
+
+**Four redeemers (`/txs/{hash}/redeemers`, data via `/scripts/datum/{hash}/cbor`):**
+
+| # | purpose | script | CBOR | decoded |
+|---|---|---|---|---|
+| 0 | `mint` | `2f1aa941…` loan policy | `d8799f02d87a8002ff` | `LoanMintRedeemer{configRefInputIndex:2, isPoolOrigin:True, originWithdrawRedeemerIndex:2}` |
+| 1 | `reward` | `2f1aa941…` loan policy | `d8799f02d87a80ff` | `LoanWithdrawRedeemer{configRefInputIndex:2, action:` **`Repay`** `}` |
+| 2 | `reward` | `c0f7e513…` | `d8799f029fd8799f01581c2e2048fc…d87a80ffffff` | `LoanRepayActionWithdrawRedeemer{configRefInputIndex:2, actionsForEachInput:[RepayData{borrowerBondOutputIndex:1, loanId:2e2048fc…,` **`isFinalRepayment:True`** `}]}` |
+| 3 | `spend` | `31e0dc1d…` loanSpend | `d87980` | `Constr0[]` — the `general_spend` unit redeemer, delegating to the withdraw-0 validators |
+
+**Three independent confirmations that this is `Repay`, and the first needs no source at all:**
+1. **`c0f7e513…` IS `loanRepayActionScriptHash`** — live config field 12 (§19.3). The script identity
+   alone names the action; it cannot be misread from a stale type definition.
+2. `Action` alternative **1** = `Repay` (`Claim`=0, `Repay`=1, `ChangeCollateral`=2, `Recast`=3).
+3. `isFinalRepayment` is documented upstream as *"Used only in Perpetual Loans to signal the last
+   repayment that will close the loan"* — **independently corroborating §19.2's `PerpetualLoan(28,5)`
+   decode**, from a different field of a different object.
+
+`mint` field key 9 carries **`qty = -1`** — a pure burn, nothing minted. Fee 555,121.
+
+**⇒ (a) The action is `Repay`, final repayment of a perpetual loan. NOT a liquidation.** No
+lender-manager action script appears anywhere in the transaction, and `loanClaimActionScriptHash`
+(`c6e0c439…`) — the claim path a liquidation would use — is absent.
+
+**⇒ (b) NOTHING touches a pool, and no compounding occurs.** Live pool credentials
+(`poolPolicyId a33aee40…`, `poolSpendScriptHash bf8c4378…`, `poolCompoundActionScriptHash`,
+`poolManagerSpendScriptHash`) appear in **no input, no output and no redeemer**. The repaid funds went
+to the **asset manager** (config field 15, `de8f8186…`), whose datum is
+`AssetManagerDatumWithToken{ inputOutputReference: (1281429c…, 1), action: "installment_repayment",
+data: …, ownerAsset: (bcd713bb… = lenderBondPolicyId, 2e2048fc… = loanId) }` — **45,000,000 lovelace
+held for whoever presents the LENDER BOND.** Repayment escrowed for the lender is the opposite of
+compounding into a pool.
+
+> ⚠ The burn redeemer's `isPoolOrigin: True` says the loan *originated* from a pool. It does **not**
+> mean a pool participates here: no pool script is invoked, so nothing pool-side was validated in this
+> transaction. Origin is a property of the loan; compounding would be a property of the action.
+
+**⇒ (c) The borrower initiated it.** `required_signers` (body key 14) is exactly one:
+`65997c7f8d4dcd677096be2a6b3ba882be0f79b7280aa2193ba20c2b` — the borrower, whose stake credential
+(`9e39d6f9…`) is the one on the loan address. Every non-collateral wallet input is theirs, and the
+change returns to them. There are **two** vkey witnesses: the borrower, and
+`55211e84a5f0bdbb0b60c46b25f887a03f05ac9146fd507acf3d102c`, which supplied **only the 5,000,000
+lovelace collateral input** — it is not a required signer, takes no output, and earns no fee. A
+collateral provider, not a batcher.
+
+**⇒ (d) The `installment_repayment` tag is NOT a pending schedule, and this tx is not executing one.**
+`action` is a free-form `ByteArray` label on the `AssetManagerDatum` — not a constructor, not a
+trigger. This transaction **created** that asset-manager UTxO (the address holds exactly one, from
+this tx). **It has nothing to do with the Aquarium node's Scheduled Transactions:** the preview tank
+script is `421e1852…` (from the pinned tank ref-input `782106…#0`) and it appears nowhere in this
+transaction.
+
+> **The naming is the whole trap.** A `ByteArray` action label chosen by an off-chain builder reads
+> exactly like a protocol concept, and this one collided with two of them at once — the node's
+> *Scheduled Transactions* and v4's *installment* repayment mode. **The loan had `totalInstallments =
+> 0`.** Only the redeemer and the script hash are load-bearing; a string in a datum is a comment.
