@@ -1901,3 +1901,62 @@ Measured on a **built body**, not arithmetic — the gap §22.9 flagged is close
 without an evaluator (size needs none, and the rig still cannot *evaluate* a referenced build per CCL
 trap 13); placeholder ex-units encode slightly smaller than real ones, so this **under**-estimates and
 the margin is conservative rather than optimistic. Arithmetic had predicted 10,426 — within 12 bytes.
+
+### 22.13 ⛔ THE PUBLICATION DISABLED THE BOT — CCL trap 17, self-inflicted (2026-09-02)
+
+`67f07c3` went live and the compound loop refused with a new reason:
+
+```
+compound SKIPPED e833a769…: no ada-only wallet utxo is nominable as input and collateral
+```
+
+**The predicate is right and the wallet is the wrong shape — and the publication I had just run is
+what made it that shape.** Measured directly at the bot's address after publishing:
+
+```
+1 utxo:  2ef25730…#1   9,898,050,234 lovelace  +  20,000,000 tFLDT
+```
+
+Nine thousand ada, and **not one lovelace of it nominable**, because `nominable()` requires
+`amount.size() == 1` — collateral must be pure ada (trap 16). Before publishing, the wallet held four
+ada-only UTxOs (three of 1,000,000 and one of 3,804,491). **The four publication transactions
+consumed every one of them and swept the remainder — token included — into a single change output.**
+
+> **⚑ This is CCL trap 17 exactly, and the trap was distilled from this very wallet.** Its recorded
+> example is *"the wallet held 9,966 ADA and could build nothing"*. This is the same wallet, the same
+> number to three significant figures, and the same failure — **re-created by a runner I wrote after
+> reading the trap.** Knowing a trap and instrumenting against it are different acts: the compound
+> BUILDER is safe by construction (`docs/change-output-enumeration.md`, route 8 refused at the door),
+> and I checked that; **the publication RUNNER was never held to the same standard, because it was
+> "just a one-off".** A one-off that spends the wallet's shape is not a smaller act than a builder.
+
+**Two code defects fixed here** (neither is the blocker; both would have bitten later):
+- The executor took `findFirst()` of the nominable UTxOs. It now takes
+  `WalletInputSelection.largest()`, as the liquidation path does. A 1,000,000 UTxO cannot cover the
+  collateral the ledger requires — 150% of a ~844,000 fee is 1,265,778 — so first-in-list would have
+  produced a **negative collateral return**, trap 16, a transaction the node cannot parse.
+- The refusal now reports the wallet's **shape**: total lovelace, UTxO count, and how many carry
+  native assets. *A message that cannot distinguish an empty wallet from a full but ineligible one
+  sends an operator looking for funds they already have.*
+
+### 22.14 The 3,804,491 is not a coincidence — same transaction, by construction
+
+The steward handed over, without a theory: the wallet held `7e1efbaf…#4`, ada-only, **exactly
+3,804,491** — the previous image's unexplained delta — and `7e1efbaf` is the same transaction as
+rejected escrow `7e1efbaf…#2`. The outputs of that transaction explain both:
+
+```
+#0  1,000,000      -> the bot      (cardano-client-lib's withdrawal dummy, trap 1)
+#2  1,771,410 +tok -> ASSET MANAGER (the escrow that appears in the refusal table)
+#4  3,804,491      -> the bot      (ada-only change)
+#5  9,954,141,273  -> the bot      (the rest)
+```
+
+**`7e1efbaf…` is a liquidation the bot itself executed.** A liquidation escrows value at the asset
+manager *and* returns the leftover ada to the bot — so the escrow and the change are siblings from one
+transaction, and sharing a tx hash is the expected relationship rather than a surprising one. Later,
+CCL's coin selection picked that ada-only change as the compound's extra input, which is why the
+`BOT_NET_MISMATCH` delta equalled it to the lovelace (§22.8).
+
+*The bot's own past work is the source of both the escrows it now wants to compound and the small
+UTxOs it needs to compound them with.*

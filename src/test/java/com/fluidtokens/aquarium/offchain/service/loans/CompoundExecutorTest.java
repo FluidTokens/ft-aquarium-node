@@ -93,13 +93,19 @@ class CompoundExecutorTest {
     private record Wiring(CompoundExecutor executor, List<byte[]> submitted) {
     }
 
+    private static Wiring wiringWithWallet(List<CompoundCandidate> candidates, List<Utxo> walletUtxos) {
+        return wiring(candidates, true, -2_000_000L, walletUtxos);
+    }
+
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor) {
+        return wiring(candidates, armed, floor, List.of(wallet()));
+    }
+
+    private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor,
+                                 List<Utxo> walletUtxos) {
         var configuration = new AppConfig.CompoundConfiguration(armed, 60L, BigInteger.valueOf(floor));
         var network = new AppConfig.Network();
         org.springframework.test.util.ReflectionTestUtils.setField(network, "network", "preview");
-
-        var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
-                LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null);
 
         var blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(false);
@@ -110,10 +116,14 @@ class CompoundExecutorTest {
             return Result.success("deadbeefcafe").withValue("deadbeefcafe");
         };
 
+        List<Utxo> universe = new java.util.ArrayList<>(universe());
+        universe.addAll(walletUtxos);
+        var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
         var executor = new CompoundExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(List.of(wallet())), ACCOUNT,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT,
                 new FakeScanner(candidates), new CompoundEconomics(configuration, network),
-                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(), submitter);
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
         return new Wiring(executor, submitted);
     }
 
@@ -195,6 +205,56 @@ class CompoundExecutorTest {
 
         executor.cycle();
         assertEquals(0, scans.get(), "a syncing node must not even scan");
+    }
+
+    /**
+     * ⛔ THE PRODUCTION SHAPE, 2026-09-02. The wallet held 9,898 ada and could build nothing, because
+     * its ONE utxo also carried a native token — CCL trap 17: a successful transaction's change
+     * output disables the builder that made it. The publications that put the reference scripts on
+     * chain consumed every ada-only utxo and swept the remainder, token included, into a single
+     * change output.
+     *
+     * <p>The predicate is RIGHT — collateral must be pure ada (trap 16) — so this must SKIP, and the
+     * log must say the wallet is the wrong SHAPE rather than empty.
+     */
+    @Test
+    void aWalletWhoseOnlyUtxoCarriesATokenIsSkippedNotSpent() {
+        Utxo tokenBearing = Utxo.builder().txHash("2e".repeat(32)).outputIndex(1)
+                .address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(9_898_050_234L)),
+                        Amount.builder().unit("0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f620014df1074464c4454")
+                                .quantity(BigInteger.valueOf(20_000_000L)).build()))
+                .build();
+
+        Wiring w = wiringWithWallet(List.of(ready(0L)), List.of(tokenBearing));
+        w.executor().cycle();
+
+        assertTrue(w.submitted().isEmpty(),
+                "9,898 ada on a token-bearing utxo is not spendable as collateral; it must skip");
+    }
+
+    /**
+     * ⚠ And the LARGEST nominable is taken, not the first. A 1 ada utxo cannot cover the collateral
+     * the ledger requires (150% of a ~0.84 ada fee), and nominating it produces a NEGATIVE collateral
+     * return — trap 16, a transaction the node cannot even parse. Picking first-in-list would have
+     * done exactly that here.
+     */
+    @Test
+    void theLargestAdaOnlyUtxoIsNominatedNotTheFirst() {
+        Utxo tiny = Utxo.builder().txHash("01".repeat(32)).outputIndex(0)
+                .address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(1_000_000L)))).build();
+        Utxo ample = Utxo.builder().txHash("02".repeat(32)).outputIndex(0)
+                .address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
+
+        // tiny FIRST in the list — first-in-list selection would take it and fail on collateral.
+        Wiring w = wiringWithWallet(List.of(ready(0L)), List.of(tiny, ample));
+        w.executor().cycle();
+
+        assertEquals(1, w.submitted().size(),
+                "the ample utxo must be nominated; taking the 1 ada one first would produce a "
+                        + "negative collateral return and an unparseable transaction");
     }
 
     // ---- fakes -------------------------------------------------------------------------------

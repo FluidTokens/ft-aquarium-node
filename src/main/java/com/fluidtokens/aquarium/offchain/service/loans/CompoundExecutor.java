@@ -187,10 +187,24 @@ public class CompoundExecutor {
             return;
         }
 
-        Optional<Utxo> wallet = nominableWalletUtxo();
+        List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
+        Optional<Utxo> wallet = WalletInputSelection.largest(walletUtxos);
         if (wallet.isEmpty()) {
-            log.warn("compound SKIPPED {}: no ada-only wallet utxo is nominable as input and collateral",
-                    candidate.loanId());
+            // ⛔ "Nothing qualified" cannot tell an EMPTY wallet from a FULL one whose every UTxO is
+            // ineligible, and those need opposite responses. Measured 2026-09-02: the wallet held
+            // 9,898 ada and could not build, because its only UTxO also carried a native token —
+            // CCL trap 17, where a successful transaction's change output disables the next one.
+            long total = walletUtxos.stream()
+                    .flatMap(u -> u.getAmount().stream())
+                    .filter(a -> "lovelace".equals(a.getUnit()))
+                    .mapToLong(a -> a.getQuantity().longValue()).sum();
+            long multiAsset = walletUtxos.stream().filter(u -> u.getAmount().size() > 1).count();
+            log.warn("compound SKIPPED {}: no ada-only wallet utxo is nominable as input and "
+                            + "collateral. The wallet holds {} utxo(s) totalling {} lovelace, of which "
+                            + "{} carry native assets and are therefore ineligible — collateral must be "
+                            + "pure ada. This is a wallet SHAPE problem, not a shortage: split an "
+                            + "ada-only output off before expecting a compound to build.",
+                    candidate.loanId(), walletUtxos.size(), total, multiAsset);
             return;
         }
 
@@ -266,17 +280,6 @@ public class CompoundExecutor {
         } catch (Exception e) {
             log.error("compound SUBMIT THREW {}: {}", candidate.loanId(), e.toString(), e);
         }
-    }
-
-    /**
-     * An ada-only wallet UTxO, which the transaction uses as both spend input and Plutus collateral.
-     * {@code WalletInputSelection.nominable} is the same predicate the liquidation path uses, and it
-     * exists because collateral must be pure ada — CCL trap 16, where a multi-asset or too-small
-     * nomination produces a negative collateral return and an unparseable transaction.
-     */
-    private Optional<Utxo> nominableWalletUtxo() {
-        List<Utxo> utxos = appUtxoService.listWalletUtxo();
-        return utxos.stream().filter(WalletInputSelection::nominable).findFirst();
     }
 
     /**
