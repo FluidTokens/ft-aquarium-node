@@ -15,6 +15,7 @@ import com.bloxbean.cardano.client.function.TxBuilder;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
@@ -31,6 +32,7 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -115,6 +117,10 @@ public class CompoundTransactionBuilder {
 
     /**
      * @param candidate      a {@link CompoundCandidate#structurallyReady()} candidate
+     * @param referenceScripts script hash → the UTxO publishing it. A validator listed here travels
+     *                       as a REFERENCE INPUT; one absent travels inline in the witness set.
+     *                       ⛔ Exactly one route per validator: a script both witnessed and
+     *                       referenced is {@code ExtraneousScriptWitnessesUTXOW} (CCL trap 9)
      * @param bondUtxo       the lender bond's UTxO. Passed in rather than taken from the candidate:
      *                       {@link com.fluidtokens.aquarium.offchain.model.loans.LenderBond} carries
      *                       the decoded datum and the coordinates, not the value, and
@@ -130,6 +136,7 @@ public class CompoundTransactionBuilder {
      *                       builder takes slots because only the caller knows the node's position.
      */
     public record Request(CompoundCandidate candidate,
+                          Map<String, TransactionInput> referenceScripts,
                           Utxo bondUtxo,
                           Utxo configUtxo,
                           Utxo lmConfigUtxo,
@@ -188,8 +195,10 @@ public class CompoundTransactionBuilder {
 
         // Reference inputs, canonically ordered before any index is read off them: the ledger sorts
         // them by (txHash, outputIndex) before a validator ever sees the list.
-        List<TransactionInput> refInputs = canonical(List.of(
+        List<TransactionInput> all = new ArrayList<>(List.of(
                 inputOf(request.configUtxo()), inputOf(request.lmConfigUtxo())));
+        all.addAll(request.referenceScripts().values());
+        List<TransactionInput> refInputs = canonical(all);
         long configRefIndex = indexOf(refInputs, inputOf(request.configUtxo()), "main config");
         // ⛔ A FOURTH WRINKLE ON §22.3: `configRefInputIndex` does not name the same config on every
         // validator. lender_manager.withdraw resolves the LM CONFIG NFT from the index it is handed
@@ -263,22 +272,26 @@ public class CompoundTransactionBuilder {
                 CompoundTxEncoder.compoundLiquidity(poolWithdrawRedeemerIndex, lmWithdrawRedeemerIndex));
 
 
-        // Every validator this transaction invokes travels INLINE in the witness set. CCL trap 13:
-        // a redeemer without its script is RequiredRedeemersMismatch, and an offline evaluator cannot
-        // fetch what is not there. Publishing these as reference scripts would cut the size and is a
-        // later, separate decision — inline is the library default and needs no coordinate to verify.
-        tx.attachSpendingValidator(registry.getAssetManagerSpendScript());
-        tx.attachSpendingValidator(registry.getLenderManagerSpendScript());
-        tx.attachSpendingValidator(registry.getPoolSpendScript());
-        tx.attachSpendingValidator(registry.getPoolManagerSpendScript());
-
-        tx.attachRewardValidator(registry.getAssetManagerScript());
-        tx.attachRewardValidator(registry.getLenderManagerScript());
-        tx.attachRewardValidator(registry.getLmCompoundActionScript());
-        tx.attachRewardValidator(registry.getPoolScript());
-        tx.attachRewardValidator(registry.getPoolCompoundActionScript());
-        tx.attachRewardValidator(registry.getPoolManagerScript());
-        tx.attachRewardValidator(registry.getPmCompoundLiquidityScript());
+        // ⛔ EXACTLY ONE ROUTE PER VALIDATOR. A script carried in the witness set AND named by a
+        // reference input is rejected as ExtraneousScriptWitnessesUTXOW (CCL trap 9), so a validator
+        // with a published coordinate is attached NOT AT ALL — only read from. One without a
+        // coordinate travels inline, because a redeemer with no reachable script is
+        // RequiredRedeemersMismatch (trap 13). Both halves fail loudly; neither fails quietly.
+        for (var spend : List.of(registry.getAssetManagerSpendScript(),
+                registry.getLenderManagerSpendScript(), registry.getPoolSpendScript(),
+                registry.getPoolManagerSpendScript())) {
+            if (!isReferenced(request, spend)) {
+                tx.attachSpendingValidator(spend);
+            }
+        }
+        for (var reward : List.of(registry.getAssetManagerScript(), registry.getLenderManagerScript(),
+                registry.getLmCompoundActionScript(), registry.getPoolScript(),
+                registry.getPoolCompoundActionScript(), registry.getPoolManagerScript(),
+                registry.getPmCompoundLiquidityScript())) {
+            if (!isReferenced(request, reward)) {
+                tx.attachRewardValidator(reward);
+            }
+        }
 
         return tx;
     }
@@ -306,6 +319,16 @@ public class CompoundTransactionBuilder {
                 .preBalanceTx((ctx, txn) ->
                         ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
                 .postBalanceTx(verify);
+
+        // CCL trap 9: the reference-script fee is only charged for bytes the library can OBTAIN.
+        // Without this it charges ZERO and the transaction is short by 15 lovelace per byte —
+        // FeeTooSmallUTxO at phase 1. removeDuplicateScriptWitnesses strips any copy a mint or
+        // attach left behind, which is the other half of the same rejection.
+        List<PlutusScript> referenced = referencedScripts(request);
+        if (!referenced.isEmpty()) {
+            context = context.withReferenceScripts(referenced.toArray(PlutusScript[]::new))
+                    .removeDuplicateScriptWitnesses(true);
+        }
 
         if (backendService == null) {
             // CCL trap 2: offline, ReferenceScriptResolver walks every reference input looking for a
@@ -500,6 +523,31 @@ public class CompoundTransactionBuilder {
                     scriptHash + " is not among the transaction's withdrawals");
         }
         return SCRIPT_SPEND_COUNT + at;
+    }
+
+    /** Whether this validator has a published coordinate, so it must NOT also be attached. */
+    private static boolean isReferenced(Request request, PlutusScript script) {
+        try {
+            return request.referenceScripts().containsKey(HexUtil.encodeHexString(script.getScriptHash()));
+        } catch (Exception e) {
+            throw refuse(Refusal.REDEEMER_INDEX_MISMATCH, "could not hash a validator: " + e);
+        }
+    }
+
+    /** The scripts travelling by reference, whose bytes CCL needs in order to price them. */
+    private List<PlutusScript> referencedScripts(Request request) {
+        List<PlutusScript> out = new ArrayList<>();
+        for (PlutusScript script : List.of(registry.getAssetManagerSpendScript(),
+                registry.getLenderManagerSpendScript(), registry.getPoolSpendScript(),
+                registry.getPoolManagerSpendScript(), registry.getAssetManagerScript(),
+                registry.getLenderManagerScript(), registry.getLmCompoundActionScript(),
+                registry.getPoolScript(), registry.getPoolCompoundActionScript(),
+                registry.getPoolManagerScript(), registry.getPmCompoundLiquidityScript())) {
+            if (isReferenced(request, script)) {
+                out.add(script);
+            }
+        }
+        return out;
     }
 
     private String rewardAddress(String scriptHash) {

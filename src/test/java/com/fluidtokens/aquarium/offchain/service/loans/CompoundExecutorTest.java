@@ -113,7 +113,7 @@ class CompoundExecutorTest {
         var executor = new CompoundExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(List.of(wallet())), ACCOUNT,
                 new FakeScanner(candidates), new CompoundEconomics(configuration, network),
-                builder, new FakeResolver(), LoanFixtures.converters(), submitter);
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(), submitter);
         return new Wiring(executor, submitted);
     }
 
@@ -190,7 +190,7 @@ class CompoundExecutorTest {
                 new CompoundEconomics(configuration, network),
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
-                new FakeResolver(), LoanFixtures.converters(),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
                 bytes -> { throw new AssertionError("a syncing node must not submit"); });
 
         executor.cycle();

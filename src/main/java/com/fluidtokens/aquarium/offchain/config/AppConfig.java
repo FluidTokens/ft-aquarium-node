@@ -557,6 +557,24 @@ public class AppConfig {
         @Value("${loans.compound.profit-margin-lovelace:0}")
         private BigInteger profitMarginLovelace;
 
+        /**
+         * Published reference scripts, as a comma-separated list of {@code txHash#index} coordinates.
+         *
+         * <p>⚑ <b>Deliberately NOT one named key per validator.</b> The liquidation path has eight
+         * such keys, and its own Argo comment records the confusion they cause: a key named for a
+         * validator holds a <em>coordinate</em>, not a contract, and nothing checks that the two
+         * agree. Here the operator lists coordinates and <b>the chain says which script each one
+         * publishes</b> — the node reads {@code referenceScriptHash} off the UTxO. A mislabelled
+         * coordinate is therefore not expressible.
+         *
+         * <p>Empty (the default) means every validator travels inline in the witness set. That is
+         * correct and it is also <b>too big to submit</b>: eleven inline validators make a
+         * 24,878-byte transaction against a 16,384 {@code max_tx_size} (findings §22.9). Referencing
+         * the four largest brings it to ~10,400.
+         */
+        @Value("${loans.compound.reference-scripts:}")
+        private String referenceScripts;
+
         /** Test seam: {@code @Value} owns these in production. */
         public CompoundConfiguration(boolean enabled, long delaySeconds, BigInteger profitMarginLovelace) {
             this.enabled = enabled;

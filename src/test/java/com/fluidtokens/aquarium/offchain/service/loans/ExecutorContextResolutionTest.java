@@ -169,6 +169,11 @@ class ExecutorContextResolutionTest {
         }
 
         @Bean
+        com.bloxbean.cardano.client.api.UtxoSupplier utxoSupplier() {
+            return LoanFixtures.utxoSupplier(List.of());
+        }
+
+        @Bean
         org.cardanofoundation.conversions.CardanoConverters converters() {
             return LoanFixtures.converters();
         }

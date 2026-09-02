@@ -111,7 +111,7 @@ class CompoundDryEvalTest {
     }
 
     private static CompoundTransactionBuilder.Request request(BigInteger fee) {
-        return new CompoundTransactionBuilder.Request(candidate(), utxo("bond"),
+        return new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
                 utxo("config"), utxo("lmConfig"), wallet(), BOT, fee,
                 VALID_FROM_SLOT, VALID_TO_SLOT);
     }
@@ -206,7 +206,7 @@ class CompoundDryEvalTest {
                 null, POOL_ID, null, null, 0L, true,
                 com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion.POOL_NOT_LIVE, "burned");
 
-        var request = new CompoundTransactionBuilder.Request(excluded, utxo("bond"), utxo("config"),
+        var request = new CompoundTransactionBuilder.Request(excluded, java.util.Map.of(), utxo("bond"), utxo("config"),
                 utxo("lmConfig"), wallet(), BOT, FEE, VALID_FROM_SLOT, VALID_TO_SLOT);
 
         var e = assertThrows(CompoundTransactionBuilder.RefusedException.class,

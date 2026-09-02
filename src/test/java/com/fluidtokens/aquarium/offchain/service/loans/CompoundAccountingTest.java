@@ -96,7 +96,7 @@ class CompoundAccountingTest {
                 EvalFixtures.scriptSupplier(REGISTRY), SlotConfigs.preview());
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), evaluator);
-        return builder.build(new CompoundTransactionBuilder.Request(candidate(), utxo("bond"),
+        return builder.build(new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
                 utxo("config"), utxo("lmConfig"), walletUtxos.getFirst(), BOT,
                 BigInteger.ZERO, 70_000_000L, 70_000_300L));
     }

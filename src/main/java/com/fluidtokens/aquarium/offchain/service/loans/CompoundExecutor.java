@@ -4,7 +4,9 @@ import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
@@ -19,7 +21,9 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -68,6 +72,7 @@ public class CompoundExecutor {
     private final CompoundEconomics economics;
     private final CompoundTransactionBuilder builder;
     private final LiquidationUtxoResolver utxoResolver;
+    private final UtxoSupplier utxoSupplier;
     private final CardanoConverters converters;
     private final TransactionSubmitter submitter;
 
@@ -93,10 +98,11 @@ public class CompoundExecutor {
                             CompoundEconomics economics,
                             CompoundTransactionBuilder builder,
                             LiquidationUtxoResolver utxoResolver,
+                            UtxoSupplier utxoSupplier,
                             CardanoConverters converters,
                             BFBackendService backendService) {
         this(configuration, blockEventListener, appUtxoService, account, scanner, economics, builder,
-                utxoResolver, converters,
+                utxoResolver, utxoSupplier, converters,
                 bytes -> backendService.getTransactionService().submitTransaction(bytes));
     }
 
@@ -109,6 +115,7 @@ public class CompoundExecutor {
                             CompoundEconomics economics,
                             CompoundTransactionBuilder builder,
                             LiquidationUtxoResolver utxoResolver,
+                            UtxoSupplier utxoSupplier,
                             CardanoConverters converters,
                             TransactionSubmitter submitter) {
         this.configuration = configuration;
@@ -119,6 +126,7 @@ public class CompoundExecutor {
         this.economics = economics;
         this.builder = builder;
         this.utxoResolver = utxoResolver;
+        this.utxoSupplier = utxoSupplier;
         this.converters = converters;
         this.submitter = submitter;
     }
@@ -200,7 +208,7 @@ public class CompoundExecutor {
         Transaction transaction;
         try {
             transaction = builder.build(new CompoundTransactionBuilder.Request(
-                    candidate, bondUtxo.get(), configUtxo.get(), lmConfigUtxo.get(), wallet.get(),
+                    candidate, referenceScripts(), bondUtxo.get(), configUtxo.get(), lmConfigUtxo.get(), wallet.get(),
                     account.baseAddress(), fee, slots[0], slots[1]));
         } catch (CompoundTransactionBuilder.RefusedException e) {
             log.warn("compound REFUSED BY BUILDER {} escrow {}: {}", candidate.loanId(),
@@ -269,6 +277,43 @@ public class CompoundExecutor {
     private Optional<Utxo> nominableWalletUtxo() {
         List<Utxo> utxos = appUtxoService.listWalletUtxo();
         return utxos.stream().filter(WalletInputSelection::nominable).findFirst();
+    }
+
+    /**
+     * Resolve the configured coordinates into scriptHash → UTxO, <b>reading the hash off the chain</b>
+     * rather than trusting the operator's ordering. A coordinate that publishes no reference script,
+     * or that cannot be resolved, is logged and skipped: the validator then travels inline, which is
+     * correct but larger — never silently referenced-but-absent, which is
+     * {@code RequiredRedeemersMismatch} (CCL trap 13).
+     */
+    Map<String, TransactionInput> referenceScripts() {
+        String configured = configuration.getReferenceScripts();
+        if (configured == null || configured.isBlank()) {
+            return Map.of();
+        }
+        Map<String, TransactionInput> resolved = new LinkedHashMap<>();
+        for (String raw : configured.split(",")) {
+            String coordinate = raw.trim();
+            if (coordinate.isEmpty()) {
+                continue;
+            }
+            String[] parts = coordinate.split("#");
+            if (parts.length != 2) {
+                log.warn("compound: reference-script coordinate '{}' is not txHash#index; ignoring",
+                        coordinate);
+                continue;
+            }
+            Optional<Utxo> utxo = utxoSupplier.getTxOutput(parts[0], Integer.parseInt(parts[1]));
+            String hash = utxo.map(Utxo::getReferenceScriptHash).orElse(null);
+            if (hash == null || hash.isBlank()) {
+                log.warn("compound: reference-script coordinate {} publishes no script (or is "
+                        + "unresolvable); that validator will travel inline", coordinate);
+                continue;
+            }
+            resolved.put(hash, new TransactionInput(parts[0], Integer.parseInt(parts[1])));
+            log.info("compound: {} travels by reference from {}", hash, coordinate);
+        }
+        return Map.copyOf(resolved);
     }
 
     private long tipMillis() {
