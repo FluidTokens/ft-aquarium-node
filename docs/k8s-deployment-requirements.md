@@ -198,6 +198,26 @@ long-running node.** Watch and adjust; I would not treat them as tuned.
 > Secret on 08-25 and reconciled away on 08-31. 765 `FailedMount` events over 25 hours, against a pod
 > that stayed `Running 1/1` and fully functional the entire time on a 5-day-old tmpfs mount. Nothing
 > was degraded; the pod was simply no longer *recreatable*. Items 8 and 9 are the two halves of that.
+>
+> **✅ RESOLVED 2026-09-02.** The structural fix landed rather than the stopgap: `DB_PASSWORD` is now
+> consumed **by reference** from the Postgres operator's own Secret, so **no copy of the password
+> exists anywhere** and items 8 and 9 can no longer recur through this key. The pod rolled cleanly
+> (restarts 0, armed state preserved, config verifiers 0 mismatched) and image rolls are ordinary
+> deploys again. *The paragraph above is kept because the mechanism is general and the next key
+> someone projects will not be `db-password`.*
+
+10. **⛔ NEVER `kubectl rollout undo` this Deployment — roll FORWARD.** Twelve old ReplicaSets still
+    carry the previous **four-item** secret projection, including the `db-password` key that no longer
+    exists. A rollback recreates the exact `ContainerCreating` condition items 8 and 9 describe — on a
+    Deployment whose *current* state is perfectly healthy. **This is the reflex reach during an
+    incident, which is precisely when it will be reached for**, and the pod it strands is an armed,
+    transaction-signing bot. A ReplicaSet is a frozen copy of a pod spec: it remembers a Secret shape
+    the cluster has since abandoned, and nothing reconciles that memory. **Old ReplicaSets are not
+    "previous good states" — they are previous states.**
+11. **A single `Startup probe failed: connection refused` event at boot is the `startupProbe` working,
+    not a fault.** It fires before the JVM has bound its port. Investigate only if it *repeats* past
+    the startup budget, or if the pod does not reach `Running 1/1` (§5 explains why a tight liveness
+    probe is only safe because a startupProbe covers the slow first boot).
 
 ---
 
