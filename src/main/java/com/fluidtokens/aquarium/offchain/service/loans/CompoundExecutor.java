@@ -13,6 +13,7 @@ import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -70,6 +71,20 @@ public class CompoundExecutor {
     private final CardanoConverters converters;
     private final TransactionSubmitter submitter;
 
+    /**
+     * ⛔ {@code @Autowired} IS LOAD-BEARING. This class has two constructors, and with neither marked
+     * Spring does not pick one — it looks for a no-arg constructor, finds none, and the context fails
+     * to start with {@code NoSuchMethodException: CompoundExecutor.<init>()}. Nothing about that
+     * message names the real cause.
+     *
+     * <p>Measured 2026-09-02: an image shipped without this annotation crash-looped in 14 seconds and
+     * took the bot down, on a Recreate singleton where <b>a bad image is an outage every time</b>.
+     * {@code LiquidationExecutor} has carried the annotation since it was written; this class copied
+     * its two-constructor SHAPE and not its ANNOTATION. <b>A sibling's shape is not its wiring.</b>
+     * {@code ExecutorContextResolutionTest} now fails on this, so the next omission is a red suite
+     * rather than a rollback.
+     */
+    @Autowired
     public CompoundExecutor(AppConfig.CompoundConfiguration configuration,
                             BlockEventListener blockEventListener,
                             AppUtxoService appUtxoService,

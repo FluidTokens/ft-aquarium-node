@@ -214,7 +214,28 @@ long-running node.** Watch and adjust; I would not treat them as tuned.
     transaction-signing bot. A ReplicaSet is a frozen copy of a pod spec: it remembers a Secret shape
     the cluster has since abandoned, and nothing reconciles that memory. **Old ReplicaSets are not
     "previous good states" — they are previous states.**
-11. **A single `Startup probe failed: connection refused` event at boot is the `startupProbe` working,
+11. **⛔ ON THIS DEPLOYMENT THERE IS NO SUCH THING AS A DEPLOY THAT FAILS SAFELY.** The workload is a
+    **`Recreate` singleton** — one replica, old pod terminated *before* the new one is tried — so a bad
+    image is an **outage every time**, not a degraded rollout that some healthy replica rides out.
+    There is no canary, no surge, and nothing to fall back to inside the rollout itself; recovery is a
+    roll *forward* to a known-good tag (item 10 forbids `rollout undo`), and it costs a real outage
+    window.
+
+    > **Measured 2026-09-02.** Image `lending-v4-588d318` crash-looped in **fourteen seconds** —
+    > `BeanCreationException: Error creating bean 'compoundExecutor' … NoSuchMethodException:
+    > CompoundExecutor.<init>()`. A new `@Service` had two constructors and neither carried
+    > `@Autowired`, so Spring selected none and looked for a no-arg one. **The whole test suite was
+    > green**, because the only test covering that bean *constructed* it rather than letting the
+    > container *resolve* it — two different questions, and the gap had been named in the deploy
+    > handoff and shipped anyway.
+
+    **⇒ The suite is the only affordable place to catch a startup failure**, which is what
+    `ExecutorContextResolutionTest` now does: a real `ApplicationContextRunner` resolving the real
+    `@Service`, plus a reflective invariant that every container-managed class with more than one
+    constructor names exactly one. Both are mutation-verified against the actual defect. *A container
+    that cannot start is not a Kubernetes problem to be probed around — it is a wiring problem, and it
+    belongs in `./gradlew test`.*
+12. **A single `Startup probe failed: connection refused` event at boot is the `startupProbe` working,
     not a fault.** It fires before the JVM has bound its port. Investigate only if it *repeats* past
     the startup budget, or if the pod does not reach `Running 1/1` (§5 explains why a tight liveness
     probe is only safe because a startupProbe covers the slow first boot).
