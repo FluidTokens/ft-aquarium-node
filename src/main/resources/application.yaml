@@ -98,6 +98,29 @@ loans:
     # Deployment-specific, so it is set in the deployment's own values, never defaulted in this image.
     reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}
 
+  # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
+  #
+  # Quoted first-hand from FluidTokens' own (TypeScript) tooling and then VERIFIED read-only against
+  # the chain: both NFTs exist in tx 7b9f20db…, asset name `parameters`, the ConfigDatum has the
+  # expected 29 fields, and — the load-bearing check — the vendored loans-v4.plutus.json DERIVES
+  # every credential the mainnet datum publishes. Their mainnet build IS the artifact we ship.
+  # See MainnetRegistryMatchesConfigTest and docs/lending-v4-findings.md section 23.
+  #
+  # ⚠ CONFIGURED IS NOT ARMED. `loans.enabled` above is false on mainnet, the liquidation mode is
+  # `disabled`, SUBMITTABLE_NETWORK is hard-coded to preview, and the compound gate HARD-FAILS a
+  # negative profit margin on mainnet by design. These four values let the node DERIVE and READ the
+  # mainnet deployment; nothing here lets it act on one.
+  #
+  # The preview profile overrides all four, so this block is inert on every preview deployment.
+  config:
+    ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:7b9f20dbadaebe1400915e4a63444a9eb7515c21c1114d4bc9c77f1455148cb0}
+    policy-id: ${LOANS_CONFIG_POLICY_ID:db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416}
+  lm-config:
+    policy-id: ${LOANS_LM_CONFIG_POLICY_ID:a56b0ac2654663f395601601a7825649e5488905648747e912d870e4}
+  # Published in the ConfigDatum (field 0) and NOT derivable from the blueprint — the same value on
+  # both networks, because it is not parameterised by the config policy id.
+  smart-tokens-spend-script-hash: ${LOANS_SMART_TOKENS_SPEND_SCRIPT_HASH:fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa}
+
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
     enabled: ${AQUARIUM_LIQUIDATION_ENABLED:false}

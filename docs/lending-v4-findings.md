@@ -2013,3 +2013,85 @@ outputs of 20 ada, and ada-only change of 9,796,688,875. Fee 184,729.
 > and **exactly the state it was meant to repair**. Caught because the runner asserts the SHAPE of the
 > built body rather than trusting what it asked for. *A no-op is the hardest failure to notice,
 > because everything about it succeeds.*
+
+---
+
+## 23. ✅ LENDING v4 IS ON MAINNET, AND OUR VENDORED BLUEPRINT DERIVES IT (2026-09-02)
+
+FluidTokens shipped v4 to mainnet. Giovanni relayed four values first-hand from their own
+(TypeScript) tooling; this repo has no TypeScript surface, so they map onto `application.yaml`'s
+**base document** — which is the mainnet profile — and the preview profile overrides all four, so the
+block is **structurally inert on every preview deployment**.
+
+```
+config ref utxo   7b9f20dbadaebe1400915e4a63444a9eb7515c21c1114d4bc9c77f1455148cb0
+config policy     db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416
+lm config policy  a56b0ac2654663f395601601a7825649e5488905648747e912d870e4
+asset name        706172616d6574657273   ("parameters", the same word as preview)
+```
+
+### 23.1 Verified read-only before committing, in the §21 discipline
+
+| check | result |
+|---|---|
+| ref UTxO exists | ✅ tx `7b9f20db…`, 4 outputs |
+| config NFT present | ✅ output #0, policy `db2c498e…`, name `parameters` |
+| LM config NFT present | ✅ output #1, policy `a56b0ac2…`, **same transaction** — the preview pattern |
+| ConfigDatum shape | ✅ constructor 0, **29 fields**, same as preview |
+| LMConfigDatum shape | ✅ 8 fields |
+| **derivation** | ✅ **the vendored `loans-v4.plutus.json` derives EVERY credential the mainnet datums publish** |
+
+**⇒ Their mainnet build IS the artefact we vendor.** Everything downstream is knowable, and the bot
+*could* operate there. `MainnetRegistryMatchesConfigTest` pins it, driving the production
+`LoansConfigVerifier` against recorded mainnet datums — the same shape as
+`ShippedRegistryMatchesPinnedConfigTest`, pointed at the other network.
+
+**Three credentials are byte-identical across networks, and that is diagnostic rather than
+suspicious**: `borrowerBondPolicyId`, `lenderBondPolicyId` (derived from an integer index, not from
+the config policy) and `smartTokensSpendScriptHash` (not derivable at all — published in the datum).
+**They are exactly the values a new deployment cannot move.** A fourth joins them:
+`lmLiquidateConvertAndCompoundActionScriptHash` = `435b42cc…` on both networks — **T-077 predicted
+this**, because that stub is the one lender-manager action derived with no config parameters.
+
+### 23.2 ⛔ Nothing has ever run there — and no reference scripts exist
+
+Confirmed by two independent providers:
+
+```
+Blockfrost /scripts/{hash}   loanSpend, poolCompoundAction  ->  HTTP 404
+Koios      /script_info      same hashes                    ->  []
+```
+
+**The validators have never appeared on chain.** The deploy transaction publishes **zero** reference
+scripts (0 of its 4 outputs carry one). So the mainnet deployment today is *the config registered and
+nothing else*: no loan has been made, no validator witnessed, nothing to point a reference input at.
+
+**Reference-script discovery, the recipe — verified, not remembered.** Neither provider offers a
+**global reverse lookup from script hash to the UTxO publishing it**. What exists:
+- **Blockfrost** — `GET /addresses/{addr}/utxos` returns `reference_script_hash` per UTxO. *Knowing a
+  publication address is sufficient; not knowing one is fatal.* `GET /scripts/{hash}` answers only
+  "has this script ever appeared on chain", which is **404 until first use** and is not a publication
+  check.
+- **Koios** — `POST /script_info` with `_script_hashes` returns creation information; `[]` for a
+  script never seen. Its UTxO endpoints expose a `reference_script` object the same way, and are
+  likewise address-scoped.
+
+**⇒ Enumerate a known publication address and match on `reference_script_hash`. There is no
+hash→UTxO index; if the publisher's address is unknown, the coordinate is not discoverable at all.**
+
+### 23.3 What publishing would cost on mainnet
+
+`coins_per_utxo_size` is 4310 and `max_tx_size` 16,384 — identical to preview, so the preview
+arithmetic transfers exactly. The applied scripts are the same sizes (a parameter change does not move
+them):
+
+| validator | bytes | locked |
+|---|---:|---:|
+| `lm_compound_action` | 5,130 | 22.80 ADA |
+| `pool_compound_action` | 3,760 | 16.90 ADA |
+| `asset_manager` | 3,287 | 14.86 ADA |
+| `pool_manager` | 2,419 | 11.12 ADA |
+| **total for the compound path** | | **65.67 ADA** |
+
+⚠ **This is real money on mainnet**, unlike the preview equivalent. And it buys nothing until a loan
+exists there to compound.
