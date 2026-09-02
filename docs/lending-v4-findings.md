@@ -1630,3 +1630,105 @@ afterwards. The Aquarium node has been correctly pinned to it the whole time.**
 - **The one genuinely useful idea in the retracted work**: nothing in the suite compares the
   **shipped** registry's derivations against the **live** config datum. Worth adding as a real test
   (pin the live datum as a fixture and assert all 29 fields), which is the check §21.1 ran by hand.
+
+---
+
+## 22. The compound transaction's redeemer map — read at the DEPLOYED sha, and three index spaces (2026-09-02)
+
+Slice-3 groundwork. **Every line below is `git show e0b818e:…`, never the working tree** — CCL trap 15,
+and the trap fired here in a benign way worth recording: §20.1 was written from the working tree at
+`bbe9c1a`. Re-read at `e0b818e`, `lm_compound_action.ak` and `pool_compound_action.ak` are
+**byte-identical** between the two commits, so §20.1 was right — *by luck, not by method*. The anchor
+is proven independently: `git show e0b818e:plutus.json` hashes to
+`a55a1c2e723a6d1222e464bb32adc1abe1d669ca6d00205d50459122adf7b98f`, exactly our vendored artefact.
+
+### 22.1 Why `general_spend` multiplies the redeemer count
+
+`general_spend` (deployed source) does almost nothing itself: with a datum present it only checks that
+**some withdrawal in the transaction is keyed to its `withdrawScriptHash`**. So every script UTxO the
+compound consumes drags in a withdraw-0 invocation to authorise it, and the four spends become four
+*pairs*. This is why "six scripts" understates the shape.
+
+| spent UTxO | at credential | authorised by a withdrawal at |
+|---|---|---|
+| the escrow | `assetManagerSpendScriptHash` | `assetManagerWithdrawScriptHash` |
+| the lender bond | `lenderManagerSpendScriptHash` | `lenderManagerWithdrawScriptHash` |
+| the pool | `poolSpendScriptHash` | `poolPolicyId` |
+| the pool manager | `poolManagerSpendScriptHash` | `poolManagerPolicyId` |
+
+Each spend's own redeemer is the unit `Constr0[]` (`d87980`) — `general_spend` ignores it.
+
+### 22.2 The seven withdrawals
+
+All at amount 0. Types from `lib/fluidtokens/types/*` at `e0b818e`.
+
+| id | script | redeemer |
+|---|---|---|
+| **a** | `assetManagerWithdrawScriptHash` | `AssetManagerWithdrawRedeemer{configRefInputIndex}` |
+| **b** | `lenderManagerWithdrawScriptHash` | `LenderManagerWithdrawRedeemer{configRefInputIndex, action: Compound}` |
+| **c** | `lmCompoundActionScriptHash` | `LMCompoundWithdrawRedeemer{configRefInputIndex, poolIds, poolInputIndexes, lenderBondInputIndexes}` |
+| **d** | `poolPolicyId` | `PoolWithdrawRedeemer{configRefInputIndex, action: Compound}` |
+| **e** | `poolCompoundActionScriptHash` | `PoolCompoundActionWithdrawRedeemer{configRefInputIndex, actionsForEachInput: [CompoundData{poolId}]}` |
+| **f** | `poolManagerPolicyId` | `PoolManagerWithdrawRedeemer{configRefInputIndex, action: CompoundLiquidity}` |
+| **g** | `pmCompoundLiquidityScriptHash` | `CompoundLiquidityActionWithdrawRedeemer{poolWithdrawRedeemerIndex, lenderManagerWithdrawRedeemerIndex}` |
+
+`assetManager.withdraw` is the mild one: for a token-owned escrow it only requires that **some input
+carries the `ownerAsset`** — satisfied because the lender bond is spent. `pm_compound_liquidity`
+authorises nothing of its own and gates purely on the action tags of **(d)** and **(b)** (D-17), which
+is why **(g)** must be able to point at them.
+
+### 22.3 ⛔ THREE INDEX SPACES, AND THEY ARE NOT INTERCHANGEABLE
+
+This is the likeliest defect site in the whole build, and the reason is that the word "index" means
+three different things in one transaction:
+
+| index field | indexes into | ordering that decides it |
+|---|---|---|
+| `configRefInputIndex` (a,b,c,d,e,f) | `self.reference_inputs` | **canonical** — sorted by `(txId, outputIndex)` |
+| `poolInputIndexes`, `lenderBondInputIndexes` (c) | the **FILTERED** lists from `get_inputs_from_smart_credential` | ledger input order, canonical, **then filtered** |
+| `poolWithdrawRedeemerIndex`, `lenderManagerWithdrawRedeemerIndex` (g) | `self.redeemers` | **canonical redeemer order** — by `(tag, index)` |
+
+**⚑ The three fail differently and none of them fails loudly.** A wrong reference index reads the wrong
+config and aborts; a wrong *filtered* input index pairs an escrow with the wrong bond, which is
+`lm_compound_action`'s own anti-double-satisfaction concern and returns false; a wrong *redeemer* index
+makes **(g)** validate the wrong sibling's action tag, which can still pass while authorising something
+nobody intended. **Only the third can be wrong and green.**
+
+**⇒ A filtered-list position is NOT a `tx.inputs` position.** Computing `lenderBondInputIndexes` by
+locating the bond in the transaction's input list is the natural implementation and it is wrong
+whenever any other input sorts between the filtered ones. The index must be computed **within the
+filtered projection**, reproducing `get_inputs_from_smart_credential`'s predicate exactly.
+
+**⇒ And (g)'s fields cannot be known before the body exists.** Redeemer positions depend on the final
+canonical ordering of every redeemer in the transaction. This is CCL trap 1's two-pass discipline
+applied to *redeemers* rather than outputs: build once to observe the ordering, then rebuild with the
+observed indexes, and **post-assert on the finished body** that each cited position really holds the
+redeemer it claims — matched by its script purpose, never by its data's shape (trap 14, which exists
+because `PoolWithdrawRedeemer` and `PoolManagerWithdrawRedeemer` are byte-indistinguishable).
+
+### 22.4 The two byte-identical restorations are a trap-4 problem
+
+`lm_compound_action` requires `builtin.equals_data(lenderBondInput.output, lenderBondOutput)` and
+`builtin.equals_data(poolManagerOutput, poolManagerInput.output)`, and `pool_compound_action` requires
+`equals_data(output.datum, input.output.datum)` for the pool.
+
+**⇒ The datums must be echoed as their ORIGINAL BYTES.** CCL trap 4: a decode→re-encode round trip is
+not byte-stable, because bytestrings over 64 bytes chunk and the chain accepts a chunking CCL will not
+reproduce. The bond, pool-manager and pool datums must be carried from the indexed UTxO's
+`inlineDatum` hex to the output untouched. Anything that parses them into a model and rebuilds is
+wrong even when every field is right.
+
+### 22.5 What the builder must therefore do
+
+1. Two passes: observe redeemer ordering, then rebuild with real indexes for **(g)**.
+2. Compute **(c)**'s indexes inside the filtered projection, not the raw input list.
+3. Echo three datums byte-for-byte; never re-encode.
+4. Place the compounding fee in an **explicit** output — no validator requires it, so a naive balance
+   donates it to the pool (§20.1).
+5. Wire a real evaluator and `ignoreScriptCostEvaluationError(false)` (trap 8/13). **Giovanni's risk
+   case — "exposure is the tx fee per execution" — is true only if the ex-units are measured.**
+   Placeholder ex-units move the exposure to the collateral, which is the one way that reasoning fails.
+6. Assert ex-units off the **built, deserialised** transaction, never off the evaluator's report.
+7. Guard coin selection so it cannot spend a reference-script UTxO (trap 9b), at **both** seams.
+8. Post-assert on the finished body: every cited index points at what it claims;
+   `collateral_return >= 0` (trap 16); no script both witnessed and referenced (trap 9).
