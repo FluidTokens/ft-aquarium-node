@@ -365,12 +365,34 @@ public class CompoundTransactionBuilder {
                 .filter(o -> request.changeAddress().equals(o.getAddress()))
                 .map(o -> o.getValue().getCoin())
                 .reduce(BigInteger.ZERO, BigInteger::add);
-        BigInteger net = toBot.subtract(lovelaceOf(request.walletUtxo().getAmount()));
+        // ⛔ The bot's contribution is read from the BUILT BODY, never from the nominated UTxO.
+        //
+        // Measured in production 2026-09-02: this assertion refused a correct transaction because it
+        // had assumed the nominated wallet input was the ONLY one. cardano-client-lib's coin
+        // selection had added 3,804,491 lovelace of further wallet inputs to cover the fee, the
+        // min-ada on the outputs and the withdrawal dummy — the bot's OWN money, returning as change.
+        // Conservation was intact and the pool had its full addedLiquidity; only the baseline was
+        // wrong. The offline rig had missed it because its wallet held one fat 20 ADA UTxO, so
+        // nothing extra was ever selected: the FIXTURE SUPPLIED WHAT PRODUCTION HAS TO EARN.
+        BigInteger fromBot = BigInteger.ZERO;
+        for (TransactionInput input : txn.getBody().getInputs()) {
+            Utxo spent = utxoSupplier.getTxOutput(input.getTransactionId(), input.getIndex())
+                    .orElseThrow(() -> refuse(Refusal.BOT_NET_MISMATCH,
+                            "input " + input.getTransactionId() + "#" + input.getIndex()
+                                    + " could not be resolved, so the bot's contribution cannot be "
+                                    + "accounted; refusing rather than assuming it was zero"));
+            if (request.changeAddress().equals(spent.getAddress())) {
+                fromBot = fromBot.add(lovelaceOf(spent.getAmount()));
+            }
+        }
+        BigInteger net = toBot.subtract(fromBot);
         BigInteger want = request.compoundingFee().subtract(txn.getBody().getFee());
         if (net.compareTo(want) != 0) {
             throw refuse(Refusal.BOT_NET_MISMATCH,
-                    "bot nets %s lovelace, expected %s (fee earned %s - tx fee %s)"
-                            .formatted(net, want, request.compoundingFee(), txn.getBody().getFee()));
+                    ("bot nets %s lovelace, expected %s (fee earned %s - tx fee %s). "
+                            + "It put in %s across its own inputs and got back %s")
+                            .formatted(net, want, request.compoundingFee(), txn.getBody().getFee(),
+                                    fromBot, toBot));
         }
 
         // 5. CCL trap 16: a negative collateral return is not a phase-1 rejection, it is an

@@ -1779,3 +1779,69 @@ landed on chain (2,819,867 / 964,770,147).
 and collateral adequacy are the ledger's and this rig is silent about every one of them. The builder's
 body assertions cover what they can; the rest is a phase-1 answer, which is free and has not been
 asked for yet.
+
+### 22.8 The first armed cycle: the guard was right, the expectation was wrong (2026-09-02)
+
+`95d87fa` went live and refused, deterministically, six cycles running:
+
+```
+BOT_NET_MISMATCH: bot nets 2325431, expected -1479060 (fee earned 0 - tx fee 1479060)
+```
+
+**The body was correct. The expectation was not.** Conservation bounds the answer, so it can be
+decomposed rather than guessed. With the pool receiving the whole `addedLiquidity` and both echoes
+byte-identical, `T = W − txFee`, hence `net = W − nominated − txFee`. Therefore
+
+```
+W − nominated = net + txFee = 2,325,431 + 1,479,060 = 3,804,491
+```
+
+⇒ **cardano-client-lib's coin selection had added 3,804,491 lovelace of FURTHER WALLET INPUTS** beyond
+the one nominated, to cover the fee, the outputs' min-ada and the withdrawal dummy. That is **the
+bot's own money returning as change**. Nothing belonging to the pool or the lender was ever at risk;
+the assertion's baseline — "the nominated UTxO is the only wallet input" — was simply false.
+
+**Reproduced offline to the lovelace.** Running the same build with a *thin* wallet selects two inputs
+and the pre-fix assertion reports `bot nets 2320261, expected -1484230` — the production failure, off
+by only the fee difference between two fixture wallets.
+
+> **⚑ Why the rig missed it, and it is this repo's own recorded failure shape.** The offline wallet
+> held **one fat 20 ADA UTxO**, so nothing extra was ever selected and the false baseline held by
+> accident. **The fixture supplied what production has to earn.** `CompoundAccountingTest` now runs the
+> wallet thin — which is what a real bot wallet looks like after it has been paying fees — and asserts
+> multi-input selection actually occurred, so the fixture cannot quietly stop exercising the thing.
+
+**The determinism is itself explained by the defect.** Six byte-identical refusals with the fee not
+moving by one lovelace: the wallet UTxO set cannot change while nothing ever submits, and CCL's
+selection is deterministic over a stable set. *A bot that never succeeds has a perfectly stable
+wallet.*
+
+**Fix:** the bot's contribution is now summed from the **built body's own inputs**, resolved through
+the `UtxoSupplier` and filtered to the change address — not from the nominated UTxO. An unresolvable
+input is a refusal, never an assumed zero.
+
+### 22.9 ⛔ AND THE TRANSACTION IS TOO BIG TO SUBMIT — seam 3, measured
+
+The refusal above was hiding a second, independent blocker that no cycle had reached:
+
+```
+built transaction   24,878 bytes
+max_tx_size         16,384        OVER BY 8,494
+inline validators   22,689        = 91% of the transaction
+```
+
+Eleven validators travel **inline** in the witness set. Even with the accounting fixed, this
+transaction is rejected at **phase 1** with `MaxTxSizeUTxO` — free and loud, nothing on chain, but it
+can never succeed as built.
+
+**Publishing the eleven as reference scripts** (its own slice) both fixes the size and pays for itself:
+
+| | |
+|---|---|
+| size fee saved | 998,316 (22,689 × 44) |
+| Conway ref-script fee added | 340,335 (22,689 × 15) |
+| **net fee saving** | **657,981 (~0.66 ADA per compound)** |
+| resulting size | ~2,189 bytes + reference-input overhead |
+
+⚠ And per CCL trap 9a, the *publishing* transactions are themselves under-fee'd by cardano-client-lib
+and need the `postBalanceTx` top-up — a known trap on the way in, not a surprise.
