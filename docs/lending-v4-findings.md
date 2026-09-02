@@ -1419,3 +1419,106 @@ transaction.
 > exactly like a protocol concept, and this one collided with two of them at once — the node's
 > *Scheduled Transactions* and v4's *installment* repayment mode. **The loan had `totalInstallments =
 > 0`.** Only the redeemer and the script hash are load-bearing; a string in a datum is a comment.
+
+---
+
+## 20. The repayment-escrow COMPOUND action: mapped, and unprofitable-by-configuration on preview (2026-09-02)
+
+Matteo Coppola Mazzetti (FluidTokens), relayed by Giovanni: *"Questo è l'azione di compound … hai la
+liquidità ferma nello smart contract … bisogna prenderla e raggiungerla alla pool del proprietario …
+Il bot prende una fee anche su questo."* This is a **different action** from §19.7's `Repay` and from
+the compound-liquidation variants of T-075/T-077. It is the action that collects the escrow §19.7
+found. Mapped here from the validators plus chain.
+
+### 20.1 What the transaction must do
+
+`lm_compound_action` (lender-manager withdraw) is the orchestrator. Per pool manager it:
+
+- reads **asset-manager** inputs, expecting `AssetManagerDatumWithToken{ownerAsset, …}` — the escrow;
+- reads the matching **lender bond** input, expecting `LenderManagerDatum{principalAsset, poolId, …}`;
+- requires `poolId != ""` (*"If `""`, no compounding allowed"* — a pool-less bond is permanently
+  uncompoundable, the §15 orphan shape again);
+- requires the **PoolManager NFT** and the **Pool NFT** to both carry `poolId` as their asset name —
+  `quantity_of(poolManagerInput.output.value, poolManagerPolicyId, poolId) == 1` and the same for the
+  pool. **This is exactly the pair T-070 already resolves.**
+- computes `compoundingFee = addedLiquidity * compoudingFeePerMille / 1000`, where
+  `compoudingFeePerMille` comes from the **`PoolManagerDatum`**;
+- constrains the pool output to `poolInput + (addedLiquidity − compoundingFee)` in the principal
+  asset, everything else equal.
+
+`pool_compound_action` (pool withdraw) independently enforces `addedPrincipal > 0`, an unchanged pool
+address and datum, and `authorize_action(datum.lenderAuth …)`.
+
+**⇒ THE BOT HOLDS NOTHING.** Both `lenderBondInputs` and the pool manager must be returned
+**byte-identical** to their inputs (`builtin.equals_data(lenderBondInput.output, lenderBondOutput)`,
+`builtin.equals_data(poolManagerOutput, poolManagerInput.output)`). The bot spends and restores them;
+ownership derives from `poolId` in the bond datum, never from anything the bot must own. *That is what
+makes this protocol-designed bot work rather than a privileged operation.*
+
+**Where the fee comes from — and it is a residue, not a payment.** No validator sends the bot
+anything. The pool is required to receive `addedLiquidity − compoundingFee`; the remaining
+`compoundingFee` is simply **not constrained**, so it stays in the transaction and lands wherever the
+builder puts it — the bot's own change. ⚠ **A builder that naively balances to the pool donates its
+own fee and no validator objects.** The fee must be an explicit output, not an accident of balancing.
+
+### 20.2 ⛔ It cannot be executed on preview today, for two independent reasons
+
+**(1) The escrow from §19.7 targets a BURNED pool.** Its lender bond (`bcd713bb…2e2048fc`, live, held
+at the LenderManager `dd2d7f3f…`) carries
+`poolId = 001183812fdf3b07179ef385658e776a99b5477e7e54b8707112061ca5`. Under `poolPolicyId a33aee40…`
+that asset's **quantity is 0**. Thirteen pools have existed; **exactly one is live**
+(`00d3513725536642b6fe985ce9ec87d1ebb880497d92e0a8495bc6d0bf`). The two `quantity_of(… ) == 1` checks
+are unsatisfiable for this escrow. **The 45,000,000 lovelace is not merely uncollected — its
+destination no longer exists.**
+
+Of the ten lender bonds at the LenderManager, **exactly one** points at the live pool (loan
+`e833a769ea3a4803…`). Every other one names a burned pool.
+
+**(2) 💀 THE FEE ON THE ONLY LIVE POOL IS ZERO.** Its `PoolManagerDatum` (utxo `1ad93a03…#1`) reads:
+
+```
+poolOwnerAuth         = Constr0[ea1bb1cc…]   (the config adminCredential — FluidTokens)
+compoudingFeePerMille = 0
+```
+
+⇒ `compoundingFee = addedLiquidity * 0 / 1000 = **0**`. **The bot would pay the transaction fee and
+earn nothing.** Matteo's *"il bot prende una fee"* is true of the protocol and false of this pool.
+
+> **⚑ The fee is neither protocol-fixed nor ours to choose — it is set by the POOL OWNER**, whose
+> `poolOwnerAuth` here is FluidTokens' own admin credential. Not a config value we can set, not a
+> number Giovanni can rule on, and not a constant. **On another pool, or on mainnet, it may be
+> nonzero — the mechanism is sound and only this instance is uneconomic.**
+
+### 20.3 What T-075 and T-077 do and do NOT cover
+
+**They do not cover this action.** T-075 measured `LiquidatePayInAdvanceAndCompound` — a *liquidation*
+variant whose economics are the collateral's mark-to-oracle value against a per-mille liquidation fee.
+T-077 pinned `LiquidateConvertAndCompound`, a hard-`False` stub. **This is `lm_compound_action`, a
+third action**: no collateral, no oracle, no liquidation — only escrowed principal moving into a pool.
+T-075's algebra (`C*(f/1000 − 1) >= txFee`, negative for any fee below 1000/1000) **does not carry
+over**, because the bot advances no principal here; its outlay is the transaction fee alone.
+
+**⇒ Economically this action is the FAVOURABLE one** — break-even needs only
+`addedLiquidity * feePerMille / 1000 >= txFee`, which at a realistic ~0.3 ADA fee and a 5‰ rate needs
+only ~60 ADA of escrow. **It fails today solely because that rate is 0**, which is a datum on someone
+else's UTxO rather than anything about the design. *T-075's conclusion and this one coincide in
+outcome and share no reasoning — worth keeping separate, because the next pool could change this one
+and nothing could change T-075's.*
+
+### 20.4 The stale derivation (§19.3) is squarely on the critical path
+
+Every credential this action needs is among the 19 that moved: `poolCompoundActionScriptHash` (25),
+`poolManagerSpendScriptHash` (26), `poolManagerPolicyId` (27), `poolSpendScriptHash` (8),
+`poolPolicyId` (2), `assetManagerSpendScriptHash` (15). **A builder written against today's derivation
+would target scripts that do not exist.** §19.3 must be fixed before any compound builder can be
+written, not after.
+
+**Candidate-commit hunt, first pass (2026-09-02).** `ft-cardano-loans-v5` **is the same repository as
+v4** — `git ls-remote` returns byte-identical ref lists for both, so the v5 name is a mirror and offers
+no newer source. Across 22 branches, the committed `plutus.json` was fingerprinted: **only `main`/HEAD
+(`e0b818e`) matches our vendored artefact** (`sha256 a55a1c2e…`), and that is the one already proven
+NOT to derive the live hashes. **21 distinct candidate blueprints remain**, none yet derived —
+derivation needs the Java registry harness, and comparing fingerprints cannot substitute for it. Two
+hypotheses stay open and must both be tested rather than assumed: the deployment was built from **one
+of those branches**, or from **uncommitted state** (in which case byte-identical re-vendoring is
+impossible and this is blocked on FluidTokens).
