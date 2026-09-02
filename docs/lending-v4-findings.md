@@ -1236,7 +1236,16 @@ against FluidTokens' preview deployment would be a hostile act, not a test.**
 
 ---
 
-## 19. ⛔ A FIFTH DEPLOYMENT IS LIVE, the config policy id DID NOT CHANGE, and the bot is blind to every loan (measured 2026-09-01)
+## 19. The 2026-09-01 transaction decode (§19.1/19.2/19.7 stand — ⛔ §19.3–19.5 are RETRACTED, see §21)
+
+> # ⛔ RETRACTION NOTICE — READ BEFORE §19.3
+> **§19.3, §19.4 and §19.5 are WRONG and are retracted in full by [§21](#21).** They claimed a fifth
+> deployment, a stale vendored blueprint and a bot blind to every loan. **None of that is true.** The
+> comparison behind them put the **third** deployment's fixture registry against the **fourth**
+> deployment's live config — two different deployments, which differ by design. The shipped registry
+> derives the live config's hashes **exactly**. The original heading ("A FIFTH DEPLOYMENT IS LIVE …
+> the bot is blind to every loan") is preserved here only so the error is legible rather than tidied
+> away. **§19.1, §19.2 and §19.7 are chain facts and are unaffected.**
 
 **Trigger.** Giovanni pointed at preview tx
 `9088270f2d941354cb52594a33a6aba0dc29eb34a2d85fa6a852256d6ceefa59` (block 4,622,348,
@@ -1505,7 +1514,16 @@ else's UTxO rather than anything about the design. *T-075's conclusion and this 
 outcome and share no reasoning — worth keeping separate, because the next pool could change this one
 and nothing could change T-075's.*
 
-### 20.4 The stale derivation (§19.3) is squarely on the critical path
+### 20.4 ~~The stale derivation (§19.3) is squarely on the critical path~~ — ⛔ RETRACTED (see §21)
+
+> **This subsection is void.** It rested entirely on §19.3, which is retracted. There is **no**
+> derivation drift: the shipped registry derives `poolCompoundActionScriptHash`,
+> `poolManagerSpendScriptHash`, `poolManagerPolicyId`, `poolSpendScriptHash`, `poolPolicyId` and
+> `assetManagerSpendScriptHash` correctly today. **No re-vendor is needed and the candidate-commit
+> hunt below is moot** — it was hunting for a replacement the code does not need. §20.1–20.3 are
+> independent of this and stand. The text is kept for legibility.
+
+**Original text, void:**
 
 Every credential this action needs is among the 19 that moved: `poolCompoundActionScriptHash` (25),
 `poolManagerSpendScriptHash` (26), `poolManagerPolicyId` (27), `poolSpendScriptHash` (8),
@@ -1522,3 +1540,93 @@ derivation needs the Java registry harness, and comparing fingerprints cannot su
 hypotheses stay open and must both be tested rather than assumed: the deployment was built from **one
 of those branches**, or from **uncommitted state** (in which case byte-identical re-vendoring is
 impossible and this is blocked on FluidTokens).
+
+
+---
+
+## 21. ⛔ §19.3 WAS WRONG: there is no drift, no fifth deployment, and no re-vendor is needed (2026-09-02)
+
+**Giovanni: *"afaik there was no re-deployment."* He is right, and §19.3 was wrong.** This section
+retracts it, states the mechanism of the error, and carries the receipt he asked for.
+
+### 21.1 The measurement that settles it
+
+`LoanFixtures.shippedPreviewRegistry()` — the registry built from `application.yaml`'s preview
+profile, i.e. **what the image actually runs** — derives, against the live config datum:
+
+| field | shipped registry derives | live config publishes | |
+|---|---|---|---|
+| `loanPolicyId` | `2f1aa941f437e351…` | `2f1aa941f437e351…` | ✓ |
+| `loanSpendScriptHash` | `31e0dc1d75076e4f…` | `31e0dc1d75076e4f…` | ✓ |
+| `poolPolicyId` | `a33aee4034165f17…` | `a33aee4034165f17…` | ✓ |
+| `poolSpendScriptHash` | `bf8c4378bab7de15…` | `bf8c4378bab7de15…` | ✓ |
+| `requestPolicyId` | `39bef32eb5f696f6…` | `39bef32eb5f696f6…` | ✓ |
+| `requestSpendScriptHash` | `978934c46206696e…` | `978934c46206696e…` | ✓ |
+
+**6 of 6.** ⇒ **`loans-v4.plutus.json` is CORRECT. The bot is NOT blind. No re-vendor is needed and
+none should be attempted.**
+
+### 21.2 How the error was made, and why it looked so convincing
+
+§19.3 read `derivedHashes()` out of **`LoansContractDerivationTest`**, which is pinned to
+`CONFIG_POLICY_ID = c45d5306…` — **the THIRD deployment, deliberately.** `ShippedPreviewRegistryTest`
+says so in its own javadoc: *"the fixture registry is deliberately still the THIRD deployment — 25
+test files replay recorded third-deployment data through it."* Every derived credential hangs off the
+config policy id, so a third-deployment registry **must** produce different hashes from a
+fourth-deployment config. **That divergence is the design working, and it was read as the design
+broken.**
+
+> **⚑ THE LESSON, and it is the exact inverse of the one §19.4 drew.** §19.4 congratulated itself for
+> asking "do the hashes we DERIVE equal the hashes the config PUBLISHES?" — a good question. **The
+> error was not the question; it was never checking WHICH registry was answering it.** A comparison
+> is only as meaningful as the identity of its two sides, and *"derived"* was not one thing: this repo
+> deliberately maintains **two** registries at different deployments. **I compared a value to a
+> constant without establishing that they were about the same object** — and then found the mismatch
+> so alarming that its size became evidence for it rather than a prompt to re-check the setup.
+> *19 of 23 fields differing should have read as "wrong baseline", not "catastrophe".*
+
+And the corroboration that felt strongest was the weakest: §19.5 cited §16 recording `2f1aa941` off a
+real transaction as proof of a contradiction. **§16 was simply right, and agreed with the shipped
+registry all along.** The only thing it contradicted was a fixture nobody claimed was current.
+
+**The 38 red tests are what they were always diagnosed as** — third-deployment fixture debt, an open
+decision that belongs to Giovanni. §19.5's *"a red suite is a disabled alarm"* was a real principle
+attached to a false instance; the redness was correctly attributed the whole time.
+
+### 21.3 The receipt: the config UTxO was created ONCE and never touched
+
+The config NFT is `d46f626f…706172616d6574657273` (asset name = ASCII **`parameters`**), quantity 1.
+
+```
+/assets/{asset}/history       →  1 entry:  minted in 8dd38e97…
+/assets/{asset}/transactions  →  1 entry:  8dd38e97…        ← its entire lifetime
+```
+
+| | |
+|---|---|
+| **tx** | `8dd38e97b79cc7c8a3c59400944b7cd9f724876a1d49ea17ffb5e49b3785091c` |
+| **block** | 4,590,589 |
+| **time** | **2026-08-21 10:13:44 UTC** |
+| **signed by** | `ea1bb1ccd33aeb9e02516c2eb50adbaa63d7b7538b03c96908bfc934` — sole `required_signer` **and** sole vkey witness |
+
+That signer **is** the `adminCredential` in the config datum's own field 1 — FluidTokens' admin, as
+expected. **There is no spend chain: the UTxO has never been spent, so there was no in-place update
+and no second config.** The datum has carried `loanPolicyId 2f1aa941…` and `loanSpendScriptHash
+31e0dc1d…` since the moment it was minted, and today's transactions use exactly those.
+
+**⇒ Plain gloss for the FluidTokens conversation: the preview lending config was created on
+2026-08-21 by the admin key and has not been modified since. Nothing was redeployed or re-pointed
+afterwards. The Aquarium node has been correctly pinned to it the whole time.**
+
+### 21.4 What still stands
+
+- **§19.1** — the 09-01 transaction closed its loan; nine loan NFTs minted, all nine burned; **zero
+  live loans.** Chain fact.
+- **§19.2 / §19.7** — `PerpetualLoan(28,5)`, action `Repay`, `isFinalRepayment: True`, no pool
+  touched. Chain fact.
+- **§20.1–20.3** — the compound action's mechanics, the **burned destination pool**, and
+  **`compoudingFeePerMille = 0`** on the only live pool. Independent of the retraction and unchanged:
+  those remain the real blockers.
+- **The one genuinely useful idea in the retracted work**: nothing in the suite compares the
+  **shipped** registry's derivations against the **live** config datum. Worth adding as a real test
+  (pin the live datum as a fixture and assert all 29 fields), which is the check §21.1 ran by hand.
