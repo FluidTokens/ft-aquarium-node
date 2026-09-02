@@ -1960,3 +1960,56 @@ CCL's coin selection picked that ada-only change as the compound's extra input, 
 
 *The bot's own past work is the source of both the escrows it now wants to compound and the small
 UTxOs it needs to compound them with.*
+
+### 22.15 ✅ THE BOT COMPOUNDED — `9ab95194…`, 2026-09-02 13:09:22Z
+
+**The wallet reshape was the last blocker. The bot did the rest by itself, one block later.**
+
+```
+tx              9ab95194e98a129eb417c9ad4ec77f54f28c9f3ca32a8475ec8f24affcd4af05
+block           4,625,217          2026-09-02 13:09:22Z
+valid_contract  TRUE
+redeemers       11                 four general_spend spends + seven withdraw-0
+size            10,637 bytes       against max_tx_size 16,384
+fee             1,060,617
+ex-units        mem 2,595,965      steps 945,031,023
+pool            395,750,000  ->  424,859,268     (+29,109,268 = the ENTIRE escrow)
+```
+
+**Every offline prediction held against the ledger:**
+
+| | predicted offline | on chain | |
+|---|---:|---:|---|
+| size | 10,414 | 10,637 | +223, and **the prediction was a deliberate under-estimate** (§22.12: placeholder ex-units encode smaller than real ones) — the error is in the direction the method promised |
+| ex-units mem | 2,584,485 | 2,595,965 | +0.44% |
+| ex-units steps | 941,698,975 | 945,031,023 | +0.35% |
+| pool delta | +29,109,268 | +29,109,268 | exact |
+| fee | 843,852 | 1,060,617 | higher: real ex-units cost more than placeholders, the same asymmetry |
+
+**The pool received the entire `addedLiquidity` and the bot kept nothing**, because
+`compoudingFeePerMille` is 0 on that pool. The bot paid 1,060,617 lovelace to do unpaid work — which
+is precisely what Giovanni's stated `-2000000` floor authorised, and what the safe default of 0 would
+have refused. **The armed loss is not a side effect of this run; it is the whole reason it happened.**
+
+### 22.16 The last blocker was a wallet with 9,898 ada in it
+
+Worth stating plainly, because the sequence is the lesson. The bot was correct, armed, and pointed at
+a real candidate for three consecutive images, and was stopped by, in order:
+
+1. `BOT_NET_MISMATCH` — a guard whose baseline was wrong (§22.8);
+2. `MaxTxSizeUTxO` waiting behind it, unreached (§22.9);
+3. `no ada-only wallet utxo is nominable` — **caused by the publication that fixed (2)** (§22.13).
+
+**Each fix uncovered the next blocker, and the third was self-inflicted.** None of the three was a
+defect in the compound logic, which evaluated correctly the first time it was built (§22.7) and
+worked unchanged on chain. *The transaction was never the hard part.*
+
+The reshape itself: one self-send `355e504c714213b358b8cda3e39c21c4100e71b63a6d566b0f2a8b6c02c22765`,
+producing one token-bearing output at its exact min-ada (1,176,630 + 20,000,000 tFLDT), five ada-only
+outputs of 20 ada, and ada-only change of 9,796,688,875. Fee 184,729.
+
+> **⚠ And the first dry run of that self-send built ONE output.** `mergeOutputs` defaults to **true**,
+> so six payments to one address collapse into one — a transaction that would have been valid, cheap,
+> and **exactly the state it was meant to repair**. Caught because the runner asserts the SHAPE of the
+> built body rather than trusting what it asked for. *A no-op is the hardest failure to notice,
+> because everything about it succeeds.*
