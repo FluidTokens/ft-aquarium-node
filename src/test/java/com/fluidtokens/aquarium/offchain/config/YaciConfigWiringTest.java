@@ -2,6 +2,7 @@ package com.fluidtokens.aquarium.offchain.config;
 
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
+import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import org.junit.jupiter.api.Test;
@@ -60,6 +61,56 @@ class YaciConfigWiringTest {
         assertTrue(evaluator instanceof TransactionEvaluator,
                 "the builder was given a " + evaluator.getClass().getName()
                         + " where a TransactionEvaluator was asked for");
+    }
+
+    /**
+     * ⛔ The COMPOUND builder's production bean, asserted the same way and for a sharper reason.
+     *
+     * <p>The operator's stated case for arming this path is that the exposure is the transaction fee
+     * per execution — nothing advanced, nothing acquired. <b>That sentence is true only while the
+     * ex-units are measured.</b> Placeholder ex-units move the exposure to the collateral, which is
+     * the one way the risk analysis becomes false, so this assertion is the thing keeping it true.
+     */
+    @Test
+    void theProductionCompoundBuilderBeanIsGivenAScriptCostEvaluator() throws Exception {
+        CompoundTransactionBuilder builder = new YaciConfig().compoundTransactionBuilder(
+                LoanFixtures.shippedPreviewRegistry(),
+                previewNetwork(),
+                LoanFixtures.utxoSupplier(List.of()),
+                LoanFixtures.protocolParams(),
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+
+        Field field = CompoundTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
+        field.setAccessible(true);
+        Object evaluator = field.get(builder);
+
+        assertNotNull(evaluator,
+                "YaciConfig built the compound transaction builder WITHOUT a script-cost evaluator. "
+                        + "Its redeemers would carry placeholder ex-units against a measured 2.58M mem / "
+                        + "941M steps, the mempool would accept it, and it would fail in phase 2 — "
+                        + "forfeiting collateral, and falsifying the risk case the path was armed on.");
+        assertTrue(evaluator instanceof TransactionEvaluator,
+                "the builder was given a " + evaluator.getClass().getName()
+                        + " where a TransactionEvaluator was asked for");
+    }
+
+    /**
+     * The compound builder must also be handed the BackendService, not a bare supplier trio: a
+     * transaction carrying reference scripts can only be priced by something that can fetch them
+     * (CCL trap 9), and the offline three-argument form cannot.
+     */
+    @Test
+    void theProductionCompoundBuilderCanReachAScriptSupplier() throws Exception {
+        CompoundTransactionBuilder builder = new YaciConfig().compoundTransactionBuilder(
+                LoanFixtures.shippedPreviewRegistry(), previewNetwork(),
+                LoanFixtures.utxoSupplier(List.of()), LoanFixtures.protocolParams(),
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+
+        Field field = CompoundTransactionBuilder.class.getDeclaredField("backendService");
+        field.setAccessible(true);
+        assertNotNull(field.get(builder),
+                "the compound builder holds no BackendService, so QuickTxBuilder gets the offline "
+                        + "three-argument form and cannot price a referenced script");
     }
 
     /**

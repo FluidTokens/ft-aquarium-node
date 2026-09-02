@@ -9,6 +9,7 @@ import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
@@ -79,6 +80,34 @@ public class YaciConfig {
         // as a reference script has to be fetchable by hash for the transaction to be priced.
         return new LiquidateTransactionBuilder(registry, network.getCardanoNetwork(), cardanoConverters,
                 bfBackendService, scriptCostEvaluator);
+    }
+
+    /**
+     * The compound builder, wired exactly as {@code liquidateTransactionBuilder} above and for the
+     * same reason (findings §20, §22).
+     *
+     * <p>⛔ <b>Without this bean the node does not start</b>: {@code CompoundExecutor} requires it, and
+     * {@code CompoundExecutor} exists whenever {@code loans.enabled=true} — which is the preview
+     * default. A builder that only ever existed in tests would have failed context startup on exactly
+     * the deployment operators run, while passing every test (the third-site hazard of CCL trap 9b,
+     * one layer up).
+     *
+     * <p>The evaluator is Blockfrost's {@code /utils/txs/evaluate}, narrowed to a lambda so what the
+     * builder holds can price a transaction and nothing else. <b>The operator's whole risk case for
+     * arming this path — "exposure is the transaction fee per execution" — is true only while the
+     * ex-units are measured</b>: placeholder ex-units move the exposure to the collateral (CCL trap 8).
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
+    public CompoundTransactionBuilder compoundTransactionBuilder(LoansContractRegistry registry,
+                                                                 AppConfig.Network network,
+                                                                 UtxoSupplier utxoSupplier,
+                                                                 ProtocolParamsSupplier protocolParamsSupplier,
+                                                                 BFBackendService bfBackendService) {
+        TransactionEvaluator scriptCostEvaluator =
+                (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
+        return new CompoundTransactionBuilder(registry, network.getCardanoNetwork(), bfBackendService,
+                utxoSupplier, protocolParamsSupplier, scriptCostEvaluator);
     }
 
     /**
