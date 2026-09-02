@@ -191,6 +191,13 @@ public class CompoundTransactionBuilder {
         List<TransactionInput> refInputs = canonical(List.of(
                 inputOf(request.configUtxo()), inputOf(request.lmConfigUtxo())));
         long configRefIndex = indexOf(refInputs, inputOf(request.configUtxo()), "main config");
+        // ⛔ A FOURTH WRINKLE ON §22.3: `configRefInputIndex` does not name the same config on every
+        // validator. lender_manager.withdraw resolves the LM CONFIG NFT from the index it is handed
+        // (it reads lmConfig fields 1..7 to pick the action script), while every other redeemer here
+        // resolves the MAIN config. Same field name, different reference input — and handing it the
+        // main config's index fails as a plain EvaluationFailure with nothing naming the cause.
+        // Found by the dry-eval, not by reading: withdraw index 4.
+        long lmConfigRefIndex = indexOf(refInputs, inputOf(request.lmConfigUtxo()), "lm config");
 
         // ⛔ self.redeemers positions. Computed, then re-derived from the finished body and compared
         // (assertStructure) — §22.3's one failure mode that can be wrong and still evaluate green.
@@ -199,7 +206,8 @@ public class CompoundTransactionBuilder {
         long lmWithdrawRedeemerIndex =
                 rewardRedeemerIndex(withdrawalOrder, registry.getLenderManagerWithdrawScriptHash());
 
-        ScriptTx tx = assemble(request, configRefIndex, poolWithdrawRedeemerIndex, lmWithdrawRedeemerIndex);
+        ScriptTx tx = assemble(request, configRefIndex, lmConfigRefIndex,
+                poolWithdrawRedeemerIndex, lmWithdrawRedeemerIndex);
 
         return complete(request, refInputs, tx,
                 (ctx, txn) -> assertStructure(txn, request, withdrawalOrder,
@@ -208,7 +216,7 @@ public class CompoundTransactionBuilder {
 
     // ---- assembly ---------------------------------------------------------------------------
 
-    private ScriptTx assemble(Request request, long configRefIndex,
+    private ScriptTx assemble(Request request, long configRefIndex, long lmConfigRefIndex,
                               long poolWithdrawRedeemerIndex, long lmWithdrawRedeemerIndex) {
         CompoundCandidate c = request.candidate();
         ScriptTx tx = new ScriptTx();
@@ -239,8 +247,9 @@ public class CompoundTransactionBuilder {
         // The seven withdrawals (§22.2). Order of addition is irrelevant — the ledger sorts them.
         tx.withdraw(rewardAddress(registry.getAssetManagerWithdrawScriptHash()), BigInteger.ZERO,
                 CompoundTxEncoder.assetManagerWithdraw(configRefIndex));
+        // ⛔ THE LM CONFIG, not the main one — see build().
         tx.withdraw(rewardAddress(registry.getLenderManagerWithdrawScriptHash()), BigInteger.ZERO,
-                CompoundTxEncoder.lenderManagerWithdraw(configRefIndex));
+                CompoundTxEncoder.lenderManagerWithdraw(lmConfigRefIndex));
         tx.withdraw(rewardAddress(registry.getLmCompoundActionScriptHash()), BigInteger.ZERO,
                 CompoundTxEncoder.lmCompound(configRefIndex, List.of(c.poolId()),
                         List.of(0L), List.of(0L)));
@@ -252,6 +261,24 @@ public class CompoundTransactionBuilder {
                 CompoundTxEncoder.poolManagerWithdraw(configRefIndex));
         tx.withdraw(rewardAddress(registry.getPmCompoundLiquidityScriptHash()), BigInteger.ZERO,
                 CompoundTxEncoder.compoundLiquidity(poolWithdrawRedeemerIndex, lmWithdrawRedeemerIndex));
+
+
+        // Every validator this transaction invokes travels INLINE in the witness set. CCL trap 13:
+        // a redeemer without its script is RequiredRedeemersMismatch, and an offline evaluator cannot
+        // fetch what is not there. Publishing these as reference scripts would cut the size and is a
+        // later, separate decision — inline is the library default and needs no coordinate to verify.
+        tx.attachSpendingValidator(registry.getAssetManagerSpendScript());
+        tx.attachSpendingValidator(registry.getLenderManagerSpendScript());
+        tx.attachSpendingValidator(registry.getPoolSpendScript());
+        tx.attachSpendingValidator(registry.getPoolManagerSpendScript());
+
+        tx.attachRewardValidator(registry.getAssetManagerScript());
+        tx.attachRewardValidator(registry.getLenderManagerScript());
+        tx.attachRewardValidator(registry.getLmCompoundActionScript());
+        tx.attachRewardValidator(registry.getPoolScript());
+        tx.attachRewardValidator(registry.getPoolCompoundActionScript());
+        tx.attachRewardValidator(registry.getPoolManagerScript());
+        tx.attachRewardValidator(registry.getPmCompoundLiquidityScript());
 
         return tx;
     }
@@ -280,6 +307,11 @@ public class CompoundTransactionBuilder {
                         ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
                 .postBalanceTx(verify);
 
+        if (backendService == null) {
+            // CCL trap 2: offline, ReferenceScriptResolver walks every reference input looking for a
+            // script to fetch and NPEs on the missing supplier. The rigs hand scripts in explicitly.
+            context = context.withScriptSupplier(scriptHash -> java.util.Optional.empty());
+        }
         if (scriptCostEvaluator != null) {
             context = context.withTxEvaluator(scriptCostEvaluator);
         }

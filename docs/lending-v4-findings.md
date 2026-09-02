@@ -1732,3 +1732,50 @@ wrong even when every field is right.
 7. Guard coin selection so it cannot spend a reference-script UTxO (trap 9b), at **both** seams.
 8. Post-assert on the finished body: every cited index points at what it claims;
    `collateral_return >= 0` (trap 16); no script both witnessed and referenced (trap 9).
+
+### 22.6 Two corrections the dry-eval found that reading had missed (2026-09-02)
+
+**⛔ `configRefInputIndex` does not name the same config on every validator.** §22.2 lists six
+redeemers carrying that field and implies one meaning. It has two. `lender_manager.withdraw` resolves
+the **LM config** NFT from the index it is handed — it reads `lmConfig` fields 1..7 to pick which
+action script must also be withdrawing — while every other redeemer on this path resolves the **main**
+config. Handing redeemer **(b)** the main config's reference index fails as a bare
+`RedeemerError { tag: "Withdraw", index: 4, Machine(EvaluationFailure) }` with nothing naming the
+cause.
+
+> **⚑ A fourth index space, and the one that hides best**, because it is not a different *kind* of
+> index — it is the same kind pointing into the same list, meaning a different object. Reading the
+> field names could not distinguish it; only running the validators did. *The three-space table in
+> §22.3 was necessary and not sufficient.*
+
+**✅ And `repaymentPolicyId` IS derivable after all** — §20/§21's "conservatism" rests on a false
+premise. The live config's field 7 is `19d8576594820b4c94d3cb2c4010ca563c6ef7b2c31e5175d7f8ec6e`, which
+is exactly what the registry already derives as **`assetManagerWithdrawScriptHash`**: `asset_manager`
+is one validator serving as both a minting policy and a withdraw script, the Tier-1 "doubles as"
+shape. So `CompoundCandidateScanner`'s escrow-shape check can count repayment receipt NFTs properly and
+stop refusing an escrow that legitimately carries one. The refusal is a false negative and harms
+nothing today — the live candidate is ada-only — but the stated reason for it was wrong.
+
+### 22.7 Measured: the compound transaction evaluates
+
+Offline PlutusV3 evaluation of the real candidate `e833a769…` against the deployed validators, over
+the recorded escrow, bond, pool, pool manager and both configs (`CompoundDryEvalTest`):
+
+```
+Spend  0    39,533 mem     13,599,872 steps      Reward 0   285,607   100,716,946
+Spend  1    50,981         17,548,148            Reward 1   110,128    36,535,810
+Spend  3    45,257         15,574,010            Reward 2   620,492   237,620,266
+Spend  4    22,361          7,677,458            Reward 3    44,833    13,723,072
+                                                 Reward 4   120,939    38,911,971
+                                                 Reward 5   152,103    46,336,496
+                                                 Reward 6 1,092,251   413,454,926
+TOTAL  mem 2,584,485   steps 941,698,975   across 11 redeemers
+```
+
+Comfortably inside preview's `maxTxExMem` 17,500,000, and the same order as the liquidation that
+landed on chain (2,819,867 / 964,770,147).
+
+⚠ **What this does not prove** (CCL trap 11): fees, min-ada, value conservation, witness-set validity
+and collateral adequacy are the ledger's and this rig is silent about every one of them. The builder's
+body assertions cover what they can; the rest is a phase-1 answer, which is free and has not been
+asked for yet.

@@ -485,6 +485,16 @@ public class LoansContractRegistry {
         return scriptOf(pmCompoundLiquidityScriptHash);
     }
 
+    /** {@code general_spend} wrapping the asset manager — the credential repayment escrows sit at. */
+    public PlutusScript getAssetManagerSpendScript() {
+        return scriptOf(assetManagerSpendScriptHash);
+    }
+
+    /** {@code lender-manager/lm_compound_action} — the withdraw script that orchestrates a compound. */
+    public PlutusScript getLmCompoundActionScript() {
+        return scriptOf(lmCompoundActionScriptHash);
+    }
+
     private PlutusScript scriptOf(String scriptHash) {
         // Only the pool-manager family can be null here, and only when smartTokensSpendScriptHash was
         // absent so its hashes were never derived (see the constructor). Say so, rather than letting
