@@ -2864,3 +2864,73 @@ misprice the gate; calling it a loss would overstate it.
 **Unstarted at this boundary:** the `@ConfigurationProperties` binding and its startup validation; the
 `MARKET_SHADOW` veto and ladder renumber; the dump and its ex-units; the operator-docs change for
 indexed env vars; and everything §28.5 already listed for convert itself.
+
+---
+
+## 30. The convert outlay becomes a FLOOR, not a sum — and the ada-collateral gap, measured (2026-09-03)
+
+Giovanni's refinement to the §28.5 gate, first-hand: *"the margin must take into account for convert the
+ADA spent to interact with the DEX. So between batcher and tx fee you can round at 4 ada or 5 ada. No
+need to convert collateral token etc. As long as, at least at tx time, given the DOLLAR VALUE of the bot
+profit and on-chain costs to do the swap, the operator is net positive even PRE-CONVERSION."*
+
+### 30.1 ⛔ The suspected ada-collateral under-count: MEASURED, and it is not where it was thought to be
+
+The question raised was whether an **ada**-collateral convert also pays the batcher fee and a mandatory
+order ada, making the shipped `(ada ? 0 : 2.8M)` branch too generous. Read at `e0b818e`:
+
+```
+if collateralPolicyId == ada_policy_id {
+    quantity_of(minswapOrderOutput.value, collateralPolicyId, collateralAssetName)
+        == swappableCollateralAmount            ← for ada this IS the order's total lovelace
+}
+```
+
+**⇒ For an ada collateral the validator mandates NO extra ada whatsoever** — the order's entire lovelace
+is the swappable collateral. So `max_batcher_fee` of 700,000 comes out of the **swap input**, which is
+**the lender's proceeds, not the bot's wallet.** The `ada ? 0` branch is correct as a *measurement*.
+
+**But the concern behind the question was right even though the mechanism was not.** An ada-collateral
+convert's measured cost is a transaction fee and nothing else — under a lovelace, where a token
+collateral pays 2.8 ada. **A gate resting on measurement alone would wave through ada converts that pay
+barely more than a fee**, which is exactly what Giovanni's rounding is guarding against.
+
+### 30.2 The instrument: `max(measured, floor)`, never a sum
+
+```
+measuredOutlay = txFee + (collateral is ada ? 0 : 2_800_000)
+outlay         = max(measuredOutlay, loans.liquidation.convert.dex-cost-floor-lovelace)   # default 5_000_000
+```
+
+**A floor, not an addend, and the distinction is load-bearing.** Adding a batcher-fee term to the
+measurement would charge the batcher twice on a token collateral and would *falsely attribute* it on an
+ada one. **A floor captures the conservatism without asserting who pays what** — the honest instrument
+for a cost whose incidence is genuinely split between the bot and the lender's proceeds. The assessment
+records `measuredOutlay`, `dexCostFloor` and `outlay` separately, and `boundByDexCostFloor()` tells an
+operator that lowering the **floor**, not the transaction, is the lever on a refusal.
+
+Default `5_000_000` — the conservative end of Giovanni's "4 ada or 5 ada". Refused at startup when
+negative or unset, **on every network**: unlike the profit margin, a negative cost of doing work has no
+reading that expresses a deliberate operator choice. It is separable from
+`profit-margin-lovelace` and cannot contradict it: one says what the interaction costs, the other says
+how far above break-even the operator wants to be.
+
+### 30.3 "Dollar value" — and why no USD feed is needed
+
+His bar is *"given the dollar value of the bot profit and on-chain costs to do the swap, the operator is
+net positive"*. The gate compares the fee's **oracle value in lovelace** against **costs in lovelace**,
+and `OraclePriceFeed` is denominated in *lovelace per smallest token unit* — so **both sides carry the
+same ADA/USD factor and it cancels.** A lovelace comparison *is* his dollar comparison, exactly, with no
+USD oracle and no new external dependency (which would have been an escalation under the constitution).
+
+### 30.4 ⚑ And he has consciously ruled on the memo's objection
+
+§27 and §28.5 both flagged that crediting an unrealised token position at oracle price is the mirror of
+the pay-in-advance error. **Giovanni has now ruled that risk acceptable at tx time** — *"no need to
+convert collateral token etc … net positive even pre-conversion"* — with net-positive as the bar and the
+margin as his cushion above it. **The model is unchanged; what changed is that it is now a decision
+rather than an assumption**, which is the whole reason it was named in-class rather than buried.
+
+**Verification:** 15 tests. Four mutants on the new arithmetic, each killed: floor-as-sum (3 tests),
+floor-ignored (2), floor-as-cap (6), and the original drop-2.8-ada (2). Suite **96 files, 822 tests, 38
+failures, 22 skipped, 0 orphans** — failures and skips unchanged.

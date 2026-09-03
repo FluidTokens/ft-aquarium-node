@@ -723,10 +723,46 @@ public class AppConfig {
         @Value("${loans.liquidation.convert.profit-margin-lovelace:0}")
         private BigInteger profitMarginLovelace = BigInteger.ZERO;
 
+        /**
+         * ⛔ <b>The floor under what one DEX interaction is assumed to cost the operator, in
+         * lovelace.</b> Giovanni's ruling, 2026-09-03: <i>"the margin must take into account for
+         * convert the ADA spent to interact with the DEX. So between batcher and tx fee you can round
+         * at 4 ada or 5 ada."</i> Default {@code 5_000_000} — the conservative end of the figure he
+         * named.
+         *
+         * <p><b>A floor, not an addend, and that distinction is the whole design.</b> The gate charges
+         * {@code max(txFee + mandatoryOrderAda, this)}, so the measured components stay visible and the
+         * assessment records which one bound — while the gate can never be more optimistic than the
+         * operator's stated cost of touching a DEX.
+         *
+         * <p>⚑ <b>Why a floor rather than adding the batcher fee to the measurement.</b> Read at
+         * {@code e0b818e}: for an <b>ada</b> collateral the validator requires the order's total
+         * lovelace to equal {@code swappableCollateralAmount} exactly — <b>no extra ada at all</b> —
+         * so Minswap's {@code max_batcher_fee} of 700,000 comes out of the <em>swap input</em>, which
+         * is the lender's proceeds, not the bot's wallet. Adding it to the bot's outlay would be a
+         * false attribution. A floor captures Giovanni's conservatism <b>without asserting who pays
+         * what</b>, which is the honest instrument for a cost whose incidence is genuinely split.
+         *
+         * <p>It is separable from {@link #profitMarginLovelace} and cannot contradict it: this one says
+         * what the interaction costs, that one says how far above break-even the operator wants to be.
+         *
+         * <p>Refused at startup when negative, on any network — a negative cost floor is not a bound an
+         * operator can meaningfully state, it is a typo.
+         */
+        @Value("${loans.liquidation.convert.dex-cost-floor-lovelace:5000000}")
+        private BigInteger dexCostFloorLovelace = BigInteger.valueOf(5_000_000L);
+
         /** Test seam: {@code @Value} owns these in production. */
         public ConvertConfiguration(boolean enabled, BigInteger profitMarginLovelace) {
+            this(enabled, profitMarginLovelace, BigInteger.valueOf(5_000_000L));
+        }
+
+        /** Test seam: {@code @Value} owns these in production. */
+        public ConvertConfiguration(boolean enabled, BigInteger profitMarginLovelace,
+                                    BigInteger dexCostFloorLovelace) {
             this.enabled = enabled;
             this.profitMarginLovelace = profitMarginLovelace;
+            this.dexCostFloorLovelace = dexCostFloorLovelace;
         }
     }
 

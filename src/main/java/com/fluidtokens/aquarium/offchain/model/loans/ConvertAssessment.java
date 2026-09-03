@@ -23,7 +23,11 @@ import java.math.BigInteger;
  * @param orderAdaFunded   the {@code 2_800_000} lovelace {@code lm_liquidate_and_convert_action}
  *                         requires to accompany a NON-ada collateral in the Minswap order output,
  *                         and which leaves with the order; {@code 0} when the collateral is ada
- * @param outlay           {@code txFee + orderAdaFunded} — the ada the bot actually parts with
+ * @param measuredOutlay   {@code txFee + orderAdaFunded} — the ada this transaction demonstrably costs
+ * @param dexCostFloor     {@code loans.liquidation.convert.dex-cost-floor-lovelace}: the operator's
+ *                         stated minimum cost of one DEX interaction, covering the batcher fee whose
+ *                         incidence the measurement cannot attribute
+ * @param outlay           {@code max(measuredOutlay, dexCostFloor)} — what the gate charges
  * @param net              {@code feeValueLovelace - outlay}
  * @param floor            {@code loans.liquidation.convert.profit-margin-lovelace}
  */
@@ -33,12 +37,14 @@ public record ConvertAssessment(boolean approved,
                                 BigInteger feeValueLovelace,
                                 BigInteger txFee,
                                 BigInteger orderAdaFunded,
+                                BigInteger measuredOutlay,
+                                BigInteger dexCostFloor,
                                 BigInteger outlay,
                                 BigInteger net,
                                 BigInteger floor) {
 
     public static ConvertAssessment refused(ConvertExclusion why) {
-        return new ConvertAssessment(false, why, null, null, null, null, null, null, null);
+        return new ConvertAssessment(false, why, null, null, null, null, null, null, null, null, null);
     }
 
     /**
@@ -47,6 +53,15 @@ public record ConvertAssessment(boolean approved,
      * saying out loud in a decision log, because the operator can only ever authorise it by stating
      * a negative floor.
      */
+    /**
+     * True when the operator's stated DEX-cost floor, not this transaction's measured cost, is what the
+     * gate charged. Worth showing in a decision log: it tells an operator that lowering the floor —
+     * not the transaction — is the lever on this refusal.
+     */
+    public boolean boundByDexCostFloor() {
+        return outlay != null && measuredOutlay != null && outlay.compareTo(measuredOutlay) > 0;
+    }
+
     public boolean zeroFeeBond() {
         return liquidationFee != null && liquidationFee.signum() == 0;
     }

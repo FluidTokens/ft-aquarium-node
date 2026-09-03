@@ -37,9 +37,19 @@ class ConvertEconomicsTest {
                 BigInteger.valueOf(denominator), 0L, Long.MAX_VALUE);
     }
 
+    /**
+     * The DEX-cost floor is set to 0 here so each case exercises the figure it is about. The floor has
+     * its own tests below; leaving the shipped 5 ada in every case would make every other assertion a
+     * test of the floor instead.
+     */
     private static ConvertEconomics economics(boolean enabled, long floorLovelace) {
+        return economics(enabled, floorLovelace, 0L);
+    }
+
+    private static ConvertEconomics economics(boolean enabled, long floorLovelace, long dexCostFloor) {
         return new ConvertEconomics(
-                new AppConfig.ConvertConfiguration(enabled, BigInteger.valueOf(floorLovelace)),
+                new AppConfig.ConvertConfiguration(enabled, BigInteger.valueOf(floorLovelace),
+                        BigInteger.valueOf(dexCostFloor)),
                 network("preview"));
     }
 
@@ -134,7 +144,9 @@ class ConvertEconomicsTest {
         assertEquals(BigInteger.valueOf(4_000L), asAda.liquidationFee());
         assertEquals(BigInteger.valueOf(2_000_000L), asAda.feeValueLovelace());
 
-        assertEquals(BigInteger.ZERO, asAda.orderAdaFunded());
+        assertEquals(BigInteger.ZERO, asAda.orderAdaFunded(),
+                "read at e0b818e: for an ADA collateral the order's TOTAL lovelace must equal the "
+                        + "swappable amount, so the validator mandates no extra ada at all");
         assertEquals(BigInteger.valueOf(1_000_000L), asAda.net());
         assertTrue(asAda.approved(), "an ada collateral pays only the transaction fee");
 
@@ -146,7 +158,74 @@ class ConvertEconomicsTest {
         assertEquals(ConvertExclusion.NET_BELOW_FLOOR, asToken.exclusion());
     }
 
-    // ---- the floor -----------------------------------------------------------------------------
+    // ---- the DEX-cost floor, Giovanni's 4-5 ada -------------------------------------------------
+
+    /**
+     * ⛔ THE FLOOR IS A max(), NOT A SUM. Giovanni's ruling rounds the whole DEX interaction — batcher
+     * fee plus transaction fee — to 4 or 5 ada. Adding the floor to the measured cost would charge the
+     * batcher twice; taking the larger of the two charges it once and never less than he stated.
+     */
+    @Test
+    void theDexCostFloorBindsWhenTheMeasuredCostIsSmallerAndIsNeverAddedToIt() {
+        // Fee income 10_000_000 lovelace; measured cost is only the 1_000_000 tx fee.
+        ConvertEconomics gate = economics(true, 0, 5_000_000L);
+        ConvertAssessment a = gate.assess(true, BigInteger.valueOf(1_000_000L), 10L, true,
+                feed(1_000, 1), ADA);
+
+        assertEquals(BigInteger.valueOf(10_000_000L), a.feeValueLovelace());
+        assertEquals(BigInteger.valueOf(1_000_000L), a.measuredOutlay(), "what this tx demonstrably costs");
+        assertEquals(BigInteger.valueOf(5_000_000L), a.dexCostFloor());
+        assertEquals(BigInteger.valueOf(5_000_000L), a.outlay(),
+                "max(measured, floor) — a sum would be 6_000_000 and would charge the batcher twice");
+        assertEquals(BigInteger.valueOf(5_000_000L), a.net());
+        assertTrue(a.boundByDexCostFloor(), "the operator's floor bound this, not the transaction");
+    }
+
+    /**
+     * ⚑ And it closes the gap on an ADA collateral, which the measurement alone leaves wide open: such
+     * a convert carries no mandatory order ada, so its measured outlay is a transaction fee and
+     * nothing else — while the batcher still takes its cut out of the swap.
+     */
+    @Test
+    void anAdaCollateralIsGovernedByTheFloorBecauseItsMeasuredCostIsOnlyTheTxFee() {
+        // Fee worth 3_000_000; tx fee 500_000. Profitable on the measurement, refused under the floor.
+        ConvertEconomics gate = economics(true, 0, 5_000_000L);
+        ConvertAssessment a = gate.assess(true, BigInteger.valueOf(1_000_000L), 3L, true,
+                feed(1_000, 1), BigInteger.valueOf(500_000L));
+
+        assertEquals(BigInteger.valueOf(500_000L), a.measuredOutlay());
+        assertEquals(BigInteger.valueOf(5_000_000L), a.outlay());
+        assertEquals(BigInteger.valueOf(-2_000_000L), a.net());
+        assertFalse(a.approved(), "the measurement alone would have approved this at +2.5 ada");
+    }
+
+    /** A measured cost above the floor governs; the floor is a minimum, never a cap. */
+    @Test
+    void aMeasuredCostAboveTheFloorGovernsInstead() {
+        ConvertEconomics gate = economics(true, 0, 5_000_000L);
+        ConvertAssessment a = gate.assess(true, BigInteger.valueOf(1_000_000L), 10L, false,
+                feed(1_000, 1), BigInteger.valueOf(4_000_000L));
+
+        assertEquals(BigInteger.valueOf(6_800_000L), a.measuredOutlay(), "4 ada tx fee + 2.8 ada order");
+        assertEquals(BigInteger.valueOf(6_800_000L), a.outlay());
+        assertFalse(a.boundByDexCostFloor());
+    }
+
+    @Test
+    void aNegativeOrAbsentDexCostFloorIsRefusedOnEveryNetwork() {
+        for (String net : new String[]{"preview", "mainnet"}) {
+            var bad = new AppConfig.ConvertConfiguration(true, BigInteger.ZERO, BigInteger.valueOf(-1L));
+            assertThrows(IllegalStateException.class,
+                    () -> new ConvertEconomics(bad, network(net)).announceAndGuard(),
+                    "a negative cost of doing work is a typo, not a bound an operator can state");
+
+            var unset = new AppConfig.ConvertConfiguration(true, BigInteger.ZERO, null);
+            assertThrows(IllegalStateException.class,
+                    () -> new ConvertEconomics(unset, network(net)).announceAndGuard());
+        }
+    }
+
+    // ---- the margin floor -----------------------------------------------------------------------
 
     @Test
     void theFloorIsInclusiveOnItsExactValueAndRefusesOneLovelaceBelow() {
@@ -218,5 +297,7 @@ class ConvertEconomicsTest {
         assertTrue(fresh.isEnabled(), "convert defaults ON per Giovanni's ruling; a field left false "
                 + "would make every non-Spring construction disagree with application.yaml");
         assertEquals(BigInteger.ZERO, fresh.getProfitMarginLovelace());
+        assertEquals(BigInteger.valueOf(5_000_000L), fresh.getDexCostFloorLovelace(),
+                "the conservative end of Giovanni's \"4 ada or 5 ada\"");
     }
 }

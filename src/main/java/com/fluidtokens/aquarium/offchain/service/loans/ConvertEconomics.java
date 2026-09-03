@@ -24,10 +24,22 @@ import java.math.BigInteger;
  * proceeds (findings §25.2). Reusing that number here would be the same category error in reverse,
  * so nothing is carried over.
  *
- * <h2>⛔ What the bot actually spends — and the one figure that is easy to miss</h2>
+ * <h2>⛔ What the bot actually spends — measured, then floored</h2>
  * <pre>
- *   outlay = txFee + (collateral is ada ? 0 : 2_800_000)
+ *   measuredOutlay = txFee + (collateral is ada ? 0 : 2_800_000)
+ *   outlay         = max(measuredOutlay, loans.liquidation.convert.dex-cost-floor-lovelace)
  * </pre>
+ * The floor is Giovanni's ruling of 2026-09-03: <i>"the margin must take into account for convert the
+ * ADA spent to interact with the DEX. So between batcher and tx fee you can round at 4 ada or 5
+ * ada."</i> Default 5,000,000 — the conservative end of what he named.
+ *
+ * <p><b>A floor rather than an addend, and the reason is a measurement.</b> Read at {@code e0b818e}:
+ * for an <b>ada</b> collateral the validator requires the order's <em>total</em> lovelace to equal
+ * {@code swappableCollateralAmount} — no extra ada whatsoever — so Minswap's {@code max_batcher_fee}
+ * of 700,000 comes out of the <b>swap input</b>, which is the lender's proceeds and not the bot's
+ * wallet. Adding it to the bot's outlay would be a false attribution; refusing to account for it at
+ * all would be optimistic. <b>A floor captures the conservatism without asserting who pays what</b>,
+ * and the assessment records both figures so an operator can see which one bound.
  * The second term is the validator's, read at the deployed sha {@code e0b818e}: when the collateral
  * is <b>not</b> ada, {@code lm_liquidate_and_convert_action} requires
  * {@code quantity_of(minswapOrderOutput.value, "", "") == 2800000} — the order output must carry
@@ -37,7 +49,7 @@ import java.math.BigInteger;
  * transaction fee and would dominate any model that omitted it. When the collateral IS ada the
  * validator constrains the order's lovelace to the swappable amount alone and there is no extra term.
  *
- * <p>⚠ <b>Provenance, stated rather than assumed:</b> this counts the whole 2.8 ada as the bot's,
+ * <p>⚠ <b>Provenance, stated rather than assumed:</b> the measurement counts the whole 2.8 ada as the bot's,
  * which is the conservative reading. The loan input carries its own min-ada and it is not yet
  * measured how much of it {@code loan_claim_action} lets flow into the order output. If a later
  * measurement shows the loan funds part of it, this gate gets <em>less</em> strict, never more —
@@ -101,9 +113,19 @@ public class ConvertEconomics {
     void announceAndGuard() {
         BigInteger floor = configuration.getProfitMarginLovelace();
         log.info("CONVERT ECONOMICS enabled={} (default ON: this path fronts no capital and holds "
-                        + "nothing); profit-margin={} lovelace, which the oracle value of the "
-                        + "collateral-denominated liquidation fee less (txFee + order ada) must reach",
-                configuration.isEnabled(), floor);
+                        + "nothing); dex-cost-floor={} lovelace, profit-margin={} lovelace. The oracle "
+                        + "value of the collateral-denominated liquidation fee, less "
+                        + "max(txFee + order ada, dex-cost-floor), must reach the margin.",
+                configuration.isEnabled(), configuration.getDexCostFloorLovelace(), floor);
+
+        BigInteger dexFloor = configuration.getDexCostFloorLovelace();
+        if (dexFloor == null || dexFloor.signum() < 0) {
+            // Not a bound an operator can meaningfully state — a negative cost of doing work is a typo,
+            // and unlike the margin there is no reading of it that expresses a deliberate loss.
+            throw new IllegalStateException(("loans.liquidation.convert.dex-cost-floor-lovelace is %s; "
+                    + "it is the assumed cost of one DEX interaction and cannot be negative or unset")
+                    .formatted(dexFloor));
+        }
 
         if (floor == null || floor.signum() >= 0) {
             return;
@@ -169,14 +191,18 @@ public class ConvertEconomics {
         }
 
         BigInteger orderAda = collateralIsAda ? BigInteger.ZERO : ORDER_ADA_FOR_TOKEN_COLLATERAL;
-        BigInteger outlay = txFee.add(orderAda);
+        BigInteger measuredOutlay = txFee.add(orderAda);
+        BigInteger dexCostFloor = configuration.getDexCostFloorLovelace();
+        // max(), never sum: the floor already covers the batcher fee, so adding it would double-count.
+        BigInteger outlay = measuredOutlay.max(dexCostFloor);
         BigInteger net = feeValue.subtract(outlay);
         BigInteger floor = configuration.getProfitMarginLovelace();
         boolean approved = net.compareTo(floor) >= 0;
 
         return new ConvertAssessment(approved,
                 approved ? null : ConvertExclusion.NET_BELOW_FLOOR,
-                liquidationFee, feeValue, txFee, orderAda, outlay, net, floor);
+                liquidationFee, feeValue, txFee, orderAda, measuredOutlay, dexCostFloor, outlay,
+                net, floor);
     }
 
     /**
