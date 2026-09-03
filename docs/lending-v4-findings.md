@@ -2658,47 +2658,80 @@ than a fixture's. **This should be the first mainnet posture for convert**, not 
 
 ### 29.1 The shape — a YAML object list, superseding the delimited string
 
+*Refined within the hour by Giovanni, and the refinement is the important part: **`mode` is the
+EXECUTION STATE, not the action.** An earlier draft folded shadow into the action as a flag; he
+separated arming from strategy, which is right — they are independent questions and a shape that
+conflates them cannot express "shadow the anticipate path".*
+
 ```yaml
 loans:
   liquidation:
     markets:
       - unit: lovelace          # "lovelace", or policyIdHex + assetNameHex
-        active: true            # default true; false is the ONLY off state
-        mode: convert           # convert | anticipate ; default convert
-        shadow: false           # default false; orthogonal to mode
-        cap: 500000000          # MANDATORY iff mode: anticipate, ignored otherwise
+        mode: SHADOW            # DISABLED | SHADOW | LIVE — execution state
+        action: CONVERT         # CONVERT | ANTICIPATE — strategy; default CONVERT
+        cap: 1000000000         # MANDATORY iff action: ANTICIPATE, meaningless otherwise
 ```
 
 Every attribute is **named**, so nothing is positional and nothing is inferred from token order. "A cap
 with no mode" and "500000000 read as a mode" stop being parse hazards and become unrepresentable.
+**In particular `action` is never inferred from the presence of `cap`** — that would reintroduce
+positional guessing in a shape whose whole purpose is to kill it.
 
-**Four design questions, resolved:**
+**Five design questions, resolved:**
 
-**① `active: false` IS the off state — there is no `off` mode.** An `active` boolean *and* an `off`
-mode is the two-knobs-that-can-disagree problem in miniature, and the answer to
-`active: false, mode: convert` would be a coin-flip. `mode` is read **only when `active` is true**.
+**① `mode` and `action` are orthogonal, and both are needed.** `mode` answers *may this market act*;
+`action` answers *which transaction it would build*. Neither is derivable from the other: shadowing an
+anticipate market and arming a convert one are both meaningful, and so is their inverse.
 
-**② `shadow` is a FLAG, not a mode.** Shadow must know *which* transaction it is rehearsing — convert
-and anticipate build different ones — so it is orthogonal by construction:
-`mode: convert, shadow: true` means *build the convert transaction, evaluate it, dump it unsigned, do
-not submit*. Making shadow a mode would have forced compound tokens (`shadow-convert`) and made
-"shadow with no action" expressible, which is exactly the state that has no meaning.
+**② `DISABLED` is the off state, and there is no separate `active` boolean.** An `active` flag *and* a
+`DISABLED` mode would be two knobs that can disagree — the answer to `active: false, mode: LIVE` would
+be a coin flip.
 
-**③ `cap` is mandatory iff `mode: anticipate`**, ignored otherwise, and the §29.4 semantics are
-unchanged.
+**③ ⛔ The mode vocabulary is the GLOBAL one reused, not a new spelling — `DISABLED | SHADOW | LIVE`.**
+Giovanni wrote `SHADOW | ARMED` and delegated the naming (*"or whatever"*), and two things argue
+against `ARMED` specifically:
+- **`armed` already means something else here.** `loans.liquidation.enabled` is the node's arming flag
+  and `LiquidationConfiguration.isArmed()` reads it. A per-market `ARMED` would put two unrelated
+  "armed"s in one subsystem.
+- **Reusing `LiquidationConfiguration.Mode` makes the composition rule below a literal `min`**, because
+  that enum is *already declared* in the order `DISABLED, SHADOW, LIVE`. One vocabulary at both scopes,
+  and the safety rule falls out of the type instead of being enforced by hand.
 
-**④ An unlisted market is `active: true, mode: convert, shadow: false`.** An absent or empty list
-means *every market converts*; listing a market is how an operator **deviates**. That is Giovanni's
-ruling — convert fronts no capital and its failure mode is a no-op (§28.3) — and it preserves
-pay-in-advance's opposite default, which still needs an explicit entry naming both the mode and a cap.
+His intent is preserved exactly; only the spelling differs, and it is a one-line change if he prefers
+his own.
 
-**⚑ And the object shape buys a real safety improvement the string could not.** Under the string
-grammar a malformed entry had to resolve to *off*, because a half-parsed token could not be
-distinguished from a typo. With named fields a broken entry is unambiguous — `mode: anticipate` with
-no `cap`, an unknown `mode`, a `unit` that is neither `lovelace` nor a well-formed hex unit — so it
-**aborts startup**, matching the precedent `LiquidationConfiguration.parseMode()` already sets. This
-is gated behind `loans.enabled`, so a typo can never refuse to start a production mainnet node that
-does not run the bot.
+**④ ⛔ THE GLOBAL MODE IS A CEILING, NOT A DEFAULT — a market may be more restrictive, never less.**
+
+```
+effective(market) = min(loans.liquidation.mode, market.mode)      DISABLED < SHADOW < LIVE
+```
+
+This is the load-bearing safety rule of the whole design. Without it, `mode: LIVE` on one market would
+let a node whose global posture is `shadow` **submit** — making the node-level dial a lie, and that dial
+is what 23 existing veto tests and every operator rely on. With it, **no per-market value can ever
+loosen a node-level safety setting**, which is the only property that makes per-market arming safe to
+ship at all. ⚠ The clamp must be **logged loudly at boot** — an operator who wrote `LIVE` and got
+`SHADOW` must be told, or they will believe they armed a market they did not.
+
+**⑤ An UNLISTED market inherits the global posture — so you never have to list a market to shadow it.**
+Its defaults are `mode:` *(the global mode)*, `action: CONVERT`, no cap. **`loans.liquidation.mode:
+shadow` therefore shadows every market with no list at all**, which matters because shadow is convert's
+only mainnet rehearsal (§29.5): needing to enumerate markets before rehearsing would make the rehearsal
+cost proportional to the market count. A per-market `mode` exists to **deviate** — arm one market while
+the rest shadow, or hold one market back while the rest are live.
+
+⚠ **And one scope limit worth stating before an operator assumes otherwise: `action` partitions only the
+`shouldLiquidationConvertToPrincipal == True` class.** A loan whose bond forbids conversion gets plain
+`Liquidate` whatever the market says — the lender picks the class, the operator picks the mechanism
+within it (§27).
+
+**⚑ The object shape buys a real safety improvement the string could not.** Under the string grammar a
+malformed entry had to resolve to *off*, because a half-parsed token could not be distinguished from a
+typo. With named fields a broken entry is unambiguous — `action: ANTICIPATE` with no `cap`, an unknown
+`mode`, a `unit` that is neither `lovelace` nor a well-formed hex unit — so it **aborts startup**,
+matching the precedent `LiquidationConfiguration.parseMode()` already sets. This is gated behind
+`loans.enabled`, so a typo can never refuse to start a production mainnet node that does not run the bot.
 
 **⇒ The 5a23cc4 string form simply ceases to exist.** There is no old value to reinterpret, so the
 behaviour-change hazard §28.4 flagged is gone — a clean structure replaces it rather than shadowing it.
@@ -2764,9 +2797,15 @@ first would be the two-knobs problem at a larger scale.** What exists today:
 
 **⇒ Per-market shadow extends this; it does not duplicate it.** Three additions, and no new mechanism:
 
-1. **One new veto, `MARKET_SHADOW`**, inserted after `S3 NETWORK_NOT_PREVIEW` and before
+1. **One new veto, `MARKET_NOT_LIVE`**, inserted after `S3 NETWORK_NOT_PREVIEW` and before
    `S4 NOT_PROFITABLE` — policy vetoes before candidate vetoes, so an operator on a live node reads
-   the real reason rather than a downstream symptom. S4–S8 renumber to S5–S9.
+   the real reason rather than a downstream symptom. S4–S8 renumber to S5–S9. Its detail names
+   **which scope decided**, since the effective mode is a clamp: the market asked for `SHADOW`, or the
+   global ceiling held it there.
+   ⚠ **`DISABLED` is NOT this veto.** A disabled market refuses *before* the build, the way
+   `MARKET_DISABLED` does today — there is nothing to rehearse. `SHADOW` is precisely the state that
+   builds and then stops, which is the whole distinction: **shadow shows you the transactions that
+   would have gone.**
 2. **The dump**, at INFO on a stable greppable prefix: candidate id, variant (which action was
    shadowed), the decision arithmetic (income / outlay / margin), **the per-redeemer ex-units**, size,
    and the **unsigned CBOR hex** on its own line so a grep can separate metadata from payload.
@@ -2792,6 +2831,35 @@ so rather than leaving an operator to infer it:
 - **Mainnet shadow is nonetheless the strongest rehearsal this project can build**, because the
   protocol parameters, the UTxOs and the ex-units are all the chain's. The offline rig's parameters are
   a fixture's, and trap 7 measured that library cost models drift *low* — the dangerous direction.
+
+### 29.7 ⇒ WHEN to force anticipate — answered by the protocol author, and it validates the shape
+
+Giovanni asked FluidTokens directly *"when should the bot pay in advance instead of always using
+Minswap?"* Matteo: **for all tokens that do not have a reliable pool on Minswap, because the order must
+always deliver at least the minimum the lender expects.**
+
+That is §27's reasoning confirmed from the source. `minimum_receive` is fixed on chain at
+`remainingDebt` (§25.2), so a pool too thin to deliver the debt means the order **will not fill** —
+convert is not merely worse there, it does not complete.
+
+**⇒ Pool reliability is a per-token property and it is the OPERATOR'S judgement.** So
+`action: ANTICIPATE` on a market is exactly the sentence *"this token has no pool I trust — take the
+capital route here"*, and every unlisted or `CONVERT` market takes the swap. **This validates two
+choices already made rather than changing them:** keying markets per unit, and making anticipate a
+per-market override rather than a global toggle.
+
+**⛔ No automatic pool-depth detection, and no runtime fallback from convert to anticipate.** It would
+need a pool-depth oracle this project deliberately does not have, and it is unnecessary: a mis-set
+convert market **self-corrects into a refund**, not a loss. If Giovanni later wants auto-routing it is a
+question to raise, not scope to assume.
+
+⚠ **One correction to the gloss that came with this, because the sign matters.** It is tempting to say a
+non-filling order means "the bot spent 2.8 ada and a fee for a no-op". **It does not.** The liquidation
+fee is subtracted *before* the swap and stays with the bot either way, so **the bot's position is
+identical whether the order fills or not** (§28.3) — the 2.8 ada is a cost it already paid for a fee it
+already holds. What differs on a non-fill is the **lender's** outcome: they get their collateral back
+rather than their principal. Calling that a no-op *for the bot* would understate what the bot keeps and
+misprice the gate; calling it a loss would overstate it.
 
 **Unstarted at this boundary:** the `@ConfigurationProperties` binding and its startup validation; the
 `MARKET_SHADOW` veto and ladder renumber; the dump and its ex-units; the operator-docs change for
