@@ -4565,3 +4565,99 @@ any wall-clock reason, and it buys **an offline proof for pay-in-advance that st
 re-capture. Those two (6 failures) are honestly **live-only or historical**: either re-founded on a
 fourth-deployment loan someone creates, or kept as a record of a deployment that is gone. **That is a
 classification, not a fix, and it is the honest half of this answer.**
+
+## 54. ⛔ THE MAINNET SHADOW RUN — one loan, liquidatable right now, and it defaults to the broken path (2026-09-03)
+
+Driven read-only against the live mainnet deployment by `MainnetShadowRunTest`, which runs the **real**
+`LiquidationCandidateScanner`, the **real** `LoanHealthService`, the **real** `FluidOracleClient` and
+the **real** `MarketGate` over the **real** population. No key, no wallet, no submit — the classes that
+could submit are not constructed at all.
+
+### 54.1 The population is ONE loan, and it is liquidatable today
+
+| | |
+|---|---|
+| live loan NFTs under this deployment's loan policy | **1** |
+| decoded as loans / unreadable / junk | 1 / **0** / 0 |
+| lender bonds joined | 1 |
+| loan | `d832b78e…#1` — the `§51` candidate, still unspent since origination |
+| principal / collateral | 20,000,000 lovelace against 100,000,000 FLDT |
+| remaining debt | 20,001,060 |
+| **current LTV** | **89.82 %** |
+| **liquidatable** | **TRUE** |
+| scanner verdict | **BUILDABLE** — fee 5,000,000 FLDT, equity 1,196,980 FLDT |
+
+**`unreadable == 0`**, so every `LOAN_NOT_FOUND` in a mainnet histogram is a settled loan and not a
+decoder gap (T-060's condition, met).
+
+### 54.2 ⚠ 2,451 lender bonds against 1 loan — and why that is NOT a flood
+
+The lender-bond policy is derived from an **integer index**, not from the config policy id, so it is
+**identical across every deployment and both networks**: 2,451 bonds have been minted under it on
+mainnet. The loan policy **is** parameterised, so it names exactly one deployment.
+
+⇒ **Enumerating bonds — which is what production does — could have counted a decade of unrelated
+FluidTokens history as this deployment's population.** It does not, and the reason is measured:
+sampled live bonds sit at ordinary **payment-key** addresses (header `0x01`) — settled bonds withdrawn
+to their lenders' wallets — while the lender-manager **spend** hash *is* parameterised by the config
+policy id. The node's credential filter therefore never sees them. Asserted, not assumed: the test
+checks every resolved loan and bond UTxO against `getLoanSpendScriptHash()` /
+`getLenderManagerSpendScriptHash()`, because a population read by *policy* that the node filters by
+*credential* is exactly the shape the preview redeploy took (§12).
+
+### 54.3 ⛔ THE LAUNCH-CRITICAL RESULT: the only mainnet candidate defaults to the one broken path
+
+The bond publishes `shouldLiquidationConvertToPrincipal = true`. **So plain `lm_liquidate_action` is
+not legal for this loan at all** — the executor's routing never reaches it. There are zero mainnet
+loans for which the plain path applies.
+
+| operator posture | effective mode | action | verdict |
+|---|---|---|---|
+| **shipped default** (`mode: disabled`) | DISABLED | CONVERT | REFUSED `MARKET_DISABLED` |
+| `mode: shadow`, market unlisted | SHADOW | **CONVERT** | REFUSED `MARKET_ACTION_IS_CONVERT` |
+| `mode: shadow`, market `action: ANTICIPATE`, cap 1000 ada | SHADOW | ANTICIPATE | **ALLOWED** |
+
+⇒ **An operator who arms this node on mainnet with no per-market configuration routes the only real
+candidate to `LiquidateAndConvert` — the path §51 proved cannot execute until FluidTokens repin their
+Minswap dependency.** The default is correct policy (convert fronts no capital) and is currently
+pointed at a dead path. **The one-line operator remedy is a market entry forcing `ANTICIPATE`**, and
+that is what belongs in the runbook before anything is armed.
+
+### 54.4 The anticipate path's real P&L, in the two currencies it lands in
+
+Taken from the **production** builder's `numbers()` and priced through the **production**
+`LoanFinance.toLovelace` on the live Charli3 `oracleFLDTC3` feed:
+
+```
+pays      : -20,887,781 lovelace   (convertedLoanCollateralToPrincipalAmount, fronted from the bot's own wallet)
+receives  : 100,000,000 FLDT, oracle-valued at 22,267,706 lovelace
+of which the bot's fee : 5,000,000 FLDT = 1,113,385 lovelace
+gross, PRE tx fee      : +1,379,925 lovelace
+```
+
+⚠ **The gain is earned in TOKENS, not ada** — the bot ends the trade holding 100M FLDT and ~20.9 ada
+poorer. Item 14 is ruled (accrue, no swap/sweep), so that is the intended end state; the number to
+watch is the operator's **ada** balance falling by ~20.9 per liquidation while the profit accrues in
+FLDT. **`required` is `convertedLoanCollateralToPrincipalAmount`, never `remainingDebt`** — the two
+differ here by 886,721 lovelace and the shadow harness took the production figure rather than
+re-deriving it.
+
+### 54.5 The compound path is structurally empty, and would pay nothing anyway
+
+Exactly one loan has ever been minted under this deployment and it has **never been burned**, so **no
+loan has ever been repaid and no escrow exists to compound**. That is stronger than an empty scan — an
+empty scan is also what blindness looks like, whereas a mint/burn count is a fact no indexing filter
+can hide.
+
+And the only live mainnet pool manager (`4d621995…#1`) publishes **`compoudingFeePerMille = 0`**, read
+live through the production decoder. Identical to the preview measurement of 2026-09-02: **the work
+pays nothing and is refused at the shipped margin of 0.**
+
+### 54.6 ⛔ What a mainnet shadow BUILD still needs, and it is not a flag
+
+`LiquidateTransactionBuilder` requires a **funded wallet UTxO** for the tx fee and the ledger
+collateral, and on the anticipate path that UTxO must also cover the ~20.9 ada fronted.
+
+⇒ **Shadow withholds the SUBMIT, not the WALLET.** Everything upstream of that wallet is proven above;
+producing and dumping actual mainnet transaction bytes needs a funded mainnet operator wallet, which is
+Giovanni's trigger and not something a shadow posture removes the need for.
