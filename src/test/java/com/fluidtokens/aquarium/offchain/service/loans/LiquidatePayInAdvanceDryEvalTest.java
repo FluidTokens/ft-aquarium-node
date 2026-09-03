@@ -853,7 +853,7 @@ class LiquidatePayInAdvanceDryEvalTest {
         assertNotNull(tx, "a feed with the margin still ahead of validTo must build");
     }
 
-    private record Fixture(Loan loan, Utxo loanUtxo, LenderBond bond, Utxo bondUtxo, OracleEntry oracle,
+    record Fixture(Loan loan, Utxo loanUtxo, LenderBond bond, Utxo bondUtxo, OracleEntry oracle,
                            LiquidatePayInAdvanceTransactionBuilder.Request request) {
     }
 
@@ -865,7 +865,7 @@ class LiquidatePayInAdvanceDryEvalTest {
         return new LenderManagerDatumConverter().deserialize(BOND_DATUM_HEX);
     }
 
-    private static Fixture fixture() {
+    static Fixture fixture() {
         LoanDatum datum = loanDatum();
         Utxo loanUtxo = LoanFixtures.utxo(LOAN_TX, LOAN_OUTPUT_INDEX, LOAN_ADDRESS, List.of(
                 Amount.lovelace(BigInteger.valueOf(LOAN_LOVELACE)),
@@ -932,7 +932,7 @@ class LiquidatePayInAdvanceDryEvalTest {
                 LoanFixtures.utxoSupplier(universe(fixture)), EvalFixtures.protocolParams());
     }
 
-    private static Transaction build(Fixture fixture) {
+    static Transaction build(Fixture fixture) {
         return builder(fixture).build(fixture.request());
     }
 

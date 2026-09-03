@@ -4661,3 +4661,116 @@ collateral, and on the anticipate path that UTxO must also cover the ~20.9 ada f
 ⇒ **Shadow withholds the SUBMIT, not the WALLET.** Everything upstream of that wallet is proven above;
 producing and dumping actual mainnet transaction bytes needs a funded mainnet operator wallet, which is
 Giovanni's trigger and not something a shadow posture removes the need for.
+
+## 55. S-sized hardening: what the oracle cadence and the anticipate wallet actually do (2026-09-03)
+
+Four S-items were worked in one pass. Two were assembly (§55.1); two produced measurements that
+corrected the expectation they were checking (§55.2, §55.3), and one of those ends at a design fork.
+
+### 55.1 S-10 / S-11 — rollout assets, and the coordinates re-verified
+
+`MainnetReferenceScriptsTest` turns §24's one-off manual verification into a repeatable one. **All
+eight named liquidation coordinates publish exactly the validator their key names**, and all eleven
+compound coordinates resolve as distinct validators of this deployment.
+
+**The asymmetry is the point.** The compound property is one unnamed list whose hashes the node reads
+off the chain, so a mislabelled coordinate there is *not expressible*. The liquidation property is
+eight keys **named for validators**, and — in `application.yaml`'s own words — *"a key named for a
+validator holds a COORDINATE, nothing checks the two agree."* **A correct coordinate filed under the
+wrong key is invisible to any hash check inside a single key**, so that pairing is what the test
+asserts, along with the key set equalling `LoansReferenceScriptVerifier`'s own.
+
+⚠ **And a trap found in passing: `derivedHashes()` is not "every hash the registry derives".** It is
+the set the ConfigDatum *publishes*, which is what `LoansConfigVerifier` cross-checks; two withdraw
+hashes are derived and deliberately absent from it, `asset_manager`'s among them. **Used as a
+membership oracle it rejects a correct coordinate as foreign** — measured, on `e5e5bab0…#0`.
+
+`docker/.env.example` was rewritten: it had gone stale in three ways that all mattered (it said
+PREVIEW ONLY, it said arming takes **two** changes when on mainnet it takes **four**, and it was
+missing the pay-in-advance key, the market list and the compound block entirely). And naming
+`LOANS_SUBMITTABLE_NETWORK` to operators exposed a gap: **nothing proved that variable binds.** Every
+existing test reaches the field through `setNetworkForTest` or a subclass — the rule, never the
+binding. `ArmingSwitchBindingTest` closes it through a real `SystemEnvironmentPropertySource`.
+**A switch that only a test seam can move is not a switch an operator has**, and this one fails *safe*,
+so a broken binding would have been invisible.
+
+### 55.2 ⛔ S-12 — the cadence claim is TRUE; the serving lag is what actually costs you
+
+`FluidOracleClient.refresh()` justified its 30-second cadence in a javadoc — *"feeds carry a 50-minute
+window (10 for the Charli3-backed one) … so a 30s cadence is fresh enough"* — and **nothing checked
+it**. Measured live, 2026-09-03, 19 entries:
+
+| | |
+|---|---|
+| variants | **18 AGGREGATED, 1 PRICE_DATA_CHARLIE** — mainnet is multisig, confirming §41 |
+| AGGREGATED window | **3,000 s** (50 min) ✅ exactly as claimed |
+| Charli3 window | **600 s** (10 min) ✅ |
+| **AGGREGATED age when served** | **1,831 s — 61 % of the window already spent** |
+| **remaining life when served** | **1,168 s**, of which 180 s is overhead ⇒ **~988 s usable** |
+| **Charli3 remaining life** | **18 s** — *below the 180 s overhead; not buildable at that instant* |
+
+⇒ **The cadence was never the binding constraint. The registry's own serving lag is.** The usable
+stretch is ~988 s of a 3,000 s window, not 2,820 s — the T-065/T-067 shape again, and worse here than
+on preview (61 % consumed vs ~5 %).
+
+**⚑ And the finding that changes the operating picture: all 18 AGGREGATED feeds share one
+`validFrom`/`validTo`.** They move in lockstep, so **the blackout is GLOBAL, not per-asset** — every
+multisig-priced market goes dark at the same instant and comes back at the same instant. A bot that
+sees zero buildable candidates for a minute is not looking at a quiet market; it may be looking at the
+whole registry between publications. **Do not tune `oracle-window-margin-seconds` against this** —
+§14's existing warning stands, and this measurement strengthens it.
+
+**⛔ A correctness distinction the run surfaced.** One AGGREGATED entry is **36 days past its
+`validTo`** and still reports `usableForLiquidation() == true`. That is not a bug: the method asks
+*can this feed satisfy the validator's shape* (signatures, reference inputs) and says nothing about
+*when*. Freshness is `OraclePriceFeed.usableOver`, which the scanner calls **in addition**.
+**Either alone is a half-truth**, and it is now pinned — offline, deliberately, so tidying the
+registry cannot turn a good change into a red test.
+
+⚠ Two ways to write that pin wrongly, both hit and both recorded in the test: `AssetType.ada()` yields
+the **synthesised unit feed**, which `usableOver` short-circuits to `true` whatever the dates, so a
+probe built on ada passes for a reason unrelated to the property; and a fabricated 4-day window fails
+the **max-window rule** (`validTo − validFrom ≤ 60 min`) rather than the containment rule, proving the
+wrong one of two independent checks.
+
+### 55.3 ⛔ S-15 — CCL trap 17 on the ANTICIPATE path, measured, and it is NOT what it looks like
+
+`docs/change-output-enumeration.md` concludes **seven of eight routes close**. That enumeration is
+**complete for the PLAIN path and silent about this one**: every line reference in it is to
+`LiquidateTransactionBuilder`, where the bot's take is the liquidation-fee slice and is therefore
+*computable and payable by name*. **On pay-in-advance there is no by-name payout of the bot's take at
+all** — the outputs are the bond echo, the borrower's equity and the lender's ada, and *"the bot keeps
+the collateral"* is implemented by letting the whole collateral fall to change.
+
+**The obvious prediction is that change is multi-asset, nothing nominable returns, and the bot dies
+after one liquidation. Measured off the built transaction, that is WRONG:**
+
+```
+out#0 [BOT]  1,000,000 lovelace                                  ada-only  → NOMINABLE
+out#4 [BOT] 30,038,621 lovelace + 91,080,816 collateral tokens   multi     → NOT nominable
+```
+
+`out#0` is **CCL trap 1's dummy output**, which every withdrawal-carrying transaction gets at the
+change address. So a nominable UTxO *does* come back and the wallet is **not bricked** — but it is one
+ada, while all the real ada change is trapped beside the token.
+
+⇒ **The failure mode is a collapsing nominable BALANCE, not an empty nominable SET.** Each anticipate
+liquidation turns one large ada-only input into ~1 ada that can be spent again and ~30 ada that cannot.
+The next candidate is refused with **`WALLET_INPUT_TOO_SMALL`** — a different message, a different
+diagnosis, and one that reads as *"top up the wallet"* when the truth is *"your ada is stuck with the
+tokens you just earned"*. **Getting that distinction wrong costs an operator the whole diagnosis.**
+
+⚠ On mainnet the trapped side is larger: 100,000,000 FLDT and ~20.9 ada per liquidation (§54.4). **A
+wallet reshape is a one-time repair for the 2026-08-25 publishing incident; here the trap is
+regenerated by success, every time.**
+
+**⛔ STOPPED AT THE FORK, deliberately.** The fix is an output paying the bot's collateral out by name.
+**Adding an output shifts the absolute output indexes the validators are handed** — `assetOutputIndexes`,
+`lenderBondOutputIndex`, and `loan_claim_action`'s forced slot — so it changes the on-chain-visible
+layout of the transaction and carries an evaluation cost. **That is a design decision, not hardening,
+and it is not S-sized.** `PayInAdvanceChangeShapeTest` pins the measured shape so it cannot regress
+silently while the decision is open.
+
+**The operator-side mitigation that needs no code**: fund the wallet with **several** ada-only UTxOs
+rather than one large one, so a liquidation consumes one and leaves the others nominable. That buys
+one liquidation per funded UTxO and does not fix the accumulation.
