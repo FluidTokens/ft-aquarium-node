@@ -141,15 +141,35 @@ class CompoundEconomicsTest {
         assertEquals(BigInteger.valueOf(225_000L), CompoundEconomics.expectedFee(ESCROW_45_ADA, 5L));
     }
 
-    /** A negative floor is a preview-only override; on mainnet it must refuse to construct. */
+    /**
+     * ⛔ <b>A negative floor is HONOURED on mainnet.</b> The inverse of what this asserted until
+     * 2026-09-03, on Giovanni's ruling: <i>"operating at a loss MUST be implemented even on
+     * mainnet."</i> Compounding a pool whose {@code compoudingFeePerMille} is 0 is exactly the
+     * protocol-health work a stated loss is for. <b>The mutant is the old hard-fail returning</b>; the
+     * protection is the DEFAULT of 0, which no copy-paste turns negative.
+     */
     @Test
-    void aNegativeFloorIsAHardStartupFailureOnMainnet() {
-        var mainnet = economics(true, -1L, "mainnet");
-        IllegalStateException e = assertThrows(IllegalStateException.class, mainnet::announceAndGuard);
-        assertTrue(e.getMessage().contains("profit-margin-lovelace"), e.getMessage());
+    void aNegativeFloorIsHonouredOnMainnetAndAnnouncedLoudly() {
+        var logger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(CompoundEconomics.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            economics(true, -1L, "mainnet").announceAndGuard();
+            // An unrecognised network is still treated as mainnet — for the LOUDER line, not a refusal.
+            economics(true, -1L, "wonderland").announceAndGuard();
+        } finally {
+            logger.detachAppender(appender);
+        }
 
-        // Fail-closed: an unrecognised network is treated as mainnet, not waved through.
-        assertThrows(IllegalStateException.class, () -> economics(true, -1L, "wonderland").announceAndGuard());
+        long announcements = appender.list.stream()
+                .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains("OPERATING AT A LOSS ON MAINNET") && m.contains("compound"))
+                .count();
+        assertEquals(2L, announcements,
+                "both the mainnet node and the unrecognised-network node must announce it");
     }
 
     @Test

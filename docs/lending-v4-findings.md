@@ -2122,6 +2122,46 @@ LENDER_BOND_MINT  479f7460…   mainnet HTTP 404   preview HTTP 200   publishes 
 Confirmed by a second provider: Koios `tx_info` returned **1 of 3** requested hashes — only the
 known-good control.
 
+**✅ CORRECTED 2026-09-03 — FluidTokens fixed the list, and both new coordinates verify on mainnet:**
+
+```
+BORROW_BOND_MINT_SCRIPT_REF  90efd6a6d59bf72137186fdb6fb9cbe4b816b95cc3ecd9383b46997947dc9063#0
+                             → publishes eadc69a5d2d1357acc9b9d49ec5390fcdf6e080c7a40139917223dcb
+LENDER_BOND_MINT_SCRIPT_REF  cf66c3c5e625b77757b2dcd366f9cb54ac61815e66e63ac9ee9ef74b8ab85f47#0
+                             → publishes bcd713bb7858d4b08738bed90ee7068d8f9b38d02e0cae0b45ac7a9b
+```
+
+Read on **mainnet** Blockfrost: both resolve, both publish at **output #0**, and the two script hashes
+are exactly the `borrowerBondPolicyId` / `lenderBondPolicyId` this project derives. **So the list is
+now 27 of 27**, in the same uniformly good shape as §24.1.
+
+**⚠ But note what that verification does and does not settle** — the same trap as before, pointed the
+other way. The hashes matching proves nothing *by itself*, because these two policies are byte-identical
+across networks. **What settles it is that these hashes resolved on MAINNET**, which the superseded pair
+did not. The network the query went to is the evidence; the hash is only the corroboration.
+
+### 24.2a "Do we need them?" — NO, and it is checked against the validators rather than recalled
+
+The bot **never mints or burns a bond on any path**, so neither bond-mint script can enter its
+reference-script set:
+
+| path | what it does with the bond |
+|---|---|
+| plain `Liquidate` | spends the lender-bond UTxO at the lender-manager credential and re-creates it |
+| `LiquidateAndPayInAdvance` | same |
+| **`LiquidateAndConvert`** | `builtin.equals_data(lenderBondInput.output, lenderBondOutput)` — the bond output must be **byte-identical to its input** |
+| `Compound` | reads the bond to resolve the pool; does not move it |
+
+Read at `e0b818e`, `lm_liquidate_and_convert_action` touches `lenderBondPolicyId` only as a **datum
+value** — `quantity_of(lenderBondInput.output.value, lenderBondPolicyId, …) == 1` — pulled out of the
+ConfigDatum as data. **A policy id used to count an asset is not a script the transaction witnesses**,
+so it needs no reference input, no witness and no redeemer. The convert transaction's reference set is
+the config UTxOs, the Minswap pool, and the validators it withdraws or spends through — the bond-mint
+scripts appear in none of them.
+
+**⇒ The two coordinates matter to origination, which this bot does not do.** Worth having correct in
+FluidTokens' list; irrelevant to the operator's `reference-scripts` configuration.
+
 > **⚑ AND THIS IS THE CASE A HASH CHECK CANNOT CATCH.** The two bond policies are precisely the
 > credentials that are **byte-identical on preview and mainnet** (§23.1 — derived from an integer
 > index, so a deployment cannot move them). So the published script hash at those preview UTxOs
@@ -2934,3 +2974,65 @@ rather than an assumption**, which is the whole reason it was named in-class rat
 **Verification:** 15 tests. Four mutants on the new arithmetic, each killed: floor-as-sum (3 tests),
 floor-ignored (2), floor-as-cap (6), and the original drop-2.8-ada (2). Suite **96 files, 822 tests, 38
 failures, 22 skipped, 0 orphans** — failures and skips unchanged.
+
+---
+
+## 31. ⛔ OPERATING AT A LOSS IS A FEATURE, ON EVERY NETWORK — the mainnet hard-fail is gone (2026-09-03)
+
+Giovanni, first-hand, closing the last standing economics question: *"it's fundamental to allow
+operators to operate at a loss. Protocol must be kept bad-loss-free at all costs. So you can expect our
+bot to be used by FluidTeam to clean up loans non-profitable for other operators but still need cleanup.
+So up to you what you want to do. BUT operating at a loss MUST be implemented even on mainnet."*
+
+**⇒ The framing changes, not just the code.** A negative margin was modelled as an *operator mistake* —
+"copy the working preview config to mainnet" — and guarded accordingly. It is now a **documented
+operating mode**: the bot is a protocol-health tool, and a stated-loss liquidation, compound or convert
+that clears an unhealthy loan nobody else will profitably touch is the intended public-good function.
+FluidTokens' own team is a foreseen operator of exactly that mode.
+
+### 31.1 What was removed, and what replaced it
+
+| path | before | after |
+|---|---|---|
+| `LiquidationExecutor.guardMainnetNegativeMargin()` | `IllegalStateException` at construction on mainnet | loud WARN, node comes up and runs |
+| `CompoundEconomics.announceAndGuard()` | same | same |
+| `ConvertEconomics.announceAndGuard()` | same | built honour-anywhere from the start |
+
+The replacement is one line an audit can grep, on **every network**, louder on mainnet, naming the
+**path** and the **stated floor**:
+
+```
+⛔ OPERATING AT A LOSS ON MAINNET, BY OPERATOR CONFIGURATION — path: convert;
+   loans.liquidation.convert.profit-margin-lovelace = -2000000 lovelace (network mainnet). …
+```
+
+⚠ The "unrecognised network counts as mainnet" rule survives, but its **purpose inverted**: it used to
+decide who gets *refused*, and now decides who gets the *louder line*. Fail-closed in reporting rather
+than in arming.
+
+### 31.2 ⛔ THE DEFAULT IS NOW THE ONLY PROTECTION — which promotes it to an invariant
+
+Defaults are unchanged and still refuse every loss on every network: **liquidation 1,500,000 in code /
+5,000,000 in the shipped yaml · compound 0 · convert 0 (net-positive)**. So an operator who configures
+nothing cannot operate at a loss anywhere, and **only an explicitly negative value** does — which no
+copy-paste of a zero or positive configuration can produce. That is Giovanni's defensive-defaults ruling
+intact, with the loss-making mode as a deliberate opt-in rather than an accessible accident.
+
+**⇒ Because the guard is gone, "every shipped default is non-negative" stops being a nicety and becomes
+load-bearing.** If one ever ships negative, a node that stated nothing would work at a loss on mainnet
+and **nothing in the build would notice** — the new boot line would fire and read like configuration
+working as designed. `LossMakingIsOptInTest` pins it in both places the promise lives: the `@Value`
+defaults in the source, and the env-var defaults in `application.yaml` (which override them, and are
+what an operator actually receives).
+
+### 31.3 The one guard that stays fatal, and why it is not the same thing
+
+`loans.liquidation.convert.dex-cost-floor-lovelace` still **aborts startup** when negative or unset.
+It is not a margin: it states what the work *costs*, not what the operator is *willing to lose*. A
+negative cost of doing work has no reading that expresses an intention — it is a typo — so the ruling
+does not reach it.
+
+**Verification:** the mutant is the old hard-fail reappearing, and it is killed on all three paths by
+one test each. The boot line is asserted through a real log appender, including that it names the path
+and the floor. Suite **98 files, 833 tests, 38 failures, 22 skipped, 0 orphans** — distribution
+unchanged.

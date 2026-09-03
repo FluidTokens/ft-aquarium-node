@@ -433,11 +433,21 @@ public class LiquidationExecutor {
     /**
      * FIX 3 (F1.ii). A negative {@code profit-margin-lovelace} is a preview-only override — it
      * re-authorises loss-making liquidations, which is a thing to do only on throwaway preview
-     * capital. On mainnet it is a hard startup failure rather than a WARN, because "copy a working
-     * preview config to mainnet" is the foreseeable operator action and a WARN on the mainnet path
-     * is a comment, not a guard. This bean only exists when {@code loans.enabled=true} (the arming
-     * condition), so failing construction here refuses to arm the liquidation path on a mainnet node
-     * whose margin would silently sanction losses. On preview it stays a WARN and proceeds.
+     * capital.
+     *
+     * <p>⛔ <b>It is NOT fatal on mainnet, and that is Giovanni's ruling of 2026-09-03, not an
+     * omission:</b> <i>"it's fundamental to allow operators to operate at a loss. Protocol must be kept
+     * bad-loss-free at all costs … operating at a loss MUST be implemented even on mainnet."</i> The
+     * bot is a <b>protocol-health tool</b>: a stated-loss liquidation that clears an unhealthy loan
+     * nobody else will profitably touch is the intended public-good function, not a misconfiguration.
+     * FluidTokens' own team is a foreseen operator of exactly that mode.
+     *
+     * <p><b>What still protects an operator is the DEFAULT, not a guard.</b> The shipped margin is
+     * 1_500_000 on every network, so a node that states nothing refuses every loss. Only an
+     * <em>explicitly negative</em> value operates at a loss — an act of configuration that cannot be
+     * reached by copying a zero or positive config from anywhere. So the loud line below is a
+     * <b>record</b>, not a warning about a mistake: a node running at a loss on mainnet must say so
+     * auditably at boot, naming the path and the stated floor.
      */
     private void guardMainnetNegativeMargin() {
         BigInteger margin = configuration.getProfitMarginLovelace();
@@ -445,18 +455,21 @@ public class LiquidationExecutor {
             return;
         }
         String networkName = network == null ? null : network.getNetwork();
-        // Fail-closed: anything that is not preview or preprod resolves to mainnet, exactly as
-        // AppConfig.Network.getCardanoNetwork() treats an unrecognised value.
+        // Fail-closed for the PURPOSE OF REPORTING only: anything not preview or preprod is treated as
+        // mainnet, so an unrecognised network gets the louder line rather than the quieter one.
         boolean mainnet = networkName == null
                 || (!"preview".equalsIgnoreCase(networkName) && !"preprod".equalsIgnoreCase(networkName));
         if (mainnet) {
-            throw new IllegalStateException(("loans.liquidation.profit-margin-lovelace is %s (negative) "
-                    + "on network %s; a negative margin is a preview-only override that re-authorises "
-                    + "loss-making liquidations and must never be set on mainnet")
-                    .formatted(margin, networkName));
+            log.warn("⛔ OPERATING AT A LOSS ON MAINNET, BY OPERATOR CONFIGURATION — path: liquidation; "
+                            + "loans.liquidation.profit-margin-lovelace = {} lovelace (network {}). This "
+                            + "node will liquidate loans that cost the operator more than they earn, "
+                            + "down to that stated floor. It is a deliberate protocol-health setting, "
+                            + "not a fault; a candidate worse than the floor is still refused.",
+                    margin, networkName);
+            return;
         }
-        log.warn("loans.liquidation.profit-margin-lovelace is {} (negative) on network {}; this is a "
-                + "preview-only override that re-authorises loss-making liquidations", margin, networkName);
+        log.warn("loans.liquidation.profit-margin-lovelace is {} (negative) on network {}; this node "
+                + "will liquidate at a loss down to that stated floor", margin, networkName);
     }
 
     @Scheduled(timeUnit = TimeUnit.SECONDS, fixedDelayString = "${loans.liquidation.delay-seconds}")

@@ -263,26 +263,43 @@ class ConvertEconomicsTest {
 
     // ---- the boot guard ------------------------------------------------------------------------
 
+    /**
+     * ⛔ <b>A negative margin is HONOURED on mainnet, and announced loudly.</b> Giovanni's ruling,
+     * 2026-09-03: <i>"it's fundamental to allow operators to operate at a loss … operating at a loss
+     * MUST be implemented even on mainnet."</i> The bot is a protocol-health tool, and a stated-loss
+     * convert that clears a loan nobody else will profitably touch is the intended function.
+     *
+     * <p><b>The mutant this guards is a hard-fail appearing here</b> — which would disable exactly the
+     * operator the capability exists for. What protects everyone else is the DEFAULT of 0, tested
+     * separately: only an explicit negative reaches this path.
+     */
     @Test
-    void aNegativeMarginIsRefusedOnMainnetAndMerelyWarnedOnPreview() {
+    void aNegativeMarginIsHonouredOnEveryNetworkAndAnnouncedLoudlyOnMainnet() {
         var negative = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(-1L));
+        var logger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(ConvertEconomics.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            // None of these may throw: an unrecognised network is treated as mainnet for the LOUDER
+            // line, not for a refusal.
+            new ConvertEconomics(negative, network("mainnet")).announceAndGuard();
+            new ConvertEconomics(negative, network("sanchonet")).announceAndGuard();
+            new ConvertEconomics(negative, null).announceAndGuard();
+            new ConvertEconomics(negative, network("preview")).announceAndGuard();
+        } finally {
+            logger.detachAppender(appender);
+        }
 
-        assertThrows(IllegalStateException.class,
-                () -> new ConvertEconomics(negative, network("mainnet")).announceAndGuard(),
-                "a negative convert floor on mainnet authorises unpaid work on someone else's loan");
-
-        new ConvertEconomics(negative, network("preview")).announceAndGuard();
-    }
-
-    /** An unknown or absent network resolves to mainnet — fail-closed, as the compound gate does. */
-    @Test
-    void anUnknownNetworkCountsAsMainnet() {
-        var negative = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(-1L));
-
-        assertThrows(IllegalStateException.class,
-                () -> new ConvertEconomics(negative, network("sanchonet")).announceAndGuard());
-        assertThrows(IllegalStateException.class,
-                () -> new ConvertEconomics(negative, null).announceAndGuard());
+        var loud = appender.list.stream()
+                .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains("OPERATING AT A LOSS ON MAINNET") && m.contains("convert"))
+                .toList();
+        assertEquals(3, loud.size(),
+                "mainnet, an unrecognised network and an absent one all get the loud line; preview gets "
+                        + "the quieter one. Saw: " + loud);
     }
 
     /**

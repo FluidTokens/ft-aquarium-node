@@ -1054,32 +1054,63 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * FIX 3 (F1.ii). A negative {@code profit-margin-lovelace} is a preview-only override; on mainnet
-     * it is a hard startup failure, so a preview config copied to a mainnet node cannot silently
-     * sanction losses. The guard lives where both the network and the margin are known — construction
-     * of the liquidation executor — so a mainnet node that would arm the path refuses to come up. On
-     * preview the same margin is a WARN and the loop runs.
+     * ⛔ <b>A negative margin is HONOURED on mainnet, and says so loudly.</b>
+     *
+     * <p>This test was the exact inverse until 2026-09-03: it asserted a hard startup failure. Giovanni
+     * reversed it first-hand — <i>"it's fundamental to allow operators to operate at a loss. Protocol
+     * must be kept bad-loss-free at all costs. So you can expect our bot to be used by FluidTeam to
+     * clean up loans non-profitable for other operators but still need cleanup … operating at a loss
+     * MUST be implemented even on mainnet."</i>
+     *
+     * <p><b>The mutant this guards is the old hard-fail reappearing</b> — a refusal to start would take
+     * out exactly the protocol-health operator the feature exists for, and it would do it at boot, on
+     * mainnet, where nobody is watching a preview log.
+     *
+     * <p>⚑ And what still protects an ordinary operator is the DEFAULT (1_500_000), not this guard:
+     * only an explicitly negative value gets here, which no copy-paste of a zero or positive config can
+     * produce. So the loud line is a <b>record of a deliberate mode</b>, not a warning about a mistake.
      */
     @Test
-    void aNegativeMarginHardFailsOnMainnetButIsOnlyAWarningOnPreview() {
-        // Mainnet: constructing the executor (inside run()) throws, naming the override.
-        IllegalStateException mainnet = assertThrows(IllegalStateException.class, () -> new Rig()
-                .network("mainnet")
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, false,
-                        NEGATIVE_MARGIN, PUBLISHED))
-                .run());
-        assertTrue(mainnet.getMessage().contains("profit-margin-lovelace")
-                        && mainnet.getMessage().contains("mainnet"),
-                "the failure must name the override and the network: " + mainnet.getMessage());
+    void aNegativeMarginIsHonouredOnMainnetAndAnnouncedLoudly() {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        Run mainnet;
+        try {
+            mainnet = new Rig()
+                    .network("mainnet")
+                    .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, false,
+                            NEGATIVE_MARGIN, PUBLISHED))
+                    .run();
+        } finally {
+            logger.detachAppender(appender);
+        }
 
-        // Preview: the identical negative margin does not stop the node — it warns and runs a cycle.
+        assertNotNull(mainnet.onlyDecision(),
+                "the node must COME UP and run a cycle: refusing to start would disable the "
+                        + "protocol-health cleanup this setting exists to enable");
+
+        String announcement = appender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains("OPERATING AT A LOSS ON MAINNET"))
+                .findFirst()
+                .orElse(null);
+        assertNotNull(announcement, "a mainnet node configured to operate at a loss must say so "
+                + "auditably at boot; the WARN lines seen were: "
+                + appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList());
+        assertTrue(announcement.contains("liquidation"), "it must name the PATH: " + announcement);
+        assertTrue(announcement.contains(NEGATIVE_MARGIN.toString()),
+                "it must name the STATED FLOOR: " + announcement);
+
+        // Preview is unchanged and still runs.
         Run preview = new Rig()
                 .network("preview")
                 .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, false,
                         NEGATIVE_MARGIN, PUBLISHED))
                 .run();
-        assertNotNull(preview.onlyDecision(),
-                "on preview the negative margin is a WARN, so the loop still records a decision");
+        assertNotNull(preview.onlyDecision());
     }
 
     // ======================================================================================

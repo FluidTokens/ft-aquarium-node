@@ -785,7 +785,10 @@ public class AppConfig {
          * this node, not by Giovanni, and not fixed by the protocol. Measured 2026-09-02: the only
          * live preview pool published {@code compoudingFeePerMille = 0}.
          *
-         * <p>Refused on mainnet at startup when negative, exactly as the liquidation margin is.
+         * <p>⛔ <b>Honoured on every network, mainnet included</b> — Giovanni's ruling of 2026-09-03:
+         * <i>"operating at a loss MUST be implemented even on mainnet."</i> The protection is this
+         * default of 0, which refuses every loss and cannot be made negative by copy-paste; a node
+         * that does state a negative announces it loudly at boot.
          */
         @Value("${loans.compound.profit-margin-lovelace:0}")
         private BigInteger profitMarginLovelace;
@@ -871,7 +874,11 @@ public class AppConfig {
          * {@code ConvertEconomics}.
          *
          * <p>A negative value is a number the operator STATES rather than a protection they switch
-         * off, exactly as on the compound path — and it is <b>refused on mainnet at startup</b>.
+         * off — and it is <b>honoured on every network, mainnet included</b> (Giovanni, 2026-09-03:
+         * <i>"operating at a loss MUST be implemented even on mainnet"</i>). The bot is a
+         * protocol-health tool and a stated-loss convert that clears a loan nobody else will touch is
+         * the point. What protects an operator is this default of 0, which no copy-paste can turn
+         * negative; a node that does state a negative announces it loudly at boot.
          */
         @Value("${loans.liquidation.convert.profit-margin-lovelace:0}")
         private BigInteger profitMarginLovelace = BigInteger.ZERO;

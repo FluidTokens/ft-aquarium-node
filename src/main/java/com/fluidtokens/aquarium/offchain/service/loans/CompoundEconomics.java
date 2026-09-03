@@ -48,12 +48,14 @@ public class CompoundEconomics {
     }
 
     /**
-     * Announce the stated bound at boot and refuse a negative one on mainnet.
+     * Announce the stated bound at boot, and say so loudly — on any network — when it is negative.
      *
-     * <p>Same shape and same reasoning as {@code LiquidationExecutor}'s margin guard: a WARN on the
-     * mainnet path is a comment rather than a guard, and "copy the working preview config" is the
-     * foreseeable operator action. A bot that will do unpaid work has to say so where the operator
-     * already looks.
+     * <p>⛔ <b>Not fatal on mainnet.</b> Giovanni, 2026-09-03: <i>"it's fundamental to allow operators
+     * to operate at a loss … operating at a loss MUST be implemented even on mainnet."</i> Compounding
+     * a pool that pays nothing is exactly the protocol-health work the bot exists to do. The
+     * protection is the DEFAULT of 0 — which refuses every loss on every network — so only an
+     * explicitly negative value gets here, and it is a stated intention rather than a copy-paste
+     * accident. A bot that will do unpaid work still has to say so where the operator already looks.
      */
     @PostConstruct
     void announceAndGuard() {
@@ -66,14 +68,17 @@ public class CompoundEconomics {
             return;
         }
         String networkName = network == null ? null : network.getNetwork();
-        // Fail-closed: anything that is not preview or preprod resolves to mainnet.
+        // Fail-closed for the PURPOSE OF REPORTING only: an unrecognised network gets the louder line.
         boolean mainnet = networkName == null
                 || (!"preview".equalsIgnoreCase(networkName) && !"preprod".equalsIgnoreCase(networkName));
         if (mainnet) {
-            throw new IllegalStateException(("loans.compound.profit-margin-lovelace is %s (negative) on "
-                    + "network %s; a negative floor authorises compounding that costs the operator "
-                    + "more than it earns — including pools that pay nothing at all — and is a "
-                    + "preview-only override that must never be set on mainnet").formatted(floor, networkName));
+            log.warn("⛔ OPERATING AT A LOSS ON MAINNET, BY OPERATOR CONFIGURATION — path: compound; "
+                            + "loans.compound.profit-margin-lovelace = {} lovelace (network {}). This "
+                            + "node will compound pools that pay it less than the work costs — including "
+                            + "pools whose compoudingFeePerMille is 0 — down to that stated floor. A "
+                            + "deliberate protocol-health setting, not a fault.",
+                    floor, networkName);
+            return;
         }
         log.warn("⛔ loans.compound.profit-margin-lovelace is {} (negative) on network {} — the bot will "
                 + "compound AT A LOSS down to that bound, including for pools whose "

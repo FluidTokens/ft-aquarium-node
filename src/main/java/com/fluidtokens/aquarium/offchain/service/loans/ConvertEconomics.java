@@ -105,9 +105,21 @@ public class ConvertEconomics {
     }
 
     /**
-     * Announce the stated bound at boot and refuse a negative one on mainnet — the same shape as the
-     * compound and liquidation margins, for the same reason: a WARN on the mainnet path is a comment
-     * rather than a guard, and "copy the working preview config" is the foreseeable operator action.
+     * Announce the stated bounds at boot, and say so loudly — on any network — when the margin is
+     * negative.
+     *
+     * <p>⛔ <b>A negative margin is HONOURED on mainnet</b>, built that way from the start rather than
+     * guarded and then un-guarded. Giovanni's ruling, 2026-09-03: <i>"it's fundamental to allow
+     * operators to operate at a loss. Protocol must be kept bad-loss-free at all costs … operating at a
+     * loss MUST be implemented even on mainnet."</i> A convert that clears a loan nobody will
+     * profitably touch is the intended public-good function of this bot.
+     *
+     * <p><b>The protection is the DEFAULT, not a guard.</b> The margin ships at 0 — net-positive — on
+     * every network, so an operator who states nothing refuses every loss. Only an explicitly negative
+     * value operates at a loss, which no copy-paste of a zero or positive config can produce.
+     *
+     * <p>⚠ The DEX-cost floor is different and still fatal: it is not a bound an operator states about
+     * their own appetite, it is an assumed cost of doing the work, and a negative one is a typo.
      */
     @PostConstruct
     void announceAndGuard() {
@@ -131,15 +143,18 @@ public class ConvertEconomics {
             return;
         }
         String networkName = network == null ? null : network.getNetwork();
-        // Fail-closed: anything that is not preview or preprod resolves to mainnet.
+        // Fail-closed for the PURPOSE OF REPORTING only: an unrecognised network gets the louder line.
         boolean mainnet = networkName == null
                 || (!"preview".equalsIgnoreCase(networkName) && !"preprod".equalsIgnoreCase(networkName));
         if (mainnet) {
-            throw new IllegalStateException(("loans.liquidation.convert.profit-margin-lovelace is %s "
-                    + "(negative) on network %s; a negative floor authorises converting at a cost to "
-                    + "the operator — including for lender bonds whose liquidationFeePerMille is 0, "
-                    + "which pay nothing at all — and is a preview-only override that must never be "
-                    + "set on mainnet").formatted(floor, networkName));
+            log.warn("⛔ OPERATING AT A LOSS ON MAINNET, BY OPERATOR CONFIGURATION — path: convert; "
+                            + "loans.liquidation.convert.profit-margin-lovelace = {} lovelace (network "
+                            + "{}). This node will build Minswap conversions that cost the operator more "
+                            + "than they earn — including for lender bonds whose liquidationFeePerMille "
+                            + "is 0 — down to that stated floor. A deliberate protocol-health setting, "
+                            + "not a fault.",
+                    floor, networkName);
+            return;
         }
         log.warn("⛔ loans.liquidation.convert.profit-margin-lovelace is {} (negative) on network {} — "
                         + "the bot will convert AT A LOSS down to that bound, including for bonds whose "
