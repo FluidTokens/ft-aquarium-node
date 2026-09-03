@@ -2641,3 +2641,158 @@ unchanged from the pre-stage baseline.
 a design, `MarketGate` still parses `<unit>:<cap>`); the registry's convert-hash derivation; the
 convert builder; Minswap `PoolDatum`/`OrderDatum` encoding; `compute_lp_asset_name`; the dry-eval rig;
 executor wiring; the image.
+
+---
+
+## 29. Per-market configuration as objects, and SHADOW — the rehearsal preview could not give (2026-09-03)
+
+Two rulings from Giovanni, same turn. The second one answers §28.1: *"make a per-market mode: shadow,
+meaning that if a liquidation can happen, we build the tx, validate and dump the tx bytes in the logs
+so it can be analysed. Unsigned obviously."*
+
+**⇒ That is the missing rehearsal.** Convert cannot be exercised on preview at all (§28.1), but it
+**can** be exercised on **mainnet, against real loans, with zero fund risk** — build the real
+transaction, evaluate it, dump the unsigned CBOR, sign nothing. And mainnet shadow is *stronger* than
+the offline rig, because the protocol parameters, the UTxOs and the ex-units are the chain's rather
+than a fixture's. **This should be the first mainnet posture for convert**, not a debugging aid.
+
+### 29.1 The shape — a YAML object list, superseding the delimited string
+
+```yaml
+loans:
+  liquidation:
+    markets:
+      - unit: lovelace          # "lovelace", or policyIdHex + assetNameHex
+        active: true            # default true; false is the ONLY off state
+        mode: convert           # convert | anticipate ; default convert
+        shadow: false           # default false; orthogonal to mode
+        cap: 500000000          # MANDATORY iff mode: anticipate, ignored otherwise
+```
+
+Every attribute is **named**, so nothing is positional and nothing is inferred from token order. "A cap
+with no mode" and "500000000 read as a mode" stop being parse hazards and become unrepresentable.
+
+**Four design questions, resolved:**
+
+**① `active: false` IS the off state — there is no `off` mode.** An `active` boolean *and* an `off`
+mode is the two-knobs-that-can-disagree problem in miniature, and the answer to
+`active: false, mode: convert` would be a coin-flip. `mode` is read **only when `active` is true**.
+
+**② `shadow` is a FLAG, not a mode.** Shadow must know *which* transaction it is rehearsing — convert
+and anticipate build different ones — so it is orthogonal by construction:
+`mode: convert, shadow: true` means *build the convert transaction, evaluate it, dump it unsigned, do
+not submit*. Making shadow a mode would have forced compound tokens (`shadow-convert`) and made
+"shadow with no action" expressible, which is exactly the state that has no meaning.
+
+**③ `cap` is mandatory iff `mode: anticipate`**, ignored otherwise, and the §29.4 semantics are
+unchanged.
+
+**④ An unlisted market is `active: true, mode: convert, shadow: false`.** An absent or empty list
+means *every market converts*; listing a market is how an operator **deviates**. That is Giovanni's
+ruling — convert fronts no capital and its failure mode is a no-op (§28.3) — and it preserves
+pay-in-advance's opposite default, which still needs an explicit entry naming both the mode and a cap.
+
+**⚑ And the object shape buys a real safety improvement the string could not.** Under the string
+grammar a malformed entry had to resolve to *off*, because a half-parsed token could not be
+distinguished from a typo. With named fields a broken entry is unambiguous — `mode: anticipate` with
+no `cap`, an unknown `mode`, a `unit` that is neither `lovelace` nor a well-formed hex unit — so it
+**aborts startup**, matching the precedent `LiquidationConfiguration.parseMode()` already sets. This
+is gated behind `loans.enabled`, so a typo can never refuse to start a production mainnet node that
+does not run the bot.
+
+**⇒ The 5a23cc4 string form simply ceases to exist.** There is no old value to reinterpret, so the
+behaviour-change hazard §28.4 flagged is gone — a clean structure replaces it rather than shadowing it.
+
+### 29.2 ⚠ Two consequences of the object shape that will bite at deploy time, not at review time
+
+**A YAML list is not expressible as one environment variable.** Every operator-facing knob in this
+repo is an `AQUARIUM_*` / `LOANS_*` env var flowing through `docker/.env`, and the string form was one
+of them. A `List<Market>` requires either **indexed env vars** —
+`LOANS_LIQUIDATION_MARKETS_0_UNIT`, `LOANS_LIQUIDATION_MARKETS_0_MODE`, … — or a **mounted YAML
+fragment**. Both work; neither is what the current `docker-compose.yaml` does. **This belongs in the
+operator docs in the same change that ships the binding**, not after the first operator finds it.
+
+**And it forces `@ConfigurationProperties`.** `@Value` cannot bind a list of objects from relaxed env
+names at all. The binding therefore lands as its own `@Component @ConfigurationProperties` class
+rather than as more fields on `LiquidationConfiguration` — which also avoids reworking a class 23
+existing veto tests construct directly.
+
+### 29.3 ⚠ The risk posture this widens, stated so it is owned rather than discovered
+
+Under `5a23cc4` an unlisted market did **nothing at all**. Under this design an unlisted market
+**converts**. Combined with `loans.liquidation.convert.enabled` defaulting true (§28.5), **an armed
+liquidation node will, on its first boot after this change, convert in every market it sees.**
+
+What still stands between that and a submission: `loans.enabled`, `loans.liquidation.mode`,
+`loans.liquidation.enabled`, `loans.submittable-network`, and the convert economics gate. That is a
+deliberate posture and it follows Giovanni's ruling — but it is a widening, and the honest mitigation
+is the one he supplied in the same breath: **`shadow: true` first.**
+
+### 29.4 The cap semantics — CONFIRMED, with the wording gap named
+
+Giovanni: *"pay-in-advance is reachable only when the market is explicitly set to anticipate AND the
+cap is higher than the principal repayment due."* The first half is the design above. The second half
+is already `5a23cc4`'s behaviour and it **inherits unchanged** — with two corrections to the wording,
+both in favour of the code that already exists:
+
+- **The comparison is `>=`, not `>`.** Read at `e0b818e`,
+  `lm_liquidate_and_pay_in_advance_action.ak`'s `validate_repayment_output` requires
+  `quantity_of(repaymentOutput.value, …) >= repaymentAmount`. **A deposit exactly equal to the
+  requirement is valid on chain**, so a strict `>` would refuse a candidate sitting exactly on the
+  operator's own stated bound — silently raising every cap by one lovelace, the same defect a strict
+  profit floor has. `MarketGate` allows `cap == required` and that is the validator's answer, not a
+  preference. `MarketGateTest.theBoundaryIsInclusiveOnTheCap` already tested it; it now **cites the
+  validator line** so the two cannot drift.
+- **"The principal repayment due" is the intuitive figure and the wrong one.** The cap is compared
+  against `convertedLoanCollateralToPrincipalAmount`, **not `remainingDebt`**.
+  `PayInAdvanceLiquidationRouter` already feeds the validator's figure and carries a comment saying
+  so; both are now named in `MarketGate`'s own javadoc, where the comparison lives.
+
+### 29.5 SHADOW: reuse, decisively — it is one veto and one log line
+
+**This repo already has the machinery, and a second shadow mechanism that could disagree with the
+first would be the two-knobs problem at a larger scale.** What exists today:
+
+- `loans.liquidation.mode: shadow` → the loop **scans, builds, prices, size-checks and records**, then
+  the ordered veto ladder fires `S1 MODE_NOT_LIVE` and nothing is signed.
+- The outcome and the veto are **separate fields**: a vetoed candidate still records
+  `WOULD_SUBMIT` or `UNPROFITABLE` on its own merits. So a veto's position in the ladder cannot
+  swallow the profitability verdict.
+- `LiquidationDecision` **already carries `txCborHex`**, populated for every built candidate regardless
+  of veto, alongside `txHash`, `txSizeBytes`, input/output/reference/redeemer counts and the full
+  pricing arithmetic. `LiquidationController` already serves it.
+
+**⇒ Per-market shadow extends this; it does not duplicate it.** Three additions, and no new mechanism:
+
+1. **One new veto, `MARKET_SHADOW`**, inserted after `S3 NETWORK_NOT_PREVIEW` and before
+   `S4 NOT_PROFITABLE` — policy vetoes before candidate vetoes, so an operator on a live node reads
+   the real reason rather than a downstream symptom. S4–S8 renumber to S5–S9.
+2. **The dump**, at INFO on a stable greppable prefix: candidate id, variant (which action was
+   shadowed), the decision arithmetic (income / outlay / margin), **the per-redeemer ex-units**, size,
+   and the **unsigned CBOR hex** on its own line so a grep can separate metadata from payload.
+   ⚠ A 10 kB transaction is ~20,000 hex characters; that is the cost of "analysable" and it is why the
+   payload gets its own line.
+3. **Ex-units, which are recorded nowhere today.** The decision counts redeemers but never says what
+   they cost — and per CCL trap 8 that is exactly the number that must be read off the **built,
+   deserialised** transaction rather than off an evaluator's report. Shadow is the feature that finally
+   needs it, so it is added there.
+
+### 29.6 ⚠ The honesty boundary — shadow proves PHASE 2, not phase 1
+
+A dumped transaction is a strong artefact and **not a submission guarantee**, and the log line must say
+so rather than leaving an operator to infer it:
+
+- **What it proves:** every script ran under a real evaluator and returned ex-units — the phase-2
+  failure mode that forfeits collateral is exactly what shadow rules out.
+- **What it does not prove:** the ledger's phase-1 rules — fees, min-ada, the witness set, collateral.
+  CCL traps 9 and 9a are both phase-1 fee defects that a clean evaluation says nothing about.
+- **And the size is an under-estimate**: an unsigned transaction carries no vkey witnesses, so the
+  signed body is larger than what `txSizeBytes` reports. Against a 16,384 `max_tx_size` that matters
+  (§22.9).
+- **Mainnet shadow is nonetheless the strongest rehearsal this project can build**, because the
+  protocol parameters, the UTxOs and the ex-units are all the chain's. The offline rig's parameters are
+  a fixture's, and trap 7 measured that library cost models drift *low* — the dangerous direction.
+
+**Unstarted at this boundary:** the `@ConfigurationProperties` binding and its startup validation; the
+`MARKET_SHADOW` veto and ladder renumber; the dump and its ex-units; the operator-docs change for
+indexed env vars; and everything §28.5 already listed for convert itself.

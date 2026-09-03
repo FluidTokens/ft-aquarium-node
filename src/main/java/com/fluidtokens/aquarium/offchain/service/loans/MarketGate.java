@@ -37,6 +37,16 @@ import java.util.Map;
  * candidate</b> — never to build a smaller deposit, which the validator would reject after the fee
  * was spent. The formula is implemented exactly as stated and the refusal falls out of it.
  *
+ * <p><b>The comparison is {@code >=}, on the validator's authority and not on preference.</b>
+ * {@code validate_repayment_output} at {@code e0b818e} requires
+ * {@code quantity_of(repaymentOutput.value, …) >= repaymentAmount}, so a deposit exactly equal to the
+ * requirement is valid on chain. Giovanni's phrasing — <i>"the cap is higher than the principal
+ * repayment due"</i> — reads as a strict {@code >}; a strict {@code >} would refuse a candidate
+ * sitting exactly on the operator's own stated bound, which raises every cap by one lovelace without
+ * saying so. ⚠ For the same reason {@code required} is
+ * {@code convertedLoanCollateralToPrincipalAmount} and <b>not {@code remainingDebt}</b>: "the
+ * principal repayment due" is the intuitive figure and the wrong one.
+ *
  * <h2>Configuration: one key, because two that can disagree are worse than one that cannot</h2>
  * <pre>
  *   loans.liquidation.markets: "lovelace:500000000,&lt;policyId&gt;&lt;assetName&gt;:1000000000"

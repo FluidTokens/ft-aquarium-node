@@ -51,7 +51,23 @@ class MarketGateTest {
                 "and the REQUIRED figure is still reported, or the operator cannot see by how much");
     }
 
-    /** ⛔ THE BOUNDARY, both directions — one lovelace either side of the cap. */
+    /**
+     * ⛔ THE BOUNDARY, both directions — one lovelace either side of the cap.
+     *
+     * <p><b>Inclusive, and that is the validator's answer rather than a preference.</b> Giovanni's
+     * wording on 2026-09-03 was <i>"the cap is higher than the principal repayment due"</i>, which
+     * reads as a strict {@code >}. Read at the deployed sha {@code e0b818e},
+     * {@code lm_liquidate_and_pay_in_advance_action.ak}'s {@code validate_repayment_output} requires
+     * <pre>quantity_of(repaymentOutput.value, …) >= repaymentAmount</pre>
+     * so a deposit exactly equal to the requirement is <b>valid on chain</b>. A strict {@code >} here
+     * would refuse a candidate sitting exactly on the operator's stated bound — silently raising
+     * every cap by one lovelace, the same defect a strict profit floor has.
+     *
+     * <p>⚠ And the figure the cap is compared against is
+     * {@code convertedLoanCollateralToPrincipalAmount}, <b>not {@code remainingDebt}</b> — "the
+     * principal repayment due" is loose for the same reason. {@code PayInAdvanceLiquidationRouter}
+     * already feeds the validator's figure; this test names it so the two never drift apart.
+     */
     @Test
     void theBoundaryIsInclusiveOnTheCap() {
         MarketGate gate = new MarketGate("lovelace:500000000");
