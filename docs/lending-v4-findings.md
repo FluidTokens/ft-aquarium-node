@@ -3462,3 +3462,94 @@ Suite **104 files, 879 tests, 38 failures, 22 skipped, 0 orphans**.
 
 **Unstarted:** sub-stage C — the dry-eval against the §32 fixtures, which is where the ex-units stop
 being an invariant and become a measurement. Then the operator docs.
+
+---
+
+## 38. ⛔ A CONVERT CAN NEVER BE DRY-EVALUATED OFFLINE — and what that does to the proof strategy (2026-09-03)
+
+Sub-stage C was to be the offline dry-eval of the convert transaction against the §32 fixtures. **It is
+blocked, structurally, and not by anything in the builder.** Reported rather than papered over.
+
+### 38.1 The proof, in three steps from source
+
+**① `retrieve_oracle_data` short-circuits only for ADA.** Read at `e0b818e`,
+`lib/fluidtokens/oracle.ak`:
+
+```
+if expectedTokenPolicyId == "" {
+    Some(Aggregated { …, token_price_in_lovelaces: 1, token_price_denominator: 1 })   // the 1:1 unit feed
+} else {
+    expect Some(oracleRedeemer) = pairs.get_first(redeemers, Withdraw(oraclePaymentCredential))
+    …
+}
+```
+
+**② `expectedTokenPolicyId` is the leg's own policy id.** `loan_claim_action.ak` passes
+`datum.collateral.policyId` (and the principal's, for the other leg). ⚠ So the `NONE/NONE`
+`oracleTokenAsset` does **not** bypass this — it only names which NFT must sit in the reference input.
+**Any non-ADA leg requires an oracle withdrawal, full stop.**
+
+**③ A convert always has a token leg.** `lm_liquidate_and_convert_action` requires a Minswap pool whose
+`asset_a`/`asset_b` are the (collateral, principal) pair — **two distinct assets**. So at least one leg
+is not ADA.
+
+> **⇒ EVERY convert transaction requires the FluidTokens oracle validator to execute. There is no
+> ada/ada convert, and therefore no oracle-free convert.**
+
+### 38.2 Why that blocks the rig, and why it is pre-existing
+
+Every **green** dry-eval in this project is ada/ada precisely to avoid the oracle leg — `LiquidateDryEvalTest`
+says so in its own javadoc: *"an ada leg consults no oracle at all … That is the only leg shape this rig
+can evaluate."*
+
+The two rigs that **do** carry an oracle leg — `RealLoanDryEvalTest` and
+`LiquidatePayInAdvanceDryEvalTest` — are **currently red**, and measured this session they fail in the
+same place:
+
+```
+RedeemerError { tag: "Withdraw", index: 1, err: Machine(EvaluationFailure, …) }
+```
+
+That is the documented pinned-to-superseded-chain-state condition (`docs/tests-pinned-to-chain-state.md`,
+8 of the 38 known failures). **Building convert's dry-eval on that foundation would inherit a broken
+oracle leg**, and a rig that cannot evaluate its own sibling cannot prove anything about a new path.
+
+⚑ Note what is *not* the blocker: the Minswap pool. A rig fabricates its own UTxOs, so a pool reference
+input carrying the real mainnet `PoolDatum` and an `MSP` NFT is trivially supplied — the evaluator
+resolves what the supplier gives it and neither knows nor cares that preview has no Minswap.
+
+### 38.3 ⇒ THE CONSEQUENCE, AND IT STRENGTHENS THE RUNBOOK
+
+Shadow-on-mainnet was already the recommended first posture (§29, §33). This upgrades it:
+
+> **Shadow-on-mainnet is not the best available rehearsal for convert. It is the ONLY thing that can
+> ever evaluate one.** It uses the real oracle reference input, the real Charli3 provider UTxO, the
+> chain's own protocol parameters and a real evaluator — every ingredient the offline rig structurally
+> cannot fabricate.
+
+And it makes the placeholder-ex-units detector of §33.2 load-bearing rather than defensive: **the shadow
+dump is now the first and only place a convert's ex-units are ever measured**, so a dump that silently
+reported placeholders would have been the whole proof, wrong.
+
+### 38.4 What convert's proof actually consists of
+
+| layer | proved by | state |
+|---|---|---|
+| Minswap byte shapes | live chain + upstream declarations (§34) | ✅ 10 tests |
+| the validator-dictated plan | the live ADA/FLDT pool datum (§35) | ✅ 10 tests |
+| the action hash | derives the published mainnet field 5 (§36) | ✅ 6 tests |
+| assembly, indexes, echoes, the bot's fee | structural post-assert on a built body (§37) | ✅ 11 tests |
+| **script execution + ex-units** | **shadow-on-mainnet only** | ⛔ not offline-provable |
+
+**Two options, and the recommendation.**
+- **(i) Un-red the oracle rigs first** — re-pin `RealLoanDryEvalTest` / `LiquidatePayInAdvanceDryEvalTest`
+  to the fourth deployment with fresh oracle payloads, then build convert's dry-eval on top. It would
+  fix 8 pre-existing failures as a side effect, and it is **unrelated maintenance that convert should
+  not be gated on**.
+- **(ii) Ship convert with its structural proof and make shadow-on-mainnet the evaluation step**, with
+  the runbook requiring the operator to read the dump before arming. ⇐ **recommended**, because it is
+  what a mainnet deploy actually needs, and (i) does not become false by waiting.
+
+⚠ **A third option does not exist**, and it is worth writing down so nobody spends a day on it: there is
+no fabricated fixture that makes a convert oracle-free, because the requirement comes from the *pair
+being two assets*, which is what a convert IS.
