@@ -424,8 +424,14 @@ class LiquidationExecutorTest {
 
     private static AppConfig.LiquidationConfiguration config(
             AppConfig.LiquidationConfiguration.Mode mode, BigInteger margin, int decisionLogSize) {
-        return new AppConfig.LiquidationConfiguration(mode, false, 60, 120, 30, margin,
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(mode, false, 60, 120, 30, margin,
                 decisionLogSize, 30);
+        // The market gate defaults to DISABLED for every market (Giovanni's defensive-default
+        // ruling). A pay-in-advance test must therefore name the market it operates in, exactly
+        // as an operator must — an ample ada cap, so the gate is satisfied and never the thing
+        // under test here.
+        configuration.setMarketsForTest("lovelace:1000000000000");
+        return configuration;
     }
 
     private static AppConfig.LiquidationConfiguration shadow(BigInteger margin) {

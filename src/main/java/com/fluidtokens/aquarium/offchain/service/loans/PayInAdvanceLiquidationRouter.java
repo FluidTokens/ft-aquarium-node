@@ -54,6 +54,20 @@ public class PayInAdvanceLiquidationRouter {
      * refusal, it never reaches the plain builder, and {@link LiquidationExecutor} turns it into a
      * {@code REFUSED} row whose reason is this exception's message.
      */
+    /**
+     * The market gate refused: the market is disabled, or the principal this candidate requires the
+     * bot to front exceeds the operator's stated cap. A clean REFUSED row and a separate type from
+     * {@code PayInAdvanceNotModelledException} — <b>"we will not" and "we cannot yet" are different
+     * statements about a candidate</b>, and collapsing them would hide a policy decision inside a
+     * capability gap.
+     */
+    public static final class MarketGateRefusedException extends RuntimeException {
+
+        MarketGateRefusedException(String message) {
+            super(message);
+        }
+    }
+
     static final class PayInAdvanceNotModelledException extends RuntimeException {
 
         PayInAdvanceNotModelledException(String message) {
@@ -80,6 +94,15 @@ public class PayInAdvanceLiquidationRouter {
     private final AppConfig.LiquidationConfiguration configuration;
 
     private final LiquidatePayInAdvanceTransactionBuilder builder;
+
+    /**
+     * Parsed lazily from the configured string so a test can drive the router without a Spring
+     * context, and rebuilt per call rather than cached — the configuration object is the single
+     * source of truth and nothing here should be able to hold a staler copy of it than it does.
+     */
+    private MarketGate marketGate() {
+        return new MarketGate(configuration == null ? null : configuration.getMarkets());
+    }
 
     public PayInAdvanceLiquidationRouter(LoansContractRegistry registry,
                                          CardanoConverters converters,
@@ -162,6 +185,20 @@ public class PayInAdvanceLiquidationRouter {
         LiquidatePayInAdvanceTransactionBuilder.Numbers numbers =
                 builder.numbers(assessment.loan(), assessment.bond(), collateralOracle, slotFromMillis);
         BigInteger lenderPayout = numbers.convertedLoanCollateralToPrincipalAmount();
+
+        // ⛔ THE MARKET GATE — before a wallet utxo is chosen and before anything is built.
+        //
+        // `lenderPayout` IS the principal this candidate would have the bot anticipate, so this is
+        // Giovanni's rule applied to the number it is about: anticipatable = min(balance, cap), and
+        // only when the market is enabled. It sits here rather than beside the profitability floors
+        // because it is a POLICY question — "will we take this exposure at all" — and it is settled
+        // before any economics, exactly as a disabled market should be.
+        MarketGate.Decision market = marketGate().decide(datum.principalAsset(), lenderPayout);
+        if (!market.allowed()) {
+            throw new MarketGateRefusedException(
+                    "%s: %s (anticipatable %s of a required %s)".formatted(
+                            market.refusal(), market.detail(), market.anticipatable(), market.required()));
+        }
         Utxo walletUtxo = walletSelector.apply(lenderPayout)
                 .orElseThrow(() -> new WalletInputTooSmallException(
                         ("no ada-only wallet utxo can fund this convert liquidation: it repays the "

@@ -307,6 +307,36 @@ public class AppConfig {
         @Value("${loans.liquidation.ignore-profit-check:false}")
         private boolean ignoreProfitCheck;
 
+        /**
+         * Which markets the bot may ANTICIPATE principal in, and up to how much, as
+         * {@code <unit>:<cap>} pairs — e.g. {@code lovelace:500000000}.
+         *
+         * <p>Applies to the <b>pay-in-advance</b> path only: it is the one action where the bot fronts
+         * its own capital. A plain liquidation fronts nothing, and a convert liquidation is funded by
+         * Minswap's batcher (findings §25).
+         *
+         * <p><b>Being listed IS being enabled</b>, and an entry carries its own cap, so a market
+         * cannot be enabled without a cap or capped without being enabled — one value that cannot
+         * contradict itself, rather than two that can. <b>Empty (the default) disables every
+         * market.</b> {@code <unit>:0} is a documented explicit disable.
+         *
+         * <p>See {@code MarketGate} for the anticipatable-principal rule and why min() is a gate.
+         */
+        @Value("${loans.liquidation.markets:}")
+        private String markets;
+
+        /**
+         * Test seam. {@code @Value} owns this in production.
+         *
+         * <p>⚠ Deliberately NOT a constructor parameter: the default must stay <b>disabled</b>, and
+         * threading it through four overloads would let a call site pass it by position and silently
+         * enable a market it never meant to. A test that exercises pay-in-advance must SAY which
+         * market it operates in — which is exactly what an operator must now do.
+         */
+        public void setMarketsForTest(String markets) {
+            this.markets = markets;
+        }
+
         @Value("${loans.liquidation.decision-log-size:200}")
         private int decisionLogSize;
 

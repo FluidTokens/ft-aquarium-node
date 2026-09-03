@@ -742,6 +742,15 @@ public class LiquidationExecutor {
                         "WALLET_INPUT_TOO_SMALL", convertDetail));
                 log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, convertDetail);
                 return;
+            } catch (PayInAdvanceLiquidationRouter.MarketGateRefusedException e) {
+                // A POLICY refusal, not a capability gap: this market is disabled, or the principal
+                // the candidate would have us front exceeds the operator's stated cap. Recorded the
+                // same clean way, and deliberately a separate catch so the log says which it was.
+                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                        e.getMessage(), e.getMessage()));
+                log.info("the convert liquidation of {} was refused by the market gate: {}",
+                        loanUtxoRef, e.getMessage());
+                return;
             } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
                 // A convert shape the seam cannot yet model (non-ada principal / non-positive equity):
                 // a clean statement about this candidate, reproducible next cycle. Not quarantined, and
