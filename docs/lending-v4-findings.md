@@ -4269,7 +4269,7 @@ date gets a different declaration.**
 was fetched.* Reproducing FT's build is therefore not possible from their repo alone. That is worth
 raising with them independently of this bug.
 
-### 49.3 ⛔ (b) RULED OUT — the record pattern binds BY NAME, tested rather than assumed
+### 49.3 ⛔ (b) — RETRACTED, THE TEST WAS INVALID. See §50.
 
 The symptom is `un_b_data` receiving `Constr1[1eae96ba…]`, which is what `asset_a.policy_id` yields **if
 `asset_a` bound to field 0** — the credential — rather than field 1. So the question is whether
@@ -4312,3 +4312,58 @@ handed** — the resolved pool input and the exact datum bytes at the index the 
 ⚑ And one thing worth keeping regardless of where the bug lands: **the investigation was worth doing
 even though its verdict is "ours".** It cost a day of somebody's goodwill to *not* send FluidTokens a
 question that would have been wrong.
+
+---
+
+## 50. ⛔ §49.3's (b) RULING IS RETRACTED — the probe proved nothing (2026-09-03)
+
+**My own test was the "fixture supplies what production must earn" defect, and I shipped a verdict on
+it.** Reported the moment it was noticed, because §49 went out an hour earlier saying (b) was ruled out.
+
+### 50.1 What the probe actually did
+
+```aiken
+let built = PoolDatum { …, asset_a: Asset { policy_id: #"aa", … }, … }   // built AS PoolDatum
+let as_data: Data = built
+expect recovered: PoolDatum = as_data                                     // cast back TO PoolDatum
+let PoolDatum { asset_a, asset_b, .. } = recovered
+```
+
+**It constructed and destructured with the SAME type.** If Aiken's codegen for
+`expect T { a, b, .. } = data` were positional rather than by-name, **both halves would be positional
+and agree** — the test passes either way. **It could not have failed.**
+
+⇒ **(b) — a compiler-level binding difference — is back on the table**, and §49's verdict of (c) rests
+on one leg fewer than it claimed.
+
+### 50.2 What a valid probe needs
+
+Bytes that are **foreign** to `PoolDatum`: build through a *distinct* type with the layout the live
+pools actually carry — in particular field 0 as `Inline(Script(h))`, i.e. `Constr0[Constr1[bytes]]`,
+which is **not** what v2.1's `pool_batching_stake_credential: Credential` declares (a bare `Credential`
+is `Constr1[bytes]`, one wrapper less). ⚠ **That discrepancy is real and was visible in the fixture
+dump all along** — `d8799f d8799f d87a9f 581c1eae96ba…` — and I read past it twice.
+
+The rewritten probe is written and does not yet compile; `aiken check`'s error output is not reaching
+this shell (rc=1, no message, with and without `NO_COLOR`/`TERM=dumb`). **Getting the error channel
+working is the next step, and it is the same lesson again**: the tool can show it, and I have been
+reading past what it shows.
+
+### 50.3 ⚑ Why this one matters beyond the bug
+
+Three of this thread's findings are now the same shape, and this is the third **committed to the record
+as a conclusion** before it was caught:
+
+1. §33.2 — a dump that reported placeholder ex-units as measurements.
+2. §43.3 — guard tests that drive the checker with a hand-built body and say nothing about the emitter.
+3. **§50 — a probe that constructs its own input with the type under test.**
+
+**In all three, the test's input came from the same place as the thing being tested.** ⇒ *A test whose
+fixture is produced by the mechanism under test cannot fail for the reason it claims.* The earlier two
+were caught by mutation; **this one was caught by asking what the test would do if the answer were the
+other one** — which is the cheaper check and should come first.
+
+⚠ **And the meta-lesson: I published a verdict built on it.** §49 said "(a) and (b) ruled out with
+evidence". One of those two was ruled out with a tautology. **The evidence standard has to apply to my
+own instruments, not only to other people's claims** — and the tell was available for free: *a test that
+cannot fail is not evidence, and I never asked whether it could.*

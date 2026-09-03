@@ -117,6 +117,24 @@ class ConvertLiveDryEvalTest {
      * Decoding it here turns "index 3 refused" into "this script at this address refused", with no
      * derivation in between.
      */
+    /**
+     * ⛔ <b>What the evaluator RESOLVES each reference input to</b> — the step between "the body names
+     * this coordinate" and "the validator reads this datum", and the only place a resolution bug can
+     * be seen. Printed beside the body because a coordinate that looks right and resolves to the wrong
+     * UTxO is invisible in the body alone.
+     */
+    private static String resolved(java.util.Set<Utxo> inputs) {
+        StringBuilder out = new StringBuilder("\n--- what the evaluator can resolve ---\n");
+        for (Utxo u : inputs) {
+            String datum = u.getInlineDatum() == null ? "(no inline datum)"
+                    : u.getInlineDatum().substring(0, Math.min(72, u.getInlineDatum().length())) + "…";
+            out.append("  ").append(u.getTxHash(), 0, 12).append('#').append(u.getOutputIndex())
+                    .append("  ").append(u.getAddress(), 0, Math.min(20, u.getAddress().length()))
+                    .append("…  ").append(datum).append('\n');
+        }
+        return out.toString();
+    }
+
     private static String describe(byte[] cbor) {
         try {
             Transaction tx = Transaction.deserialize(cbor);
@@ -202,6 +220,21 @@ class ConvertLiveDryEvalTest {
         Utxo configUtxo = output(backend, CONFIG_TX, 0);
         Utxo lmConfigUtxo = output(backend, CONFIG_TX, 1);
         Utxo poolUtxo = pool(backend);
+
+        // ⛔ INSTRUMENTATION, not reasoning. Every fixture the validator will read, printed as fetched,
+        // BEFORE anything is built. A coordinate that looks right and resolves to the wrong bytes is
+        // invisible downstream, and every wrong turn in this investigation came from deriving what the
+        // machine could show.
+        for (var pair : java.util.List.of(
+                java.util.Map.entry("loan     ", loanUtxo), java.util.Map.entry("bond     ", bondUtxo),
+                java.util.Map.entry("config   ", configUtxo), java.util.Map.entry("lmConfig ", lmConfigUtxo),
+                java.util.Map.entry("POOL     ", poolUtxo))) {
+            Utxo u = pair.getValue();
+            String d = u.getInlineDatum();
+            System.out.println("FIXTURE " + pair.getKey() + " " + u.getTxHash().substring(0, 12) + "#"
+                    + u.getOutputIndex() + "  datum=" + (d == null ? "NULL" : d.length() / 2 + "B " + d.substring(0, Math.min(64, d.length())))
+                    + "  assets=" + u.getAmount().size());
+        }
 
         LoanDatum loan = new LoanDatumConverter().deserialize(loanUtxo.getInlineDatum());
         LenderManagerDatum bond = new LenderManagerDatumConverter().deserialize(bondUtxo.getInlineDatum());
@@ -291,7 +324,7 @@ class ConvertLiveDryEvalTest {
                         chain.append(t.getClass().getSimpleName()).append(": ")
                              .append(t.getMessage()).append(" | ");
                     }
-                    lastEvaluatorMessage = chain + "\n" + describe(cbor);
+                    lastEvaluatorMessage = chain + "\n" + describe(cbor) + resolved(inputs);
                     throw e;
                 }
             }
