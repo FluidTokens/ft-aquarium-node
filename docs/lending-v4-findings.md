@@ -2182,3 +2182,103 @@ everything this bot needs.
 
 ⚠ These are unspent **today**. `LoansReferenceScriptVerifier` re-checks each at startup, so a spent or
 replaced coordinate is a hard boot failure — an answer, not an outage.
+
+---
+
+## 25. LiquidateAndConvert: the bot never holds the collateral — the strategy question is MOOT (2026-09-03)
+
+FluidTokens supplied the mainnet parameterisation for `lm_liquidate_and_convert_action`. Read at the
+**deployed sha** `e0b818e`, never the working tree.
+
+### 25.1 ✅ The parameters are VERIFIED — they derive the on-chain hash exactly
+
+Applying the eleven quoted parameters to the vendored blueprint's
+`lender_manager/lm_liquidate_and_convert_action.actionValidator.withdraw` yields
+`ed8d41e48d2b48c23c1673493e133b2e5a3300555026cab6c729683b` — **exactly what the mainnet LMConfigDatum
+publishes at field 5.**
+
+**⇒ This retires the last underivable field in the deployment.** `LoansConfigVerifier` carries the
+comment *"Field 5 … is deliberately unchecked: it takes five Minswap parameters we do not have."* We
+have them now. Verified live on mainnet, all three Minswap hashes are real PlutusV2 scripts:
+pool policy `f5808c2c…` (4,699 B), pool spend `ea07b733…` (3,965 B), order spend `c3e28c36…` (2,659 B).
+
+### 25.2 ⛔ THE READING THAT CHANGES THE PICTURE — proven from the validator, not hoped
+
+The convert action **constructs a Minswap V2 swap order inside the liquidation transaction**:
+
+```
+orderType = SwapExactIn {
+    swap_amount:     swappableCollateralAmount,
+    minimum_receive: loanInputAction.remainingDebt,   ← the VALIDATOR sets min-received
+    killable:        True }
+receiver  = get_smart_destination_address(isCIP113Pair, assetManagerSpendScriptHash, …)
+OrderDatum { canceller: lenderAuth,
+             success_receiver: receiver, success_receiver_datum: converted_to_liquidity_action,
+             refund_receiver:  receiver, refund_receiver_datum:  action_claimed_collateral,
+             max_batcher_fee: 700000 }
+```
+
+**Both the success and refund receivers are the ASSET MANAGER, owned by the LENDER BOND.**
+
+> **⇒ THE BOT NEVER HOLDS THE COLLATERAL AND NEVER HOLDS THE PROCEEDS.** It creates an order;
+> Minswap's own batcher fills it; the principal lands in the asset manager escrowed for the lender.
+> **Giovanni's standing carve-out — "it buys collateral and nobody has said what it should hold" — does
+> not apply to this action.** It was the right question about a different mechanism.
+
+**And the two paths compose.** The escrow this produces, owned by a lender bond, is *exactly* what
+`lm_compound_action` collects (§20). **convert → asset-manager escrow → compound → pool**, with the
+bot paid at each step and holding nothing in between.
+
+**Three consequences that shrink the work rather than growing it:**
+- **Slippage is not ours to model.** `minimum_receive` is fixed by the validator at `remainingDebt`,
+  and `killable: True` means a pool that cannot deliver it refunds rather than hanging. The
+  `officina:dex-swap-integration` request→batch model applies — *we create the order, we never
+  scoop* — but the price bound is enforced on chain, not by our economics gate.
+- **The bot fronts NOTHING.** The debt is settled from the swap proceeds.
+- `expect equityInPrincipalCurrency == False` — the convert path **requires** equity not in the
+  principal currency, the mirror of §13.
+
+### 25.3 ⚠ The one thing that is NOT zero: the fee is paid in the COLLATERAL asset
+
+```
+liquidationFee           = loanCollateralAmount * liquidationFeePerMille / 1000
+swappableCollateralAmount = loanCollateralAmount - equity - liquidationFee
+```
+The fee and the equity are **subtracted** from what gets swapped, and the validator **does not
+constrain where either goes** — the same unconstrained-residue shape as the compound fee (§20.1). On
+the natural construction the fee lands with the bot, **denominated in the collateral token, not ada.**
+
+**⇒ The strategy question does not vanish, it shrinks**: from *"what should the bot do with a whole
+liquidated collateral position"* to *"the bot accrues fee income in assorted collateral tokens"*. That
+is an inventory/treasury question, not a liquidation-strategy one — and it is still Giovanni's, just
+much smaller. ⚠ It also means the change output carries native assets on every convert, which is CCL
+**trap 17** by construction, every time.
+
+### 25.4 The empty parameters, and `mConStr1`
+
+`minswapPoolWithdrawScriptHash` and `minswapOrderWithdrawScriptHash` are `""`. They feed
+`get_inputs_from_smart_credential(…, Script(spend), Script(withdraw), smartTokensSpendScriptHash)`,
+whose withdraw argument is the **CIP-113 smart-token counterpart** of a credential. Minswap V2's pool
+and order validators are plain **PlutusV2** contracts with no withdraw-script half, so the empty hash
+selects the non-CIP-113 branch. *Empty here means "this credential family has no withdraw script",
+not "unset".*
+
+`mConStr1([loanClaimScript.policyId])` is a **`PaymentCredential`**: Aiken encodes
+`VerificationKey` as constructor 0 and **`Script` as constructor 1**, so this is
+`Script(loanClaimPolicyId)` — the loan-claim validator's credential, passed as a typed credential
+rather than a bare hash.
+
+### 25.5 Are we armed? No — and here is the exact gap
+
+**Code that exists:** none for convert. There is **no convert builder in `src/main` or `src/test`**.
+`PayInAdvanceLiquidationRouter` routes a `shouldLiquidationConvertToPrincipal == True` candidate to
+the **pay-in-advance** builder, and `LiquidationCandidateScanner` still carries
+`CONVERSION_TO_PRINCIPAL_REQUIRED` as an exclusion. The registry does not derive the convert hash
+(it could not, until now).
+
+**⚠ And an August finding must NOT be carried over unexamined.** The measured **−27,303,331** floor
+was on the **pay-in-advance** path, where the bot *fronts the principal* and the accounting counted
+that outlay as pure cost while valuing the received collateral at nothing. **Convert is a different
+mechanism: the bot fronts nothing.** So that objection does not transfer — it has to be **re-derived**
+for a flow whose only outlay is the transaction fee. *Reusing the number would be the same
+category error as reusing trap 14's documented redeemer pair (§14c).*
