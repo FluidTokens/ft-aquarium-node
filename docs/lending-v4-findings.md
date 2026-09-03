@@ -3908,3 +3908,69 @@ a test, and it is easy to believe the cheap half covers the expensive one.
 removed (3), the owner swapped in the asserted datum (3). **Survivor recorded rather than hidden:** the
 owner swapped in the emitted datum — the coverage boundary above. Suite **105 files, 891 tests, 38
 failures, 22 skipped, 0 orphans**.
+
+---
+
+## 44. Stage C runs the emitter — the oracle leg is PROVEN, and one validator still refuses (2026-09-03)
+
+`ConvertLiveDryEvalTest` is the first thing in this project that assembles a real convert and evaluates
+it. Gated on **`BLOCKFROST_MAINNET_KEY`** — deliberately *not* `BLOCKFROST_KEY`, because sourcing
+`.env.preview` and pointing a preview key at mainnet produced an HTTP 403 read as a code failure once
+already. **One variable per network.**
+
+It **fetches** the feed, the pool and every UTxO at run time and sets the transaction's window inside the
+feed's own: a pinned oracle payload has a **fifty-minute shelf life**, and this repo already has two
+tests that expired that way (§40.3).
+
+### 44.1 ✅ What the rig has already established
+
+- **The emitter runs.** Inputs, outputs, indexes, withdrawals, reference inputs, balancing — a real
+  transaction is produced from the live candidate.
+- **⛔ The adversarial case WORKS**: a `minimum_receive` one lovelace above `remainingDebt` makes the
+  build fail. *The rig can say no*, which is the only thing that makes its yes worth anything.
+- **✅ THE ORACLE LEG IS CORRECT, proven cryptographically and independently of the evaluator.** Taking
+  the live registry's published `multisig` feed and reconstructing the CBOR our encoder emits, the
+  published signature **verifies** under the published key:
+
+```
+data  d8799fd8799f1b000001a068d6c6e01b000001a069048da0d8799f581c577f0b13…480014df10464c4454ffff1a0153be3e1a05f5e100ff
+key   CB1506C82C3143948618C50834A527B8D471EBAE067BC0A5DEE1627DC511E914      ⇒ ed25519 VERIFIES
+```
+  The same check against the **golden transaction's own** redeemer verifies too, which pins the message
+  format: **the signature covers the `data` field's CBOR exactly as encoded**, indefinite-length forms
+  included. ⇒ `OracleFeedConverter` and the multisig overload are right, and §41's conclusion is
+  confirmed a second way.
+
+### 44.2 ⛔ AND A DIAGNOSIS THAT WAS WRONG UNTIL THE SORT WAS DONE PROPERLY
+
+Evaluation fails with `RedeemerError { tag: "Withdraw", index: 2, EvaluationFailure }`. To name the
+validator I sorted the five reward addresses — **in a `TreeMap`, by their bech32 STRINGS** — and got
+*"index 2 is the oracle"*. That sent me an hour into the oracle leg.
+
+**The ledger sorts withdrawals by the reward address's RAW BYTES**, and bech32 is not order-preserving:
+
+| index | by bech32 string (**wrong**) | by raw bytes (**right**) |
+|---|---|---|
+| 0 | loanClaimAction | **loan** |
+| 1 | convertAction | **oracle** |
+| **2** | **oracle** ⛔ | **lenderManager** ✅ |
+| 3 | lenderManager | convertAction |
+| 4 | loan | loanClaimAction |
+
+**⇒ The failing validator is `lender_manager.withdraw`, and the oracle was never the problem.**
+
+⚑ The lesson is the thread's own, in a new costume: **an encoding is not an ordering.** Bech32 is a
+presentation form with a checksum and a non-monotonic charset; sorting it answers a question about
+*strings*, not about what the ledger does. And the wrong answer was **plausible** — it named a
+validator that was genuinely new to this transaction, which is exactly why it survived scrutiny.
+*A misdiagnosis that fingers the newest component is the hardest kind to doubt.*
+
+### 44.3 Where it stands
+
+The remaining failure is a real one in this builder's own wiring — `lender_manager.withdraw` refuses —
+and it is precisely the class of defect §43.3 predicted the emitter-side coverage gap would hide.
+**Stage C is doing its job.** It is not a blocker for anyone else and needs no decision; it is the next
+thing to fix.
+
+⚠ The rig skips without the mainnet key, so the suite baseline is unchanged: **106 files, 893 tests, 38
+failures, 24 skipped** (+2 skipped, the two gated tests).
