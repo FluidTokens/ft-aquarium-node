@@ -3261,3 +3261,73 @@ skipped, 0 orphans**.
 **Unstarted:** the builder itself (`ConvertTransactionBuilder`) — output layout, the pool resolved by
 NFT at run time, the byte-echoed lender bond, trap-17 token change, and a real evaluator from the first
 commit; then its dry-eval against the §32 fixtures; then the operator docs.
+
+---
+
+## 35. The convert plan, driven by the real pool — and a test that passed for the wrong reason (2026-09-03)
+
+Builder sub-stage B1: `MinswapPoolDatumConverter` and `ConvertOrderPlan`. Everything
+`lm_liquidate_and_convert_action` **dictates** about the order, computed once and refusing rather than
+guessing, before any transaction is assembled. **Sub-stage B2 — the CCL assembly, with a real
+evaluator from its first commit — is deliberately not in this commit.**
+
+### 35.1 Why the plan is its own object
+
+Every value in it is fixed by the validator, not chosen by us: the direction comes from the pool's own
+datum, `minimum_receive` is `remainingDebt`, the order's ada is a literal, and the two datum hashes are
+constructions reproduced byte for byte. Computing them inside a `QuickTxBuilder` chain would mix
+decisions checkable **against the contract** with decisions checkable only **against a node**.
+
+**⛔ And the pool is resolved by its NFT at run time, never by a coordinate.** A Minswap pool UTxO is
+spent and re-created on *every swap*, so a pinned reference is stale within minutes. The plan takes the
+**datum the caller found**, not a reference it remembered.
+
+### 35.2 Three values the plan gets from the pool rather than from us
+
+- **Direction.** The live pool declares `asset_a = ADA` and the real candidate's collateral is FLDT, so
+  `lpABDirection` is **False** and the validator takes its else-branch — which then demands
+  `asset_b == collateral && asset_a == principal`. Deciding direction from our own idea of ordering
+  would invert the swap.
+- **The lp asset name** is computed from the **pool's declared order**. The pair is the same set either
+  way; the hash is not.
+- **A pool for a different pair is refused, not priced badly.** It is an impossible transaction, and
+  saying so with its own refusal keeps it out of the economics.
+
+The order's ada differs by collateral kind — 2,800,000 alongside a token, and for an ADA collateral the
+order's lovelace **is** the swappable amount with no rider at all (§30.1).
+
+### 35.3 ⛔ A TEST THAT PASSED FOR A REASON OTHER THAN THE ONE IT NAMED
+
+The arity guard on `PoolDatum` had a test: feed a two-field datum, assert `RuntimeException`. A mutant
+that **deleted the arity check entirely** left it **green** — because `f.get(1)` then throws
+`IndexOutOfBounds`, which is also a `RuntimeException`. **The test passed for a different reason than
+the one in its name, and would have kept passing with the guard gone.**
+
+**⇒ And the case it was testing was the harmless one.** A datum with a field *missing* throws on its
+own and needs no guard. **The dangerous change is a field ADDED**: eleven fields decode perfectly into
+the wrong positions and return a pool for a **different pair**, with nothing amiss anywhere. The test
+now feeds exactly that, with recognisable wrong assets at positions 1 and 2, and asserts the refusal
+**names both arities**. It kills the mutant.
+
+> **⚑ The rule this is an instance of: an exception-type assertion is only as specific as the narrowest
+> thing that can throw it.** `assertThrows(RuntimeException.class)` is satisfied by every bug on the
+> path to the behaviour under test, including the absence of the very check being tested. Assert on the
+> message, or on a distinguishing property, whenever the guard and its absence produce the same
+> exception class.
+
+*This is the third measurement-that-cannot-detect-its-own-absence in two days*, after the shadow dump's
+placeholder ex-units (§33.2) and the mutation harness that printed `killed=[]` for a mutant that never
+compiled (§34.3). **Three unrelated instances is a pattern, not a coincidence — and all three were found
+by mutating, never by reading.**
+
+### 35.4 Verification
+
+Six mutants, each killed: direction inverted (5 tests) · the order-ada branch flipped (1) ·
+the lp-name argument order swapped (1) · `<= 0` weakened to `< 0` on the swappable amount (1) ·
+the pool's asset_a/asset_b swapped in the decoder (2) · **and the arity check removed (1, only after
+the test was rewritten)**. Suite **102 files, 862 tests, 38 failures, 22 skipped, 0 orphans**.
+
+**Unstarted:** B2, the CCL assembly — output layout with the two-pass index discovery (trap 1), the
+byte-echoed lender bond under `equals_data`, trap-17 token change, the two self-addressed carriers, and
+**a real evaluator from the first commit** with ex-units asserted off the built, deserialised
+transaction. Then C, the dry-eval against these fixtures. Then the operator docs.
