@@ -3795,3 +3795,62 @@ chosen by us:
   in passing.
 
 **⇒ The only degree of freedom the bot has is WHETHER to act, not on what terms.**
+
+---
+
+## 42. ⛔ THE LIVE CANDIDATE HAS NON-ZERO EQUITY — the accepted scope does not cover it (2026-09-03)
+
+The convert builder was scoped to *"one loan per transaction, and a non-zero borrower equity is a named
+`EQUITY_NOT_MODELLED` refusal"*, on the stated premise that **the real candidate has zero equity so it
+costs nothing today**. ⛔ **That premise is wrong**, and it was checked before building the live rig
+around it rather than after.
+
+### 42.1 The arithmetic, from the on-chain oracle price
+
+`redeemerEquity = max(get_equity_in_collateral_currency(...), 0)` where
+`equity = collateral − debt − debt × partialLiquidationPenaltyPerMille/1000`, priced at the collateral
+oracle. For `d832b78e…#1`, with the price the real oracle redeemer carries (0.22278163 lovelace/unit)
+and the loan datum's penalty of **100 per mille**:
+
+| remainingDebt | collateral value | penalty | equity |
+|---|---|---|---|
+| 20,000,000 (principal only) | 22,278,163 | 2,000,000 | **278,163 lovelace ≈ 1,248,590 FLDT units** |
+| 20,100,000 | 22,278,163 | 2,010,000 | **168,163 lovelace ≈ 754,833 FLDT units** |
+| 21,000,000 | 22,278,163 | 2,100,000 | negative ⇒ **0** |
+
+**⇒ Today the equity is positive**, so the builder refuses the very candidate the live dry-eval exists
+to prove. It floors to zero only once accrued interest pushes the debt past ≈20.25 ada — *the scope
+would become correct by waiting, which is not a plan.*
+
+### 42.2 What modelling it costs — bounded, and fully specified by the validator
+
+`loan_claim_action`'s `equity_sent_to_borrower` dictates every field. One more output:
+
+- at the **asset-manager** smart credential, at the redeemer's per-loan `index` among the outputs to
+  that credential;
+- inline datum `AssetManagerDatumWithToken { inputOutputReference: <the loan input>, action:
+  action_partial_liquidation_compensation, data: None, ownerAsset: Asset(borrowerBondPolicyId,
+  loanId) }` — note the owner is the **BORROWER's** bond, not the lender's;
+- holding `>= equity` of the **collateral** asset (the loan's `equityInPrincipalCurrency` is false);
+- ⚠ **and a DoS guard that makes the value exact**: `length(flatten(value)) == 2 + receiptAssetCount`
+  for a token asset — ada plus the equity token and **nothing else**. A stray asset in that output
+  fails it.
+
+⚑ **It does NOT conflict with the convert action's asset-manager prohibition.** That rule is
+`list.find(self.withdrawals, … == assetManagerWithdrawScriptHash) == None` — it forbids *spending* an
+asset-manager input, which needs the withdraw script. **Creating** an asset-manager output needs no
+withdrawal at all.
+
+`LiquidationTxEncoder.assetManagerDatumWithToken(...)` already writes exactly this datum shape, and
+`PARTIAL_LIQUIDATION_ACTION_HEX` is already a constant — so the work is one output, one index, one
+branch, plus tests.
+
+### 42.3 ⚑ The pattern, a fourth time
+
+A scope limit was accepted on a factual premise about the live candidate, **and nobody had computed
+it** — including me, when I proposed it. It is the same shape as B1.5, §38 and the pool-index
+discovery: *the last mile between "the code is correct" and "it works on the thing we actually have".*
+
+**⇒ And the specific habit worth keeping: when a scope exclusion is justified by "the real case does
+not hit it", COMPUTE the real case before the exclusion is accepted.** An untested premise inside an
+accepted scope is invisible — it has already been agreed to.
