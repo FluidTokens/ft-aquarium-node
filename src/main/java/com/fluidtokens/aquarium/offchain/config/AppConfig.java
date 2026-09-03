@@ -554,17 +554,37 @@ public class AppConfig {
         private String referenceScriptAssetManager;
 
         /**
-         * The convert path's own action validator. Distinct from {@code lm-liquidate-action}, which
-         * is the PLAIN path's: measured on the fourth deployment this one is 7,051 bytes against that
-         * one's 4,227, and it is the largest script left inline on a convert liquidation. Until this
-         * key existed it could not be referenced at all, which is why a convert transaction sat at
-         * 20,548 bytes against a 16,384 limit with everything else already published.
+         * The PAY-IN-ADVANCE action validator. ⚠ Its javadoc used to call this "the convert path's",
+         * from when the two words meant the same thing here; they do not. Measured on the fourth
+         * deployment it is 7,051 bytes against {@code lm-liquidate-action}'s 4,227, and it is the
+         * largest script left inline on a pay-in-advance liquidation. Until this key existed it could
+         * not be referenced at all, which is why such a transaction sat at 20,548 bytes against a
+         * 16,384 limit with everything else already published.
          */
         @Value("${loans.liquidation.reference-scripts.lm-liquidate-and-pay-in-advance-action:}")
         private String referenceScriptLmLiquidateAndPayInAdvanceAction;
 
         /**
-         * The parsed form of the eight keys above, as {@link LiquidateTransactionBuilder} wants
+         * ⛔ The CONVERT action validator, {@code lm_liquidate_and_convert_action} — a different
+         * script from both of the above, and the one a convert liquidation cannot do without.
+         *
+         * <p>FluidTokens has published it on mainnet:
+         * {@code 56840ffb07ca0ad4e1eb921695bad5d2719f838612008e13bfe7f775933a7def#0}, part of the
+         * verified 27-of-27 set (findings §24). <b>Left empty it travels inline</b>, and a convert
+         * already carries four validators plus a Minswap order — the same arithmetic that put
+         * pay-in-advance at 20,548 bytes applies here, so this is not optional in practice.
+         *
+         * <p>⚑ A per-validator named key is the pattern this block already uses, and FAB-75 tracks
+         * replacing all nine with one coordinate list the chain resolves by
+         * {@code referenceScriptHash} — the shape the compound path already uses, where a mislabelled
+         * coordinate is not expressible. This adds the one key convert needs now rather than blocking
+         * on that harmonisation.
+         */
+        @Value("${loans.liquidation.reference-scripts.lm-liquidate-and-convert-action:}")
+        private String referenceScriptLmLiquidateAndConvertAction;
+
+        /**
+         * The parsed form of the nine keys above, as {@link LiquidateTransactionBuilder} wants
          * them: a {@code null} field per validator that is not published.
          */
         private LiquidateTransactionBuilder.ReferenceScripts referenceScripts =
@@ -707,7 +727,9 @@ public class AppConfig {
                     referenceInput("loans.liquidation.reference-scripts.asset-manager",
                             referenceScriptAssetManager),
                     referenceInput("loans.liquidation.reference-scripts.lm-liquidate-and-pay-in-advance-action",
-                            referenceScriptLmLiquidateAndPayInAdvanceAction));
+                            referenceScriptLmLiquidateAndPayInAdvanceAction),
+                    referenceInput("loans.liquidation.reference-scripts.lm-liquidate-and-convert-action",
+                            referenceScriptLmLiquidateAndConvertAction));
             log.info("INIT - liquidation reference scripts: {}", referenceScripts);
         }
 

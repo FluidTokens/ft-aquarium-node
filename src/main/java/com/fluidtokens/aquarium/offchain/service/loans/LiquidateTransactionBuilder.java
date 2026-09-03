@@ -475,7 +475,8 @@ public final class LiquidateTransactionBuilder {
                                    TransactionInput loanClaimAction,
                                    TransactionInput lmLiquidateAction,
                                    TransactionInput assetManager,
-                                   TransactionInput lmLiquidateAndPayInAdvanceAction) {
+                                   TransactionInput lmLiquidateAndPayInAdvanceAction,
+                                   TransactionInput lmLiquidateAndConvertAction) {
 
         /**
          * The seven-slot form, for callers that predate {@code lmLiquidateAndPayInAdvanceAction}.
@@ -489,12 +490,25 @@ public final class LiquidateTransactionBuilder {
                                 TransactionInput lmLiquidateAction,
                                 TransactionInput assetManager) {
             this(loan, loanSpend, lenderManager, lenderManagerSpend, loanClaimAction,
-                    lmLiquidateAction, assetManager, null);
+                    lmLiquidateAction, assetManager, null, null);
+        }
+
+        /** The eight-slot form, for callers that predate {@code lmLiquidateAndConvertAction}. */
+        public ReferenceScripts(TransactionInput loan,
+                                TransactionInput loanSpend,
+                                TransactionInput lenderManager,
+                                TransactionInput lenderManagerSpend,
+                                TransactionInput loanClaimAction,
+                                TransactionInput lmLiquidateAction,
+                                TransactionInput assetManager,
+                                TransactionInput lmLiquidateAndPayInAdvanceAction) {
+            this(loan, loanSpend, lenderManager, lenderManagerSpend, loanClaimAction,
+                    lmLiquidateAction, assetManager, lmLiquidateAndPayInAdvanceAction, null);
         }
 
         /** Nothing published: every script travels in the witness set. */
         public static ReferenceScripts none() {
-            return new ReferenceScripts(null, null, null, null, null, null, null, null);
+            return new ReferenceScripts(null, null, null, null, null, null, null, null, null);
         }
     }
 

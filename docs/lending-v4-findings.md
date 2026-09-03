@@ -3553,3 +3553,62 @@ reported placeholders would have been the whole proof, wrong.
 ⚠ **A third option does not exist**, and it is worth writing down so nobody spends a day on it: there is
 no fabricated fixture that makes a convert oracle-free, because the requirement comes from the *pair
 being two assets*, which is what a convert IS.
+
+---
+
+## 39. Stage D, piece 3 — and the last mile nobody had scoped, again (2026-09-03)
+
+Stage D is the executor wiring that makes convert reachable at all: without it
+`ConvertTransactionBuilder` is correct, tested, and **dead code** (§38 report). Five pieces; this
+records the first one landed and a discovery that changes the second.
+
+### 39.1 The convert action's reference-script key
+
+`loans.liquidation.reference-scripts.lm-liquidate-and-convert-action` — a ninth named slot beside the
+eight that existed. **It is not optional in practice.** `lm_liquidate_and_convert_action` is a
+different script from both `lm-liquidate-action` (the plain path's) and
+`lm-liquidate-and-pay-in-advance-action`; left unpublished it travels inline, and a convert already
+carries four validators plus a Minswap order. The same arithmetic put a pay-in-advance transaction at
+**20,548 bytes against a 16,384 limit** with everything else already published.
+
+**FluidTokens has already published it on mainnet** — `56840ffb…#0`, part of the verified 27-of-27 set
+(§24). The key is what lets an operator point at it.
+
+⚑ FAB-75 tracks replacing all nine named keys with **one coordinate list the chain resolves by
+`referenceScriptHash`** — the shape the compound path already uses, where *a mislabelled coordinate is
+not expressible*. This adds the one key convert needs now rather than blocking on that.
+
+⚠ Also corrected in passing: the `lm-liquidate-and-pay-in-advance-action` key's javadoc called it
+*"the convert path's own action validator"*, from when those two words meant the same thing in this
+repo. They do not, and a reader configuring convert would have pointed at the wrong key.
+
+### 39.2 ⛔ THE NODE DOES NOT INDEX MINSWAP POOLS — so piece 2 cannot read the local index
+
+The convert plan needs the **live pool UTxO and its datum**, resolved by NFT at scan time. The obvious
+implementation is a lookup in the node's own index. **It cannot be**: `TankUtxoStorage` keeps only
+UTxOs at `LoansContractRegistry.indexedPaymentCredentials()`, which are derived from the pinned config
+policy ids. **Minswap's pool credential is not among them, and a Minswap pool UTxO is therefore
+discarded at write time with no trace it was ever offered** — `officina:yaci-store-index-scoping`'s
+exact failure mode.
+
+Two ways out, and the choice matters:
+- **Index them.** Add the Minswap pool credential to the kept set. ⛔ That indexes *every Minswap V2
+  pool on the network* into this node's storage, and would need a `sync-start` far enough back to
+  capture pools created long ago. Disproportionate for a lookup of one UTxO per candidate.
+- **Query the provider.** The pool address is stable per network, and
+  `/addresses/{poolAddress}/utxos/{lpAssetUnit}` returns **exactly one** UTxO — measured this session
+  against the live ADA/FLDT pool. Two facts make this cheap: the lp asset name is computable
+  (§34, SHA3-256 twice), and the answer is one row.
+
+**⇒ Query the provider**, with the pool address as configuration. It follows the precedent already set
+by the oracle registry client, which reaches out rather than indexing.
+
+⚠ **And this is the third instance of the same shape in this stage sequence** — B1.5 (the registry
+could not derive the convert hash), §38 (no offline rig can evaluate a convert), and now the pool
+lookup. Each was found by asking *"what will actually happen when this runs"* rather than by reading
+the code, and each sat in the last mile between correct code and a working feature. **A feature is not
+done when its code is correct; it is done when something calls it and an operator can observe the
+result.**
+
+**Remaining in Stage D:** routing on `MarketGate.actionFor()` · the pool resolver · `ConvertEconomics`
+called with the built fee · a decision `variant` for convert.
