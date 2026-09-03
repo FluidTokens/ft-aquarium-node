@@ -1,0 +1,222 @@
+package com.fluidtokens.aquarium.offchain.service.loans;
+
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
+import com.fluidtokens.aquarium.offchain.model.loans.ConvertAssessment;
+import com.fluidtokens.aquarium.offchain.model.loans.ConvertExclusion;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.math.BigInteger;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * The convert profitability gate. Stage 1 of the LiquidateAndConvert build.
+ *
+ * <p>The cases here are chosen so that the two figures most likely to be got wrong — the validator's
+ * integer-truncated fee, and the 2.8 ada a token collateral forces into the Minswap order — each have
+ * a test that goes red on their own if the arithmetic drifts.
+ */
+class ConvertEconomicsTest {
+
+    private static final BigInteger ADA = BigInteger.valueOf(1_000_000L);
+
+    private static AssetType token() {
+        return new AssetType("aa".repeat(28), "544f4b454e");
+    }
+
+    /** A feed pricing one unit of the collateral at {@code lovelaces/denominator}. */
+    private static OraclePriceFeed feed(long lovelaces, long denominator) {
+        return OraclePriceFeed.aggregated(token(), BigInteger.valueOf(lovelaces),
+                BigInteger.valueOf(denominator), 0L, Long.MAX_VALUE);
+    }
+
+    private static ConvertEconomics economics(boolean enabled, long floorLovelace) {
+        return new ConvertEconomics(
+                new AppConfig.ConvertConfiguration(enabled, BigInteger.valueOf(floorLovelace)),
+                network("preview"));
+    }
+
+    private static AppConfig.Network network(String name) {
+        var n = new AppConfig.Network();
+        ReflectionTestUtils.setField(n, "network", name);
+        return n;
+    }
+
+    // ---- arming and eligibility -------------------------------------------------------------
+
+    @Test
+    void aDisabledPathRefusesBeforeAnythingElseIsEvenLookedAt() {
+        ConvertAssessment a = economics(false, 0)
+                .assess(true, BigInteger.valueOf(1_000_000_000L), 50L, true, feed(1, 1), ADA);
+
+        assertFalse(a.approved());
+        assertEquals(ConvertExclusion.NOT_ARMED, a.exclusion());
+        assertNull(a.net(), "a refusal before the arithmetic must not invent numbers to report");
+    }
+
+    /**
+     * ⛔ The lender's choice, not the operator's. {@code shouldLiquidationConvertToPrincipal} is the
+     * validator's first conjunct; converting a bond that forbids it fails on chain after the fee is
+     * spent.
+     */
+    @Test
+    void aBondThatForbidsConversionIsRefusedNoMatterHowProfitableItLooks() {
+        ConvertAssessment a = economics(true, 0)
+                .assess(false, BigInteger.valueOf(1_000_000_000L), 500L, true, feed(1, 1), ADA);
+
+        assertFalse(a.approved());
+        assertEquals(ConvertExclusion.BOND_FORBIDS_CONVERSION, a.exclusion());
+    }
+
+    // ---- the fee is in COLLATERAL units, so it needs a price ---------------------------------
+
+    @Test
+    void noCollateralFeedMeansTheFeeCannotBeValuedAtAllAndIsRefusedRatherThanGuessed() {
+        ConvertAssessment a = economics(true, 0)
+                .assess(true, BigInteger.valueOf(1_000_000_000L), 500L, false, null, ADA);
+
+        assertFalse(a.approved());
+        assertEquals(ConvertExclusion.COLLATERAL_UNPRICEABLE, a.exclusion());
+    }
+
+    /** A {@code Pooled} feed is an outright {@code fail} in finance.ak — it must not price to zero. */
+    @Test
+    void aPooledFeedIsUnpriceableRatherThanWorthNothing() {
+        OraclePriceFeed pooled = new OraclePriceFeed(OraclePriceFeed.Variant.POOLED, token(),
+                BigInteger.ONE, BigInteger.ONE, 0L, Long.MAX_VALUE);
+
+        ConvertAssessment a = economics(true, 0)
+                .assess(true, BigInteger.valueOf(1_000_000_000L), 500L, false, pooled, ADA);
+
+        assertEquals(ConvertExclusion.COLLATERAL_UNPRICEABLE, a.exclusion());
+    }
+
+    // ---- the validator's arithmetic ----------------------------------------------------------
+
+    /**
+     * {@code collateral * feePerMille / 1000}, truncated. Rounding UP would make the order short of
+     * collateral the validator computed from the same expression, which is a phase-2 failure.
+     */
+    @Test
+    void theFeeTruncatesExactlyAsTheValidatorDoes() {
+        assertEquals(BigInteger.ZERO, ConvertEconomics.liquidationFee(BigInteger.valueOf(999L), 1L),
+                "999 * 1 / 1000 is 0 on chain; a rounded-up 1 is collateral the order would not have");
+        assertEquals(BigInteger.valueOf(1L), ConvertEconomics.liquidationFee(BigInteger.valueOf(1999L), 1L));
+        assertEquals(BigInteger.valueOf(50L), ConvertEconomics.liquidationFee(BigInteger.valueOf(1000L), 50L));
+    }
+
+    // ---- the 2.8 ada, which is the term most likely to be forgotten --------------------------
+
+    /**
+     * ⛔ THE ONE THAT PAYS FOR THIS FILE. A token collateral forces
+     * {@code quantity_of(orderOutput, "", "") == 2_800_000} and that ada leaves with the order. The
+     * same candidate is profitable when the collateral is ada and a loss when it is a token, on
+     * numbers that differ in nothing else.
+     */
+    @Test
+    void aTokenCollateralCostsTwoPointEightAdaThatAnAdaCollateralDoesNot() {
+        // Fee income worth 2_000_000 lovelace, tx fee 1_000_000.
+        ConvertEconomics gate = economics(true, 0);
+        BigInteger collateral = BigInteger.valueOf(1_000_000L);
+        long feePerMille = 4L;          // -> 4_000 collateral units
+        OraclePriceFeed price = feed(500, 1);   // -> 2_000_000 lovelace
+
+        ConvertAssessment asAda = gate.assess(true, collateral, feePerMille, true, price, ADA);
+        ConvertAssessment asToken = gate.assess(true, collateral, feePerMille, false, price, ADA);
+
+        assertEquals(BigInteger.valueOf(4_000L), asAda.liquidationFee());
+        assertEquals(BigInteger.valueOf(2_000_000L), asAda.feeValueLovelace());
+
+        assertEquals(BigInteger.ZERO, asAda.orderAdaFunded());
+        assertEquals(BigInteger.valueOf(1_000_000L), asAda.net());
+        assertTrue(asAda.approved(), "an ada collateral pays only the transaction fee");
+
+        assertEquals(BigInteger.valueOf(2_800_000L), asToken.orderAdaFunded());
+        assertEquals(BigInteger.valueOf(3_800_000L), asToken.outlay());
+        assertEquals(BigInteger.valueOf(-1_800_000L), asToken.net());
+        assertFalse(asToken.approved(), "the 2.8 ada the order carries is the bot's and it does not "
+                + "come back — a model that omits it approves a loss");
+        assertEquals(ConvertExclusion.NET_BELOW_FLOOR, asToken.exclusion());
+    }
+
+    // ---- the floor -----------------------------------------------------------------------------
+
+    @Test
+    void theFloorIsInclusiveOnItsExactValueAndRefusesOneLovelaceBelow() {
+        // fee 1_000 units at 1 lovelace each = 1_000; txFee 900 -> net 100.
+        ConvertEconomics gate = economics(true, 100L);
+        BigInteger collateral = BigInteger.valueOf(1_000_000L);
+
+        ConvertAssessment onTheLine =
+                gate.assess(true, collateral, 1L, true, feed(1, 1), BigInteger.valueOf(900L));
+        assertEquals(BigInteger.valueOf(100L), onTheLine.net());
+        assertTrue(onTheLine.approved(), "net == floor must be allowed; a strict > silently raises "
+                + "every operator's stated bound by one lovelace");
+
+        ConvertAssessment justUnder =
+                gate.assess(true, collateral, 1L, true, feed(1, 1), BigInteger.valueOf(901L));
+        assertEquals(BigInteger.valueOf(99L), justUnder.net());
+        assertFalse(justUnder.approved());
+    }
+
+    /**
+     * A lender who set no liquidation fee pays the bot nothing. The default floor refuses it with no
+     * special case, exactly as the compound path does — and the assessment still says so out loud, so
+     * an operator reading a decision log sees WHY rather than only that the net was negative.
+     */
+    @Test
+    void aZeroFeeBondIsRefusedByTheDefaultFloorAndSaysSo() {
+        ConvertAssessment a = economics(true, 0)
+                .assess(true, BigInteger.valueOf(1_000_000_000L), 0L, true, feed(1, 1), ADA);
+
+        assertEquals(BigInteger.ZERO, a.liquidationFee());
+        assertTrue(a.zeroFeeBond());
+        assertFalse(a.approved());
+        assertEquals(ConvertExclusion.NET_BELOW_FLOOR, a.exclusion());
+    }
+
+    // ---- the boot guard ------------------------------------------------------------------------
+
+    @Test
+    void aNegativeMarginIsRefusedOnMainnetAndMerelyWarnedOnPreview() {
+        var negative = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(-1L));
+
+        assertThrows(IllegalStateException.class,
+                () -> new ConvertEconomics(negative, network("mainnet")).announceAndGuard(),
+                "a negative convert floor on mainnet authorises unpaid work on someone else's loan");
+
+        new ConvertEconomics(negative, network("preview")).announceAndGuard();
+    }
+
+    /** An unknown or absent network resolves to mainnet — fail-closed, as the compound gate does. */
+    @Test
+    void anUnknownNetworkCountsAsMainnet() {
+        var negative = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(-1L));
+
+        assertThrows(IllegalStateException.class,
+                () -> new ConvertEconomics(negative, network("sanchonet")).announceAndGuard());
+        assertThrows(IllegalStateException.class,
+                () -> new ConvertEconomics(negative, null).announceAndGuard());
+    }
+
+    /**
+     * ⚠ §26.2's lesson, applied before it can bite: a {@code @Value} default is not a default of the
+     * class. Every construction path that is not Spring's must still see convert armed and the floor
+     * at zero, or the shipped default silently differs from the documented one.
+     */
+    @Test
+    void theDefaultsLiveOnTheFieldsNotOnlyInTheAnnotation() {
+        var fresh = new AppConfig.ConvertConfiguration();
+
+        assertTrue(fresh.isEnabled(), "convert defaults ON per Giovanni's ruling; a field left false "
+                + "would make every non-Spring construction disagree with application.yaml");
+        assertEquals(BigInteger.ZERO, fresh.getProfitMarginLovelace());
+    }
+}

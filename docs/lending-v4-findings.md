@@ -2446,3 +2446,198 @@ derivation (now unblocked). **Plus an economics model per §27.4.**
    operator-selected alternative. §27.1 says the protocol permits either.
 3. **Whether pay-in-advance stays at all** once convert exists — it is the capital-hungry path, and
    the market gates now bound exactly that exposure.
+
+---
+
+## 28. ⛔ CONVERT CANNOT BE REHEARSED ON PREVIEW — and the validator's full shape, read at `e0b818e` (2026-09-03)
+
+Giovanni ruled the convert path in: *"liquidation by minswap/conversion should always be enabled by
+default, additional configuration can be provided to disable a market OR to force anticipate instead
+of convert."* This section is the reachability answer that had to come **before** the builder, the
+routing design that ruling implies, and everything `lm_liquidate_and_convert_action.ak` demands.
+
+### 28.1 The reachability verdict: offline YES, preview NO, live is MAINNET-ONLY
+
+Three measurements, in the order that settles the question.
+
+**① The mainnet parameterisation derives exactly — so the offline rig is unblocked.** Applying
+FluidTokens' eleven quoted parameters to our vendored blueprint yields
+`ed8d41e48d2b48c23c1673493e133b2e5a3300555026cab6c729683b`, **which is what the mainnet LMConfigDatum
+publishes at field 5.** Re-measured this session, not carried over from §25.1.
+
+**② The same Minswap coordinates do NOT derive preview.** Substituting preview's own loans
+coordinates (fourth deployment, `d46f626f…` / `a7d4b762…`) while keeping the three mainnet Minswap
+hashes yields `52b778c8…`. Preview's LMConfigDatum field 5 publishes **`aa3628d86e3f16b7d797d0633087859c11e3d200a5defc8ff0fc920e`**.
+
+> **⇒ Preview's convert action is parameterised with Minswap coordinates we do not have, and
+> cannot derive.** Placeholders were tested and excluded: all-empty gives `795441a3…`, all-zero-28
+> gives `77d61704…`. Neither matches. FluidTokens pointed preview at *some* other Minswap deployment.
+
+**③ Nothing on preview supports it anyway.** Blockfrost preview, this session:
+
+| query | result |
+|---|---|
+| `/assets/policy/f5808c2c…` (mainnet Minswap V2 pool policy) | **404** — not on preview |
+| `/scripts/aa3628d8…` (preview's OWN convert action) | **404 — never submitted on preview, ever** |
+| `/scripts/00b8a30b…` (preview's pay-in-advance action) | present, PlutusV3, 7,051 bytes |
+
+**The convert script has never appeared in a preview transaction.** The sibling path that *has* been
+exercised is right beside it in the same datum, which is what makes the absence meaningful rather
+than merely unobserved.
+
+**⇒ THE THREE CONSEQUENCES, and they are not the same shape:**
+- **The offline dry-eval rig is fully unblocked** and must run on **mainnet** parameterisation. It
+  fabricates its own UTxOs, so it needs no live pool — only a fixture pool ref-input carrying a real
+  `PoolDatum`. This is where the builder gets proven.
+- **A live preview rehearsal is impossible**, on two independent grounds — we cannot even *derive*
+  the preview script hash, and no Minswap V2 pool exists there to reference. Either alone is fatal.
+- **⚠ So convert's first on-chain execution would be its first on-chain execution ever, on mainnet,
+  with real funds.** Every prior path in this project earned a preview rehearsal first. This one
+  structurally cannot. That is a fact for Giovanni's go/no-go, not an argument against building it.
+
+**One question to FluidTokens unblocks a preview rehearsal** — the preview parameterisation of
+`lm_liquidate_and_convert_action` (the three Minswap hashes), plus whether a Minswap V2 pool exists on
+preview for any pair we can originate a loan in. Until then, offline is the whole rehearsal.
+
+### 28.2 What the validator demands — the engineering surface, complete
+
+Read from `validators/lender-manager/lm_liquidate_and_convert_action.ak` at `e0b818e`.
+
+**The Minswap pool is a REFERENCE INPUT**, resolved through `get_inputs_from_smart_credential` and
+required to hold `minswapPoolAssetName` under `minswapPoolPolicyId` (`quantity_of(...) == 1`). Its
+inline datum is decoded as a `PoolDatum`, and `asset_a`/`asset_b` must be exactly the
+(collateral, principal) pair in one order or the other — `lpABDirection` is `asset_a == collateral`.
+**⇒ No live pool for the exact pair ⇒ convert is impossible for that loan**, not merely unprofitable.
+
+**⛔ The 2.8 ada nobody would have predicted.** For a **non-ada** collateral the order output must
+carry the swappable collateral **and exactly `2_800_000` lovelace**:
+
+```
+correctOrderValue = if collateralPolicyId == ada_policy_id {
+    quantity_of(order, collateral) == swappableCollateralAmount
+} else {
+    quantity_of(order, collateral) == swappableCollateralAmount && quantity_of(order, "", "") == 2800000 }
+```
+
+That ada leaves with the order — `max_batcher_fee` is 700,000 of it and the receiver is the lender's
+asset manager. **A token collateral therefore costs the bot 2.8 ada it does not get back**, four to
+five times a typical transaction fee. An economics model that omitted it would approve losses while
+looking careful. ⚠ *Provenance:* we count the whole 2.8 ada as the bot's, which is the conservative
+reading; how much of the loan input's own min-ada `loan_claim_action` lets flow into the order is
+**not yet measured**. A later measurement can only make the gate *less* strict.
+
+**Two datum-carrier outputs.** The order's `EODInlineDatum{hash}` fields need the datums to exist on
+chain, so the transaction must carry two outputs whose **inline datums hash to** `successDatumHash`
+and `refundDatumHash`. Their **addresses are unconstrained** — so the builder self-addresses them and
+their min-ada returns as bot-owned UTxOs in the same transaction. **That is an invariant the
+economics gate rests on**: send them elsewhere and the gate silently under-counts cost.
+
+The two hashes are `blake2b_256(serialise_data(AssetManagerDatumWithToken{…}))`, and they are **not
+symmetric** — a detail worth having in writing before the builder:
+
+| | `inputOutputReference` | `action` | `data` |
+|---|---|---|---|
+| success | `OutputReference{ transaction_id: "", output_index: 0 }` | `converted_to_liquidity_action` | the **collateral** `Asset` |
+| refund | the loan input's **own** `output_reference` | `action_claimed_collateral` | `None` |
+
+**Other hard requirements:** `expect equityInPrincipalCurrency == False` (mirror of §13);
+`shouldLiquidationConvertToPrincipal` must be true; the lender bond output must equal its input under
+`builtin.equals_data` **on the whole output**; `liquidationFeePerMille >= 0`; the loan NFT's asset
+name must equal the lender bond's; `lenderBondInputIndexes` must be **unique** and as long as
+`loanInputs`; and **the asset-manager withdraw script must be absent from the transaction** — so
+convert and compound cannot share one transaction (that is the separate
+`lm_liquidate_convert_and_compound_action`). The order address is
+`Script(minswapOrderSpendScriptHash)` with the **lender's** stake credential in the non-CIP-113 case.
+
+### 28.3 ⚑ The non-atomicity problem is RETIRED — on the protocol author's word
+
+FluidTokens (Matteo), relayed first-hand 2026-09-03: if the order does not fill, **Minswap returns the
+original collateral into `asset_manager` and the lender reclaims it as-is**; the bot is finished the
+moment the order is created, whether or not it fills; the order's owner is the **lender**.
+
+**⇒ No pending-order machinery, no placed-not-yet-filled state, no re-place idempotence.** The
+liquidation **consumes the loan UTxO**, so the thing that would trigger a duplicate no longer exists.
+Order-created **is** done, terminally.
+
+**And a stronger consequence for the economics than the safety argument alone gives:** the bot's fee is
+subtracted **before** the swap, so the bot holds the same position whether the order fills or not.
+**Convert's profitability does not depend on the fill.** The worst case is a no-op for every party.
+
+⚠ **One thing the scanner must not get wrong:** a *failed* order's returned collateral sits in the
+asset manager **owned by the lender, as collateral** — it is not compoundable principal. Only a
+*successful* swap's principal is what `lm_compound_action` later collects. The compound scanner's
+existing `PRINCIPAL_NOT_ADA` / escrow-shape refusals are not obviously sufficient to tell those apart;
+**that is a named check for the compound-side stage**, not an assumption.
+
+### 28.4 The routing design: three states, one knob — `loans.liquidation.markets`
+
+Giovanni's ruling makes convert the default and leaves two overrides. The existing key already carries
+per-market state (§Thread A, `5a23cc4`), so it gains a **mode** rather than a second key:
+
+```
+loans.liquidation.markets: "<unit>:<mode>[:<cap>]"
+
+  (unlisted)              → CONVERT      the default for every market
+  <unit>:off              → SKIP         the bot does nothing in this market, on any path
+  <unit>:anticipate:<cap> → PAY-IN-ADVANCE, capped — <cap> is MANDATORY
+  <unit>:convert          → CONVERT, stated explicitly
+```
+
+**Why the mode comes before the cap.** The cap is only ever meaningful for `anticipate`: convert fronts
+no principal, so there is nothing to cap. Putting the mode first makes an entry unreadable *unless* it
+says which path it selects, and makes "a cap with no mode" — the ambiguous case — not expressible.
+
+**Why unlisted means convert, and why that is still defensive.** Convert fronts no capital and holds
+nothing, and §28.3 shows its failure mode is a no-op. **Pay-in-advance keeps the opposite default**:
+it is reachable *only* via an explicit entry naming a cap, exactly as `5a23cc4` shipped it. The two
+defaults differ because the exposures differ — the same reasoning that gives the compound path a floor
+of 0 and the liquidation path 1,500,000.
+
+**Three states that cannot contradict**, because they are one value: a market cannot be simultaneously
+off and capped, or forced to anticipate without a cap. **A malformed entry resolves to `off`**, loudly
+— never to a wider state.
+
+**⚠ The behaviour change this carries, stated rather than discovered:** under `5a23cc4` an entry
+`lovelace:500000000` meant "anticipate is permitted up to 500 ada". Under this grammar that form is
+**malformed** and the market resolves to `off`. It is rejected rather than reinterpreted precisely
+because reinterpreting it would silently change which path an operator's existing config selects.
+
+**Note on scope:** `anticipate` is the *only* way pay-in-advance can now be reached at all. §27
+established that the lender's bond flag partitions loans — `False` permits plain Liquidate only,
+`True` permits pay-in-advance **or** convert. So with convert as the default for the `True` class,
+**pay-in-advance is unreachable unless an operator forces it.** That is the intended reading of
+Giovanni's ruling, and it is also the escape hatch for a market with **no Minswap pool**, where
+convert is impossible rather than merely worse.
+
+### 28.5 Stage 1, shipped: `ConvertEconomics`
+
+A fresh model. §25.5's warning holds — the −27,303,331 pay-in-advance floor does not transfer, and
+nothing was carried over.
+
+```
+income  = liquidationFee × collateral oracle price      (collateral units → lovelace, floored)
+outlay  = txFee + (collateral is ada ? 0 : 2_800_000)
+approved ⟺ income − outlay ≥ loans.liquidation.convert.profit-margin-lovelace   (default 0)
+```
+
+**⚠ The honest statement of what this compares.** The income is an **oracle valuation of an unrealised
+token position**; the outlay is ada genuinely spent. The pay-in-advance floor went wrong by valuing an
+acquired asset at nothing, and **the opposite mistake — crediting tokens as though they were cash — is
+just as available.** It is named in the class rather than buried, and **the margin is the operator's
+lever on it**: raise it until the ada-equivalent is worth the exposure.
+
+`loans.liquidation.convert.enabled` **defaults `true`** — the only arming flag in this codebase that
+does — and that is Giovanni's ruling applied, not weakened: the flag only matters for a node whose
+operator has already passed `loans.enabled`, `loans.liquidation.mode`, `loans.liquidation.enabled` and
+`loans.submittable-network`. A negative margin is **refused on mainnet at startup**, as on every other
+path; an unknown network counts as mainnet.
+
+**Verification:** 11 tests, and four mutants each killed by exactly one test — dropping the 2.8 ada
+term, rounding the fee up, making the floor strict, and moving the `enabled` default off the field.
+Suite after: **96 files, 818 tests, 38 failures, 22 skipped, 0 orphans** — failures and skips
+unchanged from the pre-stage baseline.
+
+**Unstarted at this boundary**, named so nothing reads as done: the market **mode** parsing (§28.4 is
+a design, `MarketGate` still parses `<unit>:<cap>`); the registry's convert-hash derivation; the
+convert builder; Minswap `PoolDatum`/`OrderDatum` encoding; `compute_lp_asset_name`; the dry-eval rig;
+executor wiring; the image.

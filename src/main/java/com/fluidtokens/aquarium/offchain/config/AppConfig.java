@@ -663,4 +663,71 @@ public class AppConfig {
         }
     }
 
+    /**
+     * The <b>LiquidateAndConvert</b> path: liquidate a convert-eligible loan by building a Minswap V2
+     * swap order inside the liquidation transaction, so the collateral is converted to the principal
+     * and lands in the lender's asset manager (findings §25).
+     *
+     * <p>⚑ <b>Its own block, and its own margin key, for the reason {@link CompoundConfiguration}
+     * gives:</b> convert and pay-in-advance share the word "liquidation" and almost nothing else.
+     * Pay-in-advance fronts the whole principal and is bounded by {@code MarketGate}'s per-market cap;
+     * convert fronts nothing and its outlay is a transaction fee plus, for a token collateral, the
+     * 2.8 ada the validator makes the order output carry. A shared margin would let a number reasoned
+     * about for one silently govern the other.
+     */
+    @Component
+    @Getter
+    @NoArgsConstructor
+    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
+    public static class ConvertConfiguration {
+
+        /**
+         * ⚑ <b>Default {@code true} — the one arming flag in this codebase that defaults ON</b>, on
+         * Giovanni's first-hand ruling (2026-09-03): <i>"with the convert path, liquidation by
+         * minswap/conversion should always be enabled by default, additional configuration can be
+         * provided to disable a market OR to force anticipate instead of convert."</i>
+         *
+         * <p>That does not weaken the defensive-defaults rule, it applies it. The bot fronts no
+         * capital on this path and holds nothing: FluidTokens confirmed that an order which does not
+         * fill returns the original collateral to the asset manager for the lender to reclaim, and the
+         * bot's fee is taken before the swap either way. <b>Its failure mode is a no-op, not a
+         * loss</b> — unlike pay-in-advance, which is the capital-hungry path and stays opt-in behind a
+         * per-market cap.
+         *
+         * <p>And "on by default" is on only for a node whose operator has already armed liquidation:
+         * {@code loans.enabled}, {@code loans.liquidation.mode}, {@code loans.liquidation.enabled} and
+         * {@code loans.submittable-network} all still apply, ahead of this. This flag turns the
+         * mechanism off globally; {@code loans.liquidation.markets} turns it off per market.
+         */
+        @Value("${loans.liquidation.convert.enabled:true}")
+        private boolean enabled = true;
+
+        /**
+         * What {@code feeValueLovelace - (txFee + orderAda)} must reach for a convert to be built.
+         *
+         * <p><b>Default {@code 0} refuses every net loss</b> while allowing exact break-even, matching
+         * the compound floor and for the same reason: this path advances no principal and carries no
+         * position, so demanding the liquidation path's 1_500_000 premium would refuse sound work.
+         * It is also what refuses a bond with {@code liquidationFeePerMille = 0} out of the box — such
+         * a bond pays nothing, so the net is exactly minus the outlay.
+         *
+         * <p>⚠ <b>This is also the operator's lever on a modelling risk</b>, not only on margin. The
+         * income side is the collateral-denominated fee valued at the oracle price — real, but held in
+         * tokens and unrealised. An operator who doubts the price, or the liquidity behind it, raises
+         * this until they are paid enough ada-equivalent to be worth the exposure. See
+         * {@code ConvertEconomics}.
+         *
+         * <p>A negative value is a number the operator STATES rather than a protection they switch
+         * off, exactly as on the compound path — and it is <b>refused on mainnet at startup</b>.
+         */
+        @Value("${loans.liquidation.convert.profit-margin-lovelace:0}")
+        private BigInteger profitMarginLovelace = BigInteger.ZERO;
+
+        /** Test seam: {@code @Value} owns these in production. */
+        public ConvertConfiguration(boolean enabled, BigInteger profitMarginLovelace) {
+            this.enabled = enabled;
+            this.profitMarginLovelace = profitMarginLovelace;
+        }
+    }
+
 }
