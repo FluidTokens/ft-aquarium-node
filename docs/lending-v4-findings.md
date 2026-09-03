@@ -3192,3 +3192,72 @@ unchanged.
 
 **Unstarted:** the convert builder and its §28.5 engineering, now with §32.3's measured Minswap facts;
 and the operator docs (shadow-first, the stated-loss mode, indexed env vars).
+
+---
+
+## 34. The convert encoder — every Minswap byte taken from the chain, and one from upstream (2026-09-03)
+
+Builder sub-stage A: `ConvertTxEncoder`. Pure functions, no transaction yet — the order datum, the two
+datum hashes the order embeds, the lp asset name, and the action's own withdraw redeemer.
+
+**Pinned against three independent oracles rather than against a reading**: the **live mainnet chain**
+(the LP token, a real filled order), the **deployed blueprint** (the redeemer's field order), and the
+**upstream Minswap declarations** (one constructor index no ordinary swap exercises). Every constant
+here fails **only on chain** if wrong.
+
+### 34.1 What the chain settled, and what it could not
+
+| fact | source | why the other source could not settle it |
+|---|---|---|
+| `compute_lp_asset_name` = **SHA3-256, twice** | chain: blake2b → 404, SHA3 → the live LP token | — |
+| pool NFT asset name = **`4d5350`** (`MSP`), constant | chain: the pool creation output | — |
+| `OrderDatum` = **9 fields**, in the validator's record order | chain: a real filled order | — |
+| `SwapExactIn` = constructor **0**; `SAOSpecificAmount` = **0**; `OAMSignature` = **0** | chain, corroborated upstream | — |
+| **`EODInlineDatum` = constructor 2** | **upstream declaration only** | ⛔ **every ordinary swap on chain carries `EODNoDatum` (0)** — the live sample confirms the record's field ORDER and can say nothing about this index |
+
+**⇒ The last row is the interesting one.** A sample proves what it contains, and a variant nobody uses
+is exactly what a sample cannot reach. `EODNoDatum`, `EODDatumHash`, `EODInlineDatum` — off by one and
+the datum decodes to a *different variant*, failing `equals_data` with nothing in the error pointing at
+an enum.
+
+### 34.2 Three shapes that are not what the sibling encoders assume
+
+- **⛔ The success datum's `transaction_id` is the EMPTY byte string.** The validator writes
+  `OutputReference { transaction_id: "", output_index: 0 }` literally. `LiquidationTxEncoder`'s
+  `outputReference` helper *rejects* anything that is not 64 hex chars — correct for its own use and
+  wrong for this one, which is why this path does not reuse it. Reuse would have thrown at build time,
+  which is the good failure; a laxer helper would have shipped a wrong hash.
+- **The success datum's `data` field carries the collateral `Asset`**, where every other asset-manager
+  datum this codebase writes carries `None`. The field is typed `Data`, so **nothing but the hash
+  comparison would ever notice**.
+- **⛔ `lenderBondInputIndexes` comes BEFORE `lenderBondAssetNames` in the redeemer** — the reverse of
+  the order the validator's *body* reads them in. Both are per-loan lists, so a swap produces a
+  redeemer that decodes cleanly into the wrong fields. **The declaration is what the encoding follows;
+  the body's mention order is not evidence of anything.**
+
+Also enforced at encode time: every per-loan list must have the same length. The validator walks them
+all by one index, so a short list does not fail — it silently reads *another loan's* value.
+
+### 34.3 ⚠ A defect in the mutation harness, not in the code
+
+The first `blake2b-not-sha3` mutant reported **`killed = []`** — apparently surviving. It had not
+survived; it had **failed to compile**, and the harness counted failures without counting whether
+anything ran. **"No failures" and "nothing ran" printed identically.**
+
+That is this repo's own `cleanTest` lesson one level up (CLAUDE.md: *assert the number of XML files,
+not only the totals*), and it is worth stating as a rule because it recurs in every ad-hoc mutation
+run: **a mutation harness must report the test COUNT alongside the kill list, or a mutant that breaks
+the build reads as a mutant the suite could not catch — and the conclusion drawn is the exact opposite
+of the truth.** Re-run with a compiling substitute (SHA-256 for SHA3-256, and single- for double-hash):
+both killed, by the live-LP-token test.
+
+### 34.4 Verification
+
+Six mutants, each killed by exactly one test: SHA-256 for SHA3 · single- for double-hash ·
+`EODInlineDatum` moved to constructor 1 · the two redeemer list fields swapped · `killable` set false ·
+a non-empty `transaction_id` on the success datum. Suite **101 files, 852 tests, 38 failures, 22
+skipped, 0 orphans**.
+
+**Unstarted:** the builder itself (`ConvertTransactionBuilder`) — output layout, the pool resolved by
+NFT at run time, the byte-echoed lender bond, trap-17 token change, and a real evaluator from the first
+commit; then its dry-eval against the §32 fixtures; then the operator docs.
