@@ -384,7 +384,7 @@ with the same names.
 
 ---
 
-## 10. ⛔ SHADOW IS NOT A DRY RUN. For convert it is the ONLY proof there will ever be.
+## 10. ⛔ SHADOW IS NOT A DRY RUN — it is the in-situ final check
 
 In `SHADOW` — at node level or for one market — a candidate is **scanned, built, priced, size-checked,
 evaluated and recorded** exactly as a live one. Only the submission is withheld. Two lines land in the
@@ -401,17 +401,21 @@ SHADOW CBOR <loan> <hex>
 `SHADOW CBOR` is the complete unsigned transaction. Decode it, check the outputs, check the order
 datum. It is byte-identical to what the decision log records at `GET /api/v1/loans/liquidations`.
 
-**⛔ AND FOR THE CONVERT PATH THIS IS NOT A CONVENIENCE — IT IS THE ENTIRE EXECUTION PROOF.**
+**⛔ AND FOR THE CONVERT PATH THIS IS THE LAST CHECK BEFORE REAL FUNDS MOVE.**
 
 A convert is by definition the exchange of **two different assets**, so at least one leg is not ADA, so
-the FluidTokens oracle validator must execute. **No offline rig can fabricate that**, which means
-**no convert transaction can be evaluated anywhere except against the live chain.** Everything else
-about convert is proven offline — the Minswap byte shapes against mainnet itself, the
-validator-dictated plan against the live pool datum, the action hash against the published config
-datum, and the assembly against a built body. **Script execution and ex-units are proven at shadow
-time, by nature, and not before.** See `docs/lending-v4-findings.md` §38.
+the FluidTokens oracle validator must execute as part of the transaction.
 
-**⇒ So the rule for a mainnet convert deploy is not "shadow first if you like". It is:**
+> ⚠ **An earlier version of this section said that made convert "not offline-provable" and that shadow
+> was "the ONLY proof there will ever be". That was wrong and is retracted** (findings §40). The oracle
+> feed, its validity window and its signature are all **published** by the FluidTokens oracle API — the
+> one this node already consumes — so a convert **can** be evaluated offline against live-fetched
+> reference inputs, with real ex-units, *before* anything is deployed.
+
+**⇒ So there are two proofs, and they answer different questions.** The offline dry-eval says *"this
+transaction's scripts pass"*; shadow says *"this transaction, against the chain's UTxOs and protocol
+parameters at this instant, passes"*. **Shadow is the in-situ final check, not a substitute for the
+first and not made redundant by it.** The rule for a mainnet convert deploy is still:
 
 > **Deploy in SHADOW. Read the `SHADOW TX` line. Verify `exunits` are real. Decode the `SHADOW CBOR`.
 > Only then arm.**

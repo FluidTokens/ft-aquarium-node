@@ -3533,14 +3533,15 @@ oracle leg**, and a rig that cannot evaluate its own sibling cannot prove anythi
 input carrying the real mainnet `PoolDatum` and an `MSP` NFT is trivially supplied — the evaluator
 resolves what the supplier gives it and neither knows nor cares that preview has no Minswap.
 
-### 38.3 ⇒ THE CONSEQUENCE, AND IT STRENGTHENS THE RUNBOOK
+### 38.3 ⛔ RETRACTED — see §40. This subsection's central claim is FALSE.
 
 Shadow-on-mainnet was already the recommended first posture (§29, §33). This upgrades it:
 
-> **Shadow-on-mainnet is not the best available rehearsal for convert. It is the ONLY thing that can
-> ever evaluate one.** It uses the real oracle reference input, the real Charli3 provider UTxO, the
-> chain's own protocol parameters and a real evaluator — every ingredient the offline rig structurally
-> cannot fabricate.
+> ~~**Shadow-on-mainnet is not the best available rehearsal for convert. It is the ONLY thing that can
+> ever evaluate one.**~~ ⛔ **FALSE — do not quote this.** An offline rig can fetch the same reference
+> inputs; nothing about them is unfabricatable, because nothing needs fabricating. §40 carries the
+> mechanism. Shadow remains the **in-situ final check** — the chain's own UTxOs and parameters at that
+> instant — which is a different and still necessary thing.
 
 And it makes the placeholder-ex-units detector of §33.2 load-bearing rather than defensive: **the shadow
 dump is now the first and only place a convert's ex-units are ever measured**, so a dump that silently
