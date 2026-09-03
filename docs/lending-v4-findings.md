@@ -2095,3 +2095,90 @@ them):
 
 ⚠ **This is real money on mainnet**, unlike the preview equivalent. And it buys nothing until a loan
 exists there to compound.
+
+---
+
+## 24. FluidTokens' mainnet reference scripts — verified, and two are on the wrong network (2026-09-03)
+
+Giovanni relayed 27 published coordinates (TS constants, **tx hash only — no output index**). Every
+one resolved read-only, matched **by hash against what the mainnet config datum publishes**, never by
+the constant's name.
+
+### 24.1 ✅ 25 of 27 are correct, and the shape is uniformly good
+
+Every verified publication sits at **output #0**, is **UNSPENT**, and lives at an **enterprise SCRIPT
+address** — payment credential is a script, so **coin selection cannot spend it and CCL trap 9b is
+closed structurally**. Not one is at a key-spendable address. **And not one constant is mislabelled**:
+every name matched the role its on-chain hash maps to.
+
+**⇒ Coordinates are `<txhash>#0` throughout.**
+
+### 24.2 ⛔ TWO ENTRIES ARE PREVIEW TRANSACTIONS IN A MAINNET LIST
+
+```
+BORROW_BOND_MINT  d2d5b9b6…   mainnet HTTP 404   preview HTTP 200   publishes eadc69a5… (borrowerBondPolicyId)
+LENDER_BOND_MINT  479f7460…   mainnet HTTP 404   preview HTTP 200   publishes bcd713bb… (lenderBondPolicyId)
+```
+Confirmed by a second provider: Koios `tx_info` returned **1 of 3** requested hashes — only the
+known-good control.
+
+> **⚑ AND THIS IS THE CASE A HASH CHECK CANNOT CATCH.** The two bond policies are precisely the
+> credentials that are **byte-identical on preview and mainnet** (§23.1 — derived from an integer
+> index, so a deployment cannot move them). So the published script hash at those preview UTxOs
+> **does match what the mainnet config publishes.** A verifier comparing hashes, or trusting the
+> constant's name, passes them. **Only resolving the transaction on the intended network separates
+> them** — and the mistake is the natural one: copying two lines from a preview deploy script whose
+> values were genuinely correct.
+>
+> **⇒ For any cross-network coordinate, the network is part of the identity, and it is the part no
+> hash carries.**
+
+**Harmless for this bot**: neither bond policy is invoked on the liquidation or compound paths — the
+bot spends bonds through the lender-manager credential and never mints or burns one. It would bite
+whoever builds an origination path.
+
+### 24.3 What is NOT published — 8 of 33 roles, none of them ours
+
+`requestPolicyId`, `requestSpendScriptHash` (borrower origination), `smartTokensSpendScriptHash` (no
+such validator ships in the blueprint — it is a config input, not a publishable script),
+`lockedBorrowerManagerSpendScriptHash`, `poolSellLenderPositionActionScriptHash` (pool-owner action),
+`lmLiquidateConvertAndCompoundActionScriptHash` (**the hard-`False` stub — unusable by anyone**,
+T-077), plus the two bond policies above.
+
+**None is on either path this bot walks.** Both sets are complete.
+
+### 24.4 Paste-ready, and both paths are COMPLETE
+
+**Compound** — all eleven present (§22.1–22.2). One key, comma-separated:
+```
+AQUARIUM_COMPOUND_REFERENCE_SCRIPTS=\
+83d1c5393a53e365eb15a7bdfd1feff560f43f9560bc60c23c4e41de709bae33#0,\
+55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0,\
+d0549a87da42d048eb1c3b5b8f7811fd2ccd882ad36c85ee209d3a8d1ca0265f#0,\
+d52f3f88e44ca798d9f45313b83267a7ffa01a6105603ed2b2aebcd8383c45ea#0,\
+e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0,\
+ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0,\
+954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0,\
+5215ca557800881b044ce92c77018b92b9d5b6c56f835d6217bc7e1435000f8a#0,\
+8340312072cd352519e01d7e294d3a4cb84a7f0b63f44adef027abf84d2e0bee#0,\
+8bfb510d6d90573280d9a47b94411477f0992228e0b43cb7cb864f2af66b6812#0,\
+15d88c19c9841e7b5cdd125613ff2013993aeb89f871f340c7a2e43fce1373f5#0
+```
+
+**Liquidation** — all eight present. Named keys, *not* a list:
+```
+AQUARIUM_LIQUIDATION_REF_LOAN=f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f#0
+AQUARIUM_LIQUIDATION_REF_LOAN_SPEND=46d7195856788885fd4a488dff7bde8bbaf46d5dc4a2fa3dbd12e9cb42129c96#0
+AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER=ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0
+AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND=55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0
+AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION=51eaf4994ee313bf4c95be65656e092d7366b0f397f7ecc1e0113c063fab5f98#0
+AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION=8ba0dfb30d40361b9bc775f032e2427c799a6cfefce0cbf13e8f1242c990249a#0
+AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION=2ed58f66779acd64f9add3755dd0686d6841001c90683b369cae0f5f07287476#0
+AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER=e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0
+```
+
+**⇒ Giovanni locks NOTHING.** The 65.67 ADA estimate in §23.3 is withdrawn — FluidTokens published
+everything this bot needs.
+
+⚠ These are unspent **today**. `LoansReferenceScriptVerifier` re-checks each at startup, so a spent or
+replaced coordinate is a hard boot failure — an answer, not an outage.
