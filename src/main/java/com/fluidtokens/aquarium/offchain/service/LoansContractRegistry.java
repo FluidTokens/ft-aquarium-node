@@ -395,6 +395,16 @@ public class LoansContractRegistry {
     // `script.getScriptHash()` is the matching `…ScriptHash`/`…PolicyId` by construction rather
     // than by coincidence (asserted in LoansContractDerivationTest).
 
+    /**
+     * {@code lender_manager/lm_liquidate_and_convert_action} — null when {@code loans.minswap.*} is
+     * not configured, exactly as its hash is. A caller must check rather than assume: this is the one
+     * validator whose availability depends on coordinates outside the deployment.
+     */
+    public PlutusScript getLmLiquidateAndConvertActionScript() {
+        return lmLiquidateAndConvertActionScriptHash == null
+                ? null : scriptOf(lmLiquidateAndConvertActionScriptHash);
+    }
+
     /** {@code loan.loan} — simultaneously the loan minting policy and the loan withdraw script. */
     public PlutusScript getLoanScript() {
         return scriptOf(loanPolicyId);

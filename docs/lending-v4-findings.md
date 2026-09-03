@@ -3389,3 +3389,76 @@ for nothing.*
 Suite **103 files, 868 tests, 38 failures, 22 skipped, 0 orphans**.
 
 **Unstarted:** B2 proper — the CCL assembly, with the real evaluator from its first commit.
+
+---
+
+## 37. The convert builder — and three tests that passed for the wrong reason (2026-09-03)
+
+Builder sub-stage B2: `ConvertTransactionBuilder`. The assembly — inputs, outputs, indexes, fees,
+ex-units. Everything the validator dictates was already settled by `ConvertOrderPlan` (§35); what is
+here is only what can be checked against a node.
+
+### 37.1 ⛔ There is no constructor without a `TransactionEvaluator`
+
+Not a convention — **there is no overload**, and the private constructor `requireNonNull`s it with a
+message that names CCL trap 8. The sibling builders each grew a no-evaluator convenience, and that is
+how 2026-08-21 shipped placeholder ex-units (10000 mem / 1000 steps against a real 352,041,926) which
+pass the mempool and fail in **phase 2**.
+
+**The stakes are specific to this path**: the operator's entire exposure is *"a transaction fee per
+execution"*, and **that sentence is true only while the budgets are real.** Placeholders move the
+exposure to the collateral, which is the one way the case for running this bot at a stated loss stops
+holding. A reflective test asserts **every public constructor** takes an evaluator, so a future
+convenience overload fails a test rather than a submission.
+
+### 37.2 The two-pass, and why the indexes are observed rather than predicted
+
+The convert redeemer names the two carrier outputs by **absolute** index into `self.outputs`, and so
+does the loan-claim redeemer's `lenderBondOutputIndex`. This transaction carries withdrawals, so CCL
+prepends a dummy output at the change address (trap 1) and appends change after ours. **Predicting
+"my first `payToContract` is output 0" is off by exactly that dummy.**
+
+So the body is assembled once with placeholders purely to read the finished layout, the carriers are
+located **by their datum bytes** rather than by arithmetic, and the whole thing is assembled again with
+the observed values — then `assertStructure` re-derives them from the finished body.
+
+**Also enforced there, and nothing else would:**
+- **The bot's fee.** `collateral − equity − swappable` is an unconstrained residue (§25.3): a builder
+  that left it in the order or handed it to the lender produces a **perfectly valid transaction that
+  pays the operator nothing.** No validator objects, and the economics gate cannot see it.
+- The order's lovelace and collateral quantity, against the plan's figures.
+- The lender bond's echo, byte-identical (CCL trap 4 — a decode→re-encode is not byte-stable, and
+  `equals_data` compares bytes).
+
+Scoped as accepted: **one loan per transaction**, and a non-zero borrower equity is a named
+`EQUITY_NOT_MODELLED` refusal rather than a silent wrong build.
+
+### 37.3 ⛔ THREE TESTS IN THIS FILE PASSED FOR A REASON OTHER THAN THE ONE THEY NAMED
+
+All three were found by mutating; none by reading. **This is now six in three days.**
+
+| test | why it passed | what it was supposed to prove |
+|---|---|---|
+| off-by-the-dummy-output | **the bond fixture reused the success datum**, so the wrong index accidentally held the right bytes | that a mispredicted carrier index is caught |
+| null evaluator refused | **every other argument was null too**, so the registry's own `requireNonNull` threw first | that the *evaluator* guard fires |
+| carrier hash check | the byte-equality check upstream always fired first | that an order embedding a hash its carrier does not produce is refused |
+
+**⇒ Three distinct disarming mechanisms, one shape.**
+- **A fixture that collides with the thing under test disarms the test silently.**
+- **A test whose subject is the LAST check on a path must reach that check** — every other argument has
+  to be valid, or an earlier guard answers for it.
+- **A redundant-looking check needs the one case that separates it**, or a mutant deletes it for free.
+  Here that case cannot arise from `ConvertOrderPlan` (it computes datum and hash from one object) but
+  would arise the moment a future path took the hash from anywhere else — and the resulting transaction
+  would have carriers Minswap ignores, with nothing on chain objecting.
+
+### 37.4 Verification
+
+Four mutants, each now killed by exactly one test: the fee check removed · the carrier-hash check
+removed · the order's lovelace unchecked · a null evaluator permitted. **Two of those four survived
+their first run** and are the two rows above; the third row was a plain red.
+
+Suite **104 files, 879 tests, 38 failures, 22 skipped, 0 orphans**.
+
+**Unstarted:** sub-stage C — the dry-eval against the §32 fixtures, which is where the ex-units stop
+being an invariant and become a measurement. Then the operator docs.
