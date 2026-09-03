@@ -65,6 +65,7 @@ public class CompoundExecutor {
     }
 
     private final AppConfig.CompoundConfiguration configuration;
+    private final AppConfig.Network network;
     private final BlockEventListener blockEventListener;
     private final AppUtxoService appUtxoService;
     private final Account account;
@@ -91,6 +92,7 @@ public class CompoundExecutor {
      */
     @Autowired
     public CompoundExecutor(AppConfig.CompoundConfiguration configuration,
+                            AppConfig.Network network,
                             BlockEventListener blockEventListener,
                             AppUtxoService appUtxoService,
                             Account account,
@@ -101,13 +103,14 @@ public class CompoundExecutor {
                             UtxoSupplier utxoSupplier,
                             CardanoConverters converters,
                             BFBackendService backendService) {
-        this(configuration, blockEventListener, appUtxoService, account, scanner, economics, builder,
-                utxoResolver, utxoSupplier, converters,
+        this(configuration, network, blockEventListener, appUtxoService, account, scanner, economics,
+                builder, utxoResolver, utxoSupplier, converters,
                 bytes -> backendService.getTransactionService().submitTransaction(bytes));
     }
 
     /** The same loop with the submitter stated, so a test can watch exactly what reaches the wire. */
     public CompoundExecutor(AppConfig.CompoundConfiguration configuration,
+                            AppConfig.Network network,
                             BlockEventListener blockEventListener,
                             AppUtxoService appUtxoService,
                             Account account,
@@ -119,6 +122,7 @@ public class CompoundExecutor {
                             CardanoConverters converters,
                             TransactionSubmitter submitter) {
         this.configuration = configuration;
+        this.network = network;
         this.blockEventListener = blockEventListener;
         this.appUtxoService = appUtxoService;
         this.account = account;
@@ -256,6 +260,22 @@ public class CompoundExecutor {
 
     private void submit(CompoundCandidate candidate, Transaction transaction,
                         CompoundAssessment assessment) {
+        // ⛔ THE NETWORK GATE, enforced here — in the code that would do the submitting — exactly as
+        // the liquidation path enforces its S3 veto, and reading the SAME configured value.
+        //
+        // Until 2026-09-03 this path had NO network check at all: its only gate between a candidate
+        // and a mainnet submission was `loans.compound.enabled`, one boolean. That asymmetry is the
+        // thing this closes, and it closes with no NEW gate — one config value, both executors.
+        if (network == null || !network.isSubmittable()) {
+            log.warn("compound NOT SUBMITTED {} escrow {}: network is {}, this node submits only on "
+                            + "{} (loans.submittable-network). The transaction was built and priced "
+                            + "and is discarded.",
+                    candidate.loanId(), candidate.escrowRef(),
+                    network == null ? "<unset>" : network.getNetwork(),
+                    network == null ? "<unset>" : network.getSubmittableNetwork());
+            return;
+        }
+
         byte[] signed;
         try {
             signed = account.sign(transaction).serialize();

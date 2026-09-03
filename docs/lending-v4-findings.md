@@ -2282,3 +2282,55 @@ that outlay as pure cost while valuing the received collateral at nothing. **Con
 mechanism: the bot fronts nothing.** So that objection does not transfer — it has to be **re-derived**
 for a flow whose only outlay is the transaction fee. *Reusing the number would be the same
 category error as reusing trap 14's documented redeemer pair (§14c).*
+
+---
+
+## 26. The submission guard becomes configuration — and one gate Giovanni counted on does not exist (2026-09-03)
+
+**Giovanni's ruling**, first-hand: *"if someone is operating this bot they KNOW they're doing
+financial stuff on a network … putting too many gates is only annoying and won't really protect
+anyone. No different image pls … configuration configuration configuration. The defaults must be
+defensive; if an operator copy-pastes from preview it's their problem."*
+
+`SUBMITTABLE_NETWORK`, previously a hard-coded `"preview"` constant, is now
+**`loans.submittable-network`, defaulting to `preview`**. The gate is unchanged; **the default now
+carries the protection.** That matters more than it sounds: since `1d17e9a` **mainnet is the default
+profile**, so the submission default has to lean the other way.
+
+**Both executors read the one value.** `CompoundExecutor` had **no network check at all** — its only
+gate between a candidate and a mainnet submission was `loans.compound.enabled`, one boolean. Closing
+that asymmetry cost **zero new gates**: the same config value, applied twice.
+
+### 26.1 ⛔ CORRECTION: the market gates do not exist
+
+Giovanni's enumeration was *"loans enabled, liquidation mode, plus the gates for the markets in case
+of anticipated payments — market enabled/disable and the per-market cap"*, and he asked "right?".
+Verified exhaustively against `src/main`:
+
+| gate he named | reality |
+|---|---|
+| loans enabled | ✅ `loans.enabled` — gates bean existence; no executor exists without it |
+| liquidation mode | ✅ S1 `MODE_NOT_LIVE` + S2 `NOT_ARMED` (two flags, both required) |
+| **market enable/disable** | ❌ **DOES NOT EXIST** |
+| **per-market cap** | ❌ **DOES NOT EXIST** |
+
+There is no key matching `market`, `cap`, `exposure`, `limit` or `allow-list` anywhere in
+`AppConfig` or `application.yaml`; the complete `loans.*` inventory is 31 keys and contains nothing
+of the sort. **The one he called "the risky ones" is the one that is not built.**
+
+What pay-in-advance *does* have: the eight submit vetoes, the two profitability floors, and the
+`PayInAdvanceLiquidationRouter`'s clean-refusal seam. **No per-market exposure limit of any kind.**
+
+⇒ This does not contradict the ruling — the ruling is about not *adding* gates. It corrects the
+inventory the ruling rests on, so the decision is made against what exists.
+
+### 26.2 Two construction traps the change surfaced immediately
+
+- **A `@Value` default is not a default of the class.** Adding the field with only
+  `@Value("${…:preview}")` made **23 liquidation veto tests** go red: `@Value` fires only when Spring
+  binds, so every other construction path held `null` and read as non-submittable. The default
+  belongs **on the field** as well.
+- **A class's own logic must go through its accessor.** Those tests build `Network` as an anonymous
+  subclass overriding `getNetwork()` while the private field stays `null`. Comparing against the
+  field says "not submittable" for a node that plainly is. **An overridden accessor that the class
+  itself bypasses is a half-truth** — it behaves one way from outside and another from within.

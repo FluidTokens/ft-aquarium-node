@@ -123,8 +123,12 @@ public class LiquidationExecutor {
      */
     private static final long VALID_FROM_BACKDATE_MILLIS = 30_000L;
 
-    /** The one network this epic is allowed to submit on. */
-    static final String SUBMITTABLE_NETWORK = "preview";
+    /**
+     * ⛔ WAS a hard-coded {@code "preview"}. It is now {@code loans.submittable-network}, defaulting
+     * to {@code preview} — Giovanni's ruling of 2026-09-03. The default carries the protection; the
+     * gate itself is unchanged and still enforced here, in the code that would do the submitting.
+     * See {@code AppConfig.Network#isSubmittable()}.
+     */
 
     /**
      * The eight submit vetoes, in the order they are evaluated. Each is a separate, named reason
@@ -1054,10 +1058,11 @@ public class LiquidationExecutor {
         // S3 — the network. A second line behind loans.enabled=false on mainnet, not a restatement
         // of it: this one is enforced here, in the code that would do the submitting.
         String networkName = network == null ? null : network.getNetwork();
-        if (!SUBMITTABLE_NETWORK.equalsIgnoreCase(networkName)) {
+        if (network == null || !network.isSubmittable()) {
             return new Verdict(shadowOutcome, SubmitVeto.NETWORK_NOT_PREVIEW,
-                    "%s; network is %s, this epic submits only on %s"
-                            .formatted(detail, networkName, SUBMITTABLE_NETWORK));
+                    "%s; network is %s, this node submits only on %s (loans.submittable-network)"
+                            .formatted(detail, networkName,
+                                    network == null ? "<unset>" : network.getSubmittableNetwork()));
         }
         // S4 — profitability. Two independent gates, and the margin is deliberately NOT inside the
         // number the floors test (F1.i): a negative margin can no longer inflate a loss past a floor.

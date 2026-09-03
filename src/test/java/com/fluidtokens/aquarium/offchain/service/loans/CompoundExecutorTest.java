@@ -94,18 +94,23 @@ class CompoundExecutorTest {
     }
 
     private static Wiring wiringWithWallet(List<CompoundCandidate> candidates, List<Utxo> walletUtxos) {
-        return wiring(candidates, true, -2_000_000L, walletUtxos);
+        return wiring(candidates, true, -2_000_000L, walletUtxos, "preview", "preview");
+    }
+
+    private static Wiring wiringOnNetwork(List<CompoundCandidate> candidates, String network,
+                                          String submittable) {
+        return wiring(candidates, true, -2_000_000L, List.of(wallet()), network, submittable);
     }
 
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor) {
-        return wiring(candidates, armed, floor, List.of(wallet()));
+        return wiring(candidates, armed, floor, List.of(wallet()), "preview", "preview");
     }
 
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor,
-                                 List<Utxo> walletUtxos) {
+                                 List<Utxo> walletUtxos, String networkName, String submittable) {
         var configuration = new AppConfig.CompoundConfiguration(armed, 60L, BigInteger.valueOf(floor));
         var network = new AppConfig.Network();
-        org.springframework.test.util.ReflectionTestUtils.setField(network, "network", "preview");
+        network.setNetworkForTest(networkName, submittable);
 
         var blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(false);
@@ -120,7 +125,7 @@ class CompoundExecutorTest {
         universe.addAll(walletUtxos);
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
-        var executor = new CompoundExecutor(configuration, blockEventListener,
+        var executor = new CompoundExecutor(configuration, network, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT,
                 new FakeScanner(candidates), new CompoundEconomics(configuration, network),
                 builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
@@ -183,7 +188,7 @@ class CompoundExecutorTest {
     void nothingRunsWhileTheIndexerIsSyncing() {
         var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
         var network = new AppConfig.Network();
-        org.springframework.test.util.ReflectionTestUtils.setField(network, "network", "preview");
+        network.setNetworkForTest("preview", "preview");
         var blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(true);
 
@@ -195,7 +200,7 @@ class CompoundExecutorTest {
                 return super.scan();
             }
         };
-        var executor = new CompoundExecutor(configuration, blockEventListener,
+        var executor = new CompoundExecutor(configuration, network, blockEventListener,
                 new FakeAppUtxoService(List.of(wallet())), ACCOUNT, scanner,
                 new CompoundEconomics(configuration, network),
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
@@ -255,6 +260,42 @@ class CompoundExecutorTest {
         assertEquals(1, w.submitted().size(),
                 "the ample utxo must be nominated; taking the 1 ada one first would produce a "
                         + "negative collateral return and an unparseable transaction");
+    }
+
+    /**
+     * ⛔ THE NETWORK GATE, on the path that had none. Until 2026-09-03 the only thing between a
+     * compound candidate and a mainnet submission was {@code loans.compound.enabled} — one boolean.
+     * The transaction is still built and priced; it is simply not submitted.
+     */
+    @Test
+    void aNodeOnANetworkItMayNotSubmitOnDoesNotSubmit() {
+        Wiring w = wiringOnNetwork(List.of(ready(0L)), "mainnet", "preview");
+        w.executor().cycle();
+        assertTrue(w.submitted().isEmpty(),
+                "armed, funded, profitable under the stated floor — and still must not submit, "
+                        + "because loans.submittable-network does not name this network");
+    }
+
+    /**
+     * ⚑ And the DEFAULT is what protects: {@code preview}. Mainnet submission is a thing an operator
+     * writes down on purpose — which matters because mainnet is the default PROFILE.
+     */
+    @Test
+    void theDefaultSubmittableNetworkIsPreviewSoAnUnconfiguredMainnetNodeCannotSubmit() {
+        var defaults = new AppConfig.Network();
+        org.springframework.test.util.ReflectionTestUtils.setField(defaults, "network", "mainnet");
+        org.springframework.test.util.ReflectionTestUtils.setField(defaults, "submittableNetwork", "preview");
+        assertTrue(!defaults.isSubmittable(),
+                "an operator who configures nothing must not be able to submit on mainnet");
+    }
+
+    /** And a node explicitly configured for mainnet submission DOES submit — the gate is not a wall. */
+    @Test
+    void aNodeExplicitlyConfiguredForItsOwnNetworkSubmits() {
+        Wiring w = wiringOnNetwork(List.of(ready(0L)), "mainnet", "mainnet");
+        w.executor().cycle();
+        assertEquals(1, w.submitted().size(),
+                "stated intent must work, or the gate is an obstacle rather than a default");
     }
 
     // ---- fakes -------------------------------------------------------------------------------

@@ -32,6 +32,56 @@ public class AppConfig {
         @Value("${network}")
         private String network;
 
+        /**
+         * The one network this node is permitted to SUBMIT on. Ordinary configuration — Giovanni's
+         * ruling, 2026-09-03: <i>"if someone is operating this bot they KNOW they're doing financial
+         * stuff on a network … putting too many gates is only annoying and won't really protect
+         * anyone. No different image pls. Configuration configuration configuration. The defaults
+         * must be defensive; if an operator copy-pastes from preview it's their problem."</i>
+         *
+         * <p>⛔ <b>THE DEFAULT IS THE PROTECTION.</b> It is {@code preview}, so a node that says
+         * nothing about this cannot submit on mainnet — and since 1d17e9a mainnet is the DEFAULT
+         * PROFILE, which is exactly why this default has to lean the other way. Submitting on mainnet
+         * is a thing an operator writes down on purpose.
+         *
+         * <p>This replaced a hard-coded {@code "preview"} constant in {@code LiquidationExecutor}.
+         * The constant was safer in one narrow sense and unusable for its actual purpose: a bot
+         * meant to run on mainnet could never do so without a code change and a bespoke artefact.
+         *
+         * <p><b>Both executors read this one value</b> — the liquidation path and the compound path.
+         * That is not a new gate; it is the same gate, finally applied to both. Before this,
+         * {@code CompoundExecutor} had NO network check at all.
+         *
+         * <p>⚠ <b>The default is on the FIELD as well as in the annotation, deliberately.</b> A
+         * {@code @Value} default only fires when Spring binds the bean; an instance built any other
+         * way — reflectively in a test, or by a future {@code new Network()} — would otherwise hold
+         * {@code null} and silently become non-submittable. Measured immediately: 23 liquidation
+         * veto tests went red on exactly that, and they were right to. <b>A default that lives only
+         * in the framework is not a default of the class</b>, and the gap shows up as behaviour that
+         * differs between production and every other construction path.
+         */
+        @Value("${loans.submittable-network:preview}")
+        private String submittableNetwork = "preview";
+
+        /**
+         * Whether this node may submit on the network it is configured for.
+         *
+         * <p>⚠ Compares against {@link #getNetwork()}, not the field. The accessor is overridden by
+         * test doubles — an anonymous subclass returning a network name while the private field
+         * stays {@code null} — and reading the field there yields "not submittable" for a node that
+         * plainly is. <b>When a class exposes an accessor, its own logic should go through it</b>,
+         * or the override becomes a half-truth that behaves differently inside than out.
+         */
+        public boolean isSubmittable() {
+            return submittableNetwork != null && submittableNetwork.equalsIgnoreCase(getNetwork());
+        }
+
+        /** Test seam; {@code @Value} owns these in production. */
+        public void setNetworkForTest(String network, String submittableNetwork) {
+            this.network = network;
+            this.submittableNetwork = submittableNetwork;
+        }
+
         public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
             return switch (network) {
                 case "preprod" -> Networks.preprod();
