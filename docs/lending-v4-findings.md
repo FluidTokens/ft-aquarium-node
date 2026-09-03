@@ -4181,3 +4181,51 @@ is broken.**
 **⇒ If the reading is correct, convert cannot execute on mainnet as deployed, and no amount of off-chain
 work fixes it.** That is a decision for FluidTokens and Giovanni, not something to route around — and it
 is precisely what Stage C was built to find before an image, not after a submission.
+
+---
+
+## 48. Nothing has ever run a LenderManager action on mainnet — and the pool field order, cross-checked (2026-09-03)
+
+Two things pinned while FluidTokens' answer to §47 is pending, because both change whose problem it is.
+
+### 48.1 The yes/no: has anything ever invoked the convert action? **NO — and not just that one**
+
+A withdraw-0 invocation appears as a withdrawal from the script's reward account, so Blockfrost's
+`/accounts/{stake}/withdrawals` answers it directly. **With a control, because an empty list from a
+broken query and an empty list from an unused script look identical** — §33's lesson:
+
+| script | reward account | withdrawals |
+|---|---|---|
+| **`lm_liquidate_and_convert_action`** | `stake178kc6s0…` | **none** |
+| `loan_claim_action` | `stake178eqkcp…` | **none** |
+| `lenderManager` (the withdraw wrapper) | `stake17x5skj6…` | **none** |
+| **oracle** *(the control)* | `stake1799y3hu…` | **many** ✅ |
+
+The control fires, so the query works.
+
+**⇒ Not one LenderManager action has ever executed on mainnet.** No liquidation of any kind — plain,
+convert or pay-in-advance — has ever run there. **⇒ There is no successful precedent that would
+contradict §47's reading, and equally none that proves compatibility.** *Nobody has been in a position
+to discover this.*
+
+⚑ **And the corollary is bigger than the question that prompted it.** The mainnet v4 deployment is one
+day old (§23) and **every action this bot builds is unexercised on it.** FluidTokens cannot point to
+"it works, we have done it", and neither can we. That raises the stakes on the shadow-first posture from
+prudent to necessary — and it is worth Giovanni knowing independently of how §47 resolves.
+
+### 48.2 The pool field order, from a third angle that cannot be argued with
+
+§47 rests on the live pool datum's field order. Two sources already agreed (the decoded datum, and
+Minswap's published declaration). **The third is arithmetic and needs no declaration at all:**
+
+```
+datum field 4  reserve_a  1,691,502,006,673   ← the UTxO actually holds 1,691,510,665,009 lovelace
+datum field 5  reserve_b  7,600,244,650,446   ← the UTxO actually holds 7,600,265,931,195 FLDT
+```
+
+**Reserves at fields 4 and 5 match the UTxO's own value to within a pending batch.** That can only be
+true if the field order is as read — credential at 0, `asset_a` at 1, `asset_b` at 2. **A mis-mapped
+datum would not produce two numbers that happen to match the pool's actual holdings.**
+
+⇒ So the live pools are unambiguous, and §47's question is entirely about **what the deployed validator
+was compiled to expect** — which remains the one thing not in our hands.
