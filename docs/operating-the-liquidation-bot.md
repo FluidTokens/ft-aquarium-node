@@ -6,9 +6,11 @@ liquidation is worth doing, every configuration key, the endpoint you watch it t
 reference-script prerequisite — and, at the end, an honest account of what the bot can and
 cannot actually liquidate today.
 
-> **Preview only.** Lending v4 is disabled on mainnet (`loans.enabled=false`), and the bot
-> refuses to submit on any network but preview regardless. Nothing in this document applies
-> to a mainnet node.
+> **⚠ THIS BANNER CHANGED ON 2026-09-03. Mainnet is now a supported posture — in SHADOW.**
+> Lending v4 still ships `loans.enabled=false` on mainnet and the submit gate still defaults to
+> preview (`loans.submittable-network`), so **a stock mainnet node still does nothing**. But those
+> are now *defaults an operator may change* rather than a wall, and §9–§12 below are written for
+> the operator who does. **Read §10 before arming anything on mainnet.**
 
 ---
 
@@ -56,22 +58,27 @@ Submitting additionally requires the node to be on **preview** (veto S3). Mainne
 protected by `loans.enabled=false`, which stops the bot's beans existing at all; the network
 veto is a second, independent line enforced in the code that would do the submitting.
 
-## 3. The eight submit vetoes
+## 3. The nine submit vetoes
 
-Every cycle, for every candidate that built, the node evaluates eight checks in order. It
-submits only if all eight pass. Each failure is recorded under its own name in the
+Every cycle, for every candidate that built, the node evaluates nine checks in order. It
+submits only if all nine pass. Each failure is recorded under its own name in the
 `submit_veto` field of the decision, and the loop moves to the next candidate.
+
+**The first four are POLICY** — statements about what the operator has authorised. The last five
+are statements about *this candidate at this instant*. Policy comes first deliberately: on a node
+held back by configuration, reporting a downstream symptom would send you looking at the wrong thing.
 
 | # | Veto | Fires when |
 |---|------|-----------|
 | S1 | `MODE_NOT_LIVE` | `mode` is not `live` |
 | S2 | `NOT_ARMED` | `enabled` is `false` |
-| S3 | `NETWORK_NOT_PREVIEW` | the node is not on preview |
-| S4 | `NOT_PROFITABLE` | expected profit is not **strictly** greater than zero |
-| S5 | `TX_TOO_LARGE` | the serialised transaction exceeds the live `maxTxSize`, **or that could not be established** |
-| S6 | `ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT` | less than `oracle-window-margin-seconds` of an oracle feed's window is left *at submit time*, **or that could not be established** |
-| S7 | `STALE_UTXO` | the loan or bond UTxO is no longer unspent, **or that could not be established** |
-| S8 | `TRANSACTION_WINDOW_ELAPSED` | the built transaction's own validity interval has already ended at submit time, **or its end could not be read** |
+| S3 | `NETWORK_NOT_PREVIEW` | the node's network is not `loans.submittable-network` |
+| **S4** | **`MARKET_NOT_LIVE`** | **this loan's market is `SHADOW` or `DISABLED` on a node that is otherwise armed — see §9** |
+| S5 | `NOT_PROFITABLE` | expected profit is not **strictly** greater than zero |
+| S6 | `TX_TOO_LARGE` | the serialised transaction exceeds the live `maxTxSize`, **or that could not be established** |
+| S7 | `ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT` | less than `oracle-window-margin-seconds` of an oracle feed's window is left *at submit time*, **or that could not be established** |
+| S8 | `STALE_UTXO` | the loan or bond UTxO is no longer unspent, **or that could not be established** |
+| S9 | `TRANSACTION_WINDOW_ELAPSED` | the built transaction's own validity interval has already ended at submit time, **or its end could not be read** |
 
 Read the bolded halves carefully. Submitting is the irreversible act — it burns the loan NFT
 and moves someone's collateral — so **every ambiguous case resolves to not submitting**. A
@@ -148,7 +155,8 @@ liquidations, whose fee slice would not repay the transaction that claims it.
 | `delay-seconds` | `AQUARIUM_LIQUIDATION_DELAY_SECONDS` | `60` | Fixed delay between cycles. |
 | `validity-window-seconds` | `AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS` | `120` | How far past "now" the built transaction's validity interval extends. |
 | `oracle-window-margin-seconds` | `AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS` | `30` | How much of each oracle feed's window must still be unused after the transaction's `validTo` — and, at submit time, after *now*. |
-| `profit-margin-lovelace` | `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `1500000` | See §4. |
+| `profit-margin-lovelace` | `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `1500000` | See §4, and §11 for a **negative** value. |
+| *(node-level)* `loans.submittable-network` | `LOANS_SUBMITTABLE_NETWORK` | `preview` | The only network this node will submit on. S3 enforces it. **The default is the protection**; changing it to `mainnet` is a deliberate act. |
 | `decision-log-size` | `AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE` | `200` | Capacity of the in-memory decision ring buffer. Nothing is persisted. |
 | `quarantine-minutes` | `AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES` | `30` | How long a loan UTxO is skipped after a failed build or any submit attempt. |
 | `reference-scripts.loan` | `AQUARIUM_LIQUIDATION_REF_LOAN` | empty (preview: set) | See §6. |
@@ -308,6 +316,254 @@ Only the three Charli3 (`c3`) oracle feeds are live on preview; every multisig p
 is months stale. There is a real ~60–80 s price blackout every five minutes, upstream of
 this node, during which candidates report oracle-window refusals. That is the registry, not
 the bot.
+
+---
+
+## 9. Per-market policy — `loans.liquidation.markets`
+
+A **market** is a loan's **principal asset**. Each entry decides two independent things: whether the
+bot may act there (`mode`), and which transaction it would build (`action`).
+
+```yaml
+loans:
+  liquidation:
+    markets:
+      - unit: lovelace          # "lovelace", or policyIdHex + assetNameHex
+        mode: SHADOW            # DISABLED | SHADOW | LIVE — omit to inherit the node mode
+        action: CONVERT         # CONVERT | ANTICIPATE — default CONVERT
+        cap: 1000000000         # MANDATORY iff action: ANTICIPATE, meaningless otherwise
+```
+
+**An unlisted market is `action: CONVERT` at the node's own mode.** An absent or empty list therefore
+means *"convert everywhere, at whatever posture the node is in"*, and **listing a market is how you
+deviate.** In particular `loans.liquidation.mode: shadow` shadows **every** market with no list at all
+— you never have to enumerate markets to rehearse.
+
+**⛔ The node mode is a CEILING, not a default:**
+
+```
+effective(market) = min(loans.liquidation.mode, market.mode)     DISABLED < SHADOW < LIVE
+```
+
+A market may be **more** restrictive than the node and **never less**. A market asking for `LIVE` on a
+`shadow` node runs as `SHADOW`, and says so loudly at boot — so an operator who wrote `LIVE` and got
+`SHADOW` is told, rather than believing they armed something they did not.
+
+**`action` partitions only the loans whose lender bond permits conversion.** A bond with
+`shouldLiquidationConvertToPrincipal = false` gets a plain `Liquidate` whatever the market says — the
+lender picks the class, you pick the mechanism within it.
+
+**When to force `ANTICIPATE`.** FluidTokens' guidance, first-hand: *for tokens that do not have a
+reliable pool on Minswap*, because the swap order must always deliver at least the minimum the lender
+expects. **Pool reliability is your judgement — the bot does not detect it.** A mis-set `CONVERT`
+market is not a loss: an order that cannot fill returns the original collateral to the lender.
+
+**A malformed entry ABORTS STARTUP** — a missing `cap` on an `ANTICIPATE` market, an unknown `mode`, a
+`unit` that is neither `lovelace` nor a well-formed hex unit, or a duplicated unit. That is only
+defensible because the fields are named: every failure is unambiguous, so quietly disabling the market
+would hide your error rather than protect you from it.
+
+### 9.1 ⚠ A YAML list is not one environment variable
+
+Every other knob here is a single env var. **This one is not.** In Docker or Kubernetes you need
+either **indexed environment variables**:
+
+```
+LOANS_LIQUIDATION_MARKETS_0_UNIT=lovelace
+LOANS_LIQUIDATION_MARKETS_0_MODE=SHADOW
+LOANS_LIQUIDATION_MARKETS_0_ACTION=CONVERT
+LOANS_LIQUIDATION_MARKETS_1_UNIT=577f0b13…0014df10464c4454
+LOANS_LIQUIDATION_MARKETS_1_ACTION=ANTICIPATE
+LOANS_LIQUIDATION_MARKETS_1_CAP=500000000
+```
+
+…or a **mounted YAML fragment**. Both work; only the first fits the existing `docker/.env` shape.
+The relaxed `SCREAMING_SNAKE` mapping is a property of the environment property source specifically,
+and it is asserted by a test that binds through a real one — not by a test that merely sets properties
+with the same names.
+
+---
+
+## 10. ⛔ SHADOW IS NOT A DRY RUN. For convert it is the ONLY proof there will ever be.
+
+In `SHADOW` — at node level or for one market — a candidate is **scanned, built, priced, size-checked,
+evaluated and recorded** exactly as a live one. Only the submission is withheld. Two lines land in the
+log on a stable prefix:
+
+```
+SHADOW TX <loan> variant=… held-by=MARKET_NOT_LIVE size=NNNNB(unsigned, grows once signed)
+  exunits=[total=…/… each=Spend:0=… Reward:1=…] economics=… — PHASE-2 ONLY: the scripts
+  evaluated, but the ledger's phase-1 rules (fee, min-ada, witnesses, collateral) are NOT
+  proven by this. Nothing was signed and nothing was submitted.
+SHADOW CBOR <loan> <hex>
+```
+
+`SHADOW CBOR` is the complete unsigned transaction. Decode it, check the outputs, check the order
+datum. It is byte-identical to what the decision log records at `GET /api/v1/loans/liquidations`.
+
+**⛔ AND FOR THE CONVERT PATH THIS IS NOT A CONVENIENCE — IT IS THE ENTIRE EXECUTION PROOF.**
+
+A convert is by definition the exchange of **two different assets**, so at least one leg is not ADA, so
+the FluidTokens oracle validator must execute. **No offline rig can fabricate that**, which means
+**no convert transaction can be evaluated anywhere except against the live chain.** Everything else
+about convert is proven offline — the Minswap byte shapes against mainnet itself, the
+validator-dictated plan against the live pool datum, the action hash against the published config
+datum, and the assembly against a built body. **Script execution and ex-units are proven at shadow
+time, by nature, and not before.** See `docs/lending-v4-findings.md` §38.
+
+**⇒ So the rule for a mainnet convert deploy is not "shadow first if you like". It is:**
+
+> **Deploy in SHADOW. Read the `SHADOW TX` line. Verify `exunits` are real. Decode the `SHADOW CBOR`.
+> Only then arm.**
+
+**⚠ How to tell a real dump from a worthless one.** If the transaction was built without an evaluator
+the ex-units are cardano-client-lib's placeholders and prove nothing, so the line carries a marker and
+an ERROR beside it:
+
+```
+exunits=[⛔NOT-VALIDATED:PLACEHOLDER-EX-UNITS(CCL-trap-8) total=…]
+⛔ THE SHADOW DUMP ABOVE PROVES NOTHING: every redeemer carries cardano-client-lib's placeholder
+   budget, so no evaluator ran. …
+```
+
+**If you see that marker, the rehearsal did not happen.** Do not arm. Real budgets are hundreds of
+thousands of mem and hundreds of millions of steps; the placeholder is `10000` mem with `10000` or
+`1000` steps.
+
+---
+
+## 11. Operating at a stated loss — the protocol-health mode
+
+Giovanni's ruling, 2026-09-03: *"it's fundamental to allow operators to operate at a loss. Protocol
+must be kept bad-loss-free at all costs … operating at a loss MUST be implemented even on mainnet."*
+
+A **negative** profit margin is honoured on **every network**, mainnet included. It is not a
+protection you switch off — it is a **bound you state**: a candidate worse than the figure you name is
+still refused.
+
+| path | key | default | at the default |
+|---|---|---|---|
+| liquidation | `loans.liquidation.profit-margin-lovelace` | `1500000` (yaml) / `5000000` shipped | refuses every loss |
+| compound | `loans.compound.profit-margin-lovelace` | `0` | refuses every loss |
+| convert | `loans.liquidation.convert.profit-margin-lovelace` | `0` | refuses every loss |
+
+**The defaults are the protection, not a guard.** Only an *explicitly negative* value operates at a
+loss, and no copy-paste of a zero or positive configuration can produce one. A node that does state one
+announces it at boot, on every network, and more loudly on mainnet:
+
+```
+⛔ OPERATING AT A LOSS ON MAINNET, BY OPERATOR CONFIGURATION — path: convert;
+   loans.liquidation.convert.profit-margin-lovelace = -4000000 lovelace (network mainnet). …
+```
+
+**One knob is NOT a margin and stays fatal**: `loans.liquidation.convert.dex-cost-floor-lovelace`
+(default `5000000`) states what one Minswap interaction *costs*, not what you are willing to lose. A
+negative value there is a typo with no meaningful reading, and it aborts startup.
+
+---
+
+## 12. The convert path, end to end
+
+> **⛔ NOT YET REACHABLE FROM A RUNNING NODE — read this before configuring anything below.**
+> As of 2026-09-03 the convert path is **built and proven structurally, and has no production
+> caller.** `ConvertTransactionBuilder`, `ConvertOrderPlan` and `ConvertEconomics` exist, are tested
+> and are correct as far as offline proof can reach — but **no executor routes a candidate to them**,
+> so a deployed node will never build a convert and will never emit a convert `SHADOW TX` line.
+> `PayInAdvanceLiquidationRouter` still routes every convert-eligible candidate to pay-in-advance.
+>
+> **⇒ Everything in this section is the contract the wiring will honour, not behaviour you can
+> observe today.** The executor wiring — routing on the market's `action`, locating the Minswap pool
+> by its NFT at scan time, supplying the convert action's reference script, and consulting
+> `ConvertEconomics` with the built transaction's fee — is the remaining stage. Until it lands,
+> configuring `loans.liquidation.convert.*` changes nothing.
+
+
+**What it does.** For a loan whose lender bond permits conversion, it liquidates and — in the same
+transaction — creates a Minswap V2 swap order that turns the collateral into the lender's principal.
+Both the success and refund receivers are the **lender's** asset manager.
+
+**⇒ The bot fronts nothing and holds nothing.** Its income is the liquidation fee, taken **before** the
+swap, **in the collateral token**. FluidTokens confirmed the failure mode first-hand: an order that
+does not fill returns the **original collateral** to the lender, who reclaims it. **The bot is finished
+the moment the order is created**, and because its fee is taken before the swap, **its position is the
+same whether the order fills or not.** There is no pending-order state to track.
+
+**What it costs the bot**, and the second term surprises people:
+
+```
+outlay = max( txFee + (collateral is ADA ? 0 : 2_800_000) , dex-cost-floor )
+```
+
+For a **non-ADA** collateral the validator requires exactly **2.8 ada** in the order output alongside
+the tokens, and that ada leaves with the order. The floor (default 5 ada) then rounds the whole DEX
+interaction up, covering the batcher fee whose incidence the measurement cannot attribute.
+
+**What it earns**, valued at the collateral oracle price:
+
+```
+approved  ⟺  feeValueLovelace − outlay  ≥  profit-margin-lovelace
+```
+
+⚠ **The income is a token position valued by an oracle, and the outlay is ada you actually spent.**
+That asymmetry is deliberate and was ruled acceptable at transaction time. **The margin is your lever
+on it**: if you do not trust the price, or the liquidity behind it, raise the margin until the
+ada-equivalent is worth the exposure.
+
+### 12.1 Convert keys
+
+| Key | Environment variable | Default |
+|---|---|---|
+| `loans.liquidation.convert.enabled` | `LOANS_LIQUIDATION_CONVERT_ENABLED` | **`true`** |
+| `loans.liquidation.convert.profit-margin-lovelace` | `LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` | `0` |
+| `loans.liquidation.convert.dex-cost-floor-lovelace` | `LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE` | `5000000` |
+| `loans.minswap.pool-policy-id` | `LOANS_MINSWAP_POOL_POLICY_ID` | FluidTokens' verified **mainnet** value |
+| `loans.minswap.pool-spend-script-hash` | `LOANS_MINSWAP_POOL_SPEND_SCRIPT_HASH` | ″ |
+| `loans.minswap.order-spend-script-hash` | `LOANS_MINSWAP_ORDER_SPEND_SCRIPT_HASH` | ″ |
+
+**`convert.enabled` is the one arming flag in this codebase that defaults ON.** That is not a
+weakening: it only matters on a node that has already passed `loans.enabled`,
+`loans.liquidation.mode`, `loans.liquidation.enabled` and `loans.submittable-network` — and this path
+fronts no capital and holds nothing, so its failure mode is a no-op rather than a loss.
+
+### 12.2 Is convert available on this node? The boot log answers it
+
+The Minswap coordinates are **network-specific**, so a node carrying mainnet's while running elsewhere
+derives a real, well-formed hash **for the wrong deployment**. That is reported, never fatal — it
+disables one path and breaks none:
+
+```
+CONVERT AVAILABLE:   lm_liquidate_and_convert_action derives X and the LMConfigDatum publishes the same
+CONVERT UNAVAILABLE: loans.minswap.* is not set
+CONVERT UNAVAILABLE: derives X but this deployment's LMConfigDatum publishes Y — the configured
+                     loans.minswap.* coordinates belong to a DIFFERENT network's Minswap deployment
+```
+
+**Every preview node today prints the third line**, and correctly: preview has no Minswap deployment at
+all, so convert is unavailable there by nature and cannot be rehearsed on preview. That is precisely
+why §10's mainnet-shadow step exists.
+
+---
+
+## 13. Coherence across the three paths
+
+Three independent actions share this node, and they are armed independently. Before a mainnet deploy,
+know which is which:
+
+| | plain **Liquidate** | **Convert** | **Pay-in-advance** |
+|---|---|---|---|
+| bot fronts capital | no | no | **yes — the whole principal** |
+| bot ends up holding | the collateral | nothing | **the collateral** |
+| income | fee, in collateral | fee, in collateral | the discount, in collateral |
+| reachable when | bond flag false, or true | bond flag **true** | bond flag **true** AND market `action: ANTICIPATE` **with a cap** |
+| default margin | refuses loss | refuses loss | refuses loss |
+| per-market cap | — | — | **required** |
+
+**Compound** is separate again: it collects an already-repaid principal into the lender's pool, fronts
+nothing, and is gated by `loans.compound.enabled` (default `false`) plus its own margin.
+
+**⇒ Pay-in-advance is unreachable unless you explicitly force it per market.** With convert as the
+default for the convert-eligible class, `ANTICIPATE` is an escape hatch for markets with no viable
+Minswap pool — not a path you fall into.
 
 ---
 
