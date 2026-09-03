@@ -4367,3 +4367,79 @@ other one** — which is the cheaper check and should come first.
 evidence". One of those two was ruled out with a tautology. **The evidence standard has to apply to my
 own instruments, not only to other people's claims** — and the tell was available for free: *a test that
 cannot fail is not evidence, and I never asked whether it could.*
+
+---
+
+## 51. ⛔ FOUND IT — (a) AFTER ALL. FluidTokens pinned a Minswap branch that is not what is deployed (2026-09-03)
+
+Reproduced on **FluidTokens' exact compiler**, with a probe that can fail and a control that shows it
+discriminates.
+
+### 51.1 The two declarations
+
+| Minswap ref | `pool_batching_stake_credential` | wire shape |
+|---|---|---|
+| **`main` / `v2`** — what is DEPLOYED | **`StakeCredential`** | `Inline(Script(h))` = `Constr0[Constr1[h]]` |
+| **`v2.1`** — the branch **FT pinned** | **`Credential`** | `Script(h)` = `Constr1[h]` |
+
+**One wrapper apart.** And the live ADA/FLDT pool carries the deployed shape — `d8799f d87a9f 581c1eae96ba…`
+— which was on screen in the fixture dump the whole time.
+
+`aiken.toml` pins `minswap/minswap-dex-v2` at `"v2.1"`. **There is no `v2.1` tag** (the repo has one tag,
+`v2.0.0`): it is a **branch**, a 2025-04 PlutusV3 refactor that the deployed mainnet pools are not built
+from.
+
+### 51.2 The probe, and why this one counts
+
+```
+PASS  control_a_bare_credential_at_field_zero_is_ACCEPTED     ← v2.1's declared shape
+FAIL  asset_a_binds_by_name_on_foreign_bytes                  ← the live pools' shape
+      x <expected> recovered: PoolDatum = as_data
+```
+
+Run on **`aiken v1.1.21+42babe5`** — *character for character the compiler string in the deployed
+`plutus.json` preamble.* The two cases differ in **exactly one thing**: the wrapper on field 0. The
+control passing is what makes the failure evidence rather than noise — §50's whole lesson.
+
+### 51.3 ⇒ It explains the mainnet error exactly, and corrects my anchor
+
+`expect PoolDatum { asset_a, asset_b, .. } = data` **validates fields covered by `..`** — which I had
+doubted, and which is why I spent two rounds anchored on `asset_a`. **The failure is on the UNBOUND
+field 0.** Aiken sees `Constr0[…]`, takes `Credential`'s first constructor `VerificationKey{hash:
+ByteArray}`, and calls `un_b_data` on the inner value — which is `Constr1[1eae96ba…]`:
+
+```
+DeserialisationError("UnBData", Constr { tag: 122, fields: [ 1eae96ba…f44a ] })
+```
+
+**Byte for byte the error from mainnet.**
+
+### 51.4 The verdict, and what follows
+
+**(a) — a genuine type mismatch. Not our bug, and not fixable off chain.**
+
+> **The deployed `lm_liquidate_and_convert_action` cannot read ANY live Minswap V2 pool.** Every convert
+> fails at the pool datum cast. FluidTokens must recompile against `main`/`v2` — or change that field to
+> `StakeCredential` — and redeploy.
+
+⚑ **And §48 stops being a curiosity and becomes the corroboration**: *no LenderManager action has ever
+executed on mainnet.* Nobody had been in a position to hit this. Matteo's *"a test convert tx ready to
+go"* is consistent with a transaction that has never gone.
+
+⚠ **The related hazard is now more than housekeeping:** the pin is a **mutable branch** with an **empty
+`[etags]`** in `aiken.lock`. That is how a dependency drifts from the deployed one without anybody
+noticing — *and it is the mechanism by which this happened.*
+
+### 51.5 What it cost, and the cheapest check that would have saved it
+
+Three rounds: an hour lost to a bech32-vs-bytes sort (§44.2), a wrong verdict from a tautological probe
+(§50), and two rounds anchored on `asset_a` because the error's *value* pointed there while its *cause*
+was a field I had dismissed as unbound.
+
+**The whole thing was visible in one line of the fixture dump** — `d8799f d87a9f 581c…`, a constructor
+where the declaration says bytes. ⇒ **When a `DeserialisationError` names a value, ask which DECLARED
+type that value was being read as — not which line of the source mentions it.** The error carried the
+answer from the first run.
+
+⚑ *Environment note: this required switching the local Aiken to v1.1.21 via `aikup`. It has been
+switched back to v1.1.23, the version that was installed before.*
