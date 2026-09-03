@@ -4489,3 +4489,79 @@ skipped, 0 orphans** — baseline unchanged.
 ⚠ **Still not exercised end to end.** Convert remains blocked behind FluidTokens' redeploy (§51): this
 makes it *reachable*, not *proven on chain*. The distinction is the one that matters for launch
 readiness and it is not closed by this commit.
+
+---
+
+## 53. The 38 red tests are NOT expired payloads — they are a build mismatch, and it is the same shape as §51 (2026-09-04)
+
+Item 3 was framed as *"re-pin the 8 red oracle rigs with fresh payloads"*, and **I supplied that framing
+with a warning that a captured oracle payload has a fifty-minute shelf life.** ⛔ **That warning is
+wrong for these rigs, and the framing it produced would have fixed nothing.**
+
+### 53.1 They do not expire — they are time-frozen
+
+`LiquidatePayInAdvanceDryEvalTest` derives its whole clock from a **compile-time constant**:
+
+```java
+private static final long NOW = LEND_DATE + 3_600_000L;   // 1_787_219_664_000
+private static final long FEED_VALID_FROM = NOW - 35_555L;
+private static final long FEED_VALID_TO   = FEED_VALID_FROM + 600_000L;
+```
+
+**There is no wall clock in an offline evaluator.** The rig chooses the transaction's validity window,
+and `retrieve_oracle_data` only compares the window to the feed — so a captured feed is valid forever
+as long as the window is set inside it. **These rigs are deterministic and have never expired.**
+
+### 53.2 ⛔ The real cause, measured
+
+The five pay-in-advance failures are all `RedeemerError { tag: "Withdraw", index: 1, EvaluationFailure }`.
+
+| | value |
+|---|---|
+| what the **recorded THIRD-deployment LM config datum** publishes at field 4 | `67b6c63bad731f763d9dc033d195a18b8799fd12ee174caf241ee84f` |
+| what the **vendored blueprint derives** from those same third-deployment coordinates | `9b30965df52a003b327057c62a21506f30adaee34efe8e035e172271` |
+
+`lender_manager.withdraw` reads the action out of the redeemer, looks the matching hash up **in the
+datum**, and requires *that* script's withdrawal to be present. The rig withdraws at the **derived**
+hash; the datum names a different one; `list.any(…) = False`.
+
+**⇒ Not an oracle problem. Not a clock problem. The THIRD preview deployment was built from an EARLIER
+contract version than the `e0b818e` blueprint we vendor**, so a datum recorded then and a hash derived
+now cannot agree. That is also why `LoansContractDerivationTest` fails (4 of the 38).
+
+### 53.3 ⚑ AND IT IS THE SAME SHAPE AS THE FLUIDTOKENS BUG
+
+> **A compiled artefact validated against a datum produced by a DIFFERENT build.**
+
+§51: FT's validator compiled against a Minswap type one wrapper away from the pools' actual datum.
+§53: our rigs derive from a blueprint one deployment away from the datums they replay.
+
+**Ours is confined to test fixtures and fails loudly; theirs is on mainnet and fails silently** — but
+the failure mode is one thing, and it is worth naming once: **whenever a compiled thing meets recorded
+data, the two builds must be the same build, and nothing in either toolchain checks it.**
+
+### 53.4 The durable answer, and the one decision that is not mine
+
+**(a) — durable-green is achievable, and it is not "fresh payloads".** The fix is to re-point
+`LoanFixtures.registry()` and the recorded datums to the **FOURTH** deployment, which the shipped
+blueprint **does** derive — `ShippedRegistryMatchesPinnedConfigTest` is green on exactly that pairing.
+Once the artefact and the datums come from one build, the rigs are deterministic again **and stay
+green**, because nothing in them depends on wall-clock time (§53.1).
+
+⚠ **But `LoanFixtures.registry()` is depended on by ~25 test files, and its sibling's javadoc records
+the re-point as an OPEN DECISION THAT IS GIOVANNI'S** — written there deliberately so a passing session
+would not pre-empt it:
+
+> *"Distinct from `registry()` on purpose. That one is pinned to the THIRD deployment and 25 test files
+> depend on it; re-pointing it would pre-empt an open decision about the 37 red fixtures that is
+> Giovanni's, not this method's."*
+
+**I am not overriding that on a peer's turn instruction.** What I can now give him that he did not have
+is the *cost*: it is a mechanical re-point plus re-capture, **not** an oracle problem, **not** urgent for
+any wall-clock reason, and it buys **an offline proof for pay-in-advance that stays green**.
+
+**(b) — what is genuinely capture-bound.** `RealLoanDryEvalTest` and `RealEquityLoanDryEvalTest` replay
+**real recorded loans**, and those loans are third-deployment artefacts that no longer exist to
+re-capture. Those two (6 failures) are honestly **live-only or historical**: either re-founded on a
+fourth-deployment loan someone creates, or kept as a record of a deployment that is gone. **That is a
+classification, not a fix, and it is the honest half of this answer.**
