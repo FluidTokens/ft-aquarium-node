@@ -160,14 +160,56 @@ public final class LiquidationTxEncoder {
         return constr(0, BigIntPlutusData.of(configRefInputIndex), constr(0));
     }
 
-    // ---- LenderManagerWithdrawRedeemer (action fixed to Liquidate) ----------------------------
+    // ---- LenderManagerWithdrawRedeemer --------------------------------------------------------
 
     /**
-     * {@code LenderManagerWithdrawRedeemer { configRefInputIndex, action: Liquidate } } —
-     * {@code LenderManagerAction.Liquidate} is constructor index 1 ({@code WithdrawBonds} is 0).
+     * {@code LenderManagerAction}, in the blueprint's declaration order. <b>The ordinal IS the
+     * constructor index</b>, and {@code LenderManagerActionSchemaTest} pins that against
+     * {@code loans-v4.plutus.json} so a reordering upstream fails a test rather than a transaction.
+     *
+     * <p>⛔ <b>This is not decoration.</b> {@code lender_manager.ak}'s withdraw handler reads the
+     * action, looks up the matching action-script hash in the LM config datum, and requires <b>that
+     * script's withdrawal to be present in the transaction</b>. Naming the wrong action means the
+     * validator hunts for a script that is not there and refuses — with nothing in the failure that
+     * says "wrong action".
+     */
+    public enum LenderManagerAction {
+        WITHDRAW_BONDS,
+        LIQUIDATE,
+        COMPOUND,
+        LIQUIDATE_AND_PAY_IN_ADVANCE,
+        LIQUIDATE_AND_CONVERT,
+        LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND,
+        LIQUIDATE_CONVERT_AND_COMPOUND
+    }
+
+    /**
+     * {@code LenderManagerWithdrawRedeemer { configRefInputIndex, action } }.
+     *
+     * <p>⚠ {@code configRefInputIndex} here means the <b>LM</b> config, not the main one — the handler
+     * resolves the action hashes from the LM config datum's fields 1..7 (§22.3's fourth wrinkle).
+     */
+    public static PlutusData lenderManagerWithdrawRedeemer(long configRefInputIndex,
+                                                           LenderManagerAction action) {
+        return constr(0, BigIntPlutusData.of(configRefInputIndex), constr(action.ordinal()));
+    }
+
+    /**
+     * ⛔ <b>PLAIN {@code Liquidate} ONLY.</b> Kept because {@link LiquidateTransactionBuilder} is the
+     * plain path and this is right for it — but it is <b>wrong for every other action</b>, silently,
+     * because a wrong action produces a well-formed redeemer that makes {@code lender_manager.ak}
+     * look for a script the transaction does not withdraw through.
+     *
+     * <p>⚑ It has already cost twice. {@code LiquidatePayInAdvanceTransactionBuilder} wrote its own
+     * inline copy with constructor 3 and left a javadoc saying <i>"LiquidationTxEncoder…
+     * lenderManagerWithdrawRedeemer hard-codes the Liquidate action instead"</i> — and the convert
+     * builder then called this method anyway and failed evaluation at that withdrawal. <b>The warning
+     * existed, in a sibling, in writing, and reuse still went to the name rather than the note.</b>
+     * Prefer {@link #lenderManagerWithdrawRedeemer(long, LenderManagerAction)}, which cannot be got
+     * wrong by omission.
      */
     public static PlutusData lenderManagerWithdrawRedeemer(long configRefInputIndex) {
-        return constr(0, BigIntPlutusData.of(configRefInputIndex), constr(1));
+        return lenderManagerWithdrawRedeemer(configRefInputIndex, LenderManagerAction.LIQUIDATE);
     }
 
     // ---- LoanMintRedeemer ----------------------------------------------------------------------

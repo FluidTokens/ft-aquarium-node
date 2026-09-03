@@ -309,8 +309,14 @@ public class ConvertTransactionBuilder {
                 LiquidationTxEncoder.loanClaimActionWithdrawRedeemer(configRefIndex,
                         List.of(withIndexes(request.claim(), bondOutputIndex,
                                 collateralOracleRefIndex, principalOracleRefIndex))));
+        // ⛔ THE ACTION MATTERS. lender_manager.ak reads it, resolves the matching action-script hash
+        // from the LM config datum, and requires THAT script's withdrawal to be present. The default
+        // one-argument overload says `Liquidate`, so the validator hunts for the PLAIN action's script
+        // — which this transaction does not withdraw through — and refuses, with nothing in the
+        // failure naming the cause. Measured: EvaluationFailure at this withdrawal, first run.
         tx.withdraw(rewardAddress(registry.getLenderManagerWithdrawScriptHash()), BigInteger.ZERO,
-                LiquidationTxEncoder.lenderManagerWithdrawRedeemer(lmConfigRefIndex));
+                LiquidationTxEncoder.lenderManagerWithdrawRedeemer(lmConfigRefIndex,
+                        LiquidationTxEncoder.LenderManagerAction.LIQUIDATE_AND_CONVERT));
         // ⛔ THE ORACLE WITHDRAWAL. loan_claim_action calls retrieve_oracle_data with the collateral's
         // own policy id; a non-empty one means the FluidTokens oracle validator MUST execute.
         //

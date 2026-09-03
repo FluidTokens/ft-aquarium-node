@@ -4047,3 +4047,69 @@ makes every transaction this bot builds fail.** Worth knowing before, not after.
   to the *lender*, not to the bot or the borrower — and it is the honest answer to *"how do I know a
   pool is good"*: **you do not, and the market gate's `action: ANTICIPATE` per market is the lever**
   FluidTokens themselves recommended for tokens without a reliable pool (§29.7).
+
+---
+
+## 46. The lender-manager action — a warning that existed, in writing, in a sibling, and was reused past (2026-09-03)
+
+Stage C's first real catch, and the defect is small; **how it survived is the finding.**
+
+### 46.1 The defect
+
+`lender_manager.ak`'s `withdraw` reads `redeemer.action`, uses it to select one of **seven** action-script
+hashes out of the LM config datum, and then requires **that script's withdrawal to be present**:
+
+```aiken
+let actionWithdrawScriptHash = when redeemer.action is {
+    …  LiquidateAndConvert { .. } -> lmLiquidateAndConvertActionScriptHash  …
+}
+list.any(self.withdrawals, fn(w) { … scriptHash == actionWithdrawScriptHash })
+```
+
+The convert builder called `LiquidationTxEncoder.lenderManagerWithdrawRedeemer(index)` — **whose
+one-argument form hard-codes `Liquidate`**. So the validator hunted for the **plain** action's script,
+which this transaction does not withdraw through, and refused. ⇒ `RedeemerError { tag: "Withdraw",
+EvaluationFailure }`, **with nothing in the failure naming the cause.**
+
+Fixed with an explicit `LenderManagerAction` enum whose **ordinal is the constructor index**, pinned
+against the deployed blueprint by `LenderManagerActionSchemaTest`.
+
+### 46.2 ⛔ HOW IT SURVIVED — the part worth keeping
+
+`LiquidatePayInAdvanceTransactionBuilder` had already hit this. It wrote its own inline copy with
+constructor 3 and left a javadoc saying, in as many words:
+
+> *"Built inline: {@code LiquidationTxEncoder#lenderManagerWithdrawRedeemer} hard-codes the
+> {@code Liquidate} action instead."*
+
+**The warning existed. It was correct. It was in the nearest sibling. And the convert builder called the
+method anyway.**
+
+⇒ Because **reuse goes to the NAME, not to the note.** `lenderManagerWithdrawRedeemer` reads as *the*
+lender-manager withdraw redeemer; nothing at the call site suggests it is one of seven, and the sibling's
+javadoc is not visible from there. CLAUDE.md already requires *citing the sibling builder's hard-won
+lessons* before wiring a new builder — **and following that rule would have caught this.** I did not.
+
+**⇒ The durable fix is not a better warning, it is a shape that cannot be got wrong by omission.** The
+two-argument overload forces the action to be stated; the one-argument one is documented as plain-
+`Liquidate`-only and pinned by a test so nobody "improves" it into something more accommodating. *A
+comment telling the next caller to be careful is a comment that will be read after the failure.*
+
+⚑ This is the **third** appearance of the same family in three days: a rule written but not delivered
+(the version bump), a warning read minutes before the failure it described (the npm trigger), and now a
+warning sitting one file away from a caller who never looked. **Prose does not change behaviour;
+structure does.**
+
+### 46.3 Where Stage C stands
+
+With the action fixed, the failure **moved on** — the lender-manager withdrawal now passes and the next
+redeemer refuses. That is the rig working: each fix reveals the next real thing, and none of them were
+reachable before the emitter ran at all.
+
+⚠ **And a diagnostic gap found in passing:** with `ignoreScriptCostEvaluationError(false)`, the build
+aborts *inside* `context.build()`, so the finished body cannot be printed to identify a redeemer index
+from the artefact itself. Identification currently rests on re-deriving the ledger's ordering by hand —
+which is exactly the step that went wrong once already (§44.2). **A diagnostic that cannot inspect the
+artefact it is diagnosing forces the guessing it exists to remove.**
+
+Suite **107 files, 896 tests, 38 failures, 24 skipped, 0 orphans**.
