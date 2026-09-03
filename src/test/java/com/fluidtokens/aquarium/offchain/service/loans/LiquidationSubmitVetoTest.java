@@ -43,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -810,7 +811,120 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S4 — profitability
+    // S4 — the market's own execution state
+    // ======================================================================================
+
+    /** A configuration identical to {@link #armed()} but with one market held at {@code mode}. */
+    private static AppConfig.LiquidationConfiguration armedWithMarket(
+            AppConfig.LiquidationConfiguration.Mode marketMode) {
+        var cfg = armed();
+        var m = new AppConfig.LiquidationConfiguration.Market();
+        m.setUnit(AssetType.LOVELACE);
+        m.setMode(marketMode);
+        m.setAction(AppConfig.LiquidationConfiguration.Action.CONVERT);
+        cfg.setMarkets(java.util.List.of(m));
+        return cfg;
+    }
+
+    /**
+     * ⛔ <b>THE REHEARSAL. A market held at SHADOW on a fully armed LIVE node builds the whole
+     * transaction, records it, dumps it — and submits nothing.</b>
+     *
+     * <p>This is what makes shadow a rehearsal rather than a refusal, and on mainnet it is the ONLY
+     * rehearsal the convert path can ever have: preview carries no Minswap deployment, so a real
+     * candidate with real protocol parameters and real ex-units exists nowhere else (findings §28.1).
+     *
+     * <p>Everything else here is armed — live, enabled, submittable, profitable, small enough, fresh
+     * feeds, unspent UTxOs. <b>The market alone is what stops it</b>, and the row still reports the
+     * candidate's own verdict, which is what makes the dump worth reading.
+     */
+    @Test
+    void s4AMarketHeldAtShadowBuildsAndDumpsTheTransactionAndSubmitsNothing() {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        Run run;
+        try {
+            run = new Rig().configuration(armedWithMarket(
+                    AppConfig.LiquidationConfiguration.Mode.SHADOW)).run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = vetoed(run, LiquidationExecutor.SubmitVeto.MARKET_NOT_LIVE,
+                LiquidationDecision.Outcome.WOULD_SUBMIT);
+        assertTrue(decision.expectedProfitLovelace().signum() > 0,
+                "the candidate was worth doing — the market is the only thing that stopped it");
+        assertNotNull(decision.txCborHex(), "a rehearsal that produced no transaction is not a rehearsal");
+
+        var lines = appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+
+        String meta = lines.stream().filter(l -> l.startsWith("SHADOW TX ")).findFirst().orElse(null);
+        assertNotNull(meta, "the operator must be able to grep the dump: " + lines);
+        assertTrue(meta.contains("held-by=MARKET_NOT_LIVE"), meta);
+        assertTrue(meta.contains("PHASE-2 ONLY"),
+                "the honesty boundary must travel WITH the artefact, not sit in a doc: " + meta);
+        assertTrue(meta.contains("Nothing was signed and nothing was submitted."), meta);
+
+        // ⛔ Ex-units read off the BUILT transaction, never off an evaluator report (CCL trap 8).
+        assertTrue(meta.contains("exunits=["), meta);
+        Transaction dumped = assertDoesNotThrow(
+                () -> Transaction.deserialize(HexUtil.decodeHexString(decision.txCborHex())),
+                "the dumped hex must round-trip, or an operator cannot analyse it");
+
+        // ⚑ THIS RIG BUILDS WITHOUT AN EVALUATOR ON PURPOSE — its subject is the veto ladder, not
+        // costing — so its redeemers carry cardano-client-lib's placeholder budget. That is exactly
+        // the state a shadow dump must NOT present as a validated rehearsal, and asserting it here
+        // proves the detection fires rather than merely existing.
+        assertTrue(dumped.getWitnessSet().getRedeemers().stream()
+                        .allMatch(r -> r.getExUnits() != null
+                                && r.getExUnits().getMem().longValue() == 10_000L),
+                "this rig is expected to produce placeholders; if it stopped, the assertion below is "
+                        + "no longer testing what it claims");
+        assertTrue(meta.contains(LiquidationExecutor.PLACEHOLDER_MARKER),
+                "a dump whose budgets were never measured MUST say so — otherwise it reads as a "
+                        + "validated rehearsal and is worse than no dump at all: " + meta);
+        assertTrue(appender.list.stream()
+                        .filter(e -> e.getLevel() == Level.ERROR)
+                        .map(ILoggingEvent::getFormattedMessage)
+                        .anyMatch(l -> l.contains("PROVES NOTHING")),
+                "and it must be loud, at ERROR, not a detail inside an INFO line");
+
+        String payload = lines.stream().filter(l -> l.startsWith("SHADOW CBOR ")).findFirst().orElse(null);
+        assertNotNull(payload, "the bytes themselves must be dumped, not only described");
+        assertTrue(payload.endsWith(decision.txCborHex()),
+                "the dumped bytes must be the ones recorded, or the two disagree about what would go");
+
+        run.assertNothingWasSubmitted();
+    }
+
+    /** A DISABLED market is not a rehearsal: it is held too, but there is nothing to analyse. */
+    @Test
+    void s4ADisabledMarketSubmitsNothingEither() {
+        Run run = new Rig().configuration(armedWithMarket(
+                AppConfig.LiquidationConfiguration.Mode.DISABLED)).run();
+
+        vetoed(run, LiquidationExecutor.SubmitVeto.MARKET_NOT_LIVE,
+                LiquidationDecision.Outcome.WOULD_SUBMIT);
+        run.assertNothingWasSubmitted();
+    }
+
+    /**
+     * ⚑ And the market must not gate a node that never listed it. An unlisted market inherits the node
+     * mode, so an armed node with an empty list still submits — otherwise shipping this stage would
+     * have silently disarmed every existing operator.
+     */
+    @Test
+    void s4AnUnlistedMarketDoesNotHoldAnArmedNode() {
+        Run run = new Rig().run();
+
+        assertEquals(1, run.submitter().submitted.size(),
+                "an empty market list must leave an armed node exactly as armed as it was");
+    }
+
+    // ======================================================================================
+    // S5 — profitability
     // ======================================================================================
 
     /**

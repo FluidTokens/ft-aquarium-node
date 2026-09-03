@@ -3124,3 +3124,71 @@ so a change to the gate that quietly flips this verdict fails a test rather than
 
 ⚠ The figure uses the **pool mid-price**; production prices the fee off the Charli3 `oracleFLDTC3` feed
 the loan names. The two will differ slightly — but not by the ~4× that would change the verdict.
+
+---
+
+## 33. SHADOW is a rehearsal, not a refusal — and the dump that would have lied (2026-09-03)
+
+Stage: `MARKET_NOT_LIVE` plus the shadow dump. The per-market execution state from §29 now has the
+mechanism it was designed against.
+
+### 33.1 The ladder is nine, and the first four are POLICY
+
+`MARKET_NOT_LIVE` is inserted as **S4**, after the network and before profitability; S4–S8 renumber to
+S5–S9. Policy vetoes before candidate vetoes, so an operator who held a market back reads *that* rather
+than a downstream symptom.
+
+**⇒ And this veto is what turns per-market SHADOW into a rehearsal.** By the time it fires the candidate
+has already been scanned, built, priced, size-checked and recorded — only the submission is withheld.
+`MarketGate`'s temporary `MARKET_SHADOW_NOT_YET_IMPLEMENTED` refusal existed exactly until this veto did,
+and is now deleted.
+
+⚠ **`DISABLED` is not this state.** A disabled market is held here too, but there is nothing to analyse;
+`SHADOW` is precisely the mode that builds and then stops. **Shadow shows you the transactions that
+would have gone.**
+
+An unlisted market still inherits the node mode, so an armed node with an empty list submits exactly as
+before — asserted, because shipping this stage otherwise would have silently disarmed every existing
+operator.
+
+### 33.2 ⛔ THE DUMP ALMOST SHIPPED AS A LIE — and the rig is what caught it
+
+The dump prints, at INFO on greppable prefixes: `SHADOW TX` with the variant, the veto that held it, the
+unsigned size, **per-redeemer ex-units**, and the economics; then `SHADOW CBOR` with the payload on its
+own line (a ~10 kB transaction is ~20,000 hex characters).
+
+**The first version reported ex-units as though they were measurements. They were `10000/10000` and
+`10000/1000` — cardano-client-lib's placeholder budget, CCL trap 8's exact signature.** The veto rig
+builds through the *no-evaluator* constructor on purpose (its subject is the ladder, not costing), so
+its transactions have never carried a real budget — and the dump would have presented them as a
+validated rehearsal.
+
+> **⇒ A rehearsal whose entire claim is "every script evaluated" is WORSE THAN USELESS when the budgets
+> are placeholders, because it looks like proof.** This project has already paid for that once: the
+> 2026-08-21 incident shipped precisely these numbers, under-declaring by two to five orders of
+> magnitude, and 307 tests missed it because every ex-units assertion read the evaluator's *report*
+> rather than the transaction.
+
+So `exUnitsSummary` **detects the signature** — every redeemer at 10000 mem with 10000 or 1000 steps —
+and prefixes `⛔NOT-VALIDATED:PLACEHOLDER-EX-UNITS(CCL-trap-8)`, with a matching **ERROR** line saying
+the dump proves nothing. ⚠ **All, not any:** one measured redeemer among placeholders is a *different*
+fault (trap 8's "validate the payload, not the envelope"), and calling it placeholders would send an
+operator to the wrong cause.
+
+**⚑ The general lesson, which is the one worth keeping.** The rig supplied a weaker input than
+production earns — the same shape as the 2026-08-21 "fixture supplies what production must earn" —
+but this time the *feature under test was the reporting of that very property*. **A diagnostic must be
+able to report its own absence of evidence.** The fix was not to make the rig stronger; it was to make
+the dump refuse to overclaim, which holds for every future caller including the ones with no evaluator
+at all.
+
+### 33.3 Verification
+
+Four mutants, each killed: the market veto removed (2 tests), the placeholder marker dropped (2), the
+dump skipped for `MARKET_NOT_LIVE` (1), and `all`→`any` on the placeholder test (2). Both branches of
+the summary are driven **directly** rather than through a rig, so neither depends on a harness happening
+to be wired one way. Suite **100 files, 842 tests, 38 failures, 22 skipped, 0 orphans** — distribution
+unchanged.
+
+**Unstarted:** the convert builder and its §28.5 engineering, now with §32.3's measured Minswap facts;
+and the operator docs (shadow-first, the stated-loss mode, indexed env vars).

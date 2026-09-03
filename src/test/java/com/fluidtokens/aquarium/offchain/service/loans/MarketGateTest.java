@@ -122,31 +122,26 @@ class MarketGateTest {
     }
 
     /**
-     * ⚠ Fail-closed between stages. Until the executor grows its {@code MARKET_NOT_LIVE} submit veto a
-     * shadow market has no way to build-then-stop, so it refuses rather than behaving as LIVE. A safety
-     * setting that is briefly loosened between stages is worse than one that arrives late.
+     * ⛔ <b>A SHADOW market must BUILD — on either scope.</b> This gate refuses nothing for shadow; the
+     * executor's {@code S4 MARKET_NOT_LIVE} veto withholds the submission after the transaction exists.
+     * That is the whole point of the mode: <b>shadow shows you the transactions that would have gone</b>,
+     * so a gate that refused before the build would turn the rehearsal back into a refusal.
+     *
+     * <p>⚑ The stage before this one DID refuse here, deliberately, because no veto existed yet — and
+     * the first version of that refusal fired on the effective mode, which would have deleted node-wide
+     * shadow mode as well. A fail-closed guard that destroys the feature it guards is not fail-closed.
      */
     @Test
-    void aShadowMarketOnALiveNodeRefusesRatherThanBehavingAsLive() {
-        MarketGate.Decision d = gate(Mode.LIVE, market("lovelace", Mode.SHADOW, Action.ANTICIPATE, 1_000L))
-                .decide(ADA, n(1));
+    void aShadowMarketBuildsAndIsHeldByTheExecutorVetoInstead() {
+        assertTrue(gate(Mode.LIVE, market("lovelace", Mode.SHADOW, Action.ANTICIPATE, 1_000L))
+                        .decide(ADA, n(1)).allowed(),
+                "a market-level shadow on a live node must reach the builder");
+        assertTrue(gate(Mode.SHADOW, market("lovelace", null, Action.ANTICIPATE, 1_000L))
+                        .decide(ADA, n(1)).allowed(),
+                "and so must a node-wide shadow, which always could");
 
-        assertFalse(d.allowed(), "shadow must never fall through to a submittable path");
-        assertEquals(MarketGate.Refusal.MARKET_SHADOW_NOT_YET_IMPLEMENTED, d.refusal());
-    }
-
-    /**
-     * ⛔ AND THE OTHER HALF, which is what keeps the existing feature alive: a NODE-WIDE shadow must
-     * still BUILD. It already has a working build-then-veto path in the executor ({@code S1
-     * MODE_NOT_LIVE}), and refusing here would delete global shadow mode rather than protect anything —
-     * a fail-closed guard that destroys the feature it guards is not fail-closed, it is broken.
-     */
-    @Test
-    void aNodeWideShadowStillBuildsBecauseTheExecutorAlreadyVetoesIt() {
-        MarketGate.Decision d = gate(Mode.SHADOW, market("lovelace", null, Action.ANTICIPATE, 1_000L))
-                .decide(ADA, n(1));
-
-        assertTrue(d.allowed(), "the S1 veto, not this gate, is what stops a node-wide shadow");
+        assertEquals(Mode.SHADOW, gate(Mode.LIVE, market("lovelace", Mode.SHADOW, Action.CONVERT, null))
+                .effectiveMode(ADA), "the mode is still reported, for the executor to veto on");
         assertEquals(Mode.SHADOW, gate(Mode.SHADOW).effectiveMode(ADA));
     }
 

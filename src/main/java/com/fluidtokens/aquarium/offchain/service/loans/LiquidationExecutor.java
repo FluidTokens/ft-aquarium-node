@@ -131,8 +131,13 @@ public class LiquidationExecutor {
      */
 
     /**
-     * The eight submit vetoes, in the order they are evaluated. Each is a separate, named reason
+     * The nine submit vetoes, in the order they are evaluated. Each is a separate, named reason
      * this candidate was not submitted; a decision carries exactly the first one that fired.
+     * <p>
+     * The first four are POLICY — statements about what the operator has authorised — and they come
+     * before the five that are statements about this candidate at this instant. That ordering is
+     * deliberate: on a node held back by policy, reporting a downstream symptom would send the
+     * operator looking at the wrong thing.
      */
     public enum SubmitVeto {
         /** S1 — {@code loans.liquidation.mode} is not {@code live}. */
@@ -141,26 +146,39 @@ public class LiquidationExecutor {
         NOT_ARMED,
         /** S3 — the node is not on preview. */
         NETWORK_NOT_PREVIEW,
-        /** S4 — expected profit is not strictly positive. */
+        /**
+         * S4 — <b>this loan's MARKET is not LIVE</b>, on a node that otherwise is.
+         *
+         * <p>The market's effective mode is {@code min(nodeMode, market.mode)} (see {@code MarketGate}),
+         * so this fires when an operator has held one market back — {@code SHADOW} to rehearse it, or
+         * {@code DISABLED} to sit it out — while the node itself is armed. Its detail names which.
+         *
+         * <p>⚑ <b>This is what makes per-market SHADOW a rehearsal rather than a refusal:</b> the
+         * candidate is scanned, built, priced, size-checked and recorded exactly as a live one, and
+         * only the submission is withheld. {@code MarketGate}'s temporary
+         * {@code MARKET_SHADOW_NOT_YET_IMPLEMENTED} refusal existed only until this veto did.
+         */
+        MARKET_NOT_LIVE,
+        /** S5 — expected profit is not strictly positive. */
         NOT_PROFITABLE,
-        /** S5 — the serialised transaction is over the live {@code maxTxSize}, or it could not be read. */
+        /** S6 — the serialised transaction is over the live {@code maxTxSize}, or it could not be read. */
         TX_TOO_LARGE,
-        /** S6 — a feed this candidate prices against has less than the margin of window left, now. */
+        /** S7 — a feed this candidate prices against has less than the margin of window left, now. */
         ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT,
-        /** S7 — the loan or bond UTxO is no longer unspent, or that could not be established. */
+        /** S8 — the loan or bond UTxO is no longer unspent, or that could not be established. */
         STALE_UTXO,
         /**
-         * S8 — the built transaction's own validity interval has already ended, or its end could not
+         * S9 — the built transaction's own validity interval has already ended, or its end could not
          * be read.
          * <p>
-         * Not a duplicate of S6, and the gap it closes is a real one. S6 can only speak about loans
+         * Not a duplicate of S7, and the gap it closes is a real one. S7 can only speak about loans
          * that have an oracle feed; <b>an ada/ada loan has no feed at all</b>, so before S8 there was
          * no submit-time staleness check whatsoever on exactly the shape that actually builds today.
          * The direction was already safe — an expired transaction is refused in phase 1 and costs
          * nothing — but "we submitted a transaction we knew had expired" is not a thing this loop
          * should do, and the contract's intent was staleness protection at submit time.
          * <p>
-         * Evaluated last on purpose. Where a feed exists, S6's firing region is contained in this
+         * Evaluated last on purpose. Where a feed exists, S7's firing region is contained in this
          * one (the builder demands {@code feed.validTo >= tx.validTo + margin}, so a feed can only
          * run short after the transaction has expired), and the more specific reason is the more
          * useful one to report.
@@ -449,6 +467,117 @@ public class LiquidationExecutor {
      * <b>record</b>, not a warning about a mistake: a node running at a loss on mainnet must say so
      * auditably at boot, naming the path and the stated floor.
      */
+    /**
+     * ⛔ <b>The shadow dump: the transaction that WOULD have gone, printed where an operator can pick
+     * it up and analyse it.</b>
+     *
+     * <p>Giovanni, 2026-09-03: <i>"make a per-market mode: shadow, meaning that if a liquidation can
+     * happen, we build the tx, validate and dump the tx bytes in the logs so it can be analysed.
+     * Unsigned obviously."</i> On mainnet this is the <b>only rehearsal convert can ever have</b>:
+     * preview has no Minswap deployment at all, so a real candidate, real protocol parameters and real
+     * ex-units exist nowhere else (findings §28.1, §29).
+     *
+     * <h2>It fires for a POLICY hold, never for a rejection</h2>
+     * A candidate the gates refused is not a transaction that would have gone, and dumping it would
+     * bury the ones that would. So this prints exactly when the verdict is {@code WOULD_SUBMIT} and a
+     * policy veto (S1–S4) held it — mode, arming, network, or the market. An {@code UNPROFITABLE} row
+     * or a candidate stopped by S5–S9 gets its ordinary line and no payload.
+     *
+     * <h2>⚠ What it proves, and what it does NOT</h2>
+     * The ex-units come off the <b>built, deserialised transaction</b> — never off an evaluator's
+     * report (CCL trap 8) — so a clean dump means every script ran under a real evaluator and returned
+     * a real budget. <b>That is phase 2, the failure that forfeits collateral.</b> It says nothing
+     * about the ledger's phase 1: fees, min-ada, the witness set, collateral. And the size is an
+     * <b>under-estimate</b>, because an unsigned body carries no vkey witnesses. The line says so
+     * rather than leaving an operator to infer it.
+     *
+     * <p>Two lines, not one: the metadata is what an operator greps, the CBOR is what they feed to a
+     * decoder, and a ~10 kB transaction is ~20,000 hex characters. Splitting them keeps the first
+     * readable.
+     */
+    private void dumpShadowTransaction(LiquidationAssessment assessment, Verdict verdict,
+                                       Transaction transaction, String cborHex, int size, String detail) {
+        if (verdict.outcome() != LiquidationDecision.Outcome.WOULD_SUBMIT || verdict.veto() == null) {
+            return;
+        }
+        switch (verdict.veto()) {
+            case MODE_NOT_LIVE, NOT_ARMED, NETWORK_NOT_PREVIEW, MARKET_NOT_LIVE -> { }
+            default -> {
+                return;
+            }
+        }
+        String exUnits = exUnitsSummary(transaction);
+        log.info("SHADOW TX {} variant={} held-by={} size={}B(unsigned, grows once signed) "
+                        + "exunits=[{}] economics={} — PHASE-2 ONLY: the scripts evaluated, but the "
+                        + "ledger's phase-1 rules (fee, min-ada, witnesses, collateral) are NOT proven "
+                        + "by this. Nothing was signed and nothing was submitted.",
+                assessment.loan().utxoRef(), variantOf(assessment), verdict.veto(), size,
+                exUnits, detail);
+        if (exUnits.startsWith(PLACEHOLDER_MARKER)) {
+            log.error("⛔ THE SHADOW DUMP ABOVE PROVES NOTHING: every redeemer carries cardano-client-lib's "
+                    + "placeholder budget, so no evaluator ran. Submitting a transaction shaped like this "
+                    + "would fail in PHASE 2 and forfeit collateral. Wire a real TransactionEvaluator "
+                    + "(CCL trap 8) before treating this rehearsal as evidence.");
+        }
+        log.info("SHADOW CBOR {} {}", assessment.loan().utxoRef(), cborHex);
+    }
+
+    /**
+     * Per-redeemer ex-units, read off the BUILT transaction.
+     *
+     * <p>⛔ Never off an {@code EvaluationResult}: a rig-supplied evaluator makes that report look
+     * right while production has none, which is exactly how the 2026-08-21 incident shipped
+     * placeholder budgets (CCL trap 8). The decision record has always counted redeemers and never
+     * said what they cost — this is the first place that number is reported at all.
+     */
+    static String exUnitsSummary(Transaction transaction) {
+        if (transaction.getWitnessSet() == null || transaction.getWitnessSet().getRedeemers() == null
+                || transaction.getWitnessSet().getRedeemers().isEmpty()) {
+            return "no redeemers";
+        }
+        BigInteger mem = BigInteger.ZERO;
+        BigInteger steps = BigInteger.ZERO;
+        StringBuilder each = new StringBuilder();
+        boolean allPlaceholder = true;
+        for (var r : transaction.getWitnessSet().getRedeemers()) {
+            var ex = r.getExUnits();
+            if (ex == null) {
+                allPlaceholder = false;
+                each.append(r.getTag()).append(':').append(r.getIndex()).append("=UNMEASURED ");
+                continue;
+            }
+            allPlaceholder &= isPlaceholder(ex.getMem(), ex.getSteps());
+            mem = mem.add(ex.getMem());
+            steps = steps.add(ex.getSteps());
+            each.append(r.getTag()).append(':').append(r.getIndex()).append('=')
+                    .append(ex.getMem()).append('/').append(ex.getSteps()).append(' ');
+        }
+        String summary = "total=%s/%s each=%s".formatted(mem, steps, each.toString().trim());
+        return allPlaceholder ? PLACEHOLDER_MARKER + " " + summary : summary;
+    }
+
+    /**
+     * ⛔ The marker a dump carries when its budgets were never measured. Named as a constant so a test
+     * asserts the same string an operator greps.
+     */
+    static final String PLACEHOLDER_MARKER = "⛔NOT-VALIDATED:PLACEHOLDER-EX-UNITS(CCL-trap-8)";
+
+    /**
+     * cardano-client-lib's placeholder budget: <b>10000 mem</b>, and <b>10000 or 1000 steps</b>
+     * depending on the redeemer tag. A transaction carrying these was built with no evaluator — the
+     * failure is silent, because {@code ignoreScriptCostEvaluationError} defaults true.
+     *
+     * <p>⚑ <b>Why the shadow dump must detect it rather than print it.</b> A rehearsal whose whole
+     * claim is "every script evaluated" is worse than useless if the budgets are placeholders: it
+     * looks validated. This project has already paid for that once — the 2026-08-21 incident shipped
+     * exactly these numbers, under-declaring by 2–5 orders of magnitude, and a suite of 307 tests
+     * missed it because every assertion read the evaluator's report instead of the transaction.
+     */
+    private static boolean isPlaceholder(BigInteger mem, BigInteger steps) {
+        return BigInteger.valueOf(10_000L).equals(mem)
+                && (BigInteger.valueOf(10_000L).equals(steps) || BigInteger.valueOf(1_000L).equals(steps));
+    }
+
     private void guardMainnetNegativeMargin() {
         BigInteger margin = configuration.getProfitMarginLovelace();
         if (margin == null || margin.signum() >= 0) {
@@ -1041,6 +1170,8 @@ public class LiquidationExecutor {
 
         log.info("liquidation of {}: {} ({}), {} ({} bytes)", assessment.loan().utxoRef(),
                 verdict.outcome(), verdict.veto(), verdict.detail(), size);
+
+        dumpShadowTransaction(assessment, verdict, transaction, cborHex, size, detail);
     }
 
     // ---- the submit vetoes --------------------------------------------------------------------
@@ -1086,7 +1217,24 @@ public class LiquidationExecutor {
                             .formatted(detail, networkName,
                                     network == null ? "<unset>" : network.getSubmittableNetwork()));
         }
-        // S4 — profitability. Two independent gates, and the margin is deliberately NOT inside the
+        // S4 — the MARKET's own execution state, on a node that is otherwise armed.
+        //
+        // Policy before candidate: an operator who held this market back must read that, not a
+        // downstream symptom. And the veto is what turns per-market SHADOW into a REHEARSAL — the
+        // candidate has already been built, priced and recorded by the time we get here, so a shadow
+        // market produces the whole artefact and withholds only the submission.
+        AssetType principalAsset = assessment.loan().datum().principalAsset();
+        AppConfig.LiquidationConfiguration.Mode marketMode =
+                new MarketGate(configuration).effectiveMode(principalAsset);
+        if (marketMode != AppConfig.LiquidationConfiguration.Mode.LIVE) {
+            return new Verdict(shadowOutcome, SubmitVeto.MARKET_NOT_LIVE,
+                    ("%s; market %s is %s (node mode %s), so nothing is submitted for it"
+                            + (marketMode == AppConfig.LiquidationConfiguration.Mode.SHADOW
+                                    ? " — the transaction below is the rehearsal" : ""))
+                            .formatted(detail, principalAsset == null ? "<unknown>" : principalAsset.toUnit(),
+                                    marketMode, configuration.getMode()));
+        }
+        // S5 — profitability. Two independent gates, and the margin is deliberately NOT inside the
         // number the floors test (F1.i): a negative margin can no longer inflate a loss past a floor.
         //
         // (a) The absolute floor, applied only when check-profitability is on, tests floorProfit —
@@ -1137,7 +1285,7 @@ public class LiquidationExecutor {
                     + "would otherwise have been refused as unprofitable",
                     assessment.loan().utxoRef(), detail);
         }
-        // S5 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
+        // S6 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
         // from S4's arithmetic: a transaction can be handsomely profitable and still not fit.
         Integer maxTxSize;
         try {
@@ -1164,7 +1312,7 @@ public class LiquidationExecutor {
                     "%s; %d bytes over the live maxTxSize of %d — publish the reference scripts"
                             .formatted(detail, size, maxTxSize));
         }
-        // S6 — the oracle windows, re-read against the clock NOW rather than against the window the
+        // S7 — the oracle windows, re-read against the clock NOW rather than against the window the
         // transaction was built for. A build that started a minute ago proves nothing about the feed
         // that is going to be evaluated when this lands in a block.
         String oracleVeto = oracleWindowShortfall(assessment, submitClock.getAsLong(), oraclesByUnit);
@@ -1172,7 +1320,7 @@ public class LiquidationExecutor {
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED,
                     SubmitVeto.ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT, detail + "; " + oracleVeto);
         }
-        // S7 — the two UTxOs, re-read immediately before the wire. They were unspent when the build
+        // S8 — the two UTxOs, re-read immediately before the wire. They were unspent when the build
         // started; a block may have arrived since.
         String staleVeto = staleUtxo(assessment);
         if (staleVeto != null) {
@@ -1180,7 +1328,7 @@ public class LiquidationExecutor {
                     detail + "; " + staleVeto);
         }
 
-        // S8 — the transaction's own validity interval. Last, so that where a feed exists S6 reports
+        // S9 — the transaction's own validity interval. Last, so that where a feed exists S7 reports
         // the more specific reason; but reached on every candidate, including the ada/ada ones S6
         // has nothing to say about.
         String elapsed = transactionWindowElapsed(transaction, submitClock.getAsLong(),

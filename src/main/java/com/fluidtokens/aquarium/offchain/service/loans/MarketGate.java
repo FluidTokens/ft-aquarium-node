@@ -68,17 +68,6 @@ public final class MarketGate {
     public enum Refusal {
         /** The market's effective mode is {@code DISABLED}: the bot does nothing here. */
         MARKET_DISABLED,
-        /**
-         * The MARKET asked for {@code SHADOW} on a {@code LIVE} node. ⚠ <b>Temporary, and deliberately
-         * fail-closed:</b> until the executor grows its {@code MARKET_NOT_LIVE} submit veto there is no
-         * per-market build-then-stop path, so this refuses BEFORE the build rather than behaving as
-         * LIVE. A safety setting briefly loosened between stages is worse than one that arrives late.
-         *
-         * <p>⚑ It deliberately does NOT fire for a node-wide {@code SHADOW}: that already has a working
-         * build-then-veto path ({@code S1 MODE_NOT_LIVE}), and short-circuiting it here would destroy
-         * the existing shadow feature instead of protecting anything.
-         */
-        MARKET_SHADOW_NOT_YET_IMPLEMENTED,
         /** The market's action is {@code CONVERT}, so pay-in-advance is not the chosen mechanism here. */
         MARKET_ACTION_IS_CONVERT,
         /** {@code ANTICIPATE}, but the cap is below what the protocol requires the bot to front. */
@@ -147,15 +136,10 @@ public final class MarketGate {
                     "market " + unit + " is DISABLED (node mode " + globalMode + "), so the bot does "
                             + "nothing in it");
         }
-        // ⛔ Only when the SHADOW came from the MARKET. A node-wide SHADOW already has a working
-        // build-then-veto path — the executor's S1 MODE_NOT_LIVE — and short-circuiting it here would
-        // destroy the existing shadow feature rather than protect anything. A market-level SHADOW on a
-        // LIVE node has no veto yet, and that is the case that must fail closed.
-        if (effective == Mode.SHADOW && globalMode == Mode.LIVE) {
-            return refuse(Refusal.MARKET_SHADOW_NOT_YET_IMPLEMENTED, required,
-                    "market " + unit + " is SHADOW on a LIVE node. The per-market build-then-veto path "
-                            + "is not wired yet, so this refuses rather than behaving as LIVE");
-        }
+        // ⛔ SHADOW is NOT refused here any more, on either scope. The executor's S4 MARKET_NOT_LIVE
+        // veto now gives a market-level SHADOW the same build-then-veto path a node-wide SHADOW always
+        // had — which is the whole point: a shadow market must produce the transaction and withhold
+        // only the submission. Refusing here would turn the rehearsal back into a refusal.
 
         Action action = actionFor(principal);
         if (action != Action.ANTICIPATE) {
