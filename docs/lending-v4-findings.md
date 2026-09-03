@@ -3854,3 +3854,57 @@ discovery: *the last mile between "the code is correct" and "it works on the thi
 **⇒ And the specific habit worth keeping: when a scope exclusion is justified by "the real case does
 not hit it", COMPUTE the real case before the exclusion is accepted.** An untested premise inside an
 accepted scope is invisible — it has already been agreed to.
+
+---
+
+## 43. The equity output — and a mutant that showed the guards test the checker, not the emitter (2026-09-03)
+
+§42's fix, built to `equity_sent_to_borrower`'s spec. One output at the asset-manager credential,
+inline `AssetManagerDatumWithToken { loanRef, action_partial_liquidation_compensation, data: None,
+ownerAsset: Asset(BORROWER bond policy, loanId) }`, holding `>= equity` of the collateral.
+
+The blanket `EQUITY_NOT_MODELLED` refusal is gone. What remains is narrower and honest:
+`REPAYMENT_RECEIPTS_NOT_MODELLED` — a loan with `repaymentReceipts = true` needs a receipt NFT in that
+output which this builder does not mint, **and minting one would be a third asset in an output whose
+DoS guard permits exactly two.** The live candidate has `repaymentReceipts = false`, verified from its
+datum rather than assumed *(§42's lesson, applied immediately)*.
+
+### 43.1 The exact-value guard, and why it is asserted on the finished body
+
+`length(flatten(value)) == 2 + receiptAssetCount` — with receipts off, **ada and the equity token and
+nothing else**. A change adjustment or a merged output adds an entry and the validator refuses on
+chain, after the fee is spent. ⚠ **This path is the likeliest to produce that stray asset**, because the
+bot's own fee is a native token and CCL is already moving multi-asset values through the transaction
+(trap 17). So it is checked on what survives balancing, never on what was intended.
+
+### 43.2 ⛔ AND THE MUTANT THAT MATTERED: the owner is one field away from wrong
+
+Swapping the **borrower's** bond for the **lender's** in the equity datum produces an output at the
+right address, holding the right amount, passing the DoS guard — **and the borrower can never claim
+it.** No validator in the transaction objects; the lender's bond is the one the builder already holds
+in hand.
+
+It killed **no test** until an explicit datum comparison existed. Now it kills three.
+
+### 43.3 ⚠ And the second thing the mutant revealed — a coverage boundary, stated not assumed
+
+Re-run after the fix, the mutant **still survives on the EMITTED side**: replacing the bond in what
+`assemble()` emits kills nothing, while the same swap in what `assertStructure` expects kills three.
+
+**⇒ Because every test in that class drives `assertStructure` against a hand-built body. The class
+tests the CHECKER, not the EMITTER.**
+
+The defect is not shippable — `assertStructure` runs inside the build pipeline as a `postBalanceTx`, so
+production refuses it — **but no test proves that**, and "not shippable because another mechanism
+catches it" is exactly the kind of claim that rots silently. Closing it needs a build that actually
+assembles, which is **sub-stage C's job**, and it makes C's value concrete rather than ceremonial:
+**C is the first thing in this project that will run the convert emitter at all.**
+
+⚑ The general form, and it is a third cousin of the measurement-blind-to-itself family: **a test that
+supplies the artefact under test proves the checker and nothing about the producer.** Both halves need
+a test, and it is easy to believe the cheap half covers the expensive one.
+
+**Verification:** 19 tests. Mutants killed: the DoS guard removed (1), the whole equity post-assert
+removed (3), the owner swapped in the asserted datum (3). **Survivor recorded rather than hidden:** the
+owner swapped in the emitted datum — the coverage boundary above. Suite **105 files, 891 tests, 38
+failures, 22 skipped, 0 orphans**.

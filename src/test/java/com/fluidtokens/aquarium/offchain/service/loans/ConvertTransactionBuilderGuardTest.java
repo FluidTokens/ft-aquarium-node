@@ -38,6 +38,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>The end-to-end build and its ex-units belong to the dry-eval rig (sub-stage C); what is provable
  * here without a node is provable here, and stating which is which is the point of splitting them.
+ *
+ * <h2>⚠ WHAT THIS CLASS DOES NOT COVER, measured rather than assumed</h2>
+ * Every test here drives {@link ConvertTransactionBuilder#assertStructure} against a <b>hand-built
+ * body</b>. <b>So this class tests the CHECKER, not the EMITTER.</b> A mutant proved it: replacing the
+ * borrower's bond with the lender's in the datum {@code assemble()} <em>emits</em> kills nothing here,
+ * while the same swap in the datum {@code assertStructure} <em>expects</em> kills three tests.
+ *
+ * <p>That defect is not shippable — {@code assertStructure} runs inside the build pipeline as a
+ * {@code postBalanceTx}, so production would refuse it — but <b>no test proves that</b>, because no
+ * test here runs a real build. <b>Closing it needs a build that actually assembles, which is sub-stage
+ * C's job.</b> Stated here so the gap is a known one rather than an assumed absence.
  */
 class ConvertTransactionBuilderGuardTest {
 
@@ -135,15 +146,68 @@ class ConvertTransactionBuilderGuardTest {
         return u;
     }
 
+    /** The real candidate's equity today: ~1.25M FLDT units (findings §42). */
+    private static final BigInteger EQUITY = BigInteger.valueOf(1_248_590L);
+
+    private static ConvertTransactionBuilder.Request requestWithEquity(ConvertOrderPlan p,
+                                                                       String bondDatumHex) {
+        var base = request(p, bondDatumHex);
+        var c = base.claim();
+        var withEquity = new ClaimData(c.liquidationMode(), c.lenderBondOutputIndex(),
+                c.collateralOracleRefInputIndex(), c.principalOracleRefInputIndex(), c.lenderAuth(),
+                EQUITY, c.loanId(), c.remainingDebt());
+        return new ConvertTransactionBuilder.Request(base.loanUtxo(), base.bondUtxo(),
+                base.poolRefUtxo(), base.collateralOracle(), base.configUtxo(), base.lmConfigUtxo(),
+                base.walletUtxo(), base.referenceScripts(), base.plan(), withEquity, base.collateral(),
+                base.lenderBondAsset(), base.repaymentReceipts(), base.orderAddress(),
+                base.changeAddress(), base.validFromSlot(), base.validToSlot());
+    }
+
+    /** The address the equity output must reach — derived exactly as the builder derives it. */
+    private static String assetManagerAddress() {
+        return com.bloxbean.cardano.client.address.AddressProvider.getEntAddress(
+                com.bloxbean.cardano.client.address.Credential.fromScript(
+                        com.bloxbean.cardano.client.util.HexUtil.decodeHexString(
+                                convertCapableRegistry().getAssetManagerSpendScriptHash())),
+                LoanFixtures.NETWORK).getAddress();
+    }
+
+    /** The datum {@code equity_sent_to_borrower} compares against, owned by the BORROWER's bond. */
+    private static PlutusData equityDatum(AssetType owner) {
+        return LiquidationTxEncoder.assetManagerDatumWithToken(
+                new com.fluidtokens.aquarium.offchain.model.loans.AssetManagerDatumWithToken(
+                        "dd".repeat(32), 0, LiquidationTxEncoder.PARTIAL_LIQUIDATION_ACTION_HEX, owner));
+    }
+
+    private static AssetType borrowerBond() {
+        return new AssetType(convertCapableRegistry().getBorrowerBondPolicyId(), "6c6f616e");
+    }
+
+    private static List<TransactionOutput> goodOutputsWithEquity(ConvertOrderPlan p, String bondDatumHex) {
+        var outs = goodOutputs(p, bondDatumHex);
+        outs.add(out(assetManagerAddress(), 2_000_000L, equityDatum(borrowerBond()), FLDT, EQUITY));
+        return outs;
+    }
+
+    /** The loan input the equity datum's {@code inputOutputReference} must name. */
+    private static Utxo loanUtxo() {
+        Utxo u = new Utxo();
+        u.setTxHash("dd".repeat(32));
+        u.setOutputIndex(0);
+        u.setAddress("addr_test1wq" + "3".repeat(50));
+        u.setAmount(List.of());
+        return u;
+    }
+
     private static ConvertTransactionBuilder.Request request(ConvertOrderPlan p, String bondDatumHex) {
-        return new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex), null, oracle(),
+        return new ConvertTransactionBuilder.Request(loanUtxo(), bondUtxo(bondDatumHex), null, oracle(),
                 null, null, null, Map.of(), p,
                 new ClaimData(new LiquidationMode.Liquidation(BigInteger.ONE, BigInteger.ONE,
                         BigInteger.ZERO, false),
                         BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
                         new AuthorizationMethod.CardanoSignature("aa".repeat(28)),
-                        BigInteger.ZERO, "loan", BigInteger.valueOf(20_000_000L)),
-                FLDT, LENDER_BOND, ORDER_ADDRESS, BOT, 0L, 0L);
+                        BigInteger.ZERO, "6c6f616e", BigInteger.valueOf(20_000_000L)),
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L);
     }
 
     private static TransactionOutput out(String address, long lovelace, PlutusData datum,
@@ -348,7 +412,7 @@ class ConvertTransactionBuilderGuardTest {
         ConvertOrderPlan p = plan();
         var noOracle = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
                 null, null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
-                FLDT, LENDER_BOND, ORDER_ADDRESS, BOT, 0L, 0L);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L);
 
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
                 () -> builder().build(noOracle));
@@ -386,6 +450,114 @@ class ConvertTransactionBuilderGuardTest {
                         + "fail its threshold on chain");
         assertTrue(withSignatures.contains("ab".repeat(32)),
                 "the published signature bytes must actually reach the redeemer");
+    }
+
+    // ---- the borrower's equity, and its exact-value guard -------------------------------------
+
+    /**
+     * ⛔ <b>The output the accepted scope excluded, on a premise nobody had computed.</b> The live
+     * candidate's equity today is ≈1,248,590 FLDT units (findings §42), so "the real case has zero
+     * equity" was false and the builder would have refused the very candidate the rig exists to prove.
+     */
+    @Test
+    void anEquityOwedButNotPaidIsRefused() {
+        ConvertOrderPlan p = plan();
+        var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
+                () -> builder().assertStructure(txWith(goodOutputs(p, bondDatumHex())),
+                        requestWithEquity(p, bondDatumHex()), 3, 4, 2));
+        assertEquals(ConvertTransactionBuilder.Refusal.EQUITY_OUTPUT_MISMATCH, e.reason());
+        assertTrue(e.getMessage().contains("asset-manager"), e.getMessage());
+    }
+
+    @Test
+    void anEquityOutputThatIsShortIsRefused() {
+        ConvertOrderPlan p = plan();
+        var outs = goodOutputs(p, bondDatumHex());
+        outs.add(out(assetManagerAddress(), 2_000_000L, equityDatum(borrowerBond()), FLDT,
+                EQUITY.subtract(BigInteger.ONE)));
+
+        var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
+                () -> builder().assertStructure(txWith(outs), requestWithEquity(p, bondDatumHex()), 3, 4, 2));
+        assertEquals(ConvertTransactionBuilder.Refusal.EQUITY_OUTPUT_MISMATCH, e.reason());
+    }
+
+    /**
+     * ⛔ <b>THE DoS GUARD, and why it is asserted on the FINISHED body rather than assumed.</b>
+     * {@code equity_sent_to_borrower} requires {@code length(flatten(value)) == 2 + receiptAssetCount}
+     * — with receipts off, ada and the equity token and <b>nothing else</b>. A change adjustment or a
+     * merged output adds an entry and the validator refuses <b>on chain, after the fee is spent</b>.
+     *
+     * <p>⚠ This path is the one most likely to produce that stray asset: the bot's own fee is a native
+     * token, so CCL is already moving multi-asset values around this transaction (trap 17).
+     */
+    @Test
+    void anEquityOutputCarryingAStrayAssetIsRefusedEvenThoughItHoldsEnough() {
+        ConvertOrderPlan p = plan();
+        var outs = goodOutputs(p, bondDatumHex());
+
+        // Enough equity, right address, right datum — and one asset too many.
+        var value = Value.builder().coin(BigInteger.valueOf(2_000_000L))
+                .multiAssets(List.of(
+                        MultiAsset.builder().policyId(FLDT.policyId())
+                                .assets(List.of(Asset.builder().name("0x" + FLDT.assetName())
+                                        .value(EQUITY).build())).build(),
+                        MultiAsset.builder().policyId(LENDER_BOND.policyId())
+                                .assets(List.of(Asset.builder().name("0x" + LENDER_BOND.assetName())
+                                        .value(BigInteger.ONE).build())).build()))
+                .build();
+        outs.add(TransactionOutput.builder().address(assetManagerAddress()).value(value)
+                .inlineDatum(equityDatum(borrowerBond())).build());
+
+        var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
+                () -> builder().assertStructure(txWith(outs), requestWithEquity(p, bondDatumHex()), 3, 4, 2));
+        assertEquals(ConvertTransactionBuilder.Refusal.EQUITY_OUTPUT_MISMATCH, e.reason());
+        assertTrue(e.getMessage().contains("3") && e.getMessage().contains("exactly 2"), e.getMessage());
+    }
+
+    /** A well-formed equity output passes — or every assertion above would pass vacuously. */
+    @Test
+    void aCorrectlyPaidEquityPasses() {
+        ConvertOrderPlan p = plan();
+        builder().assertStructure(txWith(goodOutputsWithEquity(p, bondDatumHex())),
+                requestWithEquity(p, bondDatumHex()), 3, 4, 2);
+    }
+
+    /**
+     * ⚠ {@code repaymentReceipts} demands a receipt NFT this builder does not mint — and minting one
+     * would be a third asset in an output whose DoS guard permits exactly two. A named refusal.
+     */
+    @Test
+    void aLoanWithRepaymentReceiptsIsRefusedRatherThanBuiltWithoutTheReceipt() {
+        ConvertOrderPlan p = plan();
+        var base = request(p, bondDatumHex());
+        var withReceipts = new ConvertTransactionBuilder.Request(base.loanUtxo(), base.bondUtxo(),
+                base.poolRefUtxo(), base.collateralOracle(), base.configUtxo(), base.lmConfigUtxo(),
+                base.walletUtxo(), base.referenceScripts(), base.plan(), base.claim(),
+                base.collateral(), base.lenderBondAsset(), true, base.orderAddress(),
+                base.changeAddress(), base.validFromSlot(), base.validToSlot());
+
+        var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
+                () -> builder().build(withReceipts));
+        assertEquals(ConvertTransactionBuilder.Refusal.REPAYMENT_RECEIPTS_NOT_MODELLED, e.reason());
+    }
+
+    /**
+     * ⛔ <b>THE OWNER, and a mutant found this hole.</b> Swapping the BORROWER's bond for the LENDER's
+     * in the equity datum killed no test: the output was at the right address, held the right amount,
+     * and passed the DoS guard — <b>and the borrower could never have claimed it.</b> The lender's
+     * bond is the one the builder already holds in hand, one field away, which is exactly why the
+     * substitution is easy and invisible.
+     */
+    @Test
+    void anEquityOutputOwnedByTheLENDERSBondIsRefused() {
+        ConvertOrderPlan p = plan();
+        var outs = goodOutputs(p, bondDatumHex());
+        outs.add(out(assetManagerAddress(), 2_000_000L, equityDatum(LENDER_BOND), FLDT, EQUITY));
+
+        var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
+                () -> builder().assertStructure(txWith(outs), requestWithEquity(p, bondDatumHex()), 3, 4, 2));
+        assertEquals(ConvertTransactionBuilder.Refusal.EQUITY_OUTPUT_MISMATCH, e.reason());
+        assertTrue(e.getMessage().contains("BORROWER"), e.getMessage());
     }
 
     @Test

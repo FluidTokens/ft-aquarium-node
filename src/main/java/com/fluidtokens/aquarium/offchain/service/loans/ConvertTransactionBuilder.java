@@ -74,11 +74,16 @@ public class ConvertTransactionBuilder {
         /** {@code loans.minswap.*} is unset or belongs to another network — see {@code LoansConfigVerifier}. */
         CONVERT_ACTION_NOT_DERIVED,
         /**
-         * A non-zero borrower equity. The validator subtracts it from the swappable amount but does
-         * not say where it goes; {@code loan_claim_action} does, and that path is not modelled here.
+         * ⚠ {@code repaymentReceipts} is true on this loan. {@code equity_sent_to_borrower} then
+         * demands a repayment-receipt NFT in the equity output — {@code quantity_of(value,
+         * repaymentPolicyId, hash_output_ref(loanRef)) == 1} — which this builder does not mint.
          * A named refusal beats a silent wrong build.
          */
-        EQUITY_NOT_MODELLED,
+        REPAYMENT_RECEIPTS_NOT_MODELLED,
+        /**
+         * The equity output is absent, short, or carries something the validator's DoS guard forbids.
+         */
+        EQUITY_OUTPUT_MISMATCH,
         /** The lender bond's datum did not survive a decode→re-encode, so it cannot be echoed. */
         BOND_DATUM_NOT_BYTE_IDENTICAL,
         /** The built order output is not what the plan said it must be. */
@@ -126,6 +131,8 @@ public class ConvertTransactionBuilder {
      *                     — the validator checks this exactly, including the LENDER's stake part
      * @param claim       the loan-claim redeemer's per-input data; its {@code lenderBondOutputIndex}
      *                    is filled in by the second pass, not by the caller
+     * @param repaymentReceipts the loan datum's own flag. True demands a receipt NFT in the equity
+     *                    output which this builder does not mint, so it is a named refusal
      */
     public record Request(Utxo loanUtxo,
                           Utxo bondUtxo,
@@ -139,6 +146,7 @@ public class ConvertTransactionBuilder {
                           ClaimData claim,
                           AssetType collateral,
                           AssetType lenderBondAsset,
+                          boolean repaymentReceipts,
                           String orderAddress,
                           String changeAddress,
                           long validFromSlot,
@@ -201,10 +209,10 @@ public class ConvertTransactionBuilder {
                     "the collateral leg has no usable oracle entry; loan_claim_action would refuse "
                             + "this transaction on chain and nothing here would have noticed");
         }
-        if (request.claim().equity().signum() != 0) {
-            throw refuse(Refusal.EQUITY_NOT_MODELLED,
-                    "borrower equity is " + request.claim().equity() + "; loan_claim_action constrains "
-                            + "where it goes and this builder does not model that yet");
+        if (request.repaymentReceipts()) {
+            throw refuse(Refusal.REPAYMENT_RECEIPTS_NOT_MODELLED,
+                    "this loan has repaymentReceipts = true, so equity_sent_to_borrower demands a "
+                            + "receipt NFT in the equity output that this builder does not mint");
         }
 
         List<TransactionInput> refInputs = referenceInputs(request);
@@ -262,7 +270,30 @@ public class ConvertTransactionBuilder {
         tx.payToContract(request.bondUtxo().getAddress(), List.copyOf(request.bondUtxo().getAmount()),
                 echoedBondDatum(request));
 
-        // 3+4. The two datum carriers. Their ADDRESSES ARE UNCONSTRAINED by the validator, so they are
+        // ⛔ 3. THE BORROWER'S EQUITY, when there is any. loan_claim_action's equity_sent_to_borrower
+        //    dictates every field of this output, and two of them are easy to get backwards:
+        //    the owner is the BORROWER's bond (not the lender's), and the asset is the COLLATERAL
+        //    (because this loan's equityInPrincipalCurrency is false — the convert action requires it).
+        //
+        //    ⚠ AND ITS VALUE MUST BE EXACT. The validator's DoS guard is
+        //    `length(flatten(value)) == 2 + receiptAssetCount`, so with receipts off this output may
+        //    hold ada and the equity token and NOTHING ELSE. One stray asset — a change adjustment,
+        //    a merged output — fails it on chain (CCL trap 17 territory, which this path already
+        //    fights because the bot's fee is a native token).
+        BigInteger equity = request.claim().equity();
+        if (equity.signum() > 0) {
+            tx.payToContract(assetManagerAddress(),
+                    List.of(Amount.lovelace(EQUITY_OUTPUT_LOVELACE),
+                            Amount.asset(request.collateral().toUnit(), equity)),
+                    LiquidationTxEncoder.assetManagerDatumWithToken(
+                            new com.fluidtokens.aquarium.offchain.model.loans.AssetManagerDatumWithToken(
+                                    request.loanUtxo().getTxHash(),
+                                    request.loanUtxo().getOutputIndex(),
+                                    LiquidationTxEncoder.PARTIAL_LIQUIDATION_ACTION_HEX,
+                                    borrowerBondAsset(request))));
+        }
+
+        // 4+5. The two datum carriers. Their ADDRESSES ARE UNCONSTRAINED by the validator, so they are
         //      paid to the bot — which is what makes their min-ada working capital rather than cost,
         //      and is an invariant ConvertEconomics rests on.
         tx.payToContract(request.changeAddress(), List.of(Amount.lovelace(BigInteger.ZERO)),
@@ -397,6 +428,53 @@ public class ConvertTransactionBuilder {
                     "the bond output's datum is not byte-identical to its input's, so equals_data fails");
         }
 
+        // ⛔ The equity output, when one was owed. Checked on the FINISHED body, because the exact-value
+        // guard is about what survives balancing rather than what we intended to emit.
+        BigInteger equity = request.claim().equity();
+        if (equity.signum() > 0) {
+            String amAddress = assetManagerAddress();
+            TransactionOutput equityOut = outs.stream()
+                    .filter(o -> amAddress.equals(o.getAddress()))
+                    .findFirst()
+                    .orElseThrow(() -> refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
+                            "the borrower is owed " + equity + " of equity and no output reaches the "
+                                    + "asset-manager credential"));
+            if (quantityOf(equityOut, request.collateral()).compareTo(equity) < 0) {
+                throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
+                        "the equity output holds %s of the collateral, the borrower is owed %s"
+                                .formatted(quantityOf(equityOut, request.collateral()), equity));
+            }
+            // ⛔ THE OWNER. equity_sent_to_borrower compares the whole datum with equals_data, and the
+            // ownerAsset is the BORROWER's bond. Substituting the lender's — the bond this builder
+            // already holds in hand, one field away — produces a perfectly well-formed output the
+            // borrower can never claim. Found by a mutant: swapping them killed no test until this
+            // check existed, because everything else about the output was still right.
+            PlutusData expectedDatum = LiquidationTxEncoder.assetManagerDatumWithToken(
+                    new com.fluidtokens.aquarium.offchain.model.loans.AssetManagerDatumWithToken(
+                            request.loanUtxo().getTxHash(), request.loanUtxo().getOutputIndex(),
+                            LiquidationTxEncoder.PARTIAL_LIQUIDATION_ACTION_HEX,
+                            borrowerBondAsset(request)));
+            if (equityOut.getInlineDatum() == null
+                    || !expectedDatum.serializeToHex()
+                            .equalsIgnoreCase(equityOut.getInlineDatum().serializeToHex())) {
+                throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
+                        "the equity output's datum is not the partial-liquidation compensation datum "
+                                + "owned by the BORROWER's bond, so equity_sent_to_borrower's "
+                                + "equals_data fails");
+            }
+
+            // ⚠ THE DoS GUARD, and the reason it is asserted rather than assumed: ada plus the equity
+            // token and NOTHING else. A change adjustment or a merged output adds an entry here and
+            // the validator refuses — on chain, after the fee is spent.
+            int entries = flattenedLength(equityOut);
+            if (entries != 2) {
+                throw refuse(Refusal.EQUITY_OUTPUT_MISMATCH,
+                        ("the equity output carries %d distinct assets; equity_sent_to_borrower's DoS "
+                                + "guard demands exactly 2 (ada and the equity token) when "
+                                + "repaymentReceipts is false").formatted(entries));
+            }
+        }
+
         // The order output: located by its datum, then checked for the value the plan dictates.
         TransactionOutput order = outs.stream()
                 .filter(o -> request.orderAddress().equals(o.getAddress()))
@@ -451,6 +529,33 @@ public class ConvertTransactionBuilder {
     }
 
     // ---- plumbing ---------------------------------------------------------------------------------
+
+    /**
+     * The ada this builder puts in the equity output. Comfortably over min-ada for an
+     * ada-plus-one-token output, and fixed rather than computed so the DoS guard's exact-value
+     * requirement is not at the mercy of a min-ada calculation that could round differently.
+     *
+     * <p>⚠ Counted as the bot's outlay by the same conservative rule §30 applies to the order's
+     * 2.8 ada: the loan input carries ada of its own and it is not yet measured how much of it
+     * {@code loan_claim_action} lets flow here. Wrong in the safe direction.
+     */
+    static final BigInteger EQUITY_OUTPUT_LOVELACE = BigInteger.valueOf(2_000_000L);
+
+    /** {@code Address(Script(assetManagerSpendScriptHash), None)} — the non-CIP-113 smart credential. */
+    private String assetManagerAddress() {
+        return AddressProvider.getEntAddress(
+                Credential.fromScript(HexUtil.decodeHexString(
+                        registry.getAssetManagerSpendScriptHash())), network).getAddress();
+    }
+
+    /**
+     * {@code Asset { borrowerBondPolicyId, loanId }} — the BORROWER's bond, which is what owns the
+     * equity escrow. Using the lender's would produce a well-formed output the borrower can never
+     * claim, and no validator here would object to the substitution.
+     */
+    private AssetType borrowerBondAsset(Request request) {
+        return new AssetType(registry.getBorrowerBondPolicyId(), request.claim().loanId());
+    }
 
     private List<Amount> orderValue(Request request) {
         List<Amount> amounts = new ArrayList<>();
@@ -537,6 +642,16 @@ public class ConvertTransactionBuilder {
         }
         throw refuse(Refusal.INDEX_MISMATCH,
                 "the first pass produced no output carrying the " + what + "'s datum");
+    }
+
+    /** {@code length(flatten(value))} — ada counts as one entry, each distinct token as one more. */
+    private static int flattenedLength(TransactionOutput out) {
+        int assets = out.getValue() == null || out.getValue().getMultiAssets() == null
+                ? 0
+                : out.getValue().getMultiAssets().stream().mapToInt(ma -> ma.getAssets().size()).sum();
+        boolean hasAda = out.getValue() != null && out.getValue().getCoin() != null
+                && out.getValue().getCoin().signum() > 0;
+        return assets + (hasAda ? 1 : 0);
     }
 
     private static BigInteger quantityOf(TransactionOutput out, AssetType asset) {
