@@ -1,77 +1,94 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
+import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
+import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import lombok.extern.slf4j.Slf4j;
 
 import java.math.BigInteger;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.List;
+import java.util.Objects;
 
 /**
- * ⛔ <b>How much principal the bot may ANTICIPATE on a pay-in-advance liquidation.</b>
+ * ⛔ <b>Per-market policy: may the bot act in this market, which transaction does it build, and how
+ * much principal may it front?</b>
  *
- * <p>Giovanni's spec, 2026-09-03: <i>"repayable amount (principal that can be anticipated) must be
- * min(balance, market cap) and only enabled if market is enabled."</i>
+ * <h2>Two independent questions, two fields — because neither implies the other</h2>
+ * {@code mode} is the market's <b>execution state</b> (DISABLED / SHADOW / LIVE); {@code action} is its
+ * <b>strategy</b> (CONVERT / ANTICIPATE). Shadowing an anticipate market and arming a convert one are
+ * both meaningful, so a shape that folded one into the other could not express what an operator needs.
+ * Giovanni's ruling of 2026-09-03 separated them explicitly.
  *
- * <h2>Why this gate exists on THIS path only</h2>
- * Pay-in-advance is the one action where <b>the bot fronts its own capital</b>: it deposits
- * {@code oracle_convert(collateral − equity − liquidationFee)} in the principal asset and takes the
- * collateral. A plain liquidation fronts nothing, and a convert liquidation fronts nothing either —
- * Minswap's batcher supplies the principal (findings §25). <b>So this is the only path with an
- * exposure to cap</b>, which is exactly the one Giovanni named as risky.
+ * <h2>⛔ The global mode is a CEILING, not a default</h2>
+ * <pre>effective(market) = min(loans.liquidation.mode, market.mode)   over DISABLED &lt; SHADOW &lt; LIVE</pre>
+ * A market may be MORE restrictive than the node, never less. Without this a per-market {@code LIVE}
+ * would let a node whose posture is {@code shadow} actually submit — making the node-level dial a lie,
+ * and that dial is what every operator and the whole submit-veto suite rely on. The clamp is announced
+ * at boot by {@code LiquidationConfiguration.validateMarkets()}, because an operator who wrote
+ * {@code LIVE} and got {@code SHADOW} has to be told.
  *
- * <h2>A market is keyed by its PRINCIPAL asset — the decision, with its reason</h2>
- * The cap bounds an amount the bot pays out, and that amount is denominated in the loan's principal
- * asset. Keying the market by that asset makes the cap's units self-evident: {@code lovelace:500000000}
- * is five hundred ada of ada-principal exposure and cannot be read as anything else. Keying by
- * collateral would have made the cap's unit differ from the thing it limits.
- * <b>The alternative worth knowing:</b> concentration risk actually lives in the collateral the bot
- * ends up HOLDING, so a collateral-keyed cap would bound a different and also-real exposure. Both are
- * defensible; this one matches the formula as stated, and the two can coexist later.
+ * <h2>An UNLISTED market is CONVERT at the node's own mode</h2>
+ * So an empty list means "convert everywhere, at whatever posture the node is in", and listing a market
+ * is how an operator <b>deviates</b>. In particular {@code loans.liquidation.mode: shadow} shadows every
+ * market with no list at all — which matters because shadow is convert's only mainnet rehearsal
+ * (findings §29.5): needing to enumerate markets first would make the rehearsal cost scale with the
+ * market count.
  *
- * <h2>⚠ min() is a GATE, not a clamp — because the amount is not ours to choose</h2>
- * The protocol fixes what must be deposited: {@code lm_liquidate_and_pay_in_advance_action} requires
- * the repayment output to hold at least {@code convertedLoanCollateralToPrincipalAmount}. <b>The bot
- * cannot front part of a loan.</b> So when the cap is below the required amount,
- * {@code min(required, cap) < required} and the only lawful response is to <b>refuse the
- * candidate</b> — never to build a smaller deposit, which the validator would reject after the fee
- * was spent. The formula is implemented exactly as stated and the refusal falls out of it.
+ * <h2>⚠ min() is a GATE on the cap, not a clamp — because the amount is not ours to choose</h2>
+ * Giovanni's spec: <i>"repayable amount (principal that can be anticipated) must be min(balance, market
+ * cap) and only enabled if market is enabled."</i> The protocol fixes what must be deposited:
+ * {@code lm_liquidate_and_pay_in_advance_action} requires the repayment output to hold at least
+ * {@code convertedLoanCollateralToPrincipalAmount}. <b>The bot cannot front part of a loan.</b> So when
+ * the cap is below the required amount, {@code min(required, cap) < required} and the only lawful
+ * response is to <b>refuse the candidate</b> — never to build a smaller deposit, which the validator
+ * would reject after the fee was spent.
  *
  * <p><b>The comparison is {@code >=}, on the validator's authority and not on preference.</b>
  * {@code validate_repayment_output} at {@code e0b818e} requires
  * {@code quantity_of(repaymentOutput.value, …) >= repaymentAmount}, so a deposit exactly equal to the
  * requirement is valid on chain. Giovanni's phrasing — <i>"the cap is higher than the principal
- * repayment due"</i> — reads as a strict {@code >}; a strict {@code >} would refuse a candidate
- * sitting exactly on the operator's own stated bound, which raises every cap by one lovelace without
- * saying so. ⚠ For the same reason {@code required} is
- * {@code convertedLoanCollateralToPrincipalAmount} and <b>not {@code remainingDebt}</b>: "the
- * principal repayment due" is the intuitive figure and the wrong one.
+ * repayment due"</i> — reads as a strict {@code >}; a strict {@code >} would refuse a candidate sitting
+ * exactly on the operator's own stated bound, which raises every cap by one lovelace without saying so.
+ * ⚠ For the same reason {@code required} is {@code convertedLoanCollateralToPrincipalAmount} and
+ * <b>not {@code remainingDebt}</b>: "the principal repayment due" is the intuitive figure and the wrong
+ * one.
  *
- * <h2>Configuration: one key, because two that can disagree are worse than one that cannot</h2>
- * <pre>
- *   loans.liquidation.markets: "lovelace:500000000,&lt;policyId&gt;&lt;assetName&gt;:1000000000"
- * </pre>
- * <b>Being listed IS being enabled</b>, and an entry carries its own cap — so a market cannot be
- * enabled without a cap, or capped without being enabled, and the two can never contradict.
- * <b>The default is empty, which disables every market</b>: a market the operator has not explicitly
- * turned on is off, per the standing defensive-defaults ruling. An explicit {@code asset:0} is a
- * documented disable — {@code min(required, 0) == 0}, so it refuses while recording the intent.
+ * <h2>A market is keyed by its PRINCIPAL asset</h2>
+ * The cap bounds an amount the bot pays out, denominated in the loan's principal asset, so keying by
+ * that asset makes the cap's units self-evident. <b>The alternative worth knowing:</b> concentration
+ * risk actually lives in the collateral the bot ends up HOLDING, so a collateral-keyed cap would bound a
+ * different and also-real exposure. Both are defensible; this one matches the formula as stated.
  */
 @Slf4j
 public final class MarketGate {
 
-    /** Why a pay-in-advance candidate was refused by this gate. */
+    /** Why a candidate was refused by this gate. */
     public enum Refusal {
-        /** The market is not listed, so it is disabled. The default state of every market. */
+        /** The market's effective mode is {@code DISABLED}: the bot does nothing here. */
         MARKET_DISABLED,
-        /** Listed, but the cap is below what the protocol requires the bot to front. */
+        /**
+         * The MARKET asked for {@code SHADOW} on a {@code LIVE} node. ⚠ <b>Temporary, and deliberately
+         * fail-closed:</b> until the executor grows its {@code MARKET_NOT_LIVE} submit veto there is no
+         * per-market build-then-stop path, so this refuses BEFORE the build rather than behaving as
+         * LIVE. A safety setting briefly loosened between stages is worse than one that arrives late.
+         *
+         * <p>⚑ It deliberately does NOT fire for a node-wide {@code SHADOW}: that already has a working
+         * build-then-veto path ({@code S1 MODE_NOT_LIVE}), and short-circuiting it here would destroy
+         * the existing shadow feature instead of protecting anything.
+         */
+        MARKET_SHADOW_NOT_YET_IMPLEMENTED,
+        /** The market's action is {@code CONVERT}, so pay-in-advance is not the chosen mechanism here. */
+        MARKET_ACTION_IS_CONVERT,
+        /** {@code ANTICIPATE}, but the cap is below what the protocol requires the bot to front. */
         ABOVE_MARKET_CAP
     }
 
     /**
      * @param anticipatable {@code min(required, cap)} — exactly the figure Giovanni specified
      * @param required      what the protocol demands be deposited; not ours to choose
-     * @param cap           the operator's stated cap, zero when the market is disabled
+     * @param cap           the operator's stated cap, zero when no cap governs
      * @param refusal       {@code null} when the candidate may proceed
      */
     public record Decision(BigInteger anticipatable, BigInteger required, BigInteger cap,
@@ -81,30 +98,76 @@ public final class MarketGate {
         }
     }
 
-    private final Map<String, BigInteger> capsByUnit;
+    private final List<Market> markets;
+    private final Mode globalMode;
 
-    public MarketGate(String configured) {
-        this.capsByUnit = parse(configured);
+    public MarketGate(AppConfig.LiquidationConfiguration configuration) {
+        this.markets = configuration == null || configuration.getMarkets() == null
+                ? List.of() : List.copyOf(configuration.getMarkets());
+        this.globalMode = configuration == null || configuration.getMode() == null
+                ? Mode.DISABLED : configuration.getMode();
     }
 
-    /** Visible for the operator-facing boot log: which markets are on, and for how much. */
-    public Map<String, BigInteger> caps() {
-        return Map.copyOf(capsByUnit);
+    /** The entry governing this asset, or {@code null} when the market is unlisted. */
+    public Market marketFor(AssetType principal) {
+        String unit = principal == null ? null : principal.toUnit();
+        if (unit == null) {
+            return null;
+        }
+        return markets.stream()
+                .filter(m -> m != null && unit.equalsIgnoreCase(m.getUnit()))
+                .findFirst().orElse(null);
+    }
+
+    /** {@code min(globalMode, market.mode)}; an unlisted market inherits the global mode outright. */
+    public Mode effectiveMode(AssetType principal) {
+        Market market = marketFor(principal);
+        Mode wanted = market == null || market.getMode() == null ? globalMode : market.getMode();
+        return wanted.ordinal() < globalMode.ordinal() ? wanted : globalMode;
+    }
+
+    /** The strategy for this market. Unlisted markets convert — Giovanni's default. */
+    public Action actionFor(AssetType principal) {
+        Market market = marketFor(principal);
+        return market == null || market.getAction() == null ? Action.CONVERT : market.getAction();
     }
 
     /**
+     * Decide a PAY-IN-ADVANCE candidate.
+     *
      * @param principal the loan's principal asset — the market
      * @param required  {@code convertedLoanCollateralToPrincipalAmount}: what must be fronted
      */
     public Decision decide(AssetType principal, BigInteger required) {
         String unit = principal == null ? null : principal.toUnit();
-        BigInteger cap = unit == null ? null : capsByUnit.get(unit);
+        Mode effective = effectiveMode(principal);
 
-        if (cap == null) {
-            return new Decision(BigInteger.ZERO, required, BigInteger.ZERO, Refusal.MARKET_DISABLED,
-                    "market " + unit + " is not listed in loans.liquidation.markets, so it is "
-                            + "disabled; anticipatable is 0 and no principal may be fronted");
+        if (effective == Mode.DISABLED) {
+            return refuse(Refusal.MARKET_DISABLED, required,
+                    "market " + unit + " is DISABLED (node mode " + globalMode + "), so the bot does "
+                            + "nothing in it");
         }
+        // ⛔ Only when the SHADOW came from the MARKET. A node-wide SHADOW already has a working
+        // build-then-veto path — the executor's S1 MODE_NOT_LIVE — and short-circuiting it here would
+        // destroy the existing shadow feature rather than protect anything. A market-level SHADOW on a
+        // LIVE node has no veto yet, and that is the case that must fail closed.
+        if (effective == Mode.SHADOW && globalMode == Mode.LIVE) {
+            return refuse(Refusal.MARKET_SHADOW_NOT_YET_IMPLEMENTED, required,
+                    "market " + unit + " is SHADOW on a LIVE node. The per-market build-then-veto path "
+                            + "is not wired yet, so this refuses rather than behaving as LIVE");
+        }
+
+        Action action = actionFor(principal);
+        if (action != Action.ANTICIPATE) {
+            return refuse(Refusal.MARKET_ACTION_IS_CONVERT, required,
+                    "market " + unit + " is action: " + action + ", so pay-in-advance is not the "
+                            + "mechanism here; set action: ANTICIPATE with a cap to force it");
+        }
+
+        // ANTICIPATE is validated at startup to carry a cap, so this cannot be null on a live node.
+        BigInteger cap = Objects.requireNonNull(marketFor(principal).getCap(),
+                "action: ANTICIPATE without a cap should have aborted startup");
+
         // min(balance, cap), exactly as specified.
         BigInteger anticipatable = required.min(cap);
         if (anticipatable.compareTo(required) < 0) {
@@ -117,36 +180,7 @@ public final class MarketGate {
                 "market " + unit + " allows " + required + " of " + cap);
     }
 
-    /** {@code unit:cap} pairs. A malformed entry is dropped loudly — never silently widened. */
-    private static Map<String, BigInteger> parse(String configured) {
-        Map<String, BigInteger> caps = new LinkedHashMap<>();
-        if (configured == null || configured.isBlank()) {
-            return caps;
-        }
-        for (String raw : configured.split(",")) {
-            String entry = raw.trim();
-            if (entry.isEmpty()) {
-                continue;
-            }
-            int at = entry.lastIndexOf(':');
-            if (at <= 0 || at == entry.length() - 1) {
-                log.warn("loans.liquidation.markets entry '{}' is not <unit>:<cap>; IGNORING it, so "
-                        + "that market stays DISABLED", entry);
-                continue;
-            }
-            try {
-                BigInteger cap = new BigInteger(entry.substring(at + 1).trim());
-                if (cap.signum() < 0) {
-                    log.warn("loans.liquidation.markets entry '{}' has a negative cap; IGNORING it, "
-                            + "so that market stays DISABLED", entry);
-                    continue;
-                }
-                caps.put(entry.substring(0, at).trim(), cap);
-            } catch (NumberFormatException e) {
-                log.warn("loans.liquidation.markets entry '{}' has an unparseable cap; IGNORING it, "
-                        + "so that market stays DISABLED", entry);
-            }
-        }
-        return caps;
+    private static Decision refuse(Refusal why, BigInteger required, String detail) {
+        return new Decision(BigInteger.ZERO, required, BigInteger.ZERO, why, detail);
     }
 }

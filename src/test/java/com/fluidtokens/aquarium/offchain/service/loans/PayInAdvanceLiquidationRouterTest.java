@@ -257,7 +257,8 @@ class PayInAdvanceLiquidationRouterTest {
         // ruling). A pay-in-advance test must therefore name the market it operates in, exactly
         // as an operator must — an ample ada cap, so the gate is satisfied and never the thing
         // under test here.
-        configuration.setMarketsForTest("lovelace:1000000000000");
+        configuration.setMarkets(java.util.List.of(
+                anticipateMarket("lovelace", 1_000_000_000_000L)));
         return configuration;
     }
 
@@ -466,5 +467,19 @@ class PayInAdvanceLiquidationRouterTest {
                         .anyMatch(i -> i.getTransactionId().equals(WALLET_UTXO.getTxHash())
                                 && i.getIndex() == WALLET_UTXO.getOutputIndex()),
                 "the utxo the selector returned is not among the transaction's inputs");
+    }
+
+    /**
+     * A market that permits pay-in-advance up to {@code cap}. Since 2026-09-03 a test that exercises
+     * that path must SAY which market it operates in and that the operator chose ANTICIPATE there —
+     * exactly what an operator must now do, and no longer inferable from a cap alone.
+     */
+    private static AppConfig.LiquidationConfiguration.Market anticipateMarket(String unit, long cap) {
+        var m = new AppConfig.LiquidationConfiguration.Market();
+        m.setUnit(unit);
+        m.setMode(AppConfig.LiquidationConfiguration.Mode.LIVE);
+        m.setAction(AppConfig.LiquidationConfiguration.Action.ANTICIPATE);
+        m.setCap(java.math.BigInteger.valueOf(cap));
+        return m;
     }
 }

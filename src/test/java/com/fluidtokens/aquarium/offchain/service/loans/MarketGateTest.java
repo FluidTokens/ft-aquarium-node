@@ -1,20 +1,26 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
+import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
+import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigInteger;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The anticipatable-principal rule, exactly as Giovanni specified it 2026-09-03:
- * <i>"min(balance, market cap) and only enabled if market is enabled."</i>
+ * Per-market policy: the execution state, the strategy, and the anticipatable-principal rule.
  *
- * <p>⚠ Note what the boundary cases are really testing: because the protocol fixes the amount to be
- * fronted, {@code min()} <b>gates</b> rather than clamps. A cap below the requirement does not buy a
+ * <p>⚠ Note what the cap's boundary cases are really testing: because the protocol fixes the amount to
+ * be fronted, {@code min()} <b>gates</b> rather than clamps. A cap below the requirement does not buy a
  * smaller liquidation — it buys a refusal.
  */
 class MarketGateTest {
@@ -27,108 +33,235 @@ class MarketGateTest {
         return BigInteger.valueOf(v);
     }
 
-    /** ⛔ THE DEFAULT. Nothing configured ⇒ every market disabled ⇒ zero anticipatable. */
-    @Test
-    void anUnlistedMarketIsDisabledAndAnticipatesNothing() {
-        for (String configured : new String[] {null, "", "   "}) {
-            MarketGate.Decision d = new MarketGate(configured).decide(ADA, n(1_000_000));
-            assertFalse(d.allowed(), "configured=" + configured);
-            assertEquals(MarketGate.Refusal.MARKET_DISABLED, d.refusal());
-            assertEquals(BigInteger.ZERO, d.anticipatable(),
-                    "a disabled market must anticipate ZERO, not 'whatever was asked'");
-        }
+    private static Market market(String unit, Mode mode, Action action, Long cap) {
+        Market m = new Market();
+        m.setUnit(unit);
+        m.setMode(mode);
+        m.setAction(action);
+        m.setCap(cap == null ? null : BigInteger.valueOf(cap));
+        return m;
     }
 
-    /** A listed market that does not cover this candidate is still a refusal, not a partial. */
+    /** A node at the given global mode with the given market list. */
+    private static AppConfig.LiquidationConfiguration node(Mode global, Market... markets) {
+        var cfg = new AppConfig.LiquidationConfiguration();
+        ReflectionTestUtils.setField(cfg, "mode", global);
+        cfg.setMarkets(List.of(markets));
+        return cfg;
+    }
+
+    private static MarketGate gate(Mode global, Market... markets) {
+        return new MarketGate(node(global, markets));
+    }
+
+    // ---- the unlisted market ---------------------------------------------------------------------
+
+    /**
+     * ⛔ THE DEFAULT, and it is the opposite of the previous design's. An unlisted market is
+     * {@code CONVERT} at the node's own mode — so pay-in-advance is refused, but not because the market
+     * is off: because convert is the chosen mechanism there.
+     */
     @Test
-    void aMarketListedButTooSmallRefusesRatherThanReducing() {
-        MarketGate.Decision d = new MarketGate("lovelace:500000000").decide(ADA, n(500_000_001));
+    void anUnlistedMarketConvertsAtTheNodeModeAndSoRefusesPayInAdvance() {
+        MarketGate g = gate(Mode.LIVE);
+
+        assertEquals(Mode.LIVE, g.effectiveMode(ADA), "an unlisted market inherits the node's posture");
+        assertEquals(Action.CONVERT, g.actionFor(ADA));
+
+        MarketGate.Decision d = g.decide(ADA, n(1_000_000));
+        assertFalse(d.allowed());
+        assertEquals(MarketGate.Refusal.MARKET_ACTION_IS_CONVERT, d.refusal());
+    }
+
+    /**
+     * ⚑ And the reason that default is safe to ship: putting the NODE in shadow shadows every market
+     * with no list at all. If an unlisted market could not shadow, the operator would have to enumerate
+     * every market before rehearsing — and shadow is convert's only mainnet rehearsal.
+     */
+    @Test
+    void aNodeInShadowShadowsEveryUnlistedMarket() {
+        assertEquals(Mode.SHADOW, gate(Mode.SHADOW).effectiveMode(ADA));
+        assertEquals(Mode.SHADOW, gate(Mode.SHADOW).effectiveMode(TOKEN));
+        assertEquals(Mode.DISABLED, gate(Mode.DISABLED).effectiveMode(ADA));
+    }
+
+    // ---- the ceiling ------------------------------------------------------------------------------
+
+    /**
+     * ⛔ THE LOAD-BEARING SAFETY RULE: the node mode is a CEILING, not a default. A market may be more
+     * restrictive than the node and never less — otherwise a per-market {@code LIVE} would let a node
+     * whose posture is {@code shadow} submit, and the node-level dial would be a lie.
+     */
+    @Test
+    void aMarketCanBeMoreRestrictiveThanTheNodeButNeverLess() {
+        // Market wants LIVE, node says SHADOW -> clamped DOWN to SHADOW.
+        assertEquals(Mode.SHADOW,
+                gate(Mode.SHADOW, market("lovelace", Mode.LIVE, Action.CONVERT, null)).effectiveMode(ADA));
+        // Market wants LIVE, node says DISABLED -> clamped all the way DOWN.
+        assertEquals(Mode.DISABLED,
+                gate(Mode.DISABLED, market("lovelace", Mode.LIVE, Action.CONVERT, null)).effectiveMode(ADA));
+        // Market wants SHADOW on a LIVE node -> honoured, because it is MORE restrictive.
+        assertEquals(Mode.SHADOW,
+                gate(Mode.LIVE, market("lovelace", Mode.SHADOW, Action.CONVERT, null)).effectiveMode(ADA));
+        // Market wants DISABLED on a LIVE node -> honoured.
+        assertEquals(Mode.DISABLED,
+                gate(Mode.LIVE, market("lovelace", Mode.DISABLED, Action.CONVERT, null)).effectiveMode(ADA));
+        // No market mode -> inherit.
+        assertEquals(Mode.LIVE,
+                gate(Mode.LIVE, market("lovelace", null, Action.CONVERT, null)).effectiveMode(ADA));
+    }
+
+    @Test
+    void aDisabledMarketRefusesBeforeAnythingElse() {
+        MarketGate.Decision d = gate(Mode.LIVE, market("lovelace", Mode.DISABLED, Action.ANTICIPATE, 1_000L))
+                .decide(ADA, n(1));
+
+        assertFalse(d.allowed());
+        assertEquals(MarketGate.Refusal.MARKET_DISABLED, d.refusal());
+        assertEquals(BigInteger.ZERO, d.anticipatable());
+    }
+
+    /**
+     * ⚠ Fail-closed between stages. Until the executor grows its {@code MARKET_NOT_LIVE} submit veto a
+     * shadow market has no way to build-then-stop, so it refuses rather than behaving as LIVE. A safety
+     * setting that is briefly loosened between stages is worse than one that arrives late.
+     */
+    @Test
+    void aShadowMarketOnALiveNodeRefusesRatherThanBehavingAsLive() {
+        MarketGate.Decision d = gate(Mode.LIVE, market("lovelace", Mode.SHADOW, Action.ANTICIPATE, 1_000L))
+                .decide(ADA, n(1));
+
+        assertFalse(d.allowed(), "shadow must never fall through to a submittable path");
+        assertEquals(MarketGate.Refusal.MARKET_SHADOW_NOT_YET_IMPLEMENTED, d.refusal());
+    }
+
+    /**
+     * ⛔ AND THE OTHER HALF, which is what keeps the existing feature alive: a NODE-WIDE shadow must
+     * still BUILD. It already has a working build-then-veto path in the executor ({@code S1
+     * MODE_NOT_LIVE}), and refusing here would delete global shadow mode rather than protect anything —
+     * a fail-closed guard that destroys the feature it guards is not fail-closed, it is broken.
+     */
+    @Test
+    void aNodeWideShadowStillBuildsBecauseTheExecutorAlreadyVetoesIt() {
+        MarketGate.Decision d = gate(Mode.SHADOW, market("lovelace", null, Action.ANTICIPATE, 1_000L))
+                .decide(ADA, n(1));
+
+        assertTrue(d.allowed(), "the S1 veto, not this gate, is what stops a node-wide shadow");
+        assertEquals(Mode.SHADOW, gate(Mode.SHADOW).effectiveMode(ADA));
+    }
+
+    // ---- the action -------------------------------------------------------------------------------
+
+    /** Pay-in-advance is reachable ONLY through an explicit {@code action: ANTICIPATE}. */
+    @Test
+    void payInAdvanceNeedsTheMarketToSayAnticipateExplicitly() {
+        assertEquals(MarketGate.Refusal.MARKET_ACTION_IS_CONVERT,
+                gate(Mode.LIVE, market("lovelace", Mode.LIVE, Action.CONVERT, 1_000L))
+                        .decide(ADA, n(1)).refusal(),
+                "a cap alone must NOT select anticipate — that is the positional inference the object "
+                        + "shape exists to kill");
+
+        assertTrue(gate(Mode.LIVE, market("lovelace", Mode.LIVE, Action.ANTICIPATE, 1_000L))
+                .decide(ADA, n(1)).allowed());
+    }
+
+    // ---- the cap ----------------------------------------------------------------------------------
+
+    @Test
+    void aCapBelowTheRequirementRefusesRatherThanReducing() {
+        MarketGate.Decision d = gate(Mode.LIVE, market("lovelace", Mode.LIVE, Action.ANTICIPATE, 500_000_000L))
+                .decide(ADA, n(500_000_001));
 
         assertFalse(d.allowed());
         assertEquals(MarketGate.Refusal.ABOVE_MARKET_CAP, d.refusal());
         assertEquals(n(500_000_000), d.anticipatable(), "min(required, cap) is the cap here");
-        assertEquals(n(500_000_001), d.required(),
-                "and the REQUIRED figure is still reported, or the operator cannot see by how much");
+        assertEquals(n(500_000_001), d.required());
     }
 
     /**
-     * ⛔ THE BOUNDARY, both directions — one lovelace either side of the cap.
+     * ⛔ THE BOUNDARY, both directions.
      *
      * <p><b>Inclusive, and that is the validator's answer rather than a preference.</b> Giovanni's
-     * wording on 2026-09-03 was <i>"the cap is higher than the principal repayment due"</i>, which
-     * reads as a strict {@code >}. Read at the deployed sha {@code e0b818e},
+     * wording was <i>"the cap is higher than the principal repayment due"</i>, which reads as a strict
+     * {@code >}. Read at the deployed sha {@code e0b818e},
      * {@code lm_liquidate_and_pay_in_advance_action.ak}'s {@code validate_repayment_output} requires
      * <pre>quantity_of(repaymentOutput.value, …) >= repaymentAmount</pre>
      * so a deposit exactly equal to the requirement is <b>valid on chain</b>. A strict {@code >} here
-     * would refuse a candidate sitting exactly on the operator's stated bound — silently raising
-     * every cap by one lovelace, the same defect a strict profit floor has.
+     * would refuse a candidate sitting exactly on the operator's stated bound — silently raising every
+     * cap by one lovelace, the same defect a strict profit floor has.
      *
      * <p>⚠ And the figure the cap is compared against is
      * {@code convertedLoanCollateralToPrincipalAmount}, <b>not {@code remainingDebt}</b> — "the
-     * principal repayment due" is loose for the same reason. {@code PayInAdvanceLiquidationRouter}
-     * already feeds the validator's figure; this test names it so the two never drift apart.
+     * principal repayment due" is loose for the same reason.
      */
     @Test
     void theBoundaryIsInclusiveOnTheCap() {
-        MarketGate gate = new MarketGate("lovelace:500000000");
+        MarketGate g = gate(Mode.LIVE, market("lovelace", Mode.LIVE, Action.ANTICIPATE, 500_000_000L));
 
-        MarketGate.Decision exactly = gate.decide(ADA, n(500_000_000));
+        MarketGate.Decision exactly = g.decide(ADA, n(500_000_000));
         assertTrue(exactly.allowed(), "required == cap must be ALLOWED; min() returns the requirement");
         assertEquals(n(500_000_000), exactly.anticipatable());
 
-        assertTrue(gate.decide(ADA, n(499_999_999)).allowed(), "one under the cap");
-        assertFalse(gate.decide(ADA, n(500_000_001)).allowed(), "one over the cap");
+        assertTrue(g.decide(ADA, n(499_999_999)).allowed(), "one under the cap");
+        assertFalse(g.decide(ADA, n(500_000_001)).allowed(), "one over the cap");
     }
 
-    /** An explicit zero is a documented disable: min(required, 0) == 0. */
+    /** An explicit zero cap is a documented disable: min(required, 0) == 0. */
     @Test
     void anExplicitZeroCapIsADocumentedDisable() {
-        MarketGate.Decision d = new MarketGate("lovelace:0").decide(ADA, n(1));
+        MarketGate.Decision d = gate(Mode.LIVE, market("lovelace", Mode.LIVE, Action.ANTICIPATE, 0L))
+                .decide(ADA, n(1));
+
         assertFalse(d.allowed());
         assertEquals(BigInteger.ZERO, d.anticipatable());
+        assertEquals(MarketGate.Refusal.ABOVE_MARKET_CAP, d.refusal());
     }
 
-    /** Markets are independent: enabling one must not enable another. */
+    /** Markets are independent, and a token market keys on the full unit. */
     @Test
-    void enablingOneMarketDoesNotEnableAnother() {
-        MarketGate gate = new MarketGate("lovelace:500000000");
+    void marketsAreIndependentAndKeyOnTheFullUnit() {
+        MarketGate g = gate(Mode.LIVE,
+                market("lovelace", Mode.LIVE, Action.ANTICIPATE, 1_000L),
+                market(TOKEN.toUnit(), Mode.LIVE, Action.ANTICIPATE, 900L));
 
-        assertTrue(gate.decide(ADA, n(1_000)).allowed());
-        assertFalse(gate.decide(TOKEN, n(1_000)).allowed(),
-                "a token market nobody listed must stay disabled");
-        assertEquals(MarketGate.Refusal.MARKET_DISABLED, gate.decide(TOKEN, n(1_000)).refusal());
+        assertTrue(g.decide(ADA, n(1_000)).allowed());
+        assertFalse(g.decide(ADA, n(1_001)).allowed());
+        assertTrue(g.decide(TOKEN, n(900)).allowed());
+        assertFalse(g.decide(TOKEN, n(901)).allowed(), "each market carries its own cap");
     }
 
-    /** A token market keys on its full unit, so two assets of one policy are separate markets. */
-    @Test
-    void aTokenMarketKeysOnTheFullUnit() {
-        MarketGate gate = new MarketGate(TOKEN.toUnit() + ":900");
-
-        assertTrue(gate.decide(TOKEN, n(900)).allowed());
-        assertFalse(gate.decide(TOKEN, n(901)).allowed());
-        assertFalse(gate.decide(ADA, n(1)).allowed(), "ada was never listed");
-    }
+    // ---- startup validation ------------------------------------------------------------------------
 
     /**
-     * ⚠ A malformed entry must leave its market DISABLED — never widen anything. A parser that
-     * shrugged and continued could turn a typo into an uncapped market.
+     * ⛔ A broken entry ABORTS STARTUP, which the delimited-string form could not do. With named fields
+     * every failure is unambiguous, so quietly disabling the market would hide an operator's error
+     * rather than protect them from it.
      */
     @Test
-    void malformedEntriesLeaveTheirMarketDisabled() {
-        for (String bad : new String[] {"lovelace", "lovelace:", ":500", "lovelace:abc", "lovelace:-1"}) {
-            MarketGate.Decision d = new MarketGate(bad).decide(ADA, n(1));
-            assertFalse(d.allowed(), "entry '" + bad + "' must not enable anything");
-            assertEquals(MarketGate.Refusal.MARKET_DISABLED, d.refusal());
-        }
+    void aMalformedMarketAbortsStartupRatherThanResolvingToSomethingSafeLooking() {
+        assertThrows(IllegalStateException.class,
+                () -> node(Mode.LIVE, market(null, Mode.LIVE, Action.CONVERT, null)).validateMarkets(),
+                "no unit");
+        assertThrows(IllegalStateException.class,
+                () -> node(Mode.LIVE, market("not-a-unit", Mode.LIVE, Action.CONVERT, null)).validateMarkets(),
+                "a unit that is neither lovelace nor a hex unit");
+        assertThrows(IllegalStateException.class,
+                () -> node(Mode.LIVE, market("lovelace", Mode.LIVE, Action.ANTICIPATE, null)).validateMarkets(),
+                "ANTICIPATE with no cap is unbounded exposure");
+        assertThrows(IllegalStateException.class,
+                () -> node(Mode.LIVE, market("lovelace", Mode.LIVE, Action.ANTICIPATE, -1L)).validateMarkets(),
+                "a negative cap");
+        assertThrows(IllegalStateException.class,
+                () -> node(Mode.LIVE, market("lovelace", Mode.LIVE, Action.CONVERT, null),
+                        market("lovelace", Mode.LIVE, Action.ANTICIPATE, 5L)).validateMarkets(),
+                "a duplicate unit: two entries for one market cannot both apply");
     }
 
-    /** A good entry beside a bad one still works — one typo must not disable the whole config. */
     @Test
-    void aBadEntryDoesNotTakeTheGoodOnesWithIt() {
-        MarketGate gate = new MarketGate("lovelace:500000000, nonsense, " + TOKEN.toUnit() + ":900");
-
-        assertTrue(gate.decide(ADA, n(1_000)).allowed());
-        assertTrue(gate.decide(TOKEN, n(900)).allowed());
-        assertEquals(2, gate.caps().size());
+    void aWellFormedListValidatesAndAnEmptyOneIsLegal() {
+        node(Mode.LIVE).validateMarkets();
+        node(Mode.LIVE,
+                market("lovelace", Mode.SHADOW, Action.CONVERT, null),
+                market(TOKEN.toUnit(), Mode.LIVE, Action.ANTICIPATE, 1_000L)).validateMarkets();
     }
 }

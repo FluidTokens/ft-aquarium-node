@@ -96,12 +96,12 @@ public class PayInAdvanceLiquidationRouter {
     private final LiquidatePayInAdvanceTransactionBuilder builder;
 
     /**
-     * Parsed lazily from the configured string so a test can drive the router without a Spring
+     * Built lazily from the configuration object so a test can drive the router without a Spring
      * context, and rebuilt per call rather than cached — the configuration object is the single
      * source of truth and nothing here should be able to hold a staler copy of it than it does.
      */
     private MarketGate marketGate() {
-        return new MarketGate(configuration == null ? null : configuration.getMarkets());
+        return new MarketGate(configuration);
     }
 
     public PayInAdvanceLiquidationRouter(LoansContractRegistry registry,

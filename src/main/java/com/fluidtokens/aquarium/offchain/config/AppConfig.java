@@ -2,23 +2,30 @@ package com.fluidtokens.aquarium.offchain.config;
 
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.cardanofoundation.conversions.ClasspathConversionsFactory;
 import org.cardanofoundation.conversions.domain.NetworkType;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.stereotype.Component;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
 
 @Configuration
 @EnableScheduling
@@ -182,6 +189,7 @@ public class AppConfig {
     @Component
     @Getter
     @NoArgsConstructor
+    @ConfigurationProperties(prefix = "loans.liquidation")
     @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public static class LiquidationConfiguration {
 
@@ -308,33 +316,177 @@ public class AppConfig {
         private boolean ignoreProfitCheck;
 
         /**
-         * Which markets the bot may ANTICIPATE principal in, and up to how much, as
-         * {@code <unit>:<cap>} pairs — e.g. {@code lovelace:500000000}.
+         * ⛔ <b>Per-market policy: which markets the bot acts in, how, and under what execution
+         * state.</b> An object list, not a delimited string — every attribute is NAMED, so nothing is
+         * positional and nothing is inferred from another field's presence.
          *
-         * <p>Applies to the <b>pay-in-advance</b> path only: it is the one action where the bot fronts
-         * its own capital. A plain liquidation fronts nothing, and a convert liquidation is funded by
-         * Minswap's batcher (findings §25).
+         * <pre>
+         * loans:
+         *   liquidation:
+         *     markets:
+         *       - unit: lovelace          # "lovelace", or policyIdHex + assetNameHex
+         *         mode: SHADOW            # DISABLED | SHADOW | LIVE; omitted = inherit the global mode
+         *         action: CONVERT         # CONVERT | ANTICIPATE; default CONVERT
+         *         cap: 1000000000         # MANDATORY iff action: ANTICIPATE, meaningless otherwise
+         * </pre>
          *
-         * <p><b>Being listed IS being enabled</b>, and an entry carries its own cap, so a market
-         * cannot be enabled without a cap or capped without being enabled — one value that cannot
-         * contradict itself, rather than two that can. <b>Empty (the default) disables every
-         * market.</b> {@code <unit>:0} is a documented explicit disable.
+         * <p><b>An UNLISTED market is {@code action: CONVERT} at the global mode.</b> An absent or
+         * empty list therefore means "convert everywhere, at whatever posture the node is in", and
+         * listing a market is how an operator <em>deviates</em>. That is Giovanni's ruling of
+         * 2026-09-03: convert fronts no capital and its failure mode is a no-op (findings §28.3), so it
+         * is the safe default; the capital-hungry pay-in-advance path stays opt-in and still needs an
+         * explicit entry naming both {@code ANTICIPATE} and a cap.
          *
-         * <p>See {@code MarketGate} for the anticipatable-principal rule and why min() is a gate.
+         * <p>⚠ <b>A YAML list is not one environment variable.</b> Operators driving this through
+         * {@code docker/.env} need indexed names — {@code LOANS_LIQUIDATION_MARKETS_0_UNIT},
+         * {@code LOANS_LIQUIDATION_MARKETS_0_MODE}, … — or a mounted YAML fragment. That is the cost of
+         * named fields and it is worth it; see {@code docs/} for the operator-facing form.
+         *
+         * <p>Bound by {@code @ConfigurationProperties} rather than {@code @Value}, which cannot bind a
+         * list of objects at all. {@link #validateMarkets()} aborts startup on a malformed entry.
          */
-        @Value("${loans.liquidation.markets:}")
-        private String markets;
+        private List<Market> markets = new ArrayList<>();
+
+        /** Setter for {@code @ConfigurationProperties} binding, and the test seam. */
+        public void setMarkets(List<Market> markets) {
+            this.markets = markets == null ? new ArrayList<>() : markets;
+        }
 
         /**
-         * Test seam. {@code @Value} owns this in production.
-         *
-         * <p>⚠ Deliberately NOT a constructor parameter: the default must stay <b>disabled</b>, and
-         * threading it through four overloads would let a call site pass it by position and silently
-         * enable a market it never meant to. A test that exercises pay-in-advance must SAY which
-         * market it operates in — which is exactly what an operator must now do.
+         * One market's policy. Deliberately a mutable bean rather than a record: Spring Boot's relaxed
+         * binder fills it by setter, which is what makes {@code LOANS_LIQUIDATION_MARKETS_0_UNIT} work.
          */
-        public void setMarketsForTest(String markets) {
-            this.markets = markets;
+        @Getter
+        @Setter
+        @NoArgsConstructor
+        public static class Market {
+
+            /** {@code "lovelace"}, or {@code policyIdHex + assetNameHex}. */
+            private String unit;
+
+            /**
+             * The market's EXECUTION STATE, not its strategy. {@code null} means "inherit the node's
+             * {@code loans.liquidation.mode}", which is why an unlisted market needs no entry to
+             * shadow: putting the node in {@code shadow} shadows every market at once.
+             *
+             * <p>⛔ <b>The global mode is a CEILING.</b> The effective state is
+             * {@code min(globalMode, this)} over the declared order {@code DISABLED < SHADOW < LIVE},
+             * so a market may be MORE restrictive than the node but never less. Without that rule a
+             * per-market {@code LIVE} would let a node whose posture is {@code shadow} submit, which
+             * would make the node-level dial a lie.
+             */
+            private Mode mode;
+
+            /** The strategy. Never inferred from {@link #cap} — that would be positional guessing. */
+            private Action action = Action.CONVERT;
+
+            /**
+             * The most principal the bot may front in this market, in the principal asset's own unit.
+             * Mandatory when {@link #action} is {@link Action#ANTICIPATE}, meaningless otherwise.
+             */
+            private BigInteger cap;
+        }
+
+        /**
+         * Which transaction this market's liquidations build. It partitions only the loans whose lender
+         * bond carries {@code shouldLiquidationConvertToPrincipal == True}: a bond that forbids
+         * conversion is plain {@code Liquidate} whatever the market says (findings §27).
+         */
+        public enum Action {
+            /**
+             * Route the collateral through Minswap. The bot fronts nothing. The default, and the right
+             * one wherever a pool can reliably deliver {@code remainingDebt}.
+             */
+            CONVERT,
+            /**
+             * Front the principal from the bot's own wallet. FluidTokens' guidance (2026-09-03): this is
+             * for <b>tokens with no reliable Minswap pool</b>, because the order must always deliver at
+             * least the minimum the lender expects. Pool reliability is the operator's judgement — the
+             * bot does not detect it.
+             */
+            ANTICIPATE
+        }
+
+        /**
+         * ⛔ Abort startup on a market entry that cannot mean anything, rather than resolving it to a
+         * safe-looking default.
+         *
+         * <p>This is only defensible because the fields are NAMED. Under the previous delimited-string
+         * form a half-parsed token could not be told from a typo, so the only safe response was to
+         * disable that market quietly. Here every failure is unambiguous — a missing cap on an
+         * {@code ANTICIPATE} market, a unit that is neither {@code lovelace} nor a well-formed hex unit,
+         * a duplicate — and the same fail-fast that {@link #parseMode()} applies is the honest response.
+         *
+         * <p>Gated behind {@code loans.enabled} with the rest of this class, so a typo can never refuse
+         * to start a production node that does not run the bot.
+         */
+        public void validateMarkets() {
+            Set<String> seen = new LinkedHashSet<>();
+            for (int i = 0; i < markets.size(); i++) {
+                Market m = markets.get(i);
+                String where = "loans.liquidation.markets[" + i + "]";
+                if (m == null || m.getUnit() == null || m.getUnit().isBlank()) {
+                    throw new IllegalStateException(where + " has no unit");
+                }
+                String unit = m.getUnit().trim();
+                if (!isWellFormedUnit(unit)) {
+                    throw new IllegalStateException(where + " unit '" + unit + "' is neither "
+                            + "\"lovelace\" nor a policy id (56 hex chars) followed by a hex asset name");
+                }
+                if (!seen.add(unit)) {
+                    throw new IllegalStateException(where + " repeats unit '" + unit + "'; two entries "
+                            + "for one market cannot both apply and the later one would win silently");
+                }
+                if (m.getAction() == null) {
+                    throw new IllegalStateException(where + " has an empty action; legal values are "
+                            + Arrays.toString(Action.values()));
+                }
+                if (m.getAction() == Action.ANTICIPATE) {
+                    if (m.getCap() == null) {
+                        throw new IllegalStateException(where + " is action: ANTICIPATE and has no cap. "
+                                + "The cap bounds the principal the bot fronts from its own wallet; "
+                                + "anticipating without one is unbounded exposure");
+                    }
+                    if (m.getCap().signum() < 0) {
+                        throw new IllegalStateException(where + " has a negative cap (" + m.getCap() + ")");
+                    }
+                }
+                if (m.getAction() == Action.CONVERT && m.getCap() != null) {
+                    log.warn("{} is action: CONVERT and also sets cap {} — convert fronts no principal, "
+                            + "so the cap governs nothing here and is IGNORED", where, m.getCap());
+                }
+            }
+            log.info("INIT - liquidation markets: {} listed; every unlisted market is action: CONVERT at "
+                    + "the node mode ({})", markets.size(), mode);
+            for (Market m : markets) {
+                log.info("INIT - market {}: mode={} (effective {}), action={}, cap={}", m.getUnit(),
+                        m.getMode() == null ? "inherit" : m.getMode(), effectiveMode(m), m.getAction(),
+                        m.getCap());
+                if (m.getMode() == Mode.LIVE && effectiveMode(m) != Mode.LIVE) {
+                    log.warn("⛔ market {} asks for LIVE but the node mode is {} — it will run as {}. "
+                            + "The node mode is a CEILING: no market can be less restrictive than the "
+                            + "node.", m.getUnit(), mode, effectiveMode(m));
+                }
+            }
+        }
+
+        /**
+         * {@code min(globalMode, market.mode)} over {@code DISABLED < SHADOW < LIVE} — the declared
+         * order of {@link Mode}, which is why this is an ordinal comparison rather than a table.
+         */
+        public Mode effectiveMode(Market market) {
+            Mode global = mode == null ? Mode.DISABLED : mode;
+            Mode wanted = market == null || market.getMode() == null ? global : market.getMode();
+            return wanted.ordinal() < global.ordinal() ? wanted : global;
+        }
+
+        /** {@code "lovelace"}, or 56 hex chars of policy id plus an even number of hex asset-name chars. */
+        private static boolean isWellFormedUnit(String unit) {
+            if (AssetType.LOVELACE.equalsIgnoreCase(unit)) {
+                return true;
+            }
+            return unit.length() >= 56 && unit.length() % 2 == 0
+                    && unit.chars().allMatch(c -> Character.digit(c, 16) >= 0);
         }
 
         @Value("${loans.liquidation.decision-log-size:200}")
@@ -463,6 +615,7 @@ public class AppConfig {
         @PostConstruct
         void init() {
             parseMode();
+            validateMarkets();
             parseReferenceScripts();
         }
 
