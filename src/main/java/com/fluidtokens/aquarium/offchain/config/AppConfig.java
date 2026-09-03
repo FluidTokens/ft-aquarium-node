@@ -167,6 +167,35 @@ public class AppConfig {
         @Value("${loans.smart-tokens-spend-script-hash:}")
         private String smartTokensSpendScriptHash;
 
+        /**
+         * ⛔ The three Minswap V2 coordinates that parameterise
+         * {@code lm_liquidate_and_convert_action} — the LAST underivable field in the deployment
+         * (findings §25.1). Defaults are FluidTokens' <b>mainnet</b> parameterisation, quoted
+         * first-hand and verified: applied to the vendored blueprint they derive
+         * {@code ed8d41e4…}, exactly what the mainnet LMConfigDatum publishes at field 5.
+         *
+         * <p>⚠ <b>They are network-specific and preview's are NOT these.</b> Substituting preview's
+         * loans coordinates while keeping these yields {@code 52b778c8…} against a published
+         * {@code aa3628d8…}, so preview is parameterised for a Minswap deployment we cannot identify
+         * — and none exists on preview anyway (§28.1). A node whose derived hash does not match what
+         * its own LMConfigDatum publishes simply <b>cannot convert</b>; that is reported, not fatal,
+         * because every other path on that node is unaffected.
+         *
+         * <p>The two {@code *WithdrawScriptHash} parameters the validator also takes are the empty
+         * string on both networks — Minswap V2's pool and order validators are plain PlutusV2 with no
+         * withdraw half, so empty selects the non-CIP-113 branch (§25.4). They are constants here
+         * rather than keys: "unset" and "this credential family has no withdraw script" are different
+         * statements, and only the second is true.
+         */
+        @Value("${loans.minswap.pool-policy-id:f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c}")
+        private String minswapPoolPolicyId = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+
+        @Value("${loans.minswap.pool-spend-script-hash:ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b}")
+        private String minswapPoolSpendScriptHash = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+
+        @Value("${loans.minswap.order-spend-script-hash:c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c}")
+        private String minswapOrderSpendScriptHash = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
+
         /** The tx that minted both config NFTs; the point history has to be indexed from. */
         @Value("${loans.config.ref-utxo-tx-hash:}")
         private String configRefUtxoTxHash;

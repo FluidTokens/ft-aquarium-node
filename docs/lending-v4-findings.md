@@ -3331,3 +3331,61 @@ the test was rewritten)**. Suite **102 files, 862 tests, 38 failures, 22 skipped
 byte-echoed lender bond under `equals_data`, trap-17 token change, the two self-addressed carriers, and
 **a real evaluator from the first commit** with ex-units asserted off the built, deserialised
 transaction. Then C, the dry-eval against these fixtures. Then the operator docs.
+
+---
+
+## 36. The last underivable field, derived — and convert availability becomes a reported fact (2026-09-03)
+
+Builder sub-stage B1.5, a prerequisite the assembly could not proceed without: **the registry could not
+derive `lm_liquidate_and_convert_action`**, so no builder could withdraw through it.
+
+`LoansConfigVerifier` carried, since the beginning: *"Field 5 … is deliberately unchecked: it takes
+five Minswap parameters we do not have."* We have them. The three Minswap coordinates are now
+configuration (`loans.minswap.*`), defaulted to FluidTokens' **verified mainnet** parameterisation, and
+applied to the vendored blueprint they derive `ed8d41e4…` — **exactly what the mainnet LMConfigDatum
+publishes at field 5**. Every credential in the deployment is now knowable from the artefact we ship.
+
+The two `*WithdrawScriptHash` parameters stay **constants, not keys**: Minswap V2's pool and order
+validators are plain PlutusV2 with no withdraw half, so the empty string selects the non-CIP-113 branch
+(§25.4). *"Unset" and "this credential family has no withdraw script" are different statements*, and
+only the second is true — a key would let an operator express the first.
+
+### 36.1 ⛔ The one derived hash that may legitimately disagree with the chain
+
+Every other hash this registry derives is a function of the deployment alone, so a mismatch is a bug.
+**This one is not.** The Minswap coordinates are **network-specific**: a node configured with mainnet's
+while running elsewhere derives a real, well-formed hash **for the wrong deployment**. Measured, and
+pinned in the test: preview's loans coordinates with mainnet's Minswap yield `52b778c8…` against a
+published `aa3628d8…`.
+
+**⇒ So field 5 is REPORTED, never a mismatch that stops the node.** Refusing to boot would be
+disproportionate — it disables exactly one path and breaks none — and it is the state **every preview
+node is in today**. The three outcomes are deliberately distinguishable in the log, because they send an
+operator to completely different places:
+
+```
+CONVERT AVAILABLE:   derives X and the LMConfigDatum publishes X
+CONVERT UNAVAILABLE: loans.minswap.* is not set
+CONVERT UNAVAILABLE: derives X but this deployment publishes Y — the configured coordinates
+                     belong to a DIFFERENT network's Minswap deployment
+```
+
+⚑ **"We have no coordinates" and "the coordinates are for another network" are different faults**, and a
+single "unavailable" line would have merged them — the same defect shape as the quiet market that was
+indistinguishable from a dead deployment (§12).
+
+### 36.2 Verification
+
+Six tests, and two are worth naming:
+- **Every Minswap parameter must move the hash.** Three assertions, one per coordinate — a parameter
+  that silently failed to reach the derivation would otherwise produce a hash that is right for the
+  wrong reason, and only on a network where the others happened to match.
+- **The fixture must actually contain the hash the test asserts.** Without that, the mainnet assertion
+  compares a constant in the test file with a constant in the test file.
+
+Partial coordinates yield **null**, not a hash: *a hash derived from two of three is a real-looking hash
+for nothing.*
+
+Suite **103 files, 868 tests, 38 failures, 22 skipped, 0 orphans**.
+
+**Unstarted:** B2 proper — the CCL assembly, with the real evaluator from its first commit.

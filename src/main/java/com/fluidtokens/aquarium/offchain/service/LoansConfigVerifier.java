@@ -74,12 +74,19 @@ public class LoansConfigVerifier {
     private static final int CFG_LOCKED_BORROWER_MANAGER_SPEND = 28;
     private static final int CONFIG_DATUM_FIELDS = 29;
 
-    // LMConfigDatum field indices. Field 5 (lmLiquidateAndConvertActionScriptHash) is
-    // deliberately unchecked: it takes five Minswap parameters we do not have.
+    // LMConfigDatum field indices.
+    //
+    // ⛔ Field 5 was "deliberately unchecked: it takes five Minswap parameters we do not have" until
+    // 2026-09-03. We have them (findings §25.1), and it is now derived and REPORTED — never a
+    // mismatch that stops the node. The Minswap coordinates are NETWORK-SPECIFIC, so a node
+    // configured with mainnet's while running elsewhere derives a real hash for the wrong deployment.
+    // That disables exactly one path and breaks none, so refusing to boot over it would be the
+    // disproportionate response — and it is the state every preview node is in today (§28.1).
     private static final int LM_WITHDRAW_BONDS_ACTION = 1;
     private static final int LM_LIQUIDATE_ACTION = 2;
     private static final int LM_COMPOUND_ACTION = 3;
     private static final int LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION = 4;
+    private static final int LM_LIQUIDATE_AND_CONVERT_ACTION = 5;
     private static final int LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION = 6;
     private static final int LM_LIQUIDATE_CONVERT_AND_COMPOUND_ACTION = 7;
     private static final int LM_CONFIG_DATUM_FIELDS = 8;
@@ -206,7 +213,36 @@ public class LoansConfigVerifier {
         expected.put(LM_LIQUIDATE_CONVERT_AND_COMPOUND_ACTION,
                 registry.getLmLiquidateConvertAndCompoundActionScriptHash());
 
-        return compare("LMConfigDatum", fields, expected);
+        List<String> mismatches = compare("LMConfigDatum", fields, expected);
+        reportConvertAvailability(fields);
+        return mismatches;
+    }
+
+    /**
+     * ⛔ <b>Whether this node can convert at all</b>, answered against the chain rather than assumed.
+     *
+     * <p>Reported, never fatal — see the field-index comment above. The three outcomes are
+     * deliberately distinguishable in the log, because "the coordinates are for another network" and
+     * "we have no coordinates" send an operator to completely different places.
+     */
+    private void reportConvertAvailability(List<PlutusData> fields) {
+        String derived = registry.getLmLiquidateAndConvertActionScriptHash();
+        if (derived == null) {
+            log.warn("CONVERT UNAVAILABLE: loans.minswap.* is not set, so "
+                    + "lm_liquidate_and_convert_action cannot be derived");
+            return;
+        }
+        String published = bytesAt(fields, LM_LIQUIDATE_AND_CONVERT_ACTION);
+        if (derived.equalsIgnoreCase(published)) {
+            log.info("CONVERT AVAILABLE: lm_liquidate_and_convert_action derives {} and the "
+                    + "LMConfigDatum publishes the same — the configured Minswap coordinates are "
+                    + "this deployment's", derived);
+            return;
+        }
+        log.warn("⛔ CONVERT UNAVAILABLE: lm_liquidate_and_convert_action derives {} but this "
+                        + "deployment's LMConfigDatum publishes {}. The configured loans.minswap.* "
+                        + "coordinates belong to a DIFFERENT network's Minswap deployment. Every "
+                        + "other path on this node is unaffected.", derived, published);
     }
 
     // ---- Plumbing -----------------------------------------------------------------------

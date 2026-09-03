@@ -107,6 +107,16 @@ public class LoansContractRegistry {
     private final String lmLiquidateActionScriptHash;
     private final String lmLiquidateAndPayInAdvanceActionScriptHash;
     private final String lmLiquidateConvertAndCompoundActionScriptHash;
+    /**
+     * {@code lm_liquidate_and_convert_action} — the only action whose derivation needs coordinates
+     * from OUTSIDE this deployment (three Minswap V2 hashes). Null when they are not configured.
+     *
+     * <p>⚠ It is also the only derived hash that can legitimately DISAGREE with what the chain
+     * publishes: the Minswap coordinates are network-specific, so a node configured with mainnet's
+     * while running elsewhere derives a real hash for the wrong deployment. {@code LoansConfigVerifier}
+     * reports that rather than failing, because it disables one path and breaks none.
+     */
+    private final String lmLiquidateAndConvertActionScriptHash;
 
     // Tier 6/7 — pool manager and the LM actions that depend on it. These additionally
     // need smartTokensSpendScriptHash, which is not derivable from the bundled blueprint
@@ -150,12 +160,22 @@ public class LoansContractRegistry {
         this(require(cfg.getConfigPolicyId(), "loans.config.policy-id"),
                 require(cfg.getLmConfigPolicyId(), "loans.lm-config.policy-id"),
                 require(cfg.getConfigAssetName(), "loans.config.asset-name"),
-                cfg.getSmartTokensSpendScriptHash());
+                cfg.getSmartTokensSpendScriptHash(),
+                cfg.getMinswapPoolPolicyId(), cfg.getMinswapPoolSpendScriptHash(),
+                cfg.getMinswapOrderSpendScriptHash());
+    }
+
+    public LoansContractRegistry(String configPolicyId, String lmConfigPolicyId,
+                                 String configAssetName, String smartTokensSpendScriptHash) {
+        this(configPolicyId, lmConfigPolicyId, configAssetName, smartTokensSpendScriptHash,
+                null, null, null);
     }
 
     @SneakyThrows
     public LoansContractRegistry(String configPolicyId, String lmConfigPolicyId,
-                                 String configAssetName, String smartTokensSpendScriptHash) {
+                                 String configAssetName, String smartTokensSpendScriptHash,
+                                 String minswapPoolPolicyId, String minswapPoolSpendScriptHash,
+                                 String minswapOrderSpendScriptHash) {
         this.code = loadUnappliedCompiledCodes();
         this.configPolicyId = configPolicyId;
         this.lmConfigPolicyId = lmConfigPolicyId;
@@ -215,6 +235,22 @@ public class LoansContractRegistry {
                         mainCfg, name, lmSpend, amSpend, amWithdraw, loanClaimCredential);
         this.lmLiquidateConvertAndCompoundActionScriptHash =
                 derive("lender_manager/lm_liquidate_convert_and_compound_action.actionValidator");
+
+        // The eleven parameters FluidTokens quoted, in their order. The two empty ones are the
+        // CIP-113 withdraw counterparts of the pool and order credentials: Minswap V2 has none, and
+        // empty selects the non-CIP-113 branch (findings §25.4).
+        if (isBlank(minswapPoolPolicyId) || isBlank(minswapPoolSpendScriptHash)
+                || isBlank(minswapOrderSpendScriptHash)) {
+            log.warn("loans.minswap.* not fully set — lm_liquidate_and_convert_action cannot be "
+                    + "derived and the convert path is unavailable on this node");
+            this.lmLiquidateAndConvertActionScriptHash = null;
+        } else {
+            this.lmLiquidateAndConvertActionScriptHash =
+                    derive("lender_manager/lm_liquidate_and_convert_action.actionValidator",
+                            mainCfg, name, lmSpend, amSpend, amWithdraw,
+                            b(minswapPoolPolicyId), b(minswapPoolSpendScriptHash), b(""),
+                            b(minswapOrderSpendScriptHash), b(""), loanClaimCredential);
+        }
 
         String smartTokens = smartTokensSpendScriptHash;
         if (smartTokens == null || smartTokens.isBlank()) {
@@ -283,6 +319,7 @@ public class LoansContractRegistry {
         m.put("lmLiquidateActionScriptHash", lmLiquidateActionScriptHash);
         m.put("lmLiquidateAndPayInAdvanceActionScriptHash", lmLiquidateAndPayInAdvanceActionScriptHash);
         m.put("lmLiquidateConvertAndCompoundActionScriptHash", lmLiquidateConvertAndCompoundActionScriptHash);
+        m.put("lmLiquidateAndConvertActionScriptHash", lmLiquidateAndConvertActionScriptHash);
         m.put("poolManagerPolicyId", poolManagerPolicyId);
         m.put("poolManagerSpendScriptHash", poolManagerSpendScriptHash);
         // Logged and cross-checkable, but deliberately absent from LoansConfigVerifier's expectations:
@@ -565,6 +602,10 @@ public class LoansContractRegistry {
     /** A {@code cardano/address.Credential} holding a script hash — {@code Script} is its second constructor. */
     private static ConstrPlutusData scriptCredential(String scriptHash) {
         return ConstrPlutusData.of(1, b(scriptHash));
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 
     private static String require(String value, String property) {
