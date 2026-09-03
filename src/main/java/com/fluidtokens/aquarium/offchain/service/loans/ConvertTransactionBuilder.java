@@ -29,6 +29,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Stream;
 
 /**
  * Builds a <b>LiquidateAndConvert</b>: liquidates a loan and, in the same transaction, creates the
@@ -87,7 +88,14 @@ public class ConvertTransactionBuilder {
         /** The bot's collateral-token fee is absent from the built body. */
         FEE_NOT_PAID_TO_BOT,
         /** An index the redeemer claims does not point at what it claims, on the finished body. */
-        INDEX_MISMATCH
+        INDEX_MISMATCH,
+        /**
+         * ⛔ No usable oracle for the collateral leg. A convert exchanges two distinct assets, so at
+         * least one leg is a token and {@code loan_claim_action} requires an oracle withdrawal for it.
+         * Building without one produces a transaction that assembles, serialises and passes every
+         * structural check here — and fails on chain.
+         */
+        COLLATERAL_ORACLE_MISSING
     }
 
     public static final class RefusedException extends RuntimeException {
@@ -110,6 +118,10 @@ public class ConvertTransactionBuilder {
     /**
      * @param poolRefUtxo the Minswap pool UTxO, located BY ITS NFT at scan time — never a pinned
      *                    coordinate, because a pool is respent on every swap
+     * @param collateralOracle the feed for the COLLATERAL leg. ⛔ Never {@code null} on this path:
+     *                    a convert exchanges two distinct assets, so at least one leg is a token and
+     *                    {@code retrieve_oracle_data} demands an oracle withdrawal for it. The
+     *                    principal leg needs none when it is ada, which the ada short-circuit handles
      * @param orderAddress {@code Address(Script(minswapOrderSpendScriptHash), lenderStakeCredential)}
      *                     — the validator checks this exactly, including the LENDER's stake part
      * @param claim       the loan-claim redeemer's per-input data; its {@code lenderBondOutputIndex}
@@ -118,6 +130,7 @@ public class ConvertTransactionBuilder {
     public record Request(Utxo loanUtxo,
                           Utxo bondUtxo,
                           Utxo poolRefUtxo,
+                          com.fluidtokens.aquarium.offchain.model.loans.OracleEntry collateralOracle,
                           Utxo configUtxo,
                           Utxo lmConfigUtxo,
                           Utxo walletUtxo,
@@ -180,6 +193,14 @@ public class ConvertTransactionBuilder {
             throw refuse(Refusal.CONVERT_ACTION_NOT_DERIVED,
                     "loans.minswap.* is not configured, so the convert action cannot be withdrawn through");
         }
+        // ⛔ THE LIMB THIS BUILDER SHIPPED WITHOUT. Checked first because its absence is invisible
+        // downstream: every structural assertion in this class inspects what we EMIT, and none can
+        // see a withdrawal that was never added.
+        if (request.collateralOracle() == null || !request.collateralOracle().usableForLiquidation()) {
+            throw refuse(Refusal.COLLATERAL_ORACLE_MISSING,
+                    "the collateral leg has no usable oracle entry; loan_claim_action would refuse "
+                            + "this transaction on chain and nothing here would have noticed");
+        }
         if (request.claim().equity().signum() != 0) {
             throw refuse(Refusal.EQUITY_NOT_MODELLED,
                     "borrower equity is " + request.claim().equity() + "; loan_claim_action constrains "
@@ -193,12 +214,18 @@ public class ConvertTransactionBuilder {
         long lmConfigRefIndex = indexOf(refInputs, inputOf(request.lmConfigUtxo()), "lm config");
         // The pool's index is into the FILTERED list of pool reference inputs, of which there is one.
         long poolRefIndex = 0L;
+        long collateralOracleRefIndex = indexOf(refInputs,
+                request.collateralOracle().referenceInput(), "collateral oracle");
+        // ⚠ The principal leg is ada here: retrieve_oracle_data short-circuits on an empty policy id
+        // and never reads this input — but the index must still be IN RANGE. Index 0 of the
+        // canonically sorted reference inputs always is, which is what the sibling builders pass too.
+        long principalOracleRefIndex = 0L;
 
         // ⛔ PASS 1. The two carrier indexes and lenderBondOutputIndex are ABSOLUTE positions in
         // self.outputs, and a withdrawing transaction gets a dummy output prepended plus change
         // appended (trap 1). Build once with placeholders purely to read the finished layout.
         Transaction probe = assembleAndComplete(request, refInputs, configRefIndex, lmConfigRefIndex,
-                poolRefIndex, 0L, 0L, 0L, null);
+                poolRefIndex, collateralOracleRefIndex, principalOracleRefIndex, 0L, 0L, 0L, null);
 
         long successIndex = outputIndexWithDatum(probe, request.plan().successDatum(), "success carrier");
         long refundIndex = outputIndexWithDatum(probe, request.plan().refundDatum(), "refund carrier");
@@ -207,7 +234,7 @@ public class ConvertTransactionBuilder {
 
         // PASS 2, with the observed layout, and a post-assert that re-derives it from the body.
         return assembleAndComplete(request, refInputs, configRefIndex, lmConfigRefIndex, poolRefIndex,
-                successIndex, refundIndex, bondOutputIndex,
+                collateralOracleRefIndex, principalOracleRefIndex, successIndex, refundIndex, bondOutputIndex,
                 (ctx, txn) -> assertStructure(txn, request, successIndex, refundIndex, bondOutputIndex));
     }
 
@@ -215,6 +242,7 @@ public class ConvertTransactionBuilder {
 
     private Transaction assembleAndComplete(Request request, List<TransactionInput> refInputs,
                                             long configRefIndex, long lmConfigRefIndex, long poolRefIndex,
+                                            long collateralOracleRefIndex, long principalOracleRefIndex,
                                             long successIndex, long refundIndex, long bondOutputIndex,
                                             TxBuilder verify) {
         ConvertOrderPlan plan = request.plan();
@@ -248,9 +276,24 @@ public class ConvertTransactionBuilder {
                 LiquidationTxEncoder.loanWithdrawRedeemer(configRefIndex));
         tx.withdraw(rewardAddress(registry.getLoanClaimActionScriptHash()), BigInteger.ZERO,
                 LiquidationTxEncoder.loanClaimActionWithdrawRedeemer(configRefIndex,
-                        List.of(withBondOutputIndex(request.claim(), bondOutputIndex))));
+                        List.of(withIndexes(request.claim(), bondOutputIndex,
+                                collateralOracleRefIndex, principalOracleRefIndex))));
         tx.withdraw(rewardAddress(registry.getLenderManagerWithdrawScriptHash()), BigInteger.ZERO,
                 LiquidationTxEncoder.lenderManagerWithdrawRedeemer(lmConfigRefIndex));
+        // ⛔ THE ORACLE WITHDRAWAL. loan_claim_action calls retrieve_oracle_data with the collateral's
+        // own policy id; a non-empty one means the FluidTokens oracle validator MUST execute.
+        //
+        // ⚑ AND NOT THE SIBLING'S CALL. LiquidatePayInAdvanceTransactionBuilder uses
+        // oracleRedeemer(feed, providerRefInputIndex, List.of()) — an EMPTY signature list, which is
+        // the Charli3/Orcfax shape, where the price is proven by a provider reference input instead.
+        // Mainnet FLDT is served MULTISIG (findings §40), so its branch runs verify_ed25519_signature
+        // against the feed's published signatures and an empty list fails the threshold. Copying the
+        // sibling verbatim is the hurried fix, and it would emit a transaction that assembles cleanly
+        // and dies in phase 2.
+        tx.withdraw(request.collateralOracle().rewardAddress(), BigInteger.ZERO,
+                LiquidationTxEncoder.oracleRedeemer(request.collateralOracle().feed(),
+                        request.collateralOracle().signatures()));
+
         tx.withdraw(rewardAddress(registry.getLmLiquidateAndConvertActionScriptHash()), BigInteger.ZERO,
                 ConvertTxEncoder.convertRedeemer(Math.toIntExact(configRefIndex),
                         List.of(0),
@@ -441,18 +484,34 @@ public class ConvertTransactionBuilder {
         }
     }
 
-    private static ClaimData withBondOutputIndex(ClaimData claim, long index) {
-        return new ClaimData(claim.liquidationMode(), BigInteger.valueOf(index),
-                claim.collateralOracleRefInputIndex(), claim.principalOracleRefInputIndex(),
+    /**
+     * The claim data with the three indexes only the assembled body can know: the bond echo's absolute
+     * output position, and the two oracle reference-input positions. The caller supplies the economics;
+     * the builder supplies the geometry.
+     */
+    private static ClaimData withIndexes(ClaimData claim, long bondOutputIndex,
+                                         long collateralOracleRefIndex, long principalOracleRefIndex) {
+        return new ClaimData(claim.liquidationMode(), BigInteger.valueOf(bondOutputIndex),
+                BigInteger.valueOf(collateralOracleRefIndex),
+                BigInteger.valueOf(principalOracleRefIndex),
                 claim.lenderAuth(), claim.equity(), claim.loanId(), claim.remainingDebt());
     }
 
     private List<TransactionInput> referenceInputs(Request request) {
-        List<TransactionInput> all = new ArrayList<>(List.of(
+        var all = new java.util.LinkedHashSet<TransactionInput>(List.of(
                 inputOf(request.configUtxo()), inputOf(request.lmConfigUtxo()),
                 inputOf(request.poolRefUtxo())));
+        // The oracle's own three: the NFT-bearing input the validator reads the credential and value
+        // from, its published script, and — for a provider-backed feed — the provider UTxO. Any of
+        // them may be null (a multisig feed has no provider), and a null is skipped rather than
+        // encoded as a coordinate that resolves to nothing.
+        Stream.of(request.collateralOracle().referenceInput(),
+                        request.collateralOracle().referenceScript(),
+                        request.collateralOracle().charlieProviderReferenceInput())
+                .filter(Objects::nonNull)
+                .forEach(all::add);
         all.addAll(request.referenceScripts().values());
-        return canonical(all);
+        return canonical(new ArrayList<>(all));
     }
 
     private static long outputIndexWithDatum(Transaction txn, PlutusData datum, String what) {

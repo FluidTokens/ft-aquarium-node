@@ -14,6 +14,10 @@ import com.fluidtokens.aquarium.offchain.model.loans.AuthorizationMethod;
 import com.fluidtokens.aquarium.offchain.model.loans.ClaimData;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
 import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
+import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.OracleSignature;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Constructor;
@@ -24,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -98,6 +103,28 @@ class ConvertTransactionBuilderGuardTest {
                 ConvertTxEncoder.plainScriptAddress("bb".repeat(28)), "cc".repeat(32), 1);
     }
 
+    /**
+     * A multisig oracle entry that would satisfy the validator — one signature against a threshold of
+     * one, the shape mainnet FLDT actually uses (findings §40). {@code assertStructure} never reads it;
+     * it exists because {@code build()} refuses without one, and because a fixture that could not
+     * satisfy the validator would make the refusal test below pass for the wrong reason.
+     */
+    private static OracleEntry oracle() {
+        return new OracleEntry(FLDT,
+                new AssetType("93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b",
+                        "6f7261636c65464c44544333"),
+                "stake_test17" + "q".repeat(51),
+                "4a48df8eac9f3abb39bfcd15e8cc82e8f465ece322a45ed47ef7ebb9",
+                new TransactionInput("ee".repeat(32), 0),
+                new TransactionInput("ef".repeat(32), 0),
+                List.of("cb1506c82c3143948618c50834a527b8d471ebae067bc0a5dee1627dc511e914"),
+                1,
+                OraclePriceFeed.aggregated(FLDT, BigInteger.valueOf(22_265_406L),
+                        BigInteger.valueOf(100_000_000L), 0L, Long.MAX_VALUE),
+                List.of(new OracleSignature(0, "ab".repeat(64))),
+                null);
+    }
+
     private static Utxo bondUtxo(String datumHex) {
         Utxo u = new Utxo();
         u.setTxHash("dd".repeat(32));
@@ -109,8 +136,8 @@ class ConvertTransactionBuilderGuardTest {
     }
 
     private static ConvertTransactionBuilder.Request request(ConvertOrderPlan p, String bondDatumHex) {
-        return new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex), null, null, null,
-                null, Map.of(), p,
+        return new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex), null, oracle(),
+                null, null, null, Map.of(), p,
                 new ClaimData(new LiquidationMode.Liquidation(BigInteger.ONE, BigInteger.ONE,
                         BigInteger.ZERO, false),
                         BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
@@ -165,8 +192,24 @@ class ConvertTransactionBuilderGuardTest {
         return com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData.of(424242).serializeToHex();
     }
 
+    /**
+     * ⚠ A registry that CAN derive the convert action, because the derivation guard runs first and
+     * would otherwise answer for the oracle guard below. The first version of the oracle test used
+     * the plain fixture registry and got {@code CONVERT_ACTION_NOT_DERIVED} — a test whose subject is
+     * not the first check on a path has to REACH its check, which is the third time this file has had
+     * to learn that.
+     */
+    private static com.fluidtokens.aquarium.offchain.service.LoansContractRegistry convertCapableRegistry() {
+        return new com.fluidtokens.aquarium.offchain.service.LoansContractRegistry(
+                LoanFixtures.CONFIG_POLICY_ID, LoanFixtures.LM_CONFIG_POLICY_ID,
+                LoanFixtures.CONFIG_ASSET_NAME, LoanFixtures.SMART_TOKENS_SPEND,
+                "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c",
+                "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b",
+                "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c");
+    }
+
     private static ConvertTransactionBuilder builder() {
-        return new ConvertTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+        return new ConvertTransactionBuilder(convertCapableRegistry(), LoanFixtures.NETWORK,
                 LoanFixtures.utxoSupplier(List.of()), LoanFixtures.protocolParams(),
                 // ⚠ Never used: assertStructure is driven directly against hand-built bodies. It is
                 // here only because the constructor REFUSES a null one, which is the invariant above.
@@ -281,6 +324,68 @@ class ConvertTransactionBuilderGuardTest {
                         request(lying, bondDatumHex()), 3, 4, 2));
         assertEquals(ConvertTransactionBuilder.Refusal.CARRIER_DATUM_MISMATCH, e.reason());
         assertTrue(e.getMessage().contains("hashes to"), e.getMessage());
+    }
+
+    // ---- the oracle leg, which this builder shipped without -----------------------------------
+
+    /**
+     * ⛔ <b>THE DEFECT THIS CLASS EXISTS TO NOT REPEAT.</b> The first version of
+     * {@link ConvertTransactionBuilder} emitted four withdrawals and <b>no oracle leg at all</b> — no
+     * oracle withdrawal, no oracle reference inputs, no oracle indexes in the claim data.
+     *
+     * <p>It assembled, it serialised, and it passed <b>every one of the ten structural assertions
+     * above</b>, because they all inspect what the builder EMITS and none can see a limb that was
+     * never added. It would have failed {@code loan_claim_action} on chain.
+     *
+     * <p>⚑ And what hid it: a since-retracted finding said a convert could not be dry-evaluated
+     * offline (§38/§40). That claim also, quietly, meant "the builder need not be finished to be
+     * provable". <b>A wrong impossibility claim protects the thing it excuses.</b>
+     *
+     * <p>So the guard is at the FRONT of {@code build()}, before anything else can be got right.
+     */
+    @Test
+    void aCandidateWithNoUsableCollateralOracleIsRefusedBeforeAnythingIsBuilt() {
+        ConvertOrderPlan p = plan();
+        var noOracle = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
+                null, null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
+                FLDT, LENDER_BOND, ORDER_ADDRESS, BOT, 0L, 0L);
+
+        var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
+                () -> builder().build(noOracle));
+        assertEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_ORACLE_MISSING, e.reason());
+        assertTrue(e.getMessage().contains("nothing here would have noticed"), e.getMessage());
+    }
+
+    /**
+     * ⛔ <b>AND NOT THE SIBLING'S CALL.</b> {@code LiquidatePayInAdvanceTransactionBuilder} passes
+     * {@code List.of()} for the signatures — correct for a Charli3/Orcfax feed, whose price is proven
+     * by a provider reference input instead. <b>Mainnet FLDT is multisig</b> (findings §40), so its
+     * branch runs {@code verify_ed25519_signature} against the published signatures and an empty list
+     * fails the threshold.
+     *
+     * <p>Copying the sibling verbatim is what a hurried fix does, and it emits a transaction that
+     * assembles cleanly and dies in phase 2. This asserts the entry's own signatures reach the
+     * redeemer rather than being dropped.
+     */
+    @Test
+    void theOracleRedeemerCarriesThePublishedSignaturesAndNotAnEmptyList() {
+        OracleEntry entry = oracle();
+        assertEquals(1, entry.signatures().size(), "the fixture must have a signature to lose");
+        assertTrue(entry.hasEnoughSignatures());
+        assertTrue(entry.usableForLiquidation(),
+                "a fixture the validator could not satisfy would make the refusal test above pass "
+                        + "for the wrong reason");
+
+        String withSignatures = LiquidationTxEncoder
+                .oracleRedeemer(entry.feed(), entry.signatures()).serializeToHex();
+        String theSiblingsCall = LiquidationTxEncoder
+                .oracleRedeemer(entry.feed(), List.of()).serializeToHex();
+
+        assertNotEquals(theSiblingsCall, withSignatures,
+                "if these ever match, the signatures are being dropped and the multisig branch would "
+                        + "fail its threshold on chain");
+        assertTrue(withSignatures.contains("ab".repeat(32)),
+                "the published signature bytes must actually reach the redeemer");
     }
 
     @Test

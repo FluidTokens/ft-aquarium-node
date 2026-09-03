@@ -3706,3 +3706,92 @@ second source; §38 got it wrong by not.
 And the tell was in my own text: option (i) in §38.4 said the fix was *"fresh oracle payloads"* — which
 concedes the thing "never" denies. **A conclusion contradicted by its own escape hatch is not a
 conclusion.**
+
+---
+
+## 41. The oracle leg: mainnet FLDT is MULTISIG, preview tFLDT is CHARLI3 — proven from a real transaction (2026-09-03)
+
+Giovanni doubted the multisig conclusion — *"I don't think it's a multisig, haven't we used the oracle
+before in preview?"* — because it had been drawn from an **API metadata field**, not from what a real
+transaction invokes. The doubt was well-founded in method and the conclusion survives it, by a much
+better route.
+
+### 41.1 ⛔ The authority: a real mainnet transaction that invoked the oracle validator
+
+`d832b78e…` — the borrow that created the candidate — **carries an oracle withdrawal**, `reward index 0`
+against script `4a48df8e…`. ⚠ *I had earlier told the machine owner it "carried no oracle": wrong, and
+the redeemer list I had already printed said otherwise. I read the reference-input datums and not the
+redeemers.* Its redeemer, fetched by data hash and decoded:
+
+```
+Constr0[                                             ← Aggregated (constructor 0 of OracleData)
+  Constr0[ 1788434100439, 1788437100439,             ← CommonFeedData valid_from / valid_to
+           Asset(577f0b13…, 0014df10464c4454) ]      ← FLDT
+  22278163, 100000000 ]                              ← 0.22278163 lovelace per unit
+List[ Constr0[ <64-byte signature>, 0 ] ]            ← ONE SIGNATURE, key_position 0
+```
+
+`lib/fluidtokens/types/oracle.ak` declares `Aggregated, Pooled, Dedicated, PriceDataCharlie,
+PriceDataOrcfax` — so **constructor 0 is `Aggregated`**, which `validators/oracle.ak` routes to the
+`_` branch: `verify_ed25519_signature`, n-of-m. **The signature list is non-empty.**
+
+**⇒ Mainnet FLDT uses the SIGNED (multisig/aggregated) branch. Proven by a transaction the chain
+accepted, not by metadata.**
+
+### 41.2 ✅ And Giovanni's recollection about preview is ALSO right — both are true
+
+| | provider | oracle redeemer | signature? |
+|---|---|---|---|
+| **preview `tFLDT`** | `preferredOracle: c3`, `supportedOracle: ["c3"]` | `PriceDataCharlie` | **none** — proven by a provider reference input |
+| **mainnet `FLDT`** | `preferredOracle: multisig`, `supportedOracle: ["multisig"]` | `Aggregated` | **one, threshold 1** |
+
+Preview's registry even carries a *separate token* named `FLDTmultisig` for the signed case, so the two
+are deliberately distinguished there.
+
+**⇒ Both recollections are correct and they are about different networks.** That is precisely why
+`LiquidatePayInAdvanceTransactionBuilder` calls `oracleRedeemer(feed, providerRefIndex, List.of())` —
+an **empty** signature list. **It was built against preview, where that is right.** Copying it verbatim
+onto mainnet emits an empty-signature `Aggregated` redeemer, fails the threshold, and dies in phase 2.
+
+⚑ **Three price sources agree, which is the cross-check that makes this comfortable**: the on-chain
+redeemer 0.22278163, the registry 0.22265406, the Minswap pool mid ≈0.22280.
+
+⇒ The convert builder uses `oracleRedeemer(feed, signatures)` with the entry's published signatures,
+and a test asserts the two overloads produce **different** bytes — *if they ever match, the signatures
+are being dropped.*
+
+### 41.3 ⚠ And the method lesson, for the second time in a day
+
+§38 concluded "never" from an absence. This concluded "multisig" from a metadata field. **Both were
+inferences from the most convenient available source rather than from the authority**, and in this case
+the authority — a real transaction — was *already in data I had fetched and printed*. The conclusion
+happened to be right; **the method was the same one that was wrong an hour earlier.**
+
+**⇒ For anything that becomes builder code: the chain is the authority, the API is a hint, and the
+asset name is not evidence at all.** (`oracleFLDTC3` names a multisig feed on mainnet.)
+
+### 41.4 How the contract stops the bot requesting an improper swap
+
+Giovanni asked directly. From `lm_liquidate_and_convert_action` at `e0b818e`, the bot **cannot** shape
+the swap to its own advantage, because every term of the order is fixed by the validator rather than
+chosen by us:
+
+- **`minimum_receive: loanInputAction.remainingDebt`** — the floor is the debt itself. A swap that
+  would return less than the lender is owed cannot be requested at all.
+- **`success_receiver` and `refund_receiver` are BOTH `get_smart_destination_address(…,
+  assetManagerSpendScriptHash, …)`** — the lender's asset manager. Neither the proceeds nor a refund
+  can be pointed at the bot.
+- **The pool must be the right one**: `asset_a == collateral` (then `asset_b == principal`), else
+  `asset_b == collateral && asset_a == principal`, and the pool's NFT must be present
+  (`quantity_of(poolRef, minswapPoolPolicyId, minswapPoolAssetName) == 1`). A different or fake pool
+  fails.
+- **`killable: True`** — a pool that cannot deliver `minimum_receive` **refunds** rather than filling
+  badly. There is no partial-fill-at-a-bad-price outcome.
+- **`swappableCollateralAmount = loanCollateralAmount − equity − liquidationFee`**, and the order
+  output's value is checked against it exactly (plus exactly 2,800,000 lovelace for a token
+  collateral). The bot cannot hold back collateral, and the fee it keeps is bounded by
+  `liquidationFeePerMille`, **which the LENDER sets in their own bond**.
+- The lender bond output must equal its input under `builtin.equals_data` — the bond cannot be altered
+  in passing.
+
+**⇒ The only degree of freedom the bot has is WHETHER to act, not on what terms.**
