@@ -571,6 +571,153 @@ Minswap pool — not a path you fall into.
 
 ---
 
+## 14. ⛔ MAINNET PRE-ARM: the market entry you MUST set before arming anything
+
+**Measured against the live mainnet deployment on 2026-09-03** (findings §54, reproducible with
+`MainnetShadowRunTest`). Read this before setting `AQUARIUM_LIQUIDATION_MODE` to anything on mainnet.
+
+### 14.1 The situation
+
+Mainnet Lending v4 currently holds **exactly one loan**, and it is **liquidatable right now**:
+
+| | |
+|---|---|
+| loan | `d832b78e3d4a9ff99dfa8f238ae378b37dbd36b30efd24d68e5786f99786cf99#1` |
+| principal | **20,000,000 lovelace** — so its market is **`lovelace`** |
+| collateral | 100,000,000 FLDT |
+| current LTV | **89.82 %** — over the threshold |
+| lender bond | `shouldLiquidationConvertToPrincipal = true` |
+
+That last row is what makes this section necessary. **The lender has permitted conversion, so the
+plain `Liquidate` path is not legal for this loan at all** — the bot will route it to either
+`LiquidateAndConvert` or `LiquidateAndPayInAdvance`, and **which one is your configuration's choice.**
+
+### 14.2 ⛔ THE HAZARD — a half-configured arming
+
+`CONVERT` is the default for an unlisted market, and it is the right default in general: it fronts no
+capital and holds nothing. **But the convert path cannot execute on mainnet today.** FluidTokens'
+`lm_liquidate_and_convert_action` was compiled against a Minswap `PoolDatum` shape that is not what is
+deployed — their `aiken.toml` pins the `v2.1` *branch* rather than the released `v2.0.0`, and the two
+declare `pool_batching_stake_credential` differently (findings §51). Every convert attempt fails
+deserialising the live pool datum. **It is their fix, not ours, and it is not in yet.**
+
+⇒ **If you enable the `lovelace` market — or raise the node mode with no market list at all — the only
+live mainnet loan routes to a path that cannot complete.**
+
+### 14.3 ✅ THE SHIPPED DEFAULT IS SAFE — the danger is only a half-configured arming
+
+Out of the box `loans.liquidation.mode` is `disabled` and no markets are listed, so the gate returns
+**`MARKET_DISABLED`**: the bot **refuses**, it does not mis-route. **A node you have not configured is
+not at risk.** The failure mode this section exists to prevent is the *partial* one — turning the mode
+up because you want the bot working, without saying which mechanism the market uses.
+
+### 14.4 The exact configuration that is correct
+
+```yaml
+loans:
+  liquidation:
+    mode: shadow              # start here. See section 10 — shadow builds and dumps, never submits.
+    enabled: false            # both flags are required to submit; leave this false until 10 is done
+    markets:
+      - unit: lovelace        # the loan's PRINCIPAL asset, not its collateral
+        mode: SHADOW
+        action: ANTICIPATE    # ⛔ THE LOAD-BEARING LINE. Without it this market is CONVERT.
+        cap: 50000000         # lovelace. MANDATORY on ANTICIPATE. See 14.5.
+```
+
+or, in `docker/.env` (section 9.1 — a list is not one variable):
+
+```
+AQUARIUM_LIQUIDATION_MODE=shadow
+AQUARIUM_LIQUIDATION_ENABLED=false
+LOANS_LIQUIDATION_MARKETS_0_UNIT=lovelace
+LOANS_LIQUIDATION_MARKETS_0_MODE=SHADOW
+LOANS_LIQUIDATION_MARKETS_0_ACTION=ANTICIPATE
+LOANS_LIQUIDATION_MARKETS_0_CAP=50000000
+```
+
+⚠ **`unit` is the PRINCIPAL asset.** This loan's collateral is FLDT and its principal is ada, so the
+market is `lovelace`. Keying it on the FLDT unit creates a market that matches nothing and leaves the
+real one unlisted — i.e. back on `CONVERT`, silently.
+
+### 14.5 Choosing the cap, and what ANTICIPATE actually costs you
+
+**The cap is a gate, not a clamp.** The protocol fixes what must be deposited; the bot cannot front
+part of a loan. A cap below the required amount **refuses the candidate** (`ABOVE_MARKET_CAP`) rather
+than building something smaller.
+
+For this candidate, measured from the production builder on 2026-09-03:
+
+```
+must front  : 20,887,781 lovelace     (convertedLoanCollateralToPrincipalAmount)
+receives    : 100,000,000 FLDT, oracle-valued at 22,267,706 lovelace
+  of which the bot's fee : 5,000,000 FLDT = 1,113,385 lovelace
+gross, PRE tx fee        : +1,379,925 lovelace
+```
+
+**⚠ Set the cap above the amount fronted, not above the debt.** The two are different numbers —
+`remainingDebt` is 20,001,060 here, 886,721 *less* than what must actually be fronted — and a cap
+chosen from the debt would refuse the candidate it was meant to allow. **50,000,000 leaves comfortable
+headroom for one ada-principal loan of this size.** The cap is your exposure bound for the whole
+market, so size it for how many such loans you are willing to hold at once, not for this one.
+
+**⛔ And understand the trade before you arm it.** On `ANTICIPATE` the bot **pays ada and is paid in
+collateral tokens**. After this liquidation your wallet is **~20.9 ada poorer** and holds **100,000,000
+FLDT**. That is the intended end state — accrued collateral is held, and disposing of it is the
+operator's decision, not the bot's (there is no swap or sweep). **A falling ada balance on this path is
+correct behaviour, not a fault.**
+
+### 14.6 What ANTICIPATE needs that CONVERT does not
+
+**A funded wallet.** Convert fronts nothing; anticipate fronts the whole amount above, on top of the
+transaction fee and the ledger collateral. The wallet needs **one ada-only UTxO** large enough to cover
+the fronted amount plus fee headroom — a single input, not a total balance, or the candidate is refused
+with `WALLET_INPUT_TOO_SMALL`.
+
+**⚠ A shadow posture does not remove this.** Shadow withholds the *submission*; the builder still
+needs the wallet UTxO to select an input and price the transaction. **You cannot shadow-run this path
+on a wallet-less node.**
+
+### 14.7 Order of operations
+
+1. **Fund the operator wallet** with one ada-only UTxO ≥ the fronted amount + fee headroom.
+2. Set the configuration in 14.4 — `mode: shadow`, `enabled: false`.
+3. Watch for the `SHADOW TX` / `SHADOW CBOR` pair (section 10) and check the dump: variant
+   `LiquidateAndPayInAdvance`, `held-by=MODE_NOT_LIVE`, real ex-units, not placeholders.
+4. Only then consider arming. **On mainnet that is FOUR switches, not two** — the two of section 2
+   plus two more that exist specifically so mainnet cannot be armed by accident:
+
+   | switch | default | why it is separate |
+   |---|---|---|
+   | `loans.enabled` | **`false` on mainnet** | without it the lending beans do not exist at all |
+   | `loans.liquidation.mode` | `disabled` | S1 `MODE_NOT_LIVE` |
+   | `loans.liquidation.enabled` | `false` | S2 `NOT_ARMED` |
+   | **`loans.submittable-network`** | **`preview`** | S3 `NETWORK_NOT_PREVIEW` — **a mainnet node fails closed here no matter what the other three say** |
+
+   ⛔ `LOANS_SUBMITTABLE_NETWORK=mainnet` is the switch that has never been set by anyone, on any
+   node. It is the last barrier and it is deliberately not a mode: setting the other three on mainnet
+   still submits **nothing**, and the log says `NETWORK_NOT_PREVIEW`. Treat reaching for it as the
+   moment to stop and get a second pair of eyes.
+
+**Do not skip 1.** Steps 2–3 produce nothing on a wallet-less node, which looks identical to a quiet
+market.
+
+**⚑ And read the veto you actually get.** With the 14.4 configuration the dump is held by
+**`MODE_NOT_LIVE`** (S1), *not* `MARKET_NOT_LIVE` — the node mode is checked before the market's. Seeing
+`MARKET_NOT_LIVE` instead means the node is already `live`+`enabled` and only the market is holding it,
+which is a materially more armed position than you may think you are in.
+
+### 14.8 The other two paths, for completeness
+
+- **Plain `Liquidate`** — no mainnet loan is eligible: the only one permits conversion, so it never
+  routes here. Nothing to configure.
+- **Compound** — no mainnet loan has ever been repaid (one loan minted, never burned), so no escrow
+  exists to compound. And the only live pool manager publishes `compoudingFeePerMille = 0`, so the
+  work would pay nothing and be refused at the shipped margin of 0 regardless. Leave
+  `AQUARIUM_COMPOUND_ENABLED=false`.
+
+---
+
 ## Related documents
 
 - `docs/auto-liquidation-design.md` — the design, including the finance model and the
