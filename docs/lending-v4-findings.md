@@ -4113,3 +4113,71 @@ which is exactly the step that went wrong once already (§44.2). **A diagnostic 
 artefact it is diagnosing forces the guessing it exists to remove.**
 
 Suite **107 files, 896 tests, 38 failures, 24 skipped, 0 orphans**.
+
+---
+
+## 47. ⛔ THE CONVERT ACTION REFUSES A REAL MINSWAP POOL — a question for FluidTokens (2026-09-03)
+
+The diagnostic gap is closed first, exactly as §46.3 said it must be: **the evaluator is handed the CBOR,
+so it is the one place that can see the real body.** Decoding it there turns *"index 3 refused"* into
+*"this script at this address refused"*, with **no hand-derivation in between** — the step that named the
+wrong validator once already (§44.2).
+
+### 47.1 What the artefact says
+
+```
+withdrawals (body order)                          reference inputs (body order)
+ [0] stake17yqxrt0…  loan                          [0] 6ab12cdb…#2   the Minswap pool
+ [1] stake1799y3hu…  oracle                        [1] 7b9f20db…#0   main config
+ [2] stake17x5skj6…  lenderManager   ← now PASSES  [2] 7b9f20db…#1   LM config
+ [3] stake178kc6s0…  convertAction   ← REFUSES     [3] e5943f92…#0   oracle script
+ [4] stake178eqkcp…  loanClaimAction               [4] e874273f…#0   oracle NFT
+```
+
+**Withdrawal 3 is the convert action**, confirmed from the body rather than derived. It fails:
+
+```
+DeserialisationError("UnBData", Constr { tag: 122, fields: [ BoundedBytes(1eae96ba…f44a) ] })
+```
+
+`1eae96baf29e27682ea3f815aba361a0c6059d45e4bfbe95bbd2f44a` is **Minswap's pool batching stake
+credential** — and the live pool datum, decoded from the very UTxO the rig used, is:
+
+```
+field 0  Constr0[ Constr1[ 1eae96ba… ] ]     pool_batching_stake_credential = Inline(Script(…))
+field 1  Constr0[ "", "" ]                   asset_a = ADA
+field 2  Constr0[ 577f0b13…, 0014df10… ]     asset_b = FLDT
+```
+
+### 47.2 The reading, and the alternative — stated as a question, not a verdict
+
+`un_b_data` receiving `Constr1[1eae96ba…]` is what `asset_a.policy_id` produces **if `asset_a` bound to
+field 0** — because field 0's own first element is exactly that. The validator does
+`compute_lp_asset_name(asset_a.policy_id, …)` immediately after
+`expect PoolDatum { asset_a, asset_b, .. }`.
+
+**⇒ The signature of the failure is a `PoolDatum` whose `asset_a` is at index 0** — i.e. one **without**
+the leading `pool_batching_stake_credential` — while every live Minswap V2 pool carries it there.
+
+⚠ **What I can and cannot show.** `aiken.toml` pins `minswap/minswap-dex-v2` at **v2.1**; the declaration
+I could fetch has the credential first, the same as current `main`. **I cannot verify which ref actually
+answered that fetch**, and the Minswap types are absent from the vendored `plutus.json` definitions — so
+the vendored type FluidTokens compiled against is **not an artefact I hold**. The alternative explanation
+is something subtler in how Aiken casts a record with `..` from Data. **I am not asserting the contract
+is broken.**
+
+### 47.3 The question for FluidTokens, and why it matters now
+
+> **Which `amm_dex_v2` version was `lm_liquidate_and_convert_action` compiled against, and what is that
+> version's `PoolDatum` field order?** Evaluated against a real, live ADA/FLDT pool, the deployed action
+> fails reading `asset_a`, in the way a missing leading `pool_batching_stake_credential` would produce.
+
+⚑ Two facts that make this worth asking rather than debugging further:
+- The convert action is **published** on mainnet (`56840ffb…#0`, 5,777 bytes) but **there is no evidence
+  it has ever been invoked** — consistent with a latent incompatibility nobody has hit.
+- Everything upstream of it now passes: loan, oracle and lender-manager withdrawals all evaluate. **The
+  transaction is right up to the point the convert action reads the pool.**
+
+**⇒ If the reading is correct, convert cannot execute on mainnet as deployed, and no amount of off-chain
+work fixes it.** That is a decision for FluidTokens and Giovanni, not something to route around — and it
+is precisely what Stage C was built to find before an image, not after a submission.

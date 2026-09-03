@@ -103,6 +103,54 @@ class ConvertLiveDryEvalTest {
     /** What the evaluator actually said, kept because CCL's wrapper throws it away. */
     private static String lastEvaluatorMessage;
 
+    /**
+     * ⛔ <b>The body the evaluator actually saw, decoded from the bytes it was handed.</b>
+     *
+     * <p>With {@code ignoreScriptCostEvaluationError(false)} the build aborts <em>inside</em>
+     * {@code context.build()}, so the finished transaction never reaches the caller and a failing
+     * redeemer index cannot be matched to a validator from the artefact. The fallback — re-deriving
+     * the ledger's ordering by hand — is exactly the step that went wrong once already: sorting reward
+     * addresses by their bech32 STRINGS instead of their raw bytes named the wrong validator and cost
+     * an hour (findings §44.2).
+     *
+     * <p><b>The evaluator is handed the CBOR, so it is the one place that can see the real thing.</b>
+     * Decoding it here turns "index 3 refused" into "this script at this address refused", with no
+     * derivation in between.
+     */
+    private static String describe(byte[] cbor) {
+        try {
+            Transaction tx = Transaction.deserialize(cbor);
+            StringBuilder out = new StringBuilder("\n--- the body the evaluator saw ---\n");
+            int i = 0;
+            out.append("reference inputs (body order):\n");
+            for (var ri : tx.getBody().getReferenceInputs()) {
+                out.append("  [").append(i++).append("] ").append(ri.getTransactionId())
+                        .append('#').append(ri.getIndex()).append('\n');
+            }
+            i = 0;
+            out.append("withdrawals (body order):\n");
+            for (var w : tx.getBody().getWithdrawals()) {
+                out.append("  [").append(i++).append("] ").append(w.getRewardAddress()).append('\n');
+            }
+            i = 0;
+            out.append("outputs (body order):\n");
+            for (var o : tx.getBody().getOutputs()) {
+                out.append("  [").append(i++).append("] ").append(o.getAddress(), 0,
+                        Math.min(24, o.getAddress().length())).append("… coin=")
+                        .append(o.getValue().getCoin()).append('\n');
+            }
+            if (tx.getWitnessSet() != null && tx.getWitnessSet().getRedeemers() != null) {
+                out.append("redeemers:\n");
+                for (var r : tx.getWitnessSet().getRedeemers()) {
+                    out.append("  ").append(r.getTag()).append(':').append(r.getIndex()).append('\n');
+                }
+            }
+            return out.toString();
+        } catch (Exception e) {
+            return "\n(could not decode the body the evaluator saw: " + e + ")";
+        }
+    }
+
     private static BFBackendService backend() {
         return new BFBackendService(URL, System.getenv("BLOCKFROST_MAINNET_KEY"));
     }
@@ -243,7 +291,7 @@ class ConvertLiveDryEvalTest {
                         chain.append(t.getClass().getSimpleName()).append(": ")
                              .append(t.getMessage()).append(" | ");
                     }
-                    lastEvaluatorMessage = chain.toString();
+                    lastEvaluatorMessage = chain + "\n" + describe(cbor);
                     throw e;
                 }
             }
