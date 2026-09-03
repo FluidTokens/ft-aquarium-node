@@ -3465,7 +3465,22 @@ being an invariant and become a measurement. Then the operator docs.
 
 ---
 
-## 38. ⛔ A CONVERT CAN NEVER BE DRY-EVALUATED OFFLINE — and what that does to the proof strategy (2026-09-03)
+## 38. ⛔ RETRACTED IN PART — "a convert can never be dry-evaluated offline" was an OVERCLAIM (2026-09-03)
+
+> **⛔ RETRACTION, same day, on Giovanni's challenge. §40 carries the correction and the evidence;
+> this section is left standing because the reasoning that produced the error is worth reading.**
+>
+> **What stands:** every convert requires the oracle withdrawal (§38.1's three steps are correct), and
+> shadow-on-mainnet remains the in-situ final check.
+>
+> **What is WRONG:** §38.2's *"the offline rig structurally cannot fabricate an oracle leg"* and §38.4's
+> *"not offline-provable"*. **The oracle feed, its validity window and its signature are all PUBLISHED
+> by FluidTokens' own API — the one this node already consumes in production.** Nothing needs
+> fabricating; it needs fetching.
+>
+> **The error, named:** I reasoned from *"no rig here does this"* to *"no rig can"*. The sibling oracle
+> rigs are red because they **pinned a payload whose window expired** — stale data, which is a fixture
+> problem, not a capability one. Giovanni said exactly that and he was right.
 
 Sub-stage C was to be the offline dry-eval of the convert transaction against the §32 fixtures. **It is
 blocked, structurally, and not by anything in the builder.** Reported rather than papered over.
@@ -3612,3 +3627,81 @@ result.**
 
 **Remaining in Stage D:** routing on `MarketGate.actionFor()` · the pool resolver · `ConvertEconomics`
 called with the built fee · a decision `variant` for convert.
+
+---
+
+## 40. ⇒ THE CORRECTION: convert IS offline dry-evaluable, and nothing needs forging (2026-09-03)
+
+Giovanni challenged §38's *"never"* — *"it is a smart-contract tx, any TX evaluator can run it; the
+question is what the oracle leg needs, not whether evaluation is possible."* He is right. This is the
+mechanism, verified rather than reasoned.
+
+### 40.1 The oracle validator has THREE branches, and only one needs a signature
+
+Read at `e0b818e`, `validators/oracle.ak`'s `withdraw`:
+
+| redeemer variant | what it requires | can we supply it? |
+|---|---|---|
+| `PriceDataCharlie` | a Charli3 provider **reference input** with an inline `OracleDatum`, its identifier NFT, window containment, and a price identity | ✅ **reads only — no signature at all** |
+| `PriceDataOrcfax` | Orcfax pointer + price reference inputs, same shape | ✅ reads only |
+| `_` (aggregated / multisig / dedicated) | `verify_ed25519_signature` over `serialise_data(redeemer.data)`, n-of-m against the validator's baked-in keys | ⚠ needs a signature — **which FluidTokens publishes** |
+
+⚑ Note what the uniqueness line at the top does **not** do: `expect list.unique(sigs) == sigs` is
+satisfied by an **empty** list. It is a duplicate guard, not a presence check — so the two
+reference-input branches genuinely carry no signature requirement.
+
+### 40.2 And for the REAL candidate the signature is handed to us
+
+`https://api.fluidtokens.com/get-oracle-tokens` — the endpoint `FluidOracleClient` already consumes in
+production — was fetched read-only this session. Its FLDT entry:
+
+```
+preferredOracle: multisig          supportedOracle keys: ["multisig"]      (no Charli3 entry on mainnet)
+validFrom  1788463500334   validTo  1788466500334      (2026-09-03 19:25:00 .. 20:15:00 UTC — 50 minutes)
+price      22265406 / 100000000  = 0.22265406 lovelace per FLDT unit
+signatures 1 present, threshold 1
+```
+
+**⇒ The feed, its window and its signature are all published.** Nothing is forged. And the price is a
+useful cross-check: **0.22265406** against the live pool's mid-price of **≈0.22280** — four significant
+figures apart, which is what an oracle and a pool should look like.
+
+⚠ *The loan datum's oracle asset is named `oracleFLDTC3`, and the "C3" reads as Charli3 — but the
+registry says mainnet FLDT is served **multisig-only**. The asset NAME is not the provider.* That is
+the same shape as §32: **a name is not evidence of what a thing is.**
+
+### 40.3 Why the sibling rigs are red, and what the convert rig must do differently
+
+**The feed window is fifty minutes.** `RealLoanDryEvalTest` and `LiquidatePayInAdvanceDryEvalTest`
+**pinned a captured payload**, so they were correct for fifty minutes and have been wrong ever since.
+That is the whole of their redness — a fixture problem, not a capability one.
+
+**⇒ So the convert dry-eval must FETCH THE FEED AT RUN TIME** and set the transaction's validity
+interval inside `validFrom..validTo`, gated and skipping without credentials like
+`LoansConfigVerifierLiveTest`. **A pinned oracle payload is a test with a fifty-minute shelf life**,
+and this repo has two of them already.
+
+### 40.4 What this changes
+
+- **Convert gets a PRE-DEPLOY offline proof.** Better than shadow-only: the transaction can be
+  evaluated, with real ex-units, before anything is deployed anywhere.
+- **Shadow-on-mainnet is still the in-situ final check** — real UTxOs, real protocol parameters, the
+  chain's own state at that instant — but it is **no longer the only proof**, and §38.3's claim that it
+  is must not be quoted.
+- **§33.2's placeholder-ex-units detector stays load-bearing** for the shadow path; it simply is not
+  the sole line of defence any more.
+
+### 40.5 ⚑ The error worth keeping
+
+**I reasoned from "no rig here does this" to "no rig can."** The absence in front of me was a *fixture*
+limitation and I read it as a *structural* one — then wrote "never", which is the strongest possible
+claim, off the weakest possible evidence.
+
+**⇒ "No existing X does this" is not "X cannot".** It is the mirror of §34's lesson — *a sample proves
+what it contains and cannot reach a variant nobody uses* — and both reduce to the same discipline:
+**an absence is evidence about the observation, not about the world.** §34 got it right by going to a
+second source; §38 got it wrong by not.
+
+And the tell was in my own text: option (i) in §38.4 said the fix was *"fresh oracle payloads"* — which
+concedes the thing "never" denies. **A conclusion contradicted by its own escape hatch is not a
+conclusion.**
