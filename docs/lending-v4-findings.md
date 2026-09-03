@@ -4229,3 +4229,86 @@ datum would not produce two numbers that happen to match the pool's actual holdi
 
 ⇒ So the live pools are unambiguous, and §47's question is entirely about **what the deployed validator
 was compiled to expect** — which remains the one thing not in our hands.
+
+---
+
+## 49. The verdict on §47: (a) and (b) RULED OUT — the ground left is (c), ours (2026-09-03)
+
+Giovanni's instruction was right: both contracts are public, so this is answerable from source and real
+transactions without asking anyone. Four checks, and the answer is **not** the one the symptom suggested.
+
+### 49.1 The two compiler versions, quoted
+
+| | source | version |
+|---|---|---|
+| **FluidTokens** | the DEPLOYED `plutus.json` preamble we vendor | **Aiken `v1.1.21+42babe5`** |
+| **Minswap `amm_dex_v2`** | `aiken.toml` on the pinned ref | declares `compiler = "v1.1.9"` |
+| *(this machine, for the probe below)* | | `v1.1.23+8949565` |
+
+**Neither is an alpha.** Giovanni's serialisation-skew concern is the right question to ask and does not
+apply here on version grounds alone — so it had to be tested behaviourally, which it was (§49.3).
+
+### 49.2 ⛔ (a) RULED OUT — the types are identical, and have been since April 2025
+
+`aiken.toml` pins `minswap/minswap-dex-v2` at `v2.1`. ⚠ **There is no `v2.1` TAG** — the repository has
+exactly one tag, `v2.0.0`. **`v2.1` is a BRANCH**, head `7d8e1576ddeb` (2025-04-23, *"refactor: plutus
+v3; withdraw zero"*). Fetched at that exact commit, `PoolDatum` is:
+
+```aiken
+pool_batching_stake_credential: Credential,   asset_a: Asset,   asset_b: Asset,
+total_liquidity, reserve_a, reserve_b, base_fee_a_numerator, base_fee_b_numerator,
+fee_sharing_numerator_opt, allow_dynamic_fee
+```
+
+**Identical to current `main`, and identical to what the live pools carry.** The file's last change on
+that branch is that same 2025-04-23 commit, and FT's deployment is 2026-09 — **so no plausible build
+date gets a different declaration.**
+
+⚠ **A real hazard found in passing, even though it is not the cause:** the dependency is pinned to a
+**mutable branch**, and `aiken.lock`'s `[etags]` section is **empty** — *nothing records which commit
+was fetched.* Reproducing FT's build is therefore not possible from their repo alone. That is worth
+raising with them independently of this bug.
+
+### 49.3 ⛔ (b) RULED OUT — the record pattern binds BY NAME, tested rather than assumed
+
+The symptom is `un_b_data` receiving `Constr1[1eae96ba…]`, which is what `asset_a.policy_id` yields **if
+`asset_a` bound to field 0** — the credential — rather than field 1. So the question is whether
+`expect PoolDatum { asset_a, asset_b, .. } = <Data>` binds by name or positionally.
+
+**Tested with a scratch Aiken project** carrying the v2.1 declaration verbatim: build a `PoolDatum` with
+distinctive values, cast to `Data`, destructure exactly as the validator does, assert `asset_a` is the
+**second** field.
+
+```
+test asset_a_binds_by_name_not_by_position … PASS   (mem 79,500 / cpu 23,447,836)
+```
+
+**The pattern binds by name.** So the construct is not the explanation.
+
+### 49.4 Also verified, and also not the cause
+
+- **The pool address's payment credential IS the configured `minswapPoolSpendScriptHash`** —
+  `ea07b733…`, decoded from the bech32 address itself. So `get_inputs_from_smart_credential` finds
+  exactly one pool reference input and index 0 is right.
+- **The reference-input and withdrawal orders come from the built body**, not from a derivation
+  (§44.2's lesson): the pool sorts to reference index 0, the main config to 1, and withdrawal 3 is the
+  convert action.
+- ⚠ **A false alarm I nearly reported**: `grep smart_tokens` found nothing in the upstream tree and I
+  briefly concluded the source could not compile. The directory is `lib/smart-tokens` — **a hyphen.**
+  *Checking before reporting is the only reason that did not become a finding.*
+
+### 49.5 ⇒ THE VERDICT: (c). The ground left is ours, and I have not found it
+
+Every external explanation is eliminated with evidence: **the types match, the versions are stable
+releases, the binding construct behaves, the credential resolves, the indices come from the artefact.**
+What remains is our own encoding or resolution of the pool reference input — and **I have not located
+it, which I am saying rather than continuing to guess.**
+
+⇒ **The next step is instrumentation, not reasoning.** Every wrong turn in this investigation came from
+deriving what the machine could have shown: the bech32 sort (§44.2), the withdrawal action (§46), and
+twice more here. **The rig can now print the body; it should next print what the convert action is
+handed** — the resolved pool input and the exact datum bytes at the index the redeemer names.
+
+⚑ And one thing worth keeping regardless of where the bug lands: **the investigation was worth doing
+even though its verdict is "ours".** It cost a day of somebody's goodwill to *not* send FluidTokens a
+question that would have been wrong.
