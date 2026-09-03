@@ -4443,3 +4443,49 @@ answer from the first run.
 
 ⚑ *Environment note: this required switching the local Aiken to v1.1.21 via `aikup`. It has been
 switched back to v1.1.23, the version that was installed before.*
+
+---
+
+## 52. The convert path becomes reachable from the container — and a safety property that held by luck (2026-09-04)
+
+Item 1 of the launch track. `ConvertTransactionBuilder`, `MinswapPoolResolver` and
+`ConvertLiquidationRouter` had **no bean definition at all** — no stereotype annotation, no `@Bean`
+factory — while the path was reported *"complete on our side"*. Every test constructed them by hand, so
+**the whole suite was green and a deployed node would have found `convertRouter == null`** and refused
+every convert-eligible candidate.
+
+Three `@Bean` factories on `YaciConfig`, beside the builders they mirror, each carrying the real
+Blockfrost evaluator and each `@ConditionalOnProperty(loans.enabled)` like its siblings.
+
+### 52.1 ⚑ THE PROPERTY THAT MADE THE ABSENCE SAFE WAS A COINCIDENCE
+
+`LiquidationExecutor` records **`CONVERT_UNAVAILABLE`** rather than falling back to pay-in-advance — and
+that guard was written for a *different_ reason: a node whose `loans.minswap.*` coordinates belong to
+another network. **It happens to be exactly what makes a missing bean safe**, because without it those
+loans would have gone silently down the path that **fronts the operator's own capital**.
+
+> **A safety property that holds by coincidence is worth exactly one test.** It now has one, and the
+> mutant that deletes the guard kills it.
+
+⚠ Note what the coincidence rewarded: **refuse-by-name over silent-fallback** was argued on principle
+when there was no bug in sight — *"the one substitution that spends money nobody authorised"*. It paid
+off against a defect nobody had found yet. **That is the argument for the principle, not for the
+foresight.**
+
+### 52.2 What the test asserts, and why it does not start a context
+
+These beans take `BFBackendService`, which reaches the network on construction in a way a stub cannot
+stand in for — **a context test here would be testing the stub.** So it asserts by reflection over
+`YaciConfig` the three things that were actually missing: **a definition exists**, it is **conditioned
+like its siblings**, and it **returns the type**. Plus the executor's null-router guard, asserted on
+source because the branch needs an armed, live, convert-market node with a null router — *a state this
+suite cannot assemble, and whose absence of a test is exactly how the property came to hold by
+coincidence.*
+
+**Verification:** 3 tests, 3 mutants, each killed by exactly one — the router factory removed, the pool
+resolver ungated, and the null-router guard deleted. Suite **108 files, 899 tests, 38 failures, 24
+skipped, 0 orphans** — baseline unchanged.
+
+⚠ **Still not exercised end to end.** Convert remains blocked behind FluidTokens' redeploy (§51): this
+makes it *reachable*, not *proven on chain*. The distinction is the one that matters for launch
+readiness and it is not closed by this commit.

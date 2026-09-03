@@ -10,6 +10,10 @@ import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics;
+import com.fluidtokens.aquarium.offchain.service.loans.ConvertLiquidationRouter;
+import com.fluidtokens.aquarium.offchain.service.loans.ConvertTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
@@ -108,6 +112,71 @@ public class YaciConfig {
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
         return new CompoundTransactionBuilder(registry, network.getCardanoNetwork(), bfBackendService,
                 utxoSupplier, protocolParamsSupplier, scriptCostEvaluator);
+    }
+
+    /**
+     * The Minswap pool resolver — how a convert finds the ONE pool for a loan's pair.
+     *
+     * <p>⛔ <b>It queries the provider; it does NOT read the node's index, and no index is needed.</b>
+     * The LP asset name is <em>computable</em> from the pair (SHA3-256, twice — findings §34), so this
+     * asks for one specific asset rather than searching: {@code /addresses/{poolAddress}/utxos/{lpUnit}}
+     * returns exactly one row. Indexing Minswap instead would pull every V2 pool on the network into
+     * this node's storage and need a far-back {@code sync-start} (§39.2).
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
+    public MinswapPoolResolver minswapPoolResolver(AppConfig.LoansConfiguration loansConfiguration,
+                                                   BFBackendService bfBackendService) {
+        return new MinswapPoolResolver(bfBackendService.getUtxoService(),
+                loansConfiguration.getMinswapPoolAddress(),
+                loansConfiguration.getMinswapPoolPolicyId());
+    }
+
+    /**
+     * The convert builder. Wired exactly as its siblings above, and for the same reason: <b>the
+     * operator's whole risk case for this path — "exposure is the transaction fee per execution" — is
+     * true only while the ex-units are MEASURED.</b> Placeholder ex-units move the exposure to the
+     * collateral (CCL trap 8), and this class has no constructor that permits them.
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
+    public ConvertTransactionBuilder convertTransactionBuilder(LoansContractRegistry registry,
+                                                               AppConfig.Network network,
+                                                               UtxoSupplier utxoSupplier,
+                                                               ProtocolParamsSupplier protocolParamsSupplier,
+                                                               BFBackendService bfBackendService) {
+        TransactionEvaluator scriptCostEvaluator =
+                (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
+        return new ConvertTransactionBuilder(registry, network.getCardanoNetwork(), bfBackendService,
+                utxoSupplier, protocolParamsSupplier, scriptCostEvaluator);
+    }
+
+    /**
+     * The convert seam the executor routes to when a market's {@code action} is {@code CONVERT}.
+     *
+     * <p>⛔ <b>Its ABSENCE is a named refusal, not a fallback</b> — {@code LiquidationExecutor} records
+     * {@code CONVERT_UNAVAILABLE} rather than quietly routing the candidate to pay-in-advance, which
+     * would front the operator's own capital on a loan they configured to convert. So a node that
+     * cannot derive the convert action (its {@code loans.minswap.*} belonging to another network) is
+     * safe by construction.
+     *
+     * <p>⚠ <b>This bean is only conditional on {@code loans.enabled}, deliberately, and NOT on the
+     * convert action being derivable.</b> Making its existence depend on the derivation would turn a
+     * legible refusal into a missing bean, and this project has already learned what an unwired
+     * component costs: image {@code lending-v4-588d318} crash-looped in fourteen seconds because a
+     * collaborator Spring could not construct was found at startup rather than by a test
+     * ({@code ExecutorContextResolutionTest}).
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
+    public ConvertLiquidationRouter convertLiquidationRouter(LoansContractRegistry registry,
+                                                             AppConfig.LoansConfiguration loansConfiguration,
+                                                             MinswapPoolResolver minswapPoolResolver,
+                                                             ConvertEconomics convertEconomics,
+                                                             ConvertTransactionBuilder convertTransactionBuilder,
+                                                             AppConfig.Network network) {
+        return new ConvertLiquidationRouter(registry, loansConfiguration, minswapPoolResolver,
+                convertEconomics, convertTransactionBuilder, network.getCardanoNetwork());
     }
 
     /**
