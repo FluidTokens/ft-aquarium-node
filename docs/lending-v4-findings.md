@@ -3036,3 +3036,91 @@ does not reach it.
 one test each. The boot line is asserted through a real log appender, including that it names the path
 and the floor. Suite **98 files, 833 tests, 38 failures, 22 skipped, 0 orphans** — distribution
 unchanged.
+
+---
+
+## 32. ⛔ `d832b78e…` IS NOT A CONVERT — it is the loan a convert would act on (2026-09-03)
+
+Relayed as *"a test convert tx ready to go"* and passed on as a **golden reference: a real, on-chain,
+validated instance of the exact transaction shape the builder must produce**, to be used as a diff
+target. **Decoded from mainnet, it is a loan-origination (borrow) transaction.** Building a convert
+builder to diff against it would have been building against the wrong shape — so this is recorded
+first, before anything downstream rests on it.
+
+### 32.1 What settles it, from the chain rather than from the name
+
+| evidence | reading |
+|---|---|
+| **three MINTs** — loan NFT `0061ade3…`, lender bond `bcd713bb…`, borrower bond `eadc69a5…` | **a convert mints nothing** |
+| **no Minswap order output** | creating one is the convert action's entire purpose |
+| **no Minswap pool reference input** | the convert action requires one and fails without it |
+| a pool UTxO spent and re-created, 53.75 → 33.75 ada | principal leaving a pool: origination |
+| ref inputs include **both bond-MINT scripts** (`90efd6a6…`, `cf66c3c5…`) | the two §24.2a says convert never touches |
+
+`valid_contract: true`, block 13,892,677, 3,933 bytes, 7 redeemers, 3 withdraw-0 invocations.
+
+**⇒ There is still no convert transaction on any network**, so §28.1 stands unchanged: the offline rig
+plus shadow-on-mainnet remain the whole rehearsal. What this does retire is the idea that a diff target
+exists.
+
+### 32.2 ✅ What it IS — the first real convert candidate this path has ever had
+
+| | value |
+|---|---|
+| loan | `d832b78e…#1` — loan NFT + **100,000,000 FLDT** (`577f0b13…0014df10464c4454`) |
+| principal | **20,000,000 lovelace** |
+| collateral oracle | `93794f9b…` `oracleFLDTC3` (Charli3 FLDT) |
+| lender bond | `d832b78e…#3` |
+| **shouldLiquidationConvertToPrincipal** | **True** ⇒ the convert action's first conjunct passes |
+| **liquidationFeePerMille** | **50** (5%) |
+
+Every fixture is committed under `src/test/resources/loans-v4/` with its provenance.
+
+### 32.3 ⚑ Three Minswap facts the builder needs, measured on chain rather than recalled
+
+The vendored `amm_dex_v2` library is **not** in the upstream clone (it is a Aiken dependency, not a
+committed source file), so these were taken from mainnet instead — which is the stronger source anyway.
+
+- **`compute_lp_asset_name` is SHA3-256, not blake2b.** Computed both ways for ADA/FLDT and asked the
+  chain: blake2b gives `b3675eb2…` → **404**; `sha3_256(sha3_256(polA‖nameA) ‖ sha3_256(polB‖nameB))`
+  gives `bc53f5c2…` → **200, the live LP token**. A single hash-function assumption would have made
+  every order datum wrong, and it would have failed only on chain.
+- **The pool NFT's asset name is the constant `4d5350` — ASCII `MSP`** — the same for every pool, not a
+  per-pool hash. So the redeemer's `minswapPoolAssetName` is a constant, while `lpAssetName` is the
+  computed one; they are different values under the same policy, and confusing them is easy.
+- **The live ADA/FLDT `PoolDatum`**, field order confirmed against the validator's `expect`:
+  `asset_a` = **ADA**, `asset_b` = **FLDT**, reserves 1,692,342,884,761 / 7,596,442,927,398,
+  fees 80/80, `fee_sharing = Some(1666)`. ⇒ For this loan **`lpABDirection = False`**, and the
+  validator's else-branch (`asset_b == collateral && asset_a == principal`) holds. **The pool exists and
+  the pair is convertible.**
+
+⚠ The pool UTxO reference moves on every swap. A builder must resolve it by **NFT at run time**; a
+pinned coordinate is a fixture only.
+
+### 32.4 ⛔ AND THE ANSWER THE OPERATOR NEEDS BEFORE ARMING THE BOX: this candidate is REFUSED
+
+Run through the shipped gate (`9f5d101`), priced at the pool's own mid-price:
+
+```
+liquidationFee   = 100,000,000 × 50 / 1000 = 5,000,000 FLDT units   (income, in TOKENS)
+feeValueLovelace = 1,113,904                                        (≈1.11 ada)
+measuredOutlay   = 500,000 tx fee + 2,800,000 order rider = 3,300,000
+outlay           = max(3,300,000, 5,000,000 floor) = 5,000,000
+net              = −3,886,096   ⇒ NET_BELOW_FLOOR, REFUSED
+```
+
+**A 5% fee on a 20-ada loan is about 1.1 ada, and one DEX interaction costs 5.** So the shipped
+defaults refuse it, correctly and by design — a bot that took it would be paying ~3.9 ada to do the
+work.
+
+**⇒ To convert this loan Giovanni must state a negative margin**, which is legal on mainnet since
+§31 and announced loudly at boot. That is not a workaround; it is precisely the protocol-health mode he
+described the same day — *"our bot to be used by FluidTeam to clean up loans non-profitable for other
+operators but still need cleanup"*. **This candidate is that case, arriving within hours of the ruling
+that permits it.**
+
+The arithmetic is pinned in `MainnetConvertCandidateTest`, including the exact floor that accepts it,
+so a change to the gate that quietly flips this verdict fails a test rather than surprising an operator.
+
+⚠ The figure uses the **pool mid-price**; production prices the fee off the Charli3 `oracleFLDTC3` feed
+the loan names. The two will differ slightly — but not by the ~4× that would change the verdict.
