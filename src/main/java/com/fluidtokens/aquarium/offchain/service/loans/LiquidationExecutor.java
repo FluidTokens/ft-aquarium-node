@@ -13,6 +13,8 @@ import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.bloxbean.cardano.client.address.AddressProvider;
+import com.bloxbean.cardano.client.address.Credential;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
@@ -222,6 +224,19 @@ public class LiquidationExecutor {
     private final PayInAdvanceLiquidationRouter payInAdvanceRouter;
 
     /**
+     * The CONVERT seam. A convert-eligible candidate whose market says {@code action: CONVERT} — which
+     * is every unlisted market, per Giovanni's ruling — is routed here rather than to
+     * {@link #payInAdvanceRouter}.
+     *
+     * <p>⚠ <b>Nullable, and its absence is a NAMED refusal rather than a fallback.</b> A node whose
+     * {@code loans.minswap.*} coordinates belong to another network cannot derive the convert action
+     * at all (§36.1), so this bean legitimately does not exist there. Quietly routing such a candidate
+     * to pay-in-advance instead would front the operator's capital on a loan they configured to
+     * convert — <b>the one substitution that spends money nobody authorised.</b>
+     */
+    private final ConvertLiquidationRouter convertRouter;
+
+    /**
      * The runtime-derived v4 hashes. Read here for one thing only: the asset-manager spend script
      * hash, which is the payment credential the builder sends every funded asset-manager output to,
      * so {@link #minAdaFunded} can pick those outputs out of the finished body by credential rather
@@ -281,6 +296,7 @@ public class LiquidationExecutor {
                                LiquidationUtxoResolver utxoResolver,
                                LiquidateTransactionBuilder builder,
                                PayInAdvanceLiquidationRouter payInAdvanceRouter,
+                               ObjectProvider<ConvertLiquidationRouter> convertRouter,
                                LoansContractRegistry registry,
                                LiquidationDecisionLog decisionLog,
                                ObjectProvider<FluidOracleClient> oracleClient,
@@ -289,8 +305,9 @@ public class LiquidationExecutor {
                                CardanoConverters converters,
                                BFBackendService backendService) {
         this(configuration, blockEventListener, appUtxoService, account, scanner, utxoResolver, builder,
-                payInAdvanceRouter, registry, decisionLog, oracleClient, network, protocolParamsSupplier,
-                converters, bytes -> backendService.getTransactionService().submitTransaction(bytes));
+                payInAdvanceRouter, convertRouter.getIfAvailable(), registry, decisionLog, oracleClient,
+                network, protocolParamsSupplier, converters,
+                bytes -> backendService.getTransactionService().submitTransaction(bytes));
     }
 
     /** The same loop with the submitter stated, so a test can watch exactly what reaches the wire. */
@@ -309,6 +326,28 @@ public class LiquidationExecutor {
                                ProtocolParamsSupplier protocolParamsSupplier,
                                CardanoConverters converters,
                                TransactionSubmitter submitter) {
+        this(configuration, blockEventListener, appUtxoService, account, scanner, utxoResolver, builder,
+                payInAdvanceRouter, null, registry, decisionLog, oracleClient, network,
+                protocolParamsSupplier, converters, submitter);
+    }
+
+    /** The full form, with the convert seam stated. */
+    public LiquidationExecutor(AppConfig.LiquidationConfiguration configuration,
+                               BlockEventListener blockEventListener,
+                               AppUtxoService appUtxoService,
+                               Account account,
+                               LiquidationCandidateScanner scanner,
+                               LiquidationUtxoResolver utxoResolver,
+                               LiquidateTransactionBuilder builder,
+                               PayInAdvanceLiquidationRouter payInAdvanceRouter,
+                               ConvertLiquidationRouter convertRouter,
+                               LoansContractRegistry registry,
+                               LiquidationDecisionLog decisionLog,
+                               ObjectProvider<FluidOracleClient> oracleClient,
+                               AppConfig.Network network,
+                               ProtocolParamsSupplier protocolParamsSupplier,
+                               CardanoConverters converters,
+                               TransactionSubmitter submitter) {
         this.configuration = configuration;
         this.blockEventListener = blockEventListener;
         this.appUtxoService = appUtxoService;
@@ -317,6 +356,7 @@ public class LiquidationExecutor {
         this.utxoResolver = utxoResolver;
         this.builder = builder;
         this.payInAdvanceRouter = payInAdvanceRouter;
+        this.convertRouter = convertRouter;
         this.registry = registry;
         this.decisionLog = decisionLog;
         this.oracleClient = oracleClient;
@@ -857,7 +897,66 @@ public class LiquidationExecutor {
             // until now, so the only way to notice one had happened was a FALLING wallet balance
             // read off chain. An armed, unspecified and unobservable behaviour is three problems,
             // and the cheapest of them to fix is the third.
-            log.info("{} is a CONVERT liquidation (LiquidateAndPayInAdvance): the bot PAYS the "
+            // ⛔ THE MECHANISM IS THE OPERATOR'S, WITHIN THE CLASS THE LENDER PERMITTED. The bond flag
+            // above says this loan MAY be converted; the market says HOW (findings §27). An unlisted
+            // market converts — Giovanni's ruling, and the safe default, because convert fronts no
+            // capital and holds nothing.
+            AppConfig.LiquidationConfiguration.Action action =
+                    new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset());
+
+            if (action == AppConfig.LiquidationConfiguration.Action.CONVERT) {
+                // ⚠ A node whose loans.minswap.* belong to another network cannot derive the convert
+                // action at all, so this bean legitimately does not exist there. Refusing by NAME is
+                // the only honest answer: silently falling back to pay-in-advance would front the
+                // operator's own capital on a loan they configured to convert — the one substitution
+                // that spends money nobody authorised.
+                if (convertRouter == null) {
+                    String why = "market " + assessment.loan().datum().principalAsset().toUnit()
+                            + " is action: CONVERT but this node cannot convert (loans.minswap.* is "
+                            + "unset or belongs to another network — see the CONVERT UNAVAILABLE line "
+                            + "at boot). NOT falling back to pay-in-advance: that would front capital "
+                            + "the operator did not authorise";
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                            "CONVERT_UNAVAILABLE", why));
+                    log.warn("the liquidation of {} was refused: {}", loanUtxoRef, why);
+                    return;
+                }
+                log.info("{} is a CONVERT liquidation (LiquidateAndConvert): the bot creates a Minswap "
+                                + "order, fronts nothing, and keeps the liquidation fee in collateral",
+                        loanUtxoRef);
+                try {
+                    transaction = convertRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
+                            bondUtxo.get(), configUtxo, lmConfigUtxo,
+                            walletUtxos.isEmpty() ? null : walletUtxos.get(0), oraclesByUnit,
+                            account.baseAddress(), validFromMillis, validToMillis);
+                } catch (ConvertLiquidationRouter.NoPoolException e) {
+                    // Impossible, not unprofitable — and the fix is the operator's: set this market to
+                    // action: ANTICIPATE if the loan should still be liquidated.
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                            "NO_MINSWAP_POOL", e.getMessage()));
+                    log.info("the convert liquidation of {} was refused: {}", loanUtxoRef, e.getMessage());
+                    return;
+                } catch (ConvertLiquidationRouter.UnprofitableException e) {
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.UNPROFITABLE,
+                            String.valueOf(e.assessment().exclusion()), e.getMessage()));
+                    log.info("the convert liquidation of {} is not worth doing: {}", loanUtxoRef,
+                            e.getMessage());
+                    return;
+                } catch (Exception e) {
+                    quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                            rootReason(e), causeChain(e)));
+                    log.error("building the convert liquidation of {} failed: {}", loanUtxoRef,
+                            causeChain(e), e);
+                    return;
+                }
+                // Falls through to the shared record-and-maybe-submit path below, deliberately: the
+                // nine submit vetoes, the shadow dump and the decision record are the SAME for every
+                // variant, and a convert that bypassed them would be the one path an operator cannot
+                // watch through the endpoint they already use.
+            } else {
+
+            log.info("{} is a PAY-IN-ADVANCE liquidation: the bot PAYS the "
                             + "lender in ada and acquires the collateral, rather than earning a fee",
                     loanUtxoRef);
             // Convert loan: routed to the promoted, submit-incapable pay-in-advance builder. The same
@@ -915,6 +1014,7 @@ public class LiquidationExecutor {
                 log.error("building the pay-in-advance liquidation of {} failed: {}",
                         loanUtxoRef, causeChain(e), e);
                 return;
+            }
             }
         } else {
             // T-052 — A FEE-ONLY LIQUIDATION MUST NOT BE MADE TO DEMAND A LARGE INPUT.

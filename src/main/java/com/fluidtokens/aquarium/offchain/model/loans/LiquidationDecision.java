@@ -85,6 +85,19 @@ public record LiquidationDecision(long decidedAt,
     public static final String VARIANT_CONVERT = "LiquidateAndPayInAdvance";
 
     /**
+     * {@code LiquidateAndConvert}: the bot builds a Minswap swap order inside the liquidation and
+     * <b>fronts nothing</b> — the batcher supplies the principal, and both the proceeds and any refund
+     * land in the LENDER's asset manager (findings §25.2).
+     *
+     * <p>⚑ A third label, not a reuse of {@link #VARIANT_CONVERT}. That one is named "convert" for
+     * historical reasons and actually means <em>pay-in-advance</em>, where the bot PAYS the lender out
+     * of its own wallet and acquires the collateral — <b>the opposite sign</b>. Two paths that a
+     * decision log cannot tell apart are two paths an operator cannot reason about, and the older name
+     * is exactly the confusion this must not inherit.
+     */
+    public static final String VARIANT_CONVERT_MINSWAP = "LiquidateAndConvert";
+
+    /**
      * <b>Temporary back-compatibility. Remove at T-010.</b>
      * <p>
      * The 24-argument shape this record had before {@link #submitVeto} existed. It is here for one

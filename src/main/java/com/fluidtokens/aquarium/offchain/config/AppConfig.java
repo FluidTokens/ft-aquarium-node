@@ -196,6 +196,22 @@ public class AppConfig {
         @Value("${loans.minswap.order-spend-script-hash:c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c}")
         private String minswapOrderSpendScriptHash = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
 
+        /**
+         * The address every Minswap V2 pool sits at on this network — payment credential
+         * {@link #minswapPoolSpendScriptHash} plus Minswap's batching stake credential. Stable per
+         * network; the <b>pool UTxO inside it is not</b>, and is resolved by its LP asset at scan time.
+         *
+         * <p>⛔ <b>Why an address and not an index.</b> This node does not — and should not — index
+         * Minswap pools: {@code TankUtxoStorage} keeps only the derived lending credentials, so a pool
+         * UTxO is discarded at write time with no trace it was offered (findings §39.2). Indexing them
+         * would pull every V2 pool on the network into storage and need a far-back {@code sync-start}.
+         * One provider query per candidate is the proportionate answer, and it is the same shape the
+         * oracle registry client already uses.
+         */
+        @Value("${loans.minswap.pool-address:addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a}")
+        private String minswapPoolAddress =
+                "addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a";
+
         /** The tx that minted both config NFTs; the point history has to be indexed from. */
         @Value("${loans.config.ref-utxo-tx-hash:}")
         private String configRefUtxoTxHash;
