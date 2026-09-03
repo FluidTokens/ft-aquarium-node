@@ -3974,3 +3974,76 @@ thing to fix.
 
 ⚠ The rig skips without the mainnet key, so the suite baseline is unchanged: **106 files, 893 tests, 38
 failures, 24 skipped** (+2 skipped, the two gated tests).
+
+---
+
+## 45. What actually protects a convert swap — two corrections to the team's model (2026-09-03)
+
+Giovanni asked the FluidTokens team, in substance: *how do I know a pool is good, does the contract
+guarantee the order is executable, and could a dishonest bot create an order that satisfies the
+liquidation but is out of range for the pool?* The answers he got were reassuring and **two of them do
+not match the deployed validator**. Checked at `e0b818e`, the validators winning over recollection as
+CLAUDE.md requires.
+
+### 45.1 ⛔ The convert validator does NOT check pool liquidity
+
+Raul: *"Il contratto ha il check che la pool sia abbastanza liquida … Se non lo è fallisce … Slippage."*
+
+`lm_liquidate_and_convert_action.ak` destructures the pool exactly once:
+
+```aiken
+expect minswap_types.PoolDatum { asset_a, asset_b, .. } = minswapPoolRefInputDatum
+```
+
+**`asset_a` and `asset_b` only. `reserve_a` and `reserve_b` are never read**, and no `Dy` is computed
+anywhere in the file. The validator checks the pool is *the right pair* and holds *its NFT* — not that
+it is deep enough.
+
+**⇒ The protection is real but it is MINSWAP's, not FluidTokens':**
+- `minimum_receive: loanInputAction.remainingDebt` — the validator fixes the floor at the debt;
+- `killable: True` — Minswap's own documentation: *"Decide the Order behavior in case Order is not meet
+  the slippage tolerance"*; a killable order the batcher cannot fill at the minimum is **terminated and
+  refunded** rather than filled badly.
+
+So a dishonest bot **cannot** get a bad price: it cannot lower `minimum_receive` (the validator computes
+it) and it cannot redirect the proceeds (both receivers are the lender's asset manager). ✅ **Giovanni's
+"could a rogue bot request an improper swap" is answered NO** — but by a different mechanism than he was
+told, and the distinction matters for the next question.
+
+### 45.2 ⛔ THERE IS NO EXPIRY ON THIS ORDER — the deployed contract hard-codes `None`
+
+Raul: *"Mi sembra abbia una scadenza … Superata è considerata failed"*, Matteo: *"Confermo. C'è una
+scadenza"*, Raul again: *"nel datum che impostiamo mettiamo una scadenza che fa considerare failed un
+ordine pending dopo troppo … non potrà rimanere lì too long."*
+
+`lm_liquidate_and_convert_action.ak:264`:
+
+```aiken
+max_batcher_fee: 700000,
+expiry_setting_opt: None,
+```
+
+And Minswap's own documentation for that field: *"Order Expired time: if the order is not executed after
+Expired Time, **anyone can help the owner cancel it**"* plus a max tip for doing so. **`None` means the
+order has no expiration: it remains active indefinitely until executed or manually cancelled by its
+owner** — and there is no window after which a third party can help.
+
+**⇒ Giovanni's instinct was right and the reassurance was wrong.** *"Resta lì"* is exactly what happens
+if a batcher neither fills nor kills it. The **canceller is `lenderAuth`** (§25.2), so **only the lender
+can clear it** — not the bot, and not a helpful stranger.
+
+⚠ **This is a statement about the DEPLOYED contract, not about intent.** Raul's *"nel datum che
+impostiamo mettiamo una scadenza"* may describe what they mean to do; it is not what `e0b818e` does. If
+they add it, the order datum's shape changes and this bot's `ConvertTxEncoder.orderDatum` must change
+with it — **`expiry_setting_opt` is compared under `equals_data`, so a contract that starts setting it
+makes every transaction this bot builds fail.** Worth knowing before, not after.
+
+### 45.3 What this means for the operator
+
+- The bot **cannot** be made to request an improper swap. That question is closed (§41.4).
+- A pool too thin to deliver `remainingDebt` produces a **refund**, not a bad fill — the bot keeps its
+  fee either way (§28.3), so **convert's profitability does not depend on the fill**.
+- But **an unfilled order is the lender's to clear**, and with no expiry it can sit. That is a real cost
+  to the *lender*, not to the bot or the borrower — and it is the honest answer to *"how do I know a
+  pool is good"*: **you do not, and the market gate's `action: ANTICIPATE` per market is the lever**
+  FluidTokens themselves recommended for tokens without a reliable pool (§29.7).
