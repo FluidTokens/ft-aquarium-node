@@ -2334,3 +2334,115 @@ inventory the ruling rests on, so the decision is made against what exists.
   subclass overriding `getNetwork()` while the private field stays `null`. Comparing against the
   field says "not submittable" for a node that plainly is. **An overridden accessor that the class
   itself bypasses is a half-truth** — it behaves one way from outside and another from within.
+
+---
+
+## 27. MEMO — pay-in-advance vs convert: who chooses, who profits, which is better (2026-09-03)
+
+Giovanni: *"does the bot operator decide if repay in advance or use minswap? How is the bot operator
+profit calculated? What is better, anticipate principal? how about the operator profit? is it cut
+before? Let's think about that properly."* Answered from the validators at `e0b818e` and the two
+builders.
+
+### 27.1 WHO CHOOSES — the lender picks the CLASS, the operator picks the MECHANISM
+
+One flag on the **lender's bond**, `shouldLiquidationConvertToPrincipal`, partitions every loan:
+
+| the lender's flag | actions the validators permit |
+|---|---|
+| `False` | **plain `Liquidate` only** — `lm_liquidate_action` requires `== False` |
+| `True` | **`LiquidateAndPayInAdvance` OR `LiquidateAndConvert`** — both require `== True` |
+
+**⇒ So the honest answer is BOTH, at different levels.** The operator never chooses which loans are
+convert loans — the lender did that when the bond was minted. But **for the convert half, two
+mechanisms are legal and the operator picks.** `LiquidationExecutor` currently makes that choice
+implicitly: a convert-flagged bond always goes to the pay-in-advance seam, because it is the only one
+built. **Today the operator has no choice because only one door exists — not because the protocol
+denies one.**
+
+### 27.2 THE TWO FLOWS, SIDE BY SIDE
+
+| | **pay-in-advance** | **convert (Minswap)** |
+|---|---|---|
+| who supplies the principal | **the bot, from its own wallet** | **Minswap's batcher**, from the pool |
+| bot's outlay | `oracle_convert(collateral − equity − fee)` in the principal asset | the transaction fee only |
+| what the bot receives | **the collateral tokens** | **nothing but its fee slice** |
+| where the proceeds go | bot pays the lender directly | asset-manager escrow, owned by the lender bond |
+| settlement | atomic in one tx | **two-step**: our tx creates the order, the batcher fills it later |
+| price risk | the bot holds the collateral afterwards | the validator fixes `minimum_receive = remainingDebt` |
+| capital tied up | **one loan's principal, per loan** | none |
+
+### 27.3 THE PROFIT — same formula, same units, very different position
+
+**Both paths pay the operator the same slice, and it is CUT BEFORE — subtracted inside the
+transaction, never captured as a wallet delta:**
+```
+liquidationFee = loanCollateralAmount × liquidationFeePerMille / 1000      (bond datum; 50‰ observed)
+```
+In both actions it is **subtracted from what the lender receives** — `collateral − equity −
+liquidationFee` — and the validator does **not** constrain where it goes, so it lands wherever the
+builder puts it. **⇒ It is denominated in the COLLATERAL asset, not in ada, on both paths.**
+
+**But the resulting position is not the same, and this is the crux:**
+
+- **Pay-in-advance is a PURCHASE.** The bot pays the converted value of `collateral − equity − fee`
+  and receives `collateral − equity`. **It has bought the collateral at a discount equal to the fee.**
+  The profit is real but **unrealised**: it is a token position, and it becomes money only when the
+  bot sells.
+- **Convert is a COMMISSION.** The bot supplies nothing and keeps only the fee slice. There is no
+  position to unwind beyond the fee itself.
+
+> **⇒ This is the answer to "is it cut before?": yes, on both — but on pay-in-advance the cut arrives
+> wrapped in a purchase you also have to fund.**
+
+### 27.4 ⚠ THE −27,303,331 FLOOR MUST BE RE-DERIVED, AND ITS BUG IS NOW NAMEABLE
+
+The measured floor treated the fronted principal as **pure cost** and the acquired collateral as **no
+benefit at all**. §27.3 says why that is wrong in one line: **pay-in-advance is a purchase, and the
+accounting expensed it.** A model that books the outflow and ignores the asset will refuse every
+pay-in-advance forever, at any margin.
+
+**It does not transfer to convert at all** — there is no purchase to mis-book, because the bot buys
+nothing. **Convert needs a fresh model, not a corrected one**, and its shape is simpler: outlay is
+the transaction fee; income is the fee slice in collateral tokens.
+
+⚠ **Both models then need the same missing ingredient: a price for the collateral token**, to state
+profit in one currency. The oracle that already prices the collateral for the health factor is the
+obvious source, and it is already in the executor's snapshot.
+
+### 27.5 WHICH IS BETTER — and the case for each
+
+**Convert wins on almost every axis for a liquidation bot:**
+- **no capital.** Pay-in-advance ties up one loan's principal per loan and caps throughput at wallet
+  size; convert's throughput is bounded only by fees. *This is the difference between a bot that
+  scales and one that does not.*
+- **no price risk.** The bot never holds the collateral, so it cannot be caught by a move between
+  liquidating and selling.
+- **no inventory.** The fee slice is small; a whole collateral position is not.
+- **the strategy question shrinks** from "what do we do with acquired collateral" to "what do we do
+  with fee income" (§25.3).
+
+**Pay-in-advance wins in exactly two cases, and they are real:**
+1. **No Minswap pool, or a pool too thin to deliver `remainingDebt`.** Convert is then not merely
+   worse, it is impossible — the order would be killed. Pay-in-advance needs no venue.
+2. **When the operator WANTS the collateral** — believes it under-priced, or is accumulating it
+   deliberately. Then the discount is the point, and convert throws away the thing being sought.
+
+**And one honest cost of convert that pay-in-advance does not have: it is not atomic.** Our
+transaction creates an order; the batcher fills it afterwards. Between the two the position sits in
+Minswap's contract — `killable: True` and the refund path make it safe, but it is a second event to
+observe, and *"submitted" stops meaning "done"*.
+
+### 27.6 WHAT BUILDING CONVERT COSTS, AND WHAT REMAINS HIS
+
+**Engineering** (§25.5): a convert builder (never written); Minswap `OrderDatum`/`PoolDatum`
+encoding; `compute_lp_asset_name` and the a→b direction; pool reference-input resolution; the two
+blake2b datum hashes the order carries; trap-17 change handling for a token-bearing fee; registry
+derivation (now unblocked). **Plus an economics model per §27.4.**
+
+**His decisions, not ours:**
+1. **The fee-inventory policy** — both paths accrue income in collateral tokens; what happens to it.
+2. **Go/no-go on convert**, and whether it becomes the *default* for convert-flagged loans or an
+   operator-selected alternative. §27.1 says the protocol permits either.
+3. **Whether pay-in-advance stays at all** once convert exists — it is the capital-hungry path, and
+   the market gates now bound exactly that exposure.
