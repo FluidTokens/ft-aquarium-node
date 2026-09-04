@@ -4774,3 +4774,59 @@ silently while the decision is open.
 **The operator-side mitigation that needs no code**: fund the wallet with **several** ada-only UTxOs
 rather than one large one, so a liquidation consumes one and leaves the others nominable. That buys
 one liquidation per funded UTxO and does not fix the accumulation.
+
+## 56. §54.5 IS SUPERSEDED — the mainnet loan was REPAID, and the compound path has its first candidate (2026-09-04)
+
+§54.5 said the compound path was structurally empty on mainnet: *"one loan ever minted, never burned,
+so nothing has ever been repaid and no escrow exists to compound."* **True when written, false since
+08:52:48 UTC today.**
+
+### 56.1 The loan is gone, and not the way anyone was watching for
+
+```
+loan NFT 1b6fda50…   minted d832b78e…   BURNED 42a0ca18…   2026-09-04 08:52:48 UTC
+redeemer reward e4b067a674e2d695d4f7ae732103abb8d2b52cc10bd4922d7412ba19
+              = loanRepayActionScriptHash
+```
+
+**The borrower REPAID it.** Not liquidated — the bot was never armed and never acted. ⇒ **Live loans
+under the mainnet loan policy: ZERO.** The §54 candidate that every readiness figure was measured
+against no longer exists, and the readiness list would render empty today.
+
+⚠ **This is worth sitting with.** The whole mainnet convert push was sized on one loan, and the loan
+left by the ordinary route while we were working on the extraordinary one. **A population of one is
+not a market, and everything measured against it was a measurement of that loan rather than of the
+system.**
+
+### 56.2 ⇒ And the same transaction created the first compound candidate
+
+Output 0: **25,000,000 lovelace, ada-only, at `3644da1d…` — `assetManagerSpendScriptHash`.** A
+repayment escrow, `action: installment_repayment`, `ownerAsset` naming the lender bond of the repaid
+loan. Captured as `mainnet-repayment-escrow-42a0ca18.hex` with provenance, and **checked against the
+live chain rather than trusted** by `MainnetCompoundEscrowTest`.
+
+### 56.3 ⛔ THE STRUCTURAL CLAIM FLIPPED. THE PROFITABILITY CLAIM DID NOT.
+
+The only live mainnet pool manager still publishes **`compoudingFeePerMille = 0`**, read through the
+production decoder. So a compound of this escrow **pays nothing**, nets minus the transaction fee, and
+is **refused at the shipped margin of zero** — correctly, and the lever is the **pool owner's**, not
+the operator's.
+
+> **⇒ "There is finally something to compound" and "compounding it is worth doing" are different
+> questions, and the first being answered does not answer the second.**
+
+Both are asserted separately in `MainnetCompoundEscrowTest`, because a single test covering both would
+go green the day a fee appears and green the day the escrow vanishes, and those need opposite
+responses.
+
+### 56.4 What this changes about mainnet readiness
+
+- **Convert**: the deployed action is now the fixed one (§55.x, derivation green) — but there is **no
+  loan to convert**. Ready, not demonstrated.
+- **Anticipate**: same. The path is proven offline; the candidate is gone.
+- **Compound**: has a real candidate for the first time, and it is **not worth doing at today's fee**.
+- **Plain liquidate**: still has no eligible population — the repaid loan permitted conversion.
+
+⇒ **Every mainnet path is now blocked on the market rather than on us**, which is a different and
+better place to be than this morning — and it means the next real test arrives when someone opens a
+loan, not when we finish something.
