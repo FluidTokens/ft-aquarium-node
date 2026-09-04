@@ -289,9 +289,14 @@ loans:
 | `LOANS_LIQUIDATION_MARKETS_<i>_CAP` | The most principal the bot may front in this market, **in that asset's own unit**. | integer | — | ⛔ **C** — mandatory on ANTICIPATE; **startup fails without it**, because anticipating uncapped is unbounded exposure. |
 
 **Defaults and rules worth stating in the values file:**
-- ⚑ **An UNLISTED market is `action: CONVERT` at the node mode.** An empty list means *convert
+- ⛔ **An UNLISTED market is `action: CONVERT` at the node mode.** An empty list means *convert
   everywhere at whatever posture the node is in* — **it does not mean "do nothing"**. Listing a
   market is how an operator *deviates*.
+- ⛔ **AND THAT GOT SHARPER ON 2026-09-04.** `loans.liquidation.enabled` used to sit behind the mode
+  as a second arming confirmation: `mode: live` with the flag false was **not armed**. With the flag
+  gone, **`AQUARIUM_LIQUIDATION_MODE=live` plus an empty `markets` list is armed on every market
+  immediately, with nothing else to set.** ⇒ On a node that is going live, decide the market list
+  *before* the mode, not after.
 - ⛔ **The node mode is a CEILING**: effective = `min(nodeMode, marketMode)` over
   `DISABLED < SHADOW < LIVE`. A market may be more restrictive, never less. A market asking for
   `LIVE` under a `shadow` node runs as `SHADOW` and says so at boot.

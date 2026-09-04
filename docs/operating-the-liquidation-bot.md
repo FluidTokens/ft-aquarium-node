@@ -65,6 +65,16 @@ pinned by `ShippedDefaultsTest`, which also now fails if a second arming key re-
 ⇒ **What still holds a candidate back:** the mode, the market's own effective mode, and the two
 profit floors. That is the whole list.
 
+⚠ **One thing "redundant" understates, and it is the operationally important half.** `mode: disabled`
+did make the boolean meaningless — but `mode: live` with `enabled: false` was **not armed**. The flag
+was a second arming *confirmation*, not a duplicate of the off switch, so removing it genuinely
+changes what one line does.
+
+⛔ **The sharpest consequence is on `markets`.** An empty or absent market list means *convert
+everywhere at the node's posture* — it has never meant "do nothing". So **`AQUARIUM_LIQUIDATION_MODE=live`
+with no market list is now armed on every market immediately, with nothing else to set.** Decide the
+market list *before* the mode, not after.
+
 Submitting additionally requires the node to be on **preview** (veto S3). Mainnet is already
 protected by `loans.enabled=false`, which stops the bot's beans existing at all; the network
 veto is a second, independent line enforced in the code that would do the submitting.
