@@ -95,49 +95,73 @@ class PayInAdvanceChangeShapeTest {
     }
 
     /**
-     * ⛔ THE SHAPE: the bot gets back exactly one nominable output and one that is not, and the
-     * collateral it acquired is on the second.
+     * ⛔ <b>THE SHAPE, INVERTED 2026-09-04 — and the inversion is the receipt for the fix.</b>
+     *
+     * <p>This class was written to pin the S-15 trap: <i>the bot's real ada comes back trapped beside
+     * the collateral, and the only nominable thing returned is CCL's ~1-ada withdrawal dummy.</i> Its
+     * own javadoc said <i>"IF THIS EVER GOES NON-ZERO THE TRAP IS CLOSED and this test should be
+     * inverted"</i>. The builder now pays the bot's collateral out BY NAME, so it has, and this is
+     * what it turned into.
+     *
+     * <p>⇒ <b>What it pins now:</b> the collateral arrives in its own output, and <b>ada-only output(s)
+     * come back that the next liquidation can actually spend.</b> The measured shape:
+     *
+     * <pre>
+     *   dummy      ~1,000,000 lovelace                        ada-only  → NOMINABLE (CCL trap 1)
+     *   collateral    min-ada + 91,080,816 tokens             multi     → not nominable, by design
+     *   change     the rest                                   ada-only  → NOMINABLE  ← the fix
+     * </pre>
+     *
+     * ⚠ <b>The middle line is a real cost, not a free win.</b> A token-bearing output needs its own
+     * min-ada (~1.6 ADA), funded by the bot on every liquidation and locked with the tokens. The trade
+     * is that against ~30 ADA that was previously trapped and <b>compounding</b> — recoverable only by
+     * a manual wallet reshape, which the 2026-08-25 incident showed is a real operation someone has to
+     * notice they need. {@code LiquidationExecutor} subtracts the rider from the profit its gate
+     * evaluates, so the honesty of that trade is enforced rather than asserted.
      */
     @Test
-    void theBotGetsBackOneTinyNominableOutputAndItsRealAdaIsTrappedWithTheCollateral() {
+    void theBotsCollateralComesBackNamedAndItsAdaComesBackSpendable() {
         var fixture = LiquidatePayInAdvanceDryEvalTest.fixture();
         Transaction tx = LiquidatePayInAdvanceDryEvalTest.build(fixture);
 
         var collateral = fixture.loan().datum().collateral().assetType();
         List<TransactionOutput> toBot = outputsTo(tx, fixture.request().changeAddress());
-        assertEquals(2, toBot.size(),
-                "the bot's address receives the withdrawal dummy (CCL trap 1) AND the change; if this "
-                        + "moved, every figure below describes a transaction that no longer exists");
 
         List<TransactionOutput> nominable = toBot.stream()
                 .filter(o -> WalletInputSelection.nominable(asUtxo(o))).toList();
-        List<TransactionOutput> trapped = toBot.stream()
-                .filter(o -> !WalletInputSelection.nominable(asUtxo(o))).toList();
+        List<TransactionOutput> tokenBearing = toBot.stream()
+                .filter(o -> collateralIn(o, collateral.policyId(), collateral.assetName()).signum() > 0)
+                .toList();
 
-        assertEquals(1, nominable.size(),
-                "exactly one output comes back spendable. ⚠ Not zero — the obvious prediction that a "
-                        + "multi-asset change bricks the wallet outright is WRONG, and an operator told "
-                        + "that would look for the wrong symptom");
-        assertEquals(1, trapped.size(), "and exactly one is trapped");
+        assertEquals(1, tokenBearing.size(),
+                "the collateral must arrive in exactly ONE named output — zero means CCL merged it back "
+                        + "into change (trap 21) and the trap is silently back, more than one means it "
+                        + "was split");
 
-        assertEquals(BigInteger.ZERO,
-                collateralIn(nominable.get(0), collateral.policyId(), collateral.assetName()),
-                "the nominable output is the withdrawal dummy and holds no collateral");
-        assertTrue(collateralIn(trapped.get(0), collateral.policyId(), collateral.assetName()).signum() > 0,
-                "the anticipate path is DEFINED by the bot acquiring the collateral, so a zero here "
-                        + "means the path changed rather than that the trap closed");
+        assertTrue(nominable.size() >= 2,
+                "⛔ THE S-15 PROPERTY. Before the fix exactly ONE nominable output came back — CCL's "
+                        + "~1-ada withdrawal dummy — while ~30 ada sat trapped with the tokens. The "
+                        + "bot's real change must now return ada-only and spendable, so the next "
+                        + "liquidation has an input. Got " + nominable.size() + " nominable of "
+                        + toBot.size() + " outputs to the bot");
+
+        assertFalse(WalletInputSelection.nominable(asUtxo(tokenBearing.get(0))),
+                "the token-bearing output is not itself nominable, and is not meant to be — Plutus "
+                        + "collateral must be pure ada. That is the ~1.6 ADA rider, and it is the "
+                        + "price of the other two lines being clean");
     }
 
     /**
-     * ⛔ THE CONSEQUENCE: the ada the bot can spend NEXT cycle is a rounding error beside the ada it
-     * just committed.
+     * ⛔ THE CONSEQUENCE, inverted with it: the ada the bot can spend NEXT cycle is now the bulk of
+     * what it committed, not a rounding error.
      *
-     * <p>The assertion is a ratio rather than a pinned constant, because the constant is fixture-bound
-     * and the <b>ratio is the operational claim</b>: an anticipate liquidation drains the wallet's
-     * <i>nominable</i> balance almost entirely, whatever the sizes.
+     * <p>Before the fix this asserted the opposite — that under a twentieth came back spendable. The
+     * ratio is the operational claim in both directions, which is why it is a ratio and not a pinned
+     * constant: what matters is that a working liquidation stops draining the wallet's <i>nominable</i>
+     * balance, whatever the sizes happen to be.
      */
     @Test
-    void theNominableBalanceThatComesBackIsANegligibleFractionOfWhatWentIn() {
+    void theNominableBalanceThatComesBackIsNoLongerNegligible() {
         var fixture = LiquidatePayInAdvanceDryEvalTest.fixture();
         Transaction tx = LiquidatePayInAdvanceDryEvalTest.build(fixture);
 
@@ -151,18 +175,28 @@ class PayInAdvanceChangeShapeTest {
         BigInteger trappedAda = toBot.stream().filter(o -> !WalletInputSelection.nominable(asUtxo(o)))
                 .map(o -> o.getValue().getCoin()).reduce(BigInteger.ZERO, BigInteger::add);
 
-        assertTrue(trappedAda.compareTo(nominableBack) > 0,
-                "more of the bot's returned ada must be trapped than spendable for this finding to "
-                        + "hold; spendable=" + nominableBack + " trapped=" + trappedAda);
+        assertTrue(nominableBack.compareTo(trappedAda) > 0,
+                ("the spendable half must now exceed the trapped half — spendable %s, trapped %s. If "
+                        + "this inverts again the named output stopped being emitted, and the "
+                        + "WALLET_INPUT_TOO_SMALL diagnosis returns with it.")
+                        .formatted(nominableBack, trappedAda));
 
-        // ⛔ Under a twentieth of the ada committed comes back in spendable form.
-        assertTrue(nominableBack.multiply(BigInteger.valueOf(20)).compareTo(spent) < 0,
-                ("⛔ THE OPERATIONAL CLAIM. Wallet input %s lovelace; spendable next cycle %s; trapped "
-                        + "beside the collateral %s. The next candidate is refused with "
-                        + "WALLET_INPUT_TOO_SMALL — which reads as 'top up the wallet' when the truth "
-                        + "is 'your ada is stuck with the tokens you just earned'. If this ever fails "
-                        + "because MORE comes back spendable, the layout changed and this whole class "
-                        + "should be re-derived rather than relaxed.")
-                        .formatted(spent, nominableBack, trappedAda));
+        // ⚠ THE RATIO IS OVER WHAT COMES BACK, NOT OVER WHAT WENT IN — and the first draft of this
+        // assertion got that wrong, which is worth leaving recorded. Most of the 60,000,000 input does
+        // not "come back" at all: it pays the lender ~20.9 ADA in advance and the transaction fee.
+        // Measuring the returned ada against the INPUT therefore fails for a reason that has nothing
+        // to do with S-15, and would have read as the fix not working.
+        //
+        // Measured 2026-09-04: of 31,035,761 lovelace returned, 29,859,131 is spendable and 1,176,630
+        // is the min-ada rider locked with the tokens — 96.2%. Before the fix the same rig returned
+        // 1,000,000 spendable and 30,038,621 trapped.
+        BigInteger returned = nominableBack.add(trappedAda);
+        assertTrue(nominableBack.multiply(BigInteger.valueOf(10))
+                        .compareTo(returned.multiply(BigInteger.valueOf(9))) > 0,
+                ("over 90%% of the ada returned to the bot must be spendable. Returned %s, spendable "
+                        + "%s, trapped %s — the trapped part is the min-ada rider on the collateral "
+                        + "output and nothing else. (Wallet input was %s; most of it went to the "
+                        + "lender and the fee, which is why the ratio is over the RETURN.)")
+                        .formatted(returned, nominableBack, trappedAda, spent));
     }
 }

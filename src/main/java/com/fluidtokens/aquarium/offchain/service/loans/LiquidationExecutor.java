@@ -1655,6 +1655,45 @@ public class LiquidationExecutor {
                 ? assessment.loan().collateralAmount().subtract(assessment.liquidationFee())
                 : assessment.loan().lovelace();
         BigInteger funded = outputAda.subtract(collateralAdaOffset);
+
+        // ⛔ THE PAY-IN-ADVANCE RIDER, added 2026-09-04 with the S-15 fix, and it is correctness
+        // rather than conservatism.
+        //
+        // The builder now pays the bot's acquired collateral out to its OWN address by name, so the
+        // change comes back ada-only and stays spendable. A token-bearing output needs min-ada, and
+        // that ada is LOCKED WITH THE TOKENS on every liquidation — measured 1,176,630 lovelace on the
+        // pinned rig. The loop above counts only ASSET-MANAGER outputs, so without this the rider is
+        // invisible here and the gate would evaluate a profit that is too high by roughly 1.18 ADA.
+        //
+        // ⚠ Only TOKEN-BEARING outputs at the bot's address count. The plain change and CCL's
+        // withdrawal dummy also land there and are NOT costs — they come straight back, nominable.
+        // Counting them would turn the bot's own returned money into a phantom expense.
+        //
+        // A gate acting on an inflated profit is precisely the knife-edge this repo has already been
+        // bitten by (findings §55.3: a margin calibrated to nineteen thousand lovelace is a
+        // coincidence, not a policy). The operator's loss-tolerance override is untouched — it still
+        // permits proceeding below the floor; this only makes the number it is compared against true.
+        // ⚠ SCOPED TO THE PAY-IN-ADVANCE PATH, and the first attempt was NOT — which a test caught.
+        // Counting every token-bearing output at the bot's address also swept in the PLAIN path's
+        // change output, where the fee slice rides along with the bot's own returning ada. That
+        // charged the operator for money coming straight back and moved a plain-path fixture by
+        // 797,190 lovelace, changing economics this fork never touched. The bond flag is the same
+        // discriminator the routing uses a few hundred lines up, so the scope is the route's, not a
+        // guess: only a convert-permitted loan reaches the pay-in-advance builder, and only that
+        // builder emits a named collateral output to the bot.
+        if (assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
+            BigInteger rider = BigInteger.ZERO;
+            for (TransactionOutput output : transaction.getBody().getOutputs()) {
+                boolean mine = account != null && account.baseAddress().equals(output.getAddress());
+                boolean carriesTokens = output.getValue().getMultiAssets() != null
+                        && !output.getValue().getMultiAssets().isEmpty();
+                if (mine && carriesTokens) {
+                    rider = rider.add(output.getValue().getCoin());
+                }
+            }
+            funded = funded.add(rider);
+        }
+
         return funded.signum() > 0 ? funded : BigInteger.ZERO;
     }
 
