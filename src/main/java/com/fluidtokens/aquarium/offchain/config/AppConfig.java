@@ -408,7 +408,12 @@ public class AppConfig {
          * It replaces the negative-margin idiom, which is a magic number that looks like it does this
          * and does not. A named boolean says what it means and can be grepped for.
          * <p>
-         * <b>Refused on mainnet at startup</b>, exactly as a negative margin is: this disables loss
+         * ⚠ <b>STALE UNTIL 2026-09-04, and corrected here:</b> this used to say "refused on mainnet at
+         * startup, exactly as a negative margin is". <b>A negative margin is NO LONGER refused on
+         * mainnet</b> — findings §31 removed that hard-fail on Giovanni's ruling that operating at a
+         * loss must be possible on every network, and there is no network check in this class at all.
+         * The comparison misled a chart author into believing a negative margin crash-loops on
+         * mainnet. <b>Refused on mainnet at startup</b>: this flag disables loss
          * protection on someone else's collateral, and "copy the working preview config" is the
          * foreseeable operator action.
          */

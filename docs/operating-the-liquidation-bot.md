@@ -595,11 +595,27 @@ plain `Liquidate` path is not legal for this loan at all** — the bot will rout
 ### 14.2 ⛔ THE HAZARD — a half-configured arming
 
 `CONVERT` is the default for an unlisted market, and it is the right default in general: it fronts no
-capital and holds nothing. **But the convert path cannot execute on mainnet today.** FluidTokens'
-`lm_liquidate_and_convert_action` was compiled against a Minswap `PoolDatum` shape that is not what is
-deployed — their `aiken.toml` pins the `v2.1` *branch* rather than the released `v2.0.0`, and the two
-declare `pool_batching_stake_credential` differently (findings §51). Every convert attempt fails
-deserialising the live pool datum. **It is their fix, not ours, and it is not in yet.**
+capital and holds nothing. **But the convert path cannot build on mainnet today** — and as of
+2026-09-04 the reason changed hands.
+
+**FluidTokens' half is FIXED.** Their action was compiled against a Minswap `PoolDatum` shape that is
+not what is deployed (findings §51); they corrected it, and at **11:19:16 UTC on 2026-09-04** they
+updated the mainnet LMConfig **in place** to point at the new action, `dc71541066c95303794863f0a2889fb217a6cc5498e53ad3e077339a`,
+publishing a reference script for it at `e4e47ab1…#0`. The derivation is proven —
+`MainnetConvertActionDerivationTest` — so the deployed action is their committed `bb4349c`.
+
+**⛔ OUR half is not.** `ConvertLiquidationRouter` passes `Map.of()` as the reference-script map, and
+`application.yaml` carries **no `lm-liquidate-and-convert-action` key** — the `ReferenceScripts` record
+has the slot, the configuration does not. So **every validator on a convert transaction travels
+inline**, and the measured size is **20,548 bytes against a 16,384-byte `maxTxSize`**. It does not fail
+at validation; **it fails to build at all.**
+
+⇒ **So the market entry below is not advisable, it is MANDATORY.** Without it, a convert-permitted loan
+routes to `CONVERT` and every attempt is refused before a transaction exists.
+
+⚠ Fixing our half is a small change — wire the key, pass a real map, the coordinate is already
+published. **It is deliberately NOT done**: the convert path ACQUIRES COLLATERAL rather than earning a
+fee, and that strategy is Giovanni's call, not the factory's.
 
 ⇒ **If you enable the `lovelace` market — or raise the node mode with no market list at all — the only
 live mainnet loan routes to a path that cannot complete.**
