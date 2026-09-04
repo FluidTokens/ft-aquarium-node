@@ -264,13 +264,16 @@ public class CompoundExecutor {
         // is not a permission to check here: by the time control reaches this method the operator
         // has already said which network to run on.
         //
-        // ⚠ THAT LEAVES THIS PATH WITH ONE BOOLEAN. Between a candidate and a real submission the
-        // liquidation path has three switches — mode == live, liquidation.enabled, and the market's
-        // own effective mode — plus two profit floors. Compound has `loans.compound.enabled` and one
-        // floor. The network value had been closing exactly that asymmetry since 2026-09-03, so
-        // removing it re-opens it; this comment is here so the next person to read it finds the fact
-        // recorded rather than rediscovers it. The fix, if one is wanted, is a second compound
-        // switch of its own — NOT a network check, which is the thing that was found to be wrong.
+        // ⚑ ONE BOOLEAN ON THIS PATH, AND THAT IS RULED, NOT AN OVERSIGHT. Between a candidate and a
+        // real submission the liquidation path has `mode == live` plus the market's own effective
+        // mode, plus two profit floors; compound has `loans.compound.enabled` plus one floor.
+        //
+        // Giovanni ruled the asymmetry deliberate on 2026-09-04, when the question was put to him
+        // directly: compound stays ON/OFF plus a minimum margin — "shadow doesn't make sense, it's a
+        // low-risk operation". It advances no capital and moves already-repaid principal into the
+        // pool that is owed it. ⛔ So do NOT add a compound mode or a second switch here; that was
+        // considered and declined. The same day removed liquidation's own redundant second boolean,
+        // for the same reason: gates that restate each other are cost without safety.
 
         byte[] signed;
         try {

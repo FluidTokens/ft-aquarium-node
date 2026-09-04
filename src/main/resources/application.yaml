@@ -71,8 +71,8 @@ aquarium:
 # that check is what catches a redeploy, which otherwise verifies cleanly forever against a dead
 # deployment while the node reports an empty world (findings section 12). Do not soften it.
 #
-# ⚠ AND INDEXING IS NOT ARMING. Reading v4 arms nothing; the switches are `liquidation.mode: live`
-# + `liquidation.enabled: true`, and `compound.enabled` on that path. All off below.
+# ⚠ AND INDEXING IS NOT ARMING. Reading v4 arms nothing; the switch is `liquidation.mode: live`
+# on that path and `compound.enabled` on the other. Both off below.
 # (see LoansContractRegistry / docs/lending-v4-findings.md)
 loans:
   # FluidTokens oracle registry. Same endpoint ada-watch polls for Lending v3. Read-only price
@@ -82,9 +82,16 @@ loans:
   oracle:
     enabled: ${LOANS_ORACLE_ENABLED:true}
     url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
-  # The auto-liquidation bot. `mode` is disabled / shadow / live; `enabled` is the separate arming
-  # flag. Submitting requires BOTH mode==live AND enabled==true (isArmed) -- one switch is too easy
-  # to flip by accident. This is not a drill: when armed and all eight submit-vetoes pass, the
+  # The auto-liquidation bot. `mode` is disabled / shadow / live, and it is the WHOLE node-level dial.
+  #
+  # ⛔ `liquidation.enabled` IS GONE (2026-09-04). It was a second arming boolean that had to agree
+  # with the mode, justified as "one switch is too easy to flip by accident". Giovanni: "it's
+  # redundant with mode -- mode == disabled already IS off, so a separate enabled boolean makes no
+  # sense ... the gates are too much; it's a bot, if you use it you know it's risky, so gates don't
+  # really help." A redundant gate is not free: it made `disabled` and `live` + `enabled: false` two
+  # spellings of "off", and gave an operator who HAD decided to arm one more silent way not to have.
+  #
+  # This is not a drill: when mode is live and all seven submit-vetoes pass, the
   # executor SIGNS AND SUBMITS the liquidation on preview (LiquidationExecutor wires the real
   # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
   # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely.
@@ -93,7 +100,7 @@ loans:
   # would still refuse to submit and say so only in a decision row — "arming that works everywhere
   # except the last step, silently." `network` (this file / the Spring profile) is now the SINGLE
   # source of truth for where this node acts. What holds a submission back is exactly: loans.enabled,
-  # mode == live, liquidation.enabled, the market's effective mode, and the profit floors.
+  # mode == live, the market's effective mode, and the profit floors.
   # The repayment-escrow COMPOUND path (lm_compound_action): collect a repaid loan's principal from
   # the asset manager and deliver it into the lender's pool, keeping the pool owner's compounding fee.
   # A different action from every `liquidation:` key above -- see docs/lending-v4-findings.md section 20.
@@ -144,7 +151,7 @@ loans:
   # See MainnetRegistryMatchesConfigTest and docs/lending-v4-findings.md section 23.
   #
   # ⚠ CONFIGURED IS NOT ARMED. `loans.enabled` above is false on mainnet, the liquidation mode is
-  # `disabled`, and `loans.liquidation.enabled` is false — three switches, all off.
+  # `disabled` — and that single dial is the whole node-level question now.
   # ⚠ The fourth item here used to read "the compound gate HARD-FAILS a negative profit margin on
   # mainnet" — it does not; see the compound margin above. Three gates, not four. These values let
   # the node DERIVE and READ the mainnet deployment; nothing here lets it act on one.
@@ -182,7 +189,6 @@ loans:
 
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
-    enabled: ${AQUARIUM_LIQUIDATION_ENABLED:false}
     delay-seconds: ${AQUARIUM_LIQUIDATION_DELAY_SECONDS:60}
     # The two window values are one piece of arithmetic, so read them together. A preview Charli3
     # feed publishes a 600 s window (measured, design §6.7), and the builder's V3 demands
@@ -386,7 +392,7 @@ loans:
   #
   # This file ships inside the public operator image: anyone running it with the preview profile gets
   # these values, so arming here would arm it for every operator, not for us. That is the same rule
-  # that keeps `liquidation.enabled` false in this document while the preview bot runs armed --
+  # that keeps the liquidation mode unarmed in this document while the preview bot runs armed --
   # arming is a deliberate act in the deployment's own values (the Steward's Argo application),
   # never a default anybody inherits by choosing a profile. See docs/k8s-deployment-requirements.md
   # section 3 and section 8.

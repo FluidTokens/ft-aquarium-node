@@ -272,12 +272,17 @@ class CompoundExecutorTest {
      * now submits on whichever network it is pointed at. Kept as the regression guard: any
      * re-introduced network check inside {@code submit} turns this red.
      *
-     * <p>⚠ <b>And it records what the removal costs on THIS path.</b> The liquidation executor still
-     * has three switches ahead of a submission — mode {@code live}, {@code liquidation.enabled}, and
-     * the market's effective mode — plus two profit floors. <b>Compound has {@code compound.enabled}
-     * and one floor.</b> That asymmetry is exactly what the network value had been closing since
-     * 2026-09-03, and removing it re-opens it. Not a reason to keep a gate found to be wrong; a
-     * reason for compound to grow a second switch of its own.
+     * <p>⚑ <b>And the asymmetry it leaves is RULED, not outstanding.</b> Liquidation has
+     * {@code mode == live} plus the market's effective mode plus two floors; compound has
+     * {@code compound.enabled} plus one floor. That was put to Giovanni directly on 2026-09-04 and
+     * he answered it: compound stays <b>ON/OFF plus a minimum margin</b> — <i>"shadow doesn't make
+     * sense, it's a low-risk operation."</i> It advances no capital and moves already-repaid
+     * principal into the pool that is owed it.
+     *
+     * <p>⛔ <b>So do not add a compound mode or a second switch.</b> It was considered and declined.
+     * The same ruling removed liquidation's own redundant second boolean
+     * ({@code loans.liquidation.enabled}) for the same reason: a gate that restates another gate is
+     * cost without safety. <b>The paths differ because the risks differ, deliberately.</b>
      */
     @Test
     void anArmedNodeSubmitsOnWhicheverNetworkItIsPointedAt() {
@@ -301,8 +306,9 @@ class CompoundExecutorTest {
             Wiring w = wiring(List.of(ready(0L)), false, -2_000_000L, List.of(wallet()), networkName);
             w.executor().cycle();
             assertTrue(w.submitted().isEmpty(),
-                    "on " + networkName + ": loans.compound.enabled=false is now the ONLY policy "
-                            + "switch on this path, so it had better hold");
+                    "on " + networkName + ": loans.compound.enabled=false is the ONLY policy switch "
+                            + "on this path — ruled sufficient because compound is low-risk — so it "
+                            + "had better hold");
         }
     }
 

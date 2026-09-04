@@ -238,7 +238,7 @@ deployment that does not exist** — see §7 trap 3.
 | env var | property | plain English | type | default (mainnet) | preview | class |
 |---|---|---|---|---|---|---|
 | `AQUARIUM_LIQUIDATION_MODE` | `loans.liquidation.mode` | What the loop may do. `disabled` = never scans. `shadow` = scan, build, price, record, **never sign**. `live` = may submit, if also enabled. | `disabled`\|`shadow`\|`live`, case-insensitive | **`disabled`** | `shadow` | ⛔ **C** — a typo **aborts startup** by design. |
-| `AQUARIUM_LIQUIDATION_ENABLED` | `loans.liquidation.enabled` | The separate arming flag. **Submitting needs BOTH** `mode==live` **and** this — one switch is too easy to flip by accident. | bool | **`false`** | inherits | ⛔ **C** |
+| ~~`AQUARIUM_LIQUIDATION_ENABLED`~~ | ~~`loans.liquidation.enabled`~~ | ⛔ **REMOVED 2026-09-04.** A second arming boolean beside `mode`, justified as *"one switch is too easy to flip by accident"*. Giovanni: *"redundant with mode — mode == disabled already IS off … the gates are too much; it's a bot, if you use it you know it's risky, so gates don't really help."* ⚠ The redundancy cost real things: two spellings of "off" that logged differently, and one more silent way for an operator who **had** decided to arm not to have. **`AQUARIUM_LIQUIDATION_MODE` is the whole node-level dial.** Setting this is now a no-op. | — | — | — | **gone** |
 | `AQUARIUM_LIQUIDATION_DELAY_SECONDS` | `loans.liquidation.delay-seconds` | Seconds between cycles. | int | `60` | inherits | **A** |
 | `AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE` | `loans.liquidation.decision-log-size` | In-memory ring buffer behind `GET …/loans/liquidations`. | int | `200` | inherits | **A** |
 | `AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES` | `loans.liquidation.quarantine-minutes` | How long a failed candidate is skipped. | int | `30` | inherits | **A** |
@@ -511,9 +511,9 @@ Everything below is what the chart should ship, and all of it is already the app
 node indexes, serves the API, and **cannot move value**:
 
 ```yaml
-# LOANS_ENABLED and LOANS_SUBMITTABLE_NETWORK are GONE (2026-09-04) — do not emit them.
+# LOANS_ENABLED, LOANS_SUBMITTABLE_NETWORK and AQUARIUM_LIQUIDATION_ENABLED are GONE
+# (2026-09-04) — do not emit them.
 AQUARIUM_LIQUIDATION_MODE: "disabled"
-AQUARIUM_LIQUIDATION_ENABLED: "false"
 AQUARIUM_COMPOUND_ENABLED: "false"
 AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK: "false"   # fatal on mainnet if true
 LOANS_UI_ENABLED: "false"                     # no authentication
@@ -526,9 +526,9 @@ LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE: "0"
 LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE: "5000000"
 ```
 
-**Arming is now targeting plus three deliberate acts**, and the runbook
+**Arming is now targeting plus two deliberate acts**, and the runbook
 (`docs/operating-the-liquidation-bot.md` §14) is what walks them:
 point `NETWORK` / the profile at the chain → supply the config policy ids → publish **and** configure
-the reference scripts → `AQUARIUM_LIQUIDATION_MODE=live` → `AQUARIUM_LIQUIDATION_ENABLED=true`.
+the reference scripts → `AQUARIUM_LIQUIDATION_MODE=live`.
 ⛔ **There is no longer a switch after that.** A node targeted at a chain and armed **acts on it** —
 that coherence is the whole point of removing the submit gate.

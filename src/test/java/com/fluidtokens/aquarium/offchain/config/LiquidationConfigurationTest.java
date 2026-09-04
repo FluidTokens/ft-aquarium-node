@@ -120,18 +120,26 @@ class LiquidationConfigurationTest {
     // ---- the arming conjunct ------------------------------------------------------------------
 
     /**
-     * {@code isArmed()} is what the endpoint reports and what slice 3 will gate on, so its truth
-     * table is pinned here rather than only through the controller.
+     * ⛔ <b>{@code isArmed()} IS the mode, and nothing else — the truth table shrank on 2026-09-04.</b>
+     *
+     * <p>It used to be {@code mode == LIVE && enabled}, a conjunction of two booleans, and this test
+     * walked the full 3×2 table. {@code loans.liquidation.enabled} was removed on Giovanni's ruling
+     * that it is redundant with the mode: <i>"mode == disabled already IS off, so a separate enabled
+     * boolean makes no sense."</i>
+     *
+     * <p>⚠ The redundancy had a cost worth recording, because "harmless extra safety" is how it was
+     * justified: two spellings of "off" that logged differently, and one more way for an operator who
+     * had genuinely decided to arm to have silently not done it.
+     *
+     * <p>Still pinned here rather than only through the controller: this is what the
+     * {@code /loans/liquidations} view reports as {@code armed}.
      */
     @Test
-    void armingRequiresBothLiveModeAndTheEnabledFlag() {
+    void armingIsExactlyLiveModeWithNoSecondBoolean() {
         for (Mode mode : Mode.values()) {
-            for (boolean enabled : new boolean[]{false, true}) {
-                LiquidationConfiguration configuration = new LiquidationConfiguration(mode, enabled,
-                        60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
-                assertEquals(mode == Mode.LIVE && enabled, configuration.isArmed(),
-                        "mode=" + mode + " enabled=" + enabled);
-            }
+            LiquidationConfiguration configuration = new LiquidationConfiguration(mode,
+                    60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
+            assertEquals(mode == Mode.LIVE, configuration.isArmed(), "mode=" + mode);
         }
     }
 
@@ -151,13 +159,13 @@ class LiquidationConfigurationTest {
      */
     @Test
     void theConvenienceConstructorsDefaultToTheSafeProfitabilityFloors() {
-        LiquidationConfiguration eightArg = new LiquidationConfiguration(Mode.SHADOW, false,
+        LiquidationConfiguration eightArg = new LiquidationConfiguration(Mode.SHADOW,
                 60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
         assertTrue(eightArg.isCheckProfitability(), "profitability checking defaults ON");
         assertEquals(BigInteger.ZERO, eightArg.getMinProfitAbsoluteLovelace(),
                 "the absolute floor defaults to zero");
 
-        LiquidationConfiguration nineArg = new LiquidationConfiguration(Mode.SHADOW, false,
+        LiquidationConfiguration nineArg = new LiquidationConfiguration(Mode.SHADOW,
                 60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30, eightArg.getReferenceScripts());
         assertTrue(nineArg.isCheckProfitability());
         assertEquals(BigInteger.ZERO, nineArg.getMinProfitAbsoluteLovelace());
@@ -166,7 +174,7 @@ class LiquidationConfigurationTest {
     /** The full constructor carries the floors through verbatim, both halves. */
     @Test
     void theFullConstructorCarriesTheStatedFloors() {
-        LiquidationConfiguration stated = new LiquidationConfiguration(Mode.LIVE, true,
+        LiquidationConfiguration stated = new LiquidationConfiguration(Mode.LIVE,
                 60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30,
                 false, BigInteger.valueOf(2_000_000),
                 com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder
@@ -285,7 +293,7 @@ class LiquidationConfigurationTest {
      */
     @Test
     void aHandBuiltConfigurationPublishesNothingRatherThanNull() {
-        LiquidationConfiguration configuration = new LiquidationConfiguration(Mode.SHADOW, false,
+        LiquidationConfiguration configuration = new LiquidationConfiguration(Mode.SHADOW,
                 60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
 
         assertNotNull(configuration.getReferenceScripts());

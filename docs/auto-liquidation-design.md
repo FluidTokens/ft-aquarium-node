@@ -592,7 +592,8 @@ addition; (4) pool + pool_manager indexing and compound outputs.
   sync-start-blockhash }`. Add entries for main config, LM config, loan,
   lender_manager, loan_claim_action, lm_liquidate_action, asset_manager, and the
   oracle set.
-- Feature flags: `AQUARIUM_SCHEDULED_TX_ENABLED`, `AQUARIUM_LIQUIDATION_ENABLED`
+- Feature flags: `AQUARIUM_SCHEDULED_TX_ENABLED`, `AQUARIUM_LIQUIDATION_MODE`
+  (`AQUARIUM_LIQUIDATION_ENABLED` was removed 2026-09-04 as redundant with the mode)
   (both default sensibly) so an operator can run either or both.
 - `LiquidationService` mirrors `ScheduledTransactionService`: `@Scheduled` loop,
   syncing guard, per-utxo failure quarantine list, `QuickTxBuilder`/`ScriptTx`.

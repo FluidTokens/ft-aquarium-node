@@ -548,15 +548,15 @@ class LiquidationSubmitVetoTest {
     }
 
     private static AppConfig.LiquidationConfiguration configuration(
-            AppConfig.LiquidationConfiguration.Mode mode, boolean enabled, BigInteger margin,
+            AppConfig.LiquidationConfiguration.Mode mode, BigInteger margin,
             LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
-        return new AppConfig.LiquidationConfiguration(mode, enabled, 60, 120, 30, margin, 200, 30,
+        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, margin, 200, 30,
                 referenceScripts);
     }
 
     /** Armed: live, enabled, and with the reference scripts published. */
     private static AppConfig.LiquidationConfiguration armed() {
-        return configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true, SMALL_MARGIN, PUBLISHED);
+        return configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, SMALL_MARGIN, PUBLISHED);
     }
 
     // ======================================================================================
@@ -757,7 +757,7 @@ class LiquidationSubmitVetoTest {
     @Test
     void s1AShadowModeSubmitsNothingEvenWhenEverythingElseWouldAllowIt() {
         Run run = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
                         SMALL_MARGIN, PUBLISHED))
                 .run();
 
@@ -771,7 +771,7 @@ class LiquidationSubmitVetoTest {
     @Test
     void s1BDisabledModeSubmitsNothing() {
         Run run = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.DISABLED, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.DISABLED,
                         SMALL_MARGIN, PUBLISHED))
                 .run();
 
@@ -780,23 +780,64 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S2 — the arming flag
+    // ⛔ WHAT WAS S2 — the separate arming flag — IS GONE (2026-09-04)
     // ======================================================================================
 
     /**
-     * Two independent switches by design. {@code mode: live} on its own is one flag flipped — an
-     * operator experimenting, a copied env file — and it must not be enough.
+     * ⛔ <b>THE INVERSE, and the second veto removed in one day.</b>
+     *
+     * <p>This asserted that {@code mode: live} alone was NOT enough: a second boolean,
+     * {@code loans.liquidation.enabled}, had to agree, on the reasoning that one flag flipped by an
+     * experimenting operator or a copied env file must not arm a bot.
+     *
+     * <p>Giovanni, 2026-09-04: <i>"it's redundant with mode — mode == disabled already IS off, so a
+     * separate enabled boolean makes no sense … the gates are too much; it's a bot, if you use it you
+     * know it's risky, so gates don't really help."</i>
+     *
+     * <p>⚠ <b>And a redundant gate is not free.</b> It gave "off" two spellings —
+     * {@code mode: disabled}, and {@code mode: live} with the flag false — which log differently and
+     * mean the same thing. Worse, it gave an operator who <em>had</em> decided to arm one more silent
+     * way to have not done it: exactly the class of failure the network veto was removed for, one
+     * level up.
+     *
+     * <p>⇒ <b>{@code mode: live} is now sufficient at the node level</b>, and this test says so.
+     * Keep it: it is the regression guard against a second arming boolean growing back, and this
+     * codebase has now grown a redundant last-step barrier back twice.
      */
     @Test
-    void s2LiveModeWithoutTheArmingFlagSubmitsNothing() {
+    void liveModeAloneArmsTheNodeBecauseThereIsNoSecondBooleanAnyMore() {
         Run run = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, false,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE,
                         SMALL_MARGIN, PUBLISHED))
                 .run();
 
-        LiquidationDecision decision = vetoed(run, LiquidationExecutor.SubmitVeto.NOT_ARMED,
-                LiquidationDecision.Outcome.WOULD_SUBMIT);
-        assertTrue(decision.expectedProfitLovelace().signum() > 0);
+        assertEquals(1, run.submitter().submitted.size(),
+                "mode: live is the whole node-level dial now; a profitable, buildable candidate on a "
+                        + "live node must reach the submitter with nothing else to set");
+        LiquidationDecision decision = run.onlyDecision();
+        assertNull(decision.submitVeto(), "no veto may fire: " + decision.detail());
+
+        // ⚠ And the controls, so this cannot pass by simply arming everything. The two held modes
+        // stop the node in DIFFERENT places, and asserting them identically would hide that:
+        //   SHADOW   scans, builds, prices and RECORDS — the rehearsal — then vetoes MODE_NOT_LIVE.
+        //   DISABLED returns before it scans anything, so there is no decision row at all.
+        Run shadow = new Rig()
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        SMALL_MARGIN, PUBLISHED))
+                .run();
+        shadow.assertNothingWasSubmitted();
+        assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(),
+                shadow.onlyDecision().submitVeto(),
+                "shadow must build the rehearsal and then withhold it, naming MODE_NOT_LIVE");
+
+        Run disabled = new Rig()
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.DISABLED,
+                        SMALL_MARGIN, PUBLISHED))
+                .run();
+        disabled.assertNothingWasSubmitted();
+        assertTrue(disabled.log().newestFirst(10).isEmpty(),
+                "disabled returns before it scans, so it records nothing — asserting a MODE_NOT_LIVE "
+                        + "row here would be asserting a rehearsal that never happened");
     }
 
     // ======================================================================================
@@ -846,7 +887,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S3 — the market's own execution state
+    // S2 — the market's own execution state
     // ======================================================================================
 
     /** A configuration identical to {@link #armed()} but with one market held at {@code mode}. */
@@ -959,7 +1000,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S4 — profitability
+    // S3 — profitability
     // ======================================================================================
 
     /**
@@ -977,7 +1018,7 @@ class LiquidationSubmitVetoTest {
     @Test
     void s4ACandidateThatDoesNotClearTheMarginSubmitsNothing() {
         Run unprofitable = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE,
                         HUGE_MARGIN, PUBLISHED))
                 .run();
 
@@ -992,7 +1033,7 @@ class LiquidationSubmitVetoTest {
         BigInteger breakEvenMargin = BigInteger.valueOf(50_000_000).subtract(txFee);
 
         Run breakEven = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE,
                         breakEvenMargin, PUBLISHED))
                 .run();
 
@@ -1033,7 +1074,7 @@ class LiquidationSubmitVetoTest {
         Run run = new Rig()
                 .scenario(lossMakingTokenScenario())
                 .oracle(new FakeOracleClient(List.of(collateralOracle())))
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE,
                         NEGATIVE_MARGIN, PUBLISHED))
                 .run();
 
@@ -1071,7 +1112,7 @@ class LiquidationSubmitVetoTest {
     private static AppConfig.LiquidationConfiguration lossTolerant(BigInteger absoluteFloor,
                                                                   BigInteger expectedFloor) {
         return new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.LIVE, true, 60, 120, 30,
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30,
                 BigInteger.ZERO, 200, 30, true, absoluteFloor, expectedFloor, PUBLISHED);
     }
 
@@ -1088,7 +1129,7 @@ class LiquidationSubmitVetoTest {
         Run run = new Rig()
                 .scenario(lossMakingTokenScenario())
                 .oracle(new FakeOracleClient(List.of(collateralOracle())))
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE,
                         BigInteger.ZERO, PUBLISHED))
                 .run();
 
@@ -1177,7 +1218,7 @@ class LiquidationSubmitVetoTest {
         Run run = new Rig()
                 .scenario(minAdaDrivenLossTokenScenario())
                 .oracle(new FakeOracleClient(List.of(collateralOracle())))
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE,
                         BigInteger.ZERO, PUBLISHED))
                 .run();
 
@@ -1229,7 +1270,7 @@ class LiquidationSubmitVetoTest {
         try {
             mainnet = new Rig()
                     .network("mainnet")
-                    .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, false,
+                    .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
                             NEGATIVE_MARGIN, PUBLISHED))
                     .run();
         } finally {
@@ -1256,14 +1297,14 @@ class LiquidationSubmitVetoTest {
         // Preview is unchanged and still runs.
         Run preview = new Rig()
                 .network("preview")
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, false,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
                         NEGATIVE_MARGIN, PUBLISHED))
                 .run();
         assertNotNull(preview.onlyDecision());
     }
 
     // ======================================================================================
-    // S5 — the size, against the live protocol parameters
+    // S4 — the size, against the live protocol parameters
     // ======================================================================================
 
     /**
@@ -1275,7 +1316,7 @@ class LiquidationSubmitVetoTest {
     void s5ATransactionThatCannotBeShownToFitSubmitsNothing() {
         // Oversized: no reference scripts published, so all six validators travel in the witness set.
         Run oversized = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE,
                         SMALL_MARGIN, LiquidateTransactionBuilder.ReferenceScripts.none()))
                 .run();
 
@@ -1309,7 +1350,7 @@ class LiquidationSubmitVetoTest {
         generous.setMaxTxSize(1_000_000);
 
         Run run = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, true,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.LIVE,
                         SMALL_MARGIN, LiquidateTransactionBuilder.ReferenceScripts.none()))
                 .params(() -> generous)
                 .run();
@@ -1320,7 +1361,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S6 — the oracle window at submit time
+    // S5 — the oracle window at submit time
     // ======================================================================================
 
     /**
@@ -1404,7 +1445,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S7 — the UTxOs, re-read immediately before the wire
+    // S6 — the UTxOs, re-read immediately before the wire
     // ======================================================================================
 
     /**
@@ -1560,7 +1601,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S8 — the transaction's own validity window
+    // S7 — the transaction's own validity window
     // ======================================================================================
 
     /**
@@ -1862,14 +1903,14 @@ class LiquidationSubmitVetoTest {
     void withTheShippedDefaultsNothingIsSubmitted() {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         Run run = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.DISABLED, false,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.DISABLED,
                         SMALL_MARGIN, LiquidateTransactionBuilder.ReferenceScripts.none()))
                 .submitter(submitter)
                 .run();
 
         run.assertNothingWasSubmitted();
         assertEquals(0, run.log().size());
-        assertFalse(configuration(AppConfig.LiquidationConfiguration.Mode.DISABLED, false,
+        assertFalse(configuration(AppConfig.LiquidationConfiguration.Mode.DISABLED,
                 SMALL_MARGIN, LiquidateTransactionBuilder.ReferenceScripts.none()).isArmed());
     }
 
@@ -1880,7 +1921,7 @@ class LiquidationSubmitVetoTest {
     @Test
     void theShippedPreviewDefaultIsAlsoIncapableOfSubmitting() {
         Run run = new Rig()
-                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, false,
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
                         SMALL_MARGIN, PUBLISHED))
                 .run();
 

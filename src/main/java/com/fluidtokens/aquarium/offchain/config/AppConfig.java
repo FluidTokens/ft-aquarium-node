@@ -58,7 +58,7 @@ public class AppConfig {
          * for the two to disagree. Arming is coherent: target a network, arm the bot, it acts there.
          *
          * <p>⚠ <b>What still stops a submission</b>, and it is the whole list: {@code loans.enabled},
-         * {@code loans.liquidation.mode == live}, {@code loans.liquidation.enabled}, the per-market
+         * {@code loans.liquidation.mode == live}, the per-market
          * effective mode, and the profitability floors. On the compound path it is
          * {@code loans.compound.enabled} and its floor — see {@code CompoundExecutor#submit}, which
          * records that this leaves compound with one boolean where liquidation has three.
@@ -144,8 +144,7 @@ public class AppConfig {
          *
          * <p>⇒ What replaces it is {@link LoansContractRegistry#isConfigured()}: a node with no config
          * policy ids indexes nothing and says so, and a node with them indexes from its sync-start
-         * slot. Arming stays where it always was — {@code liquidation.mode}, {@code liquidation.enabled},
-         * {@code compound.enabled}.
+         * slot. Arming is {@code liquidation.mode} on that path and {@code compound.enabled} on the other.
          */
 
         /** Main config NFT policy id = hash of the applied {@code config(tx0, index0)} validator. */
@@ -304,14 +303,24 @@ public class AppConfig {
         private MarketProperties marketProperties;
 
         /**
-         * What the liquidation loop is allowed to do.
+         * ⛔ <b>What the liquidation loop is allowed to do — and since 2026-09-04 it is the WHOLE
+         * node-level dial.</b>
          * <ul>
          *   <li>{@code DISABLED} — the loop returns before it scans anything.</li>
          *   <li>{@code SHADOW} — scan, build, price and record; never sign, never submit.</li>
-         *   <li>{@code LIVE} — reserved for the arming slice. Nothing in this codebase submits a
-         *       liquidation yet, so today it behaves exactly like {@code SHADOW}; only
-         *       {@link #isArmed()} tells the two apart.</li>
+         *   <li>{@code LIVE} — sign and submit, subject to the market's own mode and the profit floors.</li>
          * </ul>
+         *
+         * <p><b>{@code loans.liquidation.enabled} is gone.</b> It sat beside this as a second arming
+         * boolean, on the reasoning that "one switch is too easy to flip by accident". Giovanni,
+         * 2026-09-04: <i>"it's redundant with mode — mode == disabled already IS off, so a separate
+         * enabled boolean makes no sense … the gates are too much; it's a bot, if you use it you know
+         * it's risky, so gates don't really help."</i>
+         *
+         * <p>⚠ <b>A redundant gate is not free.</b> It made {@code DISABLED} and
+         * {@code LIVE + enabled:false} two different spellings of "off" with different log lines, and
+         * it gave an operator who had genuinely decided to arm one more silent way to have not done
+         * it. The dial says what it does; nothing sits behind it.
          */
         public enum Mode {
             DISABLED, SHADOW, LIVE
@@ -334,13 +343,6 @@ public class AppConfig {
         void setModeName(String modeName) {
             this.modeName = modeName;
         }
-
-        /**
-         * The arming flag, deliberately separate from {@link #mode}. Submitting requires BOTH
-         * {@code mode == LIVE} and this — one switch is too easy to flip by accident.
-         */
-        @Value("${loans.liquidation.enabled:false}")
-        private boolean enabled;
 
         @Value("${loans.liquidation.delay-seconds:60}")
         private long delaySeconds;
@@ -682,35 +684,35 @@ public class AppConfig {
          * so {@link #parseMode()} has nothing to validate and is not run, and no reference script is
          * published (which is what {@code ReferenceScripts.none()} means).
          */
-        public LiquidationConfiguration(Mode mode, boolean enabled, long delaySeconds,
+        public LiquidationConfiguration(Mode mode, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
                                         BigInteger profitMarginLovelace, int decisionLogSize,
                                         long quarantineMinutes) {
-            this(mode, enabled, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
+            this(mode, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
                     profitMarginLovelace, decisionLogSize, quarantineMinutes,
                     LiquidateTransactionBuilder.ReferenceScripts.none());
         }
 
         /** As above, with the published reference scripts stated. */
-        public LiquidationConfiguration(Mode mode, boolean enabled, long delaySeconds,
+        public LiquidationConfiguration(Mode mode, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
                                         BigInteger profitMarginLovelace, int decisionLogSize,
                                         long quarantineMinutes,
                                         LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
             // The profitability floors default to the safe pair: checking on, absolute floor at 0.
-            this(mode, enabled, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
+            this(mode, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
                     profitMarginLovelace, decisionLogSize, quarantineMinutes, true, BigInteger.ZERO,
                     referenceScripts);
         }
 
         /** As above, with the profitability floors stated. */
-        public LiquidationConfiguration(Mode mode, boolean enabled, long delaySeconds,
+        public LiquidationConfiguration(Mode mode, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
                                         BigInteger profitMarginLovelace, int decisionLogSize,
                                         long quarantineMinutes, boolean checkProfitability,
                                         BigInteger minProfitAbsoluteLovelace,
                                         LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
-            this(mode, enabled, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
+            this(mode, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
                     profitMarginLovelace, decisionLogSize, quarantineMinutes, checkProfitability,
                     minProfitAbsoluteLovelace, BigInteger.ZERO, referenceScripts);
         }
@@ -720,7 +722,7 @@ public class AppConfig {
          * a loss-tolerant configuration; every other overload pins {@code minExpectedProfitLovelace}
          * to zero, so a test that does not ask for loss tolerance cannot acquire it by accident.
          */
-        public LiquidationConfiguration(Mode mode, boolean enabled, long delaySeconds,
+        public LiquidationConfiguration(Mode mode, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
                                         BigInteger profitMarginLovelace, int decisionLogSize,
                                         long quarantineMinutes, boolean checkProfitability,
@@ -730,7 +732,6 @@ public class AppConfig {
             this.minExpectedProfitLovelace = minExpectedProfitLovelace;
             this.mode = mode;
             this.modeName = mode.name();
-            this.enabled = enabled;
             this.delaySeconds = delaySeconds;
             this.validityWindowSeconds = validityWindowSeconds;
             this.oracleWindowMarginSeconds = oracleWindowMarginSeconds;
@@ -775,9 +776,13 @@ public class AppConfig {
             log.info("INIT - liquidation mode: {}, armed: {}", mode, isArmed());
         }
 
-        /** Whether the bot may move value. False for the whole shadow workstream, by construction. */
+        /**
+         * Whether the bot may move value. <b>Exactly {@code mode == LIVE}</b> since
+         * {@code loans.liquidation.enabled} was removed — kept as a named accessor because it is what
+         * the {@code /loans/liquidations} view reports and what reads correctly at every call site.
+         */
         public boolean isArmed() {
-            return mode == Mode.LIVE && enabled;
+            return mode == Mode.LIVE;
         }
 
         // ---- reference-script parsing --------------------------------------------------------
@@ -992,7 +997,7 @@ public class AppConfig {
          * per-market cap.
          *
          * <p>And "on by default" is on only for a node whose operator has already armed liquidation:
-         * {@code loans.enabled}, {@code loans.liquidation.mode}, {@code loans.liquidation.enabled} and
+         * {@code loans.liquidation.mode} and
          * {@code loans.submittable-network} all still apply, ahead of this. This flag turns the
          * mechanism off globally; {@code loans.liquidation.markets} turns it off per market.
          */

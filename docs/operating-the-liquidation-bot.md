@@ -38,21 +38,32 @@ running one you meant to disable, are both worse than refusing to start.
 So a stock preview node scans, builds, prices and records, and cannot submit. A stock
 mainnet node does not run the bot at all.
 
-## 2. The two arming flags, and why there are two
+## 2. The arming dial — one value, since 2026-09-04
 
-Submitting requires **both**:
+Submitting requires exactly one node-level setting:
 
 ```
 loans.liquidation.mode      = live     (AQUARIUM_LIQUIDATION_MODE)
-loans.liquidation.enabled   = true     (AQUARIUM_LIQUIDATION_ENABLED)
 ```
 
-They are deliberately separate and they are checked separately (vetoes S1 and S2 below).
-One flag is too easy to flip by accident — a copied `.env` from a colleague, an
-experiment left in place, a mode set to `live` "just to see the logs". Arming this bot is a
-two-key turn, and neither key is ever turned by a commit: both defaults live in
-`application.yaml` and are pinned by a test that fails if either is flipped
-(`ShippedDefaultsTest`).
+⛔ **This section used to describe TWO flags and a "two-key turn".** `loans.liquidation.enabled`
+sat beside the mode and had to agree with it, on the reasoning that one flag is too easy to flip
+by accident — a copied `.env`, an experiment left in place, a mode set to `live` "just to see the
+logs". **Giovanni removed it as redundant:** *"mode == disabled already IS off, so a separate
+enabled boolean makes no sense … the gates are too much; it's a bot, if you use it you know it's
+risky, so gates don't really help."*
+
+⚠ **And the redundancy was not free.** It gave "off" two spellings — `mode: disabled`, and
+`mode: live` with the flag false — which logged differently and meant the same thing; and it gave
+an operator who *had* decided to arm one more silent way to have not done it. Removed the same day
+as `loans.submittable-network`, for the same reason: **a gate that restates another gate is cost
+without safety.**
+
+The default is never turned by a commit: it lives in `application.yaml` as `disabled` and is
+pinned by `ShippedDefaultsTest`, which also now fails if a second arming key re-appears beside it.
+
+⇒ **What still holds a candidate back:** the mode, the market's own effective mode, and the two
+profit floors. That is the whole list.
 
 Submitting additionally requires the node to be on **preview** (veto S3). Mainnet is already
 protected by `loans.enabled=false`, which stops the bot's beans existing at all; the network
@@ -151,12 +162,10 @@ liquidations, whose fee slice would not repay the transaction that claims it.
 | Key | Environment variable | Default | What it does |
 |-----|---------------------|---------|--------------|
 | `mode` | `AQUARIUM_LIQUIDATION_MODE` | `disabled` (preview: `shadow`) | See §1. An unrecognised value aborts startup. |
-| `enabled` | `AQUARIUM_LIQUIDATION_ENABLED` | `false` | The arming flag. See §2. |
 | `delay-seconds` | `AQUARIUM_LIQUIDATION_DELAY_SECONDS` | `60` | Fixed delay between cycles. |
 | `validity-window-seconds` | `AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS` | `120` | How far past "now" the built transaction's validity interval extends. |
 | `oracle-window-margin-seconds` | `AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS` | `30` | How much of each oracle feed's window must still be unused after the transaction's `validTo` — and, at submit time, after *now*. |
 | `profit-margin-lovelace` | `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `1500000` | See §4, and §11 for a **negative** value. |
-| *(node-level)* `loans.submittable-network` | `LOANS_SUBMITTABLE_NETWORK` | `preview` | The only network this node will submit on. S3 enforces it. **The default is the protection**; changing it to `mainnet` is a deliberate act. |
 | `decision-log-size` | `AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE` | `200` | Capacity of the in-memory decision ring buffer. Nothing is persisted. |
 | `quarantine-minutes` | `AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES` | `30` | How long a loan UTxO is skipped after a failed build or any submit attempt. |
 | `reference-scripts.loan` | `AQUARIUM_LIQUIDATION_REF_LOAN` | empty (preview: set) | See §6. |
@@ -526,7 +535,7 @@ ada-equivalent is worth the exposure.
 
 **`convert.enabled` is the one arming flag in this codebase that defaults ON.** That is not a
 weakening: it only matters on a node that has already passed `loans.enabled`,
-`loans.liquidation.mode`, `loans.liquidation.enabled` and `loans.submittable-network` — and this path
+`loans.liquidation.mode` — and this path
 fronts no capital and holds nothing, so its failure mode is a no-op rather than a loss.
 
 ### 12.2 Is convert available on this node? The boot log answers it
@@ -645,7 +654,6 @@ or, in `docker/.env` (section 9.1 — a list is not one variable):
 
 ```
 AQUARIUM_LIQUIDATION_MODE=shadow
-AQUARIUM_LIQUIDATION_ENABLED=false
 LOANS_LIQUIDATION_MARKETS_0_UNIT=lovelace
 LOANS_LIQUIDATION_MARKETS_0_MODE=SHADOW
 LOANS_LIQUIDATION_MARKETS_0_ACTION=ANTICIPATE
@@ -697,23 +705,28 @@ on a wallet-less node.**
 ### 14.7 Order of operations
 
 1. **Fund the operator wallet** with one ada-only UTxO ≥ the fronted amount + fee headroom.
-2. Set the configuration in 14.4 — `mode: shadow`, `enabled: false`.
+2. Set the configuration in 14.4 — `mode: shadow`.
 3. Watch for the `SHADOW TX` / `SHADOW CBOR` pair (section 10) and check the dump: variant
    `LiquidateAndPayInAdvance`, `held-by=MODE_NOT_LIVE`, real ex-units, not placeholders.
-4. Only then consider arming. **On mainnet that is FOUR switches, not two** — the two of section 2
-   plus two more that exist specifically so mainnet cannot be armed by accident:
+4. Only then consider arming.
 
-   | switch | default | why it is separate |
-   |---|---|---|
-   | `loans.enabled` | **`false` on mainnet** | without it the lending beans do not exist at all |
-   | `loans.liquidation.mode` | `disabled` | S1 `MODE_NOT_LIVE` |
-   | `loans.liquidation.enabled` | `false` | S2 `NOT_ARMED` |
-   | **`loans.submittable-network`** | **`preview`** | S3 `NETWORK_NOT_PREVIEW` — **a mainnet node fails closed here no matter what the other three say** |
+   ⛔ **This step used to read "on mainnet that is FOUR switches, not two". It is now ONE:**
+   `AQUARIUM_LIQUIDATION_MODE=live`. On 2026-09-04 Giovanni removed three of the four —
+   `loans.enabled`, `loans.submittable-network` and `loans.liquidation.enabled` — as gates that
+   were either redundant or actively harmful:
 
-   ⛔ `LOANS_SUBMITTABLE_NETWORK=mainnet` is the switch that has never been set by anyone, on any
-   node. It is the last barrier and it is deliberately not a mode: setting the other three on mainnet
-   still submits **nothing**, and the log says `NETWORK_NOT_PREVIEW`. Treat reaching for it as the
-   moment to stop and get a second pair of eyes.
+   | removed switch | why |
+   |---|---|
+   | `loans.enabled` | its OFF position **discarded v4 UTxOs at write time**, unrecoverably. Indexing is unconditional now; the config policy ids decide what is watched |
+   | `loans.submittable-network` | a node correctly targeted at mainnet, armed and profitable, **refused to submit and said so only in a decision row** |
+   | `loans.liquidation.enabled` | a second boolean that had to agree with the mode — two spellings of "off" |
+
+   ⚠ **Read this as a change in where the care goes, not a loss of it.** *"It's a bot; if you use it
+   you know it's risky, so gates don't really help."* The care now lives in the things that actually
+   bound the outcome — the **per-market `ANTICIPATE` cap**, the **two profit floors**, and the
+   **wallet balance** — none of which a copied `.env` sets for you. **A node targeted at mainnet and
+   set to `live` ACTS on mainnet.** There is no barrier behind that to catch a mistake, which is
+   exactly why the value is stated deliberately.
 
 **Do not skip 1.** Steps 2–3 produce nothing on a wallet-less node, which looks identical to a quiet
 market.

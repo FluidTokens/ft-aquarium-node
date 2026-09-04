@@ -25,8 +25,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <h2>Why this test exists</h2>
  * Nothing else in the suite binds {@code application.yaml}. Every liquidation test builds its
  * configuration by hand, which is what makes those tests fast and readable — and also means that
- * flipping {@code loans.liquidation.enabled} to {@code true}, or the preview {@code mode} to
- * {@code live}, in the shipped file would leave the whole suite green while arming a bot on every
+ * flipping the preview {@code mode} to
+ * {@code live} in the shipped file would leave the whole suite green while arming a bot on every
  * node that pulls the image. Those are exactly the two values the submit path gates on.
  * <p>
  * So this test reads the shipped resource — the real file, parsed as YAML rather than grepped, so a
@@ -121,26 +121,29 @@ class ShippedDefaultsTest {
     }
 
     /**
-     * The arming flag, shipped off. There is no per-profile override of it anywhere in the file: the
-     * preview document deliberately does not set it, so shadow is as far as a stock node can get.
+     * ⛔ <b>THE SEPARATE ARMING FLAG IS GONE, and this now pins its ABSENCE.</b>
+     *
+     * <p>{@code loans.liquidation.enabled} shipped {@code false} beside the mode until 2026-09-04,
+     * when Giovanni removed it as redundant: <i>"mode == disabled already IS off, so a separate
+     * enabled boolean makes no sense."</i>
+     *
+     * <p>⚠ The inverted assertion is worth as much as the original was. A key re-appearing in the
+     * shipped file is how a removed gate comes back — and it would come back <b>bound to nothing</b>,
+     * since the {@code @Value} that read it is gone. A node would then ship a flag an operator can
+     * set, that reads as arming, and that changes nothing at all: <b>strictly worse than either
+     * having it or not.</b> The mode is pinned {@code disabled} by the test above; this pins that
+     * nothing sits beside it.
      */
     @Test
-    void theBaseDocumentShipsTheArmingFlagFalse() throws IOException {
-        List<Map<String, Object>> documents = documents();
-
-        assertEquals("${AQUARIUM_LIQUIDATION_ENABLED:false}",
-                at(base(documents), "loans.liquidation.enabled"),
-                "the shipped arming flag is not 'false' — arming must never be a commit");
-
-        for (Map<String, Object> document : documents) {
-            if (document == base(documents)) {
-                continue;
-            }
+    void noDocumentShipsASecondArmingFlagBesideTheMode() throws IOException {
+        for (Map<String, Object> document : documents()) {
             Object liquidation = liquidationBlockOf(document);
             if (liquidation instanceof Map<?, ?> map) {
                 assertTrue(map.get("enabled") == null,
-                        "the " + profileOf(document) + " profile overrides loans.liquidation.enabled; "
-                                + "the arming flag must be set by an operator, not by a profile");
+                        profileOf(document) + " ships loans.liquidation.enabled. That property was "
+                                + "REMOVED from the app, so the key binds to nothing: an operator "
+                                + "would set it, read no error, and arm nothing. The mode is the "
+                                + "whole node-level dial");
             }
         }
     }
@@ -163,12 +166,11 @@ class ShippedDefaultsTest {
      * those assertions pin a literal that no longer has a default behind it.
      */
     @Test
-    void bothGatingValuesAreEnvOverridableWithTheirDefaultInline() throws IOException {
+    void theGatingValueIsEnvOverridableWithItsDefaultInline() throws IOException {
         List<Map<String, Object>> documents = documents();
 
         for (String value : List.of(
                 (String) at(base(documents), "loans.liquidation.mode"),
-                (String) at(base(documents), "loans.liquidation.enabled"),
                 (String) at(preview(documents), "loans.liquidation.mode"))) {
             assertTrue(value.startsWith("${") && value.endsWith("}") && value.contains(":"),
                     "'" + value + "' is not a ${VAR:default} placeholder");
@@ -302,7 +304,6 @@ class ShippedDefaultsTest {
      */
     private static final Map<String, String> SHIPPED_LIQUIDATION_DEFAULTS = Map.ofEntries(
             Map.entry("mode", "${AQUARIUM_LIQUIDATION_MODE:disabled}"),
-            Map.entry("enabled", "${AQUARIUM_LIQUIDATION_ENABLED:false}"),
             Map.entry("delay-seconds", "${AQUARIUM_LIQUIDATION_DELAY_SECONDS:60}"),
             Map.entry("validity-window-seconds", "${AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS:120}"),
             Map.entry("oracle-window-margin-seconds", "${AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS:30}"),

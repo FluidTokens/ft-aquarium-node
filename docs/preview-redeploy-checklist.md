@@ -115,7 +115,8 @@ change as the new image** — it changes which candidates are eligible, and conf
 > **This section originally argued: "the mitigation is the mode, not the tests — in `shadow`,
 > `MODE_NOT_LIVE` stops every submission, so everything in §7 is observable with nothing on chain."
 > THAT IS VOID. Measured on the cluster: `AQUARIUM_LIQUIDATION_MODE=live`,
-> `AQUARIUM_LIQUIDATION_ENABLED=true`, and the app confirms it at boot —
+> `AQUARIUM_LIQUIDATION_MODE=live` (the separate `AQUARIUM_LIQUIDATION_ENABLED` was removed
+> 2026-09-04), and the app confirms it at boot —
 > `INIT - liquidation mode: LIVE, armed: true`. THERE IS NO SHADOW.**
 
 **And the situation is sharper than "the flag is on".**

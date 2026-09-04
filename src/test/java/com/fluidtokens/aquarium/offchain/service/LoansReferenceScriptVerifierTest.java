@@ -47,7 +47,7 @@ class LoansReferenceScriptVerifierTest {
     /** One coordinate configured — {@code loan-claim-action} — and nothing else. */
     private static AppConfig.LiquidationConfiguration oneCoordinate() {
         return new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, false, 60, 120, 30,
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
                 BigInteger.valueOf(1_500_000), 200, 30,
                 new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
                         new TransactionInput(TX, 0),
@@ -57,7 +57,7 @@ class LoansReferenceScriptVerifierTest {
     /** All six a {@code Liquidate} actually invokes, at six outputs of one publishing transaction. */
     private static AppConfig.LiquidationConfiguration sixCoordinates() {
         return new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, false, 60, 120, 30,
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
                 BigInteger.valueOf(1_500_000), 200, 30,
                 new LiquidateTransactionBuilder.ReferenceScripts(
                         new TransactionInput(TX, 0),
@@ -72,7 +72,7 @@ class LoansReferenceScriptVerifierTest {
     /** Nothing published — the shipped mainnet shape. */
     private static AppConfig.LiquidationConfiguration noCoordinates() {
         return new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, false, 60, 120, 30,
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
                 BigInteger.valueOf(1_500_000), 200, 30,
                 LiquidateTransactionBuilder.ReferenceScripts.none());
     }

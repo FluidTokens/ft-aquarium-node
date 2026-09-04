@@ -35,8 +35,8 @@ class LiquidationDecisionsEndpointTest {
     private static final String CBOR = "84a4008182582000".repeat(4);
 
     private static AppConfig.LiquidationConfiguration config(
-            AppConfig.LiquidationConfiguration.Mode mode, boolean enabled) {
-        return new AppConfig.LiquidationConfiguration(mode, enabled, 60, 120, 30,
+            AppConfig.LiquidationConfiguration.Mode mode) {
+        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30,
                 BigInteger.valueOf(1_500_000), 200, 30);
     }
 
@@ -54,7 +54,7 @@ class LiquidationDecisionsEndpointTest {
                                                   Map<LiquidationExclusion, Integer> exclusions,
                                                   int bondsScanned, int buildable) {
         LiquidationDecisionLog log = new LiquidationDecisionLog(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false));
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW));
         log.recordRun(NOW, bondsScanned, 0, buildable, 0, exclusions);
         decisions.forEach(log::record);
         return log;
@@ -73,7 +73,7 @@ class LiquidationDecisionsEndpointTest {
                         LiquidationExclusion.LOAN_NOT_FOUND, 1),
                 9, 1);
         var controller = new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false), log);
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW), log);
 
         var view = controller.liquidations(50, false);
 
@@ -104,11 +104,11 @@ class LiquidationDecisionsEndpointTest {
     @Test
     void theEndpointReportsUnreadableSoAnEmptyPageCanBeToldFromABlindOne() throws Exception {
         LiquidationDecisionLog log = new LiquidationDecisionLog(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false));
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW));
         log.recordRun(NOW, 0, 10, 0, 3, Map.of());
 
         var view = new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false), log)
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW), log)
                 .liquidations(50, false);
 
         assertEquals(3, view.unreadable(),
@@ -123,31 +123,37 @@ class LiquidationDecisionsEndpointTest {
         assertEquals(3, json.get("unreadable").asInt());
     }
 
-    /** Arming takes both switches; either one alone leaves the bot unarmed. */
+    /**
+     * ⛔ <b>Arming is the mode, and the endpoint reports exactly that.</b> This asserted a conjunction
+     * of two switches until {@code loans.liquidation.enabled} was removed on 2026-09-04 as redundant
+     * with the mode. All three modes are walked, so a bug that reported every node as armed — or none
+     * — cannot pass.
+     */
     @Test
-    void armedRequiresBothLiveModeAndTheEnabledFlag() {
+    void armedIsReportedAsExactlyLiveMode() {
         LiquidationDecisionLog log = logWith(List.of(), Map.of(), 0, 0);
 
         assertFalse(new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.LIVE, false), log)
+                config(AppConfig.LiquidationConfiguration.Mode.DISABLED), log)
                 .liquidations(50, false).armed());
         assertFalse(new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, true), log)
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW), log)
                 .liquidations(50, false).armed());
         assertTrue(new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.LIVE, true), log)
+                config(AppConfig.LiquidationConfiguration.Mode.LIVE), log)
                 .liquidations(50, false).armed(),
-                "the arming rule itself still has to work — nothing in this slice sets it");
+                "live must report armed — an endpoint that never says armed is as useless as one "
+                        + "that always does");
     }
 
     /** A node that has never completed a cycle reports that, rather than a fabricated zero-time run. */
     @Test
     void anEmptyLogReportsNoLastRunRatherThanAFabricatedOne() {
         LiquidationDecisionLog log = new LiquidationDecisionLog(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false));
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW));
 
         var view = new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false), log)
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW), log)
                 .liquidations(50, false);
 
         assertNull(view.lastRunAt());
@@ -162,7 +168,7 @@ class LiquidationDecisionsEndpointTest {
                 List.of(wouldSubmit("a1"), wouldSubmit("a2"), wouldSubmit("a3")), Map.of(), 3, 3);
 
         var view = new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false), log)
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW), log)
                 .liquidations(2, false);
 
         assertEquals(List.of("a3", "a2"),
@@ -180,7 +186,7 @@ class LiquidationDecisionsEndpointTest {
     void txCborHexIsOmittedUnlessAskedFor() throws Exception {
         LiquidationDecisionLog log = logWith(List.of(wouldSubmit("a1")), Map.of(), 1, 1);
         var controller = new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false), log);
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW), log);
 
         var without = controller.liquidations(50, false);
         assertNull(without.decisions().getFirst().txCborHex());
@@ -199,7 +205,7 @@ class LiquidationDecisionsEndpointTest {
     void txCborHexIsPresentWhenAskedFor() throws Exception {
         LiquidationDecisionLog log = logWith(List.of(wouldSubmit("a1")), Map.of(), 1, 1);
         var controller = new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false), log);
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW), log);
 
         var with = controller.liquidations(50, true);
         assertEquals(CBOR, with.decisions().getFirst().txCborHex());
@@ -215,7 +221,7 @@ class LiquidationDecisionsEndpointTest {
                 Map.of(LiquidationExclusion.NOT_LIQUIDATABLE, 2), 3, 1);
 
         JsonNode json = new ObjectMapper().valueToTree(new LiquidationController(
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false), log)
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW), log)
                 .liquidations(50, false));
 
         assertTrue(json.has("last_run_at"));
