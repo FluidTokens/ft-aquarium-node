@@ -116,8 +116,13 @@
         <td class="mono">
           <span th:if="${r.feeInCollateral != null}" th:text="${r.feeInCollateral}">0</span>
           <span th:if="${r.feeInCollateral == null}" class="unknown">unknown</span>
+          <!-- ⛔ |...| literal substitution, NOT a quoted concatenation. This read
+               th:text="'≈ ' + ${...} + ' lovelace at today&apos;s price'" and &apos; is unescaped to a
+               bare apostrophe BEFORE Thymeleaf parses the expression, terminating the literal and
+               throwing TemplateProcessingException. It only fired once a ROW rendered, so the page
+               was 200 while preview was empty and 500 the moment two loans appeared. -->
           <span class="reason" th:if="${r.feeValueLovelace != null}"
-                th:text="'≈ ' + ${r.feeValueLovelace} + ' lovelace at today&apos;s price'">value</span>
+                th:text="|≈ ${r.feeValueLovelace} lovelace at today's price|">value</span>
           <span class="reason" th:if="${r.feeUnknownReason}" th:text="${r.feeUnknownReason}">why</span>
         </td>
         <td>
