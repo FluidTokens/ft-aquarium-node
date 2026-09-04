@@ -32,6 +32,12 @@ reading of the docs: `docker/docker-compose.yaml` has always driven `STORE_CARDA
 **64 leaves total** across the two YAML documents (default = mainnet, plus the `preview` profile),
 of which 22 are hardcoded.
 
+⚠ **Enumerating a surface and cataloguing it are different acts, and this file got them out of
+step once already.** All 64 leaves were enumerated in the first pass; six of them — the Aquarium
+derivation inputs, §3.5 — never got rows, and the file went on calling itself complete. It took
+helm-charts' independent derivation to catch it. **A completeness claim is only worth what the
+last diff against it proved.**
+
 ### The env-var naming rule
 
 `property.name.with-dashes` → **`PROPERTY_NAME_WITH_DASHES`**: uppercase, and both `.` and `-`
@@ -100,7 +106,7 @@ reads the config rather than the config itself:
 |---|---|---|
 | **A** | operator-owned value | plain chart value, safe default, documented |
 | **B** | **secret** | secret reference only — never a plain value, never a default, never logged |
-| **C** | **protection / must not ship armed** | expose, but default OFF and comment *why*; several are startup-fatal if wrong |
+| **C** | **protection / must not ship armed** | ⚠ **expose it — (C) never means "omit from the chart".** Default OFF (or to the safe value), and comment *why* at the value. Several are startup-fatal if wrong. |
 | **D** | derivation input — correct per network, and wrong values silently index a dead deployment | expose (redeploys happen), but default to the shipped coordinates |
 | **I** | internal — expose only if the chart wants completeness | leave at default |
 
@@ -128,7 +134,7 @@ share one secret.
 | env var | property | plain English | type / values | default (mainnet doc) | preview profile | class | prov |
 |---|---|---|---|---|---|---|---|
 | `SPRING_PROFILES_ACTIVE` | — | Which YAML document applies. **This is the network selector.** Unset = mainnet. | `` (empty) or `preview` | *(empty → mainnet)* | `preview` | **A** | (own) |
-| `NETWORK` | `network` | The Cardano network the node believes it is on — drives address prefixes, slot conversion and every "is this mainnet" guard. | `mainnet` / `preview` / `preprod` | `mainnet` | `preview` | ⛔ **C** — **do not expose as an independent knob.** It is set by the profile, and overriding it alone decouples the network from the config policy ids, the Blockfrost URL and the relay, producing a node that derives one deployment and talks to another. | (own†) |
+| `NETWORK` | `network` | The Cardano network the node believes it is on — drives address prefixes, slot conversion and every "is this mainnet" guard. | `mainnet` / `preview` / `preprod` | `mainnet` | `preview` | **C** — ⚠ **expose with a locked-safe default and a loud warning; do NOT remove it.** (C) in this file means *handle specially*, never *forbid* — see §1. The safe default is **empty, derived from the profile**. ⛔ The hazard is setting it **alone**: it decouples the network from the config policy ids, the Blockfrost URL and the relay, producing a node that derives one deployment and talks to another. Worst case is `SPRING_PROFILES_ACTIVE` unset (⇒ mainnet document) with `NETWORK=preview` — preview addresses and slot conversion against mainnet coordinates, a mainnet relay and a mainnet Blockfrost URL. | (own†) |
 | `LOANS_SUBMITTABLE_NETWORK` | `loans.submittable-network` | ⛔ **The submit gate.** The one network this node may sign and submit on. Compared to `network`; unequal ⇒ every build stops at veto **S3**. | network name | **`preview`** *(layer 2 — no yaml line)* | `preview` | ⛔ **C** — **the default IS the protection.** Mainnet is the default *profile*, so this default deliberately leans the other way. Setting it to `mainnet` is a deliberate written act. | (own) |
 | `STORE_CARDANO_HOST` | `store.cardano.host` | The Cardano relay the indexer connects to (N2C/N2N over TCP — no Kupo/Ogmios). | hostname | `backbone.mainnet.cardanofoundation.org` ⚑ *hardcoded* | `""` ⚑ | **A** — mandatory on preview, where the default is empty. | (fwd) |
 | `STORE_CARDANO_PORT` | `store.cardano.port` | Relay port. | int | `3001` ⚑ | `0` ⚑ | **A** — mandatory on preview. | (fwd) |
@@ -147,6 +153,51 @@ share one secret.
 | `JAVA_TOOL_OPTIONS` | — | JVM options. ⛔ **NOT `JAVA_OPTS`** — the entrypoint is a bare `["java","-jar","app.jar"]` with no shell, so `JAVA_OPTS` is silently ignored. | string | `-XX:MaxRAMPercentage=75` | — | **A** | (own) |
 | `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` | `management.endpoints.web.exposure.include` | Actuator endpoints exposed. | csv | `health,prometheus` ⚑ | inherits | **I** — widening this exposes more than the chart's probes need. | (own†) |
 | `APIPREFIX` | `apiPrefix` | Path prefix for `/loans*` routes. `/healthcheck` is **outside** it. | string | `/api/v1` ⚑ | inherits | **I** — changing it moves every documented URL. | (own†) |
+
+---
+
+## 3.5 Aquarium core — the Tank / Parameters / Staker derivation (D)
+
+*Every row in this section: **(own)**, and **added 2026-09-04 after helm-charts' three-column diff
+surfaced them as missing.** They were an **omission, not a scope decision** — see the note below.*
+
+⛔ **These six parameterise the whole Aquarium contract tree**, which is the part of this node that
+runs on `main`, in production, for every operator. `ContractRegistry` applies them in a chain:
+`parameters(genesisTxHash, genesisOutputIndex)` → `staker(H_params, stakingTokenPolicy,
+stakingTokenName)` → `tank(H_staker, H_params)`. Get one wrong and every derived credential moves.
+
+| env var | property | plain English | default (mainnet) | preview | class |
+|---|---|---|---|---|---|
+| `AQUARIUM_GENESIS_TX_HASH` | `aquarium.genesis.tx-hash` | The genesis one-shot UTxO's tx hash. First parameter of the `parameters` validator, whose hash **is** the config-NFT policy id. | `45f379b3…` ⚑ | `d35f81f6…` ⚑ | **D** |
+| `AQUARIUM_GENESIS_OUTPUT_INDEX` | `aquarium.genesis.output-index` | That UTxO's output index. | `0` ⚑ | `1` ⚑ | **D** |
+| `AQUARIUM_STAKING_TOKEN_POLICY` | `aquarium.staking.token.policy` | FLDT policy id — second parameter of `staker`. | `577f0b13…` ⚑ | `0b77d150…` ⚑ | **D** |
+| `AQUARIUM_STAKING_TOKEN_NAME` | `aquarium.staking.token.name` | FLDT asset name (hex) — third parameter of `staker`. | `0014df10464c4454` ⚑ | `0014df1074464c4454` ⚑ | **D** |
+| `AQUARIUM_TANK_REF_INPUT_TXHASH` | `aquarium.tank.ref-input.txHash` | The published Tank reference input. ⚠ Note the **camelCase** property segment; the relaxed env name flattens it anyway. | `354ffe79…` ⚑ | `78210625…` ⚑ | **D** |
+| `AQUARIUM_TANK_REF_INPUT_OUTPUTINDEX` | `aquarium.tank.ref-input.outputIndex` | Its output index. | `0` ⚑ | `0` ⚑ | **D** |
+
+⛔ **Emit these only with the shipped values, never blank.** Their `@Value` annotations carry **no
+inline default**, so the yaml is the only default there is, and an env var set to the empty string
+**overrides it**. The two failure modes are asymmetric, and the dangerous one is silent:
+
+- **`AQUARIUM_GENESIS_OUTPUT_INDEX=""`** → `Integer` conversion fails → **the context fails loudly.** Fine.
+- ⛔ **`AQUARIUM_STAKING_TOKEN_POLICY=""`** (or either genesis/tank hash) → `HexUtil.decodeHexString("")`
+  returns a **zero-length array, not an error**. Derivation succeeds, produces a *valid but wrong*
+  script hash, and the node indexes at credentials nothing lives at. **It boots clean and finds an
+  empty world** — the same pathology as trap 3, on the path that serves production.
+
+⇒ A chart that renders `AQUARIUM_*: ""` when a value is unset would break the Aquarium node
+**silently**. Render the key only when the value is non-empty, or default it to the shipped constant.
+
+> ### ⚠ Why these were missing, stated plainly
+> They were **not** a scope decision. The 64-leaf enumeration in §0 included all six; the sweep
+> then wrote rows for the lending side and did not come back for them, and the file went on
+> claiming to be the complete surface. **The claim was wrong and the diff is what caught it.**
+>
+> ⛔ **And the omission fell in the worst possible place.** Everything else in this catalogue governs
+> lending v4, which is `loans.enabled=false` on mainnet and therefore inert in production. **These
+> six govern the Tank indexing that every operator actually runs today, off `main`.** The rows most
+> likely to matter to a real operator were the rows a lending-shaped sweep skipped — which is
+> exactly what an independent derivation is for.
 
 ---
 
