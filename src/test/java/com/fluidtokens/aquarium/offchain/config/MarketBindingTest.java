@@ -37,12 +37,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class MarketBindingTest {
 
     @Configuration
-    @EnableConfigurationProperties(LiquidationConfiguration.class)
+    // ⛔ The BINDER now owns only AppConfig.MarketProperties; LiquidationConfiguration is a plain
+    // @Value component that pulls the bound list in at @PostConstruct. Splitting them is what fixed
+    // the 2026-09-04 boot failure (a getter-only computed field under a bound prefix demands a setter
+    // that cannot exist) — see ApplicationYamlBindsTest. The assertions below are unchanged: they
+    // still read the list through LiquidationConfiguration, which is where the gate reads it.
+    @EnableConfigurationProperties(AppConfig.MarketProperties.class)
+    @org.springframework.context.annotation.Import(LiquidationConfiguration.class)
     static class Ctx {
     }
 
     private static ApplicationContextRunner runner() {
-        return new ApplicationContextRunner().withUserConfiguration(Ctx.class);
+        // ⚠ loans.enabled: LiquidationConfiguration is @ConditionalOnProperty on it, so without this
+        // the bean is simply absent and every assertion below would fail on a missing bean rather
+        // than on the binding it is about.
+        return new ApplicationContextRunner().withUserConfiguration(Ctx.class)
+                .withPropertyValues("loans.enabled=true");
     }
 
     /** The canonical form: a list of objects with named fields. */

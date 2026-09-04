@@ -14,6 +14,7 @@ import org.cardanofoundation.conversions.ClasspathConversionsFactory;
 import org.cardanofoundation.conversions.domain.NetworkType;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -231,12 +232,66 @@ public class AppConfig {
      * start production software over a knob that governs nothing on it. Where the fail-fast is
      * useful — a node that actually runs the bot — the condition is satisfied and it still fires.
      */
+    /**
+     * ⛔ <b>The ONLY {@code @ConfigurationProperties} bean over {@code loans.liquidation}, and it
+     * declares exactly one thing.</b>
+     *
+     * <p>{@code @Value} cannot bind a list of objects, so the per-market policy needs the binder. The
+     * binder, in turn, claims <em>every</em> getter under its prefix and demands a setter for it — so
+     * pointing it at a class that also holds computed fields is what broke the 2026-09-04 image
+     * ({@code No setter found for property: mode}). See {@link LiquidationConfiguration}'s own field
+     * javadoc for the full account.
+     *
+     * <p>⚠ <b>Keep this class to bound fields only.</b> Anything computed, parsed or derived belongs on
+     * {@link LiquidationConfiguration}; the moment a computed getter appears here the same failure
+     * returns, and it returns at container start rather than in any unit test.
+     */
+    @Component
+    @Getter
+    @ConfigurationProperties(prefix = "loans.liquidation")
+    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
+    public static class MarketProperties {
+
+        private List<LiquidationConfiguration.Market> markets = new ArrayList<>();
+
+        public void setMarkets(List<LiquidationConfiguration.Market> markets) {
+            this.markets = markets == null ? new ArrayList<>() : markets;
+        }
+    }
+
     @Component
     @Getter
     @NoArgsConstructor
-    @ConfigurationProperties(prefix = "loans.liquidation")
     @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public static class LiquidationConfiguration {
+
+        /**
+         * ⛔ <b>THIS CLASS IS NOT {@code @ConfigurationProperties}, AND MUST NOT BECOME ONE AGAIN.</b>
+         *
+         * <p>It carries a dozen {@code @Value} fields and three <b>computed</b> ones — {@link #mode},
+         * {@link #referenceScripts} — that are written by {@link #init()} and by test constructors, and
+         * by nothing else. Lombok's {@code @Getter} gives every one of them a {@code getX()}, and
+         * <b>Spring's JavaBean binder treats a getter under the bound prefix as a bindable property and
+         * demands a setter for it.</b>
+         *
+         * <h2>What that cost, on 2026-09-04</h2>
+         * The market list needs {@code @ConfigurationProperties} — {@code @Value} cannot bind a list of
+         * objects — so the annotation was added to this class. Every unit test still passed, because a
+         * test that binds {@code markets} does not also supply {@code loans.liquidation.mode}. The real
+         * {@code application.yaml} does, and the image <b>failed to start</b>:
+         *
+         * <pre>Failed to bind properties under 'loans.liquidation' … Property: loans.liquidation.mode
+         * Reason: No setter found for property: mode</pre>
+         *
+         * ⚠ <b>And {@code mode} was only the first.</b> {@code reference-scripts} is also a real key in
+         * {@code application.yaml} and also a getter-only computed field — it would have failed the
+         * moment {@code mode} was patched. <b>A one-field fix would have shipped a second broken image.</b>
+         *
+         * ⇒ The list lives in {@link MarketProperties}, its own bean over the same prefix, which
+         * declares <em>only</em> what it binds. <b>Binding and computing do not share a class.</b>
+         */
+        @Autowired(required = false)
+        private MarketProperties marketProperties;
 
         /**
          * What the liquidation loop is allowed to do.
@@ -679,6 +734,12 @@ public class AppConfig {
          */
         @PostConstruct
         void init() {
+            // The list is bound by MarketProperties (see the field's javadoc). Pull it in BEFORE
+            // validateMarkets(), or an operator's malformed entry would go unvalidated — the check
+            // must see the same list the gate will.
+            if (marketProperties != null) {
+                setMarkets(marketProperties.getMarkets());
+            }
             parseMode();
             validateMarkets();
             parseReferenceScripts();
