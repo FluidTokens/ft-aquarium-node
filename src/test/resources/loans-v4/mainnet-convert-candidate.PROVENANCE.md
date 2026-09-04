@@ -51,3 +51,29 @@ diffed against it would be diffed against the wrong shape.
 
 ⚠ **The pool UTxO reference moves every time the pool is used.** These coordinates are a snapshot for
 fixture purposes; a builder must resolve the pool by its **NFT** at run time, never by a pinned ref.
+
+---
+
+## ⛔ `mainnet-lm-config-datum.hex` RE-CAPTURED 2026-09-04
+
+FluidTokens updated the mainnet LenderManager config **in place** at **11:19:16 UTC** to point at
+their fixed convert action. The recorded fixture went stale the moment they did, and the tests
+caught it: `ConvertActionDerivationTest#theMainnetLmConfigDatumReallyPublishesThatHashAtFieldFive`
+went red because the recording still carried the superseded hash.
+
+| | before | after |
+|---|---|---|
+| config UTxO | `7b9f20db…#1` | **`8296a2fe…#0`** |
+| field 5 — convert action | `ed8d41e4…` | **`dc71541066c95303794863f0a2889fb217a6cc5498e53ad3e077339a`** |
+| every other field | — | **byte-identical** |
+| new reference script | — | `e4e47ab1…#0`, publishing the new hash |
+
+Re-captured verbatim from Blockfrost, mainnet, from that transaction's output carrying the
+`a56b0ac2…parameters` NFT.
+
+⚠ **This is the second time a recorded config datum has aged out from under the suite**, and the
+first cost a morning (findings §53). It is the ordinary condition of any fixture recorded from a
+live chain, not an accident: **the chain is the source of truth and the recording is a snapshot with
+no expiry stamped on it.** The guard is that a test compares the recording against something derived
+independently, so the drift surfaces as a red rather than as a silent agreement between two stale
+things.

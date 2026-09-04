@@ -145,19 +145,35 @@ class MainnetConvertActionDerivationTest {
     }
 
     /**
-     * ⛔ And the pairing that makes the whole thing mean something: our own VENDORED blueprint — the
-     * one the running node derives from — still produces the SUPERSEDED hash. That is the gap
-     * re-vendoring closes, stated as a measurement rather than an assumption.
+     * ⛔ <b>INVERTED 2026-09-04, and the inversion is the receipt.</b>
+     *
+     * <p>This assertion was written the other way round: <i>our vendored blueprint still derives the
+     * SUPERSEDED hash</i> — the gap the re-vendor existed to close, measured rather than assumed, so
+     * that closing it would produce a visible red. <b>It did, and this is what it turned into.</b>
+     *
+     * <p>⇒ Now it asserts the thing that has to stay true from here: <b>the artefact we SHIP derives
+     * the action mainnet actually runs.</b> Together with
+     * {@link #fluidTokensCommittedFixDerivesTheHashMainnetNowPublishes()} that is two independent
+     * paths to one hash — FluidTokens' committed source, and the file in {@code src/main/resources} —
+     * and <b>they are checked separately on purpose</b>. A single test covering both would go green if
+     * the vendored file were quietly replaced by anything that happened to derive the same value, and
+     * "a compiled artefact meeting data from a different build" is precisely the failure class
+     * findings §51 and §53 are both instances of.
      */
     @Test
-    void ourVendoredBlueprintStillDerivesTheSupersededActionUntilItIsReVendored() {
+    void ourVendoredBlueprintNowDerivesTheDeployedAction() {
         LoansContractRegistry registry = new LoansContractRegistry(
                 CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
                 MINSWAP_POOL_POLICY, MINSWAP_POOL_SPEND, MINSWAP_ORDER_SPEND);
 
-        assertEquals(SUPERSEDED_CONVERT_ACTION, registry.getLmLiquidateAndConvertActionScriptHash(),
-                "the vendored blueprint no longer derives the superseded hash either — then it is "
-                        + "neither the old deployment nor obviously the new one, and the re-vendor "
-                        + "question needs re-asking from scratch");
+        assertEquals(DEPLOYED_CONVERT_ACTION, registry.getLmLiquidateAndConvertActionScriptHash(),
+                "the SHIPPED loans-v4.plutus.json no longer derives the convert action mainnet runs. "
+                        + "Either the vendored file drifted from FluidTokens' bb4349c, or they moved "
+                        + "the deployment again — and the node cannot build a convert liquidation "
+                        + "either way, because lender_manager.withdraw only authorises the hash the "
+                        + "LMConfigDatum names.");
+        assertNotEquals(SUPERSEDED_CONVERT_ACTION,
+                registry.getLmLiquidateAndConvertActionScriptHash(),
+                "and it is not the pre-11:19-UTC action, which could not decode a live Minswap pool");
     }
 }

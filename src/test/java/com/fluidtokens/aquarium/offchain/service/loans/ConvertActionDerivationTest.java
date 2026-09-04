@@ -38,9 +38,23 @@ class ConvertActionDerivationTest {
     private static final String POOL_SPEND = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
     private static final String ORDER_SPEND = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
 
-    /** Field 5 of the mainnet LMConfigDatum, read off chain. */
+    /**
+     * Field 5 of the mainnet LMConfigDatum, read off chain.
+     *
+     * <p>⛔ <b>MOVED 2026-09-04 11:19:16 UTC</b>, when FluidTokens updated the config IN PLACE to point
+     * at their fixed convert action — the config UTxO went {@code 7b9f20db…#1} → {@code 8296a2fe…#0},
+     * this field alone changed, and a reference script {@code e4e47ab1…#0} publishing the new hash
+     * appeared. The previous value was {@code ed8d41e48d2b48c23c1673493e133b2e5a3300555026cab6c729683b},
+     * the action that could not decode a live Minswap pool (findings §51).
+     *
+     * <p>⚠ This test now passes because {@code loans-v4.plutus.json} was re-vendored to
+     * {@code bb4349c} — <b>and the two facts are checked separately on purpose</b>.
+     * {@code MainnetConvertActionDerivationTest} proves FluidTokens' committed source derives this
+     * hash; this one proves the ARTEFACT WE SHIP does. They would disagree if the vendored file were
+     * ever something other than what FluidTokens built, which is the whole §51/§53 failure class.
+     */
     private static final String MAINNET_CONVERT_ACTION =
-            "ed8d41e48d2b48c23c1673493e133b2e5a3300555026cab6c729683b";
+            "dc71541066c95303794863f0a2889fb217a6cc5498e53ad3e077339a";
     /** Field 5 of the live preview LMConfigDatum — a DIFFERENT Minswap deployment's. */
     private static final String PREVIEW_CONVERT_ACTION =
             "aa3628d86e3f16b7d797d0633087859c11e3d200a5defc8ff0fc920e";
@@ -74,7 +88,11 @@ class ConvertActionDerivationTest {
         assertNotEquals(PREVIEW_CONVERT_ACTION, derived,
                 "if these ever DID match, preview would have gained a Minswap deployment and §28.1's "
                         + "no-rehearsal-on-preview finding would need re-reading");
-        assertEquals("52b778c89022f5eb90e645b750cf9677187e1da06aca99c46f948ed1", derived,
+        // ⚠ RE-MEASURED 2026-09-04 from 52b778c8…, when loans-v4.plutus.json was re-vendored to
+        // FluidTokens' bb4349c. It moved because the convert action's compiled code changed, which is
+        // the whole point of the re-vendor — and it is pinned again rather than dropped, because an
+        // inequality that stops being checked against a known value stops noticing anything.
+        assertEquals("04540b1465a0c1134d43e440583fff1804e934e52013f208e15bd0fe", derived,
                 "the measured value, pinned so a change in the derivation is visible rather than "
                         + "hidden behind the inequality above");
     }
