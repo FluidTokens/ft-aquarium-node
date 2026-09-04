@@ -72,8 +72,11 @@ loans:
   # to flip by accident. This is not a drill: when armed and all eight submit-vetoes pass, the
   # executor SIGNS AND SUBMITS the liquidation on preview (LiquidationExecutor wires the real
   # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
-  # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely. Preview only:
-  # SUBMITTABLE_NETWORK is hard-coded to preview, so mainnet stays fail-closed regardless of flags.
+  # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely.
+  # ⚠ `SUBMITTABLE_NETWORK is hard-coded to preview` was true of an earlier build and is not now:
+  # it is ordinary configuration, `loans.submittable-network`, DEFAULTING to preview. The default
+  # is the protection — mainnet is the default PROFILE, so this default leans the other way — but
+  # an operator can set it, and on mainnet that is exactly what arming step 4 does.
   # The repayment-escrow COMPOUND path (lm_compound_action): collect a repaid loan's principal from
   # the asset manager and deliver it into the lender's pool, keeping the pool owner's compounding fee.
   # A different action from every `liquidation:` key above -- see docs/lending-v4-findings.md section 20.
@@ -95,7 +98,12 @@ loans:
     # nothing, and still bounds the loss: a candidate worse than the stated figure is refused.
     # Giovanni's ruling, 2026-09-02: acceptable "as long as operator checks this himself and owns it".
     #
-    # Negative on mainnet is a hard startup failure, exactly as the liquidation margin is.
+    # ⚠ STALE UNTIL 2026-09-04: this said "negative on mainnet is a hard startup failure, exactly
+    # as the liquidation margin is". BOTH halves were false. `CompoundEconomics.announceAndGuard`
+    # only WARNs — loudly, naming the network — and the liquidation margin's mainnet hard-fail was
+    # removed by findings section 31 on Giovanni's ruling that operating at a loss must be possible
+    # on every network. The one knob that IS fatal on mainnet is `liquidation.ignore-profit-check`.
+    # A chart author read the old wording and built around a crash that does not happen.
     profit-margin-lovelace: ${AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE:0}
     # Published reference scripts: a comma-separated list of txHash#index coordinates.
     #
@@ -119,9 +127,10 @@ loans:
   # See MainnetRegistryMatchesConfigTest and docs/lending-v4-findings.md section 23.
   #
   # ⚠ CONFIGURED IS NOT ARMED. `loans.enabled` above is false on mainnet, the liquidation mode is
-  # `disabled`, SUBMITTABLE_NETWORK is hard-coded to preview, and the compound gate HARD-FAILS a
-  # negative profit margin on mainnet by design. These four values let the node DERIVE and READ the
-  # mainnet deployment; nothing here lets it act on one.
+  # `disabled`, and `loans.submittable-network` defaults to preview so the submit gate is closed.
+  # ⚠ The fourth item here used to read "the compound gate HARD-FAILS a negative profit margin on
+  # mainnet" — it does not; see the compound margin above. Three gates, not four. These values let
+  # the node DERIVE and READ the mainnet deployment; nothing here lets it act on one.
   #
   # The preview profile overrides all four, so this block is inert on every preview deployment.
   config:
