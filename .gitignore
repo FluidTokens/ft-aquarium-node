@@ -7,5 +7,19 @@ build
 # ...but the templates are the point: they show what is needed without showing what it is.
 !.env.*.example
 
+# ⛔ `.env.*` DOES NOT MATCH BARE `.env`, NOR AN EDITOR/FINDER DUPLICATE.
+# Measured 2026-09-04 with `git check-ignore -v` against the filenames actually in use: every
+# `.env.<network>` was covered and `.env` itself was NOT. docker-compose's own convention is a
+# bare `.env`, and `docker/.env` is only covered by docker/.gitignore — a root one was one
+# `git add -A` from the remote. The " copy" form is the one that has already leaked a wallet
+# mnemonic on another repo: a duplicate nobody names and no pattern anticipated.
+# ⚠ Kept as explicit names rather than a blanket `.env*`, which would leave the tracked
+# `.env.preview.example` / `docker/.env.example` tracked-but-ignored — a state that reads as a
+# mistake and invites a "fix" that untracks them.
+.env
+.env copy
+.env*copy*
+.env.bak
+
 # Session-local agent state; never belongs in the repo.
 .claude/

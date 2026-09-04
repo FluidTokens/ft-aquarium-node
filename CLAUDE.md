@@ -39,12 +39,13 @@ Single Gradle module, one package tree: `com.fluidtokens.aquarium.offchain`
 
 ## Commands
 
-Proven 2026-08-14 (Java 21.0.11):
+Proven 2026-09-04 (Java 21.0.11):
 
 - `./gradlew build -x test` — passes; fat jar at `build/libs/ft-aquarium-node-<version>.jar`
-- `./gradlew cleanTest test` — on `feat/lending-v4`: **passes cold** (370 tests, 0 failures,
-  8 skipped — manual deploy scripts and live tests are gated behind `WALLET_MNEMONIC*` /
-  `BLOCKFROST_KEY` and skip when unset). Always force execution with **`cleanTest`**: a bare
+- `./gradlew cleanTest test` — on `feat/lending-v4`: **passes cold** (**114 files, 916 tests, 0
+  failures, 34 skipped**, 0 orphans — manual deploy scripts and live tests are gated behind
+  `WALLET_MNEMONIC*` / `BLOCKFROST_KEY` and skip when unset, plus 4 `@Disabled` historical rigs
+  classified in `LiquidatePayInAdvanceAndCompoundDryEvalTest`). Always force execution with **`cleanTest`**: a bare
   `./gradlew test` on an unchanged tree serves a Gradle UP-TO-DATE cache hit and proves
   nothing ran. On `main` the env gating does not exist and bare `test` **fails cold** (5 of
   7 tests are env-dependent manual scripts) — there, verify with an explicit `--tests`
@@ -55,7 +56,9 @@ Proven 2026-08-14 (Java 21.0.11):
   it is no longer offered above as an equivalent to `cleanTest`. A suite of this size runs in
   a few seconds with PlutusV3 evaluation included, so "too fast to have run" is not a
   reliable instinct either — the XML is the only thing that settles it.
-- **Assert the number of XML files too, not only the totals** (today: **41 files, 370 tests**).
+  ⚠ With `BLOCKFROST_KEY` set, the mainnet-reading tests also run; use `.env.preview`'s key for the
+  preview-targeting live tests, or they 403 on a network mismatch that reads as a code failure.
+- **Assert the number of XML files too, not only the totals** (today: **114 files, 916 tests**).
   A test total can only ever go up, and that is exactly the direction that hides a deletion: if
   a class is deleted or renamed, a lingering results file keeps being counted, the total never
   falls, and a rising total reads as progress. **A count that can only increase is not a
