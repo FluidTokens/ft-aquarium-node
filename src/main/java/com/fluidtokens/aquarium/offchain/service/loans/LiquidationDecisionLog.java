@@ -54,16 +54,27 @@ public class LiquidationDecisionLog {
      *                      the exclusions, but dropping the number entirely would make "the market
      *                      moved on" and "we stopped being able to see them" look identical
      * @param buildable     how many live-loan bonds the scanner passed
+     * @param unreadable    ⛔ <b>THE NUMBER THAT SEPARATES "CORRECTLY EMPTY" FROM "BLIND", and it was
+     *                      not on this endpoint until 2026-09-04.</b> Loan-bearing UTxOs at the loan
+     *                      credential that this node could NOT decode. {@code settled} asserts those
+     *                      bonds' loans are GONE; this is the only thing that can contradict it, by
+     *                      showing a loan that is present and simply not legible to us — the loans
+     *                      decoder is hand-written, so it is a live risk rather than a theoretical
+     *                      one. <b>While it is non-zero the settled count is not trustworthy either.</b>
+     *                      <p>It existed only in a log line, so an operator reading this endpoint —
+     *                      which the readiness page's own empty-state message points them at — could
+     *                      not settle the question the page raised.
      * @param exclusions    why the rest were dropped, one count per reason
      */
     public record RunSummary(Long at,
                              int bondsScanned,
                              int settled,
                              int buildable,
+                             int unreadable,
                              Map<LiquidationExclusion, Integer> exclusions) {
 
         public static RunSummary empty() {
-            return new RunSummary(null, 0, 0, 0, Map.of());
+            return new RunSummary(null, 0, 0, 0, 0, Map.of());
         }
     }
 
@@ -82,8 +93,9 @@ public class LiquidationDecisionLog {
 
     /** Records one cycle's summary, replacing the previous one. */
     public synchronized void recordRun(long at, int bondsScanned, int settled, int buildable,
+                                       int unreadable,
                                        Map<LiquidationExclusion, Integer> exclusions) {
-        this.lastRun = new RunSummary(at, bondsScanned, settled, buildable,
+        this.lastRun = new RunSummary(at, bondsScanned, settled, buildable, unreadable,
                 Map.copyOf(exclusions == null ? new EnumMap<>(LiquidationExclusion.class) : exclusions));
     }
 

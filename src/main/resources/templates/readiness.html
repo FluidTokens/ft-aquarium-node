@@ -137,9 +137,17 @@
       </tr>
       <tr th:if="${#lists.isEmpty(rows)}">
         <td colspan="7" class="empty">No loans indexed. On a healthy node that means a quiet market
-          &mdash; but it looks identical to a node pinned to a superseded deployment, so check the
-          scan summary at <span class="mono">/api/v1/loans/liquidations</span> before concluding
-          either.</td>
+          &mdash; but it looks identical to a node pinned to a superseded deployment, or to one whose
+          decoder has gone blind. <strong>Check the scan summary at
+          <span class="mono">/api/v1/loans/liquidations</span></strong>, and read three numbers
+          together:
+          <span class="mono">bonds_scanned</span> (bonds with a live loan),
+          <span class="mono">settled</span> (bonds whose loan is gone) and
+          <span class="mono">unreadable</span>.
+          <strong>Both counts zero means nothing was found at all</strong> &mdash; an indexing problem,
+          not a quiet market. <strong>And <span class="mono">unreadable</span> must be 0</strong>: while
+          it is not, the settled count cannot be trusted either, because a loan that is present and
+          merely illegible is counted as one that is gone.</td>
       </tr>
       </tbody>
     </table>

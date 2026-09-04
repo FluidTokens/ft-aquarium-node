@@ -706,13 +706,16 @@ public class LiquidationExecutor {
         // Excluded bonds are counted, never logged as decisions: the histogram is the whole record
         // of them, so every scanned bond is accounted for without the ring buffer being flooded by
         // the healthy majority.
-        decisionLog.recordRun(now, liveBonds, settled, buildable.size(), liveExclusions);
+        // ⛔ `unreadable` is passed to the RECORD, not only to the log below. Until 2026-09-04 it was
+        // logged and nowhere else, so the endpoint an operator checks — the one the readiness page's
+        // empty-state message names — could not answer the question the empty page raises.
+        int unreadable = scan.loanCensus().unreadable();
+        decisionLog.recordRun(now, liveBonds, settled, buildable.size(), unreadable, liveExclusions);
 
         // ⛔ AND THE CENSUS CLAUSE STAYS, BECAUSE SUPPRESSING LOAN_NOT_FOUND IS ONLY SAFE WHILE IT
         // READS ZERO. "settled" now asserts that those bonds' loans are GONE; `unreadable` is the
         // only thing that can contradict it, by showing a loan that is present and simply not
         // legible to us. The moment it is non-zero, the settled count is not trustworthy either.
-        int unreadable = scan.loanCensus().unreadable();
         log.info("liquidation scan: {} live bonds{}, {} buildable, exclusions {}{}",
                 liveBonds,
                 settled == 0 ? "" : " (%d settled — the bond outlives its loan)".formatted(settled),

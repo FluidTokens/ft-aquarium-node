@@ -55,7 +55,7 @@ class LiquidationDecisionsEndpointTest {
                                                   int bondsScanned, int buildable) {
         LiquidationDecisionLog log = new LiquidationDecisionLog(
                 config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false));
-        log.recordRun(NOW, bondsScanned, 0, buildable, exclusions);
+        log.recordRun(NOW, bondsScanned, 0, buildable, 0, exclusions);
         decisions.forEach(log::record);
         return log;
     }
@@ -85,6 +85,42 @@ class LiquidationDecisionsEndpointTest {
         assertEquals(Map.of("NOT_LIQUIDATABLE", 7, "LOAN_NOT_FOUND", 1), view.exclusions());
         assertEquals(1, view.decisions().size());
         assertEquals("WOULD_SUBMIT", view.decisions().getFirst().outcome());
+    }
+
+    /**
+     * ⛔ <b>{@code unreadable} MUST reach the JSON — it is the number that separates "correctly empty"
+     * from "blind", and until 2026-09-04 it existed only in a log line.</b>
+     *
+     * <p>{@code settled} asserts that those bonds' loans are GONE. {@code unreadable} is the only
+     * thing that can contradict it, by showing a loan that is present on chain, indexed, and simply
+     * not legible to this node's hand-written decoder. <b>While it is non-zero the settled count is
+     * not trustworthy either</b>, so an empty page is a symptom rather than an answer.
+     *
+     * <p>⚠ It is asserted on the SERIALISED JSON, not on the record, because the failure this guards
+     * is an operator reading the endpoint and not finding it. The readiness page's own empty-state
+     * message points them here; before this field existed, <b>the endpoint the UI cites could not
+     * settle the question the UI raised.</b>
+     */
+    @Test
+    void theEndpointReportsUnreadableSoAnEmptyPageCanBeToldFromABlindOne() throws Exception {
+        LiquidationDecisionLog log = new LiquidationDecisionLog(
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false));
+        log.recordRun(NOW, 0, 10, 0, 3, Map.of());
+
+        var view = new LiquidationController(
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, false), log)
+                .liquidations(50, false);
+
+        assertEquals(3, view.unreadable(),
+                "three loan-bearing utxos could not be decoded and the endpoint must say so");
+
+        JsonNode json = new ObjectMapper().valueToTree(view);
+        assertTrue(json.has("unreadable"),
+                "unreadable is missing from the response. An operator checking this endpoint — the one "
+                        + "the readiness page names in its own empty-state message — cannot then tell "
+                        + "a quiet market from a decoder that has gone blind, which is the whole T-060 "
+                        + "distinction");
+        assertEquals(3, json.get("unreadable").asInt());
     }
 
     /** Arming takes both switches; either one alone leaves the bot unarmed. */

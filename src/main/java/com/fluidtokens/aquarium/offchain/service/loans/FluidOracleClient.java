@@ -63,6 +63,9 @@ public class FluidOracleClient {
 
     private final AtomicReference<Instant> lastRefresh = new AtomicReference<>(Instant.EPOCH);
 
+    /** Last state warned about, per asset and warning kind — see {@link #warnOnce}. */
+    private final java.util.Map<String, String> warnedStates = new java.util.concurrent.ConcurrentHashMap<>();
+
     public FluidOracleClient(@Value("${loans.oracle.url:https://api.fluidtokens.com/get-oracle-tokens}") String url) {
         this.webClient = WebClient.builder().baseUrl(url).build();
         log.info("FluidTokens oracle registry: {}", url);
@@ -262,8 +265,15 @@ public class FluidOracleClient {
             // is no way to say which position a key occupies, and the array order is not a safe
             // substitute — a partial signer set would shift every index. Refuse rather than guess:
             // the validator expects each supplied signature to verify at its stated position.
-            log.warn("oracle {} publishes {} signature(s) but no publicKeys; cannot resolve key positions, "
-                    + "so it stays priceable but not liquidatable", asset.toUnit(), published.size());
+            //
+            // ⚠ LATCHED, because this fires on every refresh and the condition is STATIC. Measured on
+            // preview 2026-09-04: 109 identical WARNs in 56 minutes, one per 30-second refresh, for a
+            // registry FluidTokens are not about to change. A log that repeats twice a minute forever
+            // trains an operator to ignore WARN, and the next one may be the real one.
+            warnOnce(asset, "no-public-keys", String.valueOf(published.size()),
+                    "oracle {} publishes {} signature(s) but no publicKeys; cannot resolve key "
+                            + "positions, so it stays priceable but not liquidatable",
+                    asset.toUnit(), published.size());
             return List.of();
         }
         var out = new ArrayList<OracleSignature>();
@@ -278,10 +288,44 @@ public class FluidOracleClient {
             out.add(new OracleSignature(position, signature.path("signature").asText("")));
         }
         if (!unresolved.isEmpty()) {
-            log.warn("oracle {} published signatures from keys outside its publicKeys {}; dropping them",
+            // Latched on the SET of offending keys — same reasoning as above, and the set is stable
+            // across re-publications where the signatures themselves are not.
+            warnOnce(asset, "unresolved-keys", unresolved.toString(),
+                    "oracle {} published signatures from keys outside its publicKeys {}; dropping them",
                     asset.toUnit(), unresolved);
         }
         return out;
+    }
+
+    /**
+     * ⛔ <b>Say it once, and again only when it CHANGES.</b>
+     *
+     * <p>The oracle registry is re-read every 30 seconds, so a warning about a condition IN that
+     * registry repeats twice a minute for as long as the condition lasts — which, for a third party's
+     * stale preview feed, is indefinitely. **Measured 2026-09-04: 109 identical WARNs in 56 minutes.**
+     * That is not a loud signal, it is a quiet one: it teaches whoever reads these logs that WARN
+     * means nothing here, and the next WARN may be the one that matters.
+     *
+     * <h2>⚠ What the latch keys on, and the trap in choosing it</h2>
+     * On {@code state} — a caller-supplied string that must be <b>stable while the condition is
+     * unchanged</b>. That rules out the obvious choice: <b>the signatures themselves are re-signed on
+     * every publication</b>, so latching on their content would re-warn every refresh and the latch
+     * would do nothing at all while looking like it worked. The signature COUNT and the SET OF
+     * OFFENDING KEYS are stable; the signatures are not.
+     *
+     * <p>⇒ So it re-warns exactly when something an operator would want to know has moved — a signer
+     * added or removed, a different key going unresolved — and stays silent otherwise. And when the
+     * condition is fixed upstream this branch simply stops being reached, so the latch needs no
+     * clearing.
+     */
+    private void warnOnce(AssetType asset, String kind, String state, String format, Object... args) {
+        String key = asset.toUnit() + "/" + kind;
+        String previous = warnedStates.put(key, state);
+        if (state.equals(previous)) {
+            log.debug(format, args);
+            return;
+        }
+        log.warn(format, args);
     }
 
     private static int indexOfIgnoringCase(List<String> keys, String key) {
