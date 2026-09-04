@@ -30,6 +30,11 @@ dependencies {
 
 	implementation 'org.springframework.boot:spring-boot-starter'
 	implementation 'org.springframework.boot:spring-boot-starter-web'
+	// Server-rendered operator UI (controller/LiquidationReadinessController). The whole UI is
+	// behind loans.ui.enabled, default FALSE, so an operator who does not turn it on serves
+	// nothing new and constructs no extra bean. NOTE: this dependency is in the image either
+	// way — the flag makes the node behave identically, not the jar byte-identical.
+	implementation 'org.springframework.boot:spring-boot-starter-thymeleaf'
 	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
 	implementation 'org.springframework.boot:spring-boot-starter-webflux'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'

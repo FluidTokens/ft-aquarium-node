@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Liquidation readiness</title>
+  <style>
+    :root {
+      --ground:#f7f7f9; --surface:#fff; --surface-2:#eeeef1; --ink:#191920; --ink-2:#43434f;
+      --muted:#6f6f7d; --rule:#dededf; --warn:#a5561a; --warn-soft:#fbf0e4;
+      --crit:#a5382a; --crit-soft:#f9e7e4; --ok:#2c6b52; --unknown:#6f6f7d;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --ground:#131317; --surface:#1b1b21; --surface-2:#24242b; --ink:#e9e9ef; --ink-2:#c5c5d1;
+        --muted:#8f8f9d; --rule:#2e2e37; --warn:#e0a05e; --warn-soft:#2c2116;
+        --crit:#e08a79; --crit-soft:#2e1a17; --ok:#63bb95; --unknown:#8f8f9d;
+      }
+    }
+    :root[data-theme="dark"] {
+      --ground:#131317; --surface:#1b1b21; --surface-2:#24242b; --ink:#e9e9ef; --ink-2:#c5c5d1;
+      --muted:#8f8f9d; --rule:#2e2e37; --warn:#e0a05e; --warn-soft:#2c2116;
+      --crit:#e08a79; --crit-soft:#2e1a17; --ok:#63bb95; --unknown:#8f8f9d;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--ground); color:var(--ink);
+           font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    header { border-bottom:1px solid var(--rule); background:var(--surface); padding:1.1rem 1.4rem; }
+    h1 { margin:0 0 .3rem; font-size:1.15rem; letter-spacing:-.02em; }
+    .meta { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.72rem; color:var(--muted); }
+    main { padding:1.2rem 1.4rem 3rem; }
+    .lede { max-width:70ch; color:var(--ink-2); margin:0 0 1.1rem; }
+    .lede strong { color:var(--ink); }
+    .note { max-width:70ch; background:var(--surface); border-left:3px solid var(--rule);
+            padding:.7rem .9rem; margin:0 0 1.2rem; font-size:.86rem; color:var(--ink-2); }
+    .tw { overflow-x:auto; border:1px solid var(--rule); border-radius:3px; background:var(--surface); }
+    table { border-collapse:collapse; width:100%; font-size:.83rem; }
+    th { text-align:left; font-size:.66rem; letter-spacing:.08em; text-transform:uppercase;
+         color:var(--muted); padding:.6rem .7rem; background:var(--surface-2);
+         border-bottom:1px solid var(--rule); white-space:nowrap; }
+    td { padding:.6rem .7rem; border-bottom:1px solid var(--rule); vertical-align:top; color:var(--ink-2); }
+    tr:last-child td { border-bottom:0; }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric:tabular-nums; }
+    .id { font-size:.75rem; }
+    .hf { font-weight:700; font-size:.95rem; }
+    .hf.crit { color:var(--crit); }
+    .hf.warn { color:var(--warn); }
+    .hf.ok { color:var(--ok); }
+    .unknown { color:var(--unknown); font-style:italic; }
+    .reason { display:block; font-size:.74rem; color:var(--muted); margin-top:.2rem; max-width:34ch; }
+    .pill { display:inline-block; font-size:.66rem; font-weight:600; letter-spacing:.05em;
+            padding:.18em .5em; border-radius:2px; white-space:nowrap; }
+    .pill.advance { background:var(--warn-soft); color:var(--warn); }
+    .pill.convert { background:var(--surface-2); color:var(--ok); }
+    .pill.plain { background:var(--surface-2); color:var(--ink-2); }
+    .pill.unknown { background:var(--surface-2); color:var(--muted); }
+    tr.liquidatable td { background:var(--crit-soft); }
+    .empty { padding:1.4rem; color:var(--muted); }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Liquidation readiness</h1>
+  <div class="meta">
+    <span th:text="'network ' + ${network}">network</span> &middot;
+    <span th:text="${generatedAt}">now</span> &middot; read-only &middot; no authentication
+  </div>
+</header>
+
+<main>
+  <p class="lede">Sorted by <strong>health factor ascending</strong> &mdash; closest to liquidation
+    first. Loans that are only <strong>approaching</strong> the threshold are included on purpose:
+    where the route is <strong>capital in advance</strong>, the principal has to be found
+    <em>before</em> the loan goes sour, and a list of what is already liquidatable would arrive too
+    late to act on.</p>
+
+  <p class="note">A health factor below <strong>1.0</strong> is liquidatable now. Every figure comes
+    from the same code the bot acts through &mdash; the scanner, the health service, the economics
+    gate, the pool resolver and the pay-in-advance builder &mdash; so what is shown here is what the
+    bot would decide. Where a value cannot be computed it reads <em>unknown</em> with the reason;
+    it is never shown as zero.</p>
+
+  <div th:if="${disabledReason}" class="note" th:text="${disabledReason}">disabled</div>
+
+  <div class="tw" th:unless="${disabledReason}">
+    <table>
+      <thead>
+      <tr>
+        <th>Loan</th><th>Principal</th><th>Collateral</th><th>Health</th>
+        <th>Fee slice at liquidation</th><th>Route</th><th>Capital needed</th>
+      </tr>
+      </thead>
+      <tbody>
+      <tr th:each="r : ${rows}" th:classappend="${r.liquidatable != null and r.liquidatable} ? 'liquidatable'">
+        <td class="mono id">
+          <span th:text="${#strings.abbreviate(r.loanId, 18)}">id</span>
+          <span class="reason" th:text="${r.utxoRef}">utxo</span>
+        </td>
+        <td class="mono">
+          <span th:text="${r.principalAmount}">0</span>
+          <span class="reason" th:text="${#strings.abbreviate(r.principalUnit, 24)}">unit</span>
+        </td>
+        <td class="mono">
+          <span th:text="${r.collateralAmount}">0</span>
+          <span class="reason" th:text="${#strings.abbreviate(r.collateralUnit, 24)}">unit</span>
+        </td>
+        <td>
+          <span th:if="${r.healthFactor != null}" class="hf mono"
+                th:classappend="${r.healthFactor < 1.0} ? 'crit' : (${r.healthFactor < 1.25} ? 'warn' : 'ok')"
+                th:text="${#numbers.formatDecimal(r.healthFactor, 1, 3)}">1.000</span>
+          <span th:if="${r.healthFactor == null}" class="unknown">unknown</span>
+          <span class="reason" th:if="${r.currentLtvPercent != null}"
+                th:text="'LTV ' + ${#numbers.formatDecimal(r.currentLtvPercent, 1, 2)} + '%'">LTV</span>
+          <span class="reason" th:if="${r.healthUnknownReason}" th:text="${r.healthUnknownReason}">why</span>
+        </td>
+        <td class="mono">
+          <span th:if="${r.feeInCollateral != null}" th:text="${r.feeInCollateral}">0</span>
+          <span th:if="${r.feeInCollateral == null}" class="unknown">unknown</span>
+          <span class="reason" th:if="${r.feeValueLovelace != null}"
+                th:text="'≈ ' + ${r.feeValueLovelace} + ' lovelace at today&apos;s price'">value</span>
+          <span class="reason" th:if="${r.feeUnknownReason}" th:text="${r.feeUnknownReason}">why</span>
+        </td>
+        <td>
+          <span class="pill"
+                th:classappend="${r.route == 'CAPITAL IN ADVANCE'} ? 'advance' : (${r.route == 'CONVERT'} ? 'convert' : (${r.route == 'UNKNOWN'} ? 'unknown' : 'plain'))"
+                th:text="${r.route}">ROUTE</span>
+          <span class="reason" th:text="${r.routeDetail}">why</span>
+        </td>
+        <td class="mono">
+          <span th:if="${r.advanceLovelace != null}" th:text="${r.advanceLovelace}">0</span>
+          <span th:if="${r.advanceLovelace == null and r.route == 'CAPITAL IN ADVANCE'}"
+                class="unknown">unknown</span>
+          <span th:if="${r.advanceLovelace == null and r.route != 'CAPITAL IN ADVANCE'}"
+                class="reason">&mdash;</span>
+          <span class="reason" th:if="${r.advanceLovelace != null}">principal the operator must have ready</span>
+        </td>
+      </tr>
+      <tr th:if="${#lists.isEmpty(rows)}">
+        <td colspan="7" class="empty">No loans indexed. On a healthy node that means a quiet market
+          &mdash; but it looks identical to a node pinned to a superseded deployment, so check the
+          scan summary at <span class="mono">/api/v1/loans/liquidations</span> before concluding
+          either.</td>
+      </tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+</body>
+</html>

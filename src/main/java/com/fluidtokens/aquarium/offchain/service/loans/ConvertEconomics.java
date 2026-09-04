@@ -229,7 +229,12 @@ public class ConvertEconomics {
      * same expression, so a fee we round UP is collateral the order is short of, and the transaction
      * fails phase 2.
      */
-    static BigInteger liquidationFee(BigInteger collateralAmount, long feePerMille) {
+    /**
+     * ⚠ <b>public so the readiness UI can show the figure the GATE uses</b>, not one it re-derives.
+     * A view that recomputed this would be a second implementation of the same formula, and the
+     * first time the two disagreed the operator would have two numbers and no way to choose.
+     */
+    public static BigInteger liquidationFee(BigInteger collateralAmount, long feePerMille) {
         return collateralAmount.multiply(BigInteger.valueOf(feePerMille)).divide(PER_MILLE);
     }
 }

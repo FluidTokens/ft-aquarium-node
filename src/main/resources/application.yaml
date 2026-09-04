@@ -1,4 +1,16 @@
 spring:
+  # ⛔ The template engine exists only when the readiness operator UI does (loans.ui.enabled). Boot's
+  # ThymeleafAutoConfiguration is @ConditionalOnProperty(spring.thymeleaf.enabled, matchIfMissing =
+  # true), so binding it to the same variable means a node with the UI off constructs NO Thymeleaf
+  # bean at all — the dependency sits in the jar unused. That is as close to "unchanged when off" as
+  # an added dependency can honestly get: the node's behaviour is identical, the jar's bytes are not.
+  #
+  # ⚠ It lives HERE, inside the one root `spring:` block, deliberately. A second root `spring:` key in
+  # the same YAML document is not an error to SnakeYAML — the last one WINS and the first is silently
+  # discarded, which would have taken flyway and the scheduler pool with it. Measured while writing
+  # this: the duplicate parsed clean and the suite stayed green.
+  thymeleaf:
+    enabled: ${LOANS_UI_ENABLED:false}
   task:
     scheduling:
       # Spring's default is a single scheduler thread, shared by the transaction processor and the
@@ -120,6 +132,27 @@ loans:
   # Published in the ConfigDatum (field 0) and NOT derivable from the blueprint — the same value on
   # both networks, because it is not parameterised by the config policy id.
   smart-tokens-spend-script-hash: ${LOANS_SMART_TOKENS_SPEND_SCRIPT_HASH:fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa}
+
+  # ── The operator readiness UI (server-rendered, GET /api/v1/loans/readiness) ────────────────
+  #
+  # DECISION SUPPORT, not profit tracking: a list of loans sorted by health factor ascending —
+  # closest to liquidation first — INCLUDING loans that are only approaching it, because the whole
+  # point is runway to find capital before one goes sour. Per loan it shows identity, health, the
+  # liquidation fee slice, and the route: Minswap convert available, or capital-in-advance required
+  # and how much principal must be ready.
+  #
+  # ⛔ OFF BY DEFAULT, AND THERE IS NO AUTHENTICATION. It is a run-it-locally tool: the page exposes
+  # loan positions and the operator's own routing, and anything reachable on a public port is
+  # reachable by anyone. Turn it on behind a loopback bind or a reverse proxy, or not at all.
+  #
+  # With this false the controller bean is never constructed and no route is mapped — the node
+  # behaves exactly as it did before the UI existed. (The Thymeleaf dependency is in the image
+  # either way; the flag governs behaviour, not the jar's bytes.)
+  #
+  # Requires loans.enabled=true — the page reads the same scanner, health service and economics the
+  # bot acts on. With lending off it renders a single line saying so rather than failing to start.
+  ui:
+    enabled: ${LOANS_UI_ENABLED:false}
 
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
