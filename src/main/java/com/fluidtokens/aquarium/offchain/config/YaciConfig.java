@@ -17,7 +17,6 @@ import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -40,13 +39,11 @@ public class YaciConfig {
      * submits" property a matter of wiring rather than of discipline.
      */
     @Bean
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public UtxoSupplier utxoSupplier(BFBackendService bfBackendService) {
         return new DefaultUtxoSupplier(bfBackendService.getUtxoService());
     }
 
     @Bean
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public ProtocolParamsSupplier protocolParamsSupplier(BFBackendService bfBackendService) {
         return new DefaultProtocolParamsSupplier(bfBackendService.getEpochService());
     }
@@ -69,7 +66,6 @@ public class YaciConfig {
      * submission path through the back door.
      */
     @Bean
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public LiquidateTransactionBuilder liquidateTransactionBuilder(LoansContractRegistry registry,
                                                                    AppConfig.Network network,
                                                                    CardanoConverters cardanoConverters,
@@ -102,7 +98,6 @@ public class YaciConfig {
      * ex-units are measured</b>: placeholder ex-units move the exposure to the collateral (CCL trap 8).
      */
     @Bean
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public CompoundTransactionBuilder compoundTransactionBuilder(LoansContractRegistry registry,
                                                                  AppConfig.Network network,
                                                                  UtxoSupplier utxoSupplier,
@@ -124,7 +119,6 @@ public class YaciConfig {
      * this node's storage and need a far-back {@code sync-start} (§39.2).
      */
     @Bean
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public MinswapPoolResolver minswapPoolResolver(AppConfig.LoansConfiguration loansConfiguration,
                                                    BFBackendService bfBackendService) {
         return new MinswapPoolResolver(bfBackendService.getUtxoService(),
@@ -139,7 +133,6 @@ public class YaciConfig {
      * collateral (CCL trap 8), and this class has no constructor that permits them.
      */
     @Bean
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public ConvertTransactionBuilder convertTransactionBuilder(LoansContractRegistry registry,
                                                                AppConfig.Network network,
                                                                UtxoSupplier utxoSupplier,
@@ -168,7 +161,6 @@ public class YaciConfig {
      * ({@code ExecutorContextResolutionTest}).
      */
     @Bean
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public ConvertLiquidationRouter convertLiquidationRouter(LoansContractRegistry registry,
                                                              AppConfig.LoansConfiguration loansConfiguration,
                                                              MinswapPoolResolver minswapPoolResolver,
@@ -197,7 +189,6 @@ public class YaciConfig {
      * submission stay in {@code LiquidationExecutor} behind its two independent flags.
      */
     @Bean
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public LiquidatePayInAdvanceTransactionBuilder liquidatePayInAdvanceTransactionBuilder(
             LoansContractRegistry registry,
             AppConfig.Network network,

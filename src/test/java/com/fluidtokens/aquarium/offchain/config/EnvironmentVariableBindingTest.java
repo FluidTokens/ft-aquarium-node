@@ -67,13 +67,12 @@ class EnvironmentVariableBindingTest {
     }
 
     /**
-     * The six keys with NO {@code application.yaml} placeholder. Each is named the way a chart would
+     * The five keys with NO {@code application.yaml} placeholder. Each is named the way a chart would
      * have to name it, and asserted to reach the bean that reads it.
      */
     @Test
     void theKeysWithNoYamlPlaceholderAreReachableAsEnvironmentVariables() {
         withEnv(Map.of(
-                "LOANS_SUBMITTABLE_NETWORK", "preview",
                 "LOANS_LIQUIDATION_CONVERT_ENABLED", "false",
                 "LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE", "-2000000",
                 "LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE", "4000000",
@@ -82,14 +81,6 @@ class EnvironmentVariableBindingTest {
                 .run(ctx -> {
                     assertFalse(ctx.getStartupFailure() != null,
                             () -> "context failed: " + ctx.getStartupFailure());
-
-                    var network = ctx.getBean(AppConfig.Network.class);
-                    assertEquals("preview", network.getSubmittableNetwork());
-                    assertTrue(network.isSubmittable(),
-                            "network=preview and LOANS_SUBMITTABLE_NETWORK=preview must arm the "
-                                    + "network gate — if the env name did not bind, the default "
-                                    + "'preview' would make this pass for the wrong reason, which is "
-                                    + "why the convert keys below carry non-default values");
 
                     var convert = ctx.getBean(AppConfig.ConvertConfiguration.class);
                     assertFalse(convert.isEnabled(),
@@ -107,6 +98,27 @@ class EnvironmentVariableBindingTest {
                     assertEquals("56840ffb07ca0ad4e1eb921695bad5d2719f838612008e13bfe7f775933a7def",
                             refs.lmLiquidateAndConvertAction().getTransactionId());
                 });
+    }
+
+    /**
+     * ⛔ {@code NETWORK} — the one value that decides which chain this node acts on — binds from a
+     * real environment variable. Asserted for both networks, so a default cannot make it pass.
+     */
+    @Test
+    void theTargetNetworkBindsFromTheEnvironmentAndIsTheOnlyNetworkValue() {
+        for (String target : new String[]{"mainnet", "preview", "preprod"}) {
+            new ApplicationContextRunner()
+                    .withInitializer(ctx -> ((StandardEnvironment) ctx.getEnvironment())
+                            .getPropertySources().addFirst(new SystemEnvironmentPropertySource(
+                                    StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                                    Map.of("NETWORK", target))))
+                    .withUserConfiguration(Beans.class)
+                    .withPropertyValues("loans.enabled=true")
+                    .run(ctx -> assertEquals(target, ctx.getBean(AppConfig.Network.class).getNetwork(),
+                            "NETWORK must reach the bean: it is the only thing that decides where "
+                                    + "this node submits, and a value that binds nowhere points a "
+                                    + "node at the wrong chain with no error"));
+        }
     }
 
     /**

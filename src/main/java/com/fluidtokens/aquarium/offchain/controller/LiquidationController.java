@@ -9,7 +9,6 @@ import com.fluidtokens.aquarium.offchain.model.loans.LiquidationExclusion;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidationDecisionLog;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -38,7 +37,6 @@ import java.util.Map;
 @RequestMapping("${apiPrefix}/loans/liquidations")
 @RequiredArgsConstructor
 @Slf4j
-@ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class LiquidationController {
 
     private static final int DEFAULT_LIMIT = 50;

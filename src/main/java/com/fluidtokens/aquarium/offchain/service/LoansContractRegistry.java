@@ -18,7 +18,6 @@ import lombok.Getter;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
@@ -59,7 +58,6 @@ import java.util.stream.Stream;
 @Service
 @Getter
 @Slf4j
-@ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class LoansContractRegistry {
 
     private static final String BLUEPRINT_RESOURCE = "loans-v4.plutus.json";
@@ -157,9 +155,9 @@ public class LoansContractRegistry {
 
     @Autowired
     public LoansContractRegistry(AppConfig.LoansConfiguration cfg) {
-        this(require(cfg.getConfigPolicyId(), "loans.config.policy-id"),
-                require(cfg.getLmConfigPolicyId(), "loans.lm-config.policy-id"),
-                require(cfg.getConfigAssetName(), "loans.config.asset-name"),
+        this(coordinate(cfg.getConfigPolicyId(), "loans.config.policy-id"),
+                coordinate(cfg.getLmConfigPolicyId(), "loans.lm-config.policy-id"),
+                cfg.getConfigAssetName(),
                 cfg.getSmartTokensSpendScriptHash(),
                 cfg.getMinswapPoolPolicyId(), cfg.getMinswapPoolSpendScriptHash(),
                 cfg.getMinswapOrderSpendScriptHash());
@@ -286,7 +284,17 @@ public class LoansContractRegistry {
                             b(poolManagerSpendScriptHash), b(poolManagerPolicyId), loanClaimCredential);
         }
 
-        log.info("Derived Lending v4 contract hashes: {}", derivedHashes());
+        // ⚠ NOT the hash table when there is nothing to derive from. Blank coordinates still produce
+        // a full set of well-formed, entirely meaningless hashes (b("") is a legal empty bytestring),
+        // and printing them at INFO on a bare install is how a "not configured yet" node reads as a
+        // configured one to whoever greps the boot log.
+        if (isConfigured()) {
+            log.info("Derived Lending v4 contract hashes: {}", derivedHashes());
+        } else {
+            log.warn("Lending v4 NOT CONFIGURED — loans.config.policy-id and loans.lm-config.policy-id "
+                    + "are empty, so nothing is derived, NOTHING is indexed for v4, and nothing is "
+                    + "verified against chain. This is the correct state for a fresh install.");
+        }
     }
 
     /**
@@ -332,6 +340,30 @@ public class LoansContractRegistry {
     }
 
     /**
+     * ⛔ <b>Whether this node has been given a deployment to derive from at all.</b>
+     *
+     * <p>Both config NFT policy ids must be present and well-formed — 56 hex characters, the length
+     * of a script hash. Anything else means <b>"not configured yet"</b>, which is a legitimate state
+     * for a fresh install and is <em>not</em> an error: a chart that ships empty coordinates by
+     * default must start clean, index nothing, and wait to be told which deployment to watch.
+     *
+     * <p>⚠ <b>It is a separate question from whether the coordinates are RIGHT.</b> Absent is not
+     * wrong; STALE is wrong, and {@code LoansConfigVerifier} still hard-fails on a mismatch, because
+     * a node pointed at a superseded deployment verifies cleanly forever and finds nothing (§12).
+     * Collapsing the two would either crash every bare install or silence the one check that catches
+     * a redeploy. <b>Keep them distinct.</b>
+     */
+    public boolean isConfigured() {
+        return wellFormedHash(configPolicyId) && wellFormedHash(lmConfigPolicyId);
+    }
+
+    /** A script hash is 28 bytes, i.e. exactly 56 hex characters. */
+    private static boolean wellFormedHash(String value) {
+        return value != null && value.length() == 56
+                && value.chars().allMatch(c -> Character.digit(c, 16) >= 0);
+    }
+
+    /**
      * The payment credentials the indexer has to keep UTxOs for.
      * <p>
      * Payment credential, never full address: loan/pool/lender-manager outputs carry the
@@ -344,6 +376,23 @@ public class LoansContractRegistry {
      * we need as a reference input.
      */
     public List<String> indexedPaymentCredentials() {
+        // ⛔ NOT CONFIGURED ⇒ INDEX NOTHING. This guard is the whole reason `isConfigured()` exists,
+        // and it closes a hole that only opened when `loans.enabled` was removed (2026-09-04).
+        //
+        // Measured that day: with BLANK config policy ids this constructor does NOT fail. `b("")`
+        // is a legal empty bytestring, every `applyParamToScript` succeeds, and the registry comes
+        // up holding a full set of REAL-LOOKING hashes derived from nothing — plus the blank policy
+        // id itself, which `AddressProvider` happily turns into `addr1wy22xa6y`. Seven credentials,
+        // none of them anything.
+        //
+        // ⚠ Feeding those to TankUtxoStorage's write-time filter would give a bare install the exact
+        // pathology of findings §39 / trap 3: a node that boots clean, verifies nothing, indexes at
+        // credentials no UTxO will ever carry, and reports an empty world indistinguishable from a
+        // quiet market. Returning an empty list instead means an unconfigured node indexes NOTHING
+        // and says so — "not configured yet" is a state, and it has to be a visible one.
+        if (!isConfigured()) {
+            return List.of();
+        }
         return Stream.of(
                         configPolicyId,
                         lmConfigPolicyId,
@@ -618,11 +667,41 @@ public class LoansContractRegistry {
         return s == null || s.isBlank();
     }
 
-    private static String require(String value, String property) {
+    /**
+     * ⛔ <b>THREE states, not two — and collapsing them is what would crash every bare install.</b>
+     *
+     * <p>Until 2026-09-04 this method was {@code require(...)}: blank threw, with the message
+     * <i>"must be set when loans.enabled=true"</i>. That was safe only because {@code loans.enabled}
+     * defaulted to false, so a node with no coordinates never built this class. <b>The flag is gone
+     * and this constructor now runs on every node</b>, including a bare {@code helm install} whose
+     * chart ships every coordinate as the empty string. Keeping the throw would mean a crash-loop
+     * with nothing left to switch off.
+     *
+     * <ul>
+     *   <li><b>BLANK ⇒ "not configured yet."</b> Legitimate, and not an error. Returns the empty
+     *       string; {@link #isConfigured()} is then false, {@link #indexedPaymentCredentials()} is
+     *       empty, and {@code LoansConfigVerifier} skips without contacting anything.</li>
+     *   <li><b>WELL-FORMED ⇒ configured.</b> Derive, index, and verify against chain — where a
+     *       MISMATCH is still fatal, because a stale policy id verifies cleanly forever against a
+     *       dead deployment (findings §12) and that check is a real safeguard.</li>
+     *   <li>⚠ <b>PRESENT BUT MALFORMED ⇒ fail, loudly, here.</b> A typo is not an absence. Silently
+     *       treating it as "not configured" would give an operator who fat-fingered one character a
+     *       node that indexes nothing and reports a quiet market — the exact silent failure this
+     *       whole class exists to prevent.</li>
+     * </ul>
+     */
+    private static String coordinate(String value, String property) {
         if (value == null || value.isBlank()) {
-            throw new IllegalStateException(property + " must be set when loans.enabled=true");
+            return "";
         }
-        return value;
+        String trimmed = value.trim();
+        if (!wellFormedHash(trimmed)) {
+            throw new IllegalStateException(property + " is '" + value + "', which is neither empty "
+                    + "(\"not configured\") nor a 56-character hex script hash. A malformed "
+                    + "coordinate is a typo, and treating it as absent would leave this node indexing "
+                    + "nothing while reporting a quiet market");
+        }
+        return trimmed;
     }
 
     private static Map<String, String> loadUnappliedCompiledCodes() throws Exception {

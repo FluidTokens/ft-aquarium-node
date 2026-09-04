@@ -4,7 +4,6 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationDecision;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationExclusion;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayDeque;
@@ -38,7 +37,6 @@ import java.util.Map;
  */
 @Service
 @Slf4j
-@ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class LiquidationDecisionLog {
 
     /**

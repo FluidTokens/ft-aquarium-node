@@ -31,7 +31,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -106,7 +105,6 @@ import java.util.concurrent.TimeUnit;
  */
 @Service
 @Slf4j
-@ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class LiquidationExecutor {
 
     /**
@@ -126,18 +124,11 @@ public class LiquidationExecutor {
     private static final long VALID_FROM_BACKDATE_MILLIS = 30_000L;
 
     /**
-     * ⛔ WAS a hard-coded {@code "preview"}. It is now {@code loans.submittable-network}, defaulting
-     * to {@code preview} — Giovanni's ruling of 2026-09-03. The default carries the protection; the
-     * gate itself is unchanged and still enforced here, in the code that would do the submitting.
-     * See {@code AppConfig.Network#isSubmittable()}.
-     */
-
-    /**
-     * The nine submit vetoes, in the order they are evaluated. Each is a separate, named reason
+     * The eight submit vetoes, in the order they are evaluated. Each is a separate, named reason
      * this candidate was not submitted; a decision carries exactly the first one that fired.
      * <p>
-     * The first four are POLICY — statements about what the operator has authorised — and they come
-     * before the five that are statements about this candidate at this instant. That ordering is
+     * The first three are POLICY — statements about what the operator has authorised — and they
+     * come before the five that are statements about this candidate at this instant. That ordering is
      * deliberate: on a node held back by policy, reporting a downstream symptom would send the
      * operator looking at the wrong thing.
      */
@@ -146,10 +137,8 @@ public class LiquidationExecutor {
         MODE_NOT_LIVE,
         /** S2 — {@code loans.liquidation.enabled} is false. */
         NOT_ARMED,
-        /** S3 — the node is not on preview. */
-        NETWORK_NOT_PREVIEW,
         /**
-         * S4 — <b>this loan's MARKET is not LIVE</b>, on a node that otherwise is.
+         * S3 — <b>this loan's MARKET is not LIVE</b>, on a node that otherwise is.
          *
          * <p>The market's effective mode is {@code min(nodeMode, market.mode)} (see {@code MarketGate}),
          * so this fires when an operator has held one market back — {@code SHADOW} to rehearse it, or
@@ -161,16 +150,16 @@ public class LiquidationExecutor {
          * {@code MARKET_SHADOW_NOT_YET_IMPLEMENTED} refusal existed only until this veto did.
          */
         MARKET_NOT_LIVE,
-        /** S5 — expected profit is not strictly positive. */
+        /** S4 — expected profit is not strictly positive. */
         NOT_PROFITABLE,
-        /** S6 — the serialised transaction is over the live {@code maxTxSize}, or it could not be read. */
+        /** S5 — the serialised transaction is over the live {@code maxTxSize}, or it could not be read. */
         TX_TOO_LARGE,
-        /** S7 — a feed this candidate prices against has less than the margin of window left, now. */
+        /** S6 — a feed this candidate prices against has less than the margin of window left, now. */
         ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT,
-        /** S8 — the loan or bond UTxO is no longer unspent, or that could not be established. */
+        /** S7 — the loan or bond UTxO is no longer unspent, or that could not be established. */
         STALE_UTXO,
         /**
-         * S9 — the built transaction's own validity interval has already ended, or its end could not
+         * S8 — the built transaction's own validity interval has already ended, or its end could not
          * be read.
          * <p>
          * Not a duplicate of S7, and the gap it closes is a real one. S7 can only speak about loans
@@ -541,7 +530,7 @@ public class LiquidationExecutor {
             return;
         }
         switch (verdict.veto()) {
-            case MODE_NOT_LIVE, NOT_ARMED, NETWORK_NOT_PREVIEW, MARKET_NOT_LIVE -> { }
+            case MODE_NOT_LIVE, NOT_ARMED, MARKET_NOT_LIVE -> { }
             default -> {
                 return;
             }
@@ -1296,7 +1285,8 @@ public class LiquidationExecutor {
     private Verdict verdict(LiquidationAssessment assessment, long now, Transaction transaction,
                             Map<String, OracleEntry> oraclesByUnit, BigInteger floorProfit,
                             BigInteger expectedProfit, int size, String detail) {
-        // What the row says on an unarmed node: WOULD_SUBMIT only if it would actually clear S4 on an
+        // What the row says on an unarmed node: WOULD_SUBMIT only if it would actually clear S4 (the
+        // profitability gate, renumbered from S5 when the network veto was removed) on an
         // armed one — i.e. it passes both the profitability floor and the margin lever.
         LiquidationDecision.Outcome shadowOutcome = wouldSubmit(floorProfit, expectedProfit)
                 ? LiquidationDecision.Outcome.WOULD_SUBMIT
@@ -1311,16 +1301,13 @@ public class LiquidationExecutor {
         if (!configuration.isEnabled()) {
             return new Verdict(shadowOutcome, SubmitVeto.NOT_ARMED, detail);
         }
-        // S3 — the network. A second line behind loans.enabled=false on mainnet, not a restatement
-        // of it: this one is enforced here, in the code that would do the submitting.
-        String networkName = network == null ? null : network.getNetwork();
-        if (network == null || !network.isSubmittable()) {
-            return new Verdict(shadowOutcome, SubmitVeto.NETWORK_NOT_PREVIEW,
-                    "%s; network is %s, this node submits only on %s (loans.submittable-network)"
-                            .formatted(detail, networkName,
-                                    network == null ? "<unset>" : network.getSubmittableNetwork()));
-        }
-        // S4 — the MARKET's own execution state, on a node that is otherwise armed.
+        // ⛔ THERE IS NO NETWORK VETO. `loans.submittable-network` and its NETWORK_NOT_PREVIEW veto
+        // were removed on 2026-09-04: a node correctly targeted at mainnet, armed and profitable,
+        // would stop here and say so only in a decision row. Giovanni: "arming that works everywhere
+        // except the last step, silently." `config.network` is now the single source of truth for
+        // where this node acts, and it is chosen before the bot is armed, not re-checked after.
+        //
+        // S3 — the MARKET's own execution state, on a node that is otherwise armed.
         //
         // Policy before candidate: an operator who held this market back must read that, not a
         // downstream symptom. And the veto is what turns per-market SHADOW into a REHEARSAL — the
@@ -1337,7 +1324,7 @@ public class LiquidationExecutor {
                             .formatted(detail, principalAsset == null ? "<unknown>" : principalAsset.toUnit(),
                                     marketMode, configuration.getMode()));
         }
-        // S5 — profitability. Two independent gates, and the margin is deliberately NOT inside the
+        // S4 — profitability. Two independent gates, and the margin is deliberately NOT inside the
         // number the floors test (F1.i): a negative margin can no longer inflate a loss past a floor.
         //
         // (a) The absolute floor, applied only when check-profitability is on, tests floorProfit —
@@ -1388,7 +1375,7 @@ public class LiquidationExecutor {
                     + "would otherwise have been refused as unprofitable",
                     assessment.loan().utxoRef(), detail);
         }
-        // S6 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
+        // S5 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
         // from S4's arithmetic: a transaction can be handsomely profitable and still not fit.
         Integer maxTxSize;
         try {
@@ -1415,7 +1402,7 @@ public class LiquidationExecutor {
                     "%s; %d bytes over the live maxTxSize of %d — publish the reference scripts"
                             .formatted(detail, size, maxTxSize));
         }
-        // S7 — the oracle windows, re-read against the clock NOW rather than against the window the
+        // S6 — the oracle windows, re-read against the clock NOW rather than against the window the
         // transaction was built for. A build that started a minute ago proves nothing about the feed
         // that is going to be evaluated when this lands in a block.
         String oracleVeto = oracleWindowShortfall(assessment, submitClock.getAsLong(), oraclesByUnit);
@@ -1423,7 +1410,7 @@ public class LiquidationExecutor {
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED,
                     SubmitVeto.ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT, detail + "; " + oracleVeto);
         }
-        // S8 — the two UTxOs, re-read immediately before the wire. They were unspent when the build
+        // S7 — the two UTxOs, re-read immediately before the wire. They were unspent when the build
         // started; a block may have arrived since.
         String staleVeto = staleUtxo(assessment);
         if (staleVeto != null) {
@@ -1431,7 +1418,7 @@ public class LiquidationExecutor {
                     detail + "; " + staleVeto);
         }
 
-        // S9 — the transaction's own validity interval. Last, so that where a feed exists S7 reports
+        // S8 — the transaction's own validity interval. Last, so that where a feed exists S6 reports
         // the more specific reason; but reached on every candidate, including the ada/ada ones S6
         // has nothing to say about.
         String elapsed = transactionWindowElapsed(transaction, submitClock.getAsLong(),

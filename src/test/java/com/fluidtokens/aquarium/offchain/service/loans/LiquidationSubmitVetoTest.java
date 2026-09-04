@@ -43,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -799,35 +800,53 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S3 — the network
+    // ⛔ WHAT WAS S3 — the network veto — IS GONE (2026-09-04); the test below is its
+    // inverse, kept as the guard against the barrier growing back.
     // ======================================================================================
 
     /**
-     * Mainnet is additionally protected by {@code loans.enabled=false}, which stops this class from
-     * existing at all there. This veto is the second line, enforced in the code that would do the
-     * submitting rather than in the wiring — so it holds even on a node where lending was switched on.
-     * <p>
-     * Preprod is checked alongside it because the veto is an allow-list of one, not a mainnet block:
-     * a preprod deployment has no verified reference-script coordinates either, and would build
-     * against a contract tree this node cannot vouch for.
+     * ⛔ <b>THE INVERSE OF WHAT THIS TEST USED TO ASSERT, and that inversion IS the change.</b>
+     *
+     * <p>Until 2026-09-04 a {@code NETWORK_NOT_PREVIEW} veto sat here: a fully armed node on mainnet
+     * or preprod built the transaction, priced it, recorded {@code WOULD_SUBMIT} with a positive
+     * profit — <b>and sent nothing</b>. The old version of this test asserted exactly that, and read
+     * as a safeguard.
+     *
+     * <p>Giovanni's ruling, 2026-09-04: <i>"a barrier that silently blocks submission even when
+     * everything else is armed is a bug, not a safeguard — arming that works everywhere except the
+     * last step, silently."</i> It was defensible while this node was preview-only. The product goes
+     * to mainnet for real, and a veto aimed at its own purpose had to go.
+     *
+     * <p>⇒ <b>So this now asserts that an armed node SUBMITS on whatever network it is pointed at.</b>
+     * {@code config.network} is the single source of truth; there is no second network value that can
+     * disagree with it. <b>Keep this test as the regression guard:</b> re-introducing any network
+     * check inside the submit path turns it red, which is the only thing that stops the barrier
+     * growing back — the old one grew back once already, as a hard-coded {@code "preview"} constant
+     * before it was a config key.
+     *
+     * <p>⚠ Preview is asserted alongside, unchanged, so a mutant that simply inverted the comparison
+     * (submit on mainnet, veto on preview) cannot pass either.
      */
     @Test
-    void s3AFullyArmedNodeOnAnyNetworkButPreviewSubmitsNothing() {
-        for (String networkName : List.of("mainnet", "preprod")) {
+    void s3AnArmedNodeSubmitsOnWhicheverNetworkItIsPointedAt() {
+        for (String networkName : List.of("mainnet", "preprod", "preview")) {
             Run run = new Rig().network(networkName).run();
 
-            run.assertNothingWasSubmitted();
+            assertEquals(1, run.submitter().submitted.size(),
+                    "on " + networkName + ": an armed, profitable, buildable candidate must reach "
+                            + "the submitter. A node targeted at a network and then armed ACTS on "
+                            + "that network — there is no second network value left to disagree");
             LiquidationDecision decision = run.onlyDecision();
-            assertEquals(LiquidationExecutor.SubmitVeto.NETWORK_NOT_PREVIEW.name(),
-                    decision.submitVeto(), "on " + networkName + ": " + decision.detail());
-            assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, decision.outcome());
+            assertNull(decision.submitVeto(),
+                    "on " + networkName + ": no veto may fire — got " + decision.submitVeto()
+                            + " (" + decision.detail() + ")");
             assertTrue(decision.expectedProfitLovelace().signum() > 0,
-                    "the candidate was worth doing on " + networkName + " — only the network stopped it");
+                    "the candidate was worth doing on " + networkName);
         }
     }
 
     // ======================================================================================
-    // S4 — the market's own execution state
+    // S3 — the market's own execution state
     // ======================================================================================
 
     /** A configuration identical to {@link #armed()} but with one market held at {@code mode}. */
@@ -940,7 +959,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S5 — profitability
+    // S4 — profitability
     // ======================================================================================
 
     /**

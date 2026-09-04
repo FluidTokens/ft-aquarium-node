@@ -139,12 +139,17 @@ public class LiquidationReadinessController {
         LiquidationCandidateScanner scan = scanner.getIfAvailable();
         LoanHealthService health = loanHealthService.getIfAvailable();
         if (loans == null || scan == null || health == null) {
-            // ⚠ A legible line beats a context failure. loans.ui.enabled=true with loans.enabled=false
-            // is an ordinary misconfiguration, and a crash-loop names the wrong subsystem.
+            // ⚠ A legible line beats a context failure. This branch predates the removal of
+            // `loans.enabled` (2026-09-04), when it was the ordinary misconfiguration of turning the
+            // UI on with lending off. The lending beans are unconditional now, so reaching this means
+            // one of them genuinely failed to build — a different and worse thing, and the line must
+            // not keep blaming a flag that no longer exists.
             model.addAttribute("disabledReason",
-                    "lending is disabled on this node (loans.enabled=false), so there is nothing to "
-                            + "read. The readiness list needs the same scanner and health service the "
-                            + "bot uses; it does not have its own.");
+                    "the lending scanner or health service is not available on this node, so there is "
+                            + "nothing to read. These beans are built unconditionally, so this points "
+                            + "at a startup failure in one of them rather than at a setting — check "
+                            + "the boot log. The readiness list has no scanner of its own; it reads "
+                            + "exactly what the bot reads.");
             model.addAttribute("rows", List.of());
             return "readiness";
         }

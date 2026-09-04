@@ -7,7 +7,6 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
@@ -84,7 +83,6 @@ import java.math.BigInteger;
  */
 @Service
 @Slf4j
-@ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class ConvertEconomics {
 
     private static final BigInteger PER_MILLE = BigInteger.valueOf(1000L);

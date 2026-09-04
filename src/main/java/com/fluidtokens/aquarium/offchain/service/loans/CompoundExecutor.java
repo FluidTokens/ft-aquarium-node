@@ -16,7 +16,6 @@ import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -51,7 +50,6 @@ import java.util.concurrent.TimeUnit;
  */
 @Service
 @Slf4j
-@ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class CompoundExecutor {
 
     /** 30 s of backdate, matching the liquidation path. Anchored to the tip, never to the clock. */
@@ -260,21 +258,19 @@ public class CompoundExecutor {
 
     private void submit(CompoundCandidate candidate, Transaction transaction,
                         CompoundAssessment assessment) {
-        // ⛔ THE NETWORK GATE, enforced here — in the code that would do the submitting — exactly as
-        // the liquidation path enforces its S3 veto, and reading the SAME configured value.
+        // ⛔ THE NETWORK GATE IS GONE — `loans.submittable-network` was removed on 2026-09-04
+        // (Giovanni: "a barrier that silently blocks submission even when everything else is armed
+        // is a bug, not a safeguard"). `config.network` alone decides where this node acts, and it
+        // is not a permission to check here: by the time control reaches this method the operator
+        // has already said which network to run on.
         //
-        // Until 2026-09-03 this path had NO network check at all: its only gate between a candidate
-        // and a mainnet submission was `loans.compound.enabled`, one boolean. That asymmetry is the
-        // thing this closes, and it closes with no NEW gate — one config value, both executors.
-        if (network == null || !network.isSubmittable()) {
-            log.warn("compound NOT SUBMITTED {} escrow {}: network is {}, this node submits only on "
-                            + "{} (loans.submittable-network). The transaction was built and priced "
-                            + "and is discarded.",
-                    candidate.loanId(), candidate.escrowRef(),
-                    network == null ? "<unset>" : network.getNetwork(),
-                    network == null ? "<unset>" : network.getSubmittableNetwork());
-            return;
-        }
+        // ⚠ THAT LEAVES THIS PATH WITH ONE BOOLEAN. Between a candidate and a real submission the
+        // liquidation path has three switches — mode == live, liquidation.enabled, and the market's
+        // own effective mode — plus two profit floors. Compound has `loans.compound.enabled` and one
+        // floor. The network value had been closing exactly that asymmetry since 2026-09-03, so
+        // removing it re-opens it; this comment is here so the next person to read it finds the fact
+        // recorded rather than rediscovers it. The fix, if one is wanted, is a second compound
+        // switch of its own — NOT a network check, which is the thing that was found to be wrong.
 
         byte[] signed;
         try {

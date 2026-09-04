@@ -135,7 +135,7 @@ share one secret.
 |---|---|---|---|---|---|---|---|
 | `SPRING_PROFILES_ACTIVE` | — | Which YAML document applies. **This is the network selector.** Unset = mainnet. | `` (empty) or `preview` | *(empty → mainnet)* | `preview` | **A** | (own) |
 | `NETWORK` | `network` | The Cardano network the node believes it is on — drives address prefixes, slot conversion and every "is this mainnet" guard. | `mainnet` / `preview` / `preprod` | `mainnet` | `preview` | **C** — ⚠ **expose with a locked-safe default and a loud warning; do NOT remove it.** (C) in this file means *handle specially*, never *forbid* — see §1. The safe default is **empty, derived from the profile**. ⛔ The hazard is setting it **alone**: it decouples the network from the config policy ids, the Blockfrost URL and the relay, producing a node that derives one deployment and talks to another. Worst case is `SPRING_PROFILES_ACTIVE` unset (⇒ mainnet document) with `NETWORK=preview` — preview addresses and slot conversion against mainnet coordinates, a mainnet relay and a mainnet Blockfrost URL. | (own†) |
-| `LOANS_SUBMITTABLE_NETWORK` | `loans.submittable-network` | ⛔ **The submit gate.** The one network this node may sign and submit on. Compared to `network`; unequal ⇒ every build stops at veto **S3**. | network name | **`preview`** *(layer 2 — no yaml line)* | `preview` | ⛔ **C** — **the default IS the protection.** Mainnet is the default *profile*, so this default deliberately leans the other way. Setting it to `mainnet` is a deliberate written act. | (own) |
+| ~~`LOANS_SUBMITTABLE_NETWORK`~~ | ~~`loans.submittable-network`~~ | ⛔ **REMOVED 2026-09-04 — the property no longer exists.** It named the one network the node could submit on; a node correctly targeted at mainnet, armed and profitable, would refuse to submit and say so only in a decision row. Giovanni: *"arming that works everywhere except the last step, silently."* **`NETWORK` is now the single source of truth.** ⚠ Setting this env var is now a **no-op** — the harmless direction, since Spring ignores an unknown variable. | — | — | — | **gone** | (own) |
 | `STORE_CARDANO_HOST` | `store.cardano.host` | The Cardano relay the indexer connects to (N2C/N2N over TCP — no Kupo/Ogmios). | hostname | `backbone.mainnet.cardanofoundation.org` ⚑ *hardcoded* | `""` ⚑ | **A** — mandatory on preview, where the default is empty. | (fwd) |
 | `STORE_CARDANO_PORT` | `store.cardano.port` | Relay port. | int | `3001` ⚑ | `0` ⚑ | **A** — mandatory on preview. | (fwd) |
 | `STORE_CARDANO_PROTOCOL_MAGIC` | `store.cardano.protocol-magic` | Network magic for the handshake. | int | `764824073` ⚑ | `2` ⚑ | ⛔ **C** — must match `network`. A mismatch fails the handshake, not the config. Expose for completeness; never vary independently. | (own†) |
@@ -211,7 +211,7 @@ deployment that does not exist** — see §7 trap 3.
 
 | env var | property | plain English | default (mainnet) | preview | class |
 |---|---|---|---|---|---|
-| `LOANS_ENABLED` | `loans.enabled` | ⛔ **The master switch for everything lending.** False ⇒ the beans are not constructed at all: no scanner, no bot, no UI, no market validation. | **`false`** | `true` | ⛔ **C** — false on mainnet by design. Turning it on is step 1 of arming. |
+| ~~`LOANS_ENABLED`~~ | ~~`loans.enabled`~~ | ⛔ **REMOVED 2026-09-04 — v4 indexing is UNCONDITIONAL.** The flag *was* the defect: `TankUtxoStorage` fixes its credential set once at startup, so with it off v4 UTxOs were dropped at write time with no trace while the cursor advanced, and switching it back on never re-read those blocks. Worse, `saveSpent` kept working, so a loan indexed *before* an off-window that *moved* during it vanished from the index while still live on chain. **What decides whether anything is indexed is now whether the config policy ids are set** — §7 trap 7. ⚠ Setting this env var is now a no-op. | — | — | **gone** |
 | `LOANS_CONFIG_POLICY_ID` | `loans.config.policy-id` | Main config-NFT policy id — the parameter the whole tree is derived from. | `db2c498e…` | `d46f626f…` | **D** |
 | `LOANS_LM_CONFIG_POLICY_ID` | `loans.lm-config.policy-id` | LenderManager config-NFT policy id. | `a56b0ac2…` | `a7d4b762…` | **D** |
 | `LOANS_CONFIG_REF_UTXO_TX_HASH` | `loans.config.ref-utxo-tx-hash` | The tx that minted both config NFTs. | `7b9f20db…` | `8dd38e97…` | **D** |
@@ -457,6 +457,39 @@ not on the classpath. **Do not model this key in the chart**; it is an app-side 
 
 ---
 
+### Trap 7 ⛔ — "not configured" and "configured wrong" are different, and only one may fail
+
+*(own)* With `loans.enabled` gone there is no switch left that stops `LoansContractRegistry` and
+`LoansConfigVerifier` being built, so **a bare install reaches both on every node.** A public chart
+ships every contract coordinate empty, which makes this the default path, not an edge case.
+
+**Measured 2026-09-04, and the surprising half first:** blank coordinates **do not fail**. `b("")` is
+a legal empty bytestring, every `applyParamToScript` succeeds, and the registry comes up holding a
+full set of plausible 56-hex hashes derived from nothing — plus the blank policy id itself, which
+`AddressProvider` turns into the perfectly valid address `addr1wy22xa6y`. Feeding those seven
+credentials to the write-time filter would give a fresh install the exact pathology of trap 3:
+**boots clean, indexes at credentials no UTxO will ever carry, reports an empty world.**
+
+⇒ The app now distinguishes **three** states, and a chart should mirror them in its values comments:
+
+| coordinates | node does | why |
+|---|---|---|
+| **blank** | starts clean, derives nothing, **indexes nothing for v4**, WARNs, contacts no provider | "not configured yet" is legitimate for a fresh install and must never crash |
+| **well-formed** | derives, indexes, verifies against chain | the normal path |
+| ⛔ **present but malformed** | **fails at startup, naming the key** | a typo is not an absence; reading it as "not configured" would leave an operator who fat-fingered one character with a node reporting a quiet market |
+
+⛔ **The mismatch hard-fail is UNCHANGED and must stay.** `LoansConfigVerifier` still refuses to start
+when the derived hashes disagree with the live config datums. Unlike the network gate removed the
+same day, **that one is a real safeguard**: a stale policy id verifies cleanly forever against a dead
+deployment (trap 3), so it is the only thing that catches a redeploy. **Absent is a Tuesday; stale is
+a fault.**
+
+⇒ **Chart implication:** `loans.config.policyId` / `lmConfig.policyId` may ship empty and a bare
+`helm install` starts. Do **not** add a chart-side gate that skips them — the app owns that
+distinction now, and a second one would drift.
+
+---
+
 ## 8. What is NOT in this app, and belongs to the chart
 
 - **Maintenance mode / `sleep infinity`.** No such flag exists in the image; the entrypoint is a bare
@@ -478,10 +511,9 @@ Everything below is what the chart should ship, and all of it is already the app
 node indexes, serves the API, and **cannot move value**:
 
 ```yaml
-LOANS_ENABLED: "false"                        # mainnet default; "true" on preview
+# LOANS_ENABLED and LOANS_SUBMITTABLE_NETWORK are GONE (2026-09-04) — do not emit them.
 AQUARIUM_LIQUIDATION_MODE: "disabled"
 AQUARIUM_LIQUIDATION_ENABLED: "false"
-LOANS_SUBMITTABLE_NETWORK: "preview"          # the submit gate — NOT the network selector
 AQUARIUM_COMPOUND_ENABLED: "false"
 AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK: "false"   # fatal on mainnet if true
 LOANS_UI_ENABLED: "false"                     # no authentication
@@ -494,7 +526,9 @@ LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE: "0"
 LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE: "5000000"
 ```
 
-**Arming is four deliberate acts, in this order**, and the runbook
+**Arming is now targeting plus three deliberate acts**, and the runbook
 (`docs/operating-the-liquidation-bot.md` §14) is what walks them:
-`LOANS_ENABLED=true` → reference scripts published and configured → `AQUARIUM_LIQUIDATION_MODE=live`
-→ `AQUARIUM_LIQUIDATION_ENABLED=true` → `LOANS_SUBMITTABLE_NETWORK=mainnet`.
+point `NETWORK` / the profile at the chain → supply the config policy ids → publish **and** configure
+the reference scripts → `AQUARIUM_LIQUIDATION_MODE=live` → `AQUARIUM_LIQUIDATION_ENABLED=true`.
+⛔ **There is no longer a switch after that.** A node targeted at a chain and armed **acts on it** —
+that coherence is the whole point of removing the submit gate.

@@ -20,6 +20,8 @@ import java.util.List;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -87,8 +89,7 @@ class ContainerWiringTest {
      */
     private static ApplicationContextRunner runner() {
         var network = new AppConfig.Network();
-        org.springframework.test.util.ReflectionTestUtils.setField(network, "network", "preview");
-        org.springframework.test.util.ReflectionTestUtils.setField(network, "submittableNetwork", "preview");
+        network.setNetworkForTest("preview");
 
         return new ApplicationContextRunner()
                 .withUserConfiguration(YaciConfig.class)
@@ -154,24 +155,90 @@ class ContainerWiringTest {
     }
 
     /**
-     * ⛔ And the control: with lending OFF the same beans must be ABSENT. Without this the test above
-     * could pass on a context that builds them unconditionally, and the {@code @ConditionalOnProperty}
-     * that lets an operator run the node with no lending at all would be unasserted.
+     * ⛔ <b>THE CONTROL, INVERTED — and the inversion is the point.</b>
+     *
+     * <p>Until 2026-09-04 this asserted the opposite: with {@code loans.enabled} unset the same beans
+     * had to be ABSENT, proving the switch that let an operator run the node with no lending at all.
+     * <b>That switch was removed</b> — it was the cause of a permanent indexing gap, because
+     * {@code TankUtxoStorage} fixes its credential set once at startup and a flag flipped later never
+     * re-reads the blocks that passed meanwhile.
+     *
+     * <p>⇒ <b>So the beans must now be present with NOTHING configured at all</b> — no
+     * {@code loans.enabled}, no config policy ids, no coordinates. That is the bare-install shape: a
+     * public chart ships every contract coordinate empty, and with no flag left to switch off, this
+     * context IS what such an install gets. If it cannot be built, every bare install crash-loops.
+     *
+     * <p>⚠ What makes that safe is not a bean being absent but
+     * {@link LoansContractRegistry#isConfigured()} being false: the registry derives nothing usable
+     * from blank coordinates, so it hands the indexer an EMPTY credential list rather than the seven
+     * real-looking hashes a blank policy id otherwise produces. Asserted here beside the wiring,
+     * because the two claims are only meaningful together — beans that exist, indexing that does not.
      */
     @Test
-    void withLendingDisabledNoneOfThemAreWired() {
+    void withNoCoordinatesConfiguredTheBeansStillWireAndNothingIsIndexed() {
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
         new ApplicationContextRunner()
                 .withUserConfiguration(YaciConfig.class)
                 .withBean(BFBackendService.class,
                         () -> new BFBackendService("https://cardano-preview.blockfrost.io/api/v0/", "test"))
-                // ⚠ QuickTxBuilder is deliberately NOT @ConditionalOnProperty — the tank/scheduled
-                // transaction path uses it and predates lending entirely. Measured here rather than
-                // assumed: the first version of this control asserted all nine were absent and this
-                // one was present, which is correct behaviour and a wrong expectation.
-                .run(ctx -> requiredBeans().filter(t -> t != QuickTxBuilder.class).forEach(type ->
-                        assertEquals(0, ctx.getBeanNamesForType(type).length,
-                                type.getSimpleName() + " was built with loans.enabled unset — the "
-                                        + "condition that lets an operator run without lending is not "
-                                        + "holding")));
+                .withBean(AppConfig.Network.class, () -> network)
+                // ⛔ THE BARE-INSTALL REGISTRY: built through the same path Spring uses, from a
+                // LoansConfiguration whose coordinates are all empty — which is exactly what a public
+                // chart ships by default. Not a stub; the real class, given nothing.
+                .withBean(LoansContractRegistry.class,
+                        () -> new LoansContractRegistry(new AppConfig.LoansConfiguration()))
+                .withBean(AppConfig.LoansConfiguration.class, AppConfig.LoansConfiguration::new)
+                .withBean(com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics.class,
+                        () -> new com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics(
+                                new AppConfig.ConvertConfiguration(), network))
+                .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
+                        () -> org.cardanofoundation.conversions.ClasspathConversionsFactory
+                                .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW))
+                .run(ctx -> {
+                    assertNull(ctx.getStartupFailure(),
+                            () -> "a bare install — no flag, no coordinates — must START. There is no "
+                                    + "longer any switch that could turn this off: "
+                                    + ctx.getStartupFailure());
+                    requiredBeans().forEach(type ->
+                            assertEquals(1, ctx.getBeanNamesForType(type).length,
+                                    type.getSimpleName() + " must be wired unconditionally now that "
+                                            + "loans.enabled is gone"));
+                });
+    }
+
+    /**
+     * ⛔ <b>And the claim the one above rests on, isolated so it cannot pass for the wrong reason:
+     * blank coordinates index NOTHING.</b>
+     *
+     * <p>Measured 2026-09-04, and it is the reason this guard exists at all: a registry built from
+     * two blank policy ids <b>does not fail</b>. {@code b("")} is a legal empty bytestring, every
+     * {@code applyParamToScript} succeeds, and the object comes up holding a full set of plausible
+     * 56-hex hashes derived from nothing — plus the blank policy id itself, which
+     * {@code AddressProvider} turns into the perfectly valid {@code addr1wy22xa6y}.
+     *
+     * <p>⚠ Handing those seven credentials to the write-time filter would give a bare install the
+     * exact pathology of findings §12/§39: boots clean, verifies nothing, indexes at credentials no
+     * UTxO will ever carry, and reports an empty world that looks identical to a quiet market.
+     * <b>"Not configured" has to be a visible state, not a silently wrong one.</b>
+     */
+    @Test
+    void aRegistryWithBlankCoordinatesDerivesNothingItWillIndex() {
+        var blank = new LoansContractRegistry("", "", "706172616d6574657273", "");
+        assertFalse(blank.isConfigured(),
+                "two blank policy ids are NOT a configured deployment");
+        assertTrue(blank.indexedPaymentCredentials().isEmpty(),
+                "an unconfigured registry must offer the indexer NO credentials; it derived "
+                        + blank.indexedPaymentCredentials().size() + " of them, which would be "
+                        + "indexed forever and match nothing");
+
+        var configured = new LoansContractRegistry(
+                "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416",
+                "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4",
+                "706172616d6574657273", "");
+        assertTrue(configured.isConfigured(), "the real mainnet coordinates ARE configured");
+        assertFalse(configured.indexedPaymentCredentials().isEmpty(),
+                "and a configured registry must still produce credentials — otherwise the guard "
+                        + "above would pass by disabling indexing everywhere");
     }
 }

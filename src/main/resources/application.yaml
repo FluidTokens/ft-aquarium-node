@@ -55,11 +55,26 @@ aquarium:
       txHash: 354ffe7958d62a8a2bf0b0bd97a06694d59dc49b6d02f1ab40165a3955257168
       outputIndex: 0
 
-# FluidTokens Lending v4. Disabled on mainnet until FT confirms the deployment and
-# gives us the two config NFT policy ids; the whole contract tree derives from them
-# (see LoansContractRegistry / docs/lending-v4-findings.md).
+# FluidTokens Lending v4.
+#
+# ⛔ `loans.enabled` IS GONE (2026-09-04, Giovanni's ruling). v4 indexing is UNCONDITIONAL, because
+# the flag itself was the defect: TankUtxoStorage builds its credential set ONCE at startup, so with
+# the flag off v4 UTxOs were DISCARDED AT WRITE TIME while the cursor advanced anyway — and turning
+# it back on only widened the filter for blocks indexed from then on. Worse, saveSpent kept working,
+# so a loan indexed BEFORE the off-window that MOVED during it had its old row marked spent and its
+# new output dropped: the loan vanished from the index while still live on chain. No flag, no gap.
+#
+# ⇒ WHAT DECIDES WHETHER ANYTHING IS INDEXED IS NOW THE COORDINATES BELOW. Absent or malformed
+# config policy ids mean "not configured yet": the node starts CLEAN, indexes nothing for v4, says so
+# at WARN, and contacts nothing. Supply both and it indexes from the sync-start slot.
+# ⚠ ABSENT is not MISMATCHED. A stale policy id still HARD-FAILS at startup (LoansConfigVerifier) —
+# that check is what catches a redeploy, which otherwise verifies cleanly forever against a dead
+# deployment while the node reports an empty world (findings section 12). Do not soften it.
+#
+# ⚠ AND INDEXING IS NOT ARMING. Reading v4 arms nothing; the switches are `liquidation.mode: live`
+# + `liquidation.enabled: true`, and `compound.enabled` on that path. All off below.
+# (see LoansContractRegistry / docs/lending-v4-findings.md)
 loans:
-  enabled: ${LOANS_ENABLED:false}
   # FluidTokens oracle registry. Same endpoint ada-watch polls for Lending v3. Read-only price
   # feeds for the health-factor engine; it also carries the multisig signatures a liquidation tx
   # needs, which we do not consume yet. NOTE: serves mainnet assets, so on preview most
@@ -73,10 +88,12 @@ loans:
   # executor SIGNS AND SUBMITS the liquidation on preview (LiquidationExecutor wires the real
   # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
   # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely.
-  # ⚠ `SUBMITTABLE_NETWORK is hard-coded to preview` was true of an earlier build and is not now:
-  # it is ordinary configuration, `loans.submittable-network`, DEFAULTING to preview. The default
-  # is the protection — mainnet is the default PROFILE, so this default leans the other way — but
-  # an operator can set it, and on mainnet that is exactly what arming step 4 does.
+  # ⛔ THERE IS NO NETWORK GATE ANY MORE. `loans.submittable-network` existed until 2026-09-04 and
+  # was removed on Giovanni's ruling: a node correctly targeted at mainnet, armed and profitable,
+  # would still refuse to submit and say so only in a decision row — "arming that works everywhere
+  # except the last step, silently." `network` (this file / the Spring profile) is now the SINGLE
+  # source of truth for where this node acts. What holds a submission back is exactly: loans.enabled,
+  # mode == live, liquidation.enabled, the market's effective mode, and the profit floors.
   # The repayment-escrow COMPOUND path (lm_compound_action): collect a repaid loan's principal from
   # the asset manager and deliver it into the lender's pool, keeping the pool owner's compounding fee.
   # A different action from every `liquidation:` key above -- see docs/lending-v4-findings.md section 20.
@@ -127,7 +144,7 @@ loans:
   # See MainnetRegistryMatchesConfigTest and docs/lending-v4-findings.md section 23.
   #
   # ⚠ CONFIGURED IS NOT ARMED. `loans.enabled` above is false on mainnet, the liquidation mode is
-  # `disabled`, and `loans.submittable-network` defaults to preview so the submit gate is closed.
+  # `disabled`, and `loans.liquidation.enabled` is false — three switches, all off.
   # ⚠ The fourth item here used to read "the compound gate HARD-FAILS a negative profit margin on
   # mainnet" — it does not; see the compound margin above. Three gates, not four. These values let
   # the node DERIVE and READ the mainnet deployment; nothing here lets it act on one.
@@ -358,7 +375,6 @@ aquarium:
       outputIndex: 0
 
 loans:
-  enabled: ${LOANS_ENABLED:true}
   # FluidTokens runs a separate registry for preview. Unlike mainnet it prices tFLDT — the
   # collateral on the loans we index — so health is fully computable here.
   oracle:

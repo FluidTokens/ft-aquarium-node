@@ -13,7 +13,6 @@ import org.cardanofoundation.conversions.CardanoConverters;
 import org.cardanofoundation.conversions.ClasspathConversionsFactory;
 import org.cardanofoundation.conversions.domain.NetworkType;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -41,53 +40,37 @@ public class AppConfig {
         private String network;
 
         /**
-         * The one network this node is permitted to SUBMIT on. Ordinary configuration — Giovanni's
-         * ruling, 2026-09-03: <i>"if someone is operating this bot they KNOW they're doing financial
-         * stuff on a network … putting too many gates is only annoying and won't really protect
-         * anyone. No different image pls. Configuration configuration configuration. The defaults
-         * must be defensive; if an operator copy-pastes from preview it's their problem."</i>
+         * ⛔ <b>{@code loans.submittable-network} IS GONE, and it was removed on purpose.</b>
          *
-         * <p>⛔ <b>THE DEFAULT IS THE PROTECTION.</b> It is {@code preview}, so a node that says
-         * nothing about this cannot submit on mainnet — and since 1d17e9a mainnet is the DEFAULT
-         * PROFILE, which is exactly why this default has to lean the other way. Submitting on mainnet
-         * is a thing an operator writes down on purpose.
+         * <p>It named the one network this node was permitted to submit on, defaulted to
+         * {@code preview}, and was checked separately from {@link #network} — so a node could be
+         * correctly targeted at mainnet, fully armed, profitable, and still refuse to submit. That
+         * refusal was a {@code NETWORK_NOT_PREVIEW} line in a decision row and nothing else.
          *
-         * <p>This replaced a hard-coded {@code "preview"} constant in {@code LiquidationExecutor}.
-         * The constant was safer in one narrow sense and unusable for its actual purpose: a bot
-         * meant to run on mainnet could never do so without a code change and a bespoke artefact.
+         * <p><b>Giovanni's ruling, 2026-09-04:</b> <i>"a barrier that silently blocks submission even
+         * when everything else is armed is a bug, not a safeguard — arming that works everywhere
+         * except the last step, silently."</i> It earned its place while this node was preview-only;
+         * the product ships to mainnet for real now, and a veto pointed at its own purpose has to go.
          *
-         * <p><b>Both executors read this one value</b> — the liquidation path and the compound path.
-         * That is not a new gate; it is the same gate, finally applied to both. Before this,
-         * {@code CompoundExecutor} had NO network check at all.
+         * <p>⇒ <b>{@link #network} — that is, {@code config.network} and the Spring profile — is now
+         * the SINGLE source of truth for which network this node targets.</b> Nothing else decides
+         * where a transaction goes, so there is no second value to keep in step with it and no way
+         * for the two to disagree. Arming is coherent: target a network, arm the bot, it acts there.
          *
-         * <p>⚠ <b>The default is on the FIELD as well as in the annotation, deliberately.</b> A
-         * {@code @Value} default only fires when Spring binds the bean; an instance built any other
-         * way — reflectively in a test, or by a future {@code new Network()} — would otherwise hold
-         * {@code null} and silently become non-submittable. Measured immediately: 23 liquidation
-         * veto tests went red on exactly that, and they were right to. <b>A default that lives only
-         * in the framework is not a default of the class</b>, and the gap shows up as behaviour that
-         * differs between production and every other construction path.
+         * <p>⚠ <b>What still stops a submission</b>, and it is the whole list: {@code loans.enabled},
+         * {@code loans.liquidation.mode == live}, {@code loans.liquidation.enabled}, the per-market
+         * effective mode, and the profitability floors. On the compound path it is
+         * {@code loans.compound.enabled} and its floor — see {@code CompoundExecutor#submit}, which
+         * records that this leaves compound with one boolean where liquidation has three.
          */
-        @Value("${loans.submittable-network:preview}")
-        private String submittableNetwork = "preview";
 
         /**
-         * Whether this node may submit on the network it is configured for.
-         *
-         * <p>⚠ Compares against {@link #getNetwork()}, not the field. The accessor is overridden by
-         * test doubles — an anonymous subclass returning a network name while the private field
-         * stays {@code null} — and reading the field there yields "not submittable" for a node that
-         * plainly is. <b>When a class exposes an accessor, its own logic should go through it</b>,
-         * or the override becomes a half-truth that behaves differently inside than out.
+         * Test seam; {@code @Value} owns this in production. One argument now — the second was
+         * {@code submittableNetwork}, and a two-argument version would let a test express a
+         * distinction the app no longer has.
          */
-        public boolean isSubmittable() {
-            return submittableNetwork != null && submittableNetwork.equalsIgnoreCase(getNetwork());
-        }
-
-        /** Test seam; {@code @Value} owns these in production. */
-        public void setNetworkForTest(String network, String submittableNetwork) {
+        public void setNetworkForTest(String network) {
             this.network = network;
-            this.submittableNetwork = submittableNetwork;
         }
 
         public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
@@ -141,16 +124,45 @@ public class AppConfig {
     @Getter
     public static class LoansConfiguration {
 
-        @Value("${loans.enabled:false}")
-        private boolean enabled;
+        /**
+         * ⛔ <b>{@code loans.enabled} IS GONE (2026-09-04). Lending v4 indexing is UNCONDITIONAL.</b>
+         *
+         * <p>Giovanni: <i>"we must index loans; if the flag is flipped later we won't see old
+         * loans."</i> That is not a preference, it is the only fix for a defect the flag created.
+         * {@code TankUtxoStorage} builds its payment-credential set ONCE, in its constructor, from
+         * the beans present at startup. With the flag off the v4 credentials were absent, so v4
+         * UTxOs were offered to {@code saveUnspent} and <b>discarded at write time with no trace they
+         * were ever seen</b> — while Yaci Store's cursor advanced regardless. Turning the flag back
+         * on widened the filter only for blocks indexed FROM THEN ON; the blocks that passed while it
+         * was off are never re-read.
+         *
+         * <p>⚠ <b>And it was worse than a gap.</b> {@code saveSpent} kept working while the flag was
+         * off, so a loan indexed BEFORE the off-window that MOVED during it had its old row marked
+         * spent and its new output dropped: <b>the loan vanished from the index while remaining live
+         * on chain.</b> Recovery meant deleting the cursor and re-syncing — the operation the
+         * cursor-cleanup OOM makes hazardous. <b>No flag, no flip, no gap.</b>
+         *
+         * <p>⇒ What replaces it is {@link LoansContractRegistry#isConfigured()}: a node with no config
+         * policy ids indexes nothing and says so, and a node with them indexes from its sync-start
+         * slot. Arming stays where it always was — {@code liquidation.mode}, {@code liquidation.enabled},
+         * {@code compound.enabled}.
+         */
 
         /** Main config NFT policy id = hash of the applied {@code config(tx0, index0)} validator. */
+        /**
+         * ⚠ Defaulted on the FIELD as well as in the annotation — the lesson {@code Network} paid for
+         * once already: <b>a default that lives only in the framework is not a default of the
+         * class.</b> An instance built any other way holds {@code null}, and since
+         * {@code loans.enabled} was removed this class is constructed on every node, including ones
+         * that configure nothing. Measured: a bare {@code new LoansConfiguration()} NPE'd inside the
+         * registry on {@code configAssetName} before these were added.
+         */
         @Value("${loans.config.policy-id:}")
-        private String configPolicyId;
+        private String configPolicyId = "";
 
         /** LenderManager config NFT policy id = hash of the applied {@code lm_config(tx0, index0)}. */
         @Value("${loans.lm-config.policy-id:}")
-        private String lmConfigPolicyId;
+        private String lmConfigPolicyId = "";
 
         /**
          * Hex of "parameters". Hardcoded in lib/fluidtokens/constants.ak, so this is
@@ -158,7 +170,7 @@ public class AppConfig {
          * force a code change.
          */
         @Value("${loans.config.asset-name:706172616d6574657273}")
-        private String configAssetName;
+        private String configAssetName = "706172616d6574657273";
 
         /**
          * Not derivable from the blueprint (no smart_tokens validator is bundled); it is
@@ -166,7 +178,7 @@ public class AppConfig {
          * branch of the derivation is skipped, which the liquidation path does not need.
          */
         @Value("${loans.smart-tokens-spend-script-hash:}")
-        private String smartTokensSpendScriptHash;
+        private String smartTokensSpendScriptHash = "";
 
         /**
          * ⛔ The three Minswap V2 coordinates that parameterise
@@ -215,7 +227,7 @@ public class AppConfig {
 
         /** The tx that minted both config NFTs; the point history has to be indexed from. */
         @Value("${loans.config.ref-utxo-tx-hash:}")
-        private String configRefUtxoTxHash;
+        private String configRefUtxoTxHash = "";
 
     }
 
@@ -249,7 +261,6 @@ public class AppConfig {
     @Component
     @Getter
     @ConfigurationProperties(prefix = "loans.liquidation")
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public static class MarketProperties {
 
         private List<LiquidationConfiguration.Market> markets = new ArrayList<>();
@@ -262,7 +273,6 @@ public class AppConfig {
     @Component
     @Getter
     @NoArgsConstructor
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public static class LiquidationConfiguration {
 
         /**
@@ -880,7 +890,6 @@ public class AppConfig {
     @Component
     @Getter
     @NoArgsConstructor
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public static class CompoundConfiguration {
 
         /**
@@ -967,7 +976,6 @@ public class AppConfig {
     @Component
     @Getter
     @NoArgsConstructor
-    @ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
     public static class ConvertConfiguration {
 
         /**

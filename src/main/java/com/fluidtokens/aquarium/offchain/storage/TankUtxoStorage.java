@@ -49,7 +49,17 @@ public class TankUtxoStorage extends UtxoStorageImpl {
                 stakerContractService.getScriptHashHex(),
                 tankContractService.getScriptHashHex()
         ));
-        // Absent unless loans.enabled=true — the node then also indexes Lending v4 UTxOs.
+        // ⛔ THE REGISTRY IS ALWAYS PRESENT NOW — `loans.enabled` was removed on 2026-09-04 and v4
+        // indexing is unconditional. What varies is whether it has COORDINATES: an unconfigured
+        // registry returns an EMPTY credential list, so a fresh install indexes the Aquarium set and
+        // nothing else. The ObjectProvider is kept because a test may still wire this class without
+        // one, not because the bean is conditional.
+        //
+        // ⚠ THIS SET IS BUILT ONCE, HERE, AND IT IS WHY THE FLAG HAD TO GO. `saveUnspent` drops
+        // everything not in it, at write time, leaving no trace the row was ever offered — while the
+        // cursor advances regardless. A credential added later therefore only ever sees blocks from
+        // that moment on; the ones that passed meanwhile are unrecoverable short of a cursor delete
+        // and a full re-sync. A filter that narrows at startup is a filter that loses history.
         loansContractRegistry.ifAvailable(loans -> pkhs.addAll(loans.indexedPaymentCredentials()));
         this.contractPaymentPkh = Set.copyOf(pkhs);
         log.info("Indexing UTxOs for {} payment credentials: {}", contractPaymentPkh.size(), contractPaymentPkh);

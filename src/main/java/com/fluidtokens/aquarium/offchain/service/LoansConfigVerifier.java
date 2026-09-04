@@ -13,7 +13,6 @@ import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -47,7 +46,6 @@ import java.util.Map;
  */
 @Service
 @Slf4j
-@ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class LoansConfigVerifier {
 
     // ConfigDatum field indices.
@@ -119,6 +117,28 @@ public class LoansConfigVerifier {
 
     @PostConstruct
     public void verify() {
+        // ⛔ ABSENT COORDINATES ARE NOT A MISMATCH, and this distinction became load-bearing on
+        // 2026-09-04 when `loans.enabled` was removed. There is no longer a switch that stops this
+        // bean existing, so a bare install — a chart that ships `loans.config.policy-id: ""` — reaches
+        // this method on EVERY node.
+        //
+        // What it would do without this guard, measured rather than assumed: a blank policy id
+        // derives an address (`addr1wy22xa6y`), Blockfrost answers 4xx, and `fetchConfigDatumHex`
+        // correctly treats a 4xx as an ANSWER rather than an outage — so it throws, out of a
+        // @PostConstruct, and the pod CRASH-LOOPS with no way to turn it off.
+        //
+        // ⚠ The hard fail below is NOT weakened by this and must not be. A MISMATCH means the
+        // configured policy ids no longer describe the deployment, which is precisely the redeploy
+        // that verifies cleanly forever while the node indexes a dead world (§12). Absent means the
+        // operator has not said which deployment to watch yet. One is a fault; the other is a Tuesday.
+        if (!registry.isConfigured()) {
+            log.warn("Lending v4 is NOT CONFIGURED — loans.config.policy-id / loans.lm-config.policy-id "
+                    + "are absent or malformed, so no deployment is being watched, NOTHING is indexed "
+                    + "for v4, and nothing was verified against chain. This is the correct state for a "
+                    + "fresh install; supply both policy ids to start indexing.");
+            return;
+        }
+
         List<String> mismatches;
         try {
             mismatches = verifyAgainst(

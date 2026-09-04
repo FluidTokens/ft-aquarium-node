@@ -16,7 +16,6 @@ import com.fluidtokens.aquarium.offchain.service.loans.LoanService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -44,7 +43,6 @@ import java.util.stream.Collectors;
 @RequestMapping("${apiPrefix}/loans")
 @RequiredArgsConstructor
 @Slf4j
-@ConditionalOnProperty(prefix = "loans", name = "enabled", havingValue = "true")
 public class LoanController {
 
     private final LoanService loanService;

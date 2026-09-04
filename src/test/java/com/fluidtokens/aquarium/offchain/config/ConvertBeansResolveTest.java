@@ -14,6 +14,7 @@ import java.util.stream.Collectors;
 import org.springframework.context.annotation.Bean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -79,23 +80,36 @@ class ConvertBeansResolveTest {
     }
 
     /**
-     * ⚠ Conditioned like its siblings, or the node fails to START on a configuration where lending is
-     * off — which is the shipped mainnet default, and therefore the deployment most likely to meet it.
+     * ⛔ <b>THE INVERSE OF WHAT THIS ASSERTED UNTIL 2026-09-04.</b> It used to require every convert
+     * {@code @Bean} to carry {@code @ConditionalOnProperty(loans.enabled=true)} exactly like its
+     * siblings, because a node with lending off could not satisfy their dependencies.
+     *
+     * <p><b>{@code loans.enabled} was removed entirely on Giovanni's ruling</b> — <i>"we must index
+     * loans; if the flag is flipped later we won't see old loans."</i> The flag WAS the defect:
+     * {@code TankUtxoStorage} fixes its credential set at startup, so an off-window's v4 UTxOs were
+     * dropped at write time with no trace, and switching back on never re-read those blocks.
+     *
+     * <p>⇒ So the invariant flips: <b>NO bean may be gated on it any more.</b> A single surviving
+     * {@code @ConditionalOnProperty(loans.enabled)} would recreate the flip-gap for whatever it
+     * guards, and it would do so silently — which is precisely how the original defect stayed
+     * invisible. Asserted across the whole configuration class, not just the convert factories,
+     * because the flag's danger was never specific to convert.
      */
     @Test
-    void everyConvertBeanIsGatedOnLoansEnabledExactlyAsItsSiblingsAre() {
+    void noBeanIsGatedOnLoansEnabledBecauseThatFlagWasTheDefect() {
         for (Method m : YaciConfig.class.getDeclaredMethods()) {
-            if (!m.isAnnotationPresent(Bean.class) || !BY_FACTORY.contains(m.getReturnType())) {
-                continue;
-            }
             var condition = m.getAnnotation(
                     org.springframework.boot.autoconfigure.condition.ConditionalOnProperty.class);
-            assertTrue(condition != null, m.getName() + " is not @ConditionalOnProperty; on a node with "
-                    + "loans disabled its dependencies do not exist and the context fails to start");
-            assertEquals("loans", condition.prefix(), m.getName() + " is gated on the wrong prefix");
-            assertEquals("true", condition.havingValue(), m.getName() + " is gated on the wrong value");
-            assertTrue(Arrays.asList(condition.name()).contains("enabled"),
-                    m.getName() + " is gated on the wrong property: " + Arrays.toString(condition.name()));
+            if (condition == null) {
+                continue;
+            }
+            boolean gatedOnLoansEnabled = "loans".equals(condition.prefix())
+                    && Arrays.asList(condition.name()).contains("enabled");
+            assertFalse(gatedOnLoansEnabled, m.getName() + " is gated on loans.enabled, which was "
+                    + "REMOVED on 2026-09-04. A conditional on it can never be true, so the bean is "
+                    + "permanently absent — and every collaborator that injects it fails the context "
+                    + "at startup. If the flag is being brought back, the write-time indexing gap it "
+                    + "creates has to be solved first");
         }
     }
 

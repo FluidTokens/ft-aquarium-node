@@ -94,23 +94,22 @@ class CompoundExecutorTest {
     }
 
     private static Wiring wiringWithWallet(List<CompoundCandidate> candidates, List<Utxo> walletUtxos) {
-        return wiring(candidates, true, -2_000_000L, walletUtxos, "preview", "preview");
+        return wiring(candidates, true, -2_000_000L, walletUtxos, "preview");
     }
 
-    private static Wiring wiringOnNetwork(List<CompoundCandidate> candidates, String network,
-                                          String submittable) {
-        return wiring(candidates, true, -2_000_000L, List.of(wallet()), network, submittable);
+    private static Wiring wiringOnNetwork(List<CompoundCandidate> candidates, String network) {
+        return wiring(candidates, true, -2_000_000L, List.of(wallet()), network);
     }
 
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor) {
-        return wiring(candidates, armed, floor, List.of(wallet()), "preview", "preview");
+        return wiring(candidates, armed, floor, List.of(wallet()), "preview");
     }
 
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor,
-                                 List<Utxo> walletUtxos, String networkName, String submittable) {
+                                 List<Utxo> walletUtxos, String networkName) {
         var configuration = new AppConfig.CompoundConfiguration(armed, 60L, BigInteger.valueOf(floor));
         var network = new AppConfig.Network();
-        network.setNetworkForTest(networkName, submittable);
+        network.setNetworkForTest(networkName);
 
         var blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(false);
@@ -188,7 +187,7 @@ class CompoundExecutorTest {
     void nothingRunsWhileTheIndexerIsSyncing() {
         var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
         var network = new AppConfig.Network();
-        network.setNetworkForTest("preview", "preview");
+        network.setNetworkForTest("preview");
         var blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(true);
 
@@ -263,39 +262,48 @@ class CompoundExecutorTest {
     }
 
     /**
-     * ⛔ THE NETWORK GATE, on the path that had none. Until 2026-09-03 the only thing between a
-     * compound candidate and a mainnet submission was {@code loans.compound.enabled} — one boolean.
-     * The transaction is still built and priced; it is simply not submitted.
+     * ⛔ <b>THE INVERSE OF WHAT THESE THREE TESTS USED TO ASSERT.</b> Until 2026-09-04 this path read
+     * {@code loans.submittable-network} and refused to submit unless it named the node's own network;
+     * three tests here pinned that gate, its {@code preview} default, and the fact that stating
+     * mainnet lifted it.
+     *
+     * <p>The key was removed on Giovanni's ruling — <i>"a barrier that silently blocks submission
+     * even when everything else is armed is a bug, not a safeguard"</i> — so an armed compound node
+     * now submits on whichever network it is pointed at. Kept as the regression guard: any
+     * re-introduced network check inside {@code submit} turns this red.
+     *
+     * <p>⚠ <b>And it records what the removal costs on THIS path.</b> The liquidation executor still
+     * has three switches ahead of a submission — mode {@code live}, {@code liquidation.enabled}, and
+     * the market's effective mode — plus two profit floors. <b>Compound has {@code compound.enabled}
+     * and one floor.</b> That asymmetry is exactly what the network value had been closing since
+     * 2026-09-03, and removing it re-opens it. Not a reason to keep a gate found to be wrong; a
+     * reason for compound to grow a second switch of its own.
      */
     @Test
-    void aNodeOnANetworkItMayNotSubmitOnDoesNotSubmit() {
-        Wiring w = wiringOnNetwork(List.of(ready(0L)), "mainnet", "preview");
-        w.executor().cycle();
-        assertTrue(w.submitted().isEmpty(),
-                "armed, funded, profitable under the stated floor — and still must not submit, "
-                        + "because loans.submittable-network does not name this network");
+    void anArmedNodeSubmitsOnWhicheverNetworkItIsPointedAt() {
+        for (String networkName : List.of("mainnet", "preprod", "preview")) {
+            Wiring w = wiringOnNetwork(List.of(ready(0L)), networkName);
+            w.executor().cycle();
+            assertEquals(1, w.submitted().size(),
+                    "on " + networkName + ": armed, funded and profitable under the stated floor "
+                            + "must submit — there is no second network value left to disagree with "
+                            + "config.network");
+        }
     }
 
     /**
-     * ⚑ And the DEFAULT is what protects: {@code preview}. Mainnet submission is a thing an operator
-     * writes down on purpose — which matters because mainnet is the default PROFILE.
+     * ⚠ The one thing that DOES still hold this path back, asserted beside the removal so the pair
+     * reads together: {@code loans.compound.enabled}. It is the whole list.
      */
     @Test
-    void theDefaultSubmittableNetworkIsPreviewSoAnUnconfiguredMainnetNodeCannotSubmit() {
-        var defaults = new AppConfig.Network();
-        org.springframework.test.util.ReflectionTestUtils.setField(defaults, "network", "mainnet");
-        org.springframework.test.util.ReflectionTestUtils.setField(defaults, "submittableNetwork", "preview");
-        assertTrue(!defaults.isSubmittable(),
-                "an operator who configures nothing must not be able to submit on mainnet");
-    }
-
-    /** And a node explicitly configured for mainnet submission DOES submit — the gate is not a wall. */
-    @Test
-    void aNodeExplicitlyConfiguredForItsOwnNetworkSubmits() {
-        Wiring w = wiringOnNetwork(List.of(ready(0L)), "mainnet", "mainnet");
-        w.executor().cycle();
-        assertEquals(1, w.submitted().size(),
-                "stated intent must work, or the gate is an obstacle rather than a default");
+    void anUnarmedNodeStillSubmitsNothingOnAnyNetwork() {
+        for (String networkName : List.of("mainnet", "preview")) {
+            Wiring w = wiring(List.of(ready(0L)), false, -2_000_000L, List.of(wallet()), networkName);
+            w.executor().cycle();
+            assertTrue(w.submitted().isEmpty(),
+                    "on " + networkName + ": loans.compound.enabled=false is now the ONLY policy "
+                            + "switch on this path, so it had better hold");
+        }
     }
 
     // ---- fakes -------------------------------------------------------------------------------
