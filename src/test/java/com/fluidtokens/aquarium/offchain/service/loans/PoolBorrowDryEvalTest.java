@@ -76,7 +76,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Slf4j
 class PoolBorrowDryEvalTest {
 
-    private static final LoansContractRegistry REGISTRY = LoanFixtures.registry();
+    private static final LoansContractRegistry REGISTRY = LoanFixtures.thirdDeploymentRegistry();
     private static final String FUNDER = LoanFixtures.botAddress();
     private static final Address BORROWER = new Address(FUNDER);
     private static final PoolFixtures.PoolParameters PARAMS = PoolFixtures.defaults();

@@ -24,13 +24,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class LoansConfigVerifierTest {
 
-    private static final String CONFIG_POLICY_ID = "c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9";
-    private static final String LM_CONFIG_POLICY_ID = "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
+    private static final String CONFIG_POLICY_ID = "d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e";
+    private static final String LM_CONFIG_POLICY_ID = "a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13";
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
 
-    private static final String CONFIG_DATUM = fixture("preview-config-datum.hex");
-    private static final String LM_CONFIG_DATUM = fixture("preview-lm-config-datum.hex");
+    private static final String CONFIG_DATUM = fixture("fourth-deployment-config-datum.hex");
+    private static final String LM_CONFIG_DATUM = fixture("fourth-deployment-lm-config-datum.hex");
 
     private static String fixture(String name) {
         try (InputStream is = LoansConfigVerifierTest.class.getResourceAsStream("/loans-v4/" + name)) {

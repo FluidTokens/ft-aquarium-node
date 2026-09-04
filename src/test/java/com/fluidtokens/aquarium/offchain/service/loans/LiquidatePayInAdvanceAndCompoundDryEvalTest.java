@@ -31,6 +31,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
@@ -44,6 +45,32 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * ⛔ <b>FOUR OF THESE NINE TESTS ARE DISABLED AS HISTORICAL — read this before re-enabling them.</b>
+ *
+ * <p>On 2026-09-04 the fixtures moved from the THIRD preview deployment to the FOURTH, so that the
+ * recorded config datums and the vendored blueprint come from one build (findings §53, Giovanni's
+ * ruling). Five of the tests here followed cleanly: their addresses and asset policies are now
+ * DERIVED from the registry rather than pinned as literals, which is the fix, and they are green.
+ *
+ * <p><b>The other four cannot follow, and the obstacle is a fact about the chain.</b> This rig
+ * replays {@code POOL_DATUM_HEX} — the verbatim inline datum of a real third-deployment pool — and
+ * that datum <em>embeds</em> two credentials that are parameterised by the config policy id: the
+ * pool's {@code lenderAuth} names {@code poolManagerPolicyId}, and it carries
+ * {@code lenderManagerSpendScriptHash}. The compound action requires a withdrawal at the credential
+ * the datum names, so against a blueprint that derives the fourth deployment it fails at
+ * {@code Withdraw index 2}, and pointing the rig back at the third deployment does not help: the
+ * blueprint still derives the fourth.
+ *
+ * <p>⚠ <b>Substituting those hashes inside the recording was tried and reverted.</b> It is two
+ * fixed-width fields and it compiles, but it turns a recording into a fabrication — and a rig whose
+ * input was manufactured to satisfy the code under test proves nothing about the chain. <b>Being red
+ * for an honest reason is worth more than being green for a manufactured one.</b>
+ *
+ * <p>⇒ <b>To re-found them:</b> create a pool under the fourth (or current) deployment on preview,
+ * capture its inline datum, replace {@code POOL_DATUM_HEX} and {@code PM_DATUM_HEX}, and delete the
+ * {@code @Disabled} annotations. Nothing else about the rig needs to change.
+ */
 /**
  * <b>Proof that a {@code LiquidateAndPayInAdvanceAndCompound} liquidation can be built and would pass
  * the deployed preview validators.</b> The real preview loan {@code 287dd41e…#1} — 100 000 000 tFLDT of
@@ -132,25 +159,25 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
     private static final String PM_DATUM_HEX =
             "d8799fd8799f581cea1bb1ccd33aeb9e02516c2eb50adbaa63d7b7538b03c96908bfc934ff00ff";
 
+    // ⛔ DERIVED FROM THE REGISTRY, not pinned as bech32 — see LiquidatePayInAdvanceDryEvalTest.
+    private static final String LOAN_STAKE_KEY = "9e39d6f9824de5f24ac1d73243ebd54bbcaf764e56de11d0c23db9a8";
+    private static final String LENDER_STAKE_KEY = "1c5621a0d3f7ee5041ece1c8f41a9f611ab4bca268923c21b6ca8dc3";
+
     private static final String LOAN_ADDRESS =
-            "addr_test1zzrr2mm7vnwzsnn8eqsqf62dgf84sr3z2rq2xnne5a7mr0y788t0nqjduhey4swhxfp7h42thj"
-                    + "hhvnjkmcgaps3ahx5qxanp9j";
+            LoanFixtures.baseScriptAddress(REGISTRY.getLoanSpendScriptHash(), LOAN_STAKE_KEY);
     private static final String BOND_ADDRESS =
-            "addr_test1zr3s95d7aq2zhm597lnk76pengtsk2s52jkpnl7ejfen95cu2cs6p5lhaegyrm8per6p48mpr2"
-                    + "6tegngjg7zrdk23hps7h96kk";
+            LoanFixtures.baseScriptAddress(REGISTRY.getLenderManagerSpendScriptHash(), LENDER_STAKE_KEY);
     private static final String POOL_ADDRESS =
-            "addr_test1zrqtup89qqtvzf9fj49svmx2temtrx4e0vyxve4dnax8c3gu2cs6p5lhaegyrm8per6p48mpr2"
-                    + "6tegngjg7zrdk23hpsgrpkjm";
+            LoanFixtures.baseScriptAddress(REGISTRY.getPoolSpendScriptHash(), LENDER_STAKE_KEY);
     private static final String PM_ADDRESS =
-            "addr_test1zpeqm6heflk06jhzl723petzekluf7rvz77yr9g8rx6auvsu2cs6p5lhaegyrm8per6p48mpr2"
-                    + "6tegngjg7zrdk23hpscmydxy";
+            LoanFixtures.baseScriptAddress(REGISTRY.getPoolManagerSpendScriptHash(), LENDER_STAKE_KEY);
 
     private static final AssetType COLLATERAL =
             new AssetType("0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62", "0014df1074464c4454");
     private static final AssetType POOL_NFT =
-            new AssetType("65a0bc5e6e5152fbe2bf3e1053f4020f6c7ee0a563beb0fe070a7b93", POOL_ID);
+            new AssetType(REGISTRY.getPoolPolicyId(), POOL_ID);
     private static final AssetType PM_NFT =
-            new AssetType("b2324fbdcace499f6f1a9599daaebd707eb0ca70edbd6676fa20520b", POOL_ID);
+            new AssetType(REGISTRY.getPoolManagerPolicyId(), POOL_ID);
 
     private static final long COLLATERAL_AMOUNT = 100_000_000L;
     private static final long LOAN_LOVELACE = 3_000_000L;
@@ -256,6 +283,8 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
      * {@code pm_compound_liquidity} and the oracle.
      */
     @Test
+    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy a blueprint that derives the FOURTH deployment, and substituting them makes it a fabrication rather than a recording. Re-found it on a fourth-deployment preview pool "
+            + "and delete this annotation.")
     void theRealLoanCompoundLiquidationEvaluatesAgainstTheDeployedValidators() {
         Fixture fixture = fixture();
         LiquidatePayInAdvanceAndCompoundTransactionBuilder.Numbers numbers =
@@ -365,6 +394,8 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
      * arithmetic is the risk this test defends.)
      */
     @Test
+    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy a blueprint that derives the FOURTH deployment, and substituting them makes it a fabrication rather than a recording. Re-found it on a fourth-deployment preview pool "
+            + "and delete this annotation.")
     void aWrongCompoundedPoolValueIsRejectedByTheCompoundAction() {
         Fixture fixture = fixture();
         List<Utxo> universe = universe(fixture);
@@ -397,6 +428,8 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
      * it, so this isolates the one field that moved.
      */
     @Test
+    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy a blueprint that derives the FOURTH deployment, and substituting them makes it a fabrication rather than a recording. Re-found it on a fourth-deployment preview pool "
+            + "and delete this annotation.")
     void aWrongCompoundedPoolDatumIsRejected() {
         Fixture fixture = fixture();
         List<Utxo> universe = universe(fixture);
@@ -431,6 +464,8 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
      * withdrawal index; the clean build passes it, so this isolates the one pointer that moved.
      */
     @Test
+    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy a blueprint that derives the FOURTH deployment, and substituting them makes it a fabrication rather than a recording. Re-found it on a fourth-deployment preview pool "
+            + "and delete this annotation.")
     void aWrongPmCompoundLiquidityRedeemerIndexIsRejected() {
         Fixture fixture = fixture();
         List<Utxo> universe = universe(fixture);

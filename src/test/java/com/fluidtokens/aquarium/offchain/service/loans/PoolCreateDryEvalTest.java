@@ -65,7 +65,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Slf4j
 class PoolCreateDryEvalTest {
 
-    private static final LoansContractRegistry REGISTRY = LoanFixtures.registry();
+    private static final LoansContractRegistry REGISTRY = LoanFixtures.thirdDeploymentRegistry();
 
     private static final String FUNDER = LoanFixtures.botAddress();
 
@@ -89,7 +89,7 @@ class PoolCreateDryEvalTest {
      * script — which is what {@link #assertRefusedByTheMint} has always claimed to be asserting.
      */
     private static final List<com.bloxbean.cardano.client.plutus.spec.PlutusScript> POOL_POLICY =
-            List.of(LoanFixtures.registry().getPoolScript());
+            List.of(LoanFixtures.thirdDeploymentRegistry().getPoolScript());
 
     /** The pool liquidity leg, from the default pool parameters. */
     private static final long POOL_LOVELACE = PoolFixtures.defaults().poolLiquidityLovelace();

@@ -64,7 +64,7 @@ import static com.bloxbean.cardano.client.common.model.Networks.preview;
                 + "wallet on the path of a loan origination")
 public class LoanFactoryRunnerTest {
 
-    private static final LoansContractRegistry REGISTRY = LoanFixtures.registry();
+    private static final LoansContractRegistry REGISTRY = LoanFixtures.thirdDeploymentRegistry();
 
     /** Synthetic funding legs; see the class javadoc. */
     private static final long SEED_LOVELACE = 100_000_000L;

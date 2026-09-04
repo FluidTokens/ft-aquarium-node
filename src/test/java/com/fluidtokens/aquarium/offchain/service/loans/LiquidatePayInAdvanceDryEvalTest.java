@@ -141,12 +141,22 @@ class LiquidatePayInAdvanceDryEvalTest {
                     + "1832581d00183f8ba4d1e645b1e26e9caf56f802b129b50d833689727c920abe11d8799f4040ff"
                     + "ff";
 
+    /**
+     * The lender's stake key, read out of {@link #BOND_DATUM_HEX} field 1
+     * ({@code lenderStakeCredential}) &mdash; the protocol puts it on every UTxO it creates for them.
+     */
+    private static final String LENDER_STAKE_KEY =
+            "1c5621a0d3f7ee5041ece1c8f41a9f611ab4bca268923c21b6ca8dc3";
+
+    // ⛔ DERIVED FROM THE REGISTRY, not pinned. These were literal bech32 strings until 2026-09-04 and
+    // that is precisely what broke on the re-point: the inputs stayed at the third deployment's script
+    // while every redeemer named the fourth, which the evaluator reports as RequiredRedeemersMismatch
+    // — an error that names script hashes and says nothing about addresses, so it reads as a builder
+    // bug rather than as a stale fixture.
     private static final String LOAN_ADDRESS =
-            "addr_test1zzrr2mm7vnwzsnn8eqsqf62dgf84sr3z2rq2xnne5a7mr0y788t0nqjduhey4swhxfp7h42thj"
-                    + "hhvnjkmcgaps3ahx5qxanp9j";
+            LoanFixtures.baseScriptAddress(REGISTRY.getLoanSpendScriptHash(), LENDER_STAKE_KEY);
     private static final String BOND_ADDRESS =
-            "addr_test1zr3s95d7aq2zhm597lnk76pengtsk2s52jkpnl7ejfen95cu2cs6p5lhaegyrm8per6p48mpr2"
-                    + "6tegngjg7zrdk23hps7h96kk";
+            LoanFixtures.baseScriptAddress(REGISTRY.getLenderManagerSpendScriptHash(), LENDER_STAKE_KEY);
 
     private static final AssetType COLLATERAL =
             new AssetType("0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62", "0014df1074464c4454");

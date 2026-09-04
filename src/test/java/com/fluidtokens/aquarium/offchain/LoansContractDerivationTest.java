@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
  * the ft-cardano-loans-v4 script hashes that are really deployed on preview, starting from
  * nothing but the two config NFT policy ids.
  * <p>
- * Ground truth is tx {@code 7374a985…e781} on preview — the THIRD deployment: output 0 holds the
+ * Ground truth is tx {@code 8dd38e97…091c} on preview — the FOURTH deployment: output 0 holds the
  * main config NFT ({@code ConfigDatum}), output 1 holds the LenderManager config NFT
  * ({@code LMConfigDatum}). Every constant below was read off those two datums, transcribed from
  * the inline datum bytes the chain carries rather than produced by the derivation it checks. See
@@ -29,8 +29,8 @@ class LoansContractDerivationTest {
 
     // ---- Derivation inputs (preview) ----------------------------------------------------
 
-    private static final String CONFIG_POLICY_ID = "c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9";
-    private static final String LM_CONFIG_POLICY_ID = "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
+    private static final String CONFIG_POLICY_ID = "d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e";
+    private static final String LM_CONFIG_POLICY_ID = "a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13";
     /** "parameters" — hardcoded in lib/fluidtokens/constants.ak, not a free choice. */
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     /**
@@ -40,25 +40,29 @@ class LoansContractDerivationTest {
      */
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
 
-    // ---- Ground truth: ConfigDatum, output 0 of 7374a985…e781 ----------------------------
+    // ---- Ground truth: ConfigDatum, output 0 of 8dd38e97…091c (FOURTH deployment) ----------
+    //
+    // ⛔ Moved from the THIRD deployment (7374a985…e781) on 2026-09-04, with LoanFixtures.
+    // These are what the LIVE datum publishes; the vendored blueprint derives exactly them,
+    // which is the pairing ShippedRegistryMatchesPinnedConfigTest asserts independently.
 
-    private static final String POOL_POLICY_ID = "65a0bc5e6e5152fbe2bf3e1053f4020f6c7ee0a563beb0fe070a7b93";
-    private static final String REQUEST_POLICY_ID = "88fa30dbb11dc0943d6fe2b6bae5b3ef3b80c60cd4e6421410cfba8c";
-    private static final String LOAN_POLICY_ID = "4f84c6e3f4a7812d23a968e38dd22016abea07cdee48e80a17839476";
-    private static final String POOL_SPEND = "c0be04e50016c124a9954b066cca5e76b19ab97b086666ad9f4c7c45";
-    private static final String REQUEST_SPEND = "f50595e04ed417869360e4b9ff8da4e97777cd9e0da9af641a408783";
-    private static final String LOAN_SPEND = "86356f7e64dc284e67c82004e94d424f580e2250c0a34e79a77db1bc";
-    private static final String LOAN_CLAIM_ACTION = "9ae63b26c98d90024a45f9cdb57e4154f72144d44325f0a261b8bc1d";
-    private static final String LOAN_REPAY_ACTION = "4309f0537f5a5ae3d13005b2c522fb829b58e90a233bef9e4da601f0";
-    private static final String LOAN_CHANGE_COLLATERAL_ACTION = "029b10229f3b5c8b2abd4684b00b0d0e4d20e4d0ed452a368676d137";
-    private static final String LOAN_RECAST_ACTION = "bd60c5f18113e0a132ffa48c859c0f3ee16d6533965ea37fd4296fbf";
-    private static final String ASSET_MANAGER_SPEND = "f5b63a6b092b2dc9790d823f782801e2f1416783097e8cf989ac495b";
-    private static final String POOL_CANCEL_ACTION = "4e4c5ed0d8c96fd158fa70ed619b93ec6bb9d0dfb425f3961b35d95b";
-    private static final String POOL_BORROW_ACTION = "2fd32e80ffdc2435613f1977b4633b66d21f5ff4cf31d4fc7c6c64e1";
-    private static final String POOL_SELL_LENDER_POSITION_ACTION = "56814009563fdcad029bdb8009d6252593ca6af233fac13a9b2aeeed";
-    private static final String POOL_COMPOUND_ACTION = "a5e9ce2d7fa196b9bbbb2aac183a17540e7a5e52bece9ab7b23d7e38";
-    private static final String POOL_MANAGER_SPEND = "720deaf94fecfd4ae2ff9510e562cdbfc4f86c17bc41950719b5de32";
-    private static final String POOL_MANAGER_POLICY_ID = "b2324fbdcace499f6f1a9599daaebd707eb0ca70edbd6676fa20520b";
+    private static final String POOL_POLICY_ID = "a33aee4034165f1772e57af5fb975f26c35f7e9080b7e44b4634f227";
+    private static final String REQUEST_POLICY_ID = "39bef32eb5f696f6d0b1cc0446903311f04fe008797c0e349a672acb";
+    private static final String LOAN_POLICY_ID = "2f1aa941f437e351e3870f7247d735b2bc2952f1c7977426e8960d17";
+    private static final String POOL_SPEND = "bf8c4378bab7de15baddbb5d8805255d89174c08bf36179c21cad685";
+    private static final String REQUEST_SPEND = "978934c46206696e0d44e56a43ceeaf0a607b1232fcd5b4ec64b0f73";
+    private static final String LOAN_SPEND = "31e0dc1d75076e4f7795b24c4cc4b5515791bb4eff4af7961e404f3e";
+    private static final String LOAN_CLAIM_ACTION = "c6e0c4395cf22e08f918ca996d7db49faba793dbd6b647160168ff39";
+    private static final String LOAN_REPAY_ACTION = "c0f7e513e81f7eb1abf8429c614cc0ab2acde02189bade0dd65c15be";
+    private static final String LOAN_CHANGE_COLLATERAL_ACTION = "899f9bf3ff89d48537a283a38e5c8d868a97c22200f8c66695f38e7b";
+    private static final String LOAN_RECAST_ACTION = "1628910a5fbdba415c3b1bf7304672106659ac527442f10701472753";
+    private static final String ASSET_MANAGER_SPEND = "de8f81868054fe87019230b9c33e1d18d668689ee201f3f57fbfa69c";
+    private static final String POOL_CANCEL_ACTION = "a4f2d030b2348582335038135cb7b59bbe7145d44d2dab9a409dde50";
+    private static final String POOL_BORROW_ACTION = "344755c30db0617ff43cb41e5212379b729985352a213371b15c90cd";
+    private static final String POOL_SELL_LENDER_POSITION_ACTION = "db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56";
+    private static final String POOL_COMPOUND_ACTION = "33128ca352b5472f593104d5884ced5cba5e980b3177353eb2116c62";
+    private static final String POOL_MANAGER_SPEND = "b4ad9a6f2710d68067177e0de5a4378ebe4fcdfdc929c7488479c313";
+    private static final String POOL_MANAGER_POLICY_ID = "45ce890c9bcf70f6eed629b5db7c0622e44ca1003e001a2cf951518f";
     /**
      * <b>Not ground truth from the datum</b> — the {@code ConfigDatum} does not publish the pool-manager
      * <em>action</em> hashes, they are baked into {@code pool_manager.ak}'s parameters instead. It is
@@ -67,11 +71,11 @@ class LoansContractDerivationTest {
      * and {@link #POOL_MANAGER_POLICY_ID} above <em>is</em> ground truth off the live datum. A wrong value
      * here cannot produce the right value there.
      */
-    private static final String PM_CANCEL_POOL_MANAGER = "e1945d090cab66d9ad314ecb8550c13ced6e1f194309d5c937f3426e";
-    private static final String LOCKED_BORROWER_MANAGER_SPEND = "b0e010c5d8cf28b20d7dfb14e109d19632c2590b0057e40f6a7433fa";
+    private static final String PM_CANCEL_POOL_MANAGER = "72bdf30225529881c6e6de5f6576b0ec5f55a8e515019b3412d7bce1";
+    private static final String LOCKED_BORROWER_MANAGER_SPEND = "d815766d61c1241742ff78164cdf8edaef1746a99a242a7fb7938aa6";
 
     /**
-     * Bond policy ids, read from the {@code ConfigDatum} (output 0 of {@code 7374a985…e781}): the
+     * Bond policy ids, read from the {@code ConfigDatum} (output 0 of {@code 8dd38e97…091c}): the
      * borrower bond sits at datum index 4, the lender bond at index 5 (see
      * {@code LoansConfigVerifier}'s {@code CFG_BORROWER_BOND_POLICY_ID} / {@code CFG_LENDER_BOND_POLICY_ID}).
      * {@code bond.ak} is parameterised only by the borrower/lender discriminator Int, so neither hash
@@ -80,13 +84,13 @@ class LoansContractDerivationTest {
     private static final String BORROWER_BOND_POLICY_ID = "eadc69a5d2d1357acc9b9d49ec5390fcdf6e080c7a40139917223dcb";
     private static final String LENDER_BOND_POLICY_ID = "bcd713bb7858d4b08738bed90ee7068d8f9b38d02e0cae0b45ac7a9b";
 
-    // ---- Ground truth: LMConfigDatum, output 1 of 7374a985…e781 --------------------------
+    // ---- Ground truth: LMConfigDatum, output 1 of 8dd38e97…091c --------------------------
 
-    private static final String LM_WITHDRAW_BONDS_ACTION = "353c844023c794304d28cfe882848df514ef20a40edf12d96a0fcff6";
-    private static final String LM_LIQUIDATE_ACTION = "a39acb16a53422bfa690c6e74435f6edcb8d61114e1c468f332e78ce";
-    private static final String LM_COMPOUND_ACTION = "67ff9e2df0b5d1f0ffc004864e4cb6529cbaefa6b79aaa04ae92a73e";
-    private static final String LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION = "67b6c63bad731f763d9dc033d195a18b8799fd12ee174caf241ee84f";
-    private static final String LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION = "2219ee395196eeef5372e94641afa0f7d82d035378b94bbce9f704ce";
+    private static final String LM_WITHDRAW_BONDS_ACTION = "42c4a0d6f33f21ccc694c6620d6485331df6528da8b8d16acf1589fe";
+    private static final String LM_LIQUIDATE_ACTION = "e0a13838d176cea9de466afe2075f38f682603013604021a3959700f";
+    private static final String LM_COMPOUND_ACTION = "dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457";
+    private static final String LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION = "00b8a30bd2f18962e527d7c03712e86077a688bfce7e2934ef70034d";
+    private static final String LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION = "70b149e7c84a4cf47fb273d87ed2fe97562f0148bfce0b4681afa480";
     /** Unchanged across the third redeploy: the parameterless stub takes no config policy id. */
     private static final String LM_LIQUIDATE_CONVERT_AND_COMPOUND_ACTION = "435b42cc200719c3868dfe01689ee07e2eeff5f5809f25408cbe4e7d";
 
@@ -100,8 +104,8 @@ class LoansContractDerivationTest {
     // that went into it were wrong. Pinned here so an accidental change to the derivation is caught
     // explicitly rather than only through that one indirect route.
 
-    private static final String LENDER_MANAGER_WITHDRAW = "695388d1f34e744cf7b015b85d294eeeeefbe6b425c890888d155516";
-    private static final String LENDER_MANAGER_SPEND = "e302d1bee8142bee85f7e76f68399a170b2a1454ac19ffd9927332d3";
+    private static final String LENDER_MANAGER_WITHDRAW = "777aa0f117733d2c504c8ae56618b4196aa322fb75f9e2d67a6b85e6";
+    private static final String LENDER_MANAGER_SPEND = "dd2d7f3fdd0ca7ea68e94912c3d332f18299b6ec8854577492d006eb";
 
     private static LoansContractRegistry registry(String smartTokensSpendScriptHash) {
         return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID,

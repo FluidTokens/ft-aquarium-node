@@ -457,12 +457,28 @@ class LiquidationSubmitVetoTest {
      * {@code Σ(assetManagerOutput.ada) = A = 3_193_710} against the loan UTxO's own {@code L =
      * 2_000_000}: the bot funds {@code A − L = 1_193_710}.
      * <p>
-     * The bond's fee is 40 per mille, so the fee slice is {@code 1_000_000 * 40 / 1000 = 40_000 TOK},
-     * priced through the c3 feed to {@code 2_000_000 lovelace} — above the ~1.36 ADA transaction fee, so
+     * The bond's fee is 30 per mille, so the fee slice is {@code 1_000_000 * 30 / 1000 = 30_000 TOK},
+     * priced through the c3 feed to {@code 1_500_000 lovelace} — above the ~0.54 ADA transaction fee, so
      * {@code expectedFee − txFee > 0} and the loss is NOT a fee/size artefact. It is the {@code A − L}
      * rider that pulls {@code floorProfit} below zero. Zero that rider out and the fee slice alone clears
      * the floor and the candidate submits — which is the verdict flip {@link
      * #aTokenLiquidationRefusedSolelyByTheMinAdaRider()} pins.
+     *
+     * <h2>⚠ RECALIBRATED 2026-09-04 — the property held, the scenario stopped instantiating it</h2>
+     * The fee was 40 per mille against a transaction fee of ~1.36 ADA, giving
+     * {@code 2_000_000 − 1_364_238 − 1_193_710 = −557_948}: refused. When the fixtures moved to the
+     * FOURTH deployment the transaction fee fell to ~539,546 (evaluation cost against a different
+     * ConfigDatum), and the same scenario came out at <b>+266,744 — it submitted.</b>
+     *
+     * <p><b>The SCENARIO was recalibrated, not the assertion.</b> Relaxing the assertion would have
+     * deleted the property; lowering the fee slice restores the condition the property is about.
+     * At 30 per mille the two halves are {@code 1_500_000 − 539_546 − 1_193_710 = −233_256} (refused)
+     * and {@code 1_500_000 − 539_546 = +960_454} (submits with the rider zeroed) — both with ~200k of
+     * headroom instead of the ~19k the old calibration had.
+     *
+     * <p>⛔ <b>And that thinness is the lesson worth keeping.</b> A knife-edge scenario does not fail
+     * when the thing it tests breaks; it fails when anything nearby moves. If this needs recalibrating
+     * a third time, widen the margin rather than re-centring it.
      */
     private static Scenario minAdaDrivenLossTokenScenario() {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(40_000_000),
@@ -473,7 +489,7 @@ class LiquidationSubmitVetoTest {
         LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum, 2_000_000L,
                 List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
         LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
-                LoanFixtures.bondDatum(BigInteger.valueOf(40),
+                LoanFixtures.bondDatum(BigInteger.valueOf(30),
                         LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
                 2_000_000L);
 

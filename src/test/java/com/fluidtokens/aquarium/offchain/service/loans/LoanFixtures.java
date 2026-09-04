@@ -77,13 +77,23 @@ public final class LoanFixtures {
 
     // ---- preview derivation inputs (see LoansContractDerivationTest) -------------------------
     //
-    // THIRD preview deployment, config NFTs minted in tx 7374a985…e781 (outputs 0 and 1). These
-    // must stay in step with the two recorded config datums under src/test/resources/loans-v4:
-    // the validators compare the hashes they derive from these policy ids against the ones the
-    // datum publishes, so a mismatched pair makes every dry-eval fixture unsatisfiable.
+    // FOURTH preview deployment (e0b818e), config NFTs minted in tx 8dd38e97…091c at outputs 0 and 1
+    // — the deployment application.yaml's preview profile is pinned to and the running pod uses.
+    //
+    // ⛔ RE-POINTED 2026-09-04 FROM THE THIRD DEPLOYMENT, on Giovanni's ruling. These must stay in
+    // step with the two recorded config datums this class serves below: the validators compare the
+    // hashes they derive from these policy ids against the ones the datum publishes, so a mismatched
+    // pair makes every dry-eval fixture unsatisfiable — and that is exactly what the third-deployment
+    // pairing had become. The vendored loans-v4.plutus.json derives THIS deployment
+    // (ShippedRegistryMatchesPinnedConfigTest), so blueprint and fixtures are now one build.
+    //
+    // ⚠ The third-deployment datums stay on disk under src/test/resources/loans-v4 and are still
+    // used, deliberately: LoansConfigVerifierTest exercises the verifier on a matched third/third
+    // pair, and ShippedRegistryMatchesPinnedConfigTest pins that a third-deployment fixture must NOT
+    // verify against the shipped blueprint. Do not delete them.
 
-    public static final String CONFIG_POLICY_ID = "c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9";
-    public static final String LM_CONFIG_POLICY_ID = "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
+    public static final String CONFIG_POLICY_ID = "d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e";
+    public static final String LM_CONFIG_POLICY_ID = "a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13";
     public static final String CONFIG_ASSET_NAME = "706172616d6574657273";
 
     public static final Network NETWORK = Networks.preview();
@@ -112,10 +122,13 @@ public final class LoanFixtures {
      * <b>A registry built from the coordinates {@code application.yaml} ACTUALLY SHIPS for preview —
      * read from the file, never typed here.</b>
      *
-     * <p>⛔ <b>Distinct from {@link #registry()} on purpose.</b> That one is pinned to the THIRD
-     * deployment and 25 test files depend on it; re-pointing it would pre-empt an open decision about
-     * the 37 red fixtures that is Giovanni's, not this method's. <b>Anything that must talk to the
-     * LIVE chain uses this; anything replaying recorded third-deployment data keeps that.</b>
+     * <p>⚠ <b>Since 2026-09-04 this agrees with {@link #registry()}</b>, and that agreement is now an
+     * asserted invariant rather than a coincidence ({@code ShippedPreviewRegistryTest}). It did not
+     * always: {@code registry()} was pinned to the THIRD deployment while this parsed the FOURTH, and
+     * re-pointing it was an open decision Giovanni ruled on. <b>The two methods still exist for
+     * different reasons</b> — this one is a GENERATOR that cannot disagree with what ships, that one
+     * is a constant. Keep both: if a fifth deployment lands, this moves by itself and the assertion
+     * that they agree is what makes the constant's staleness fail loudly instead of silently.
      *
      * <h2>Why it parses the file instead of holding constants</h2>
      * The on-chain loan factory silently targeted the third deployment after the 2026-08-25 redeploy,
@@ -167,6 +180,60 @@ public final class LoanFixtures {
         return REGISTRY;
     }
 
+    // ---- the THIRD deployment, kept on purpose ------------------------------------------------
+
+    private static final String THIRD_CONFIG_POLICY_ID =
+            "c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9";
+    private static final String THIRD_LM_CONFIG_POLICY_ID =
+            "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
+
+    private static final LoansContractRegistry THIRD_DEPLOYMENT_REGISTRY = new LoansContractRegistry(
+            THIRD_CONFIG_POLICY_ID, THIRD_LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
+
+    /**
+     * ⛔ <b>The THIRD preview deployment &mdash; NOT a leftover, and not a candidate for the next
+     * clean-up.</b>
+     *
+     * <h2>Why one family of rigs cannot move to the fourth deployment</h2>
+     * The 2026-09-04 re-point moved {@link #registry()} to the FOURTH deployment so that fixtures and
+     * the vendored blueprint come from one build. <b>The pool-origination rigs cannot follow, and the
+     * reason is a fact about the chain rather than about this code.</b>
+     *
+     * <p>{@link PoolFixtures#PUBLISHED_REFERENCE_SCRIPTS} is a record of <b>reference-script UTxOs
+     * FluidTokens actually published on preview</b>, keyed by the script hash each one publishes.
+     * Those publications exist for the <b>third</b> deployment only: every hash is parameterised by the
+     * config policy id, so the fourth deployment moved them all, and nothing was republished
+     * (see {@code application.yaml}'s preview block, where every liquidation coordinate is blank for
+     * exactly this reason). <b>Re-keying that map to fourth-deployment hashes with invented
+     * coordinates would not fix anything — it would delete the map's meaning</b>, and with it the
+     * {@code LoanFactory} gate that refuses to create a PoolManager-bearing pool whose cancel could
+     * never be submitted.
+     *
+     * <p>⇒ <b>The split is by what a rig REPLAYS, which is the only honest boundary.</b> A rig that
+     * replays published third-deployment reference scripts stays here; a rig that derives from the
+     * shipped blueprint uses {@link #registry()}. Both are internally consistent, and neither is
+     * pretending to be the other.
+     *
+     * <p>⚠ These rigs prove the same thing they proved before &mdash; the pool validators' shape,
+     * arbitrated by the real compiled scripts. What they do <b>not</b> prove is anything about the
+     * deployment the node is pinned to, which is what {@link #registry()} is now for.
+     */
+    public static LoansContractRegistry thirdDeploymentRegistry() {
+        return THIRD_DEPLOYMENT_REGISTRY;
+    }
+
+    /** The third deployment's main config reference input, paired with {@link #thirdDeploymentRegistry()}. */
+    public static Utxo thirdDeploymentConfigUtxo(String txHash, int outputIndex) {
+        return configUtxo(txHash, outputIndex, THIRD_CONFIG_POLICY_ID,
+                fixture("preview-config-datum.hex"));
+    }
+
+    /** The third deployment's LenderManager config reference input. */
+    public static Utxo thirdDeploymentLmConfigUtxo(String txHash, int outputIndex) {
+        return configUtxo(txHash, outputIndex, THIRD_LM_CONFIG_POLICY_ID,
+                fixture("preview-lm-config-datum.hex"));
+    }
+
     public static CardanoConverters converters() {
         return ClasspathConversionsFactory.createConverters(NetworkType.PREVIEW);
     }
@@ -187,6 +254,21 @@ public final class LoanFixtures {
                 Credential.fromKey("11111111111111111111111111111111111111111111111111111111"),
                 Credential.fromKey("22222222222222222222222222222222222222222222222222222222"),
                 NETWORK).getAddress();
+    }
+
+    /**
+     * A script payment credential with a key-hash stake part &mdash; the shape a real loan or lender-bond
+     * UTxO has, because {@code LenderManagerDatum.lenderStakeCredential} puts the LENDER's stake
+     * credential on every UTxO the protocol creates for them (findings §5).
+     *
+     * <p>⛔ <b>Derived, never pinned.</b> A rig that hard-codes such an address survives a redeploy
+     * looking correct and then fails as {@code RequiredRedeemersMismatch}, because the inputs sit at
+     * the old script while the redeemers name the new one &mdash; measured on exactly that during the
+     * 2026-09-04 re-point. The payment half must come from the registry so it moves with it.
+     */
+    public static String baseScriptAddress(String scriptHash, String stakeKeyHash) {
+        return AddressProvider.getBaseAddress(Credential.fromScript(scriptHash),
+                Credential.fromKey(stakeKeyHash), NETWORK).getAddress();
     }
 
     public static String entAddress(String scriptHash) {
@@ -559,16 +641,16 @@ public final class LoanFixtures {
      * The main config reference input as {@code utils.get_config_as_data_list} needs to see it: the
      * config NFT in the value (the {@code quantity_of(..) > 0} expectation) and the
      * <em>real</em> preview {@code ConfigDatum} inline
-     * ({@code src/test/resources/loans-v4/preview-config-datum.hex}, the same bytes
-     * {@code LoansConfigVerifierTest} verifies the derivation against).
+     * ({@code src/test/resources/loans-v4/fourth-deployment-config-datum.hex} since the 2026-09-04
+     * re-point — the live datum of the deployment the shipped blueprint actually derives).
      */
     public static Utxo configUtxo(String txHash, int outputIndex) {
-        return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, fixture("preview-config-datum.hex"));
+        return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, fixture("fourth-deployment-config-datum.hex"));
     }
 
     /** The LenderManager config reference input, carrying the real preview {@code LMConfigDatum}. */
     public static Utxo lmConfigUtxo(String txHash, int outputIndex) {
-        return configUtxo(txHash, outputIndex, LM_CONFIG_POLICY_ID, fixture("preview-lm-config-datum.hex"));
+        return configUtxo(txHash, outputIndex, LM_CONFIG_POLICY_ID, fixture("fourth-deployment-lm-config-datum.hex"));
     }
 
     private static Utxo configUtxo(String txHash, int outputIndex, String policyId, String datumHex) {

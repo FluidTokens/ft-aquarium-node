@@ -143,7 +143,7 @@ public class LoanFactoryOnChainRunnerTest {
      * ⛔ {@code shippedPreviewRegistry()}, NOT {@code registry()}.
      * <p>
      * This runner creates REAL loans on preview, so it must use the coordinates the running node is
-     * pinned to. It was on {@code LoanFixtures.registry()} — the THIRD deployment, superseded
+     * pinned to. It was on {@code LoanFixtures.thirdDeploymentRegistry()} — the THIRD deployment, superseded
      * 2026-08-25 — which meant every loan it created would have landed at credentials
      * {@code TankUtxoStorage} does not index. <b>The bot would have reported {@code 0 live bonds} and
      * that reads as "the experiment failed" or "the indexer is broken", neither of which is true.</b>

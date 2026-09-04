@@ -108,7 +108,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class PoolCancelDryEvalTest {
 
     private static final com.fluidtokens.aquarium.offchain.service.LoansContractRegistry REGISTRY =
-            LoanFixtures.registry();
+            LoanFixtures.thirdDeploymentRegistry();
     private static final String FUNDER = LoanFixtures.botAddress();
     private static final PoolFixtures.PoolParameters PARAMS = PoolFixtures.defaults();
 

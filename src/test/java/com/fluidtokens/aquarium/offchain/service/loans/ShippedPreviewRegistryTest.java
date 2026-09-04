@@ -45,33 +45,45 @@ class ShippedPreviewRegistryTest {
     }
 
     /**
-     * ⛔ AND THE ONE THAT PROVES THE RE-POINT ACTUALLY MOVED SOMETHING. If these ever coincide, the
-     * shipped registry has silently become the fixture registry again and the on-chain runner is
-     * back on a dead deployment with nothing failing.
+     * ⛔ <b>AND THE ONE THAT KEEPS THE TWO HONEST — inverted on 2026-09-04, when Giovanni ruled the
+     * re-point.</b>
+     *
+     * <h2>What it used to assert, and why that reversed rather than disappeared</h2>
+     * Until the re-point this asserted the two registries were <b>different</b>: the fixture registry
+     * was pinned to the THIRD deployment while this parsed the FOURTH, and the risk being guarded was
+     * that the on-chain runner silently fell back onto the dead one. <b>Now they are the same
+     * deployment, and the risk points the other way</b> — the constant can go stale at the next
+     * redeploy while the parsed value moves by itself, and nothing would fail.
+     *
+     * <p>⇒ <b>So the assertion is that they AGREE</b>, and it is the same guard doing the same job
+     * from the other side: {@link LoanFixtures#shippedPreviewRegistry()} is a <b>generator</b> that
+     * cannot disagree with what ships, {@link LoanFixtures#registry()} is a <b>constant</b>, and this
+     * is what makes the constant's staleness loud instead of silent. <b>Do not "simplify" it by
+     * deleting one of them</b>: a constant compared against nothing is exactly what drifted last time.
      */
     @Test
-    void theShippedRegistryIsNotTheThirdDeploymentFixtureRegistry() {
-        assertNotEquals(LoanFixtures.registry().getConfigPolicyId(), SHIPPED.getConfigPolicyId(),
-                "the on-chain registry must NOT be the third-deployment fixture registry");
-        assertEquals("c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9",
-                LoanFixtures.registry().getConfigPolicyId(),
-                "and the fixture registry is deliberately still the THIRD deployment — 25 test files "
-                        + "replay recorded third-deployment data through it, and re-pointing it is the "
-                        + "open decision about the 37 that belongs to Giovanni, not to this change");
+    void theFixtureRegistryAgreesWithWhatShips() {
+        assertEquals(SHIPPED.getConfigPolicyId(), LoanFixtures.registry().getConfigPolicyId(),
+                "the fixture registry and the shipped config have diverged. If application.yaml was "
+                        + "re-pointed at a FIFTH deployment, LoanFixtures.CONFIG_POLICY_ID and the "
+                        + "recorded config datums must move with it — otherwise every dry-eval rig is "
+                        + "back to validating a blueprint against a datum from a different build, "
+                        + "which is findings §53 all over again");
+        assertEquals(SHIPPED.getLmConfigPolicyId(), LoanFixtures.registry().getLmConfigPolicyId());
     }
 
     /**
-     * The derived hashes must actually differ between the two, or the distinction is cosmetic. This
-     * is the measurable form of "25 of 28 derived script hashes move on a re-mint alone".
+     * ⚠ And the THIRD deployment is still reachable, deliberately — the pool-origination rigs replay
+     * reference-script UTxOs that FluidTokens published for that deployment and never republished.
+     * See {@link LoanFixtures#thirdDeploymentRegistry()}. <b>It must not silently become the fourth</b>,
+     * or those rigs would look for coordinates that do not exist.
      */
     @Test
-    void theTwoDeploymentsDeriveDifferentCredentials() {
-        assertNotEquals(LoanFixtures.registry().getLoanSpendScriptHash(),
-                SHIPPED.getLoanSpendScriptHash(),
-                "if the loan spend credential is identical the re-point changes nothing that matters");
-        assertNotEquals(LoanFixtures.registry().getLenderManagerSpendScriptHash(),
-                SHIPPED.getLenderManagerSpendScriptHash());
-        assertTrue(SHIPPED.indexedPaymentCredentials().size() >= 6,
-                "a usable registry must derive the credentials the indexer scopes on");
+    void theThirdDeploymentRegistryIsStillDistinctAndStillTheThird() {
+        assertNotEquals(LoanFixtures.thirdDeploymentRegistry().getConfigPolicyId(),
+                SHIPPED.getConfigPolicyId(),
+                "the third-deployment fixture registry must stay distinct from what ships");
+        assertEquals("c45d5306a7c0f7ba361af5fcdfa9bdbe0ba67f105caa2d2d4032aaa9",
+                LoanFixtures.thirdDeploymentRegistry().getConfigPolicyId());
     }
 }

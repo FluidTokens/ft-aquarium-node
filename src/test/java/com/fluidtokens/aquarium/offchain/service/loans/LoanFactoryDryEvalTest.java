@@ -70,7 +70,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Slf4j
 class LoanFactoryDryEvalTest {
 
-    private static final LoansContractRegistry REGISTRY = LoanFixtures.registry();
+    private static final LoansContractRegistry REGISTRY = LoanFixtures.thirdDeploymentRegistry();
     private static final String FUNDER = LoanFixtures.botAddress();
     private static final Address LENDER = new Address(FUNDER);
 
@@ -165,7 +165,7 @@ class LoanFactoryDryEvalTest {
         // The emitted lender bond decodes to fee 100 off the finished borrow body.
         String bondAssetName = PoolTxEncoder.bondAssetName(
                 new TransactionInput(TransactionUtil.getTxHash(create), 0));
-        TransactionOutput bondOutput = outputWithNft(borrow, LoanFixtures.bondAddress(),
+        TransactionOutput bondOutput = outputWithNft(borrow, LoanFixtures.entAddress(LoanFixtures.thirdDeploymentRegistry().getLenderManagerSpendScriptHash()),
                 REGISTRY.getLenderBondPolicyId(), bondAssetName);
         LenderManagerDatum bondDatum = new LenderManagerDatumConverter()
                 .deserialize(bondOutput.getInlineDatum().serializeToHex());
@@ -477,7 +477,7 @@ class LoanFactoryDryEvalTest {
     private static LenderManagerDatum emittedBond(Transaction borrow, Transaction create) {
         String bondAssetName = PoolTxEncoder.bondAssetName(
                 new TransactionInput(TransactionUtil.getTxHash(create), 0));
-        TransactionOutput bondOutput = outputWithNft(borrow, LoanFixtures.bondAddress(),
+        TransactionOutput bondOutput = outputWithNft(borrow, LoanFixtures.entAddress(LoanFixtures.thirdDeploymentRegistry().getLenderManagerSpendScriptHash()),
                 REGISTRY.getLenderBondPolicyId(), bondAssetName);
         return new LenderManagerDatumConverter()
                 .deserialize(bondOutput.getInlineDatum().serializeToHex());

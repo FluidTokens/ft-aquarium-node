@@ -179,14 +179,20 @@ class RealLoanDryEvalTest {
      * on chain: {@code get_inputs_from_smart_credential} ({@code lib/smart-tokens/utils.ak}) filters
      * on {@code payment_credential} alone in its native-token branch.
      */
+    // ⛔ DERIVED FROM THE REGISTRY, not pinned as bech32. Literal addresses here survived the
+    // 2026-09-04 re-point looking correct and then failed as RequiredRedeemersMismatch /
+    // STRUCTURAL_ASSERTION_FAILED — the inputs stayed at the old script while every redeemer named
+    // the new one. Those errors name script hashes and never mention addresses, so a stale fixture
+    // reads as a builder bug. The stake halves are the real ones from the recorded UTxOs.
+    private static final String LOAN_STAKE_KEY = "9e39d6f9824de5f24ac1d73243ebd54bbcaf764e56de11d0c23db9a8";
+    private static final String LENDER_STAKE_KEY = "1c5621a0d3f7ee5041ece1c8f41a9f611ab4bca268923c21b6ca8dc3";
+
     private static final String LOAN_ADDRESS =
-            "addr_test1zzrr2mm7vnwzsnn8eqsqf62dgf84sr3z2rq2xnne5a7mr0y788t0nqjduhey4swhxfp7h42thj"
-                    + "hhvnjkmcgaps3ahx5qxanp9j";
+            LoanFixtures.baseScriptAddress(REGISTRY.getLoanSpendScriptHash(), LOAN_STAKE_KEY);
 
     /** The bond's address: {@code lenderManagerSpendScriptHash} + the datum's own stake credential. */
     private static final String BOND_ADDRESS =
-            "addr_test1zr3s95d7aq2zhm597lnk76pengtsk2s52jkpnl7ejfen95cu2cs6p5lhaegyrm8per6p48mpr2"
-                    + "6tegngjg7zrdk23hps7h96kk";
+            LoanFixtures.baseScriptAddress(REGISTRY.getLenderManagerSpendScriptHash(), LENDER_STAKE_KEY);
 
     private static final AssetType COLLATERAL =
             new AssetType("0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62", "0014df1074464c4454");

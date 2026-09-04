@@ -256,8 +256,11 @@ public final class PoolFixtures {
 
     // ---- our factory pool, ready to build --------------------------------------------------------
 
+    // ⛔ THIRD deployment, deliberately — see LoanFixtures.thirdDeploymentRegistry(). This family
+    // replays PUBLISHED_REFERENCE_SCRIPTS below, which are real preview publications that exist for
+    // the third deployment only. It is the one chokepoint for the whole pool family.
     private static LoansContractRegistry registry() {
-        return LoanFixtures.registry();
+        return LoanFixtures.thirdDeploymentRegistry();
     }
 
     /** The pool-create seed UTxO's transaction hash — also the {@code inputRef} the mint names. */
@@ -360,7 +363,9 @@ public final class PoolFixtures {
 
     /** Where our lender bonds go: the enterprise address of the LenderManager spend script. */
     public static Address lenderBondAddress() {
-        return new Address(LoanFixtures.bondAddress());
+        // ⚠ NOT LoanFixtures.bondAddress(): that follows registry(), which is the FOURTH
+        // deployment since 2026-09-04, while this family is deliberately third.
+        return new Address(LoanFixtures.entAddress(registry().getLenderManagerSpendScriptHash()));
     }
 
     /**
@@ -396,7 +401,7 @@ public final class PoolFixtures {
 
     /** The config reference input, carrying the real preview {@code ConfigDatum}. */
     public static Utxo configUtxo() {
-        return LoanFixtures.configUtxo(RequestFixtures.TX_CONFIG, 0);
+        return LoanFixtures.thirdDeploymentConfigUtxo(RequestFixtures.TX_CONFIG, 0);
     }
 
     /**
