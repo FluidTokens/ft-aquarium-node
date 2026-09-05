@@ -140,7 +140,7 @@ loans:
     # Referencing the four largest measures 10,414 bytes, 5,970 of margin (findings section 22.9).
     #
     # Deployment-specific, so it is set in the deployment's own values, never defaulted in this image.
-    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:83d1c5393a53e365eb15a7bdfd1feff560f43f9560bc60c23c4e41de709bae33#0,55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0,d0549a87da42d048eb1c3b5b8f7811fd2ccd882ad36c85ee209d3a8d1ca0265f#0,d52f3f88e44ca798d9f45313b83267a7ffa01a6105603ed2b2aebcd8383c45ea#0,e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0,ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0,954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0,5215ca557800881b044ce92c77018b92b9d5b6c56f835d6217bc7e1435000f8a#0,8340312072cd352519e01d7e294d3a4cb84a7f0b63f44adef027abf84d2e0bee#0,8bfb510d6d90573280d9a47b94411477f0992228e0b43cb7cb864f2af66b6812#0,15d88c19c9841e7b5cdd125613ff2013993aeb89f871f340c7a2e43fce1373f5#0}
 
   # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
   #
@@ -313,20 +313,25 @@ loans:
     # No coordinates on mainnet: lending is disabled there, and a stale coordinate is worse than an
     # absent one — LoansReferenceScriptVerifier hard-fails on a hash that does not match.
     reference-scripts:
-      loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}
-      loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:}
-      lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:}
-      lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:}
-      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
-      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
+      loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f#0}
+      loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:46d7195856788885fd4a488dff7bde8bbaf46d5dc4a2fa3dbd12e9cb42129c96#0}
+      lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0}
+      lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0}
+      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:51eaf4994ee313bf4c95be65656e092d7366b0f397f7ecc1e0113c063fab5f98#0}
+      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:8ba0dfb30d40361b9bc775f032e2427c799a6cfefce0cbf13e8f1242c990249a#0}
       # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
       # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
       # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
       # at all, so it could not be referenced however much else was published -- which is why a convert
       # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
       # referenced and working. Referencing this one alone sheds ~7,051 bytes.
-      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:}
-      asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:}
+      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:2ed58f66779acd64f9add3755dd0686d6841001c90683b369cae0f5f07287476#0}
+      asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0}
+      # ⚑ The CONVERT action. It has NO AQUARIUM_LIQUIDATION_REF_* alias -- the only route in is
+      # the relaxed name LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION.
+      # ⚠ It binds and is verified today but ConvertLiquidationRouter still passes Map.of(), so it
+      # is INERT until that is fixed. Baked anyway: when the fix lands nothing needs reconfiguring.
+      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:56840ffb07ca0ad4e1eb921695bad5d2719f838612008e13bfe7f775933a7def#0}
 
 scheduling:
   transaction-processor:
@@ -403,6 +408,9 @@ loans:
   # which mirrors the liquidation side's stated -2000000 bound.
   compound:
     enabled: ${AQUARIUM_COMPOUND_ENABLED:false}
+    # ⛔ BLANKED for the same reason as the liquidation keys below: the base document bakes the
+    # ELEVEN mainnet compound coordinates, and preview must not inherit them.
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}
 
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
@@ -482,6 +490,13 @@ loans:
       # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
       # referenced and working. Referencing this one alone sheds ~7,051 bytes.
       lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:}
+      # ⛔ BLANKED EXPLICITLY, not omitted. The base document now BAKES mainnet coordinates as its
+      # defaults, and a preview node inherits every base key it does not override. A mainnet
+      # coordinate reaching a preview node is not inert: LoansReferenceScriptVerifier resolves it,
+      # finds a hash that is not what preview derives, and HARD-FAILS AT BOOT. These two were
+      # previously absent here and harmless only because the base default was empty too.
+      asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:}
+      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:}
   config:
     # FOURTH preview deployment (14 Jul -> 5 Aug -> 17 Aug -> 25 Aug 2026). Both config NFTs are
     # minted in the single tx 8dd38e97...091c at outputs 0 and 1.

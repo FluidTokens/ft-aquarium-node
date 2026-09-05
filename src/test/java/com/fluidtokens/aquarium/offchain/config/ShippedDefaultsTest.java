@@ -178,6 +178,48 @@ class ShippedDefaultsTest {
     }
 
     /**
+     * ⛔ <b>EVERY reference-script key the BASE document bakes must be blanked in the preview
+     * document — and this is a generator guard, not a spot check.</b>
+     *
+     * <p>The base document now ships the <b>verified mainnet coordinates</b> as its defaults, so an
+     * operator never types one. ⚠ <b>A preview node inherits every base key it does not override</b>,
+     * and a mainnet coordinate reaching a preview node is not inert:
+     * {@code LoansReferenceScriptVerifier} resolves it, derives a different hash, and <b>HARD-FAILS AT
+     * BOOT</b>. Two keys — {@code asset-manager} and the convert action — were previously absent from
+     * the preview document and harmless <em>only</em> because the base default was empty too. Baking
+     * turned that omission into a crash-loop for every preview node, including any operator running
+     * the public image with the preview profile.
+     *
+     * <p>⇒ So the assertion is over the base document's OWN key set rather than a list written here:
+     * <b>add a key to the base and forget the preview blank, and this goes red</b> — which is the only
+     * form of this check that survives the next key being added.
+     */
+    @Test
+    void everyBakedReferenceScriptKeyIsBlankedInThePreviewDocument() throws IOException {
+        List<Map<String, Object>> documents = documents();
+        Object liq = at(base(documents), "loans.liquidation.reference-scripts");
+        assertTrue(liq instanceof Map, "the base document must still carry the block");
+
+        for (Map.Entry<?, ?> entry : ((Map<?, ?>) liq).entrySet()) {
+            String key = String.valueOf(entry.getKey());
+            Object previewValue = at(preview(documents),
+                    "loans.liquidation.reference-scripts." + key);
+            assertNotNull(previewValue, "the preview document does not override "
+                    + "loans.liquidation.reference-scripts." + key + ", so it INHERITS the baked "
+                    + "mainnet coordinate and the node hard-fails at boot on the hash mismatch");
+            assertTrue(String.valueOf(previewValue).endsWith(":}"),
+                    "preview's " + key + " must be a placeholder with an EMPTY default; it is "
+                            + previewValue);
+        }
+
+        Object compound = at(preview(documents), "loans.compound.reference-scripts");
+        assertNotNull(compound, "preview does not override loans.compound.reference-scripts, so it "
+                + "inherits the eleven baked mainnet coordinates");
+        assertTrue(String.valueOf(compound).endsWith(":}"),
+                "preview's compound coordinate list must default empty; it is " + compound);
+    }
+
+    /**
      * The six preview reference-script keys, each shipped <b>deliberately blank</b>, and the proof
      * that blank is a supported path rather than a parse error.
      *
@@ -228,7 +270,7 @@ class ShippedDefaultsTest {
             "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0";
 
     @Test
-    void thePreviewProfileShipsSevenBlankedReferenceScriptKeys() throws IOException {
+    void thePreviewProfileShipsNineBlankedReferenceScriptKeys() throws IOException {
         Object block = at(preview(documents()), "loans.liquidation.reference-scripts");
         assertTrue(block instanceof Map, "reference-scripts is not a block");
         @SuppressWarnings("unchecked")
@@ -236,10 +278,18 @@ class ShippedDefaultsTest {
 
         assertEquals(List.of("loan", "loan-spend", "lender-manager", "lender-manager-spend",
                         "loan-claim-action", "lm-liquidate-action",
-                        "lm-liquidate-and-pay-in-advance-action"),
+                        "lm-liquidate-and-pay-in-advance-action", "asset-manager",
+                        "lm-liquidate-and-convert-action"),
                 List.copyOf(scripts.keySet()),
-                "asset-manager is deliberately absent on preview: a plain Liquidate never spends an "
-                        + "asset-manager output, so its script is neither attached nor needed");
+                "⚠ SEVEN became NINE on 2026-09-05, and the REASON for the two additions is the "
+                        + "opposite of the reason the old seven were here. asset-manager used to be "
+                        + "deliberately ABSENT — 'a plain Liquidate never spends an asset-manager "
+                        + "output, so its script is neither attached nor needed' — which was safe only "
+                        + "while the BASE default was also empty. The base document now BAKES the "
+                        + "verified mainnet coordinates, so an absent key here means preview INHERITS a "
+                        + "mainnet one and LoansReferenceScriptVerifier hard-fails at boot on the hash "
+                        + "mismatch. Absence stopped meaning 'not needed' and started meaning "
+                        + "'inherited'");
 
         for (Map.Entry<String, Object> entry : scripts.entrySet()) {
             String value = (String) entry.getValue();
