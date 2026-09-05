@@ -405,9 +405,22 @@ public class ConvertTransactionBuilder {
                 // The four outputs are distinct by construction; merging them would destroy the
                 // absolute indexes the redeemer names.
                 .mergeOutputs(false)
-                // ⛔ The evaluator is never null here, so a failed evaluation ABORTS rather than
-                // handing back placeholders with a log.warn (CCL trap 8).
-                .ignoreScriptCostEvaluationError(false)
+                // ⛔ PASS 2 ABORTS on a failed evaluation rather than handing back placeholder
+                // ex-units with a log.warn (CCL trap 8). PASS 1 MUST NOT, and that was the bug.
+                //
+                // Pass 1 exists only to read the finished output layout, so it is assembled with
+                // PLACEHOLDER indexes 0/0/0 (trap 1). Index 0 is the dummy output a withdrawing
+                // transaction gets prepended — it carries no datum, so the validator's
+                // `expect InlineDatum(..) = output.datum` ABORTS on it. With the strict setting this
+                // threw inside pass 1 and the real transaction was never assembled at all: every
+                // convert died on its own scaffolding, and the evaluator's ex-unit budget described
+                // a body nobody would ever have submitted.
+                //
+                // ⚠ Tolerating the error here is safe for exactly one reason — pass 1's transaction
+                // is DISCARDED. Only its output ordering is read. Pass 2 re-evaluates strictly with
+                // the observed indexes, and `assertStructure` re-derives that layout from the
+                // finished body, so nothing built on placeholder ex-units can escape this method.
+                .ignoreScriptCostEvaluationError(verify == null)
                 .withTxEvaluator(scriptCostEvaluator)
                 // CCL trap 9b, BOTH seams: the default selector will spend a UTxO carrying a
                 // reference script, and ChangeOutputAdjustments falls through to its own selector.

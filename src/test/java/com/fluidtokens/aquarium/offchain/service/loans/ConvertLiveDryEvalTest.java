@@ -200,6 +200,10 @@ class ConvertLiveDryEvalTest {
         }
     }
 
+    /** TRACE PROBE state: the deployed convert hash and the traced rebuild's hash. */
+    private static String REAL_CONVERT_HASH;
+    private static String TRACED_CONVERT_HASH;
+
     private static BFBackendService backend() {
         return new BFBackendService(URL, System.getenv("BLOCKFROST_MAINNET_KEY"));
     }
@@ -244,12 +248,21 @@ class ConvertLiveDryEvalTest {
     private Built build(boolean adversarial) throws Exception {
         BFBackendService backend = backend();
         LoansContractRegistry registry = registry();
+        injectTracedConvertScript(registry);   // TEMPORARY TRACE PROBE
         CardanoConverters converters = ClasspathConversionsFactory.createConverters(NetworkType.MAINNET);
 
         Utxo loanUtxo = output(backend, LOAN_TX, LOAN_IX);
         Utxo bondUtxo = output(backend, LOAN_TX, BOND_IX);
         Utxo configUtxo = output(backend, CONFIG_TX, 0);
         Utxo lmConfigUtxo = output(backend, LM_CONFIG_TX, LM_CONFIG_IX);
+        if (TRACED_CONVERT_HASH != null && lmConfigUtxo.getInlineDatum() != null) {
+            // The LMConfigDatum names the convert action's hash and a wrapper checks it. The traced
+            // rebuild hashes differently, so the config the validator READS must name the traced one.
+            // Same length (28 bytes), so this is a substitution, not a re-encode.
+            lmConfigUtxo.setInlineDatum(lmConfigUtxo.getInlineDatum()
+                    .replace(REAL_CONVERT_HASH, TRACED_CONVERT_HASH));
+            System.out.println("TRACE PROBE: lm-config convert slot repointed");
+        }
         Utxo poolUtxo = pool(backend);
 
         // ⛔ INSTRUMENTATION, not reasoning. Every fixture the validator will read, printed as fetched,
@@ -463,5 +476,61 @@ class ConvertLiveDryEvalTest {
                 "a perturbed minimum_receive built CLEANLY, so this rig is not running the convert "
                         + "validator at all and its green case proves nothing");
         assertNotNull(e.getMessage());
+    }
+
+    /**
+     * TEMPORARY DIAGNOSTIC PROBE — swaps the convert action's bytes for a trace-enabled rebuild of
+     * the SAME source sha (bb4349c), applied to the SAME eleven parameters, injected under the REAL
+     * hash so every address and index in the body stays correct. Diagnostic only: these bytes are
+     * not the deployed script and must never be vendored or submitted.
+     */
+    @SuppressWarnings("unchecked")
+    private static void injectTracedConvertScript(LoansContractRegistry registry) throws Exception {
+        String path = System.getenv("TRACED_BLUEPRINT");
+        if (path == null) {
+            return;
+        }
+        com.fasterxml.jackson.databind.JsonNode root =
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree(new java.io.File(path));
+        String unapplied = null;
+        for (com.fasterxml.jackson.databind.JsonNode v : root.get("validators")) {
+            if (v.get("title").asText()
+                    .equals("lender_manager/lm_liquidate_and_convert_action.actionValidator.withdraw")) {
+                unapplied = v.get("compiledCode").asText();
+            }
+        }
+        assertNotNull(unapplied, "traced blueprint has no convert validator");
+
+        com.bloxbean.cardano.client.plutus.spec.ListPlutusData params = com.bloxbean.cardano.client.plutus.spec.ListPlutusData.builder().build();
+        for (String hex : new String[]{CONFIG_POLICY, ASSET_NAME,
+                registry.getLenderManagerSpendScriptHash(),
+                registry.getAssetManagerSpendScriptHash(),
+                registry.getAssetManagerWithdrawScriptHash(),
+                MS_POOL_POLICY, MS_POOL_SPEND, "", MS_ORDER_SPEND, ""}) {
+            params.add(com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(HexUtil.decodeHexString(hex)));
+        }
+        params.add(com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.builder().alternative(1)
+                .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of(com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(
+                        HexUtil.decodeHexString(registry.getLoanClaimActionScriptHash()))))
+                .build());
+
+        String applied = com.bloxbean.cardano.aiken.AikenScriptUtil
+                .applyParamToScript(params, unapplied);
+        // The traced bytes hash differently, so the WHOLE transaction must move to the traced hash
+        // or the withdrawal, its redeemer and its witness disagree (RequiredRedeemersMismatch).
+        String tracedHash = HexUtil.encodeHexString(
+                com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil
+                        .getPlutusScriptFromCompiledCode(applied, PlutusVersion.v3).getScriptHash());
+        java.lang.reflect.Field codes =
+                LoansContractRegistry.class.getDeclaredField("appliedCompiledCode");
+        codes.setAccessible(true);
+        ((java.util.Map<String, String>) codes.get(registry)).put(tracedHash, applied);
+        java.lang.reflect.Field hash =
+                LoansContractRegistry.class.getDeclaredField("lmLiquidateAndConvertActionScriptHash");
+        hash.setAccessible(true);
+        System.out.println("TRACE PROBE: " + hash.get(registry) + " -> " + tracedHash);
+        REAL_CONVERT_HASH = (String) hash.get(registry);
+        TRACED_CONVERT_HASH = tracedHash;
+        hash.set(registry, tracedHash);
     }
 }
