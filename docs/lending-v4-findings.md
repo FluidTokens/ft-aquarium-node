@@ -4917,6 +4917,57 @@ obviously the wall** — but a liquidation that leaves the loan NFT in the liqui
 deserves an explicit answer rather than an assumption. Settle it against the deployed validator
 before dismissing it.
 
+### 57.5 2026-09-05 (second pass): one real defect fixed, conjuncts 4–10 eliminated BY COMPUTATION
+
+⚑ **Correction to §57.2's elimination list: "the order address (latent — this lender's stake
+credential is `None`)" was WRONG.** The bond datum at `4a95a00f…#3` carries
+`lenderStakeCredential = Some(Inline(VerificationKey(0fec96a1…)))`. **The rig reported `None`
+because it never looked** — its own `orderAddress(registry, bond)` took both arguments, ignored
+both, and returned an *enterprise* address while its javadoc promised the stake credential.
+Production was already right; the rig had duplicated the derivation. Fixed at the cause in
+`d4d478d`: one shared `ConvertLiquidationRouter.minswapOrderAddress` that both call.
+
+**Control re-run and reproduced exactly: `configRefInputIndex + 1` ⇒ 148430 / 56454729.**
+
+**Eliminated by DIRECT COMPUTATION against real chain values** — this is the strongest grade in
+this file, above both "measured by budget" and "read the source":
+
+| conjunct | how it was settled |
+|---|---|
+| 4 pool LP quantity | budget moved when broken (888302) ⇒ reached and passing |
+| 5 pair check | pool datum field 1 = ADA, field 2 = FLDT; collateral FLDT, principal ADA ⇒ `lpABDirection = False`, else-branch **True** |
+| 6 bond echo | address, amounts and inline datum **byte-identical** to `4a95a00f…#3` |
+| 7 success datum hash | constructed the validator's `AssetManagerDatumWithToken` from real values: **`d65c287a…` = blake2b(output[4])** |
+| 8 refund datum hash | same construction: **`efa300ef…` = blake2b(output[5])** |
+| 9 order datum | built the validator's whole `expectedOrderDatum` from scratch — **296 bytes, byte-identical** |
+| 10 order value | FLDT = `swappable` = 150,000,000 − equity − 7,500,000 ✓, ada = **2,800,000** ✓ |
+
+Also verified: the redeemer's seven fields match the declared order in `lender_manager.ak`;
+`OutputReference` is **flat** (`Constr 0 [bytes, int]`) in stdlib **v2.1.0**, which `aiken.lock`
+pins — so the empty-txid encoding `d8799f4000ff` is right.
+
+⛔ **AND A RIG-INTEGRITY FINDING THAT OUTRANKS ALL OF THAT:
+`aMinimumReceiveThatDisagreesWithTheValidatorIsREJECTED` IS A FALSE GREEN.** It asserts only that
+the build throws. **It throws at the identical `909363 / 377022438`** — the baseline's own failure,
+not the perturbation's. *The rig's one guarantee that it evaluates the real validator has been
+vacuous for as long as the baseline has been red.* Re-arm it by asserting the budget **differs**.
+
+### ⇒ 57.6 THE CONTRADICTION, which is the actual lead now
+
+**Conjuncts 1–10 are eliminated, 11 is fixed, and the budget did not move by a single unit.**
+That is not a conjunct hunt any more — **an assumption underneath the whole search is wrong.**
+Rank the suspects that way, and test the cheap one first:
+
+1. ⚑ **Is the evaluator running the bytes I read?** Every elimination above is against source at
+   `bb4349c`. Confirm the script the rig supplies for withdraw index 3 hashes to `dc715410…` **and
+   that those bytes are the vendored blueprint's**, not a published coordinate.
+2. **Does the validator see the inputs I fetched?** The eliminations use Blockfrost's view; the
+   evaluator uses the rig's fabricated universe. Diff them.
+3. Only then re-open the conjuncts.
+
+⚠ **Do not re-derive 4–10 from source.** They are settled by computation; repeating that is the
+loop this section exists to stop.
+
 ### 57.4 The rig
 
 `ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,
