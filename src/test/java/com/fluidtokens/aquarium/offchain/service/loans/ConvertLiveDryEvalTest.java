@@ -396,11 +396,18 @@ class ConvertLiveDryEvalTest {
         }
     }
 
-    /** {@code Address(Script(minswapOrderSpendScriptHash), lenderStakeCredential)}. */
+    /**
+     * {@code Address(Script(minswapOrderSpendScriptHash), lenderStakeCredential)} — delegated to
+     * <b>production's</b> {@link ConvertLiquidationRouter#minswapOrderAddress}.
+     *
+     * <p>⛔ This used to build an <b>enterprise</b> address here, ignoring both its arguments while
+     * its javadoc claimed the stake credential. The rig therefore could not reproduce the very
+     * defect production had, and after production was fixed it held the rig red on its own.
+     * <b>A rig that re-implements the thing it is testing is testing itself.</b>
+     */
     private static String orderAddress(LoansContractRegistry registry, LenderManagerDatum bond) {
-        return AddressProvider.getEntAddress(
-                Credential.fromScript(HexUtil.decodeHexString(MS_ORDER_SPEND)),
-                Networks.mainnet()).getAddress();
+        return ConvertLiquidationRouter.minswapOrderAddress(
+                MS_ORDER_SPEND, bond.lenderStakeCredential(), LOAN_ID, Networks.mainnet());
     }
 
     // ---- the assertions ---------------------------------------------------------------------------
@@ -436,6 +443,16 @@ class ConvertLiveDryEvalTest {
      * ⛔ THE ADVERSARIAL CASE. A {@code minimum_receive} one lovelace above {@code remainingDebt} is a
      * value the validator computes for itself, so it MUST fail — and if it does not, the rig is not
      * evaluating what it claims to and every green above is worthless.
+     *
+     * <p>⚠ <b>MEASURED 2026-09-05: THIS TEST IS CURRENTLY A FALSE GREEN and proves nothing.</b> It
+     * asserts only that the build throws. Both this case and the unperturbed one throw at the
+     * <b>identical</b> ex-unit budget {@code mem 909363 / cpu 377022438}, so the rejection it
+     * observes is the baseline's own unsolved failure, not the perturbation it introduced. A
+     * negative test must reject for the RIGHT reason; this one cannot distinguish them while the
+     * baseline is red.
+     *
+     * <p>⇒ <b>When the baseline goes green, re-arm this by asserting the budget DIFFERS from the
+     * baseline's</b> — identical budgets are what exposed the defect and are the thing to assert on.
      */
     @Test
     void aMinimumReceiveThatDisagreesWithTheValidatorIsREJECTED() {

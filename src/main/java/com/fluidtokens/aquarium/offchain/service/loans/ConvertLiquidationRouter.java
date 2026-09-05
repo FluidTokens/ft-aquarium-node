@@ -226,11 +226,28 @@ public class ConvertLiquidationRouter {
      * carries someone else's collateral is not a trade this builder makes.
      */
     private String orderAddress(LenderBond bond) {
+        return minswapOrderAddress(loansConfiguration.getMinswapOrderSpendScriptHash(),
+                bond.datum().lenderStakeCredential(), bond.loanId(), network);
+    }
+
+    /**
+     * ⛔ <b>The single derivation of the Minswap order address — call this, never re-implement it.</b>
+     *
+     * <p>It is package-private and static so the offline rig can call the same code the node runs.
+     * <b>The rig used to re-implement it and dropped the stake part</b>, which made a real production
+     * defect invisible and then, once production was fixed, kept the rig red against a fault that no
+     * longer existed — a duplicated derivation is wrong in both directions at once.
+     */
+    static String minswapOrderAddress(String minswapOrderSpendScriptHash,
+                                      PlutusData lenderStakeCredentialField,
+                                      String label,
+                                      com.bloxbean.cardano.client.common.model.Network network) {
         com.bloxbean.cardano.client.address.Credential payment =
                 com.bloxbean.cardano.client.address.Credential.fromScript(
                         com.bloxbean.cardano.client.util.HexUtil.decodeHexString(
-                                loansConfiguration.getMinswapOrderSpendScriptHash()));
-        com.bloxbean.cardano.client.address.Credential stake = lenderStake(bond);
+                                minswapOrderSpendScriptHash));
+        com.bloxbean.cardano.client.address.Credential stake =
+                lenderStake(lenderStakeCredentialField, label);
         return stake == null
                 ? com.bloxbean.cardano.client.address.AddressProvider
                         .getEntAddress(payment, network).getAddress()
@@ -242,10 +259,10 @@ public class ConvertLiquidationRouter {
      * {@code Option<StakeCredential>} → a CCL credential, or {@code null} for {@code None}.
      * {@code Some(Inline(credential))} contributes the stake part; anything else is refused by name.
      */
-    private static com.bloxbean.cardano.client.address.Credential lenderStake(LenderBond bond) {
-        PlutusData data = bond.datum().lenderStakeCredential();
+    private static com.bloxbean.cardano.client.address.Credential lenderStake(
+            PlutusData data, String label) {
         if (!(data instanceof ConstrPlutusData option)) {
-            throw new IllegalStateException("bond " + bond.loanId()
+            throw new IllegalStateException("bond " + label
                     + ": lenderStakeCredential is not a constructor");
         }
         if (option.getAlternative() == 1) {
@@ -253,21 +270,21 @@ public class ConvertLiquidationRouter {
         }
         if (option.getAlternative() != 0
                 || !(firstField(option) instanceof ConstrPlutusData referenced)) {
-            throw new IllegalStateException("bond " + bond.loanId()
+            throw new IllegalStateException("bond " + label
                     + ": Option<StakeCredential> constructor " + option.getAlternative());
         }
         if (referenced.getAlternative() == 1) {
-            throw new IllegalStateException("bond " + bond.loanId()
+            throw new IllegalStateException("bond " + label
                     + " carries a POINTER stake credential; refusing to guess its bytes onto an "
                     + "output holding someone else's collateral");
         }
         if (referenced.getAlternative() != 0
                 || !(firstField(referenced) instanceof ConstrPlutusData credential)) {
-            throw new IllegalStateException("bond " + bond.loanId()
+            throw new IllegalStateException("bond " + label
                     + ": StakeCredential constructor " + referenced.getAlternative());
         }
         if (!(firstField(credential) instanceof BytesPlutusData hash)) {
-            throw new IllegalStateException("bond " + bond.loanId()
+            throw new IllegalStateException("bond " + label
                     + ": credential hash is not a ByteArray");
         }
         // Credential is VerificationKey (0) or Script (1) — the same two the ledger has.
