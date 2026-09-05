@@ -5003,6 +5003,39 @@ about it: break 5, then 6, then 7, and read where 909363 lands between two rungs
 drops the budget is before the failure; the first break that leaves it at 909363 is at or after it.
 *That is a measurement, and it is the next thing to do.*
 
+### 57.8 ⛔ The convert-family reward accounts were never REGISTERED — a ledger rule, found only at submit
+
+A withdraw-zero invocation is valid only from a reward account that **exists**. Two of the node's
+action scripts have never been registered on mainnet:
+
+| | |
+|---|---|
+| `lmLiquidateAndConvertActionScriptHash` `dc715410…` | **NOT REGISTERED** — every convert dies here |
+| `lmLiquidateConvertAndCompoundActionScriptHash` `435b42cc…` | **NOT REGISTERED** |
+
+**Ten others — checked individually — are registered.** FluidTokens registered **25 accounts in the
+deployment transaction `7b9f20db…`** at 2 ada each; **the convert family postdates that batch.**
+
+⇒ **This is CCL trap 11 in its purest form.** The transaction evaluates clean offline, Blockfrost's
+script evaluator costs all eight redeemers — **and the ledger rejects it at submit** with
+`ConwayWithdrawalsMissingAccounts`. *Neither evaluator checks whether a reward account exists,
+because it is not a script question.* **Nothing offline could have found this**, which is exactly why
+forcing the candidate through to a real submit was worth it.
+
+**The registration is PERMISSIONLESS.** That deployment transaction carries **25 certificates against
+only 2 redeemers** ⇒ **registering a script credential needs no script witness.** Anyone who pays the
+deposit can do it; FluidTokens are not required.
+
+**Cert shape, verified against the proven ones rather than assumed:** `82 00 8201581c <hash>` —
+legacy type-0 `stake_registration` with a **script** credential, deposit implicit at 2,000,000 from
+protocol params. Built for `dc715410…` by `BuildStakeRegistrationTxTest`, unsigned.
+
+⚠ **`435b42cc…` IS DELIBERATELY NOT REGISTERED YET.** Its applied script is **86 bytes** against the
+convert action's 5,517 — *it looks like a placeholder in the vendored blueprint rather than a real
+validator.* **The liquidate-convert-and-compound path would fail exactly as convert did if it were
+ever run.** ⇒ **Confirm the script is real before spending a second deposit**; that is a separate
+question and is open.
+
 ### 57.4 The rig
 
 `ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,
