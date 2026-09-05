@@ -5024,9 +5024,35 @@ coordinates against the live UTxO set before trusting a red.**
 
 ### 57.5 Held, and not to be started without Giovanni's explicit word
 
-**O-2** (the gate scores ANTICIPATE on the fee slice rather than its return) and the **rider
-mis-scoping** (`minAdaFunded`'s rider fires on the convert path because the bond flag no longer
-selects pay-in-advance uniquely). ⇒ Both change **what the bot decides**, which is the economics
+**O-2** (the gate scores ANTICIPATE on the fee slice rather than its return) and — ✅ **RESOLVED
+2026-09-05, on Giovanni's first-hand word ("fix it and push the code")** — the **rider mis-scoping**
+(`minAdaFunded`'s rider fired on the convert path because the bond flag no longer selected
+pay-in-advance uniquely).
+
+⇒ **The held item predicted the failure and the failure arrived.** Live on mainnet, candidate
+`4a95a00f…#1`: `min-ada 25,425,321` — **essentially all of it the bot's own change output**, which on
+a convert always carries tokens because the liquidation fee is kept in collateral. That turned a
+**+636,510** floor into **−24,788,811** and refused at `min-profit-absolute-lovelace`. *The code's own
+comment two lines above the guard already forbade exactly this: "the plain change … comes straight
+back, nominable … counting them would turn the bot's own returned money into a phantom expense."*
+
+The guard now asks `MarketGate` — **the routing's own discriminator, on the same loan** — rather than
+a proxy for it. **A proxy that was true when written is exactly what drifted.**
+
+| | before | after |
+|---|---|---|
+| min-ada counted | 25,425,321 | **0** (asset-manager output 2,000,000 − loan ada 3,000,000, clamped) |
+| `floorProfit` vs floor 0 | −24,788,811 ⛔ | **+636,510** ✅ |
+| `expectedProfit` vs margin 5,000,000 | −29,788,811 | **−4,363,490** ⛔ |
+
+⚠ **It is still refused — now honestly, at the 5 ADA margin rather than at a miscount**, and by 4.36
+ADA rather than 29.79. **What changes next is an operator decision, not a defect.**
+
+⚑ **AND ONE TERM IS DELIBERATELY STILL UNCOUNTED, left for Giovanni:** the convert's Minswap order
+carries **~2.8 ADA to the asset manager and does NOT return to the bot**. No output at the
+asset-manager *spend* credential holds it, so `minAdaFunded` never saw it — before this change or
+after. ⇒ **Adding it is a NEW COST TERM, not the correction of a miscount, so it was not made here.**
+*A correct rider is not zero, and this is the part of it that is still missing.* ⇒ Both change **what the bot decides**, which is the economics
 side of the line: *dictated by the validator ⇒ build-correctness; encodes a choice ⇒ economics.*
 Build-correctness fixes proceed under a standing go; **each one states its classification in its
 own commit message**, so the boundary stays inspectable per push rather than asserted once.

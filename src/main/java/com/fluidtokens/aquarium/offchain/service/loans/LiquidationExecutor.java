@@ -1668,7 +1668,21 @@ public class LiquidationExecutor {
         // discriminator the routing uses a few hundred lines up, so the scope is the route's, not a
         // guess: only a convert-permitted loan reaches the pay-in-advance builder, and only that
         // builder emits a named collateral output to the bot.
-        if (assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
+        // ⛔ FIXED 2026-09-05 (findings §57 held item, RESOLVED). The scope above was the BOND FLAG,
+        // justified as "only a convert-permitted loan reaches the pay-in-advance builder". That
+        // stopped being true the moment the CONVERT path shipped: the routing now reads the bond flag
+        // AND the market's action, and a convert-permitted loan whose market says CONVERT goes to the
+        // convert builder instead. The bond flag no longer selects pay-in-advance uniquely.
+        //
+        // ⚠ On the convert route the bot's change ALWAYS carries tokens — the liquidation fee is kept
+        // in collateral — so the rider swept in the change output and charged the operator for its own
+        // returning money. Measured on mainnet 2026-09-05, candidate 4a95a00f…#1: min-ada 25,425,321,
+        // essentially all of it change, turning a ~+0.6 ADA floor into −24.8 ADA and refusing at
+        // min-profit-absolute. That is precisely the phantom expense the comment above forbids.
+        //
+        // ⇒ The discriminator is now the ROUTING'S OWN — the same MarketGate call, on the same loan —
+        // rather than a proxy for it. A proxy that was true when written is exactly what drifted.
+        if (isPayInAdvanceRoute(assessment)) {
             BigInteger rider = BigInteger.ZERO;
             for (TransactionOutput output : transaction.getBody().getOutputs()) {
                 boolean mine = account != null && account.baseAddress().equals(output.getAddress());
@@ -1682,6 +1696,26 @@ public class LiquidationExecutor {
         }
 
         return funded.signum() > 0 ? funded : BigInteger.ZERO;
+    }
+
+    /**
+     * Whether this candidate goes to the PAY-IN-ADVANCE builder — the only route that emits a named
+     * token-bearing collateral output to the bot, and therefore the only one the rider applies to.
+     *
+     * <p>This asks {@link MarketGate} exactly as the routing does, on the same loan, so the two cannot
+     * drift apart again. The bond flag alone says the loan MAY be converted; the market says HOW.
+     *
+     * <p>⚠ <b>The convert route funds ada this method deliberately does NOT count</b> — the Minswap
+     * order carries ~2.8 ADA to the asset manager and does not come back to the bot. Whether that
+     * belongs in the profitability floor is an ECONOMICS decision and is not made here: adding it
+     * would be a new cost term, not a correction of a miscount. Recorded in findings §57 as open.
+     */
+    private boolean isPayInAdvanceRoute(LiquidationAssessment assessment) {
+        if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
+            return false;
+        }
+        return new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset())
+                != AppConfig.LiquidationConfiguration.Action.CONVERT;
     }
 
     /** The payment credential hash of an address, or null — the same read the builder does. */
