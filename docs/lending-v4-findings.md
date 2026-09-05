@@ -4859,7 +4859,7 @@ lender's stake credential (`4a2ba29`, latent — this loan's lender has `None`),
 carried the **assessment's** figures rather than the loan's at the body's `validFrom` (`2ae88e8`,
 the sibling asserts it at five call sites and convert had none).
 
-### 57.2 ⇒ THE LEAD: the ex-units have not moved, and that is the measurement
+### 57.2 The bisection has RUN — five measurements, and a retracted inference
 
 ```
 AIKEN: RedeemerError { tag: "Withdraw", index: 3,
@@ -4868,27 +4868,54 @@ AIKEN: RedeemerError { tag: "Withdraw", index: 3,
 **Withdrawal index 3 is `lm_liquidate_and_convert_action`** — read off the body's own withdrawal
 list, never by re-deriving the sort (§44.2 cost an hour to that).
 
-⛔ **That budget is byte-identical across FOUR unrelated changes.** A deterministic script that
-fails at the same conjunct consumes the same budget, so **the failure point has never moved and
-nothing touched so far is read before it.** ⇒ **The failure is EARLIER in the validator than
-everything examined top-down.**
+**⇒ RUN THE CONTROL FIRST.** Perturbing `configRefInputIndex` — the first thing the validator
+reads — collapses the budget:
 
-**Eliminated by reading the deployed sha `bb4349c` against our encoders** — and none moved the
-budget: pool-datum field positions (we read 1 and 2, matching FT's `unconstr_fields` positional
-read) · `lpAssetName` and `a_to_b_direction` (both from the pool datum, not argument order) · the
-pair check · `get_smart_destination_address` (non-CIP113 ⇒ `Address(Script(assetManagerSpend),
-None)`) · `AssetManagerDatumWithToken` is constructor 0 with an untyped `data` field · the
-nine-field `OrderDatum` order · `to_order_auth_method` · `equityInPrincipalCurrency` · the order
-address · the figures at `validFrom`.
+| perturbation | mem / cpu | |
+|---|---|---|
+| **baseline** | **909363 / 377022438** | |
+| `configRefInputIndex + 1` | 148430 / 56454729 | **CONTROL — the instrument responds** |
+| `poolRefInputIndex + 1` | 485173 / 195202483 | moved, far earlier |
+| `poolAssetName` wrong | 888302 / 363208240 | moved, slightly earlier |
+| `successOutputIndex + 1` | 909773 / 408103726 | moved |
+| `MAX_BATCHER_FEE + 1` | 909363 / 377022438 | identical |
+| `CONVERTED_TO_LIQUIDITY` perturbed | 909363 / 377022438 | identical |
 
-### 57.3 ⇒ WHAT TO DO NEXT: bisect, do not hypothesise
+⚑ **The control inverted this section's former headline.** It used to read *"the failure is EARLIER
+than everything examined."* **The opposite is true: the config read alone costs ~148k and we reach
+909k, so `909363` is a LATE failure.** An unchanged budget means *those inputs are not read* — it
+never meant the failure was early.
 
-**The search order above was wrong.** Reading the validator top-down and testing plausible
-candidates produced ten eliminations and no localisation. ⇒ **Perturb ONE input at a time and watch
-the budget.** An input whose change leaves `909363/377022438` untouched **is not read before the
-failure**; the first change that moves it **brackets the conjunct**. That is CCL trap 5's
-adversarial-mutation discipline pointed at **localisation** rather than validation, and it is
-mechanical rather than clever.
+⛔ **AND THE RETRACTION THAT MATTERS MORE THAN THE DATA: THE BUDGET DISTINGUISHES POSITION, NOT
+CONTENT.** The two identical rows were read here as *"that conjunct is never reached"*, and three
+rounds of inspection were built on the bracket that followed. **That inference is unsound.** Both
+perturbations change a value the validator would hash or compare **at the same cost** — blake2b over
+140 vs 141 bytes is the same number of compression rounds. ⇒ **An identical budget is equally
+consistent with failing AT that conjunct.**
+
+⇒ **So: perturb an INDEX to move the failure point. A VALUE at the same position may cost the same,
+and proves nothing.** *Using a position-instrument to answer a content question is the trap, and it
+is easy precisely because the method is otherwise sound.*
+
+**Eliminated by MEASUREMENT** (not inspection): the **lender-bond echo**, conjunct
+`builtin.equals_data(lenderBondInput.output, lenderBondOutput)` — the built output is byte-identical
+to `4a95a00f…#3` on chain, address, amounts and inline datum. The rig now dumps every built output's
+full CBOR, which is what settles an `equals_data` conjunct; an abbreviated address and a coin cannot.
+
+**Eliminated by reading the deployed sha `bb4349c` against our encoders** — weaker evidence, kept for
+what it is: pool-datum field positions (we read 1 and 2, matching FT's `unconstr_fields` positional
+read) · `lpAssetName` and `a_to_b_direction` · the pair check · `get_smart_destination_address`
+(non-CIP113 ⇒ `Address(Script(assetManagerSpend), None)`) · `AssetManagerDatumWithToken` is
+constructor 0 with an untyped `data` field · the nine-field `OrderDatum` order · `to_order_auth_method`
+· `equityInPrincipalCurrency` · the order address · the figures at `validFrom`.
+
+### 57.3 ⚑ An open lead the bisection surfaced: the loan NFT lands in the bot's change
+
+The byte dump shows the built body's **change output carries the loan NFT**
+`0061ade3…cae82d7d…` alongside the FLDT. **No conjunct examined so far reads it, so it is not
+obviously the wall** — but a liquidation that leaves the loan NFT in the liquidator's wallet
+deserves an explicit answer rather than an assumption. Settle it against the deployed validator
+before dismissing it.
 
 ### 57.4 The rig
 
