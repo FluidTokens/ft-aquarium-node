@@ -167,9 +167,10 @@ public class YaciConfig {
                                                              ConvertEconomics convertEconomics,
                                                              ConvertTransactionBuilder convertTransactionBuilder,
                                                              AppConfig.LiquidationConfiguration liquidationConfiguration,
+                                                             CardanoConverters converters,
                                                              AppConfig.Network network) {
         return new ConvertLiquidationRouter(registry, loansConfiguration, liquidationConfiguration,
-                minswapPoolResolver, convertEconomics, convertTransactionBuilder,
+                minswapPoolResolver, convertEconomics, convertTransactionBuilder, converters,
                 network.getCardanoNetwork());
     }
 

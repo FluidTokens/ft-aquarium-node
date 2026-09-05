@@ -15,6 +15,10 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.math.BigInteger;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import org.cardanofoundation.conversions.CardanoConverters;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -60,6 +64,7 @@ public class ConvertLiquidationRouter {
     private final LoansContractRegistry registry;
     private final AppConfig.LoansConfiguration loansConfiguration;
     private final AppConfig.LiquidationConfiguration liquidationConfiguration;
+    private final CardanoConverters converters;
     private final MinswapPoolResolver poolResolver;
     private final ConvertEconomics economics;
     private final ConvertTransactionBuilder builder;
@@ -71,6 +76,7 @@ public class ConvertLiquidationRouter {
                                     MinswapPoolResolver poolResolver,
                                     ConvertEconomics economics,
                                     ConvertTransactionBuilder builder,
+                                    CardanoConverters converters,
                                     com.bloxbean.cardano.client.common.model.Network network) {
         this.registry = registry;
         this.loansConfiguration = loansConfiguration;
@@ -78,6 +84,7 @@ public class ConvertLiquidationRouter {
         this.poolResolver = poolResolver;
         this.economics = economics;
         this.builder = builder;
+        this.converters = converters;
         this.network = network;
     }
 
@@ -142,6 +149,31 @@ public class ConvertLiquidationRouter {
         return Map.copyOf(resolved);
     }
 
+    /**
+     * Slots for the requested millisecond window, clamped <em>inwards</em> — the same rule
+     * {@code PayInAdvanceLiquidationRouter} and {@code LiquidateTransactionBuilder} apply, so the
+     * interval the transaction claims is contained by the one the guards proved safe.
+     */
+    private long[] validitySlots(long validFromMillis, long validToMillis) {
+        long slotFrom = converters.time().toSlot(utc(validFromMillis));
+        if (millisOf(converters.slot().slotToTime(slotFrom)) < validFromMillis) {
+            slotFrom += 1;
+        }
+        long slotTo = converters.time().toSlot(utc(validToMillis));
+        if (millisOf(converters.slot().slotToTime(slotTo)) > validToMillis) {
+            slotTo -= 1;
+        }
+        return new long[]{slotFrom, slotTo};
+    }
+
+    private static LocalDateTime utc(long millis) {
+        return LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneOffset.UTC);
+    }
+
+    private static long millisOf(LocalDateTime time) {
+        return time.toInstant(ZoneOffset.UTC).toEpochMilli();
+    }
+
     private static void put(Map<String, TransactionInput> into, String scriptHash,
                             TransactionInput coordinate) {
         if (scriptHash != null && !scriptHash.isBlank() && coordinate != null) {
@@ -198,11 +230,24 @@ public class ConvertLiquidationRouter {
                 assessment.bond().datum().lenderAuth(), assessment.equity(),
                 assessment.loan().loanId(), assessment.remainingDebt());
 
+        // ⛔ MILLISECONDS ARE NOT SLOTS, and until 2026-09-05 this router handed the caller's
+        // millisecond window straight into a record whose components are `validFromSlot` /
+        // `validToSlot`. Both are `long` and both are positional, so javac saw nothing and the
+        // ledger saw a validity interval of SlotNo 1788596164000 — about 12,776x past the tip,
+        // rejected as "beyond the foreseeable end of the current era". A convert has therefore
+        // NEVER built, on any network, for any configuration.
+        //
+        // ⚠ Every sibling already did this and only this one did not: PayInAdvanceLiquidationRouter,
+        // LiquidateTransactionBuilder and CompoundExecutor all call toSlot() at their boundary.
+        // Sibling parity is what localises a defect like this — "what is this path omitting that the
+        // working ones do" — not a search for something novel.
+        long[] slots = validitySlots(validFromMillis, validToMillis);
+
         // 3. BUILD, then price. The gate needs the fee this transaction actually pays.
         Transaction transaction = builder.build(new ConvertTransactionBuilder.Request(
                 loanUtxo, bondUtxo, pool.utxo(), collateralOracle, configUtxo, lmConfigUtxo, walletUtxo,
                 referenceScripts(), plan, claim, collateral, lenderBond, loan.repaymentReceipts(),
-                orderAddress(), changeAddress, validFromMillis, validToMillis));
+                orderAddress(), changeAddress, slots[0], slots[1]));
 
         BigInteger txFee = transaction.getBody().getFee();
         ConvertAssessment verdict = economics.assess(

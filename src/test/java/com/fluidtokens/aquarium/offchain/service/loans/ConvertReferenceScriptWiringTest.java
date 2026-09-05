@@ -85,7 +85,7 @@ class ConvertReferenceScriptWiringTest {
     private static ConvertLiquidationRouter router(LoansContractRegistry registry,
                                                    AppConfig.LiquidationConfiguration configuration) {
         return new ConvertLiquidationRouter(registry, new AppConfig.LoansConfiguration(),
-                configuration, null, null, null, null);
+                configuration, null, null, null, null, null);
     }
 
     // ==========================================================================================

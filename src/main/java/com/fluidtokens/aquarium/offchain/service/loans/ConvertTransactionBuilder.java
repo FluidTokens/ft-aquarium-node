@@ -151,6 +151,36 @@ public class ConvertTransactionBuilder {
                           String changeAddress,
                           long validFromSlot,
                           long validToSlot) {
+
+        /**
+         * ⛔ <b>A SLOT THIS LARGE IS A MILLISECOND TIMESTAMP, and javac cannot tell you so.</b>
+         *
+         * <p>Until 2026-09-05 {@code ConvertLiquidationRouter} passed its {@code validFromMillis} /
+         * {@code validToMillis} straight into these two components. Both sides are {@code long} and
+         * both are positional, so the call compiled in silence and the ledger rejected every convert
+         * with {@code PastHorizon … (ELit (SlotNo 1788596164000))} — about 12,776× past the tip.
+         * <b>A convert had therefore never built, on any network, under any configuration.</b>
+         *
+         * <p>⚠ The guard is here rather than in the router because <b>this is the boundary the
+         * confusion crosses</b>. A rule stated where the mistake is made fires for every future
+         * caller; one stated in the caller that got it wrong protects only that caller.
+         *
+         * <p>The threshold separates the two families for centuries: a Cardano slot advances one per
+         * second, so mainnet is ~1.4e8 today and reaches ~2.4e9 in the year 2100, while POSIX
+         * milliseconds have exceeded 1.7e12 since 2023. <b>Anything above 1e11 is a timestamp.</b>
+         */
+        private static final long MILLISECONDS_NOT_SLOTS = 100_000_000_000L;
+
+        public Request {
+            if (validFromSlot > MILLISECONDS_NOT_SLOTS || validToSlot > MILLISECONDS_NOT_SLOTS) {
+                throw new IllegalArgumentException(("validFromSlot=%d validToSlot=%d — a slot cannot "
+                        + "be this large; these are MILLISECONDS. Convert them at the boundary with "
+                        + "converters.time().toSlot(utc(millis)), exactly as every sibling router "
+                        + "does. Handed to the ledger unconverted this is a PastHorizon rejection "
+                        + "and the transaction never builds.")
+                        .formatted(validFromSlot, validToSlot));
+            }
+        }
     }
 
     private final LoansContractRegistry registry;
