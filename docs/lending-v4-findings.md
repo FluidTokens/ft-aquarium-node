@@ -4968,6 +4968,41 @@ Rank the suspects that way, and test the cheap one first:
 ⚠ **Do not re-derive 4–10 from source.** They are settled by computation; repeating that is the
 loop this section exists to stop.
 
+### 57.7 §57.6's two controls have RUN — both premises HOLD, and a position ladder came out of it
+
+**Both were run as controls, not as reasoning, and both moved.**
+
+**(1) Is the evaluator running the bytes we read?** Replacing the rig's `ScriptSupplier` with one
+that returns `Optional.empty()` changes the failure from the budget error to
+`RequiredRedeemersMismatch { missing: ["4a48df8e…"] }`. ⇒ **The supplier is load-bearing; the
+evaluator consumes the scripts the rig hands it.**
+
+**(2) Does the evaluator see the inputs we fetched?** Setting the loan NFT's quantity to 2 — which
+breaks conjunct 2 — drops the budget to **825646 / 344963808**. ⇒ **The fabricated universe is what
+the validator reads.**
+
+⚠ **Two earlier attempts at (2) were UNINFORMATIVE, and both for the reason §22 names.** `+1
+lovelace` on the loan input perturbs a field this validator never reads. `+1` on the collateral
+perturbs one it *does* read — but 150,000,000 and 150,000,001 are the same size, so the arithmetic
+costs the same and the failure position does not move. **Both returned an unchanged budget that
+means nothing.** ⇒ **To probe with this instrument, break something that moves the failure POSITION
+— a conjunct's truth — not a value's content.**
+
+**⇒ THE LADDER, which is the durable product of this pass:**
+
+| state | mem / cpu |
+|---|---|
+| break conjunct 2 (loan NFT quantity) | **825646** / 344963808 |
+| break conjunct 4 (pool asset name) | **888302** / 363208240 |
+| **baseline (unsolved)** | **909363** / 377022438 |
+| break conjunct 9 (minimum_receive) | 909363 / 377022438 — *unchanged; the false green* |
+| control: `configRefInputIndex + 1` | 148430 / 56454729 |
+
+**Baseline sits 21,061 mem past a conjunct-4 failure.** ⇒ **Extend the ladder rather than reasoning
+about it: break 5, then 6, then 7, and read where 909363 lands between two rungs.** A break that
+drops the budget is before the failure; the first break that leaves it at 909363 is at or after it.
+*That is a measurement, and it is the next thing to do.*
+
 ### 57.4 The rig
 
 `ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,
