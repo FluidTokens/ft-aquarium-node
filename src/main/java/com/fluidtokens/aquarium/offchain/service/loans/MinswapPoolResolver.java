@@ -87,8 +87,40 @@ public class MinswapPoolResolver {
         try {
             Result<List<Utxo>> result = utxoService.getUtxos(poolAddress, unit, 10, 1);
             if (!result.isSuccessful()) {
-                throw refuse(Refusal.LOOKUP_FAILED, "the provider refused the pool lookup: "
-                        + result.getResponse());
+                // ⛔ A 404 IS AN ANSWER, NOT AN OUTAGE — and reading it as one broke the whole
+                // either-order mechanism below. Measured on mainnet 2026-09-05: the ADA/FLDT pool
+                // exists and is healthy (1.69M ada / 7.6M FLDT, one UTxO, inline datum), and this
+                // method reported LOOKUP_FAILED for it.
+                //
+                // `compute_lp_asset_name` is ORDER-SENSITIVE, so exactly one of the two orderings
+                // names a real asset:
+                //     LP(ada, fldt)  bc53f5c2…  -> HTTP 200
+                //     LP(fldt, ada)  df40ef9f…  -> HTTP 404
+                // Blockfrost expresses "no UTxO with that asset at this address" as a 404, not as an
+                // empty list — so the WRONG ordering landed here rather than in the `found.isEmpty()`
+                // branch below, and `resolveEitherOrder` RETHROWS anything that is not
+                // NO_POOL_FOR_PAIR. The correct ordering was therefore never tried.
+                //
+                // ⚠ Two consequences, and the second is why this is not a mislabel but a defect:
+                //   1. the `found.isEmpty()` -> NO_POOL_FOR_PAIR branch is UNREACHABLE via this
+                //      provider, so it has never fired in production;
+                //   2. the either-order fallback fails whenever the wrong ordering happens to be
+                //      tried first — a coin flip per pair — and presents as "no pool exists".
+                //
+                // The rule is not new to this repo: LoansConfigVerifier.fetchConfigDatumHex already
+                // says "a 4xx is an answer, not an outage". This class is the sibling that never
+                // applied it. 404 alone is the "no such asset here" answer; every other 4xx is about
+                // US (a bad key, a quota), and 5xx / 429 / transport are genuinely transient.
+                int code = result.code();
+                if (code == 404) {
+                    throw refuse(Refusal.NO_POOL_FOR_PAIR,
+                            "the provider has no UTxO at " + poolAddress + " holding the LP asset "
+                                    + unit + " (HTTP 404). If this is one of two orderings, the other "
+                                    + "is the one to try; if both 404, there is no Minswap pool for "
+                                    + "this pair and a convert is impossible rather than unprofitable");
+                }
+                throw refuse(Refusal.LOOKUP_FAILED, "the provider refused the pool lookup (HTTP "
+                        + code + "): " + result.getResponse());
             }
             found = result.getValue();
         } catch (RefusedException e) {
