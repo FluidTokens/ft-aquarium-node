@@ -144,7 +144,8 @@ final class EvalFixtures {
      */
     static ScriptSupplier scriptSupplier(LoansContractRegistry registry, List<PlutusScript> extra) {
         Map<String, PlutusScript> byHash = new LinkedHashMap<>();
-        List<PlutusScript> scripts = List.of(
+        List<PlutusScript> scripts;
+        scripts = List.of(
                 registry.getLoanScript(),
                 registry.getLoanSpendScript(),
                 registry.getLenderManagerScript(),
@@ -152,6 +153,14 @@ final class EvalFixtures {
                 registry.getLoanClaimActionScript(),
                 registry.getLmLiquidateActionScript(),
                 registry.getAssetManagerScript());
+        // ⚠ A Blockfrost Utxo carries referenceScriptHash but NEVER the script bytes (CCL trap 9),
+        // so a rig that mirrors production's REFERENCE-SCRIPT wiring cannot resolve them from the
+        // universe — the supplier is the only route in. Null when loans.minswap.* is unconfigured.
+        List<PlutusScript> withConvert = new ArrayList<>(scripts);
+        if (registry.getLmLiquidateAndConvertActionScript() != null) {
+            withConvert.add(registry.getLmLiquidateAndConvertActionScript());
+        }
+        scripts = List.copyOf(withConvert);
         List<PlutusScript> all = new ArrayList<>(scripts);
         all.addAll(extra);
         for (PlutusScript script : all) {

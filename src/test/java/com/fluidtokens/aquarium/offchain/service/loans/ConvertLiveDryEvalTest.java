@@ -8,6 +8,7 @@ import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.common.model.SlotConfigs;
 import com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil;
@@ -230,6 +231,20 @@ class ConvertLiveDryEvalTest {
     }
 
     /** A synthetic bot wallet — ours, and not a property of the candidate. Every sibling rig does this. */
+    /** The operator wallet's LIVE UTxO set — read-only, and the thing the fabricated one stands in for. */
+    private static List<Utxo> liveWalletUtxos(BFBackendService backend, String address) throws Exception {
+        Result<List<Utxo>> r = backend.getUtxoService().getUtxos(address, 100, 1);
+        assertTrue(r.isSuccessful(), "could not read the wallet's UTxOs: " + r.getResponse());
+        List<Utxo> all = new ArrayList<>(r.getValue());
+        assertFalse(all.isEmpty(), "the wallet at " + address + " holds no UTxOs");
+        all.sort(java.util.Comparator.comparing(
+                (Utxo u) -> u.getAmount().stream()
+                        .filter(a -> a.getUnit().equals("lovelace")).findFirst()
+                        .map(Amount::getQuantity).orElse(BigInteger.ZERO)).reversed());
+        System.out.println("REAL WALLET: " + all.size() + " UTxOs at " + address);
+        return all;
+    }
+
     private static Utxo wallet(String address) {
         Utxo u = new Utxo();
         u.setTxHash("00".repeat(32));
@@ -316,9 +331,17 @@ class ConvertLiveDryEvalTest {
                 ConvertTxEncoder.plainScriptAddress(registry.getAssetManagerSpendScriptHash()),
                 LOAN_TX, LOAN_IX);
 
-        String botAddress = AddressProvider.getEntAddress(
-                Credential.fromKey(HexUtil.decodeHexString("11".repeat(28))), Networks.mainnet())
-                .getAddress();
+        // ⛔ THE ONE FABRICATED ELEMENT, and the residual risk it carries. Coin selection over a
+        // single synthetic UTxO produces a different OUTPUT LAYOUT than a real multi-UTxO wallet —
+        // and this redeemer names output positions ABSOLUTELY. Set REAL_BOT_WALLET to the operator's
+        // address to build against its live UTxO set instead (read-only; nothing is ever submitted).
+        String realWallet = System.getenv("REAL_BOT_WALLET");
+        String botAddress = realWallet != null ? realWallet
+                : AddressProvider.getEntAddress(
+                        Credential.fromKey(HexUtil.decodeHexString("11".repeat(28))), Networks.mainnet())
+                        .getAddress();
+        List<Utxo> walletUtxos = realWallet != null
+                ? liveWalletUtxos(backend, realWallet) : List.of(wallet(botAddress));
 
         ClaimData claim = new ClaimData(liquidation, BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
                 bond.lenderAuth(), equity, LOAN_ID, remainingDebt);
@@ -331,7 +354,11 @@ class ConvertLiveDryEvalTest {
         // a universe the build produces. And it is the BUILDER's evaluator, not a separate pass: the
         // ex-units asserted later must be the ones that ended up in the body (CCL trap 8).
         List<Utxo> universe = new ArrayList<>(List.of(loanUtxo, bondUtxo, configUtxo, lmConfigUtxo,
-                poolUtxo, wallet(botAddress)));
+                poolUtxo));
+        universe.addAll(walletUtxos);
+        for (TransactionInput in : referenceScripts(registry).values()) {
+            universe.add(output(backend, in.getTransactionId(), in.getIndex()));
+        }
         entryReferenceInputs(backend, entry, universe);
 
         var aiken = new AikenTransactionEvaluator(
@@ -375,7 +402,7 @@ class ConvertLiveDryEvalTest {
                 evaluator);
 
         var request = new ConvertTransactionBuilder.Request(loanUtxo, bondUtxo, poolUtxo, entry,
-                configUtxo, lmConfigUtxo, wallet(botAddress), Map.of(), plan, claim, FLDT, lenderBond,
+                configUtxo, lmConfigUtxo, walletUtxos.get(0), referenceScripts(registry), plan, claim, FLDT, lenderBond,
                 loan.repaymentReceipts(), orderAddress(registry, bond), botAddress,
                 validFromSlot, validToSlot);
 
@@ -432,6 +459,16 @@ class ConvertLiveDryEvalTest {
 
         // ⛔ Ex-units off the BUILT, DESERIALISED transaction — never off an evaluator's report. A
         // rig-supplied evaluator makes the report look right while production has none (CCL trap 8).
+        // Optional: hand the finished CBOR to a SECOND evaluator of different provenance
+        // (Blockfrost /utils/txs/evaluate). Read-only; it never submits. CCL trap 7 — a local
+        // evaluator's protocol params and cost model are a library snapshot, the chain's are not.
+        String out = System.getenv("CBOR_OUT");
+        if (out != null) {
+            java.nio.file.Files.writeString(java.nio.file.Path.of(out),
+                    HexUtil.encodeHexString(built.transaction().serialize()));
+            System.out.println("CBOR written to " + out);
+        }
+
         Transaction rebuilt = Transaction.deserialize(built.transaction().serialize());
         assertNotNull(rebuilt.getWitnessSet(), "the built transaction has no witness set");
         assertNotNull(rebuilt.getWitnessSet().getRedeemers(), "the built transaction has no redeemers");
@@ -576,5 +613,28 @@ class ConvertLiveDryEvalTest {
             d = d.replace(e.getKey(), e.getValue());
         }
         utxo.setInlineDatum(d);
+    }
+
+    /**
+     * ⛔ THE SHIPPED reference-script coordinates, mirroring {@code ConvertLiquidationRouter}'s own
+     * map. The rig used to pass {@code Map.of()} — every script inline — which made its transaction
+     * <b>22,685 bytes against a 16,384 maxTxSize</b>: a body the ledger would reject at phase 1,
+     * however cleanly its scripts evaluate. An offline rig proves SCRIPTS, not ledger rules (trap 11),
+     * so the one thing it must not do is build a shape production would never build.
+     */
+    private static Map<String, TransactionInput> referenceScripts(LoansContractRegistry registry) {
+        Map<String, TransactionInput> m = new java.util.LinkedHashMap<>();
+        m.put(registry.getLoanPolicyId(), ref("f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f"));
+        m.put(registry.getLoanSpendScriptHash(), ref("46d7195856788885fd4a488dff7bde8bbaf46d5dc4a2fa3dbd12e9cb42129c96"));
+        m.put(registry.getLenderManagerWithdrawScriptHash(), ref("ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b"));
+        m.put(registry.getLenderManagerSpendScriptHash(), ref("55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d"));
+        m.put(registry.getLoanClaimActionScriptHash(), ref("51eaf4994ee313bf4c95be65656e092d7366b0f397f7ecc1e0113c063fab5f98"));
+        m.put(registry.getLmLiquidateAndConvertActionScriptHash(),
+                ref("e4e47ab13b26a200d5939def5ef7d60af3dc0a719dac0aadbcbafb191f9c6541"));
+        return m;
+    }
+
+    private static TransactionInput ref(String txHash) {
+        return TransactionInput.builder().transactionId(txHash).index(0).build();
     }
 }
