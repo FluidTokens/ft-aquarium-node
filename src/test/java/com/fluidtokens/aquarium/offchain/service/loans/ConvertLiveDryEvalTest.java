@@ -255,14 +255,8 @@ class ConvertLiveDryEvalTest {
         Utxo bondUtxo = output(backend, LOAN_TX, BOND_IX);
         Utxo configUtxo = output(backend, CONFIG_TX, 0);
         Utxo lmConfigUtxo = output(backend, LM_CONFIG_TX, LM_CONFIG_IX);
-        if (TRACED_CONVERT_HASH != null && lmConfigUtxo.getInlineDatum() != null) {
-            // The LMConfigDatum names the convert action's hash and a wrapper checks it. The traced
-            // rebuild hashes differently, so the config the validator READS must name the traced one.
-            // Same length (28 bytes), so this is a substitution, not a re-encode.
-            lmConfigUtxo.setInlineDatum(lmConfigUtxo.getInlineDatum()
-                    .replace(REAL_CONVERT_HASH, TRACED_CONVERT_HASH));
-            System.out.println("TRACE PROBE: lm-config convert slot repointed");
-        }
+        repointConfigDatum(configUtxo);
+        repointConfigDatum(lmConfigUtxo);
         Utxo poolUtxo = pool(backend);
 
         // ⛔ INSTRUMENTATION, not reasoning. Every fixture the validator will read, printed as fetched,
@@ -471,11 +465,23 @@ class ConvertLiveDryEvalTest {
     void aMinimumReceiveThatDisagreesWithTheValidatorIsREJECTED() {
         // ignoreScriptCostEvaluationError(false) means a failed evaluation ABORTS the build, so the
         // rejection surfaces as a build failure rather than an outcome to inspect.
+        lastEvaluatorMessage = null;
         Exception e = org.junit.jupiter.api.Assertions.assertThrows(Exception.class,
                 () -> build(true),
                 "a perturbed minimum_receive built CLEANLY, so this rig is not running the convert "
                         + "validator at all and its green case proves nothing");
-        assertNotNull(e.getMessage());
+
+        // ⛔ RE-ARMED 2026-09-05. "It threw" is NOT the assertion — that is what made this check
+        // vacuous for as long as the unperturbed case was also red: both threw, at the identical
+        // budget, and this test was observing the baseline's own failure rather than its own
+        // perturbation. A negative test must reject for the RIGHT reason.
+        assertNotNull(lastEvaluatorMessage,
+                "the build failed before the evaluator ever ran, so this proves nothing about the "
+                        + "validator; the rejection must come from EVALUATION, not from assembly");
+        assertTrue(lastEvaluatorMessage.contains("EvaluationFailure"),
+                "the perturbed build failed for a reason other than script evaluation, so it does "
+                        + "not demonstrate that the validator rejects a wrong minimum_receive: "
+                        + lastEvaluatorMessage);
     }
 
     /**
@@ -492,45 +498,83 @@ class ConvertLiveDryEvalTest {
         }
         com.fasterxml.jackson.databind.JsonNode root =
                 new com.fasterxml.jackson.databind.ObjectMapper().readTree(new java.io.File(path));
-        String unapplied = null;
+        java.util.Map<String, String> unapplied = new java.util.LinkedHashMap<>();
         for (com.fasterxml.jackson.databind.JsonNode v : root.get("validators")) {
-            if (v.get("title").asText()
-                    .equals("lender_manager/lm_liquidate_and_convert_action.actionValidator.withdraw")) {
-                unapplied = v.get("compiledCode").asText();
-            }
+            unapplied.putIfAbsent(v.get("title").asText().replaceAll("\\.(withdraw|else|spend|mint)$", ""),
+                    v.get("compiledCode").asText());
         }
-        assertNotNull(unapplied, "traced blueprint has no convert validator");
 
-        com.bloxbean.cardano.client.plutus.spec.ListPlutusData params = com.bloxbean.cardano.client.plutus.spec.ListPlutusData.builder().build();
-        for (String hex : new String[]{CONFIG_POLICY, ASSET_NAME,
-                registry.getLenderManagerSpendScriptHash(),
-                registry.getAssetManagerSpendScriptHash(),
-                registry.getAssetManagerWithdrawScriptHash(),
-                MS_POOL_POLICY, MS_POOL_SPEND, "", MS_ORDER_SPEND, ""}) {
-            params.add(com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(HexUtil.decodeHexString(hex)));
+        java.util.Map<String, String> codes = (java.util.Map<String, String>) field("appliedCompiledCode").get(registry);
+        SWAPPED.clear();
+
+        // loan_claim_action first: the convert action takes its credential as a PARAMETER, so a
+        // traced claim action changes the convert action's hash too.
+        String claim = apply(unapplied.get("loan/loan_claim_action.loan_claim_action"),
+                bytes(CONFIG_POLICY), bytes(ASSET_NAME),
+                bytes(registry.getAssetManagerSpendScriptHash()),
+                bytes(registry.getAssetManagerWithdrawScriptHash()));
+        String claimHash = hashOf(claim);
+        record(registry, codes, "loanClaimActionScriptHash", claimHash, claim);
+
+        String convert = apply(unapplied.get("lender_manager/lm_liquidate_and_convert_action.actionValidator"),
+                bytes(CONFIG_POLICY), bytes(ASSET_NAME),
+                bytes(registry.getLenderManagerSpendScriptHash()),
+                bytes(registry.getAssetManagerSpendScriptHash()),
+                bytes(registry.getAssetManagerWithdrawScriptHash()),
+                bytes(MS_POOL_POLICY), bytes(MS_POOL_SPEND), bytes(""), bytes(MS_ORDER_SPEND), bytes(""),
+                com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.builder().alternative(1)
+                        .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of(bytes(claimHash)))
+                        .build());
+        record(registry, codes, "lmLiquidateAndConvertActionScriptHash", hashOf(convert), convert);
+    }
+
+    /** real hash -> traced hash, for every script swapped; config datums are rewritten with these. */
+    private static final java.util.Map<String, String> SWAPPED = new java.util.LinkedHashMap<>();
+
+    private static void record(LoansContractRegistry registry, java.util.Map<String, String> codes,
+                               String fieldName, String tracedHash, String applied) throws Exception {
+        java.lang.reflect.Field f = field(fieldName);
+        String real = (String) f.get(registry);
+        codes.put(tracedHash, applied);
+        f.set(registry, tracedHash);
+        SWAPPED.put(real, tracedHash);
+        System.out.println("TRACE PROBE: " + fieldName + " " + real + " -> " + tracedHash);
+    }
+
+    private static java.lang.reflect.Field field(String name) throws Exception {
+        java.lang.reflect.Field f = LoansContractRegistry.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f;
+    }
+
+    private static com.bloxbean.cardano.client.plutus.spec.PlutusData bytes(String hex) {
+        return com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(HexUtil.decodeHexString(hex));
+    }
+
+    private static String apply(String unapplied,
+                                com.bloxbean.cardano.client.plutus.spec.PlutusData... params) {
+        assertNotNull(unapplied, "traced blueprint is missing a validator");
+        var list = com.bloxbean.cardano.client.plutus.spec.ListPlutusData.builder().build();
+        for (var p : params) {
+            list.add(p);
         }
-        params.add(com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.builder().alternative(1)
-                .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of(com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(
-                        HexUtil.decodeHexString(registry.getLoanClaimActionScriptHash()))))
-                .build());
+        return com.bloxbean.cardano.aiken.AikenScriptUtil.applyParamToScript(list, unapplied);
+    }
 
-        String applied = com.bloxbean.cardano.aiken.AikenScriptUtil
-                .applyParamToScript(params, unapplied);
-        // The traced bytes hash differently, so the WHOLE transaction must move to the traced hash
-        // or the withdrawal, its redeemer and its witness disagree (RequiredRedeemersMismatch).
-        String tracedHash = HexUtil.encodeHexString(
-                com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil
-                        .getPlutusScriptFromCompiledCode(applied, PlutusVersion.v3).getScriptHash());
-        java.lang.reflect.Field codes =
-                LoansContractRegistry.class.getDeclaredField("appliedCompiledCode");
-        codes.setAccessible(true);
-        ((java.util.Map<String, String>) codes.get(registry)).put(tracedHash, applied);
-        java.lang.reflect.Field hash =
-                LoansContractRegistry.class.getDeclaredField("lmLiquidateAndConvertActionScriptHash");
-        hash.setAccessible(true);
-        System.out.println("TRACE PROBE: " + hash.get(registry) + " -> " + tracedHash);
-        REAL_CONVERT_HASH = (String) hash.get(registry);
-        TRACED_CONVERT_HASH = tracedHash;
-        hash.set(registry, tracedHash);
+    private static String hashOf(String applied) throws Exception {
+        return HexUtil.encodeHexString(com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil
+                .getPlutusScriptFromCompiledCode(applied, PlutusVersion.v3).getScriptHash());
+    }
+
+    /** Config datums name the real hashes; the traced universe must name the traced ones. */
+    private static void repointConfigDatum(Utxo utxo) {
+        if (SWAPPED.isEmpty() || utxo.getInlineDatum() == null) {
+            return;
+        }
+        String d = utxo.getInlineDatum();
+        for (var e : SWAPPED.entrySet()) {
+            d = d.replace(e.getKey(), e.getValue());
+        }
+        utxo.setInlineDatum(d);
     }
 }

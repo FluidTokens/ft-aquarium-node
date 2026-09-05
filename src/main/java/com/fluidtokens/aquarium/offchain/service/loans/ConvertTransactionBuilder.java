@@ -331,6 +331,21 @@ public class ConvertTransactionBuilder {
         tx.payToContract(request.changeAddress(), List.of(Amount.lovelace(BigInteger.ZERO)),
                 plan.refundDatum());
 
+        // ⛔ THE LOAN NFT MUST BE BURNED, and until 2026-09-05 this builder minted nothing at all.
+        //
+        // loan_claim_action requires `quantity_of(self.mint, loanPolicyId, inputAction.loanId) == -1`
+        // — the claim is what RETIRES the loan. With no mint field the NFT simply fell into the bot's
+        // change output, which is how it was first noticed (findings §57.3, recorded as an open lead
+        // before it could be confirmed). Traced evaluation named the conjunct outright:
+        //   Log("quantity_of(self.mint, loanPolicyId, inputAction.loanId) == -1 ? False")
+        //
+        // Both liquidation siblings already do this identically; convert was the one that did not.
+        // isPoolOrigin=false / originWithdrawRedeemerIndex=0 are inert for a burn: loan.ak's
+        // check_mint reads them only when something is MINTED (quantity > 0).
+        tx.mintAsset(registry.getLoanScript(),
+                List.of(new com.bloxbean.cardano.client.transaction.spec.Asset("0x" + request.claim().loanId(), BigInteger.ONE.negate())),
+                LiquidationTxEncoder.loanMintRedeemer(configRefIndex, false, 0));
+
         // The four withdraw-0 invocations. ⚠ The asset-manager withdraw script must be ABSENT: the
         // validator explicitly refuses a convert that also spends an asset-manager input.
         tx.withdraw(rewardAddress(registry.getLoanPolicyId()), BigInteger.ZERO,
