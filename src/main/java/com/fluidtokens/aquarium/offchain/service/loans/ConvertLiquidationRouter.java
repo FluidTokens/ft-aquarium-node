@@ -23,6 +23,8 @@ import com.bloxbean.cardano.client.plutus.spec.BytesPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -178,6 +180,16 @@ public class ConvertLiquidationRouter {
         return time.toInstant(ZoneOffset.UTC).toEpochMilli();
     }
 
+    /** The feed for a non-ada leg, refused by name rather than defaulted when it is absent. */
+    private static OraclePriceFeed feedOf(Map<String, OracleEntry> oracles, AssetType oracleToken) {
+        OracleEntry entry = oracles.get(oracleToken.toUnit());
+        if (entry == null) {
+            throw new IllegalStateException("no oracle feed for " + oracleToken.toUnit()
+                    + "; the loan's figures cannot be derived at the body's validFrom");
+        }
+        return entry.feed();
+    }
+
     private static void put(Map<String, TransactionInput> into, String scriptHash,
                             TransactionInput coordinate) {
         if (scriptHash != null && !scriptHash.isBlank() && coordinate != null) {
@@ -293,26 +305,6 @@ public class ConvertLiquidationRouter {
                                 + "; convert is impossible for this loan, not merely unprofitable — "
                                 + "set this market to action: ANTICIPATE if it should be liquidated"));
 
-        // 2. Everything the validator dictates, computed against that pool.
-        AssetType lenderBond = new AssetType(registry.getLenderBondPolicyId(), assessment.loan().loanId());
-        ConvertOrderPlan plan = ConvertOrderPlan.plan(collateral, loan.principalAsset(),
-                assessment.loan().collateralAmount(), assessment.equity(), assessment.remainingDebt(),
-                assessment.bond().datum().liquidationFeePerMille().longValueExact(),
-                assessment.bond().datum().shouldLiquidationConvertToPrincipal(),
-                ((LiquidationMode.Liquidation) loan.liquidationMode()).equityInPrincipalCurrency(),
-                pool.datum(), loansConfiguration.getMinswapPoolPolicyId(), lenderBond,
-                assessment.bond().datum().lenderAuth(),
-                ConvertTxEncoder.plainScriptAddress(registry.getAssetManagerSpendScriptHash()),
-                loanUtxo.getTxHash(), loanUtxo.getOutputIndex());
-
-        OracleEntry collateralOracle =
-                oraclesByOracleTokenUnit.get(loan.collateral().oracleTokenAsset().toUnit());
-
-        ClaimData claim = new ClaimData((LiquidationMode.Liquidation) loan.liquidationMode(),
-                BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
-                assessment.bond().datum().lenderAuth(), assessment.equity(),
-                assessment.loan().loanId(), assessment.remainingDebt());
-
         // ⛔ MILLISECONDS ARE NOT SLOTS, and until 2026-09-05 this router handed the caller's
         // millisecond window straight into a record whose components are `validFromSlot` /
         // `validToSlot`. Both are `long` and both are positional, so javac saw nothing and the
@@ -325,6 +317,57 @@ public class ConvertLiquidationRouter {
         // Sibling parity is what localises a defect like this — "what is this path omitting that the
         // working ones do" — not a search for something novel.
         long[] slots = validitySlots(validFromMillis, validToMillis);
+
+        OracleEntry collateralOracle =
+                oraclesByOracleTokenUnit.get(loan.collateral().oracleTokenAsset().toUnit());
+
+        // ⛔ THE FIGURES ARE THE LOAN'S AT THE BODY'S OWN validFrom — NOT the assessment's.
+        //
+        // Until 2026-09-05 this passed `assessment.equity()` and `assessment.remainingDebt()`, the
+        // numbers the SCANNER computed at assessment time, into both the order plan and the claim
+        // redeemer — while the body's validity interval starts at a different instant. Interest
+        // accrues per slot, so the two disagree, and `loan_claim_action` recomputes them itself:
+        // the validator derives `swappableCollateralAmount = collateral − equity − liquidationFee`
+        // and `minimum_receive = remainingDebt` from what the redeemer carries.
+        //
+        // ⚑ SIBLING PARITY, the fourth time on this path. LiquidateTransactionBuilder does exactly
+        // this and then re-asserts it off the FINISHED body — five call sites of
+        // assertRedeemerFiguresMatchTheBodysValidFrom. This builder had none.
+        //
+        // ⚠ It became REACHABLE only when the slot fix (5b65c72) gave the body a real validFrom to
+        // disagree at: before that, evaluation died at PastHorizon long before any figure was
+        // compared. Clearing the third wall is what made the fourth visible — which is the shape of
+        // this whole path, and the reason "expect the next wall, not green" keeps being right.
+        long figuresAtMillis = millisOf(converters.slot().slotToTime(slots[0]));
+        BigInteger remainingDebt = LoanFinance.remainingDebt(loan, figuresAtMillis);
+        // The principal leg: ada is the synthesised 1:1 feed (retrieve_oracle_data's
+        // `expectedTokenPolicyId == ""` branch), any other principal needs its own feed.
+        OraclePriceFeed principalFeed = loan.principalAsset().isAda()
+                ? OraclePriceFeed.unit()
+                : feedOf(oraclesByOracleTokenUnit, loan.principalOracleAsset());
+        BigInteger equity = LoanFinance.redeemerEquity(
+                (LiquidationMode.Liquidation) loan.liquidationMode(),
+                Rational.fromInt(assessment.loan().collateralAmount()),
+                Rational.fromInt(remainingDebt),
+                principalFeed,
+                collateralOracle == null ? null : collateralOracle.feed());
+
+        // 2. Everything the validator dictates, computed against that pool.
+        AssetType lenderBond = new AssetType(registry.getLenderBondPolicyId(), assessment.loan().loanId());
+        ConvertOrderPlan plan = ConvertOrderPlan.plan(collateral, loan.principalAsset(),
+                assessment.loan().collateralAmount(), equity, remainingDebt,
+                assessment.bond().datum().liquidationFeePerMille().longValueExact(),
+                assessment.bond().datum().shouldLiquidationConvertToPrincipal(),
+                ((LiquidationMode.Liquidation) loan.liquidationMode()).equityInPrincipalCurrency(),
+                pool.datum(), loansConfiguration.getMinswapPoolPolicyId(), lenderBond,
+                assessment.bond().datum().lenderAuth(),
+                ConvertTxEncoder.plainScriptAddress(registry.getAssetManagerSpendScriptHash()),
+                loanUtxo.getTxHash(), loanUtxo.getOutputIndex());
+
+        ClaimData claim = new ClaimData((LiquidationMode.Liquidation) loan.liquidationMode(),
+                BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
+                assessment.bond().datum().lenderAuth(), equity,
+                assessment.loan().loanId(), remainingDebt);
 
         // 3. BUILD, then price. The gate needs the fee this transaction actually pays.
         Transaction transaction = builder.build(new ConvertTransactionBuilder.Request(
