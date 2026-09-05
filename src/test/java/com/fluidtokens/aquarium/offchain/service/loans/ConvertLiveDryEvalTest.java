@@ -75,16 +75,38 @@ class ConvertLiveDryEvalTest {
 
     // ---- the live candidate (findings §32) --------------------------------------------------------
 
-    private static final String LOAN_TX = "d832b78e3d4a9ff99dfa8f238ae378b37dbd36b30efd24d68e5786f99786cf99";
+    // ⇑ REPOINTED 2026-09-05 at the LIVE candidate. It was d832b78e…#1 (loan 1b6fda50…), which has
+    // since been REPAID — its escrow is the 25 ada the compound collected in f2a598a9…. A rig aimed
+    // at a settled loan reads a spent output, which Blockfrost answers happily (CCL trap 12:
+    // getTxOutput is not an existence check), so it fails for a reason unrelated to the code.
+    private static final String LOAN_TX = "4a95a00f8d0ba2d0ab0dca1cbbad9f4dd5aa9600dbcc2174f21f33c1fd12f80a";
     private static final int LOAN_IX = 1;
     private static final int BOND_IX = 3;
     /** The asset name shared by the loan NFT and both bonds. */
-    private static final String LOAN_ID = "1b6fda505ea9b739e42b5871d274344af37c196ddb70619541a7d06d";
+    private static final String LOAN_ID = "cae82d7d6cbe064249c49c685267fbe8185ddcb869f35ce9dc13495d";
     private static final AssetType FLDT =
             new AssetType("577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e", "0014df10464c4454");
 
-    /** Both config NFTs were minted in one transaction and have never been spent. */
+    /** The main config NFT, minted here and never spent. */
     private static final String CONFIG_TX = "7b9f20dbadaebe1400915e4a63444a9eb7515c21c1114d4bc9c77f1455148cb0";
+
+    /**
+     * ⛔ <b>The LM config is NOT at {@code CONFIG_TX#1} any more, and reading it there is silent.</b>
+     *
+     * <p>Both NFTs were minted in one transaction, and this rig read {@code CONFIG_TX#0} and
+     * {@code CONFIG_TX#1} accordingly. FluidTokens then updated the LMConfig <b>in place</b> —
+     * {@code 7b9f20db…#1} was consumed by {@code 8296a2fe…}, which recreated it at output 0 with a new
+     * field 5 (the convert action, {@code ed8d41e4…} → {@code dc715410…}).
+     *
+     * <p>⚠ <b>Nothing about reading the old coordinate fails.</b> CCL trap 12: {@code getTxOutput}
+     * answers "this output existed" from the creating transaction, and that stays true forever after
+     * it is spent. So the rig would have built against the SUPERSEDED datum and refused the convert
+     * action the node correctly derives — reproducing, in the rig, the exact production failure this
+     * rig exists to diagnose. <b>Same staleness class as the baked reference-script coordinate.</b>
+     */
+    private static final String LM_CONFIG_TX =
+            "8296a2fea4124a23d48dab15b9930731f44174090717d4cbf39e4e1e37364916";
+    private static final int LM_CONFIG_IX = 0;
 
     // ---- mainnet deployment coordinates -----------------------------------------------------------
 
@@ -218,7 +240,7 @@ class ConvertLiveDryEvalTest {
         Utxo loanUtxo = output(backend, LOAN_TX, LOAN_IX);
         Utxo bondUtxo = output(backend, LOAN_TX, BOND_IX);
         Utxo configUtxo = output(backend, CONFIG_TX, 0);
-        Utxo lmConfigUtxo = output(backend, CONFIG_TX, 1);
+        Utxo lmConfigUtxo = output(backend, LM_CONFIG_TX, LM_CONFIG_IX);
         Utxo poolUtxo = pool(backend);
 
         // ⛔ INSTRUMENTATION, not reasoning. Every fixture the validator will read, printed as fetched,

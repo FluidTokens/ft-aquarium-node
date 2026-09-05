@@ -19,6 +19,10 @@ import org.cardanofoundation.conversions.CardanoConverters;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import com.bloxbean.cardano.client.plutus.spec.BytesPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusData;
+import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -181,12 +185,91 @@ public class ConvertLiquidationRouter {
         }
     }
 
-    private String orderAddress() {
-        return com.bloxbean.cardano.client.address.AddressProvider.getEntAddress(
+    /**
+     * ⛔ <b>The order output's address is DICTATED by the validator, not chosen by us — and this
+     * built an enterprise address unconditionally until 2026-09-05.</b>
+     *
+     * <p>{@code lm_liquidate_and_convert_action} at the deployed sha {@code bb4349c} requires, for a
+     * non-CIP-113 pair:
+     * <pre>
+     * minswapOrderOutput.address == Address {
+     *     payment_credential: Script(minswapOrderSpendScriptHash),
+     *     stake_credential:   lenderStakeCredential,        // ← the LENDER's, from the bond datum
+     * }
+     * </pre>
+     * ⚠ <b>An enterprise address has no stake part</b>, so it satisfies that equality only when the
+     * bond's {@code lenderStakeCredential} is {@code None}. This method's own {@code @param} javadoc
+     * on {@code ConvertTransactionBuilder.Request} has always said
+     * {@code Address(Script(minswapOrderSpendScriptHash), lenderStakeCredential)} — <b>the parameter
+     * was documented correctly and constructed wrongly</b>, and the two never met.
+     *
+     * <p>⚑ <b>Sibling parity, again:</b> {@code LiquidateTransactionBuilder} already decodes this
+     * exact {@code Option&lt;StakeCredential&gt;} (findings §7 D6) and this path did not use it. The
+     * decode is duplicated here deliberately and minimally rather than refactoring the working plain
+     * builder mid-diagnosis; <b>one shared decoder is the right end state and is recorded as a
+     * follow-up.</b>
+     *
+     * <p>⚠ {@code Some(Pointer{..})} is refused rather than guessed, exactly as the sibling refuses
+     * it: cardano-client-lib can build a pointer address, and putting guessed bytes on an output that
+     * carries someone else's collateral is not a trade this builder makes.
+     */
+    private String orderAddress(LenderBond bond) {
+        com.bloxbean.cardano.client.address.Credential payment =
                 com.bloxbean.cardano.client.address.Credential.fromScript(
                         com.bloxbean.cardano.client.util.HexUtil.decodeHexString(
-                                loansConfiguration.getMinswapOrderSpendScriptHash())),
-                network).getAddress();
+                                loansConfiguration.getMinswapOrderSpendScriptHash()));
+        com.bloxbean.cardano.client.address.Credential stake = lenderStake(bond);
+        return stake == null
+                ? com.bloxbean.cardano.client.address.AddressProvider
+                        .getEntAddress(payment, network).getAddress()
+                : com.bloxbean.cardano.client.address.AddressProvider
+                        .getBaseAddress(payment, stake, network).getAddress();
+    }
+
+    /**
+     * {@code Option<StakeCredential>} → a CCL credential, or {@code null} for {@code None}.
+     * {@code Some(Inline(credential))} contributes the stake part; anything else is refused by name.
+     */
+    private static com.bloxbean.cardano.client.address.Credential lenderStake(LenderBond bond) {
+        PlutusData data = bond.datum().lenderStakeCredential();
+        if (!(data instanceof ConstrPlutusData option)) {
+            throw new IllegalStateException("bond " + bond.loanId()
+                    + ": lenderStakeCredential is not a constructor");
+        }
+        if (option.getAlternative() == 1) {
+            return null;                                  // None ⇒ enterprise, and that is correct
+        }
+        if (option.getAlternative() != 0
+                || !(firstField(option) instanceof ConstrPlutusData referenced)) {
+            throw new IllegalStateException("bond " + bond.loanId()
+                    + ": Option<StakeCredential> constructor " + option.getAlternative());
+        }
+        if (referenced.getAlternative() == 1) {
+            throw new IllegalStateException("bond " + bond.loanId()
+                    + " carries a POINTER stake credential; refusing to guess its bytes onto an "
+                    + "output holding someone else's collateral");
+        }
+        if (referenced.getAlternative() != 0
+                || !(firstField(referenced) instanceof ConstrPlutusData credential)) {
+            throw new IllegalStateException("bond " + bond.loanId()
+                    + ": StakeCredential constructor " + referenced.getAlternative());
+        }
+        if (!(firstField(credential) instanceof BytesPlutusData hash)) {
+            throw new IllegalStateException("bond " + bond.loanId()
+                    + ": credential hash is not a ByteArray");
+        }
+        // Credential is VerificationKey (0) or Script (1) — the same two the ledger has.
+        return credential.getAlternative() == 0
+                ? com.bloxbean.cardano.client.address.Credential.fromKey(hash.getValue())
+                : com.bloxbean.cardano.client.address.Credential.fromScript(hash.getValue());
+    }
+
+    private static PlutusData firstField(ConstrPlutusData constr) {
+        var list = constr.getData().getPlutusDataList();
+        if (list.isEmpty()) {
+            throw new IllegalStateException("expected a field, found an empty constructor");
+        }
+        return list.get(0);
     }
 
     public Transaction buildConvertLiquidation(LiquidationAssessment assessment,
@@ -247,7 +330,7 @@ public class ConvertLiquidationRouter {
         Transaction transaction = builder.build(new ConvertTransactionBuilder.Request(
                 loanUtxo, bondUtxo, pool.utxo(), collateralOracle, configUtxo, lmConfigUtxo, walletUtxo,
                 referenceScripts(), plan, claim, collateral, lenderBond, loan.repaymentReceipts(),
-                orderAddress(), changeAddress, slots[0], slots[1]));
+                orderAddress(assessment.bond()), changeAddress, slots[0], slots[1]));
 
         BigInteger txFee = transaction.getBody().getFee();
         ConvertAssessment verdict = economics.assess(
