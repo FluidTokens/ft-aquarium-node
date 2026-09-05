@@ -278,4 +278,54 @@ class LoansReferenceScriptVerifierTest {
                 () -> verifier(oneCoordinate(), fiveHundred, true).verify());
         assertTrue(thrown.getMessage().contains("Cannot verify"), thrown.getMessage());
     }
+
+    /**
+     * ⛔ <b>THE NINTH SLOT — and its absence is the whole reason a stale coordinate here booted clean
+     * and failed four walls later.</b>
+     *
+     * <p>Eight slots were checked against the derived hash at startup; {@code
+     * lm-liquidate-and-convert-action} was checked by nothing. So {@code 56840ffb…#0}, which publishes
+     * the <b>superseded</b> convert action {@code ed8d41e4…}, passed startup — and the live build then
+     * withdrew from the reward address of the hash the node <em>derives</em> ({@code dc715410…}) with
+     * only {@code ed8d41e4…} on offer: {@code withdraw:3 missingRequiredScripts}.
+     *
+     * <p>⚑ <b>The check that would have caught it is the one this class already performs for every
+     * other slot</b> — compare the PUBLISHED hash against the DERIVED one. The coordinate had been
+     * confirmed only to resolve and to carry <em>a</em> script, which is a different claim.
+     *
+     * <p>⚠ Asserted on the expectation MAP rather than by reaching chain, exactly as the sibling
+     * assertions here do: the value under test is which keys are covered, not what the chain says.
+     */
+    @Test
+    void theConvertActionSlotIsVerifiedLikeTheOtherEight() {
+        assertTrue(expectationKeys().contains(
+                        "loans.liquidation.reference-scripts.lm-liquidate-and-convert-action"),
+                "the convert action is not verified at startup, so a stale coordinate there boots "
+                        + "clean and fails at build with missingRequiredScripts. Covered keys: "
+                        + expectationKeys());
+    }
+
+    /** Every named slot configured, so the covered-key set is the only variable. */
+    private static java.util.Set<String> expectationKeys() {
+        AppConfig.LiquidationConfiguration all = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
+                java.math.BigInteger.ZERO, 200, 30,
+                new LiquidateTransactionBuilder.ReferenceScripts(
+                        in(1), in(2), in(3), in(4), in(5), in(6), in(7), in(8), in(9)));
+        return new LoansReferenceScriptVerifier(REGISTRY, all,
+                (tx, ix) -> { throw new UnsupportedOperationException("expectations() must not reach the chain"); }, false).expectations().keySet();
+    }
+
+    private static com.bloxbean.cardano.client.transaction.spec.TransactionInput in(int n) {
+        return new com.bloxbean.cardano.client.transaction.spec.TransactionInput(
+                String.valueOf(n).repeat(64).substring(0, 64), 0);
+    }
+
+    /** ⚠ Proof of harness: the reader must see the slots that ARE covered, or the test above is vacuous. */
+    @Test
+    void theExpectationReaderSeesEveryConfiguredSlot() {
+        assertEquals(9, expectationKeys().size(),
+                "nine named reference-script slots exist and all nine must be verified: "
+                        + expectationKeys());
+    }
 }

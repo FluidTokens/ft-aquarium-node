@@ -329,9 +329,22 @@ loans:
       asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0}
       # ⚑ The CONVERT action. It has NO AQUARIUM_LIQUIDATION_REF_* alias -- the only route in is
       # the relaxed name LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION.
-      # ⚠ It binds and is verified today but ConvertLiquidationRouter still passes Map.of(), so it
-      # is INERT until that is fixed. Baked anyway: when the fix lands nothing needs reconfiguring.
-      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:56840ffb07ca0ad4e1eb921695bad5d2719f838612008e13bfe7f775933a7def#0}
+      #
+      # ⛔ CORRECTED 2026-09-05. This was 56840ffb...#0, which publishes ed8d41e4... -- the SUPERSEDED
+      # convert action, from before FluidTokens' in-place LMConfig fix. The node derives dc715410...
+      # from the vendored blueprint, so the transaction withdrew from dc715410's reward address while
+      # the only script offered was ed8d41e4's: `withdraw:3 missingRequiredScripts`, found four walls
+      # deep in a live mainnet build.
+      #
+      # ⚠ The coordinate below was in Giovanni's own config paste that morning
+      # (LM_LIQUIDATE_AND_CONVERT_SCRIPT_REF). It was baked from findings section 24's older verified
+      # set instead, and the check that would have caught it -- comparing the published hash against
+      # the DERIVED one -- was not run: the coordinate was only confirmed to resolve and to carry
+      # *a* script. Verified now: e4e47ab1...#0 publishes dc715410..., 5,516 bytes, unspent.
+      #
+      # ⇒ And LoansReferenceScriptVerifier now covers this slot too, so a future staleness here
+      # hard-fails at boot naming the key, exactly like the other eight.
+      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:e4e47ab13b26a200d5939def5ef7d60af3dc0a719dac0aadbcbafb191f9c6541#0}
 
 scheduling:
   transaction-processor:

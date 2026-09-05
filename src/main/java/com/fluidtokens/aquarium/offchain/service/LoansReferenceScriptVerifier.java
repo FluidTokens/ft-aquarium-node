@@ -134,7 +134,12 @@ public class LoansReferenceScriptVerifier {
      * are absent rather than checked: "not published" is a legal configuration, it just makes the
      * transaction larger.
      */
-    private Map<String, Expectation> expectations() {
+    /**
+     * Package-private so a test can assert WHICH SLOTS ARE COVERED. That set is the thing that was
+     * wrong — the convert action was absent, so a stale coordinate there was the one kind that boots
+     * clean — and a set is only assertable if it can be read.
+     */
+    Map<String, Expectation> expectations() {
         LiquidateTransactionBuilder.ReferenceScripts scripts = configuration.getReferenceScripts();
         Map<String, Expectation> expected = new LinkedHashMap<>();
         put(expected, "loans.liquidation.reference-scripts.loan",
@@ -151,9 +156,21 @@ public class LoansReferenceScriptVerifier {
                 scripts.lmLiquidateAction(), registry.getLmLiquidateActionScriptHash());
         put(expected, "loans.liquidation.reference-scripts.asset-manager",
                 scripts.assetManager(), registry.getAssetManagerWithdrawScriptHash());
+        // ⛔ THE NINTH SLOT, ADDED 2026-09-05 — and its absence is why a stale coordinate here was the
+        // ONE kind that boots clean. Every other slot is hard-checked against the derived hash at
+        // startup; this one was checked by nothing, so `56840ffb…#0` — which publishes the SUPERSEDED
+        // convert action ed8d41e4… — passed startup and failed at build with
+        // `withdraw:3 missingRequiredScripts`, four walls deep into a live mainnet debug.
+        //
+        // ⚠ The derived hash is null when loans.minswap.* is not configured, and put() skips a null
+        // expectation, so a node that legitimately cannot convert is unaffected.
         put(expected, "loans.liquidation.reference-scripts.lm-liquidate-and-pay-in-advance-action",
                 scripts.lmLiquidateAndPayInAdvanceAction(),
                 registry.getLmLiquidateAndPayInAdvanceActionScriptHash());
+        put(expected, "loans.liquidation.reference-scripts.lm-liquidate-and-convert-action",
+                scripts.lmLiquidateAndConvertAction(),
+                registry.getLmLiquidateAndConvertActionScriptHash());
+
         return expected;
     }
 
