@@ -4830,3 +4830,90 @@ responses.
 ⇒ **Every mainnet path is now blocked on the market rather than on us**, which is a different and
 better place to be than this morning — and it means the next real test arrives when someone opens a
 loan, not when we finish something.
+
+## 57. ⛔ HANDOFF — the convert path is four defects deep, and the next lead is an INVARIANT BUDGET (2026-09-05)
+
+**Read this before touching the convert path.** It is written for a session that has just
+rehydrated and has none of the afternoon's context.
+
+⚠ **This section lives here rather than in WORKLOG.md deliberately.** Both `PLAN.md` and
+`WORKLOG.md` are in `.git/info/exclude` (the public-repo tracking rule), so **neither survives a
+clone and neither is visible to anyone but this machine.** `docs/lending-v4-findings.md` is tracked
+and is what CLAUDE.md points a new session at. *A handoff in an untracked file is a handoff to
+one machine.*
+
+### 57.1 Where it stands
+
+`origin/feat/lending-v4` at **`2ae88e8`**. Four defects found and fixed today, each only visible
+once its predecessor stopped firing:
+
+| | defect | commit |
+|---|---|---|
+| 1 | the Minswap pool lookup read a 404 as an outage, so the either-order fallback rethrew and never tried the ordering that works | `166ac41` |
+| 2 | `ConvertLiquidationRouter` passed `Map.of()`, so all six validators travelled inline — 20,270 B against 16,384 | `0e4ffa5` |
+| 3 | milliseconds passed positionally into `validFromSlot`/`validToSlot` — `PastHorizon`, ~12,776× past the tip | `5b65c72` |
+| 4 | the baked convert-action coordinate published the **superseded** script, and the verifier covered 8 of 9 slots so it booted clean | `704dbc1` |
+
+Plus two fixes that are correct and **did not** move the failure: the order address dropped the
+lender's stake credential (`4a2ba29`, latent — this loan's lender has `None`), and the redeemer
+carried the **assessment's** figures rather than the loan's at the body's `validFrom` (`2ae88e8`,
+the sibling asserts it at five call sites and convert had none).
+
+### 57.2 ⇒ THE LEAD: the ex-units have not moved, and that is the measurement
+
+```
+AIKEN: RedeemerError { tag: "Withdraw", index: 3,
+       Machine(EvaluationFailure, ExBudget { mem: 909363, cpu: 377022438 }, []) }
+```
+**Withdrawal index 3 is `lm_liquidate_and_convert_action`** — read off the body's own withdrawal
+list, never by re-deriving the sort (§44.2 cost an hour to that).
+
+⛔ **That budget is byte-identical across FOUR unrelated changes.** A deterministic script that
+fails at the same conjunct consumes the same budget, so **the failure point has never moved and
+nothing touched so far is read before it.** ⇒ **The failure is EARLIER in the validator than
+everything examined top-down.**
+
+**Eliminated by reading the deployed sha `bb4349c` against our encoders** — and none moved the
+budget: pool-datum field positions (we read 1 and 2, matching FT's `unconstr_fields` positional
+read) · `lpAssetName` and `a_to_b_direction` (both from the pool datum, not argument order) · the
+pair check · `get_smart_destination_address` (non-CIP113 ⇒ `Address(Script(assetManagerSpend),
+None)`) · `AssetManagerDatumWithToken` is constructor 0 with an untyped `data` field · the
+nine-field `OrderDatum` order · `to_order_auth_method` · `equityInPrincipalCurrency` · the order
+address · the figures at `validFrom`.
+
+### 57.3 ⇒ WHAT TO DO NEXT: bisect, do not hypothesise
+
+**The search order above was wrong.** Reading the validator top-down and testing plausible
+candidates produced ten eliminations and no localisation. ⇒ **Perturb ONE input at a time and watch
+the budget.** An input whose change leaves `909363/377022438` untouched **is not read before the
+failure**; the first change that moves it **brackets the conjunct**. That is CCL trap 5's
+adversarial-mutation discipline pointed at **localisation** rather than validation, and it is
+mechanical rather than clever.
+
+### 57.4 The rig
+
+`ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,
+`AikenTransactionEvaluator` offline. **Ten seconds, no rebuild, no deploy, nothing on chain.**
+
+```
+export BLOCKFROST_MAINNET_KEY=<a MAINNET key>      # NOT BLOCKFROST_KEY — a preview key 403s here
+./gradlew test --tests '*ConvertLiveDryEvalTest*' -i
+```
+It prints the body the evaluator saw (reference inputs, withdrawals, outputs, redeemers in body
+order), what the evaluator can resolve, and the trace. **The local evaluator is the whole point:
+the remote one returns `{"ScriptFailures":{}}` — unsuccessful, naming nothing.**
+
+⚠ **The rig itself carried two stale coordinates** and would have diagnosed a ghost: it targeted
+the **repaid** loan `d832b78e…#1`, and read the LM config at `CONFIG_TX#1` which FluidTokens had
+**consumed in place** (`8296a2fe…#0` is live, with the new field 5). Neither read fails — CCL trap
+12, `getTxOutput` answers from the creating transaction forever. ⇒ **Re-check the rig's own
+coordinates against the live UTxO set before trusting a red.**
+
+### 57.5 Held, and not to be started without Giovanni's explicit word
+
+**O-2** (the gate scores ANTICIPATE on the fee slice rather than its return) and the **rider
+mis-scoping** (`minAdaFunded`'s rider fires on the convert path because the bond flag no longer
+selects pay-in-advance uniquely). ⇒ Both change **what the bot decides**, which is the economics
+side of the line: *dictated by the validator ⇒ build-correctness; encodes a choice ⇒ economics.*
+Build-correctness fixes proceed under a standing go; **each one states its classification in its
+own commit message**, so the boundary stays inspectable per push rather than asserted once.
