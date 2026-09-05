@@ -14,6 +14,8 @@ import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import lombok.extern.slf4j.Slf4j;
 
 import java.math.BigInteger;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -57,6 +59,7 @@ public class ConvertLiquidationRouter {
 
     private final LoansContractRegistry registry;
     private final AppConfig.LoansConfiguration loansConfiguration;
+    private final AppConfig.LiquidationConfiguration liquidationConfiguration;
     private final MinswapPoolResolver poolResolver;
     private final ConvertEconomics economics;
     private final ConvertTransactionBuilder builder;
@@ -64,12 +67,14 @@ public class ConvertLiquidationRouter {
 
     public ConvertLiquidationRouter(LoansContractRegistry registry,
                                     AppConfig.LoansConfiguration loansConfiguration,
+                                    AppConfig.LiquidationConfiguration liquidationConfiguration,
                                     MinswapPoolResolver poolResolver,
                                     ConvertEconomics economics,
                                     ConvertTransactionBuilder builder,
                                     com.bloxbean.cardano.client.common.model.Network network) {
         this.registry = registry;
         this.loansConfiguration = loansConfiguration;
+        this.liquidationConfiguration = liquidationConfiguration;
         this.poolResolver = poolResolver;
         this.economics = economics;
         this.builder = builder;
@@ -90,6 +95,60 @@ public class ConvertLiquidationRouter {
      * convert validator checks the order output against. ⚠ Only the non-CIP-113 branch is built, which
      * is the one a pool at Minswap's own credential takes.
      */
+    /**
+     * ⛔ <b>The configured reference scripts, as {@code scriptHash -> UTxO}. This was {@code Map.of()}
+     * until 2026-09-05, and that literal was the entire reason a convert could not be submitted.</b>
+     *
+     * <p>Every other path supplies this correctly — {@code LiquidationExecutor}, the pay-in-advance
+     * router, and {@code CompoundExecutor} all read the operator's coordinates. <b>Convert alone
+     * threw them away</b>, so all six of its validators travelled inline: <b>20,270 bytes of script
+     * against a 16,384 {@code max_tx_size}</b>, measured from the published mainnet scripts —
+     * {@code loan} 2,547 · {@code loan-spend} 1,158 · {@code lender-manager} 968 ·
+     * {@code lender-manager-spend} 1,158 · {@code loan-claim-action} 8,662 ·
+     * {@code lm-liquidate-and-convert-action} 5,777. A convert could be planned, priced and refused,
+     * but never built small enough to send.
+     *
+     * <p><b>Exactly the six {@code ConvertTransactionBuilder} can reference, and no more.</b> Its
+     * {@code referencedScripts} considers that set; anything else here would still be added as a
+     * reference input by {@code referenceInputs()} and charged the Conway per-byte reference-script
+     * fee for a script no redeemer invokes. So {@code asset-manager}, {@code lm-liquidate-action} and
+     * {@code lm-liquidate-and-pay-in-advance-action} are deliberately absent — they belong to the
+     * other two routes.
+     *
+     * <p>⚠ <b>Keyed by the REGISTRY's hash for each named slot, not by a hash read off the chain.</b>
+     * That is sound only because {@code LoansReferenceScriptVerifier} resolves every configured
+     * coordinate at startup and <b>hard-fails on a mismatch</b> — so by the time this runs, the claim
+     * "the key named {@code loan-spend} publishes the loan-spend script" is already proven. The
+     * compound path reads the hash off chain instead because its coordinates are an unnamed list,
+     * where a mislabelled entry would otherwise be inexpressible.
+     *
+     * <p>An unconfigured slot is simply absent: that validator travels inline, which is correct and
+     * larger — never referenced-but-absent, which is {@code RequiredRedeemersMismatch} (CCL trap 13).
+     */
+    Map<String, TransactionInput> referenceScripts() {
+        LiquidateTransactionBuilder.ReferenceScripts configured =
+                liquidationConfiguration == null ? null : liquidationConfiguration.getReferenceScripts();
+        if (configured == null) {
+            return Map.of();
+        }
+        Map<String, TransactionInput> resolved = new LinkedHashMap<>();
+        put(resolved, registry.getLoanPolicyId(), configured.loan());
+        put(resolved, registry.getLoanSpendScriptHash(), configured.loanSpend());
+        put(resolved, registry.getLenderManagerWithdrawScriptHash(), configured.lenderManager());
+        put(resolved, registry.getLenderManagerSpendScriptHash(), configured.lenderManagerSpend());
+        put(resolved, registry.getLoanClaimActionScriptHash(), configured.loanClaimAction());
+        put(resolved, registry.getLmLiquidateAndConvertActionScriptHash(),
+                configured.lmLiquidateAndConvertAction());
+        return Map.copyOf(resolved);
+    }
+
+    private static void put(Map<String, TransactionInput> into, String scriptHash,
+                            TransactionInput coordinate) {
+        if (scriptHash != null && !scriptHash.isBlank() && coordinate != null) {
+            into.put(scriptHash, coordinate);
+        }
+    }
+
     private String orderAddress() {
         return com.bloxbean.cardano.client.address.AddressProvider.getEntAddress(
                 com.bloxbean.cardano.client.address.Credential.fromScript(
@@ -142,7 +201,7 @@ public class ConvertLiquidationRouter {
         // 3. BUILD, then price. The gate needs the fee this transaction actually pays.
         Transaction transaction = builder.build(new ConvertTransactionBuilder.Request(
                 loanUtxo, bondUtxo, pool.utxo(), collateralOracle, configUtxo, lmConfigUtxo, walletUtxo,
-                Map.of(), plan, claim, collateral, lenderBond, loan.repaymentReceipts(),
+                referenceScripts(), plan, claim, collateral, lenderBond, loan.repaymentReceipts(),
                 orderAddress(), changeAddress, validFromMillis, validToMillis));
 
         BigInteger txFee = transaction.getBody().getFee();

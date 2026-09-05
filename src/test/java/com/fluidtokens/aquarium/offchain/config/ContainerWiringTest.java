@@ -99,6 +99,14 @@ class ContainerWiringTest {
                 .withBean(AppConfig.Network.class, () -> network)
                 .withBean(LoansContractRegistry.class, ContainerWiringTest::previewRegistry)
                 .withBean(AppConfig.LoansConfiguration.class, AppConfig.LoansConfiguration::new)
+                // ⚑ Added 2026-09-05 with the convert reference-script fix: ConvertLiquidationRouter
+                // now takes the LiquidationConfiguration, because that is where the operator's
+                // coordinates live. THIS TEST CAUGHT THAT — the runner went red the moment the
+                // constructor grew, which is precisely what a container-shape check is for.
+                .withBean(AppConfig.LiquidationConfiguration.class, () ->
+                        new AppConfig.LiquidationConfiguration(
+                                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
+                                java.math.BigInteger.ZERO, 200, 30))
                 .withBean(com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics.class,
                         () -> new com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics(
                                 new AppConfig.ConvertConfiguration(), network))
@@ -189,6 +197,14 @@ class ContainerWiringTest {
                 .withBean(LoansContractRegistry.class,
                         () -> new LoansContractRegistry(new AppConfig.LoansConfiguration()))
                 .withBean(AppConfig.LoansConfiguration.class, AppConfig.LoansConfiguration::new)
+                // ⚑ Added 2026-09-05 with the convert reference-script fix: ConvertLiquidationRouter
+                // now takes the LiquidationConfiguration, because that is where the operator's
+                // coordinates live. THIS TEST CAUGHT THAT — the runner went red the moment the
+                // constructor grew, which is precisely what a container-shape check is for.
+                .withBean(AppConfig.LiquidationConfiguration.class, () ->
+                        new AppConfig.LiquidationConfiguration(
+                                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
+                                java.math.BigInteger.ZERO, 200, 30))
                 .withBean(com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics.class,
                         () -> new com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics(
                                 new AppConfig.ConvertConfiguration(), network))
