@@ -348,6 +348,11 @@ loans:
 
 scheduling:
   transaction-processor:
+    # ⛔ OFF BY DEFAULT. The transaction processor builds and SUBMITS transactions from the
+    # configured wallet, so an operator who has not said "yes" gets a node that indexes and serves
+    # and spends nothing. Set to true to arm it.
+    # ⚠ Upgrading across this change: a processor that was running will STOP until this is set.
+    enabled: ${SCHEDULING_TRANSACTION_PROCESSOR_ENABLED:false}
     delay-minutes: ${SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES:5}
 
 blockfrost:

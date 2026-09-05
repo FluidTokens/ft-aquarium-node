@@ -41,9 +41,30 @@ import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 import static com.fluidtokens.aquarium.offchain.util.UtxoUtil.toUtxo;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+
 import static java.math.BigInteger.ZERO;
 
+/**
+ * ⛔ <b>OFF BY DEFAULT.</b> {@code scheduling.transaction-processor.enabled} must be set to
+ * {@code true} for this service to exist at all — there is no {@code matchIfMissing}, so an operator
+ * who says nothing gets a node that indexes and serves but never builds or submits a transaction.
+ *
+ * <p>⚠ <b>This is a deliberate change of default for an operator-facing image</b>, and it is the
+ * safe direction: the previous behaviour was that pulling the image and starting it began
+ * <em>spending from the configured wallet</em> on the next scheduling tick. Arming is now something
+ * an operator does on purpose. ⇒ An operator upgrading across this change and expecting the
+ * processor to keep running <b>must set the flag</b>; nothing else in the node will complain,
+ * because a quiet processor and a disabled one look identical from outside — which is exactly why
+ * this logs its own absence at startup rather than staying silent.
+ *
+ * <p>The gate is on the BEAN, not on the scheduled method, so a disabled processor costs nothing and
+ * cannot be re-armed by a stray call. Nothing injects this class — its many mentions elsewhere are
+ * javadoc cross-references — so removing it from the context is safe.
+ */
 @Service
+@ConditionalOnProperty(prefix = "scheduling.transaction-processor", name = "enabled",
+        havingValue = "true")
 @RequiredArgsConstructor
 @Slf4j
 public class ScheduledTransactionService {
