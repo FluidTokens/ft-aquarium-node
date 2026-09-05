@@ -173,11 +173,20 @@ class ConvertLiveDryEvalTest {
                 out.append("  [").append(i++).append("] ").append(w.getRewardAddress()).append('\n');
             }
             i = 0;
-            out.append("outputs (body order):\n");
+            out.append("outputs (body order, with serialised bytes):\n");
             for (var o : tx.getBody().getOutputs()) {
+                String bytes;
+                try {
+                    bytes = com.bloxbean.cardano.client.util.HexUtil.encodeHexString(
+                            com.bloxbean.cardano.client.common.cbor.CborSerializationUtil.serialize(
+                                    o.serialize()));
+                } catch (Exception e) {
+                    bytes = "(unserialisable: " + e + ")";
+                }
                 out.append("  [").append(i++).append("] ").append(o.getAddress(), 0,
                         Math.min(24, o.getAddress().length())).append("… coin=")
-                        .append(o.getValue().getCoin()).append('\n');
+                        .append(o.getValue().getCoin()).append('\n')
+                        .append("        ").append(bytes).append('\n');
             }
             if (tx.getWitnessSet() != null && tx.getWitnessSet().getRedeemers() != null) {
                 out.append("redeemers:\n");
