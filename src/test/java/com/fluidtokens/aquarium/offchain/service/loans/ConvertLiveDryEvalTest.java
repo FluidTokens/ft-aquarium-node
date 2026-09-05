@@ -402,7 +402,7 @@ class ConvertLiveDryEvalTest {
                 evaluator);
 
         var request = new ConvertTransactionBuilder.Request(loanUtxo, bondUtxo, poolUtxo, entry,
-                configUtxo, lmConfigUtxo, walletUtxos.get(0), referenceScripts(registry), plan, claim, FLDT, lenderBond,
+                configUtxo, lmConfigUtxo, walletUtxos.get(walletUtxos.size() - 1), referenceScripts(registry), plan, claim, FLDT, lenderBond,
                 loan.repaymentReceipts(), orderAddress(registry, bond), botAddress,
                 validFromSlot, validToSlot);
 

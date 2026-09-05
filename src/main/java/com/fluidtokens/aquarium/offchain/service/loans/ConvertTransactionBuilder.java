@@ -276,6 +276,22 @@ public class ConvertTransactionBuilder {
                 (ctx, txn) -> assertStructure(txn, request, successIndex, refundIndex, bondOutputIndex));
     }
 
+    /**
+     * ⛔ For PASS 1 ONLY. Reports success and costs nothing, so the layout probe cannot fail on the
+     * placeholder indexes it is built with — see the two-site note in {@link #assembleAndComplete}.
+     *
+     * <p>⚠ This is the shape CCL trap 8 warns about — a build that ships placeholder ex-units — and it
+     * is safe here for one reason, which must stay true: <b>pass 1's transaction never leaves this
+     * class.</b> Only {@code getBody().getOutputs()} ordering is read from it. Pass 2 runs the real
+     * evaluator, aborts on failure, and {@code assertStructure} re-derives the layout from the
+     * finished body. If pass 1's output is ever returned or submitted, this becomes the incident.
+     */
+    private static final com.bloxbean.cardano.client.api.TransactionEvaluator LAYOUT_PROBE_EVALUATOR =
+            (cbor, inputUtxos) -> com.bloxbean.cardano.client.api.model.Result
+                    .success("layout probe — ex-units deliberately not computed")
+                    .withValue(java.util.List
+                            .<com.bloxbean.cardano.client.api.model.EvaluationResult>of());
+
     // ---- assembly -------------------------------------------------------------------------------
 
     private Transaction assembleAndComplete(Request request, List<TransactionInput> refInputs,
@@ -436,7 +452,22 @@ public class ConvertTransactionBuilder {
                 // the observed indexes, and `assertStructure` re-derives that layout from the
                 // finished body, so nothing built on placeholder ex-units can escape this method.
                 .ignoreScriptCostEvaluationError(verify == null)
-                .withTxEvaluator(scriptCostEvaluator)
+                // ⛔ AND THE FLAG ABOVE IS NOT ENOUGH — cardano-client-lib 0.7.2 evaluates TWICE.
+                //
+                //   QuickTxBuilder:453   evaluateScriptCost()   — wrapped in try/catch, the flag guards it
+                //   ScriptBalanceTxProviders:78  evaluateScriptCost()  — UNGUARDED, and it rethrows
+                //
+                // The second one runs only when balancing ADDS INPUTS
+                // (`if (!containsScript || newInputSize == inputSize) return;`). So a probe whose
+                // nominated UTxO already covers the cost never reaches it, and a probe that needs
+                // more ada does — which is why this reproduced on a 7-UTxO operator wallet and not
+                // in a rig handing the builder one large UTxO.
+                //
+                // ⇒ Pass 1 therefore cannot be made TOLERANT of evaluation failure; it has to be
+                // made INCAPABLE of it. It is given an evaluator that always succeeds and costs
+                // nothing, because its ex-units are read by no one: the transaction is discarded and
+                // only its OUTPUT ORDERING is used.
+                .withTxEvaluator(verify == null ? LAYOUT_PROBE_EVALUATOR : scriptCostEvaluator)
                 // CCL trap 9b, BOTH seams: the default selector will spend a UTxO carrying a
                 // reference script, and ChangeOutputAdjustments falls through to its own selector.
                 .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
