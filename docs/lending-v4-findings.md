@@ -5107,6 +5107,32 @@ carry it, and the bond datum carries only `lenderAuth`, `lenderStakeCredential`,
 ⇒ **Existing loans and bonds need no migration** — the LM config's convert slot is the single
 pointer, and swapping it is sufficient.
 
+### 57.9c ⛔ NODE AND CONTRACT MUST SHIP TOGETHER — five literals that break the moment FluidTokens redeploys
+
+**When the convert validator is fixed (§57.9b), these mirrors must move in the SAME release.** They
+are not defaults; they are copies of validator literals, enforced by an exact equality and an
+`equals_data` over the whole order datum. ⇒ **A node on the new numbers against the old validator
+fails, and a node on the old numbers against the new one fails.** *There is no version of this that
+degrades gracefully.*
+
+```
+ConvertTxEncoder:52       MAX_BATCHER_FEE = 700_000              -> 2_000_000
+ConvertEconomics:95       ORDER_ADA_FOR_TOKEN_COLLATERAL         -> 4_000_000
+ConvertEconomics:206      orderAda = isAda ? ZERO : …            -> the ada branch gains the overhead
+ConvertOrderPlan:146      orderLovelace = isAda ? swappable      -> swappable + overhead
+ConvertTxEncoderTest:146  asserts the 700_000 literal            -> moves with it
+```
+
+⚑ **And the trigger is not a date, it is the deployed COORDINATE.** The new validator has a new
+script hash, so `loans.liquidation.reference-scripts.lm-liquidate-and-convert-action` changes too —
+⇒ **pin the coordinate change and the constant changes in ONE commit**, so a half-applied upgrade is
+impossible rather than merely unlikely. *This is §57.8's lesson again: the deployed coordinate and
+the code that assumes it are one fact, and splitting them across commits is how the node booted
+clean against a superseded script for days.*
+
+⚠ **Also part of that release: the new reward account needs registering** before the first convert,
+or `ConwayWithdrawalsMissingAccounts` returns exactly as it did on `dc715410…` (§57.8).
+
 ### 57.4 The rig
 
 `ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,
