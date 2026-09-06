@@ -5036,6 +5036,77 @@ validator.* **The liquidate-convert-and-compound path would fail exactly as conv
 ever run.** ⇒ **Confirm the script is real before spending a second deposit**; that is a separate
 question and is open.
 
+### 57.9 ⛔ NO FT CONVERT ORDER HAS EVER BEEN BATCHABLE — and the first one ever built is the proof
+
+The first convert liquidation confirmed on mainnet (`abd8b959…`, 2026-09-06) and its Minswap order
+has sat unexecuted ever since. **It always will.**
+
+**Ruled OUT by measurement, not assumed: slippage.** At live reserves the swap yields **29,223,503**
+against the datum's `min_receive` of **28,004,852** — **4.3% headroom.** *Economically it should
+execute immediately.*
+
+**What Minswap actually requires**, read off **six real successfully-batched orders** taken from the
+pool's own recent batch transactions — **six for six, identical:**
+
+```
+order ada        4,000,000
+max_batcher_fee  1a001e8480 = 2,000,000
+```
+⇒ **`order ada = max_batcher_fee + output min-ada` = 2,000,000 + 2,000,000.** The cap is declared
+per order and the batcher enforces it by **simply not taking orders whose cap is below its fee** —
+there is no error, no rejection, no event. *An unbatchable order is indistinguishable from a
+patient one.*
+
+**Ours: `max_batcher_fee` 700,000 and 2,800,000 ada.** ⛔ **The cap is 1.3 ADA short and the funding
+1.2 ADA short.**
+
+**⚑ AND NEITHER NUMBER IS OURS TO CHOOSE.** Both are hardcoded in the validator and enforced:
+
+| | `lm_liquidate_and_convert_action.ak` |
+|---|---|
+| `max_batcher_fee: 700000` | :273 — compared via `equals_data` over the whole order datum |
+| `quantity_of(minswapOrderOutput.value, "", "") == 2800000` | :292 — **an exact equality** |
+
+`ConvertEconomics.ORDER_ADA_FOR_TOKEN_COLLATERAL` and `ConvertTxEncoder.MAX_BATCHER_FEE` are
+**mirrors of those literals**. ⇒ **Changing either in this node makes the validator refuse. There is
+nothing to fix on our side.**
+
+**⚠ The ADA-collateral branch is worse.** :284 demands
+`quantity_of(order.value, "", "") == swappableCollateralAmount` — **exactly the swap amount and
+nothing else** ⇒ **no room for a batcher fee or min-ada at all.** *Both directions are broken; the
+token direction is merely the one we reached first.*
+
+**And nothing in this node checks BATCHABILITY** — only validator compliance. ⇒ *That is why a
+convert builds, evaluates, submits, confirms, and then sits forever: every gate we own was
+satisfied.* **The missing check is "will the counterparty's off-chain agent act on this", which no
+validator and no evaluator asks.**
+
+### 57.9a Recovery: not ours, and not Giovanni's
+
+`canceller = OAMSignature(6fae7995…)` = **`lenderAuth` from the bond — the LENDER's key.** ⛔ **The
+bot cannot cancel; neither can the operator.** And `refund_receiver` is the **asset-manager**
+address, so **even on cancel the 134,568,556 FLDT goes to the asset manager, not back to the bot.**
+⇒ **Recovery is the lender's action, and the collateral is the lender's either way.** *Do not build
+a cancel transaction for the operator to sign — their key is not the canceller.*
+
+### 57.9b Where the fix lives: UPSTREAM, and we cannot redeploy it
+
+⇒ **`ft-cardano-loans-v4` is `github.com/FluidTokens/ft-cardano-loans-v4` — FluidTokens' repository,
+not ours or a fork.** Every commit is theirs; we hold a read-only clone pinned at the deployed sha.
+**This is a bug REPORT, not a PR-and-redeploy.**
+
+**What their fix entails, so the report can say it:** changing that validator changes its **script
+hash**, which means a new published **reference script**, a **respend of the `lm_config` UTxO** to
+name the new hash in `LMConfigDatum.lmLiquidateAndConvertActionScriptHash` (admin-gated), and — ⚑
+**a fresh stake registration of the new reward account, or the very wall §57.8 just cleared reappears
+on the first convert.**
+
+**It is NOT a protocol migration.** Nothing else pins the convert action's hash: loan datums do not
+carry it, and the bond datum carries only `lenderAuth`, `lenderStakeCredential`,
+`shouldLiquidationConvertToPrincipal`, `liquidationFeePerMille`, `poolId` and `principalAsset`.
+⇒ **Existing loans and bonds need no migration** — the LM config's convert slot is the single
+pointer, and swapping it is sufficient.
+
 ### 57.4 The rig
 
 `ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,
