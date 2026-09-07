@@ -140,10 +140,10 @@ class ConvertTxEncoderTest {
 
         // lp_asset, max_batcher_fee and expiry sit where the live order puts them.
         assertEquals(5, indexOfAssetConstructor(fields(ours)));
-        assertEquals(BigInteger.valueOf(700_000L),
+        assertEquals(BigInteger.valueOf(2_000_000L),
                 ((BigIntPlutusData) fields(ours).get(7)).getValue(),
-                "the validator's literal, not a Minswap default we may track");
-        assertEquals(BigInteger.valueOf(700_000L), ConvertTxEncoder.MAX_BATCHER_FEE);
+                "the validator's literal at db5069e — and it is now Minswap's real 2 ada");
+        assertEquals(BigInteger.valueOf(2_000_000L), ConvertTxEncoder.MAX_BATCHER_FEE);
         assertEquals(1, ((ConstrPlutusData) fields(ours).get(8)).getAlternative(),
                 "expiry_setting_opt is None, which is constructor 1");
     }

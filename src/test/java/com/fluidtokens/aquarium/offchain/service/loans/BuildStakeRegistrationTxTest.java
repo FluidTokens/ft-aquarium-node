@@ -41,11 +41,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @EnabledIfEnvironmentVariable(named = "BUILD_STAKE_REG", matches = ".+")
 class BuildStakeRegistrationTxTest {
 
-    /** The convert action's reward account — script credential dc715410…, unregistered on mainnet. */
-    private static final String REWARD_ADDRESS =
-            "stake178w8z4qsvmy4xqmefp3lpg5gn7ep0fkv2jvw2wknupmn8xseaqrq4";
-    private static final String CONVERT_ACTION_HASH =
-            "dc71541066c95303794863f0a2889fb217a6cc5498e53ad3e077339a";
+    /**
+     * The convert action's reward account. Defaults to the CURRENT deployment (`c3f51e55…`, published
+     * at `8ab0c6d1…#0` after FluidTokens merged the batchability fix); override both with
+     * {@code REWARD_ADDRESS} / {@code SCRIPT_HASH} for a future redeploy.
+     *
+     * <p>⚠ <b>Every redeploy of this validator needs this again.</b> A new script hash is a new reward
+     * account, and a withdraw-zero is only valid from an account that exists — so
+     * {@code ConwayWithdrawalsMissingAccounts} recurs on the first convert otherwise. It has already
+     * happened once, on {@code dc715410…} (findings §57.8).
+     */
+    private static final String REWARD_ADDRESS = System.getenv().getOrDefault("REWARD_ADDRESS",
+            "stake178pl28j4m52k5npf5swlp43skrv0rjt089h45vth3z55kuqnzlvkh");
+    private static final String CONVERT_ACTION_HASH = System.getenv().getOrDefault("SCRIPT_HASH",
+            "c3f51e55dd156a4c29a41df0d630b0d8f1c96f396f5a317788a94b70");
     private static final String BOT_WALLET =
             "addr1q8kfqpcpm3c77sstcf9a5mzgfa0eya5rd2h8838hpd75fymg9lkpepnud2jejx80dujud0wn3sw86q7hrs95lg3utwkqvd5zcd";
 

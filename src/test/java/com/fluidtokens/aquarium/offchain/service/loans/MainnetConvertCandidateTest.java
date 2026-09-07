@@ -112,8 +112,8 @@ class MainnetConvertCandidateTest {
                 "100,000,000 * 50 / 1000, in FLDT units — the bot's whole income, and it is not ada");
         assertEquals(BigInteger.valueOf(1_113_904L), a.feeValueLovelace(),
                 "≈1.11 ada at the pool's mid-price");
-        assertEquals(BigInteger.valueOf(3_300_000L), a.measuredOutlay(),
-                "0.5 ada tx fee + the validator's 2.8 ada order rider");
+        assertEquals(BigInteger.valueOf(4_500_000L), a.measuredOutlay(),
+                "0.5 ada tx fee + the validator's 4 ada Minswap order overhead (db5069e)");
         assertEquals(BigInteger.valueOf(5_000_000L), a.outlay(),
                 "the DEX-cost floor governs, because the measurement alone is below Giovanni's 5 ada");
         assertTrue(a.boundByDexCostFloor());

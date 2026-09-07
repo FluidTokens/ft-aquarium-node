@@ -5133,6 +5133,57 @@ clean against a superseded script for days.*
 ⚠ **Also part of that release: the new reward account needs registering** before the first convert,
 or `ConwayWithdrawalsMissingAccounts` returns exactly as it did on `dc715410…` (§57.8).
 
+### 57.10 ✅ The redeploy taken up — one commit, coordinate and constants together (§57.9c honoured)
+
+FluidTokens merged PR #14 (`db5069e`) and redeployed. **The two coordinates Matteo sent were not
+sufficient**, and the reason is the one §57.9c predicted: the node **derives** hashes from the
+vendored blueprint, so a new coordinate without a new blueprint makes `LoansReferenceScriptVerifier`
+refuse to boot. *The safety net fired exactly as designed — loud, not silent.*
+
+| | |
+|---|---|
+| blueprint | re-vendored from FluidTokens' **committed** `plutus.json` at `db5069e` — sha256 `4f0c3691…` → `768c951b…` |
+| derived vs published | **`c3f51e55dd156a4c29a41df0d630b0d8f1c96f396f5a317788a94b70` = both** ✅ |
+| coordinate | `e4e47ab1…#0` → **`8ab0c6d1…#0`** |
+| `MAX_BATCHER_FEE` | 700,000 → **2,000,000** |
+| `MINSWAP_ORDER_OVERHEAD` | (was `ORDER_ADA_FOR_TOKEN_COLLATERAL` 2,800,000) → **4,000,000** |
+| ada-collateral order | `swappable` → **`swappable + overhead`** |
+
+⚑ **FluidTokens improved on the reported fix: `>=`, not `==`.** *"The ADA overhead is a FLOOR, not an
+equality."* ⇒ **A future min-ada rise no longer breaks the contract**, and an overshoot is legal where
+it used to be fatal. We still send exactly the floor.
+
+⚠ **AND THE OVERHEAD NOW APPLIES TO ADA COLLATERAL TOO** — the old ada branch demanded the order hold
+*exactly* the swap amount, which is precisely why those orders were unbatchable. ⇒ **A convert costs
+the bot 4 ada it does not get back, whichever kind the collateral is** — up from 2.8, and zero on the
+ada path. **That moves the break-even loan size again and it is Giovanni's to weigh.**
+
+**`LM_CONFIG_REF_UTXO` is not a node setting.** The lm-config UTxO is discovered by its NFT policy
+(`a56b0ac2…`, unchanged), so the new one is indexed at the same credential. **Only the convert-action
+reference coordinate is a config change.**
+
+**Blast radius confirmed minimal:** every other `lm_config` slot — liquidate, compound, withdrawBonds,
+payInAdvance, convert-and-compound — is unchanged. **One validator moved. Not a migration**, exactly as
+§57.9b predicted.
+
+⚠ **Tests were INVERTED, not deleted.** Several asserted the old asymmetry by name
+(`aTokenCollateralCostsTwoPointEightAdaThatAnAdaCollateralDoesNot`). *Those assertions were true, and
+the behaviour they pinned was the defect.* They now pin the symmetry and say so, so a regression to
+the unbatchable shape is visible rather than silently re-permitted.
+
+⛔ **STILL OUTSTANDING BEFORE CONVERT CAN RUN: the new reward account is UNREGISTERED.**
+`stake178pl28j4m52k5npf5swlp43skrv0rjt089h45vth3z55kuqnzlvkh` ⇒ the first convert fails
+`ConwayWithdrawalsMissingAccounts` exactly as `dc715410…` did (§57.8). **An unsigned registration is
+built and verified; it needs Giovanni's signature.** `BuildStakeRegistrationTxTest` now takes
+`REWARD_ADDRESS`/`SCRIPT_HASH` from the environment, **because every future redeploy needs this
+again.**
+
+⚠ **What could NOT be re-verified end to end: the rig's pinned candidate is spent.** Loan
+`4a95a00f…#1` was liquidated by the convert that confirmed on mainnet, so `ConvertLiveDryEvalTest`
+has no live candidate to rebuild against. ⇒ **This change is verified by derivation, by the unit
+suite and by the boot verifier's derived-vs-published check — but NOT by a fresh end-to-end build.**
+*Say so rather than let the earlier green be read as covering this.*
+
 ### 57.4 The rig
 
 `ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,

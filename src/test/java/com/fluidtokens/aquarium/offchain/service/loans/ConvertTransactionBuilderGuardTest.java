@@ -237,7 +237,7 @@ class ConvertTransactionBuilderGuardTest {
         }
         var outs = new ArrayList<TransactionOutput>();
         outs.add(out(BOT, 1_000_000L, null, null, null));                        // trap-1 dummy
-        outs.add(out(ORDER_ADDRESS, 2_800_000L, p.orderDatum(), FLDT,
+        outs.add(out(ORDER_ADDRESS, 4_000_000L, p.orderDatum(), FLDT,
                 p.swappableCollateralAmount()));                                  // 1: the order
         outs.add(out(BOND_ADDRESS, 2_000_000L, bondDatum, null, null));           // 2: the bond echo
         outs.add(out(BOT, 1_200_000L, p.successDatum(), null, null));             // 3: success carrier
@@ -333,14 +333,14 @@ class ConvertTransactionBuilderGuardTest {
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
                 () -> builder().assertStructure(txWith(outs), request(p, bondDatumHex()), 3, 4, 2));
         assertEquals(ConvertTransactionBuilder.Refusal.ORDER_OUTPUT_MISMATCH, e.reason());
-        assertTrue(e.getMessage().contains("2800000"), e.getMessage());
+        assertTrue(e.getMessage().contains("4000000"), e.getMessage());
     }
 
     @Test
     void anOrderCarryingTheWrongCollateralAmountIsRefused() {
         ConvertOrderPlan p = plan();
         var outs = goodOutputs(p, bondDatumHex());
-        outs.set(1, out(ORDER_ADDRESS, 2_800_000L, p.orderDatum(), FLDT,
+        outs.set(1, out(ORDER_ADDRESS, 4_000_000L, p.orderDatum(), FLDT,
                 p.swappableCollateralAmount().add(BigInteger.ONE)));
 
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,

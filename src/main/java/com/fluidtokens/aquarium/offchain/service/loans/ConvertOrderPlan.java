@@ -140,12 +140,13 @@ public record ConvertOrderPlan(boolean aToBDirection,
         // the same set either way, and the hash is not.
         String lpAssetName = ConvertTxEncoder.computeLpAssetName(pool.assetA(), pool.assetB());
 
-        // ⚠ The order's ada is a validator literal, and it differs by collateral kind: an ADA
-        // collateral's order holds exactly the swappable amount and NOTHING extra, while a token
-        // collateral's must carry 2_800_000 lovelace alongside — which the bot funds (findings §30).
+        // ⛔ The order's ada is the validator's, and BOTH branches carry the Minswap overhead now.
+        // Until db5069e the ada branch held exactly the swappable amount and nothing else, leaving no
+        // room for a batcher fee at all — which is why no convert order was ever batchable
+        // (findings §57.9). The validator now reads `>=`, so this is a floor we meet exactly.
         BigInteger orderLovelace = collateral.isAda()
-                ? swappable
-                : ConvertEconomics.ORDER_ADA_FOR_TOKEN_COLLATERAL;
+                ? swappable.add(ConvertEconomics.MINSWAP_ORDER_OVERHEAD)
+                : ConvertEconomics.MINSWAP_ORDER_OVERHEAD;
 
         PlutusData successDatum = ConvertTxEncoder.successDatum(collateral, lenderBond);
         PlutusData refundDatum = ConvertTxEncoder.refundDatum(loanTxHash, loanOutputIndex, lenderBond);

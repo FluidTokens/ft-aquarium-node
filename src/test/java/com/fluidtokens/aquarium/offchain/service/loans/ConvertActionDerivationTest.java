@@ -54,7 +54,7 @@ class ConvertActionDerivationTest {
      * ever something other than what FluidTokens built, which is the whole §51/§53 failure class.
      */
     private static final String MAINNET_CONVERT_ACTION =
-            "dc71541066c95303794863f0a2889fb217a6cc5498e53ad3e077339a";
+            "c3f51e55dd156a4c29a41df0d630b0d8f1c96f396f5a317788a94b70";
     /** Field 5 of the live preview LMConfigDatum — a DIFFERENT Minswap deployment's. */
     private static final String PREVIEW_CONVERT_ACTION =
             "aa3628d86e3f16b7d797d0633087859c11e3d200a5defc8ff0fc920e";
@@ -88,11 +88,12 @@ class ConvertActionDerivationTest {
         assertNotEquals(PREVIEW_CONVERT_ACTION, derived,
                 "if these ever DID match, preview would have gained a Minswap deployment and §28.1's "
                         + "no-rehearsal-on-preview finding would need re-reading");
-        // ⚠ RE-MEASURED 2026-09-04 from 52b778c8…, when loans-v4.plutus.json was re-vendored to
-        // FluidTokens' bb4349c. It moved because the convert action's compiled code changed, which is
-        // the whole point of the re-vendor — and it is pinned again rather than dropped, because an
-        // inequality that stops being checked against a known value stops noticing anything.
-        assertEquals("04540b1465a0c1134d43e440583fff1804e934e52013f208e15bd0fe", derived,
+        // ⚠ RE-MEASURED 2026-09-07, when loans-v4.plutus.json was re-vendored to FluidTokens'
+        // db5069e — the merged Minswap-batchability fix (§57.9). It moved for the same reason it
+        // moved at bb4349c: the convert action's compiled code changed, which is the whole point of
+        // the re-vendor. Pinned again rather than dropped, because an inequality that stops being
+        // checked against a known value stops noticing anything.
+        assertEquals("7227c4ef46c5895ea0d1d6aca757f9fd3346daee899ba55d5d566470", derived,
                 "the measured value, pinned so a change in the derivation is visible rather than "
                         + "hidden behind the inequality above");
     }

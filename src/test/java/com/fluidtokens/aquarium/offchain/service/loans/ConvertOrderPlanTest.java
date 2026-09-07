@@ -164,8 +164,8 @@ class ConvertOrderPlanTest {
      * order holds exactly the swappable amount and nothing extra.
      */
     @Test
-    void aTokenCollateralOrderCarriesTheValidatorsTwoPointEightAdaAndAnAdaOneDoesNot() throws IOException {
-        assertEquals(BigInteger.valueOf(2_800_000L), planTheRealCandidate(livePool()).orderLovelace());
+    void everyOrderCarriesTheMinswapOverhead_andTheAdaCaseAddsItToTheSwapAmount() throws IOException {
+        assertEquals(BigInteger.valueOf(4_000_000L), planTheRealCandidate(livePool()).orderLovelace());
 
         // The same loan with ADA collateral, against an ADA/FLDT-shaped pool with the roles swapped.
         var adaCollateralPool = new MinswapPoolDatum(AssetType.ada(), FLDT,
@@ -176,8 +176,13 @@ class ConvertOrderPlanTest {
                 new AuthorizationMethod.CardanoSignature("aa".repeat(28)), receiver(), LOAN_TX, 1);
 
         assertTrue(adaPlan.aToBDirection(), "now the collateral IS asset_a");
-        assertEquals(adaPlan.swappableCollateralAmount(), adaPlan.orderLovelace(),
-                "an ADA collateral's order lovelace IS the swappable amount — no rider at all");
+        // ⛔ INVERTED at db5069e, and the old assertion was the defect. An ada collateral's order
+        // used to hold exactly the swappable amount, which left no room for a batcher fee and made
+        // the order unbatchable (findings §57.9). It now carries the swap amount PLUS the overhead.
+        assertEquals(adaPlan.swappableCollateralAmount().add(BigInteger.valueOf(4_000_000L)),
+                adaPlan.orderLovelace(),
+                "an ada collateral's order is swap amount + minswap_order_overhead; equality with "
+                        + "the bare swap amount is the shape that could never be batched");
     }
 
     /** The two datum hashes are asymmetric by construction and must never coincide. */

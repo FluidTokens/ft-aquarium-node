@@ -63,7 +63,7 @@ class MainnetConvertActionDerivationTest {
 
     /** Read from the LIVE mainnet LMConfigDatum, field 5, after the 11:19 UTC in-place update. */
     private static final String DEPLOYED_CONVERT_ACTION =
-            "dc71541066c95303794863f0a2889fb217a6cc5498e53ad3e077339a";
+            "c3f51e55dd156a4c29a41df0d630b0d8f1c96f396f5a317788a94b70";
 
     /** What the LMConfigDatum published BEFORE it — the broken action (§51). */
     private static final String SUPERSEDED_CONVERT_ACTION =
@@ -120,10 +120,10 @@ class MainnetConvertActionDerivationTest {
     void fluidTokensCommittedFixDerivesTheHashMainnetNowPublishes() throws IOException {
         LoansContractRegistry registry = mainnetRegistry();
         String derived = applyMainnetParameters(
-                fixture("ft-bb4349c-convert-action-unapplied.hex"), registry);
+                fixture("ft-db5069e-convert-action-unapplied.hex"), registry);
 
         assertEquals(DEPLOYED_CONVERT_ACTION, derived,
-                "bb4349c does NOT derive the convert action deployed at 11:19 UTC. Something other "
+                "db5069e does NOT derive the convert action deployed. Something other "
                         + "than the committed fix is on chain, and nothing about the convert path may "
                         + "be believed until that is explained — this is exactly the §51/§53 shape, a "
                         + "compiled artefact meeting data from a different build. Do NOT re-vendor.");

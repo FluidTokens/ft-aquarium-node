@@ -25,7 +25,7 @@ import java.math.BigInteger;
  *
  * <h2>⛔ What the bot actually spends — measured, then floored</h2>
  * <pre>
- *   measuredOutlay = txFee + (collateral is ada ? 0 : 2_800_000)
+ *   measuredOutlay = txFee + 4_000_000
  *   outlay         = max(measuredOutlay, loans.liquidation.convert.dex-cost-floor-lovelace)
  * </pre>
  * The floor is Giovanni's ruling of 2026-09-03: <i>"the margin must take into account for convert the
@@ -39,12 +39,12 @@ import java.math.BigInteger;
  * wallet. Adding it to the bot's outlay would be a false attribution; refusing to account for it at
  * all would be optimistic. <b>A floor captures the conservatism without asserting who pays what</b>,
  * and the assessment records both figures so an operator can see which one bound.
- * The second term is the validator's, read at the deployed sha {@code e0b818e}: when the collateral
+ * The second term is the validator's, read at the deployed sha {@code db5069e}: when the collateral
  * is <b>not</b> ada, {@code lm_liquidate_and_convert_action} requires
- * {@code quantity_of(minswapOrderOutput.value, "", "") == 2800000} — the order output must carry
- * exactly 2.8 ada alongside the collateral, and that ada leaves with the order (Minswap's batcher fee
- * is 700,000 of it, and the receiver is the lender's asset manager, not the bot). <b>So a token
- * collateral costs the bot 2.8 ada it does not get back</b>, which is four to five times a typical
+ * {@code quantity_of(minswapOrderOutput.value, "", "") >= 4000000} — the order output must carry
+ * at least 4 ada alongside the collateral, and that ada leaves with the order (Minswap's batcher fee
+ * is 2,000,000 of it, and the receiver is the lender's asset manager, not the bot). <b>So a convert
+ * costs the bot 4 ada it does not get back</b>, which is four to five times a typical
  * transaction fee and would dominate any model that omitted it. When the collateral IS ada the
  * validator constrains the order's lovelace to the swappable amount alone and there is no extra term.
  *
@@ -88,11 +88,22 @@ public class ConvertEconomics {
     private static final BigInteger PER_MILLE = BigInteger.valueOf(1000L);
 
     /**
-     * {@code quantity_of(minswapOrderOutput.value, "", "") == 2800000} — the exact literal in
-     * {@code lm_liquidate_and_convert_action.ak} at {@code e0b818e}, for a non-ada collateral.
-     * Not a min-ada estimate and not ours to tune: a different figure fails the validator.
+     * {@code minswap_order_overhead} — the constant in {@code lm_liquidate_and_convert_action.ak} at
+     * the deployed sha {@code db5069e}, and it is what Minswap actually needs:
+     * {@code max_batcher_fee 2,000,000 + output min-ada 2,000,000}. Measured against six real
+     * batched orders, which carry exactly 4,000,000 (findings §57.9).
+     *
+     * <p>⚑ <b>It is now a FLOOR, not an equality.</b> The validator reads {@code >=}, not {@code ==}
+     * — FluidTokens' own improvement on the reported fix — so an overshoot is legal where it used to
+     * be fatal. We still send exactly the floor; the difference is that a future min-ada rise no
+     * longer breaks the contract.
+     *
+     * <p>⚠ <b>And it now applies to BOTH collateral kinds.</b> The previous literal (2,800,000) was
+     * token-only because the ada branch demanded the order hold exactly the swap amount and nothing
+     * else — which is precisely why no convert order was ever batchable. The ada branch now requires
+     * {@code swappable + minswap_order_overhead}, so the bot funds this overhead either way.
      */
-    static final BigInteger ORDER_ADA_FOR_TOKEN_COLLATERAL = BigInteger.valueOf(2_800_000L);
+    static final BigInteger MINSWAP_ORDER_OVERHEAD = BigInteger.valueOf(4_000_000L);
 
     private final AppConfig.ConvertConfiguration configuration;
     private final AppConfig.Network network;
@@ -203,7 +214,11 @@ public class ConvertEconomics {
             return ConvertAssessment.refused(ConvertExclusion.COLLATERAL_UNPRICEABLE);
         }
 
-        BigInteger orderAda = collateralIsAda ? BigInteger.ZERO : ORDER_ADA_FOR_TOKEN_COLLATERAL;
+        // ⚠ Both branches now, not just token collateral: the fixed validator requires the overhead
+        // on an ada-collateral order too (`>= swappable + minswap_order_overhead`), so the bot funds
+        // it either way. This was ZERO for ada collateral while the ada branch carried only the swap
+        // amount — the shape that made those orders unbatchable.
+        BigInteger orderAda = MINSWAP_ORDER_OVERHEAD;
         BigInteger measuredOutlay = txFee.add(orderAda);
         BigInteger dexCostFloor = configuration.getDexCostFloorLovelace();
         // max(), never sum: the floor already covers the batcher fee, so adding it would double-count.

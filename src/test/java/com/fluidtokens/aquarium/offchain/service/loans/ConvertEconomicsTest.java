@@ -122,16 +122,22 @@ class ConvertEconomicsTest {
         assertEquals(BigInteger.valueOf(50L), ConvertEconomics.liquidationFee(BigInteger.valueOf(1000L), 50L));
     }
 
-    // ---- the 2.8 ada, which is the term most likely to be forgotten --------------------------
+    // ---- the Minswap order overhead, the term most likely to be forgotten --------------------
 
     /**
-     * ⛔ THE ONE THAT PAYS FOR THIS FILE. A token collateral forces
-     * {@code quantity_of(orderOutput, "", "") == 2_800_000} and that ada leaves with the order. The
-     * same candidate is profitable when the collateral is ada and a loss when it is a token, on
-     * numbers that differ in nothing else.
+     * ⛔ THE ONE THAT PAYS FOR THIS FILE. Every convert funds {@code minswap_order_overhead}
+     * (4,000,000) into the order, and that ada leaves with the order — the receiver is the lender's
+     * asset manager, not the bot.
+     *
+     * <p>⚑ <b>This test used to assert the OPPOSITE for an ada collateral, and that asymmetry was
+     * the defect.</b> Until db5069e the ada branch required the order to hold exactly the swappable
+     * amount and nothing else, so the model recorded a zero cost — truthfully, because the validator
+     * really did mandate no extra ada. It was the validator that was wrong: an order with no room for
+     * a batcher fee can never be batched (findings §57.9). The assertion is inverted rather than
+     * deleted, so the symmetry is pinned and a regression to the old shape is visible.
      */
     @Test
-    void aTokenCollateralCostsTwoPointEightAdaThatAnAdaCollateralDoesNot() {
+    void everyConvertFundsTheMinswapOverhead_theOldAdaExemptionWasTheDefect() {
         // Fee income worth 2_000_000 lovelace, tx fee 1_000_000.
         ConvertEconomics gate = economics(true, 0);
         BigInteger collateral = BigInteger.valueOf(1_000_000L);
@@ -144,17 +150,21 @@ class ConvertEconomicsTest {
         assertEquals(BigInteger.valueOf(4_000L), asAda.liquidationFee());
         assertEquals(BigInteger.valueOf(2_000_000L), asAda.feeValueLovelace());
 
-        assertEquals(BigInteger.ZERO, asAda.orderAdaFunded(),
-                "read at e0b818e: for an ADA collateral the order's TOTAL lovelace must equal the "
-                        + "swappable amount, so the validator mandates no extra ada at all");
-        assertEquals(BigInteger.valueOf(1_000_000L), asAda.net());
-        assertTrue(asAda.approved(), "an ada collateral pays only the transaction fee");
+        // ⛔ Both kinds now, and the ada case is the one that changed: `>= swappable + overhead`.
+        assertEquals(BigInteger.valueOf(4_000_000L), asAda.orderAdaFunded(),
+                "an ada collateral funds the overhead too since db5069e — the old zero was the "
+                        + "unbatchable shape, not a saving");
+        assertEquals(BigInteger.valueOf(4_000_000L), asToken.orderAdaFunded());
 
-        assertEquals(BigInteger.valueOf(2_800_000L), asToken.orderAdaFunded());
-        assertEquals(BigInteger.valueOf(3_800_000L), asToken.outlay());
-        assertEquals(BigInteger.valueOf(-1_800_000L), asToken.net());
-        assertFalse(asToken.approved(), "the 2.8 ada the order carries is the bot's and it does not "
-                + "come back — a model that omits it approves a loss");
+        assertEquals(BigInteger.valueOf(5_000_000L), asAda.outlay());
+        assertEquals(BigInteger.valueOf(-3_000_000L), asAda.net());
+        assertFalse(asAda.approved(), "the overhead is the bot's and it does not come back — a model "
+                + "that omits it approves a loss, whichever kind the collateral is");
+        assertEquals(ConvertExclusion.NET_BELOW_FLOOR, asAda.exclusion());
+
+        assertEquals(BigInteger.valueOf(5_000_000L), asToken.outlay());
+        assertEquals(BigInteger.valueOf(-3_000_000L), asToken.net());
+        assertFalse(asToken.approved());
         assertEquals(ConvertExclusion.NET_BELOW_FLOOR, asToken.exclusion());
     }
 
@@ -173,30 +183,31 @@ class ConvertEconomicsTest {
                 feed(1_000, 1), ADA);
 
         assertEquals(BigInteger.valueOf(10_000_000L), a.feeValueLovelace());
-        assertEquals(BigInteger.valueOf(1_000_000L), a.measuredOutlay(), "what this tx demonstrably costs");
+        assertEquals(BigInteger.valueOf(5_000_000L), a.measuredOutlay(),
+                "what this tx demonstrably costs: 1 ada tx fee + the 4 ada Minswap overhead");
         assertEquals(BigInteger.valueOf(5_000_000L), a.dexCostFloor());
         assertEquals(BigInteger.valueOf(5_000_000L), a.outlay(),
-                "max(measured, floor) — a sum would be 6_000_000 and would charge the batcher twice");
+                "max(measured, floor) — a sum would be 10_000_000 and would charge the batcher twice");
         assertEquals(BigInteger.valueOf(5_000_000L), a.net());
-        assertTrue(a.boundByDexCostFloor(), "the operator's floor bound this, not the transaction");
     }
 
     /**
-     * ⚑ And it closes the gap on an ADA collateral, which the measurement alone leaves wide open: such
-     * a convert carries no mandatory order ada, so its measured outlay is a transaction fee and
-     * nothing else — while the batcher still takes its cut out of the swap.
+     * ⚑ The floor still binds when the measurement is small. Since db5069e an ada collateral also
+     * funds the 4 ada overhead, so the gap the floor closes is narrower than it was — but a cheap
+     * transaction can still measure below the operator's stated cost of doing DEX work.
      */
     @Test
-    void anAdaCollateralIsGovernedByTheFloorBecauseItsMeasuredCostIsOnlyTheTxFee() {
+    void theFloorStillBindsWhenTheMeasuredCostFallsBelowIt() {
         // Fee worth 3_000_000; tx fee 500_000. Profitable on the measurement, refused under the floor.
         ConvertEconomics gate = economics(true, 0, 5_000_000L);
         ConvertAssessment a = gate.assess(true, BigInteger.valueOf(1_000_000L), 3L, true,
                 feed(1_000, 1), BigInteger.valueOf(500_000L));
 
-        assertEquals(BigInteger.valueOf(500_000L), a.measuredOutlay());
+        assertEquals(BigInteger.valueOf(4_500_000L), a.measuredOutlay(),
+                "0.5 ada tx fee + the 4 ada Minswap overhead");
         assertEquals(BigInteger.valueOf(5_000_000L), a.outlay());
         assertEquals(BigInteger.valueOf(-2_000_000L), a.net());
-        assertFalse(a.approved(), "the measurement alone would have approved this at +2.5 ada");
+        assertFalse(a.approved(), "the measurement alone would have approved this");
     }
 
     /** A measured cost above the floor governs; the floor is a minimum, never a cap. */
@@ -206,8 +217,8 @@ class ConvertEconomicsTest {
         ConvertAssessment a = gate.assess(true, BigInteger.valueOf(1_000_000L), 10L, false,
                 feed(1_000, 1), BigInteger.valueOf(4_000_000L));
 
-        assertEquals(BigInteger.valueOf(6_800_000L), a.measuredOutlay(), "4 ada tx fee + 2.8 ada order");
-        assertEquals(BigInteger.valueOf(6_800_000L), a.outlay());
+        assertEquals(BigInteger.valueOf(8_000_000L), a.measuredOutlay(), "4 ada tx fee + 4 ada order");
+        assertEquals(BigInteger.valueOf(8_000_000L), a.outlay());
         assertFalse(a.boundByDexCostFloor());
     }
 
@@ -229,18 +240,21 @@ class ConvertEconomicsTest {
 
     @Test
     void theFloorIsInclusiveOnItsExactValueAndRefusesOneLovelaceBelow() {
-        // fee 1_000 units at 1 lovelace each = 1_000; txFee 900 -> net 100.
+        // ⚠ Scaled past the 4 ada Minswap overhead, which every convert now funds: the property
+        // under test is that net == floor is ALLOWED, and it needs an income that clears the
+        // overhead before a hundred lovelace of margin means anything.
+        // fee 1_000 units at 4_001 lovelace each = 4_001_000; txFee 900 + overhead 4_000_000 -> net 100.
         ConvertEconomics gate = economics(true, 100L);
         BigInteger collateral = BigInteger.valueOf(1_000_000L);
 
         ConvertAssessment onTheLine =
-                gate.assess(true, collateral, 1L, true, feed(1, 1), BigInteger.valueOf(900L));
+                gate.assess(true, collateral, 1L, true, feed(4_001, 1), BigInteger.valueOf(900L));
         assertEquals(BigInteger.valueOf(100L), onTheLine.net());
         assertTrue(onTheLine.approved(), "net == floor must be allowed; a strict > silently raises "
                 + "every operator's stated bound by one lovelace");
 
         ConvertAssessment justUnder =
-                gate.assess(true, collateral, 1L, true, feed(1, 1), BigInteger.valueOf(901L));
+                gate.assess(true, collateral, 1L, true, feed(4_001, 1), BigInteger.valueOf(901L));
         assertEquals(BigInteger.valueOf(99L), justUnder.net());
         assertFalse(justUnder.approved());
     }

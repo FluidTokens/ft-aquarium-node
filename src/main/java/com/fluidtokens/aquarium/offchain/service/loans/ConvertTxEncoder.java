@@ -46,10 +46,10 @@ public final class ConvertTxEncoder {
     }
 
     /**
-     * {@code max_batcher_fee} — the literal {@code 700000} in the validator, not a Minswap default we
+     * {@code max_batcher_fee} — the literal {@code 2000000} in the validator, not a Minswap default we
      * are free to track. A different figure fails {@code equals_data} on the order datum.
      */
-    public static final BigInteger MAX_BATCHER_FEE = BigInteger.valueOf(700_000L);
+    public static final BigInteger MAX_BATCHER_FEE = BigInteger.valueOf(2_000_000L);
 
     /** Every Minswap V2 pool NFT: policy = the pool policy, asset name = ASCII {@code MSP}. */
     public static final String POOL_NFT_ASSET_NAME = "4d5350";

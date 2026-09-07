@@ -344,7 +344,7 @@ loans:
       #
       # ⇒ And LoansReferenceScriptVerifier now covers this slot too, so a future staleness here
       # hard-fails at boot naming the key, exactly like the other eight.
-      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:e4e47ab13b26a200d5939def5ef7d60af3dc0a719dac0aadbcbafb191f9c6541#0}
+      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:8ab0c6d168746f5827aeb0d8981f9edbb9ae00a17db95d7d44e8a8a1b86ea0bf#0}
 
 scheduling:
   transaction-processor:
