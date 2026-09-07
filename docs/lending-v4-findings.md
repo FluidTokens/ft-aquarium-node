@@ -5202,6 +5202,44 @@ convert order actually BATCHES.** *That is the acceptance test; nothing offline 
 the lender's `lenderAuth` and its `refund_receiver` the asset manager ⇒ **recovery is FluidTokens'
 user's, not the operator's.**
 
+### 57.11 ⚑ THE BOOT VERIFIER CHECKS CONSISTENCY, NOT CURRENCY — and a stale image boots clean
+
+**Found 2026-09-07 while refusing to accept an inference.** The claim was reasonable: *the verifier
+hard-fails at boot, so a node running with convert enabled is a node whose verifier passed on the new
+coordinate.* **It is unsound, and the reason generalises.**
+
+`LoansReferenceScriptVerifier` compares **its own derived hash** against **its own configured
+coordinate**. Both move together in an image. ⇒ **An image that was never updated derives
+`dc715410…`, looks at `e4e47ab1…#0`, finds `dc715410…` still published there, and PASSES.**
+
+| | new image | **stale image** |
+|---|---|---|
+| derives | `c3f51e55…` | `dc715410…` |
+| configured coordinate | `8ab0c6d1…#0` | `e4e47ab1…#0` |
+| published there | `c3f51e55…` | `dc715410…` — *nothing was retired* |
+| **verifier** | ✅ | **✅** |
+
+⇒ **A clean boot cannot distinguish "current" from "internally consistent but superseded."** *The
+check is true and useless for the question being asked of it* — §22's axis problem, in our own
+production code rather than in a diagnostic.
+
+**⇒ THE FIX THAT WOULD CLOSE IT, and it is cheap:** the node already reads the live `lm_config`
+datum. **Compare the derived convert-action hash against the hash that datum PUBLISHES**, not only
+against what sits at our own coordinate. **The chain's config is the authority on which script is
+current; our config is only a claim about where to find it.** ⇒ *A stale image would then fail at
+boot with an exact message instead of running silently and refusing every convert at evaluation.*
+**Not yet implemented — offered, not assumed.**
+
+⚠ **The failure mode today is SAFE, and that is the only reason this is a follow-up rather than an
+incident.** The live `lm_config` names `c3f51e55…` and not `dc715410…`, so a stale image's convert is
+refused by `lender_manager.withdraw` at **evaluation, before submit** — nothing strands, no collateral
+is forfeit. *An earlier instinct that it would strand another order was wrong: the config respend
+closed that door.*
+
+⇒ **What it actually costs is DIAGNOSIS.** A stale node looks deployed, boots clean, and produces a
+confusing evaluation failure on the first candidate that reads like a new bug. **Which is §57.10's
+point once more: the silence of a working node and the silence of a wrong one are the same silence.**
+
 ### 57.4 The rig
 
 `ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,
