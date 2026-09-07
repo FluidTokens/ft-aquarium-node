@@ -5171,10 +5171,13 @@ payInAdvance, convert-and-compound — is unchanged. **One validator moved. Not 
 the behaviour they pinned was the defect.* They now pin the symmetry and say so, so a regression to
 the unbatchable shape is visible rather than silently re-permitted.
 
-⛔ **STILL OUTSTANDING BEFORE CONVERT CAN RUN: the new reward account is UNREGISTERED.**
-`stake178pl28j4m52k5npf5swlp43skrv0rjt089h45vth3z55kuqnzlvkh` ⇒ the first convert fails
-`ConwayWithdrawalsMissingAccounts` exactly as `dc715410…` did (§57.8). **An unsigned registration is
-built and verified; it needs Giovanni's signature.** `BuildStakeRegistrationTxTest` now takes
+✅ **RESOLVED 2026-09-07: the new reward account is REGISTERED** —
+`stake178pl28j4m52k5npf5swlp43skrv0rjt089h45vth3z55kuqnzlvkh`, tx `464df985…`, block 13911568,
+deposit 2,000,000, active epoch 654. ⚠ **Checked against the right credential, not merely "a
+registration succeeded"**: Blockfrost attributes that tx to `c3f51e55…`'s own reward account.
+*Registering a lookalike would have confirmed cleanly and left convert just as broken.*
+**The coordinate `8ab0c6d1…#0` is live and publishes `c3f51e55…`, matching what the vendored
+blueprint derives, so every `LoansReferenceScriptVerifier` precondition holds.** `BuildStakeRegistrationTxTest` now takes
 `REWARD_ADDRESS`/`SCRIPT_HASH` from the environment, **because every future redeploy needs this
 again.**
 
@@ -5183,6 +5186,21 @@ again.**
 has no live candidate to rebuild against. ⇒ **This change is verified by derivation, by the unit
 suite and by the boot verifier's derived-vs-published check — but NOT by a fresh end-to-end build.**
 *Say so rather than let the earlier green be read as covering this.*
+
+⛔ **AND AS OF 2026-09-07 IT CANNOT FIRE AT ALL: mainnet has ZERO live v4 loans.** The loan NFT policy
+`0061ade3…` has minted **two ever, both burned** — one of them by our own convert. **There is no
+candidate, so there is nothing to prove it with.**
+
+⚑ **Which makes the silence dangerous to read.** *A node with convert armed and working logs exactly
+the same nothing as one that is broken* — §57.9's lesson wearing different clothes, and the second
+time this path has produced it. ⇒ **"Deployed, and every checkable precondition green" is NOT
+"proven working", and this section stays open until a v4 loan appears, becomes liquidatable, and a
+convert order actually BATCHES.** *That is the acceptance test; nothing offline substitutes for it.*
+
+⚠ **The first convert's order is still stranded** (`abd8b959…#1`, unspent, 2,800,000 lovelace +
+134,568,556 FLDT). **The fix reaches future orders only and cannot recover it.** Its `canceller` is
+the lender's `lenderAuth` and its `refund_receiver` the asset manager ⇒ **recovery is FluidTokens'
+user's, not the operator's.**
 
 ### 57.4 The rig
 
