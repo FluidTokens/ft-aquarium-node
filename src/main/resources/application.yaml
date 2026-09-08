@@ -166,6 +166,15 @@ loans:
   # both networks, because it is not parameterised by the config policy id.
   smart-tokens-spend-script-hash: ${LOANS_SMART_TOKENS_SPEND_SCRIPT_HASH:fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa}
 
+  minswap:
+    # ⛔ THE MAINNET Minswap V2 pool address. It lived ONLY as an inline @Value default in
+    # AppConfig, which meant no profile could blank it: the preview document has no key to
+    # override, so a preview node resolved this MAINNET address and every convert candidate
+    # died at the pool lookup with "Invalid address for this network", once per cycle, at ERROR.
+    # A default that no configuration layer can reach is not a default; it is a hardcoding.
+    # ⚠ Blank means "this network has no Minswap deployment" and converts are SKIPPED, not failed.
+    pool-address: ${LOANS_MINSWAP_POOL_ADDRESS:addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a}
+
   # ── The operator readiness UI (server-rendered, GET /api/v1/loans/readiness) ────────────────
   #
   # DECISION SUPPORT, not profit tracking: a list of loans sorted by health factor ascending —
@@ -546,6 +555,13 @@ loans:
   # Published in the ConfigDatum; the blueprint ships no smart_tokens validator so this
   # one cannot be derived. Only the pool-manager branch needs it.
   smart-tokens-spend-script-hash: fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa
+
+  minswap:
+    # ⛔ BLANK ON PURPOSE. Minswap V2 has no preview deployment, so there is no pool to swap
+    # against and a convert cannot be built here at all. Blank makes the convert path SKIP with
+    # one line naming the reason, instead of sending a mainnet address to a preview provider and
+    # failing at ERROR every scheduling cycle (findings §57.12).
+    pool-address: ""
 
 blockfrost:
   url: https://cardano-preview.blockfrost.io/api/v0/

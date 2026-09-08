@@ -104,9 +104,16 @@ class ConvertLiveDryEvalTest {
      * it is spent. So the rig would have built against the SUPERSEDED datum and refused the convert
      * action the node correctly derives — reproducing, in the rig, the exact production failure this
      * rig exists to diagnose. <b>Same staleness class as the baked reference-script coordinate.</b>
+     *
+     * <p>⚑ <b>AND IT HAPPENED AGAIN — to this very constant, which is why the warning above is worth
+     * keeping.</b> FluidTokens updated the LMConfig in place a second time when they redeployed the
+     * fixed convert action ({@code 8296a2fe…} → {@code 78d4a273…}, field 5 {@code dc715410…} →
+     * {@code c3f51e55…}). {@code e6a9752} moved {@code application.yaml} and missed this copy, and
+     * the symptom was a refusal at {@code lender_manager.withdraw} — which resolves the action hash
+     * from THIS datum — rather than anywhere near the convert action itself.
      */
     private static final String LM_CONFIG_TX =
-            "8296a2fea4124a23d48dab15b9930731f44174090717d4cbf39e4e1e37364916";
+            "78d4a273b15382a671bb04fe647a9b621665427f1405e3903817beecfde35bfa";
     private static final int LM_CONFIG_IX = 0;
 
     // ---- mainnet deployment coordinates -----------------------------------------------------------
@@ -630,7 +637,12 @@ class ConvertLiveDryEvalTest {
         m.put(registry.getLenderManagerSpendScriptHash(), ref("55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d"));
         m.put(registry.getLoanClaimActionScriptHash(), ref("51eaf4994ee313bf4c95be65656e092d7366b0f397f7ecc1e0113c063fab5f98"));
         m.put(registry.getLmLiquidateAndConvertActionScriptHash(),
-                ref("e4e47ab13b26a200d5939def5ef7d60af3dc0a719dac0aadbcbafb191f9c6541"));
+                // ⛔ MOVED with FluidTokens' redeploy (db5069e). This hardcodes what
+                // application.yaml also states, and e6a9752 updated the yaml and MISSED this copy —
+                // §57.9c's own lesson, landing in the rig instead of production: the rig then
+                // referenced the superseded script while the withdrawal named the new one, and the
+                // evaluator said RequiredRedeemersMismatch { missing: [c3f51e55…] }.
+                ref("8ab0c6d168746f5827aeb0d8981f9edbb9ae00a17db95d7d44e8a8a1b86ea0bf"));
         return m;
     }
 

@@ -314,6 +314,23 @@ public class ConvertLiquidationRouter {
         LoanDatum loan = assessment.loan().datum();
         AssetType collateral = loan.collateral().assetType();
 
+        // ⛔ NO POOL ADDRESS CONFIGURED = NO MINSWAP ON THIS NETWORK. Checked BEFORE the provider is
+        // called, because calling it is the bug: a preview node used to send the mainnet address to a
+        // preview provider and take a 400 back, at ERROR, for every candidate on every scheduling
+        // cycle. There is nothing to retry and nothing an operator can do about it from the log.
+        //
+        // ⚠ NoPoolException rather than a new type: this is the same fact the resolver reports when a
+        // pair has no pool — a convert is IMPOSSIBLE here, not unprofitable — and the executor already
+        // logs it once per candidate at INFO. Reusing it keeps one vocabulary for one outcome.
+        if (loansConfiguration.getMinswapPoolAddress() == null
+                || loansConfiguration.getMinswapPoolAddress().isBlank()) {
+            throw new NoPoolException(
+                    "convert unavailable: no Minswap pool address configured for this network, so "
+                            + "there is no pool to swap " + collateral.toUnit() + " against; set "
+                            + "loans.minswap.pool-address, or set this market to action: ANTICIPATE "
+                            + "if the loan should still be liquidated");
+        }
+
         // 1. The pool, by NFT at run time. Either order — the datum then states the ordering.
         MinswapPoolResolver.ResolvedPool pool = poolResolver
                 .resolveEitherOrder(collateral, loan.principalAsset())

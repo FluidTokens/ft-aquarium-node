@@ -5240,6 +5240,63 @@ closed that door.*
 confusing evaluation failure on the first candidate that reads like a new bug. **Which is §57.10's
 point once more: the silence of a working node and the silence of a wrong one are the same silence.**
 
+### 57.12 ⛔ A `@Value` DEFAULT NO PROFILE CAN REACH IS NOT A DEFAULT — it is a hardcoding
+
+**Observed running on preview, 2026-09-08.** The preview bot was finding convert candidates and
+failing every one, every scheduling cycle, at ERROR with a stack trace:
+
+```
+82d02036…#1 is a CONVERT liquidation (LiquidateAndConvert)
+  failed: LOOKUP_FAILED … {"status_code":400,"message":"Invalid address for this network"}
+```
+
+⇒ **`loans.minswap.pool-address` existed ONLY as an inline `@Value` default in `AppConfig`, carrying
+the MAINNET address, with no key in `application.yaml` at all.** ⚑ **A profile document can only
+override a key that EXISTS**, so the preview document had nothing to blank: preview resolved a
+mainnet address and sent it to a preview provider.
+
+**Fixed:** the value now lives in `application.yaml` — mainnet declares it with an env override,
+preview blanks it explicitly — and the `@Value` carries **no** inline default. **Blank is meaningful:
+this network has no Minswap deployment.** A convert candidate is then **SKIPPED** with one INFO line
+naming the key to set, **checked before the provider is called** — because calling it was the bug.
+
+⚠ **The test asserts the ABSENCE of an inline default**, on the annotation itself. *Re-adding one
+would restore the defect while every other test still passed, because the mainnet document supplies
+the same value and nothing on the mainnet path would change.* **The guard is mutation-checked: the
+provider is passed as `null`, so removing the skip fails with a `NullPointerException` — "did not
+call the provider" is proven by construction, not asserted about a mock.**
+
+⚑ **The other three `loans.minswap.*` keys share the trap** (`pool-policy-id`,
+`pool-spend-script-hash`, `order-spend-script-hash` — all inline mainnet defaults, none in the yaml).
+**They are harmless today**, because a wrong derivation on preview publishes nothing, **but they are
+the same defect and are not fixed here.** *Scope was one key; the family is recorded.*
+
+### 57.13 ⚑ §57.10 UPGRADED: the offline end-to-end DOES pass against the new deployment
+
+**§57.10 said the redeploy could not be verified end to end, and gave one reason — the rig's pinned
+candidate was liquidated. There was a SECOND reason I had not found: the rig itself was stale.**
+
+`e6a9752` moved `application.yaml` and missed **two hardcoded copies in the rig**:
+
+| | was | now |
+|---|---|---|
+| convert reference coordinate | `e4e47ab1…` | **`8ab0c6d1…`** |
+| `LM_CONFIG_TX` | `8296a2fe…` | **`78d4a273…`** |
+
+⇒ **That is §57.9c's own lesson landing in the test instead of production**, and the second symptom
+was misleading: `lender_manager.withdraw` refused — because it resolves the action hash from the LM
+config datum — so the failure pointed nowhere near the convert action.
+
+⚠ **The constant's own javadoc already warned about exactly this staleness class, and it recurred to
+that very constant.** *A warning beside a value does not update the value.*
+
+**⇒ With both corrected, `ConvertLiveDryEvalTest` is GREEN against the fixed validator, the new
+coordinate and the new LM config, on real mainnet data.** ⇒ **The convert path IS verified offline
+end to end against the redeploy** — the thing §57.10 recorded as missing.
+
+⚠ **What remains unproven is unchanged and is the part offline cannot reach:** that a Minswap batcher
+actually TAKES the order. **That still needs a live loan.**
+
 ### 57.4 The rig
 
 `ConvertLiveDryEvalTest` — real chain data throughout, one fabricated wallet UTxO,

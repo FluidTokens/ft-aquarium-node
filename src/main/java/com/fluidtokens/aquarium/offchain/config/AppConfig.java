@@ -220,9 +220,19 @@ public class AppConfig {
          * One provider query per candidate is the proportionate answer, and it is the same shape the
          * oracle registry client already uses.
          */
-        @Value("${loans.minswap.pool-address:addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a}")
-        private String minswapPoolAddress =
-                "addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a";
+        /**
+         * ⛔ <b>No inline default, deliberately.</b> This carried the MAINNET address here and had no
+         * key in {@code application.yaml} at all — so the preview document had nothing to override
+         * and a preview node resolved a mainnet address, failing every convert candidate at the pool
+         * lookup with {@code "Invalid address for this network"}, at ERROR, once per cycle.
+         * <b>A default no configuration layer can reach is not a default; it is a hardcoding.</b>
+         * The value now lives in {@code application.yaml}, per profile, where an operator can see it.
+         *
+         * <p>⚠ Blank is meaningful: it says <b>this network has no Minswap deployment</b>, and the
+         * convert path skips rather than calling a provider it cannot succeed against.
+         */
+        @Value("${loans.minswap.pool-address:}")
+        private String minswapPoolAddress = "";
 
         /** The tx that minted both config NFTs; the point history has to be indexed from. */
         @Value("${loans.config.ref-utxo-tx-hash:}")
