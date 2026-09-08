@@ -124,13 +124,37 @@ class ConvertActionDerivationTest {
                 .getLmLiquidateAndConvertActionScriptHash(), "order spend script hash");
     }
 
-    /** The shipped defaults ARE the verified mainnet parameterisation, not placeholders. */
+    /**
+     * The shipped MAINNET defaults ARE the verified parameterisation, not placeholders.
+     *
+     * <p>⚑ <b>They moved out of the Java field defaults and into {@code application.yaml}</b> — an
+     * inline {@code @Value} default cannot be overridden by any profile document, so while they lived
+     * here a preview node silently resolved MAINNET Minswap credentials (§57.12). The assertion
+     * therefore reads the SHIPPED YAML rather than {@code new LoansConfiguration()}, whose fields are
+     * now deliberately blank.
+     */
     @Test
-    void theShippedDefaultsAreTheVerifiedMainnetCoordinates() {
+    void theShippedDefaultsAreTheVerifiedMainnetCoordinates() throws java.io.IOException {
+        String yaml = java.nio.file.Files.readString(
+                java.nio.file.Path.of("src/main/resources/application.yaml"));
+        int preview = yaml.indexOf("on-profile: preview");
+        String mainnet = preview > 0 ? yaml.substring(0, preview) : yaml;
+
+        assertTrue(mainnet.contains("pool-policy-id: ${LOANS_MINSWAP_POOL_POLICY_ID:" + POOL_POLICY + "}"),
+                "the mainnet document must ship the verified pool policy id");
+        assertTrue(mainnet.contains("pool-spend-script-hash: ${LOANS_MINSWAP_POOL_SPEND_SCRIPT_HASH:"
+                        + POOL_SPEND + "}"),
+                "the mainnet document must ship the verified pool spend script hash");
+        assertTrue(mainnet.contains("order-spend-script-hash: ${LOANS_MINSWAP_ORDER_SPEND_SCRIPT_HASH:"
+                        + ORDER_SPEND + "}"),
+                "the mainnet document must ship the verified order spend script hash");
+
+        // ⛔ And the fields themselves must stay blank — a restored inline default is the defect.
         var cfg = new AppConfig.LoansConfiguration();
-        assertEquals(POOL_POLICY, cfg.getMinswapPoolPolicyId());
-        assertEquals(POOL_SPEND, cfg.getMinswapPoolSpendScriptHash());
-        assertEquals(ORDER_SPEND, cfg.getMinswapOrderSpendScriptHash());
+        assertEquals("", cfg.getMinswapPoolPolicyId(),
+                "an inline default is back; no profile can blank a key that resolves without the yaml");
+        assertEquals("", cfg.getMinswapPoolSpendScriptHash());
+        assertEquals("", cfg.getMinswapOrderSpendScriptHash());
     }
 
     /** The published field this whole test is about, read from the recorded mainnet datum. */

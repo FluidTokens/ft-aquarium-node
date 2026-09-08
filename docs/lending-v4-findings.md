@@ -5266,10 +5266,36 @@ the same value and nothing on the mainnet path would change.* **The guard is mut
 provider is passed as `null`, so removing the skip fails with a `NullPointerException` — "did not
 call the provider" is proven by construction, not asserted about a mock.**
 
-⚑ **The other three `loans.minswap.*` keys share the trap** (`pool-policy-id`,
-`pool-spend-script-hash`, `order-spend-script-hash` — all inline mainnet defaults, none in the yaml).
-**They are harmless today**, because a wrong derivation on preview publishes nothing, **but they are
-the same defect and are not fixed here.** *Scope was one key; the family is recorded.*
+✅ **All four are now per-profile** (`pool-policy-id`, `pool-spend-script-hash`,
+`order-spend-script-hash`, `pool-address`) — declared in the mainnet document with env overrides,
+blanked in preview, **no inline default on any of the four annotations**, and one test asserts the
+absence across all of them.
+
+### 57.14 ⇒ THE RIG NOW READS WHAT PRODUCTION READS, instead of being warned not to drift
+
+**The same fact was written down twice — in `application.yaml` and again as constants in
+`ConvertLiveDryEvalTest` — and a javadoc beside the constants warned about exactly that. It went
+stale anyway, twice.** ⚑ *A second copy of a fact cannot be kept in step by asking people to keep it
+in step.*
+
+**Fixed by removing the second copy, not by warning harder.** All six liquidation reference
+coordinates are now **read out of `application.yaml`'s mainnet document at test time**, so a
+coordinate move cannot leave the rig behind — *there is no longer a copy to forget.* Mutation-checked:
+reverting the yaml to the superseded coordinate turns the rig red.
+
+⚠ **`LM_CONFIG_TX` could NOT be handled that way, and the reason is worth stating**: production does
+not configure the LM config UTxO — it **discovers** it by NFT policy. There is no shipped value to
+read. ⇒ **So it is pinned against the CHAIN instead of against a constant:** the pinned UTxO must
+still carry the LM config NFT **and** its datum must still name the convert action this node derives.
+*A constant-versus-constant check could never have caught this; both copies would simply have been
+equally stale.*
+
+⛔ **And the NFT half of that check is weaker than it looks — CCL trap 12 again.** Reading a spent
+output never fails, so the superseded UTxO still reports the NFT. **It is the DATUM assertion that
+bites**, and the mutation check proved it: reverting `LM_CONFIG_TX` fails on *"the live LM config
+names a different convert action than this node derives"*, not on the NFT.
+
+
 
 ### 57.13 ⚑ §57.10 UPGRADED: the offline end-to-end DOES pass against the new deployment
 

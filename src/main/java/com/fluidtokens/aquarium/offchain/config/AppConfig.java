@@ -198,15 +198,23 @@ public class AppConfig {
          * withdraw half, so empty selects the non-CIP-113 branch (§25.4). They are constants here
          * rather than keys: "unset" and "this credential family has no withdraw script" are different
          * statements, and only the second is true.
+         *
+         * <p>⛔ <b>None of these carries an inline default any more, for the reason §57.12 records:
+         * a profile can only override a key that EXISTS.</b> While the mainnet values were inlined
+         * here and absent from {@code application.yaml}, the preview document had nothing to blank —
+         * so a preview node silently resolved MAINNET Minswap credentials. That was visible only on
+         * {@code pool-address}, which reaches a provider; these three merely derived a convert action
+         * nobody had published, which is quieter and no more correct. <b>The values now live in
+         * {@code application.yaml}, per profile, where an operator can see them.</b>
          */
-        @Value("${loans.minswap.pool-policy-id:f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c}")
-        private String minswapPoolPolicyId = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+        @Value("${loans.minswap.pool-policy-id:}")
+        private String minswapPoolPolicyId = "";
 
-        @Value("${loans.minswap.pool-spend-script-hash:ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b}")
-        private String minswapPoolSpendScriptHash = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+        @Value("${loans.minswap.pool-spend-script-hash:}")
+        private String minswapPoolSpendScriptHash = "";
 
-        @Value("${loans.minswap.order-spend-script-hash:c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c}")
-        private String minswapOrderSpendScriptHash = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
+        @Value("${loans.minswap.order-spend-script-hash:}")
+        private String minswapOrderSpendScriptHash = "";
 
         /**
          * The address every Minswap V2 pool sits at on this network — payment credential

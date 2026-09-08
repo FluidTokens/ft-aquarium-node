@@ -31,17 +31,47 @@ class MinswapPoolAddressIsPerProfileTest {
     private static final String MAINNET_POOL =
             "addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a";
 
-    @Test
-    @DisplayName("the @Value carries NO inline default — a hardcoding no profile can reach")
-    void thereIsNoInlineDefault() throws Exception {
-        Field f = AppConfig.LoansConfiguration.class.getDeclaredField("minswapPoolAddress");
-        String expression = f.getAnnotation(Value.class).value();
+    /** field name -> the property key it must read, with NO default after the colon. */
+    private static final java.util.Map<String, String> ALL_FOUR = java.util.Map.of(
+            "minswapPoolPolicyId", "loans.minswap.pool-policy-id",
+            "minswapPoolSpendScriptHash", "loans.minswap.pool-spend-script-hash",
+            "minswapOrderSpendScriptHash", "loans.minswap.order-spend-script-hash",
+            "minswapPoolAddress", "loans.minswap.pool-address");
 
-        assertEquals("${loans.minswap.pool-address:}", expression,
-                "an inline default here cannot be overridden by any profile document — that is what "
-                        + "made a preview node resolve the mainnet address");
-        assertFalse(expression.contains(MAINNET_POOL),
+    @Test
+    @DisplayName("NONE of the four @Values carries an inline default — a hardcoding no profile reaches")
+    void noneOfThemHasAnInlineDefault() throws Exception {
+        for (var e : ALL_FOUR.entrySet()) {
+            Field f = AppConfig.LoansConfiguration.class.getDeclaredField(e.getKey());
+            String expression = f.getAnnotation(Value.class).value();
+
+            assertEquals("${" + e.getValue() + ":}", expression,
+                    e.getKey() + " carries an inline default; no profile document can override a key "
+                            + "that resolves before the yaml is consulted, which is exactly how a "
+                            + "preview node came to resolve MAINNET Minswap credentials");
+        }
+        // The address is the one that reached a provider and produced the visible failure.
+        assertFalse(AppConfig.LoansConfiguration.class.getDeclaredField("minswapPoolAddress")
+                        .getAnnotation(Value.class).value().contains(MAINNET_POOL),
                 "the mainnet address is inlined again; the preview profile cannot blank it");
+    }
+
+    @Test
+    @DisplayName("all four are declared in mainnet and blanked in preview")
+    void allFourAreStatedPerProfile() throws Exception {
+        String yaml = Files.readString(YAML);
+        int preview = yaml.indexOf("on-profile: preview");
+        assertTrue(preview > 0, "the preview document moved");
+
+        for (String key : new String[]{"pool-policy-id", "pool-spend-script-hash",
+                "order-spend-script-hash", "pool-address"}) {
+            int mainnet = yaml.indexOf(key + ": ${");
+            assertTrue(mainnet > 0 && mainnet < preview,
+                    key + " must be declared in the MAINNET document with an env override");
+            assertTrue(yaml.indexOf(key + ": \"\"", preview) > preview,
+                    key + " must be blanked in the PREVIEW document — Minswap V2 has no preview "
+                            + "deployment, so every one of these credentials is absent there");
+        }
     }
 
     @Test

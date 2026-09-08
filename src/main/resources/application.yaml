@@ -167,6 +167,11 @@ loans:
   smart-tokens-spend-script-hash: ${LOANS_SMART_TOKENS_SPEND_SCRIPT_HASH:fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa}
 
   minswap:
+    # The Minswap V2 mainnet credentials the convert action is parameterised with (§25.1).
+    # ⚠ Blank on a network without a Minswap deployment — see the preview document.
+    pool-policy-id: ${LOANS_MINSWAP_POOL_POLICY_ID:f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c}
+    pool-spend-script-hash: ${LOANS_MINSWAP_POOL_SPEND_SCRIPT_HASH:ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b}
+    order-spend-script-hash: ${LOANS_MINSWAP_ORDER_SPEND_SCRIPT_HASH:c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c}
     # ⛔ THE MAINNET Minswap V2 pool address. It lived ONLY as an inline @Value default in
     # AppConfig, which meant no profile could blank it: the preview document has no key to
     # override, so a preview node resolved this MAINNET address and every convert candidate
@@ -557,7 +562,12 @@ loans:
   smart-tokens-spend-script-hash: fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa
 
   minswap:
-    # ⛔ BLANK ON PURPOSE. Minswap V2 has no preview deployment, so there is no pool to swap
+    # ⛔ BLANK ON PURPOSE, all four. Minswap V2 has no preview deployment, so none of these
+    # credentials exists here and the convert action cannot be derived, let alone used.
+    pool-policy-id: ""
+    pool-spend-script-hash: ""
+    order-spend-script-hash: ""
+    # Minswap V2 has no preview deployment, so there is no pool to swap
     # against and a convert cannot be built here at all. Blank makes the convert path SKIP with
     # one line naming the reason, instead of sending a mainnet address to a preview provider and
     # failing at ERROR every scheduling cycle (findings §57.12).

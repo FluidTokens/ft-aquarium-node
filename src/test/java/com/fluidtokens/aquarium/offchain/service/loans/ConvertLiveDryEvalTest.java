@@ -454,6 +454,37 @@ class ConvertLiveDryEvalTest {
     // ---- the assertions ---------------------------------------------------------------------------
 
     /** ⛔ THE ONE THIS RIG EXISTS FOR: a real convert, assembled and evaluated. */
+    /**
+     * ⛔ {@code LM_CONFIG_TX} IS PINNED AGAINST THE CHAIN, NOT AGAINST A CONSTANT.
+     *
+     * <p>Unlike the reference-script coordinates it has no counterpart in {@code application.yaml} to
+     * read: production does not configure the LM config UTxO, it DISCOVERS it by its NFT policy. So
+     * there is no source to read from, and a copy here would be free to rot — which it did, twice,
+     * each time because FluidTokens updated the datum <b>in place</b> and the pinned output was spent.
+     *
+     * <p>⇒ <b>This asserts the pin is still CURRENT against the chain</b>, which a constant-vs-constant
+     * check could never do: the UTxO must still carry the LM config NFT, and its datum must still name
+     * the convert action this node derives. Either failing is the drift, named.
+     */
+    @Test
+    void thePinnedLmConfigIsStillTheLiveOne() throws Exception {
+        BFBackendService backend = backend();
+        Utxo lmConfig = output(backend, LM_CONFIG_TX, LM_CONFIG_IX);
+
+        String nft = LM_CONFIG_POLICY + ASSET_NAME;
+        assertTrue(lmConfig.getAmount().stream().anyMatch(a -> nft.equals(a.getUnit())),
+                "the pinned LM config UTxO no longer carries the LM config NFT " + nft
+                        + " — FluidTokens have respent it, and this rig is reading a superseded datum "
+                        + "exactly as it did before (CCL trap 12: reading a spent output never fails)");
+
+        String derived = registry().getLmLiquidateAndConvertActionScriptHash();
+        assertNotNull(lmConfig.getInlineDatum(), "the LM config UTxO carries no inline datum");
+        assertTrue(lmConfig.getInlineDatum().contains(derived),
+                "the live LM config names a different convert action than this node derives. Either "
+                        + "the vendored blueprint or the pinned LM config is stale — derived "
+                        + derived + ", and the datum does not contain it");
+    }
+
     @Test
     void theRealCandidateBuildsAndEveryScriptEvaluates() throws Exception {
         Built built;
@@ -629,24 +660,55 @@ class ConvertLiveDryEvalTest {
      * however cleanly its scripts evaluate. An offline rig proves SCRIPTS, not ledger rules (trap 11),
      * so the one thing it must not do is build a shape production would never build.
      */
+    /**
+     * ⛔ <b>READ FROM {@code application.yaml}, NOT COPIED FROM IT.</b>
+     *
+     * <p>These six were hardcoded here, duplicating what the shipped configuration already states.
+     * {@code e6a9752} moved the yaml for FluidTokens' redeploy and missed this copy, so the rig
+     * referenced the superseded convert script while the withdrawal named the new one — and a javadoc
+     * warning beside the constant had already failed to prevent exactly that, twice.
+     *
+     * <p>⇒ <b>A second copy of a fact cannot be kept in step by asking people to keep it in step.</b>
+     * The rig now reads the same defaults production reads, so a coordinate move cannot leave it
+     * behind: there is no longer a second copy to forget.
+     */
     private static Map<String, TransactionInput> referenceScripts(LoansContractRegistry registry) {
         Map<String, TransactionInput> m = new java.util.LinkedHashMap<>();
-        m.put(registry.getLoanPolicyId(), ref("f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f"));
-        m.put(registry.getLoanSpendScriptHash(), ref("46d7195856788885fd4a488dff7bde8bbaf46d5dc4a2fa3dbd12e9cb42129c96"));
-        m.put(registry.getLenderManagerWithdrawScriptHash(), ref("ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b"));
-        m.put(registry.getLenderManagerSpendScriptHash(), ref("55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d"));
-        m.put(registry.getLoanClaimActionScriptHash(), ref("51eaf4994ee313bf4c95be65656e092d7366b0f397f7ecc1e0113c063fab5f98"));
+        m.put(registry.getLoanPolicyId(), shippedRef("loan"));
+        m.put(registry.getLoanSpendScriptHash(), shippedRef("loan-spend"));
+        m.put(registry.getLenderManagerWithdrawScriptHash(), shippedRef("lender-manager"));
+        m.put(registry.getLenderManagerSpendScriptHash(), shippedRef("lender-manager-spend"));
+        m.put(registry.getLoanClaimActionScriptHash(), shippedRef("loan-claim-action"));
         m.put(registry.getLmLiquidateAndConvertActionScriptHash(),
-                // ⛔ MOVED with FluidTokens' redeploy (db5069e). This hardcodes what
-                // application.yaml also states, and e6a9752 updated the yaml and MISSED this copy —
-                // §57.9c's own lesson, landing in the rig instead of production: the rig then
-                // referenced the superseded script while the withdrawal named the new one, and the
-                // evaluator said RequiredRedeemersMismatch { missing: [c3f51e55…] }.
-                ref("8ab0c6d168746f5827aeb0d8981f9edbb9ae00a17db95d7d44e8a8a1b86ea0bf"));
+                shippedRef("lm-liquidate-and-convert-action"));
         return m;
     }
 
-    private static TransactionInput ref(String txHash) {
-        return TransactionInput.builder().transactionId(txHash).index(0).build();
+    /**
+     * The {@code txHash#index} default the MAINNET document ships for one liquidation reference
+     * script. Only the mainnet document is consulted — the preview one deliberately blanks these,
+     * and a blank would silently produce a reference input pointing nowhere.
+     */
+    private static TransactionInput shippedRef(String key) {
+        String yaml;
+        try {
+            yaml = java.nio.file.Files.readString(
+                    java.nio.file.Path.of("src/main/resources/application.yaml"));
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("cannot read application.yaml", e);
+        }
+        int preview = yaml.indexOf("on-profile: preview");
+        String mainnet = preview > 0 ? yaml.substring(0, preview) : yaml;
+
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(?m)^\\s*" + java.util.regex.Pattern.quote(key)
+                        + ":\\s*\\$\\{[A-Z_]+:([0-9a-f]{64})#(\\d+)}\\s*$")
+                .matcher(mainnet);
+        assertTrue(m.find(), "application.yaml's mainnet document ships no reference-script "
+                + "coordinate for '" + key + "'; the rig reads what production reads, so a missing "
+                + "key here is a real configuration gap rather than a test problem");
+        return TransactionInput.builder()
+                .transactionId(m.group(1)).index(Integer.parseInt(m.group(2))).build();
     }
+
 }
