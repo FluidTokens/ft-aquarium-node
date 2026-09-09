@@ -63,7 +63,15 @@ class EnvironmentVariableBindingTest {
                             StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME, env));
                 })
                 .withUserConfiguration(Beans.class)
-                .withPropertyValues("loans.enabled=true", "network=preview");
+                // ⚠ The convert block and the config asset name carry NO inline default as of
+                // 2026-09-09 — application.yaml is their only home (§57.12). A synthetic context
+                // does not read that file, so it must state them, exactly as a node's configuration
+                // must. This is the intended behaviour: a context that omits them does not start.
+                .withPropertyValues("loans.enabled=true", "network=preview",
+                        "loans.config.asset-name=706172616d6574657273",
+                        "loans.liquidation.convert.enabled=false",
+                        "loans.liquidation.convert.profit-margin-lovelace=0",
+                        "loans.liquidation.convert.dex-cost-floor-lovelace=5000000");
     }
 
     /**
@@ -113,7 +121,12 @@ class EnvironmentVariableBindingTest {
                                     StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
                                     Map.of("NETWORK", target))))
                     .withUserConfiguration(Beans.class)
-                    .withPropertyValues("loans.enabled=true")
+                    // Same reason as withEnv(): the no-default keys have no home but the yaml.
+                    .withPropertyValues("loans.enabled=true",
+                            "loans.config.asset-name=706172616d6574657273",
+                            "loans.liquidation.convert.enabled=false",
+                            "loans.liquidation.convert.profit-margin-lovelace=0",
+                            "loans.liquidation.convert.dex-cost-floor-lovelace=5000000")
                     .run(ctx -> assertEquals(target, ctx.getBean(AppConfig.Network.class).getNetwork(),
                             "NETWORK must reach the bean: it is the only thing that decides where "
                                     + "this node submits, and a value that binds nowhere points a "

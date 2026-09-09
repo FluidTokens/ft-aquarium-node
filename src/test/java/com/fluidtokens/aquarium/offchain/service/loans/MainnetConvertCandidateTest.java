@@ -98,7 +98,11 @@ class MainnetConvertCandidateTest {
      */
     @Test
     void atTheShippedDefaultsThisCandidateIsRefusedAndTheOperatorMustStateALossToTakeIt() {
-        var shipped = new AppConfig.ConvertConfiguration();   // enabled, margin 0, dex floor 5_000_000
+        // ⚠ ARMED EXPLICITLY. Convert ships DISARMED as of 2026-09-09, and this test is about the
+        // MARGIN gate — a candidate refused because the mechanism is off would assert nothing about
+        // the economics it exists to pin, while still reading green.
+        var shipped = new AppConfig.ConvertConfiguration(
+                true, BigInteger.ZERO, BigInteger.valueOf(5_000_000L));
         var network = new AppConfig.Network();
         ReflectionTestUtils.setField(network, "network", "mainnet");
 

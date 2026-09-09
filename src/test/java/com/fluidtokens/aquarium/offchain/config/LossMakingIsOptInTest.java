@@ -40,7 +40,7 @@ class LossMakingIsOptInTest {
 
     /** Every {@code @Value("${…profit-margin-lovelace:X}")} default in the config source. */
     private static final Pattern MARGIN_DEFAULT = Pattern.compile(
-            "\\$\\{(loans\\.[a-z.]*profit-margin-lovelace):(-?\\d+)\\}");
+            "\\$\\{(loans\\.[a-z.]*profit-margin-lovelace|[A-Z_]*PROFIT_MARGIN_LOVELACE):(-?\\d+)\\}");
 
     /** The same idea in the yaml, where an env-var default is the operator-visible promise. */
     private static final Pattern YAML_MARGIN_DEFAULT = Pattern.compile(
@@ -48,7 +48,12 @@ class LossMakingIsOptInTest {
 
     @Test
     void noShippedMarginDefaultOperatesAtALoss() throws IOException {
-        String source = Files.readString(APP_CONFIG, StandardCharsets.UTF_8);
+        // ⚠ BOTH sources. As of 2026-09-09 the convert margin's shipped default lives in the yaml
+        // rather than the annotation (§57.12: an inline default no profile can reach is not a
+        // default). The invariant follows the VALUE — scanning only the old home would have quietly
+        // stopped covering convert while still reporting green.
+        String source = Files.readString(APP_CONFIG, StandardCharsets.UTF_8)
+                + "\n" + Files.readString(YAML, StandardCharsets.UTF_8);
         Matcher m = MARGIN_DEFAULT.matcher(source);
 
         int found = 0;
@@ -91,8 +96,12 @@ class LossMakingIsOptInTest {
      */
     @Test
     void theDexCostFloorAlsoShipsNonNegative() throws IOException {
-        String source = Files.readString(APP_CONFIG, StandardCharsets.UTF_8);
-        Matcher m = Pattern.compile("\\$\\{loans\\.liquidation\\.convert\\.dex-cost-floor-lovelace:(-?\\d+)\\}")
+        // Moved to the yaml with the rest of the convert block; the promise moved with it.
+        String source = Files.readString(APP_CONFIG, StandardCharsets.UTF_8)
+                + "\n" + Files.readString(YAML, StandardCharsets.UTF_8);
+        Matcher m = Pattern.compile(
+                "\\$\\{(?:loans\\.liquidation\\.convert\\.dex-cost-floor-lovelace"
+                        + "|LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE):(-?\\d+)\\}")
                 .matcher(source);
         assertTrue(m.find(), "the dex-cost-floor default is no longer declared where this can read it");
         assertTrue(new BigInteger(m.group(1)).signum() >= 0);

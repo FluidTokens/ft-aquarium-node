@@ -56,6 +56,46 @@ class MinswapPoolAddressIsPerProfileTest {
                 "the mainnet address is inlined again; the preview profile cannot blank it");
     }
 
+    /**
+     * The convert block and the config asset name, moved out of inline defaults on 2026-09-09.
+     * ⚠ These use the NO-DEFAULT form {@code ${key}} rather than {@code ${key:}} — an empty string
+     * cannot convert to a boolean or a BigInteger, so the safe-looking empty default would fail at
+     * startup with a conversion error. No default at all says what is meant: the yaml must state it,
+     * and a node whose configuration omits it does not boot.
+     */
+    private static final java.util.Map<String, String> NO_DEFAULT_KEYS = java.util.Map.of(
+            "configAssetName", "loans.config.asset-name");
+
+    @Test
+    @DisplayName("the convert block and asset name carry NO default either — nothing inlined")
+    void theConvertBlockIsAlsoPerProfile() throws Exception {
+        for (var e : NO_DEFAULT_KEYS.entrySet()) {
+            Field f = AppConfig.LoansConfiguration.class.getDeclaredField(e.getKey());
+            assertEquals("${" + e.getValue() + "}", f.getAnnotation(Value.class).value(),
+                    e.getKey() + " must carry no inline default at all");
+        }
+        for (var e : java.util.Map.of(
+                "enabled", "loans.liquidation.convert.enabled",
+                "profitMarginLovelace", "loans.liquidation.convert.profit-margin-lovelace",
+                "dexCostFloorLovelace", "loans.liquidation.convert.dex-cost-floor-lovelace").entrySet()) {
+            Field f = AppConfig.ConvertConfiguration.class.getDeclaredField(e.getKey());
+            assertEquals("${" + e.getValue() + "}", f.getAnnotation(Value.class).value(),
+                    e.getKey() + " must carry no inline default; convert is a money path and an "
+                            + "inline default is a value no profile and no chart can reach");
+        }
+
+        String yaml = Files.readString(YAML);
+        int preview = yaml.indexOf("on-profile: preview");
+        // ⛔ THE ARMING DEFAULT. Exposed, documented, and OFF.
+        assertTrue(yaml.substring(0, preview)
+                        .contains("enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:false}"),
+                "convert must ship DISABLED on mainnet and be armed explicitly; an on-by-default "
+                        + "money path is the wrong way round, whatever else gates it");
+        assertTrue(yaml.indexOf("enabled: false", preview) > preview,
+                "the preview document must state convert disabled — Minswap V2 has no preview "
+                        + "deployment, so a convert cannot be built there at all");
+    }
+
     @Test
     @DisplayName("all four are declared in mainnet and blanked in preview")
     void allFourAreStatedPerProfile() throws Exception {

@@ -168,7 +168,7 @@ public class AppConfig {
          * effectively a constant — exposed only so a future contract revision does not
          * force a code change.
          */
-        @Value("${loans.config.asset-name:706172616d6574657273}")
+        @Value("${loans.config.asset-name}")
         private String configAssetName = "706172616d6574657273";
 
         /**
@@ -1019,8 +1019,23 @@ public class AppConfig {
          * {@code loans.submittable-network} all still apply, ahead of this. This flag turns the
          * mechanism off globally; {@code loans.liquidation.markets} turns it off per market.
          */
-        @Value("${loans.liquidation.convert.enabled:true}")
-        private boolean enabled = true;
+        /**
+         * ⛔ <b>DEFAULT FALSE since 2026-09-09, and the previous {@code true} was the wrong way round
+         * on a path that spends.</b> Giovanni's standing rule for this node: every mode and parameter
+         * is EXPOSED to the chart user and documented, and ships with a SAFE default — never armed.
+         *
+         * <p>⚠ <b>CONSEQUENCE: a mainnet deployment must now set
+         * {@code LOANS_LIQUIDATION_CONVERT_ENABLED=true} explicitly, and the chart must pass it,
+         * or the next image runs with convert silently off.</b>
+         *
+         * <p>⚠ <b>No default at all, not an empty one.</b> {@code ${key:}} binds the empty STRING,
+         * which cannot convert to a boolean — so the safe-looking form would fail at startup with a
+         * conversion error instead of a missing-key error. The no-default form says what is meant:
+         * <b>application.yaml must state this, and a node whose configuration omits it does not
+         * boot.</b> Same reasoning for the two amounts below and for {@code loans.config.asset-name}.
+         */
+        @Value("${loans.liquidation.convert.enabled}")
+        private boolean enabled = false;
 
         /**
          * What {@code feeValueLovelace - (txFee + orderAda)} must reach for a convert to be built.
@@ -1044,7 +1059,7 @@ public class AppConfig {
          * the point. What protects an operator is this default of 0, which no copy-paste can turn
          * negative; a node that does state a negative announces it loudly at boot.
          */
-        @Value("${loans.liquidation.convert.profit-margin-lovelace:0}")
+        @Value("${loans.liquidation.convert.profit-margin-lovelace}")
         private BigInteger profitMarginLovelace = BigInteger.ZERO;
 
         /**
@@ -1073,7 +1088,7 @@ public class AppConfig {
          * <p>Refused at startup when negative, on any network — a negative cost floor is not a bound an
          * operator can meaningfully state, it is a typo.
          */
-        @Value("${loans.liquidation.convert.dex-cost-floor-lovelace:5000000}")
+        @Value("${loans.liquidation.convert.dex-cost-floor-lovelace}")
         private BigInteger dexCostFloorLovelace = BigInteger.valueOf(5_000_000L);
 
         /** Test seam: {@code @Value} owns these in production. */

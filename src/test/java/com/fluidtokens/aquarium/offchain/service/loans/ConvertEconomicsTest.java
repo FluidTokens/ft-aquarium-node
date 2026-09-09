@@ -318,15 +318,29 @@ class ConvertEconomicsTest {
 
     /**
      * ⚠ §26.2's lesson, applied before it can bite: a {@code @Value} default is not a default of the
-     * class. Every construction path that is not Spring's must still see convert armed and the floor
-     * at zero, or the shipped default silently differs from the documented one.
+     * class. Every construction path that is not Spring's must agree with what the shipped
+     * configuration says, or the effective default silently differs from the documented one.
+     *
+     * <p>⛔ <b>THE ARMING DEFAULT WAS REVERSED ON 2026-09-09, and the earlier ruling is recorded here
+     * rather than erased.</b> This test previously asserted <i>"convert defaults ON per Giovanni's
+     * ruling"</i>. It now ships OFF, under the later standing rule that every mode is exposed to the
+     * chart user and documented but <b>none ships armed</b> — the same rule that put
+     * {@code scheduling.transaction-processor.enabled} at false. <b>Convert spends the bot's own ada
+     * on a batcher fee and an order's min-ada, so on-by-default was the wrong way round.</b>
+     *
+     * <p>⚠ <b>CONSEQUENCE, and it is the reason to read this paragraph:</b> a mainnet deployment must
+     * now set {@code LOANS_LIQUIDATION_CONVERT_ENABLED=true} explicitly and the chart must pass it,
+     * or the next image runs with convert silently off. <b>If that trade is not what was intended,
+     * this is the line to revisit — the two rulings genuinely conflict and the later one was taken.</b>
      */
     @Test
     void theDefaultsLiveOnTheFieldsNotOnlyInTheAnnotation() {
         var fresh = new AppConfig.ConvertConfiguration();
 
-        assertTrue(fresh.isEnabled(), "convert defaults ON per Giovanni's ruling; a field left false "
-                + "would make every non-Spring construction disagree with application.yaml");
+        assertFalse(fresh.isEnabled(), "convert must ship DISARMED: application.yaml states "
+                + "enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:false}, and a field left true would "
+                + "make every non-Spring construction disagree with it — armed where the shipped "
+                + "configuration says disarmed is the worst direction for that disagreement");
         assertEquals(BigInteger.ZERO, fresh.getProfitMarginLovelace());
         assertEquals(BigInteger.valueOf(5_000_000L), fresh.getDexCostFloorLovelace(),
                 "the conservative end of Giovanni's \"4 ada or 5 ada\"");

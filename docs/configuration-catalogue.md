@@ -20,7 +20,7 @@ placeholders or `@Value` annotations.
 | layer | how many | how to find them | example |
 |---|---|---|---|
 | **1. Placeholder keys** — `application.yaml` names the env var itself | 38 leaves | grep `${` | `mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}` |
-| **2. `@Value`-only keys** — no yaml line at all, default inline in Java | 11 | grep `@Value` | `@Value("${loans.liquidation.convert.enabled:true}")` |
+| **2. `@Value`-only keys** — no yaml line at all, default inline in Java | ⚑ **0 (closed 2026-09-09)** | grep `@Value` | *was* `@Value("${loans.liquidation.convert.enabled:true}")` — **every key now has a yaml line; see trap 8** |
 | **3. ⚑ Hardcoded yaml leaves** — a literal value in the file, **still overridable** | 22 | walk the YAML | `store.cardano.sync-start-slot: 154984561` |
 
 ⛔ **Layer 3 is the one a derivation misses, and it contains the highest-stakes knobs in the file.**
@@ -304,11 +304,11 @@ loans:
   an `ANTICIPATE` entry with no cap, a negative cap. A `CONVERT` entry with a cap **warns** and
   ignores it.
 
-### 5.5 The convert path (layer 2 — no yaml lines)
+### 5.5 The convert path — ⚑ **now yaml, per profile** (was layer 2, closed 2026-09-09)
 
 | env var | property | plain English | type | default | class |
 |---|---|---|---|---|---|
-| `LOANS_LIQUIDATION_CONVERT_ENABLED` | `loans.liquidation.convert.enabled` | The Minswap conversion mechanism, globally. | bool | ⚑ **`true`** | **A** — *the one arming flag in this codebase that defaults ON*, on Giovanni's ruling: it fronts no capital and its failure mode is a no-op, not a loss. It is still behind `loans.enabled`, the mode, the arming flag and the submit gate. |
+| `LOANS_LIQUIDATION_CONVERT_ENABLED` | `loans.liquidation.convert.enabled` | The Minswap conversion mechanism, globally. | bool | ⛔ **`false`** | **C** — ⚑ **REVERSED 2026-09-09.** It defaulted `true` on an earlier ruling (fronts no capital, failure mode a no-op). It now ships **disarmed** under the later standing rule that every mode is exposed and documented but **none ships armed** — convert spends the bot's own ada on a batcher fee and an order's min-ada. ⚠ **A mainnet deployment MUST set this to `true` explicitly and the chart MUST pass it, or the node runs with convert silently off.** |
 | `LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` | `loans.liquidation.convert.profit-margin-lovelace` | What `feeValue − (txFee + orderAda)` must reach. `0` refuses every net loss while allowing break-even — which is what refuses a `liquidationFeePerMille = 0` bond out of the box. | lovelace, **may be negative** | `0` | **A** — honoured on **every** network, mainnet included. A negative value WARNs loudly at boot; it never hard-fails. |
 | `LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE` | `loans.liquidation.convert.dex-cost-floor-lovelace` | The assumed cost of one DEX interaction (batcher + fee), as a **floor** on the charged outlay, not an addend: the gate charges `max(txFee + orderAda, this)`. | lovelace, **≥ 0** | `5000000` | ⛔ **C** — **negative or unset throws at startup, on every network.** A negative cost of doing work is a typo, not a bound. |
 
@@ -356,6 +356,64 @@ liquidation key above.
 | `AQUARIUM_COMPOUND_REFERENCE_SCRIPTS` | `loans.compound.reference-scripts` | ⚑ **A comma-separated coordinate LIST, not named keys.** The node reads `referenceScriptHash` off the chain, so a mislabelled coordinate is not expressible — the shape the liquidation path should eventually adopt (FAB-75). | csv of `txHash#index` | *(empty)* | **A** — empty means all 11 validators inline = **24,878 bytes against a 16,384 limit**, i.e. unbuildable. Referencing the four largest measures ~10,400. |
 
 ---
+
+## 6.4 ⚑ The Aquarium scheduled-transaction processor (NEW since e6a9752)
+
+| env var | property | plain English | type | default | class |
+|---|---|---|---|---|---|
+| `SCHEDULING_TRANSACTION_PROCESSOR_ENABLED` | `scheduling.transaction-processor.enabled` | The Tank scheduled-transaction processor — the original Aquarium job, which **builds and SUBMITS** from the operator's wallet. | bool | ⛔ **`false`** | **C** — gates the whole bean via `@ConditionalOnProperty` with **no `matchIfMissing`**. ⚠ **A node upgrading across this change stops processing until it is set**, and nothing else complains: a disabled processor and a quiet one look identical. |
+| `SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES` | `scheduling.transaction-processor.delay-minutes` | Poll interval. | int | `5` | **A** |
+
+## 6.5 ⇒ THE MINIMUM MAINNET ARMING SET — what actually turns the bot on
+
+**Everything else is tuning. These are the dials that decide whether the node does anything**, and
+each ships in the safe position, so a node that is merely installed and started **spends nothing**.
+
+| env var | ships | to arm |
+|---|---|---|
+| `SCHEDULING_TRANSACTION_PROCESSOR_ENABLED` | `false` | `"true"` — the Aquarium scheduled-transaction processor |
+| `AQUARIUM_LIQUIDATION_MODE` | `disabled` | `live` (or `shadow` to rehearse) |
+| `LOANS_LIQUIDATION_CONVERT_ENABLED` | `false` | `"true"` — ⚑ **new requirement as of 2026-09-09** |
+| `AQUARIUM_COMPOUND_ENABLED` | `false` | `"true"` |
+| `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `5000000` | lower it, or the shared floor refuses work the operator wants |
+
+⚠ **The margin is the one that surprises people.** It is **shared across every mode** and it is what
+refused the first live convert. Arming a path and leaving this at 5 ada is a node that looks armed
+and does nothing.
+
+## 6.6 ⛔ NEVER OPERATOR-SETTABLE — validator literals, not configuration
+
+| constant | value | why |
+|---|---|---|
+| `ConvertTxEncoder.MAX_BATCHER_FEE` | `2000000` | the order datum is compared with `equals_data`; a different value **fails the validator** |
+| `ConvertEconomics.MINSWAP_ORDER_OVERHEAD` | `4000000` | the order's ada is checked `>=` against this; below it the order is refused, above it the bot overpays |
+
+⇒ **These mirror literals in `lm_liquidate_and_convert_action.ak` at the deployed sha.** They move
+only when FluidTokens redeploy, **in the same commit as the reference-script coordinate** (§57.9c).
+**A chart that exposes them is a chart that can break every convert.**
+
+## 6.7 ⛔ REMOVED — a chart must NOT pass these
+
+| gone | why |
+|---|---|
+| `AQUARIUM_X_SUBMIT` / `loans.submittable-network` | removed on Giovanni's ruling: *"a barrier that silently blocks submission even when everything else is armed is a bug, not a safeguard"* |
+| `LOANS_ENABLED` (`loans.enabled`) | removed: v4 indexing is unconditional — *"if the flag is flipped later we won't see old loans"* |
+| `AQUARIUM_LIQUIDATION_ENABLED` | removed: redundant with the mode |
+
+⚠ **Passing a removed key is not an error and produces no warning** — it is simply ignored, which
+reads exactly like it working.
+
+## 6.8 ⚠ THE PREFIX TRAP — one reference-script key is `LOANS_`, not `AQUARIUM_`
+
+Eight liquidation reference-script slots are `AQUARIUM_LIQUIDATION_REF_*`. **The ninth is not:**
+
+```
+LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION
+```
+⇒ It is the **relaxed-binding form of `loans.liquidation.reference-scripts.…`, and it has no
+`AQUARIUM_LIQUIDATION_REF_*` alias.** *A chart that names it by the pattern of the other eight passes
+nothing, the slot stays empty, the convert script travels inline, and the transaction exceeds
+`maxTxSize` — with no configuration error anywhere.*
 
 ## 7. Traps
 
@@ -537,3 +595,28 @@ point `NETWORK` / the profile at the chain → supply the config policy ids → 
 the reference scripts → `AQUARIUM_LIQUIDATION_MODE=live`.
 ⛔ **There is no longer a switch after that.** A node targeted at a chain and armed **acts on it** —
 that coherence is the whole point of removing the submit gate.
+
+### Trap 8 ✅ — the `@Value`-only key a profile could not reach (**CLOSED 2026-09-09**)
+
+**Historically the largest silent gap in this surface, and it is now shut.** Eleven keys existed only
+as inline `@Value` defaults with **no yaml line at all**. ⛔ **A profile document can only override a
+key that EXISTS** — so the `preview` document had nothing to blank, and a preview node resolved
+**mainnet** values.
+
+**It was not theoretical.** Observed running on preview: `loans.minswap.pool-address` resolved the
+mainnet DEX pool address, sent it to a preview provider, and took back
+`400 "Invalid address for this network"` — at ERROR, with a stack trace, **for every candidate on
+every scheduling cycle.** ⚠ **The three sibling Minswap keys had the identical defect and produced no
+symptom at all**, because they only fed a derivation nobody had published. *The loud one was the
+lucky one.*
+
+**Every key now has a yaml line, per profile**, and the annotations carry **no inline default** —
+either `${key:}` for strings, or **no default at all** where the type cannot bind an empty string
+(a boolean or a `BigInteger`: `${key:}` would fail at startup with a *conversion* error rather than a
+missing-key one). ⇒ **A node whose configuration omits one of those does not boot**, which is the
+intended reading of "the yaml is where this lives".
+
+**Guarded by `MinswapPoolAddressIsPerProfileTest`, which asserts the ABSENCE of an inline default on
+the annotation itself.** *Asserting the resolved value cannot catch a re-added default: the mainnet
+document supplies the same value, so nothing on the mainnet path would change and every other test
+would still pass.*

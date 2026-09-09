@@ -160,6 +160,10 @@ loans:
   config:
     ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:7b9f20dbadaebe1400915e4a63444a9eb7515c21c1114d4bc9c77f1455148cb0}
     policy-id: ${LOANS_CONFIG_POLICY_ID:db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416}
+    # The config NFTs' asset name, "parameters" in hex. Identical on every network — stated
+    # rather than inlined, because a key that exists nowhere can be neither overridden nor
+    # documented (§57.12).
+    asset-name: ${LOANS_CONFIG_ASSET_NAME:706172616d6574657273}
   lm-config:
     policy-id: ${LOANS_LM_CONFIG_POLICY_ID:a56b0ac2654663f395601601a7825649e5488905648747e912d870e4}
   # Published in the ConfigDatum (field 0) and NOT derivable from the blueprint — the same value on
@@ -326,6 +330,18 @@ loans:
     #
     # No coordinates on mainnet: lending is disabled there, and a stale coordinate is worse than an
     # absent one — LoansReferenceScriptVerifier hard-fails on a hash that does not match.
+    convert:
+      # ⛔ OFF UNLESS ARMED. The convert path creates a Minswap order and spends the bot's own ada
+      # on the batcher fee and the order's min-ada; it is a money path, so it ships disabled.
+      # ⚠ A MAINNET DEPLOYMENT MUST SET THIS TO "true" EXPLICITLY, and the chart must pass it, or
+      # the node runs with convert silently off. Changed from an on-by-default inline value on
+      # 2026-09-09: every mode is exposed and documented, and none ships armed.
+      enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:false}
+      # What feeValue - (txFee + orderAda) must reach. 0 refuses every net loss, allows break-even.
+      profit-margin-lovelace: ${LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE:0}
+      # The operator's stated cost of a DEX interaction: a max() against the measured cost, never a sum.
+      dex-cost-floor-lovelace: ${LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE:5000000}
+
     reference-scripts:
       loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f#0}
       loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:46d7195856788885fd4a488dff7bde8bbaf46d5dc4a2fa3dbd12e9cb42129c96#0}
@@ -445,6 +461,12 @@ loans:
     reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}
 
   liquidation:
+    convert:
+      # ⛔ Minswap V2 has no preview deployment, so a convert cannot be built here at all. Off, and
+      # the two amounts stated so every key exists on every profile (§57.12).
+      enabled: false
+      profit-margin-lovelace: 0
+      dex-cost-floor-lovelace: 5000000
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
     # Six of the seven, verified on chain: each of these UTxOs publishes a reference_script_hash
     # equal to the hash this repo derives for that validator, and LoansReferenceScriptVerifier
@@ -555,6 +577,7 @@ loans:
     # parameters, so 25 of 28 derived script hashes move on a re-mint alone.
     ref-utxo-tx-hash: 8dd38e97b79cc7c8a3c59400944b7cd9f724876a1d49ea17ffb5e49b3785091c
     policy-id: d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e
+    asset-name: 706172616d6574657273
   lm-config:
     policy-id: a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13
   # Published in the ConfigDatum; the blueprint ships no smart_tokens validator so this
