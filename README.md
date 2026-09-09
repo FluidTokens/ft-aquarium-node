@@ -213,6 +213,18 @@ Two controls, and a convert needs **both** to permit it:
 (default `5000000` — 5 ADA of profit per liquidation). There is no separate convert margin. Lowering
 it to take on convert work lowers it for `ANTICIPATE` work too.
 
+⚑ **margin 0 on a convert already means it must cover the outlay — and the outlay is usually 5 ADA,
+not 4.** `LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE` (default `4000000`) is charged as a
+fixed expense of every conversion before the margin applies, but the gate is
+`max(txFee + orderCost, dex-cost-floor-lovelace)` — a FLOOR over that whole sum, not an addend — and
+the shipped `dex-cost-floor-lovelace` (`5000000`) binds whenever `txFee < 1000000`, true of most
+liquidation transactions. **So at the shipped defaults a convert must clear 5,000,000 lovelace of
+outlay before margin `0` counts as break-even, and ≥ 10,000,000 lovelace of oracle-valued fee slice
+once the shipped 5,000,000 margin is added** — not the 5 ADA of profit alone stated above.
+`LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE` is what you raise if you believe a conversion
+costs you more than that; the node refuses to start on a value below it, because the chain spends the
+4 ADA regardless.
+
 ### Worked example — three markets
 
 Convert ADA-principal loans, anticipate a token-principal market you do not trust a pool for

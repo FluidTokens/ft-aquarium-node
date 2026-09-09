@@ -164,7 +164,7 @@ actually costs you". It has to absorb:
 - the value of a cycle spent on a candidate that later turns out to be unbuildable.
 - ordinary fee variance between the build and the block.
 
-The shipped 1.5 ADA leaves headroom for either reference-script shape and still refuses dust
+The shipped 5 ADA leaves headroom for either reference-script shape and still refuses dust
 liquidations, whose fee slice would not repay the transaction that claims it.
 
 ## 5. Every `loans.liquidation.*` key
@@ -175,7 +175,7 @@ liquidations, whose fee slice would not repay the transaction that claims it.
 | `delay-seconds` | `AQUARIUM_LIQUIDATION_DELAY_SECONDS` | `60` | Fixed delay between cycles. |
 | `validity-window-seconds` | `AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS` | `120` | How far past "now" the built transaction's validity interval extends. |
 | `oracle-window-margin-seconds` | `AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS` | `30` | How much of each oracle feed's window must still be unused after the transaction's `validTo` — and, at submit time, after *now*. |
-| `profit-margin-lovelace` | `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `1500000` | See §4, and §11 for a **negative** value. |
+| `profit-margin-lovelace` | `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `5000000` | See §4, and §11 for a **negative** value. This is the ONE margin, shared with convert since 2026-09-09 — see §11 and §12.1. |
 | `decision-log-size` | `AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE` | `200` | Capacity of the in-memory decision ring buffer. Nothing is persisted. |
 | `quarantine-minutes` | `AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES` | `30` | How long a loan UTxO is skipped after a failed build or any submit attempt. |
 | `reference-scripts.loan` | `AQUARIUM_LIQUIDATION_REF_LOAN` | empty (preview: set) | See §6. |
@@ -466,9 +466,13 @@ still refused.
 
 | path | key | default | at the default |
 |---|---|---|---|
-| liquidation | `loans.liquidation.profit-margin-lovelace` | `1500000` (yaml) / `5000000` shipped | refuses every loss |
+| liquidation and convert | `loans.liquidation.profit-margin-lovelace` | `5000000` | refuses every loss |
 | compound | `loans.compound.profit-margin-lovelace` | `0` | refuses every loss |
-| convert | `loans.liquidation.convert.profit-margin-lovelace` | `0` | refuses every loss |
+
+⚠ **`loans.liquidation.convert.profit-margin-lovelace` no longer exists** — deleted 2026-09-09, when
+the convert margin was merged into the shared `loans.liquidation.profit-margin-lovelace` row above.
+A chart still passing `LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` sets nothing and warns
+nowhere; see §12.1.
 
 **The defaults are the protection, not a guard.** Only an *explicitly negative* value operates at a
 loss, and no copy-paste of a zero or positive configuration can produce one. A node that does state one
@@ -476,12 +480,15 @@ announces it at boot, on every network, and more loudly on mainnet:
 
 ```
 ⛔ OPERATING AT A LOSS ON MAINNET, BY OPERATOR CONFIGURATION — path: convert;
-   loans.liquidation.convert.profit-margin-lovelace = -4000000 lovelace (network mainnet). …
+   loans.liquidation.profit-margin-lovelace = -4000000 lovelace (network mainnet). …
 ```
 
-**One knob is NOT a margin and stays fatal**: `loans.liquidation.convert.dex-cost-floor-lovelace`
-(default `5000000`) states what one Minswap interaction *costs*, not what you are willing to lose. A
-negative value there is a typo with no meaningful reading, and it aborts startup.
+**Two knobs are NOT margins and stay fatal**: `loans.liquidation.convert.dex-cost-floor-lovelace`
+(default `5000000`) and `loans.liquidation.convert.minswap-order-cost-lovelace` (default `4000000`)
+both state what a convert *costs*, not what you are willing to lose. A negative value on either is a
+typo with no meaningful reading, and both abort startup — the order cost additionally aborts if it
+falls below `ConvertEconomics.MINSWAP_ORDER_OVERHEAD` (also `4000000`), the non-configurable figure
+the order output must carry.
 
 ---
 
@@ -537,11 +544,16 @@ ada-equivalent is worth the exposure.
 | Key | Environment variable | Default |
 |---|---|---|
 | `loans.liquidation.convert.enabled` | `LOANS_LIQUIDATION_CONVERT_ENABLED` | **`true`** |
-| `loans.liquidation.convert.profit-margin-lovelace` | `LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` | `0` |
 | `loans.liquidation.convert.dex-cost-floor-lovelace` | `LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE` | `5000000` |
+| `loans.liquidation.convert.minswap-order-cost-lovelace` | `LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE` | `4000000` |
 | `loans.minswap.pool-policy-id` | `LOANS_MINSWAP_POOL_POLICY_ID` | FluidTokens' verified **mainnet** value |
 | `loans.minswap.pool-spend-script-hash` | `LOANS_MINSWAP_POOL_SPEND_SCRIPT_HASH` | ″ |
 | `loans.minswap.order-spend-script-hash` | `LOANS_MINSWAP_ORDER_SPEND_SCRIPT_HASH` | ″ |
+
+⚠ **`loans.liquidation.convert.profit-margin-lovelace` is GONE** (deleted `ba5ef4c`, 2026-09-09): the
+margin convert answers to is the shared `loans.liquidation.profit-margin-lovelace` of §5/§11, not a
+row in this table. Setting `LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` binds nowhere and warns
+nowhere.
 
 **`convert.enabled` is the one arming flag in this codebase that defaults ON.** That is not a
 weakening: it only matters on a node that has already passed `loans.enabled`,

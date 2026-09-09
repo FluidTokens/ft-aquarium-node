@@ -26,19 +26,35 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code application.yaml}</b> ({@code mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}}), so their env
  * name is spelled out in the file and there is nothing to infer.
  *
- * <p>⚠ <b>Some do not.</b> The two {@code loans.liquidation.convert.*} keys,
- * {@code loans.verify-config.fail-on-unreachable} and
- * {@code loans.liquidation.reference-scripts.lm-liquidate-and-convert-action} have no placeholder of
- * their own. They are settable exclusively through Spring Boot's <b>relaxed environment binding</b> —
- * {@code SystemEnvironmentPropertySource} mapping {@code loans.liquidation.convert.enabled} to
- * {@code LOANS_LIQUIDATION_CONVERT_ENABLED}, dashes and dots alike becoming underscores.
+ * <p>⚠ <b>Corrected this round — both halves of the previous account were stale.</b> Only
+ * {@code loans.verify-config.fail-on-unreachable} genuinely has no placeholder of its own today: it
+ * is not declared in {@code application.yaml} at all, so its only route in is relaxed binding plus
+ * its inline {@code @Value("${loans.verify-config.fail-on-unreachable:false}")} default, and it is
+ * <b>out of this file's scope</b> — no test here exercises it; a future one should.
  *
- * <p>⚑ <b>One of them stopped existing on 2026-09-09</b> and is NOT re-pointed at something else
- * here: {@code loans.liquidation.convert.profit-margin-lovelace} was deleted when the convert margin
- * was merged into the shared {@code loans.liquidation.profit-margin-lovelace}. That key <b>does</b>
- * have an {@code application.yaml} placeholder ({@code AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE}),
- * so it is out of this file's scope by construction — its env name is spelled out in the file rather
- * than inferred, which is the whole distinction this test exists to police.
+ * <p><b>The other two families no longer belong on this list, and BOTH already carried an explicit
+ * placeholder at {@code ba5ef4c}, before this correction.</b> There are THREE
+ * {@code loans.liquidation.convert.*} keys, not two ({@code enabled}, {@code dex-cost-floor-lovelace},
+ * {@code minswap-order-cost-lovelace}), and every one of them is spelled out in
+ * {@code application.yaml} as {@code ${LOANS_LIQUIDATION_CONVERT_*:default}} — {@code enabled} and
+ * {@code dex-cost-floor-lovelace} already did before this file was last touched;
+ * {@code minswap-order-cost-lovelace} gained one when it was added. Likewise
+ * {@code loans.liquidation.reference-scripts.lm-liquidate-and-convert-action} is declared as
+ * {@code ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:default}} in both
+ * profile documents — an explicit placeholder, just one that happens to spell out the same name
+ * relaxed binding would derive anyway (its eight sibling reference-script keys use short
+ * {@code AQUARIUM_LIQUIDATION_REF_*} names instead, which is the real thing that sets it apart from
+ * them, not an absent mapping). <b>The tests below are kept anyway</b>, as regression coverage for
+ * the relaxed-binding mechanism itself — these four keys gained their placeholders only recently, a
+ * placeholder line can be deleted again, and relaxed binding is what would still carry the value if
+ * that happened.
+ *
+ * <p>⚑ <b>{@code loans.liquidation.convert.profit-margin-lovelace} stopped existing on 2026-09-09</b>
+ * and is NOT re-pointed at something else here: it was deleted when the convert margin was merged
+ * into the shared {@code loans.liquidation.profit-margin-lovelace}. That key <b>does</b> have an
+ * {@code application.yaml} placeholder ({@code AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE}), so it
+ * was always out of this file's scope by construction — its env name is spelled out in the file
+ * rather than inferred, which is the whole distinction this test exists to police.
  *
  * <p>⇒ <b>That mapping is an assumption a whole chart rests on, and until now nothing in this repo
  * measured it.</b> A catalogue that told a chart author to write
@@ -73,21 +89,27 @@ class EnvironmentVariableBindingTest {
                 // 2026-09-09 — application.yaml is their only home (§57.12). A synthetic context
                 // does not read that file, so it must state them, exactly as a node's configuration
                 // must. This is the intended behaviour: a context that omits them does not start.
-                // Two convert keys are left to state: `profit-margin-lovelace` was deleted the same
-                // day, merged into the shared loans.liquidation.profit-margin-lovelace.
+                // THREE convert keys are left to state: `profit-margin-lovelace` was deleted the same
+                // day, merged into the shared loans.liquidation.profit-margin-lovelace, and
+                // `minswap-order-cost-lovelace` was added when the Minswap order's ada became an
+                // explicit configurable expense.
                 .withPropertyValues("loans.enabled=true", "network=preview",
                         "loans.config.asset-name=706172616d6574657273",
                         "loans.liquidation.profit-margin-lovelace=5000000",
                         "loans.liquidation.convert.enabled=true",
-                        "loans.liquidation.convert.dex-cost-floor-lovelace=5000000");
+                        "loans.liquidation.convert.dex-cost-floor-lovelace=5000000",
+                        "loans.liquidation.convert.minswap-order-cost-lovelace=4000000");
     }
 
     /**
-     * The keys with NO {@code application.yaml} placeholder. Each is named the way a chart would have
-     * to name it, and asserted to reach the bean that reads it.
+     * ⚠ <b>Renamed this round</b> — these four keys now carry an explicit {@code application.yaml}
+     * placeholder each (see the class javadoc's correction), so "no yaml placeholder" no longer
+     * describes them. Kept as regression coverage for the relaxed-binding mechanism itself: each is
+     * named the way a chart would have to name it if its placeholder line were ever removed again,
+     * and asserted to reach the bean that reads it.
      */
     @Test
-    void theKeysWithNoYamlPlaceholderAreReachableAsEnvironmentVariables() {
+    void theseFourKeysAreReachableThroughRelaxedEnvironmentBindingRegardlessOfTheirYamlPlaceholder() {
         withEnv(Map.of(
                 "LOANS_LIQUIDATION_CONVERT_ENABLED", "false",
                 "LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE", "4000000",
@@ -134,7 +156,8 @@ class EnvironmentVariableBindingTest {
                             "loans.config.asset-name=706172616d6574657273",
                         "loans.liquidation.profit-margin-lovelace=5000000",
                             "loans.liquidation.convert.enabled=true",
-                            "loans.liquidation.convert.dex-cost-floor-lovelace=5000000")
+                            "loans.liquidation.convert.dex-cost-floor-lovelace=5000000",
+                            "loans.liquidation.convert.minswap-order-cost-lovelace=4000000")
                     .run(ctx -> assertEquals(target, ctx.getBean(AppConfig.Network.class).getNetwork(),
                             "NETWORK must reach the bean: it is the only thing that decides where "
                                     + "this node submits, and a value that binds nowhere points a "

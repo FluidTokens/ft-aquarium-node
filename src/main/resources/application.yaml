@@ -356,6 +356,20 @@ loans:
       # sum. NOT a margin -- it says what the work COSTS, not what the operator will accept to lose,
       # which is why the merge above left it standing. Negative or unset throws at startup.
       dex-cost-floor-lovelace: ${LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE:5000000}
+      # ⛔ WHAT A CONVERSION SPENDS on the Minswap order -- a FIXED EXPENSE, charged before the
+      # conversion counts as break-even. This is why `profit-margin-lovelace: 0` is honest on this
+      # path: at 0 the conversion must still cover the OUTLAY.
+      # ⚠ AND THE OUTLAY IS USUALLY 5 ADA, NOT 4 -- corrected this round. `dex-cost-floor-lovelace`
+      # above is a FLOOR over the whole measurement (max(txFee + this, that)), not an addend, and it
+      # binds whenever txFee < 1,000,000 -- true of most liquidation transactions. So at the shipped
+      # defaults (this = 4,000,000, floor = 5,000,000) a margin of 0 must clear 5,000,000 lovelace of
+      # outlay, and the operator-facing number nobody wrote down: at the shipped 5,000,000 margin too,
+      # a convert needs >= 10,000,000 lovelace of oracle-valued fee slice to be approved.
+      # ⚠ IT IS NOT THE BUILDER'S NUMBER. ConvertEconomics.MINSWAP_ORDER_OVERHEAD is what the order
+      # output must CARRY -- the validator checks it -- and stays a non-configurable Java constant
+      # (catalogue §6.6). Stating MORE here is a legitimate belief about cost; stating LESS is
+      # refused at startup, because the chain will spend the 4 ada regardless.
+      minswap-order-cost-lovelace: ${LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE:4000000}
 
     reference-scripts:
       loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f#0}
@@ -489,6 +503,21 @@ loans:
       # Both keys are stated explicitly so every key exists on every profile (§57.12).
       enabled: true
       dex-cost-floor-lovelace: 5000000
+      # Stated as a literal, like every other key on this profile: the annotation carries no inline
+      # default, so an environment that OMITS this key entirely does not start. Matches mainnet
+      # deliberately -- the order ada the validator demands is not a per-network figure.
+      #
+      # ⚠ "Does not start" is true for omitted, not for BLANK -- docker/.env's actual failure shape.
+      # LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE set to the empty string makes
+      # ${LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE:4000000} resolve to "", and Spring's
+      # String->BigInteger conversion returns no value for blank text -- the @Value field injection
+      # is silently SKIPPED rather than throwing. The field then keeps its Java default
+      # (AppConfig.ConvertConfiguration.minswapOrderCostLovelace = 4,000,000, pinned equal to
+      # ConvertEconomics.MINSWAP_ORDER_OVERHEAD) and THIS LINE is never consulted. Verified by probe
+      # (this round): the context boots clean with orderCost=4000000 on a blank env value. Harmless
+      # here only because the field default matches the builder constant announceAndGuard() refuses
+      # to let it fall below -- it would not be harmless if the two were ever allowed to diverge.
+      minswap-order-cost-lovelace: 4000000
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
     # Six of the seven, verified on chain: each of these UTxOs publishes a reference_script_hash
     # equal to the hash this repo derives for that validator, and LoansReferenceScriptVerifier

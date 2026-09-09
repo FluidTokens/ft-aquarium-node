@@ -87,9 +87,14 @@ class MinswapPoolAddressIsPerProfileTest {
                 "the shared margin must carry NO inline default: the yaml is its single source, and "
                         + "an inline one is a second answer that only non-Spring paths ever read");
 
+        // ⛔ THREE KEYS SINCE 2026-09-09: the order cost joined them when the Minswap order's ada
+        // became an explicit configurable EXPENSE, split from the builder constant that says what the
+        // order must carry. Same rule, same reason — convert is a money path.
         for (var e : java.util.Map.of(
                 "enabled", "loans.liquidation.convert.enabled",
-                "dexCostFloorLovelace", "loans.liquidation.convert.dex-cost-floor-lovelace").entrySet()) {
+                "dexCostFloorLovelace", "loans.liquidation.convert.dex-cost-floor-lovelace",
+                "minswapOrderCostLovelace",
+                "loans.liquidation.convert.minswap-order-cost-lovelace").entrySet()) {
             Field f = AppConfig.ConvertConfiguration.class.getDeclaredField(e.getKey());
             assertEquals("${" + e.getValue() + "}", f.getAnnotation(Value.class).value(),
                     e.getKey() + " must carry no inline default; convert is a money path and an "
@@ -128,6 +133,15 @@ class MinswapPoolAddressIsPerProfileTest {
                 "the preview document must state the DEX cost floor as a literal — every key exists "
                         + "on every profile, or the profile that omits it fails to start");
 
+        // ⛔ AND THE MINSWAP ORDER COST, in both documents, for the same reason.
+        assertTrue(yaml.substring(0, preview).contains(
+                        "minswap-order-cost-lovelace: ${LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE:4000000}"),
+                "the mainnet document must declare the Minswap order COST with its env override — it "
+                        + "is what a conversion spends, and an operator who believes it costs more "
+                        + "than the order carries has no other way to say so");
+        assertTrue(yaml.indexOf("minswap-order-cost-lovelace: 4000000", preview) > preview,
+                "the preview document must state the Minswap order cost as a literal");
+
         // ⛔ THE DELETED KEY MUST NOT COME BACK, in either document. A chart still passing
         // LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE sets nothing and warns nowhere
         // (catalogue §6.7); a yaml key resurrected under the same name would look like it works.
@@ -140,12 +154,14 @@ class MinswapPoolAddressIsPerProfileTest {
             if (convert == null) {
                 continue;
             }
-            assertEquals(java.util.Set.of("enabled", "dex-cost-floor-lovelace"),
+            assertEquals(java.util.Set.of("enabled", "dex-cost-floor-lovelace",
+                            "minswap-order-cost-lovelace"),
                     new java.util.LinkedHashSet<>(convert.keySet()),
-                    "the convert block holds exactly the global switch and the DEX cost floor. "
-                            + "profit-margin-lovelace was deleted on 2026-09-09 — the margin is the "
-                            + "shared loans.liquidation.profit-margin-lovelace, for every mode — and "
-                            + "a new key here is a knob nothing documents");
+                    "the convert block holds exactly the global switch and the TWO cost inputs — the "
+                            + "Minswap order cost and the DEX cost floor. profit-margin-lovelace was "
+                            + "deleted on 2026-09-09 — the margin is the shared "
+                            + "loans.liquidation.profit-margin-lovelace, for every mode — and a new "
+                            + "key here is a knob nothing documents");
         }
     }
 

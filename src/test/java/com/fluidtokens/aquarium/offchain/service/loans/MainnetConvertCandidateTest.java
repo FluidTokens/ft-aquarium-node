@@ -141,6 +141,73 @@ class MainnetConvertCandidateTest {
                         + "operator cleaning up a loan nobody will profitably touch is the point");
     }
 
+    /**
+     * ⛔ <b>THE LIVE CANDIDATE, PINNED — the numbers Giovanni is choosing a margin between.</b>
+     *
+     * <p>⚠ <b>Provenance:</b> these five figures were relayed with the ticket as the measurement of a
+     * live convert on this path — a fee slice worth 1,626,257 lovelace against a 989,747 lovelace
+     * transaction fee. They are <b>not</b> derived from the {@code d832b78e} fixtures above and do not
+     * claim to be; what is asserted here is what THIS GATE says about them, so the verdict cannot
+     * drift silently while the arithmetic changes underneath it.
+     *
+     * <pre>
+     *   feeValue   1_626_257            income, at the collateral oracle price
+     *   txFee        989_747            measured
+     *   orderCost  4_000_000            loans.liquidation.convert.minswap-order-cost-lovelace
+     *   ---------------------
+     *   measured   4_989_747            txFee + orderCost
+     *   dexFloor   5_000_000            binds, by 10,253 lovelace
+     *   outlay     5_000_000
+     *   net       -3_373_743
+     * </pre>
+     *
+     * <p>⇒ <b>The choice this pins:</b> a shared margin of {@code -5_000_000} BUILDS this convert;
+     * {@code -2_500_000} REFUSES it. Both are stated-loss settings, legal on mainnet since findings
+     * §31, and the net sits between them — which is exactly why the number matters and why it is
+     * asserted rather than described.
+     */
+    @Test
+    void theLiveCandidateIsBuiltAtAFiveAdaStatedLossAndRefusedAtTwoAndAHalf() {
+        var network = new AppConfig.Network();
+        ReflectionTestUtils.setField(network, "network", "mainnet");
+
+        // Shipped costs: the 4 ada order cost and the 5 ada DEX floor, both stated rather than
+        // inherited — this test is ABOUT those figures, so a change to either must show up here.
+        var shipped = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(5_000_000L),
+                BigInteger.valueOf(4_000_000L));
+
+        // 32,525,140 collateral units at 50/1000 = 1,626,257, priced 1:1 -> the observed fee slice.
+        BigInteger collateral = BigInteger.valueOf(32_525_140L);
+        BigInteger txFee = BigInteger.valueOf(989_747L);
+        OraclePriceFeed oneForOne =
+                OraclePriceFeed.aggregated(FLDT, BigInteger.ONE, BigInteger.ONE, 0L, Long.MAX_VALUE);
+
+        ConvertAssessment a = new ConvertEconomics(shipped, liquidation(BigInteger.ZERO), network)
+                .assess(true, collateral, 50L, false, oneForOne, txFee);
+
+        assertEquals(BigInteger.valueOf(1_626_257L), a.feeValueLovelace(), "the fee slice");
+        assertEquals(BigInteger.valueOf(989_747L), a.txFee());
+        assertEquals(BigInteger.valueOf(4_000_000L), a.orderAdaFunded(),
+                "the CONFIGURED order cost — the fixed expense of every conversion");
+        assertEquals(BigInteger.valueOf(4_989_747L), a.measuredOutlay());
+        assertEquals(BigInteger.valueOf(5_000_000L), a.outlay(),
+                "the DEX floor still binds — by 10,253 lovelace, which is the whole of what it is "
+                        + "still worth once the order cost is stated explicitly");
+        assertEquals(BigInteger.valueOf(-3_373_743L), a.net());
+
+        // ⛔ THE TWO CANDIDATE MARGINS, and the verdict each produces.
+        assertTrue(new ConvertEconomics(shipped, liquidation(BigInteger.valueOf(-5_000_000L)), network)
+                        .assess(true, collateral, 50L, false, oneForOne, txFee).approved(),
+                "a stated loss of 5 ada BUILDS this convert: -3,373,743 clears -5,000,000");
+
+        ConvertAssessment refused =
+                new ConvertEconomics(shipped, liquidation(BigInteger.valueOf(-2_500_000L)), network)
+                        .assess(true, collateral, 50L, false, oneForOne, txFee);
+        assertFalse(refused.approved(),
+                "a stated loss of 2.5 ada REFUSES it: -3,373,743 is below -2,500,000");
+        assertEquals(ConvertExclusion.NET_BELOW_FLOOR, refused.exclusion());
+    }
+
     /** The shared margin — {@code loans.liquidation.profit-margin-lovelace} — and nothing else. */
     private static AppConfig.LiquidationConfiguration liquidation(BigInteger margin) {
         return new AppConfig.LiquidationConfiguration(

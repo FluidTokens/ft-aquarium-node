@@ -20,9 +20,14 @@ import java.math.BigInteger;
  * @param feeValueLovelace {@link #liquidationFee} at the collateral oracle price, floored;
  *                         income the bot holds in tokens, not ada
  * @param txFee            the measured fee of the built transaction, in lovelace
- * @param orderAdaFunded   the {@code 2_800_000} lovelace {@code lm_liquidate_and_convert_action}
- *                         requires to accompany a NON-ada collateral in the Minswap order output,
- *                         and which leaves with the order; {@code 0} when the collateral is ada
+ * @param orderAdaFunded   {@code loans.liquidation.convert.minswap-order-cost-lovelace} — what THIS
+ *                         conversion SPENDS on the Minswap order, in both collateral kinds since
+ *                         {@code db5069e}, and default {@code 4_000_000}. That ada leaves with the
+ *                         order. <b>Not</b> what the order must carry — that is
+ *                         {@code ConvertEconomics.MINSWAP_ORDER_OVERHEAD}, a separate,
+ *                         non-configurable validator literal the builder always sends and this
+ *                         field can only ever equal or exceed (the gate refuses a lower configured
+ *                         value at startup)
  * @param measuredOutlay   {@code txFee + orderAdaFunded} — the ada this transaction demonstrably costs
  * @param dexCostFloor     {@code loans.liquidation.convert.dex-cost-floor-lovelace}: the operator's
  *                         stated minimum cost of one DEX interaction, covering the batcher fee whose

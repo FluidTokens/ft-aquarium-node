@@ -259,6 +259,73 @@ class ConvertEconomicsTest {
         }
     }
 
+    // ---- the Minswap order cost: a CONFIGURED expense, split from the builder constant -----------
+
+    /**
+     * ⛔ <b>THE SPLIT, MEASURED.</b> {@code ConvertEconomics.MINSWAP_ORDER_OVERHEAD} is the BUILDER's
+     * number — the ada the order output must <em>carry</em>, checked {@code >=} by the validator — and
+     * it stays a Java constant. What a conversion <em>spends</em> is
+     * {@code loans.liquidation.convert.minswap-order-cost-lovelace}, and this is the test that goes red
+     * if the gate reads the constant instead: 7,000,000 is a figure the constant cannot produce.
+     */
+    @Test
+    void theOutlayChargesTheCONFIGUREDOrderCostAndNotTheBuilderConstant() {
+        // Fee income 10_000_000 lovelace; tx fee 1_000_000; DEX floor 0 so nothing else can bind.
+        ConvertEconomics gate = new ConvertEconomics(
+                new AppConfig.ConvertConfiguration(true, BigInteger.ZERO,
+                        BigInteger.valueOf(7_000_000L)),
+                liquidation(BigInteger.ZERO), network("preview"));
+
+        ConvertAssessment a = gate.assess(true, BigInteger.valueOf(1_000_000L), 10L, false,
+                feed(1_000, 1), ADA);
+
+        assertEquals(BigInteger.valueOf(7_000_000L), a.orderAdaFunded(),
+                "the operator stated 7 ada of order cost; a gate still reading the 4,000,000 constant "
+                        + "reports that instead");
+        assertEquals(BigInteger.valueOf(8_000_000L), a.measuredOutlay(),
+                "1 ada tx fee + the CONFIGURED 7 ada — 5_000_000 here would mean the constant won");
+        assertEquals(BigInteger.valueOf(8_000_000L), a.outlay());
+        assertEquals(BigInteger.valueOf(2_000_000L), a.net(),
+                "10 ada of income less an 8 ada outlay; against the 4 ada constant it would be 5");
+        assertTrue(a.approved(), "at margin 0 the conversion covers its stated cost with 2 ada to spare");
+    }
+
+    /**
+     * ⛔ <b>The startup refusal, BOTH SIDES.</b> An operator may believe a convert costs MORE than the
+     * order carries — a fee they attribute differently, a spread they distrust — and that is a
+     * legitimate statement. Stating LESS understates a spend the chain will certainly make: the
+     * builder always sends {@code MINSWAP_ORDER_OVERHEAD} and the validator checks it, so the ada
+     * leaves the wallet whatever the configuration says.
+     */
+    @Test
+    void anOrderCostBelowWhatTheOrderMustCarryIsRefusedAtStartupAndAtOrAboveItStarts() {
+        for (String net : new String[]{"preview", "mainnet"}) {
+            for (BigInteger understated : new BigInteger[]{
+                    BigInteger.valueOf(3_999_999L),   // one lovelace under the constant
+                    BigInteger.valueOf(-1L),          // negative
+                    null}) {                          // unset
+                var bad = new AppConfig.ConvertConfiguration(true, BigInteger.ZERO, understated);
+                IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                        () -> new ConvertEconomics(bad, liquidation(BigInteger.ZERO), network(net))
+                                .announceAndGuard(),
+                        "an order cost of " + understated + " understates a spend the chain makes anyway");
+                assertTrue(thrown.getMessage()
+                                .contains("loans.liquidation.convert.minswap-order-cost-lovelace"),
+                        "the refusal must NAME the key — an operator reading a boot failure needs the "
+                                + "key, not a symptom. Saw: " + thrown.getMessage());
+            }
+
+            // ⛔ AND THE OTHER SIDE: at the constant, and above it, the node starts.
+            for (BigInteger stated : new BigInteger[]{
+                    BigInteger.valueOf(4_000_000L),   // exactly what the order carries
+                    BigInteger.valueOf(7_000_000L)}) {// a belief that a convert costs more
+                new ConvertEconomics(
+                        new AppConfig.ConvertConfiguration(true, BigInteger.ZERO, stated),
+                        liquidation(BigInteger.ZERO), network(net)).announceAndGuard();
+            }
+        }
+    }
+
     // ---- the margin floor -----------------------------------------------------------------------
 
     @Test
@@ -362,9 +429,22 @@ class ConvertEconomicsTest {
      * {@code loans.liquidation.convert.profit-margin-lovelace} stays deleted, merged into the shared
      * {@code loans.liquidation.profit-margin-lovelace}, which {@code LiquidationConfiguration} owns
      * and tests. Two fields are left in this block and this test pins both.
+     *
+     * <p>⚠ <b>RENAMED this round — the old name said the opposite of a third of this method's own
+     * body.</b> {@code theDefaultsLiveOnTheFieldsNotOnlyInTheAnnotation} was true for
+     * {@code ConvertConfiguration}'s own three fields, asserted just above, but the final assertion
+     * is about a DIFFERENT class, {@code LiquidationConfiguration}, whose shared margin field is
+     * pinned to carry <b>no default at all</b> — the deliberate exception §26.2 usually argues
+     * against. A contributor who read only the name and "fixed" the margin field back to a default
+     * "for consistency" would hit a failure whose own method name endorsed the change, and the
+     * natural repair is deleting the assertion — exactly the silent-stop-testing shape this file
+     * exists to prevent. The margin is the exception because the yaml is its ONLY source of truth
+     * (§26.2's normal case is "if Spring never binds it, be sure the field still agrees with the
+     * yaml"; the margin instead ensures nothing but the yaml can ever supply it, so a bare
+     * construction fails loudly at {@code init()} rather than defaulting quietly).
      */
     @Test
-    void theDefaultsLiveOnTheFieldsNotOnlyInTheAnnotation() {
+    void everyConvertFieldDefaultMatchesTheYaml_ExceptTheSharedMarginWhichHasDeliberatelyNone() {
         var fresh = new AppConfig.ConvertConfiguration();
 
         assertTrue(fresh.isEnabled(), "convert ships ARMED: application.yaml states "
@@ -374,6 +454,13 @@ class ConvertEconomicsTest {
                 + "presents as a quiet market");
         assertEquals(BigInteger.valueOf(5_000_000L), fresh.getDexCostFloorLovelace(),
                 "the conservative end of Giovanni's \"4 ada or 5 ada\"");
+        // ⛔ AND THE ORDER COST, whose field default must equal the BUILDER constant: at the shipped
+        // value the economics produce exactly the numbers they produced before the split, so this
+        // change is invisible to every candidate until an operator states otherwise.
+        assertEquals(ConvertEconomics.MINSWAP_ORDER_OVERHEAD, fresh.getMinswapOrderCostLovelace(),
+                "the shipped order cost is the ada the order actually carries; a field default below "
+                        + "it would be refused at startup, and one above it would price every convert "
+                        + "differently from the yaml");
         // ⛔ THE SHARED MARGIN'S FIELD DEFAULT, pinned here because convert now depends on it.
         // ConvertEconomics.assess does net.compareTo(floor) unguarded; a null floor NPEs. The convert
         // margin this replaced carried its own field default and this class asserted it — the merge

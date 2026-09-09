@@ -315,13 +315,30 @@ loans:
 profitMarginLovelace is literally the same as liquidation. can we get rid of convert and merge into
 liquidation? … it's just one knob, the additional protection is the market specification where we can
 enable/override convert w/ anticipate."* Convert now answers to the **shared**
-`AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` in §5.3, like every other mode. **Two keys are left in
-this block, and neither is a margin.**
+`AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` in §5.3, like every other mode. **Three keys are left in
+this block, and none of them is a margin** — one arming flag and two cost inputs.
 
 | env var | property | plain English | type | default | class |
 |---|---|---|---|---|---|
 | `LOANS_LIQUIDATION_CONVERT_ENABLED` | `loans.liquidation.convert.enabled` | The Minswap conversion mechanism, **globally**. `false` = no converts anywhere, whatever any market says. | bool | ⚑ **`true`** | **C** — ⚠ **the one arming flag in this app that defaults ON.** Flipped to `false` on 2026-09-09 and **restored to `true` on 2026-09-10** on Giovanni's ruling: *"convert should remain but under liquidation and be enabled by default. there is a case we want to disable conversions."* Defensible here and nowhere else: the bot fronts no capital on this path and an unfilled order returns the collateral to the lender, so the failure mode is a no-op, not a loss. Still subject to `AQUARIUM_LIQUIDATION_MODE`. |
-| `LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE` | `loans.liquidation.convert.dex-cost-floor-lovelace` | The assumed cost of one DEX interaction (batcher + fee), as a **floor** on the charged outlay, not an addend: the gate charges `max(txFee + orderAda, this)`. **A cost input, not a margin** — which is why the merge left it standing. | lovelace, **≥ 0** | `5000000` | ⛔ **C** — **negative or unset throws at startup, on every network.** A negative cost of doing work is a typo, not a bound. |
+| `LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE` | `loans.liquidation.convert.minswap-order-cost-lovelace` | ⚑ **What a conversion SPENDS on the Minswap order — a fixed expense, charged before the conversion counts as break-even.** ⚠ **This does NOT mean a margin of `0` clears at 4 ADA of income** — the gate is `max(txFee + this, dex-cost-floor-lovelace)`, and the floor below is a FLOOR over that whole sum, not an addend to it. | lovelace, **≥ 4000000** | `4000000` | ⛔ **C** — **null, negative, or below `ConvertEconomics.MINSWAP_ORDER_OVERHEAD` throws at startup, on every network, naming the key.** Stating MORE is a legitimate belief about cost; stating LESS understates a spend the chain will certainly make. |
+| `LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE` | `loans.liquidation.convert.dex-cost-floor-lovelace` | A **floor on the TOTAL cost** of a convert: the gate charges `max(txFee + orderCost, this)`. ⚑ **This is what actually binds at the shipped defaults**, not the order cost above — it wins whenever `txFee < 1,000,000`, true of most liquidation transactions (the pinned candidate elsewhere in this repo measures `txFee = 989,747`). What it still guards is an **under-measured tx fee**: the order cost is stated, the fee is measured. **To be folded away after the first correctly-priced live convert.** | lovelace, **≥ 0** | `5000000` | ⛔ **C** — **negative or unset throws at startup, on every network.** A negative cost of doing work is a typo, not a bound. |
+
+⛔ **THE NUMBER AN OPERATOR ACTUALLY FACES, missing until this round: at the shipped defaults a
+convert needs ≥ 10,000,000 lovelace of oracle-valued fee slice to be approved** —
+`5,000,000` outlay (the dex-cost floor binding, not the 4,000,000 order cost) **plus** the shipped
+`5,000,000` `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` margin (§5.3). "Margin `0` means clear
+4 ADA" was never the whole story even before the floor was accounted for correctly — it omitted the
+margin on top of the outlay entirely.
+
+#### ⇒ Two cost keys, and why they are two
+
+`minswap-order-cost-lovelace` is a **named term inside** the measurement;
+`dex-cost-floor-lovelace` is a **floor over the whole of it**. Neither is a margin: both say what the
+work costs, and `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` (§5.3) says how far above break-even the
+operator wants to be. **⛔ Read §6.6 before touching the order cost** — a second, *non*-configurable
+number of the same magnitude decides what the order must **carry**, and confusing the two fails
+conversions on chain.
 
 #### ⇒ The two convert controls, and how they compose
 
@@ -430,6 +447,26 @@ None of them is an error, and all three read as a quiet market.
 ⇒ **These mirror literals in `lm_liquidate_and_convert_action.ak` at the deployed sha.** They move
 only when FluidTokens redeploy, **in the same commit as the reference-script coordinate** (§57.9c).
 **A chart that exposes them is a chart that can break every convert.**
+
+### ⛔ `MINSWAP_ORDER_OVERHEAD` STAYS NON-CONFIGURABLE — and there is now a settable key beside it
+
+⚠ **`LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE` (§5.5) is `4000000` too, and it is a
+different thing.** Until 2026-09-09 one Java constant served two masters, and the split exists because
+those two masters answer to different authorities:
+
+| | the BUILDER's number | the ECONOMICS' number |
+|---|---|---|
+| **what it means** | what the order output must **CARRY** | what the bot **SPENDS** |
+| **who decides** | `lm_liquidate_and_convert_action` — it checks `>=` | the operator's belief about cost |
+| **where it lives** | `ConvertEconomics.MINSWAP_ORDER_OVERHEAD`, read by `ConvertOrderPlan` | `loans.liquidation.convert.minswap-order-cost-lovelace` |
+| **settable?** | ⛔ **never** — a wrong value fails on chain | ✅ yes, **downward-bounded by the constant** |
+
+⇒ **A configurable value must never reach order construction.** `ConvertOrderPlan`,
+`ConvertTransactionBuilder` and `ConvertTxEncoder` read the constant and nothing else; the configured
+key is read only by `ConvertEconomics.assess`. **`announceAndGuard` refuses at startup, naming the key,
+if the configured cost is null, negative, or below the constant** — an operator may believe a convert
+costs *more* than the order carries, but stating *less* understates a spend the chain will certainly
+make.
 
 ## 6.7 ⛔ REMOVED — a chart must NOT pass these
 
@@ -626,6 +663,7 @@ AQUARIUM_LIQUIDATION_MIN_PROFIT_ABSOLUTE_LOVELACE: "0"
 AQUARIUM_LIQUIDATION_MIN_EXPECTED_PROFIT_LOVELACE: "0"
 AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY: "true"
 LOANS_LIQUIDATION_CONVERT_ENABLED: "true"     # fronts no capital; failure mode is a no-op
+LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE: "4000000"  # what a convert SPENDS; ≥ the constant
 LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE: "5000000"
 # markets[] deliberately EMPTY: with the mode disabled above it changes nothing, and an empty list
 # means "convert every market at the node mode" the moment the mode is raised (§5.5).

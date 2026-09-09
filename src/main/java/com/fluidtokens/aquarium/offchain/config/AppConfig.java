@@ -792,8 +792,18 @@ public class AppConfig {
             }
             // ⛔ A NAMED failure, not an NPE three classes away. The margin has no inline default
             // (the yaml is its only source) and since the 2026-09-10 merge it gates convert as well,
-            // where `net.compareTo(floor)` would dereference it. A context that never bound it must
-            // say so here, in words an operator can act on.
+            // where `net.compareTo(floor)` would dereference it.
+            //
+            // ⚠ CORRECTED (this round): this check is NOT what catches an OMITTED key. A property
+            // entirely absent from the environment fails earlier, at @Value's own placeholder
+            // resolution, and this method never runs at all. What actually reaches this line is the
+            // BLANK case — an environment variable that IS set, to the empty string (docker/.env's
+            // `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE=`) — because Spring's String→BigInteger
+            // conversion returns no value for blank text, the @Value field injection is silently
+            // skipped, and this field (which carries no Java default, unlike
+            // ConvertConfiguration.minswapOrderCostLovelace) is left null with no exception from the
+            // framework. THIS check is the only thing that catches that silent null, so it has to say
+            // so here, in words an operator can act on.
             if (profitMarginLovelace == null) {
                 throw new IllegalStateException(
                         "loans.liquidation.profit-margin-lovelace is not set. It has no inline "
@@ -1023,11 +1033,13 @@ public class AppConfig {
      * is."</i> So the margin every mode answers to — convert included — is
      * {@link LiquidationConfiguration#profitMarginLovelace}, one number an operator sets once.
      *
-     * <p><b>Two things survive here, and neither is a margin.</b> {@link #enabled} is the global
+     * <p><b>Three things live here, and none of them is a margin.</b> {@link #enabled} is the global
      * on/off for the mechanism, kept on Giovanni's follow-up ruling of 2026-09-10 — <i>"convert should
      * remain but under liquidation and be enabled by default. there is a case we want to disable
-     * conversions"</i> — and {@link #dexCostFloorLovelace} states what one DEX interaction
-     * <em>costs</em>, not how much the operator is willing to lose.
+     * conversions"</i> — while {@link #minswapOrderCostLovelace} states the fixed ada a conversion
+     * spends on the Minswap order and {@link #dexCostFloorLovelace} states a floor under the total
+     * cost of one DEX interaction. Both are what the work <em>costs</em>, not how much the operator
+     * is willing to lose.
      *
      * <p><b>How the two controls compose:</b> {@link #enabled} {@code false} means no convert
      * anywhere, whatever any market says; with it {@code true}, each market's
@@ -1098,11 +1110,45 @@ public class AppConfig {
          * break-even the operator wants to be. A cost input is not a second margin, so folding it into
          * the shared knob would have merged two different questions rather than one duplicated answer.
          *
+         * <p>⚑ <b>NEAR-REDUNDANT SINCE THE ORDER COST BECAME EXPLICIT (2026-09-09), AND KEPT ANYWAY.</b>
+         * It is now a floor on the <b>TOTAL</b> cost of a convert, sitting over a measurement that
+         * already contains {@link #minswapOrderCostLovelace} as a named term. At the shipped defaults
+         * it binds by only <b>10,253 lovelace</b> — {@code 5,000,000} against a measured
+         * {@code 4,000,000 + 989,747}. <b>What it still guards is an UNDER-MEASURED transaction
+         * fee</b>: the order cost is now stated, but the fee is measured, and a measurement that came
+         * back too low would otherwise pass straight through to the margin. <b>To be folded away after
+         * the first correctly-priced live convert</b>, once there is a real fee to compare against.
+         *
          * <p>Refused at startup when negative, on any network — a negative cost floor is not a bound an
          * operator can meaningfully state, it is a typo.
          */
         @Value("${loans.liquidation.convert.dex-cost-floor-lovelace}")
         private BigInteger dexCostFloorLovelace = BigInteger.valueOf(5_000_000L);
+
+        /**
+         * ⛔ <b>What one Minswap order COSTS the bot, in lovelace — a fixed expense of every
+         * conversion.</b> Default {@code 4_000_000}, which is what the order actually carries today.
+         *
+         * <p><b>This is the ECONOMICS half of a number that used to serve two masters.</b>
+         * {@code ConvertEconomics.MINSWAP_ORDER_OVERHEAD} is the BUILDER's figure: the ada the order
+         * output must <em>carry</em>, checked {@code >=} by
+         * {@code lm_liquidate_and_convert_action}, so a wrong value fails on chain. That one is a
+         * validator literal and stays a Java constant, <b>never operator-settable</b> (catalogue
+         * §6.6). This one is a <em>belief about cost</em> — what the bot spends and does not get back
+         * — and a belief may be stated by the operator.
+         *
+         * <p>⚑ <b>The split is what makes "margin 0" honest on a convert.</b> Under the single shared
+         * {@link LiquidationConfiguration#profitMarginLovelace}, a stated margin of zero means the
+         * conversion must cover this cost before it counts as break-even — the order ada is charged
+         * as an expense rather than assumed away.
+         *
+         * <p>⛔ Refused at startup when null or <b>below the builder constant</b>. An operator may
+         * believe a convert costs MORE than the order carries — a wider spread, a fee they attribute
+         * differently — and that is a legitimate statement. Letting them state LESS understates a
+         * spend the chain will certainly make.
+         */
+        @Value("${loans.liquidation.convert.minswap-order-cost-lovelace}")
+        private BigInteger minswapOrderCostLovelace = BigInteger.valueOf(4_000_000L);
 
         /** Test seam: {@code @Value} owns these in production. */
         public ConvertConfiguration(boolean enabled) {
@@ -1118,6 +1164,18 @@ public class AppConfig {
         public ConvertConfiguration(boolean enabled, BigInteger dexCostFloorLovelace) {
             this.enabled = enabled;
             this.dexCostFloorLovelace = dexCostFloorLovelace;
+        }
+
+        /**
+         * Test seam: {@code @Value} owns these in production. The two-argument form above leaves
+         * {@link #minswapOrderCostLovelace} at its field default deliberately — a caller that does
+         * not care about the order cost gets the shipped one, and only a test that is ABOUT the order
+         * cost states it.
+         */
+        public ConvertConfiguration(boolean enabled, BigInteger dexCostFloorLovelace,
+                                    BigInteger minswapOrderCostLovelace) {
+            this(enabled, dexCostFloorLovelace);
+            this.minswapOrderCostLovelace = minswapOrderCostLovelace;
         }
     }
 

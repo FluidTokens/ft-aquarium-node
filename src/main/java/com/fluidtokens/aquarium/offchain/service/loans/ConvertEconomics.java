@@ -25,9 +25,14 @@ import java.math.BigInteger;
  *
  * <h2>⛔ What the bot actually spends — measured, then floored</h2>
  * <pre>
- *   measuredOutlay = txFee + 4_000_000
+ *   measuredOutlay = txFee + loans.liquidation.convert.minswap-order-cost-lovelace   # default 4_000_000
  *   outlay         = max(measuredOutlay, loans.liquidation.convert.dex-cost-floor-lovelace)
  * </pre>
+ * ⚑ <b>The order ada is an explicit, configurable FIXED EXPENSE since 2026-09-09</b>, and that is
+ * what makes a stated margin of {@code 0} mean something on this path: <b>a convert must cover the
+ * order cost before it counts as break-even.</b> The configured figure is what the bot <em>spends</em>;
+ * {@link #MINSWAP_ORDER_OVERHEAD} is what the order must <em>carry</em>, and the two are deliberately
+ * different objects — see that constant's javadoc and {@link #announceAndGuard()}.
  * The floor is Giovanni's ruling of 2026-09-03: <i>"the margin must take into account for convert the
  * ADA spent to interact with the DEX. So between batcher and tx fee you can round at 4 ada or 5
  * ada."</i> Default 5,000,000 — the conservative end of what he named.
@@ -118,6 +123,14 @@ public class ConvertEconomics {
      * token-only because the ada branch demanded the order hold exactly the swap amount and nothing
      * else — which is precisely why no convert order was ever batchable. The ada branch now requires
      * {@code swappable + minswap_order_overhead}, so the bot funds this overhead either way.
+     *
+     * <p>⛔ <b>THE BUILDER'S NUMBER, AND IT IS NOT CONFIGURABLE — EVER.</b> This is what the order
+     * output must <em>carry</em>: {@code ConvertOrderPlan} sends exactly this, and the validator
+     * checks it, so an operator-settable value here would fail conversions on chain. What a convert
+     * <em>costs</em> is a separate question and a separate value —
+     * {@code loans.liquidation.convert.minswap-order-cost-lovelace}, read by {@link #assess} — which
+     * {@link #announceAndGuard()} refuses to let fall below this one. <b>A configurable value must
+     * never reach order construction</b> (catalogue §6.6).
      */
     static final BigInteger MINSWAP_ORDER_OVERHEAD = BigInteger.valueOf(4_000_000L);
 
@@ -157,8 +170,14 @@ public class ConvertEconomics {
      * for every other liquidation mode too. That is the point of the merge, and it is exactly the
      * thing an operator reading only this line could miss — so the line names the key.
      *
-     * <p>⚠ The DEX-cost floor is different and still fatal: it is not a bound an operator states about
-     * their own appetite, it is an assumed cost of doing the work, and a negative one is a typo.
+     * <p>⚠ The two COST keys are different and both fatal: neither is a bound an operator states about
+     * their own appetite, both are assumed costs of doing the work, and a negative one is a typo.
+     *
+     * <p>⛔ <b>{@code minswap-order-cost-lovelace} additionally cannot fall below
+     * {@link #MINSWAP_ORDER_OVERHEAD}</b>, and that refusal is the whole point of splitting them.
+     * Believing a convert costs more than the order carries is a legitimate operator position;
+     * stating less understates a spend the chain will certainly make, and would let a losing convert
+     * pass a stated margin of 0.
      */
     @PostConstruct
     void announceAndGuard() {
@@ -168,8 +187,24 @@ public class ConvertEconomics {
                         + "dex-cost-floor={} lovelace, profit-margin={} lovelace (the SHARED "
                         + "loans.liquidation.profit-margin-lovelace — convert has no margin of its "
                         + "own). The oracle value of the collateral-denominated liquidation fee, less "
-                        + "max(txFee + order ada, dex-cost-floor), must reach the margin.",
-                configuration.isEnabled(), configuration.getDexCostFloorLovelace(), floor);
+                        + "max(txFee + order ada, dex-cost-floor), must reach the margin. "
+                        + "minswap-order-cost={} lovelace — the FIXED expense of every conversion, so "
+                        + "a margin of 0 means the conversion must cover it to be break-even.",
+                configuration.isEnabled(), configuration.getDexCostFloorLovelace(), floor,
+                configuration.getMinswapOrderCostLovelace());
+
+        BigInteger orderCost = configuration.getMinswapOrderCostLovelace();
+        if (orderCost == null || orderCost.compareTo(MINSWAP_ORDER_OVERHEAD) < 0) {
+            // The two halves of the old single constant must not blur. An operator may believe a
+            // convert costs MORE than the order carries; stating LESS — a negative, an unset key, or
+            // any figure under the validator's floor — understates a spend the chain will certainly
+            // make, and would let a losing convert read as break-even at margin 0.
+            throw new IllegalStateException(("loans.liquidation.convert.minswap-order-cost-lovelace is "
+                    + "%s; it is what a convert SPENDS on the Minswap order and cannot be null, "
+                    + "negative, or below %s — the ada the order output must CARRY, which the "
+                    + "validator checks and the builder always sends")
+                    .formatted(orderCost, MINSWAP_ORDER_OVERHEAD));
+        }
 
         BigInteger dexFloor = configuration.getDexCostFloorLovelace();
         if (dexFloor == null || dexFloor.signum() < 0) {
@@ -254,7 +289,10 @@ public class ConvertEconomics {
         // on an ada-collateral order too (`>= swappable + minswap_order_overhead`), so the bot funds
         // it either way. This was ZERO for ada collateral while the ada branch carried only the swap
         // amount — the shape that made those orders unbatchable.
-        BigInteger orderAda = MINSWAP_ORDER_OVERHEAD;
+        // ⛔ THE CONFIGURED cost, not the builder constant. `MINSWAP_ORDER_OVERHEAD` is what the order
+        // must CARRY (the validator's `>=`); this is what the bot SPENDS, and the operator may state a
+        // larger figure. announceAndGuard refuses a smaller one, so this can never be optimistic.
+        BigInteger orderAda = configuration.getMinswapOrderCostLovelace();
         BigInteger measuredOutlay = txFee.add(orderAda);
         BigInteger dexCostFloor = configuration.getDexCostFloorLovelace();
         // max(), never sum: the floor already covers the batcher fee, so adding it would double-count.
