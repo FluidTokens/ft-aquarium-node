@@ -1,6 +1,8 @@
 package com.fluidtokens.aquarium.offchain.util;
 
+import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 
 import java.math.BigInteger;
 import java.util.Comparator;
@@ -99,6 +101,71 @@ public final class WalletInputSelection {
         return utxos.stream()
                 .filter(WalletInputSelection::nominable)
                 .map(LedgerCeilings::lovelaceOf)
+                .max(BigInteger::compareTo);
+    }
+
+    // ---- token-principal nomination (ADDITIVE — Part 2 of the token-principals slice) -------------
+    //
+    // A pay-in-advance liquidation on a TOKEN principal must front that token, not ada, so the utxo
+    // that funds it must carry the principal asset alongside enough ada for the fee ceiling and the
+    // min-ada rider on the lender's output. `nominable` above requires `getAmount().size() == 1` —
+    // ADA ONLY — so it filters out exactly the multi-asset (principal + min-ada) utxo this shape
+    // needs; that rule is untouched here, because the 2026-08-24 incident it defends against is about
+    // the plain SPEND/collateral input, which stays ada-only on every path. This is a SEPARATE,
+    // ADDITIVE rule for a SEPARATE purpose.
+
+    /**
+     * Carries at least one unit of {@code principal} (a non-ada token), no reference script, no datum
+     * of either kind — the same datum/reference-script exclusions {@link #nominable} applies, for the
+     * same reason (a datum-bearing or reference-script-carrying utxo is not a plain spendable input).
+     * <b>Does not require ada-only</b> — the whole point is a utxo carrying the token AND its min-ada
+     * rider together, exactly the shape a real funding transaction produces.
+     */
+    public static boolean nominableForToken(Utxo utxo, AssetType principal) {
+        if (utxo.getReferenceScriptHash() != null || utxo.getInlineDatum() != null
+                || utxo.getDataHash() != null || utxo.getAmount() == null) {
+            return false;
+        }
+        String unit = principal.toUnit();
+        return utxo.getAmount().stream().anyMatch(a -> unit.equalsIgnoreCase(a.getUnit()));
+    }
+
+    /** The quantity of {@code asset} an amount list holds. Zero if it holds none. */
+    public static BigInteger tokenQuantityOf(Utxo utxo, AssetType asset) {
+        if (utxo.getAmount() == null) {
+            return BigInteger.ZERO;
+        }
+        String unit = asset.toUnit();
+        return utxo.getAmount().stream()
+                .filter(a -> unit.equalsIgnoreCase(a.getUnit()))
+                .map(Amount::getQuantity)
+                .reduce(BigInteger.ZERO, BigInteger::add);
+    }
+
+    /**
+     * The smallest {@link #nominableForToken} UTxO holding at least {@code requiredPrincipal} of
+     * {@code principal} AND at least {@code requiredAda} lovelace alongside it, or empty when none
+     * does. Ordered by the PRINCIPAL quantity — the scarcer resource on this path — the same
+     * smallest-that-suffices rule {@link #smallestSufficient} applies to ada.
+     *
+     * @param requiredAda a CEILING (fee ceiling plus the min-ada rider), never an estimate — see the
+     *                    class javadoc on why under-estimating is the dangerous direction
+     */
+    public static Optional<Utxo> smallestSufficientToken(List<Utxo> utxos, AssetType principal,
+                                                          BigInteger requiredPrincipal,
+                                                          BigInteger requiredAda) {
+        return utxos.stream()
+                .filter(u -> nominableForToken(u, principal))
+                .filter(u -> tokenQuantityOf(u, principal).compareTo(requiredPrincipal) >= 0)
+                .filter(u -> LedgerCeilings.lovelaceOf(u).compareTo(requiredAda) >= 0)
+                .min(Comparator.comparing(u -> tokenQuantityOf(u, principal)));
+    }
+
+    /** The largest nominable-for-token holding of {@code principal}, for diagnostics. */
+    public static Optional<BigInteger> largestNominableToken(List<Utxo> utxos, AssetType principal) {
+        return utxos.stream()
+                .filter(u -> nominableForToken(u, principal))
+                .map(u -> tokenQuantityOf(u, principal))
                 .max(BigInteger::compareTo);
     }
 }

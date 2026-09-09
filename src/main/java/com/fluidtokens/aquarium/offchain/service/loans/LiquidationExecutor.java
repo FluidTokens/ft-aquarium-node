@@ -12,6 +12,7 @@ import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
+import com.bloxbean.cardano.client.transaction.spec.Asset;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
@@ -959,21 +960,46 @@ public class LiquidationExecutor {
                 // watch through the endpoint they already use.
             } else {
 
-            log.info("{} is a PAY-IN-ADVANCE liquidation: the bot PAYS the "
-                            + "lender in ada and acquires the collateral, rather than earning a fee",
-                    loanUtxoRef);
+            // ⛔ ANNOUNCE THE ASSET — "PAYS the lender in ada" was only ever true of the ada-principal
+            // shape; a token principal pays out that token, never ada. The AMOUNT is announced
+            // separately below, once the transaction exists and the figure can be MEASURED off it
+            // rather than re-derived — the same "off the finished body" discipline the builder's own
+            // index derivation uses.
+            AssetType payInAdvancePrincipal = assessment.loan().datum().principalAsset();
+            log.info("{} is a PAY-IN-ADVANCE liquidation: the bot PAYS the lender in {} and acquires "
+                            + "the collateral, rather than earning a fee",
+                    loanUtxoRef, payInAdvancePrincipal.isAda() ? "ada" : payInAdvancePrincipal.toUnit());
             // Convert loan: routed to the promoted, submit-incapable pay-in-advance builder. The same
             // window the plain path uses is handed to the router, which derives its own slots from it.
             try {
+                // Part 3 — the balance MarketGate's decide() checks: the sum of the principal asset
+                // across the wallet utxos a real selection could actually spend (nominate(), below) —
+                // never a utxo the selector would refuse, or the gate would allow what the build cannot
+                // fund (T-061's "a remedy is a claim" rule).
+                BigInteger principalBalance = payInAdvancePrincipal.isAda()
+                        ? walletUtxos.stream().filter(WalletInputSelection::nominable)
+                                .map(LedgerCeilings::lovelaceOf).reduce(BigInteger.ZERO, BigInteger::add)
+                        : walletUtxos.stream()
+                                .filter(u -> WalletInputSelection.nominableForToken(u, payInAdvancePrincipal))
+                                .map(u -> WalletInputSelection.tokenQuantityOf(u, payInAdvancePrincipal))
+                                .reduce(BigInteger.ZERO, BigInteger::add);
                 transaction = payInAdvanceRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
-                        bondUtxo.get(), configUtxo, lmConfigUtxo, oraclesByUnit,
+                        bondUtxo.get(), configUtxo, lmConfigUtxo, oraclesByUnit, principalBalance,
                         // T-052 — the router knows the lender payout, this knows the wallet and the
                         // fee ceiling, and neither has to learn the other's job. It computes the
-                        // exact ada it must repay and asks for the SMALLEST input that covers that
+                        // exact amount it must repay and asks for the SMALLEST input that covers that
                         // plus the fee.
-                        lenderPayout -> nominate(walletUtxos, feeCeiling, lenderPayout, loanUtxoRef),
+                        lenderPayout -> nominate(walletUtxos, feeCeiling, payInAdvancePrincipal,
+                                lenderPayout, loanUtxoRef),
                         validFromMillis,
                         validToMillis);
+                // ⛔ THE AMOUNT — "PAYS the lender 1,033,850,000 c48cbb3d…0014df105553444d and
+                // acquires the collateral", never "ada" unless it is ada. Measured off the BUILT body
+                // (payInAdvanceAmountPaid), not re-derived, so this line cannot disagree with what the
+                // transaction actually pays.
+                BigInteger paid = payInAdvanceAmountPaid(transaction, payInAdvancePrincipal);
+                log.info("{} pays the lender {} {} and acquires the collateral", loanUtxoRef, paid,
+                        payInAdvancePrincipal.isAda() ? "lovelace" : payInAdvancePrincipal.toUnit());
             } catch (PayInAdvanceLiquidationRouter.WalletInputTooSmallException e) {
                 // T-061 — the router knows the lender payout and nothing about the wallet; THIS knows
                 // the wallet and the parameters. Neither can state every gate alone, so the message is
@@ -1052,7 +1078,7 @@ public class LiquidationExecutor {
             // that compounds — the biggest input gets consumed by whichever candidate runs first, so
             // a fee-only liquidation can spend the one input a principal-repaying candidate needed.
             Optional<Utxo> plainWalletUtxo =
-                    nominate(walletUtxos, feeCeiling, BigInteger.ZERO, loanUtxoRef);
+                    nominate(walletUtxos, feeCeiling, null, BigInteger.ZERO, loanUtxoRef);
             if (plainWalletUtxo.isEmpty()) {
                 // A refusal, not a failure: true of this candidate against this wallet, reproducible
                 // next cycle, and cured by a top-up. Never quarantined.
@@ -1240,11 +1266,68 @@ public class LiquidationExecutor {
         BigInteger minAdaFunded = minAdaFunded(assessment, transaction);
         // FIX 1/FIX 2: the floors test this margin-EXCLUDED number; the margin is applied separately.
         BigInteger floorProfit = expectedFee.subtract(txFee).subtract(minAdaFunded);
+
+        // ⛔ ECONOMICS GATE — the pay-in-advance TOKEN OUTLAY, token-principals slice.
+        //
+        // ada principal: PricingService.toLovelace is the IDENTITY for ada (no oracle lookup at all),
+        // and this branch is scoped to a NON-ada principal specifically, so the ada gate's arithmetic
+        // is UNCHANGED — pin it. Before this, nothing subtracted the pay-in-advance payout at all: for
+        // ada that is correct (the ada paid out and the collateral value received are the same mark,
+        // through the SAME oracle feed used to build the transaction, so they cancel and only the fee
+        // slice is real profit). For a TOKEN principal that cancellation is NOT guaranteed here: this
+        // gate prices the outlay through PricingService's OWN, independently-sourced feed — which can
+        // disagree with the oracle feed the validator actually priced the transaction against — so it
+        // must be subtracted as a real, separately-priced cost rather than assumed away.
+        //
+        // Direction: PricingService.toLovelace ROUNDS FLOOR (its own javadoc: correct for pricing
+        // EARNED amounts, which is what expectedFee above is). Applied to an OUTLAY, floor would
+        // UNDERSTATE the cost and flatter the bot — the wrong direction for a number being subtracted.
+        // So the outlay is taken at floor()+1: a cheap, always-safe correction to the ceiling side
+        // (never below the true value; at most one lovelace above it) without needing Rational's own
+        // ceil() through a code path PricingService does not expose.
+        String tokenOutlayDetail = "";
+        if (isPayInAdvanceRoute(assessment)) {
+            AssetType payInAdvancePrincipal = assessment.loan().datum().principalAsset();
+            if (!payInAdvancePrincipal.isAda()) {
+                BigInteger payout = payInAdvanceAmountPaid(transaction, payInAdvancePrincipal);
+                FluidOracleClient client = oracleClient.getIfAvailable();
+                if (client == null) {
+                    String priceDetail = ("PRICE_UNAVAILABLE: no oracle client bean, so the pay-in-advance "
+                            + "outlay of %s %s cannot be priced into lovelace")
+                            .formatted(payout, payInAdvancePrincipal.toUnit());
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
+                            "PRICE_UNAVAILABLE", priceDetail));
+                    log.info("the pay-in-advance liquidation of {} was refused: {}",
+                            assessment.loan().utxoRef(), priceDetail);
+                    return;
+                }
+                PricingService.Priced priced = new PricingService(client)
+                        .toLovelace(payInAdvancePrincipal, payout, now);
+                if (!priced.isPriced()) {
+                    PricingService.PriceRefusal refusal = priced.refusal();
+                    String priceDetail = ("PRICE_UNAVAILABLE: cannot price the pay-in-advance outlay of "
+                            + "%s %s into lovelace — %s (feed window [%s,%s], age %sms at %s)").formatted(
+                            payout, payInAdvancePrincipal.toUnit(), refusal.reason(),
+                            refusal.feedValidFrom(), refusal.feedValidTo(), refusal.feedAgeMillis(), now);
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
+                            "PRICE_UNAVAILABLE", priceDetail));
+                    log.info("the pay-in-advance liquidation of {} was refused: {}",
+                            assessment.loan().utxoRef(), priceDetail);
+                    return;
+                }
+                BigInteger tokenOutlayLovelace = outlayCeilBiased(priced.lovelace());
+                floorProfit = floorProfit.subtract(tokenOutlayLovelace);
+                tokenOutlayDetail = " - token outlay %s %s (%s lovelace, ceil-biased)"
+                        .formatted(payout, payInAdvancePrincipal.toUnit(), tokenOutlayLovelace);
+            }
+        }
+
         BigInteger margin = configuration.getProfitMarginLovelace();
         BigInteger expectedProfit = floorProfit.subtract(margin);
 
-        String detail = "fee slice %s lovelace - tx fee %s - min-ada %s = floor %s; - margin %s = %s"
-                .formatted(expectedFee, txFee, minAdaFunded, floorProfit, margin, expectedProfit);
+        String detail = "fee slice %s lovelace - tx fee %s - min-ada %s%s = floor %s; - margin %s = %s"
+                .formatted(expectedFee, txFee, minAdaFunded, tokenOutlayDetail, floorProfit, margin,
+                        expectedProfit);
 
         int size;
         String cborHex;
@@ -1754,6 +1837,21 @@ public class LiquidationExecutor {
      * belongs in the profitability floor is an ECONOMICS decision and is not made here: adding it
      * would be a new cost term, not a correction of a miscount. Recorded in findings §57 as open.
      */
+    /**
+     * ⛔ THE DIRECTION — extracted so it is unit-testable on its own, without a whole built
+     * transaction. {@link PricingService#toLovelace} rounds {@code floor()}, which is correct for
+     * pricing an EARNED amount (this method's caller's {@code expectedFee} term) but WRONG for an
+     * OUTLAY: floor understates the cost and flatters the bot. {@code floor() + 1} is a cheap,
+     * always-safe correction toward the ceiling side (never below the true value, at most one
+     * lovelace above it) — see {@code record()}'s own comment for why a fresh {@code Rational.ceil()}
+     * call is not used instead. A mutant that drops the {@code + 1} (i.e. uses the bare floor for the
+     * outlay) must be caught by a test that can tell the two apart — see
+     * {@code LiquidationExecutorTest#outlayCeilBiasedAddsOneToTheFlooredPrice}.
+     */
+    static BigInteger outlayCeilBiased(BigInteger flooredLovelace) {
+        return flooredLovelace.add(BigInteger.ONE);
+    }
+
     private boolean isPayInAdvanceRoute(LiquidationAssessment assessment) {
         if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
             return false;
@@ -1895,15 +1993,47 @@ public class LiquidationExecutor {
     }
 
     /**
+     * ⚠ A conservative CEILING for the min-ada rider a token-principal lender output needs, sized for
+     * wallet-selection headroom rather than computed from live protocol parameters — {@code
+     * LedgerCeilings} has no min-ada helper and this class does not derive one (out of this slice's
+     * file allowlist). Over-estimating is the safe direction here (this class's own javadoc, and
+     * {@link WalletInputSelection}'s): a single-asset min-ada output on {@code coinsPerUtxoSize} 4310
+     * measures well under 1.5 ada in every fixture seen so far, so 2 ada leaves real headroom rather
+     * than sitting on the edge.
+     */
+    private static final BigInteger TOKEN_PRINCIPAL_MIN_ADA_CEILING = BigInteger.valueOf(2_000_000L);
+
+    /**
      * T-052 — nominate the wallet input for ONE candidate: the smallest that covers the fee ceiling
-     * plus whatever extra ada this liquidation itself must pay out.
+     * plus whatever extra outlay this liquidation itself must pay out.
+     * <p>
+     * Part 2 of the token-principals slice — TOKEN-AWARE. When {@code principal} is a real token AND
+     * there is an outlay to fund, the nominated utxo must carry {@code extraOutlay} of THAT token
+     * (never lovelace) plus enough ada alongside it for the fee ceiling and the min-ada rider on the
+     * lender's output — {@link WalletInputSelection#smallestSufficientToken}. The ada-only path below
+     * is otherwise BYTE-IDENTICAL to before: same selection, same log shape.
      *
-     * @param extraOutlay ada this transaction pays from the bot's own wallet beyond the fee — the
-     *                    lender payout on the principal-repaying path, and {@code ZERO} on the
-     *                    fee-only path, which is the distinction the whole ticket is about
+     * @param principal   the loan's principal asset; irrelevant (and may be {@code null}) when
+     *                    {@code extraOutlay} is zero — the fee-only path never reads it
+     * @param extraOutlay this transaction pays out from the bot's own wallet beyond the fee, in
+     *                    PRINCIPAL units — ada for an ada principal, the principal's own base units for
+     *                    a token one — and {@code ZERO} on the fee-only path, which is the distinction
+     *                    the whole ticket is about
      */
     private Optional<Utxo> nominate(List<Utxo> walletUtxos, Optional<BigInteger> feeCeiling,
-                                    BigInteger extraOutlay, String loanUtxoRef) {
+                                    AssetType principal, BigInteger extraOutlay, String loanUtxoRef) {
+        if (principal != null && !principal.isAda() && extraOutlay.signum() > 0) {
+            BigInteger requiredAda = feeCeiling.orElse(BigInteger.ZERO).add(TOKEN_PRINCIPAL_MIN_ADA_CEILING);
+            Optional<Utxo> chosen = WalletInputSelection.smallestSufficientToken(
+                    walletUtxos, principal, extraOutlay, requiredAda);
+            chosen.ifPresent(utxo -> log.info("{} nominates wallet utxo {}#{} ({} {} + {} lovelace) for "
+                            + "a requirement of {} {} + {} lovelace (fee ceiling + min-ada rider){}",
+                    loanUtxoRef, utxo.getTxHash(), utxo.getOutputIndex(),
+                    WalletInputSelection.tokenQuantityOf(utxo, principal), principal.toUnit(),
+                    LedgerCeilings.lovelaceOf(utxo), extraOutlay, principal.toUnit(), requiredAda,
+                    feeCeiling.isPresent() ? "" : " (fee ceiling unavailable this cycle)"));
+            return chosen;
+        }
         Optional<Utxo> chosen = feeCeiling
                 .map(ceiling -> WalletInputSelection.smallestSufficient(
                         walletUtxos, ceiling.add(extraOutlay)))
@@ -1915,6 +2045,47 @@ public class LiquidationExecutor {
                 feeCeiling.map(Object::toString).orElse("an unknown fee"), extraOutlay,
                 feeCeiling.isPresent() ? "" : " (largest, protocol params unavailable)"));
         return chosen;
+    }
+
+    /**
+     * The amount actually paid to the lender on the pay-in-advance path, MEASURED off the built
+     * transaction's asset-manager outputs rather than re-derived — the announce line's source of
+     * truth, so it can never disagree with what the transaction pays. For ada: the ada-only
+     * asset-manager output's coin (the borrower compensation output, when the collateral is a token,
+     * carries no ada of its own beyond its min-ada rider and no multi-asset lender output competes
+     * with it here). For a token principal: the asset-manager output's quantity of {@code principal}.
+     */
+    private BigInteger payInAdvanceAmountPaid(Transaction transaction, AssetType principal) {
+        String assetManagerCredential = registry.getAssetManagerSpendScriptHash();
+        BigInteger paid = BigInteger.ZERO;
+        for (TransactionOutput output : transaction.getBody().getOutputs()) {
+            if (!assetManagerCredential.equals(paymentCredentialOf(output.getAddress()))) {
+                continue;
+            }
+            if (principal.isAda()) {
+                boolean carriesTokens = output.getValue().getMultiAssets() != null
+                        && !output.getValue().getMultiAssets().isEmpty();
+                if (!carriesTokens) {
+                    paid = paid.max(output.getValue().getCoin());
+                }
+            } else {
+                paid = paid.max(quantityOf(output, principal));
+            }
+        }
+        return paid;
+    }
+
+    /** The quantity of {@code asset} an output's value holds. Zero if it holds none. */
+    private static BigInteger quantityOf(TransactionOutput output, AssetType asset) {
+        if (output.getValue().getMultiAssets() == null) {
+            return BigInteger.ZERO;
+        }
+        return output.getValue().getMultiAssets().stream()
+                .filter(multiAsset -> multiAsset.getPolicyId().equalsIgnoreCase(asset.policyId()))
+                .flatMap(multiAsset -> multiAsset.getAssets().stream())
+                .filter(a -> HexUtil.encodeHexString(a.getNameAsBytes()).equalsIgnoreCase(asset.assetName()))
+                .map(Asset::getValue)
+                .reduce(BigInteger.ZERO, BigInteger::add);
     }
 
     /**

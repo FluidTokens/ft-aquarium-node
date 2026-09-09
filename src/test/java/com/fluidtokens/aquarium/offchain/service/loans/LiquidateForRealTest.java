@@ -128,7 +128,7 @@ public class LiquidateForRealTest {
             LenderBond bond = new LenderBond(t.tx(), 3, bu.getAddress(), t.loanId(), bu.getInlineDatum(), bd);
 
             var req = new LiquidatePayInAdvanceTransactionBuilder.Request(loan, lu, bond, bu, wallet,
-                    cfg(b, CFG), cfg(b, LMCFG), entry, fromMs, toMs, sl[0], sl[1],
+                    cfg(b, CFG), cfg(b, LMCFG), entry, null, fromMs, toMs, sl[0], sl[1],
                     signer.baseAddress(),
                     new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
                             new TransactionInput(REF_LOAN_CLAIM, 0), null, null), MARGIN);

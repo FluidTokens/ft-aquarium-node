@@ -131,19 +131,16 @@ public class PayInAdvanceLiquidationRouter {
                                         Utxo configUtxo,
                                         Utxo lmConfigUtxo,
                                         Map<String, OracleEntry> oraclesByUnit,
+                                        BigInteger principalBalance,
                                         Function<BigInteger, Optional<Utxo>> walletSelector,
                                         long validFromMillis,
                                         long validToMillis) {
         LoanDatum datum = assessment.loan().datum();
 
-        // Precondition guards, before the builder is touched. The promoted builder prices the
-        // principal leg as ada and throws IllegalStateException on equity <= 0; a convert loan outside
-        // that shape is a candidate this seam cannot yet model, so it is a CLEAN refusal here rather
-        // than a crash or a quarantine downstream.
-        if (!datum.principalAsset().isAda()) {
-            throw new PayInAdvanceNotModelledException(
-                    "pay-in-advance not yet modelled for non-ada principal");
-        }
+        // Precondition guard, before the builder is touched. The promoted builder throws
+        // IllegalStateException on equity <= 0; a convert loan outside that shape is a candidate this
+        // seam cannot yet model, so it is a CLEAN refusal here rather than a crash or a quarantine
+        // downstream.
         if (assessment.equity() == null || assessment.equity().signum() <= 0) {
             throw new PayInAdvanceNotModelledException(
                     "pay-in-advance not yet modelled for non-positive equity");
@@ -153,6 +150,21 @@ public class PayInAdvanceLiquidationRouter {
         // executor's snapshot and the plain builder use, never the priced asset.
         OracleEntry collateralOracle =
                 oraclesByUnit.get(datum.collateral().oracleTokenAsset().toUnit());
+
+        // WALL 3 — the principal's own oracle, keyed by the ORACLE-TOKEN unit the loan datum names
+        // (datum.principalOracleAsset()), never by the priced asset — the oraclesByUnit snapshot is
+        // keyed by oracle NFT, and an asset priced by two feeds would otherwise pick the wrong one.
+        // null for ada, exactly as LiquidatePayInAdvanceTransactionBuilder.Request.principalOracle()
+        // documents: ada needs no principal oracle at all.
+        OracleEntry principalOracle = null;
+        if (!datum.principalAsset().isAda()) {
+            principalOracle = oraclesByUnit.get(datum.principalOracleAsset().toUnit());
+            if (principalOracle == null) {
+                throw new PayInAdvanceNotModelledException(
+                        "pay-in-advance not yet modelled: no oracle entry for principal oracle asset "
+                                + datum.principalOracleAsset().toUnit());
+            }
+        }
 
         // The window and the redeemer's validFrom are derived EXACTLY as the plain path
         // (LiquidateTransactionBuilder.build ~578-580) and the dry-eval fixture do: the requested
@@ -167,10 +179,11 @@ public class PayInAdvanceLiquidationRouter {
 
         // T-052 — THE WALLET INPUT IS CHOSEN TO COVER THIS LIQUIDATION, NOT PICKED BLIND.
         //
-        // This is the principal-repaying path: the collateral is a token, so the ada the lender is
-        // paid comes out of the BOT'S OWN WALLET. That amount is
+        // This is the principal-repaying path: the collateral is a token, so the principal the lender
+        // is paid comes out of the BOT'S OWN WALLET (ada for an ada principal; the principal TOKEN
+        // itself for a token one — see WalletInputSelection's token-aware nomination). That amount is
         // convertedLoanCollateralToPrincipalAmount, and it is knowable here because numbers() reads
-        // the loan, the bond, the oracle and the instant — NEVER the wallet. The caller hands in a
+        // the loan, the bond, the two oracles and the instant — NEVER the wallet. The caller hands in a
         // selector rather than a UTxO, so the choice is made where the amount is known, and the
         // builder still knows nothing about liquidation types.
         //
@@ -180,8 +193,8 @@ public class PayInAdvanceLiquidationRouter {
         // lender's converted share is not bounded by the debt. The exact number costs nothing here;
         // a wrong bound costs the candidate, and fails at evaluation with an EMPTY ScriptFailures map
         // that reads as "a script refused" rather than "you are short" (measured 2026-08-24).
-        LiquidatePayInAdvanceTransactionBuilder.Numbers numbers =
-                builder.numbers(assessment.loan(), assessment.bond(), collateralOracle, slotFromMillis);
+        LiquidatePayInAdvanceTransactionBuilder.Numbers numbers = builder.numbers(assessment.loan(),
+                assessment.bond(), collateralOracle, principalOracle, slotFromMillis);
         BigInteger lenderPayout = numbers.convertedLoanCollateralToPrincipalAmount();
 
         // ⛔ THE MARKET GATE — before a wallet utxo is chosen and before anything is built.
@@ -190,25 +203,35 @@ public class PayInAdvanceLiquidationRouter {
         // Giovanni's rule applied to the number it is about: anticipatable = min(balance, cap), and
         // only when the market is enabled. It sits here rather than beside the profitability floors
         // because it is a POLICY question — "will we take this exposure at all" — and it is settled
-        // before any economics, exactly as a disabled market should be.
-        MarketGate.Decision market = marketGate().decide(datum.principalAsset(), lenderPayout);
+        // before any economics, exactly as a disabled market should be. `principalBalance` is the
+        // executor's own sum of the principal asset across the NOMINABLE wallet utxos — the ones the
+        // selector below can actually spend — so the gate cannot allow a candidate the wallet cannot
+        // fund (MarketGate's own javadoc, Part 3 of the token-principals slice).
+        MarketGate.Decision market = marketGate().decide(datum.principalAsset(), lenderPayout, principalBalance);
         if (!market.allowed()) {
             throw new MarketGateRefusedException(
                     "%s: %s (anticipatable %s of a required %s)".formatted(
                             market.refusal(), market.detail(), market.anticipatable(), market.required()));
         }
+        boolean adaPrincipal = datum.principalAsset().isAda();
+        String principalUnit = adaPrincipal ? "ada" : datum.principalAsset().toUnit();
         Utxo walletUtxo = walletSelector.apply(lenderPayout)
-                .orElseThrow(() -> new WalletInputTooSmallException(
-                        ("no ada-only wallet utxo can fund this convert liquidation: it repays the "
+                .orElseThrow(() -> new WalletInputTooSmallException(adaPrincipal
+                        ? ("no ada-only wallet utxo can fund this convert liquidation: it repays the "
                                 + "lender %s lovelace on top of the fee, and no single nominable utxo "
                                 + "covers that. Fund the wallet with one ada-only utxo of at least "
-                                + "that amount plus fee headroom.").formatted(lenderPayout)));
+                                + "that amount plus fee headroom.").formatted(lenderPayout)
+                        : ("no wallet utxo can fund this convert liquidation: it repays the lender %s "
+                                + "%s on top of the fee, and no single nominable utxo covers that. Fund "
+                                + "the wallet with one utxo holding at least %s %s alongside enough ada "
+                                + "for the fee ceiling and the min-ada rider.").formatted(
+                                lenderPayout, principalUnit, lenderPayout, principalUnit)));
 
         LiquidatePayInAdvanceTransactionBuilder.Request request =
                 new LiquidatePayInAdvanceTransactionBuilder.Request(
                         assessment.loan(), loanUtxo, assessment.bond(), bondUtxo, walletUtxo,
-                        configUtxo, lmConfigUtxo, collateralOracle, slotFromMillis, slotToMillis,
-                        slots[0], slots[1],
+                        configUtxo, lmConfigUtxo, collateralOracle, principalOracle,
+                        slotFromMillis, slotToMillis, slots[0], slots[1],
                         // The bot keeps the collateral and pays change back to itself: the fee/collateral
                         // wallet UTxO is one of its own, so its address is the change address — the same
                         // identity account.baseAddress() carries on the plain path.

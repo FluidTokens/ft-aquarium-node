@@ -301,7 +301,9 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
 
         long now = System.currentTimeMillis();
         var request = new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond,
-                bondUtxo, walletUtxo, configUtxo, lmConfigUtxo, oracleEntry, now, now + 120_000L,
+                bondUtxo, walletUtxo, configUtxo, lmConfigUtxo, oracleEntry,
+                null,   // ada principal — see the Request javadoc
+                now, now + 120_000L,
                 slotOf(now - 60_000L), slotOf(now + 120_000L), bot.baseAddress(),
                 referenceScripts(), 30_000L);
 

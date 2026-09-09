@@ -91,6 +91,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class LiquidationExecutorTest {
 
+    // ---- ECONOMICS GATE direction (token-principals slice) -----------------------------------------
+
+    /**
+     * ⛔ THE DIRECTION. {@code PricingService.toLovelace} floors, which flatters an OUTLAY (understates
+     * the cost); {@link LiquidationExecutor#outlayCeilBiased} corrects that toward the ceiling side. A
+     * mutant that drops the {@code +1} (reverting to the bare floor) must change this test's result —
+     * it does, because the floored price here is not already a "round" figure the +1 could hide
+     * behind.
+     */
+    @Test
+    void outlayCeilBiasedAddsOneToTheFlooredPrice() {
+        assertEquals(BigInteger.valueOf(1_033_850_766L),
+                LiquidationExecutor.outlayCeilBiased(BigInteger.valueOf(1_033_850_765L)),
+                "the outlay must be taken ONE ABOVE the floored price, never the bare floor");
+        assertNotEquals(BigInteger.valueOf(1_033_850_765L),
+                LiquidationExecutor.outlayCeilBiased(BigInteger.valueOf(1_033_850_765L)),
+                "a mutant reverting to the bare floor must be distinguishable from the fix");
+    }
+
     /** A fixed instant well inside preview's history, so slot conversion is deterministic. */
     private static final long NOW = 1_700_000_000_000L;
 
@@ -1810,16 +1829,14 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * The OTHER trigger behind the same exception, and the one the remedy is actually for.
-     *
-     * <p>{@code PayInAdvanceLiquidationRouter:143} refuses a non-ada principal outright, before equity
-     * is looked at. Here the advice is sound — the convert router genuinely supports a non-ada
-     * principal (it resolves a {@code collateral/principal} pool and prices the principal leg through
-     * its own feed) — so the line must carry it, and must name the asset that makes it apply.
-     *
-     * <p>⚠ This pair exists because the two triggers share ONE exception type. A single test can only
-     * ever prove the message fits the trigger it happened to fire; it takes both to prove the message
-     * fits <em>each</em>.
+     * ⛔ REPURPOSED, token-principals slice: {@code PayInAdvanceLiquidationRouter:143} — the outright
+     * "non-ada principal" refusal this test used to pin — is GONE (Part 1 of that slice; a non-ada
+     * principal is now modelled). The remaining {@code PayInAdvanceNotModelledException} trigger a
+     * non-ada principal can still hit is "no oracle entry for principal oracle asset X" (WALL 3): the
+     * executor's {@code oraclesByUnit} snapshot has nothing for the loan's own
+     * {@code principalOracleAsset}. The remedy logic this test exists to pin ({@code action: CONVERT}
+     * is sound advice for ANY non-ada-principal trigger, never for a non-positive-equity one) is
+     * unchanged and still keyed on the principal asset alone, so it still fires here.
      */
     @Test
     void aNonAdaPrincipalNotModelledRefusalCarriesTheConvertRemedy() {
@@ -1847,7 +1864,7 @@ class LiquidationExecutorTest {
         assertEquals(1, infos.size(), "expected exactly one INFO line for the not-modelled refusal: "
                 + appender.list);
         String message = infos.getFirst().getFormattedMessage();
-        assertTrue(message.contains("non-ada principal"),
+        assertTrue(message.contains("no oracle entry for principal oracle asset"),
                 "must carry the router's own message, which is what names this trigger: " + message);
         assertTrue(message.contains(COLLATERAL_TOKEN.toUnit()),
                 "must name the principal unit that makes the remedy apply: " + message);
@@ -1857,8 +1874,10 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * A convert-flagged loan whose PRINCIPAL is a token. Nothing past
-     * {@code PayInAdvanceLiquidationRouter:143} is reached, so the feeds here need only be present.
+     * A convert-flagged loan whose PRINCIPAL is a token, with equity forced strictly positive so the
+     * router's equity precondition clears and the NEXT gate — WALL 3's missing-principal-oracle
+     * refusal — is what actually fires (no oracle entry is wired for {@code COLLATERAL_TOKEN} as a
+     * PRINCIPAL in this fixture's {@code oraclesByUnit}, only, where applicable, as a collateral).
      */
     private static Scenario tokenPrincipalConvertScenario() {
         LoanDatum datum = LoanFixtures.loanDatum(COLLATERAL_TOKEN, BigInteger.valueOf(100_000_000),
@@ -1874,7 +1893,9 @@ class LiquidationExecutorTest {
 
         LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(),
                 OraclePriceFeed.unit(), OraclePriceFeed.unit(), VALID_FROM);
-        return new Scenario(loan, bond, assessment);
+        LiquidationAssessment positiveEquity = LoanFixtures.withNumbers(assessment,
+                assessment.remainingDebt(), BigInteger.ONE, assessment.liquidationFee());
+        return new Scenario(loan, bond, positiveEquity);
     }
 
     /**

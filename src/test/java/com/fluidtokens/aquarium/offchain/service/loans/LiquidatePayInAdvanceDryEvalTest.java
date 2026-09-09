@@ -405,7 +405,7 @@ class LiquidatePayInAdvanceDryEvalTest {
         LiquidatePayInAdvanceTransactionBuilder.Request refRequest =
                 new LiquidatePayInAdvanceTransactionBuilder.Request(base.loan(), base.loanUtxo(),
                         base.bond(), base.bondUtxo(), base.walletUtxo(), base.configUtxo(),
-                        base.lmConfigUtxo(), base.oracle(), base.validFromMillis(),
+                        base.lmConfigUtxo(), base.oracle(), base.principalOracle(), base.validFromMillis(),
                         base.validToMillis(), base.validFromSlot(),
                         base.validToSlot(), base.changeAddress(),
                         new LiquidateTransactionBuilder.ReferenceScripts(
@@ -696,7 +696,7 @@ class LiquidatePayInAdvanceDryEvalTest {
         return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
                 r.bondUtxo(),
                 LoanFixtures.adaUtxo(TX_WALLET, 0, LoanFixtures.botAddress(), lovelace),
-                r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.validFromMillis(), r.validToMillis(),
+                r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.principalOracle(), r.validFromMillis(), r.validToMillis(),
                 r.validFromSlot(), r.validToSlot(), r.changeAddress(), r.referenceScripts(),
                 r.oracleWindowMarginMillis());
     }
@@ -799,7 +799,7 @@ class LiquidatePayInAdvanceDryEvalTest {
                         FEED_VALID_FROM, feedValidTo),
                 ORACLE_REF_INPUT, ORACLE_REF_SCRIPT, C3_PROVIDER);
         return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
-                r.bondUtxo(), r.walletUtxo(), r.configUtxo(), r.lmConfigUtxo(), narrowed,
+                r.bondUtxo(), r.walletUtxo(), r.configUtxo(), r.lmConfigUtxo(), narrowed, r.principalOracle(),
                 r.validFromMillis(), r.validToMillis(), r.validFromSlot(), r.validToSlot(),
                 r.changeAddress(), r.referenceScripts(), r.oracleWindowMarginMillis());
     }
@@ -900,7 +900,10 @@ class LiquidatePayInAdvanceDryEvalTest {
         long validToMillis = millisOf(converters().slot().slotToTime(slots[1]));
         LiquidatePayInAdvanceTransactionBuilder.Request request =
                 new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond, bondUtxo,
-                        WALLET_UTXO, CONFIG_UTXO, LM_CONFIG_UTXO, oracle, validFromMillis,
+                        WALLET_UTXO, CONFIG_UTXO, LM_CONFIG_UTXO, oracle,
+                        // WALL 2/3 — this fixture's principal is ada; null means "ada", exactly as
+                        // the Request javadoc documents. The ada-principal invariant rig.
+                        null, validFromMillis,
                         validToMillis, slots[0], slots[1], LoanFixtures.botAddress(),
                         // All-inline shape: every validator travels in the witness set.
                         LiquidateTransactionBuilder.ReferenceScripts.none(),
