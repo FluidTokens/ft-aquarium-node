@@ -13,13 +13,13 @@ import java.util.Optional;
  * The one place a token quantity becomes lovelace for the liquidation economics, and it fails
  * closed.
  * <p>
- * <b>No decimals scaling, anywhere in this class, and there must never be one.</b> The oracle
+ * <b>No 10^n scaling of any kind in this class, and there must never be one.</b> The oracle
  * feed's price is lovelace <em>per base unit</em> ({@code feed.price()} in {@link LoanFinance}), so
- * {@code baseUnits * price = lovelace} exactly — the registry's {@code decimals} field is for
+ * {@code baseUnits * price = lovelace} exactly — the registry's display-precision field is for
  * DISPLAY only, and applying it here would introduce a 10^n error while reading like correctness.
  * Verified against live mainnet data 2026-09-09: FLDT's registry price is
  * {@code 21785609/100000000} lovelace per base unit; 23,000,000,000 base units (23,000 FLDT at 6
- * decimals) times that is 5,010,690,070 lovelace = 5,010.69 ADA — no scaling anywhere.
+ * display units) times that is 5,010,690,070 lovelace = 5,010.69 ADA — no scaling anywhere.
  * <p>
  * <b>Fails closed.</b> A missing, stale or unpriceable feed is a refusal, never a fallback price:
  * there is no 1:1 assumption and no last-known price anywhere below.
