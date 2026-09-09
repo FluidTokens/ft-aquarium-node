@@ -5446,3 +5446,156 @@ So: the arithmetic and the fail-closed refusal are now correct and ready. The es
 refused every cycle, honestly, for a reason that no longer overstates what is actually missing — the
 `CompoundCandidateScanner` and `CompoundExecutor` log lines say so explicitly rather than repeating
 the old "cannot compare units" claim, which stopped being true this slice.
+
+## 59. Slice 3 of the token-principals epic — the four walls of a token-principal pay-in-advance, and why the dry-eval rig could not follow it there (2026-09-10)
+
+**Slice 3 of `feat/lending-v4-token-principals`** (FAB-77), on the highest-stakes path in the epic:
+mainnet, USDM market `ANTICIPATE` (cap 1,500,000,000), bot wallet funded with USDM, loan
+`279499ff77d9c8efacda…` (utxo `0d080eb21bf4951af926acdab34a5b12b0aaf4c62c52bc6b999fc849967f6c4a#1`,
+bond `#3`) REFUSED every cycle before this slice with "pay-in-advance not yet modelled for non-ada
+principal". Four walls, each read from `validators/lender-manager/lm_liquidate_and_pay_in_advance_action.ak`
+in `../ft-cardano-loans-v4` (validators win over the README).
+
+### 59.1 WALL 1 — the payout is a two-feed cross conversion with ONE ceil at the end
+
+`lm_liquidate_and_pay_in_advance_action.ak:178-183` and `finance.ak:433-444`:
+```
+convertedLoanCollateralToPrincipalAmount =
+  ceil( fromLovelace( toLovelace(share, collateralFeed), principalFeed ) )
+```
+Before this slice, `LiquidatePayInAdvanceTransactionBuilder.numbers()` (:320-322) computed
+`toLovelace(share, collateralFeed).ceil()` — the lovelace figure, ceiled, paid out AS the principal.
+That coincides with the validator only when the principal feed is the unit feed (ada). For a token
+principal it is wrong by the ratio of the principal's own price: measured at the pinned figures
+(collateral share 21,984,388,515 FLDT, FLDT `21785609/1e8`, USDM `463261535/1e8`), the old shortcut
+pays 4,789,432,923 where the validator demands 1,033,850,765 — **4.63× too much**.
+
+⇒ `LoanFinance.convertFromAToBWithOracles(aFeed, bFeed, aAmount)` is the exact composition —
+`ceil(fromLovelace(toLovelace(aAmount, aFeed), bFeed))` — named after the Aiken function, pinned
+against the exact pinned-candidate figure in `LoanFinanceTest`. For ada (`bFeed = unit()`) it reduces
+algebraically to the old formula exactly, so the ada path is byte-identical (pinned by
+`adaPrincipalReducesToTodaysNumber`).
+
+**The rounding-order hazard is real but does not bite the pinned candidate.** Ceil-then-divide
+(ceiling the intermediate lovelace amount before dividing by the principal feed) and divide-then-ceil
+(the validator's own order, one ceil at the very end) CAN differ by one — checked at the pinned
+figures across three equity samples, diff 0 every time; a synthetic pair chosen to differ IS in
+`LoanFinanceTest.roundingOrderMattersAndTheValidatorsOrderIsDivideThenCeil`, and it is the test that
+actually proves the ORDER, since the pinned candidate does not exercise it.
+
+### 59.2 WALL 2 — the redeemer equity must use the REAL principal feed
+
+`numbers()` computed equity with `OraclePriceFeed.unit()` hardcoded as the principal feed, always —
+correct for ada, wrong for a token, because `loan_claim_action` recomputes equity on chain with the
+REAL principal oracle and a one-unit disagreement fails the loan spend at phase 2. ⇒ `numbers()` now
+takes the principal oracle (nullable — `null` means ada) and passes its feed through; ada keeps the
+unit feed by construction, so this too is byte-identical on the ada path.
+
+### 59.3 WALL 3 — the principal oracle needs its own reference input, index, and window check
+
+`lm_liquidate_and_pay_in_advance_action.ak:110-166`: `principalOracleRefInputIndex` is read from the
+reference-input list and `retrieve_oracle_data` is called a SECOND time, for the principal leg, with
+its own `provider_ref_input_index`. Before this slice, `principalOracleRefIndex` was hardcoded to `0`
+with a comment saying ada never reads it, and `referenceInputs()` never added a principal reference
+input at all. ⇒ For a token principal: `LiquidatePayInAdvanceTransactionBuilder.Request` carries a
+nullable `principalOracle` (an `OracleEntry`, keyed — like the collateral leg — by
+`datum.principalOracleAsset().toUnit()` in the executor's `oraclesByUnit` snapshot, never by the
+priced asset); its `referenceInput`, `referenceScript` and (if a c3 feed) `charlieProviderReferenceInput`
+join the reference-input set; `principalOracleRefIndex` is derived by the same `refIndex()` lookup the
+collateral leg uses; the SAME V3 oracle-window check the collateral feed already gets is applied to it
+too. For ada: index stays `0` and no reference input is added — the validator never reads one for it.
+
+**A SECOND withdraw-0 invocation, only when the two oracle credentials differ.**
+`retrieve_oracle_data` resolves its feed with `pairs.get_first(self.redeemers, Withdraw(oraclePaymentCredential))`
+— one redeemer PER CREDENTIAL (`OracleEntry`'s own javadoc: 19 distinct oracle deployments on the
+registry, one per priced asset, each with its own script hash / reward address, because
+`validators/oracle.ak`'s `_oracle_asset_policy_id`/`_oracle_asset_asset_name` are validator
+PARAMETERS — the compiled script differs per asset). So a genuinely different principal asset needs
+its own oracle withdrawal; a loan whose principal happens to equal its collateral asset (never seen
+in practice) would share one.
+
+### 59.4 WALL 4 — the lender output is paid in the principal asset, and its shape changes
+
+`validators/loan/loan_recast_action.ak:343-366` (`validate_repayment_output`, shared): the check is
+`quantity_of(output, principalAsset) >= convertedAmount`, and `dosProtection` demands
+`flatten(output) == 1` for an ada `repaymentAsset`, `== 2` for anything else (the token plus its
+min-ada rider). Before this slice the builder always paid `Amount.lovelace(converted)` and asserted
+`flatten == 1`. ⇒ `lenderConvertedAmounts()` pays the principal's own asset for a token principal
+(min-ada left to cardano-client-lib, trap 6); `assertStructure` now branches on the principal asset
+for both the flatten count and which quantity it checks (`quantityOf(output, principalAsset)`, never
+the coin, for a token).
+
+### 59.5 The three parts, ruled by the machine owner
+
+1. **The `:143` refusal in `PayInAdvanceLiquidationRouter`** — the outright "non-ada principal"
+   short-circuit — is REMOVED, last, only once 59.1–59.4 held. The remaining
+   `PayInAdvanceNotModelledException` triggers on a token principal are now only non-positive equity,
+   or no matching oracle entry for `principalOracleAsset` in the executor's snapshot.
+2. **Token-aware wallet selection.** `WalletInputSelection.nominable` stays ada-only, untouched — the
+   2026-08-24 incident it defends against is real and orthogonal. ADDITIVE:
+   `nominableForToken`/`smallestSufficientToken`/`tokenQuantityOf`/`largestNominableToken`, keyed on
+   the principal asset, requiring the token AND enough ada alongside it (fee ceiling + a conservative
+   2 ADA min-ada-rider ceiling — `LedgerCeilings` has no min-ada helper and none was added, out of
+   this slice's file allowlist; over-estimating is the safe direction here, same as everywhere else in
+   this class). `LiquidationExecutor.nominate()` branches on the principal asset and logs the
+   requirement in the principal's own unit for a token, never "lovelace".
+3. **A real balance check in `MarketGate`.** `decide()` gained a third argument, `balance` — the sum
+   of the principal asset across the bot's NOMINABLE wallet UTxOs (part 2's own selector; never one it
+   would refuse). `anticipatable = min(balance, cap)` is now literally what the comment always claimed
+   it was; a `balance`-limited refusal is a NEW `Refusal.INSUFFICIENT_BALANCE`, distinct from
+   `ABOVE_MARKET_CAP`, because the two demand different operator remedies. See catalogue §5.4.
+
+**The economics gate** now subtracts a token-principal pay-in-advance's OUTLAY, priced via slice 2's
+`PricingService`, from `floorProfit` — a NEW term that does not exist on the ada path (there the ada
+paid out and the collateral value received cancel algebraically through the SAME oracle feed the
+transaction was built against; a token's outlay is priced through PricingService's OWN,
+independently-sourced feed, which can disagree with the validator's, so it cannot be assumed away).
+Priced at `floor() + 1` (`LiquidationExecutor.outlayCeilBiased`), because `PricingService.toLovelace`
+floors — correct for the EARNED fee-slice term, wrong (flattering) for an outlay. Refuses as the new
+`LiquidationDecision.Outcome.PRICE_UNAVAILABLE` — live now on this path; see catalogue §5.7, and
+`CompoundExclusion.PRICE_UNAVAILABLE` for the sibling the oracle-pricing slice landed first.
+
+### 59.6 What the offline rig could verify, and the wall it could NOT get past
+
+**The exact arithmetic is verified, chain-data-free.** `LoanFinanceTest` pins
+`convertFromAToBWithOracles` against the pinned mainnet candidate's exact figures — 1,033,850,765 USDM
+base units, exact rational 1,033,850,764.8641…, plus the 4.63× shortcut it replaces, the ada-reduces
+invariant, and a synthetic rounding-order pair. This needs no chain-shaped fixture at all and is the
+strongest verification in this slice.
+
+**A genuinely-real, two-real-oracle-leg UPLC-evaluated dry-eval transaction for a token principal
+could NOT be built offline, and this is a wall the contract did not name.** Every existing dry-eval
+fixture in this repo (`LoanFixtures`, `EvalFixtures`, `RealLoanDryEvalTest`,
+`LiquidatePayInAdvanceDryEvalTest`, …) is a SYNTHETIC construction over the real PREVIEW registry
+coordinates and the real oracle script — none replays literal on-chain bytes for the loan/bond/config
+data, and `LoanFixtures`'s own class javadoc says "Everything is preview". Reusing that pattern for a
+SECOND real oracle asset (the principal leg) hits a hard architectural blocker read out of
+`validators/oracle.ak`:
+- The `PRICE_DATA_CHARLIE` branch calls `get_oracle_config(charlie_specs, common.token)`, and
+  `charlie_specs` is a VALIDATOR PARAMETER — a closed, deployment-time set of recognised tokens. A
+  token not in that set aborts the validator; there is no way to add one from off chain.
+- The `AGGREGATED`/`DEDICATED` (self-signed) branch instead needs an Ed25519 signature from one of the
+  oracle's own `verification_keys` — also a closed, deployment-time parameter — which requires a
+  private key this repo does not hold.
+- Both branches are moot regardless: `retrieve_oracle_data` resolves its feed by
+  `pairs.get_first(self.redeemers, Withdraw(oraclePaymentCredential))`, and `_oracle_asset_policy_id`/
+  `_oracle_asset_asset_name` are themselves validator parameters, so EACH priced asset is a SEPARATE
+  compiled oracle script with its OWN script hash / reward address (`OracleEntry`'s own javadoc: 19
+  distinct entries on the registry). This repo has real chain coordinates for exactly ONE deployed
+  oracle asset (tFLDT, `402c984d…`) — not two — so a genuinely distinct second real leg cannot be
+  built without live registry/chain access this environment does not have.
+
+⇒ **What was actually built and verified**: `PayInAdvanceLiquidationRouterTest` exercises the full
+OFF-CHAIN builder — routing, both oracle lookups, wallet selection, `numbers()` — against a
+SYNTHETIC principal oracle (its own fake script hash / reference input / reward address, the same
+style `LiquidationSubmitVetoTest` and `LiquidationExecutorTest` already use for their oracle
+fixtures), proving WALLS 1/3/4's WIRING is real (a genuinely distinct reference input, a genuinely
+distinct withdraw-0, the redeemer's `principalOracleRefInputIndex` measured off the built body against
+its TRUE sorted position, the payout landing in the principal asset with the right shape) without
+ever claiming to be a UPLC-evaluated proof — this test class evaluates no script, same as it always
+did. **No claim is made that the full token-principal shape has been proven against the real deployed
+PlutusV3 machine** — that would need either a second real registered oracle asset's coordinates, or a
+FluidTokens-operated signing key, neither obtainable offline. Flagged for the ticket owner / Giovanni:
+the natural next step, when this liquidates for real on mainnet (shadow mode first), is to capture the
+ACTUAL built transaction and diff its shape against this slice's structural assertions — the dry-eval
+rig cannot get there first this time, the way it did for the ada path.

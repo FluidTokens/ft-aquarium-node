@@ -71,7 +71,17 @@ public final class MarketGate {
         /** The market's action is {@code CONVERT}, so pay-in-advance is not the chosen mechanism here. */
         MARKET_ACTION_IS_CONVERT,
         /** {@code ANTICIPATE}, but the cap is below what the protocol requires the bot to front. */
-        ABOVE_MARKET_CAP
+        ABOVE_MARKET_CAP,
+        /**
+         * {@code ANTICIPATE}, under the cap, but the bot's own NOMINABLE wallet balance of the
+         * principal asset is below what the protocol requires it to front. Distinct from
+         * {@link #ABOVE_MARKET_CAP} on purpose — the two demand different operator responses ("fund
+         * the wallet" vs "raise the cap") and collapsing them into one refusal would hide which is
+         * true. Part 3 of the token-principals slice: before this, {@code decide} had no balance term
+         * at all — {@code required.min(cap)} — so a bot holding zero of the principal with a generous
+         * cap passed this gate and died in the build.
+         */
+        INSUFFICIENT_BALANCE
     }
 
     /**
@@ -126,8 +136,13 @@ public final class MarketGate {
      *
      * @param principal the loan's principal asset — the market
      * @param required  {@code convertedLoanCollateralToPrincipalAmount}: what must be fronted
+     * @param balance   the sum of {@code principal} across the bot's own NOMINABLE wallet UTxOs — the
+     *                  ones a real wallet selection could actually spend (Part 2 of the
+     *                  token-principals slice). <b>Never a UTxO the selector would refuse</b> — that
+     *                  is the lie the executor's T-061 javadoc warns about: a remedy is a claim, and
+     *                  "fund the wallet" must be sufficient.
      */
-    public Decision decide(AssetType principal, BigInteger required) {
+    public Decision decide(AssetType principal, BigInteger required, BigInteger balance) {
         String unit = principal == null ? null : principal.toUnit();
         Mode effective = effectiveMode(principal);
 
@@ -152,13 +167,21 @@ public final class MarketGate {
         BigInteger cap = Objects.requireNonNull(marketFor(principal).getCap(),
                 "action: ANTICIPATE without a cap should have aborted startup");
 
-        // min(balance, cap), exactly as specified.
-        BigInteger anticipatable = required.min(cap);
+        // ⛔ anticipatable = min(balance, cap) — MADE TRUE, not merely claimed. Before Part 3 the code
+        // was `required.min(cap)`, so a bot holding ZERO of the principal with a generous cap still
+        // computed anticipatable == required and passed. On the ada path the downstream wallet
+        // nomination was the de-facto balance check; on a token path there was none at all.
+        BigInteger anticipatable = balance.min(cap);
         if (anticipatable.compareTo(required) < 0) {
-            return new Decision(anticipatable, required, cap, Refusal.ABOVE_MARKET_CAP,
-                    ("market %s is capped at %s but this candidate requires %s to be fronted; the "
+            boolean balanceLimited = balance.compareTo(cap) < 0;
+            Refusal why = balanceLimited ? Refusal.INSUFFICIENT_BALANCE : Refusal.ABOVE_MARKET_CAP;
+            String detail = balanceLimited
+                    ? ("market %s holds %s %s, needs %s to front this candidate (cap %s)")
+                            .formatted(unit, balance, unit, required, cap)
+                    : ("market %s is capped at %s but this candidate requires %s to be fronted; the "
                             + "protocol does not allow fronting part of a loan, so it is refused "
-                            + "rather than reduced").formatted(unit, cap, required));
+                            + "rather than reduced").formatted(unit, cap, required);
+            return new Decision(anticipatable, required, cap, why, detail);
         }
         return new Decision(anticipatable, required, cap, null,
                 "market " + unit + " allows " + required + " of " + cap);

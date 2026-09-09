@@ -344,7 +344,11 @@ class MainnetShadowRunTest {
                             configuration(Mode.SHADOW, List.of(market(principal.toUnit(), Mode.SHADOW,
                                     Action.ANTICIPATE, BigInteger.valueOf(1_000_000_000L))))))) {
                 var gate = new MarketGate(posture.getValue());
-                var decision = gate.decide(principal, required);
+                // Diagnostic report only — this manual rig does not read a real wallet balance, so it
+                // passes `required` as the balance too, which is what `decide`'s old two-argument form
+                // always assumed. min(required, cap) is unchanged from before Part 3 of the
+                // token-principals slice.
+                var decision = gate.decide(principal, required, required);
                 System.out.println("  GATE " + posture.getKey());
                 System.out.println("       effectiveMode=" + gate.effectiveMode(principal)
                         + "  action=" + gate.actionFor(principal)

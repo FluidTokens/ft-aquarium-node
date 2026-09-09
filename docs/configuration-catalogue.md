@@ -308,6 +308,15 @@ loans:
 - **Startup aborts** on: a missing/blank unit, a malformed unit, a duplicate unit, an empty action,
   an `ANTICIPATE` entry with no cap, a negative cap. A `CONVERT` entry with a cap **warns** and
   ignores it.
+- ⛔ **`cap` is a CEILING on a REAL BALANCE CHECK, not the only gate (token-principals slice,
+  2026-09-10).** `MarketGate.decide` is `anticipatable = min(balance, cap)`, where `balance` is the
+  sum of the market's principal asset across the bot's own NOMINABLE wallet UTxOs — the ones a real
+  wallet selection could actually spend (never a UTxO the selector would refuse). Before this it was
+  `required.min(cap)`: a bot holding **zero** of a token principal, with a generous cap, passed the
+  gate and died in the build. Two distinct refusals now exist and name different remedies:
+  `ABOVE_MARKET_CAP` ("raise the cap") and `INSUFFICIENT_BALANCE` ("fund the wallet with X `<unit>`").
+  On the ada path this was always de-facto true (the downstream wallet-input-selection refusal caught
+  it); on a token path there was no such check at all until this fix.
 
 ### 5.5 The convert path — ⚑ **now yaml, per profile** (was layer 2, closed 2026-09-09)
 
@@ -419,14 +428,15 @@ Everywhere else the two are byte-identical, computed once and shared.
 | ~950 convert unprofitable | `UNPROFITABLE` | INFO | the Minswap convert was built and priced, but its fee does not clear the operator's floor |
 | ~957 convert build failed | `REFUSED` / the exception's root class name | ERROR | a genuine machinery fault assembling the convert transaction (a Blockfrost timeout, say); quarantined |
 | ~992 wallet input too small (pay-in-advance) | `REFUSED` / `WALLET_INPUT_TOO_SMALL` | WARN | no wallet utxo covers the lender payout this pay-in-advance liquidation must fund; not quarantined — a wallet top-up cures it |
-| ~1000 market gate refusal (pay-in-advance) | `REFUSED` / the gate's own reason | INFO | the market is disabled, or the principal this candidate requires the bot to front exceeds the operator's stated cap |
-| ~1015 pay-in-advance shape not modelled | `REFUSED` / the router's own message | INFO | the convert shape (non-ada principal, or non-positive equity) this seam cannot yet build for; the log line names the principal asset unit and, for a non-ada principal, the remedy — set that market's `action` to `CONVERT` so Minswap fronts it instead |
+| ~1000 market gate refusal (pay-in-advance) | `REFUSED` / the gate's own reason | INFO | the market is disabled, the principal this candidate requires the bot to front exceeds the operator's stated cap (`ABOVE_MARKET_CAP`), or the bot's own nominable wallet balance of that principal is short of it (`INSUFFICIENT_BALANCE`, token-principals slice — see §5.4) |
+| ~1015 pay-in-advance shape not modelled | `REFUSED` / the router's own message | INFO | non-positive equity, or (token-principals slice) no oracle entry for the loan's `principalOracleAsset` in the executor's snapshot — a non-ada principal is no longer refused outright; the log line names the principal asset unit and, when the trigger is non-ada-principal-shaped, the remedy — set that market's `action` to `CONVERT` so Minswap fronts it instead |
 | ~1033 pay-in-advance build failed | `REFUSED` / the exception's root class name | ERROR | a genuine machinery fault; quarantined |
+| — pay-in-advance token outlay unpriceable | `PRICE_UNAVAILABLE` / `PRICE_UNAVAILABLE` | INFO | (token-principals slice) the economics gate could not price the pay-in-advance TOKEN payout into lovelace via `PricingService` — no feed for the principal, a feed not usable at the instant asked, or a `POOLED` variant; not quarantined, a feed coming back into its window cures it. Ada principal: unaffected — `PricingService.toLovelace` is the identity for ada, so this refusal is unreachable on that path |
 | ~1057 wallet input too small (plain path) | `REFUSED` / `WALLET_INPUT_TOO_SMALL` | WARN | no wallet utxo covers the fee for a fee-only liquidation; not quarantined |
 | ~1094 plain-path builder refusal | `REFUSED` / the builder's own `Refusal` name (one of fifty) | **INFO** for 48 of the 50 reasons — a clean verdict on the candidate, reproducible next cycle; **ERROR** for the two that wrap a real fault underneath (`SCRIPT_COST_EVALUATION_FAILED`, `TRANSACTION_NOT_BUILDABLE`) | the level is the discriminator: INFO means "this candidate is not liquidatable", ERROR means "the machinery broke while checking" — logging every refusal at ERROR would bury the two that matter under the forty-eight that do not |
 | ~1115 plain-path build failed | `REFUSED` / the exception's root class name | ERROR | a genuine machinery fault; quarantined |
 | ~1299 priced verdict | `WOULD_SUBMIT` \| `UNPROFITABLE` \| `SUBMIT_VETOED` \| `SUBMITTED` \| `SUBMIT_FAILED` | INFO | the candidate was built and priced; every armed-vs-shadow and profitable-vs-not question is answered from this line — read `submit_veto` alongside it |
-| — | `PRICE_UNAVAILABLE` (`LiquidationDecision.Outcome`) | **still RESERVED here, not yet emitted** | the oracle-pricing slice (2026-09-09) landed the fail-closed pricing gate and its named refusal on the **compound** path only (`CompoundExclusion.PRICE_UNAVAILABLE`, §6 below, via the new `PricingService`) — `LiquidationExecutor`'s plain/anticipate/convert paths were out of that slice's file allowlist and do not emit this `Outcome` value yet; grepping this class for it today and finding nothing is still a deliberate gap, tracked as FAB-77 item (2) ("decidable in every mode … with no silent refusal") |
+| — | `PRICE_UNAVAILABLE` (`LiquidationDecision.Outcome`) | **live on the pay-in-advance path since 2026-09-10** | the oracle-pricing slice (2026-09-09) landed the fail-closed pricing gate and its named refusal on the **compound** path first (`CompoundExclusion.PRICE_UNAVAILABLE`, §6 below, via the new `PricingService`); the token-principals slice (2026-09-10) is what makes `LiquidationDecision.Outcome.PRICE_UNAVAILABLE` itself a real, emitted value — on the pay-in-advance token-outlay row above. The plain and convert paths still do not emit it; FAB-77 item (2) ("decidable in every mode … with no silent refusal") is now partially closed, not fully |
 
 Line numbers are a reading aid against `HEAD`, not ground truth — re-derive them from the file when
 they drift.

@@ -51,6 +51,32 @@ public final class LoanFinance {
                 .orElseThrow(() -> new ArithmeticException("oracle price is zero"));
     }
 
+    /**
+     * {@code finance.convertFromAToBWithOracles} (WALL 1 of the token-principal pay-in-advance slice)
+     * — converts an amount denominated in {@code a}'s currency into {@code b}'s currency through two
+     * oracle feeds, in the validator's <b>exact</b> composition:
+     * {@code ceil( fromLovelace( toLovelace(aAmount, aFeed), bFeed ) )} — ONE {@link Rational#ceil()},
+     * at the END, over the exact rational.
+     * <p>
+     * <b>This is NOT {@code toLovelace(aAmount, aFeed).ceil()}.</b> That shortcut — ceiling the
+     * intermediate lovelace figure and never dividing by {@code bFeed} at all — coincides with this
+     * method only when {@code bFeed} is the 1:1 unit feed ({@link OraclePriceFeed#unit()}, i.e. an ada
+     * {@code b}), which is exactly why the ada-principal pay-in-advance path never caught it: for a
+     * token {@code b} it under-divides by the token's own price and pays a LOVELACE-SIZED figure as if
+     * it were the token — measured 4.63× too much at the pinned mainnet candidate (4,789,432,923
+     * instead of 1,033,850,765 USDM base units).
+     * <p>
+     * For {@code a} = the collateral leg and {@code b} = the principal leg, this is
+     * {@code convertedLoanCollateralToPrincipalAmount} — a VALIDATOR-CHECKED figure
+     * ({@code validate_repayment_output} requires {@code quantity_of(output, principalAsset) >=} this
+     * exact number), never economics: callers must not round it any other way.
+     */
+    public static BigInteger convertFromAToBWithOracles(OraclePriceFeed aFeed, OraclePriceFeed bFeed,
+                                                         Rational aAmount) {
+        Rational aAmountInLovelace = toLovelace(aAmount, aFeed);
+        return fromLovelace(aAmountInLovelace, bFeed).ceil();
+    }
+
     // ---- debt ---------------------------------------------------------------------------
 
     /** {@code rational.new(datum.interestRate, 10000)} — the scaling {@code loan_claim_action.ak:83} applies. */

@@ -168,4 +168,91 @@ class LoanFinanceTest {
                                 Rational.fromInt(30_000_000), Rational.ZERO, ltv, feed(1, 1), feed(3, 10)),
                 "0 * (3/10) is 0/10, which is not structurally rational.zero — the contract fails here");
     }
+
+    // ---- WALL 1: convertFromAToBWithOracles ----------------------------------------------------
+
+    /**
+     * The pinned mainnet candidate (loan {@code 279499ff…}, docs/lending-v4-findings.md §59): 23 B
+     * FLDT collateral, 920,000,000 FLDT fee, equity 95,611,485 FLDT at the 20:04Z sample — so the
+     * lender's collateral share is {@code 23,000,000,000 − 95,611,485 − 920,000,000 = 21,984,388,515}
+     * FLDT, at FLDT {@code 21785609/1e8} and USDM {@code 463261535/1e8} lovelace-per-base-unit.
+     * <p>
+     * <b>This is the number the rig asserts, not "≈1,034 USDM"</b> — the exact rational is
+     * {@code 1,033,850,764.8641…}, so the ceiling below matters.
+     */
+    @Test
+    void convertFromAToBWithOraclesMatchesThePinnedMainnetCandidate() {
+        Rational lenderShare = Rational.fromInt(BigInteger.valueOf(21_984_388_515L));
+        OraclePriceFeed fldt = feed(21_785_609L, 100_000_000L);
+        OraclePriceFeed usdm = feed(463_261_535L, 100_000_000L);
+
+        BigInteger payout = LoanFinance.convertFromAToBWithOracles(fldt, usdm, lenderShare);
+
+        assertEquals(BigInteger.valueOf(1_033_850_765L), payout);
+    }
+
+    /**
+     * ⛔ THE 4.63× BUG this wall exists to kill. The pre-fix code was
+     * {@code toLovelace(share, collateralFeed).ceil()} — the lovelace figure, ceiled, paid out AS the
+     * principal — which never divides by the principal feed at all. At the pinned figures that pays
+     * 4,789,432,923 where the validator demands 1,033,850,765: 4.63× too much.
+     */
+    @Test
+    void theOldOneFeedShortcutOverpaysByFourPointSixThreeTimes() {
+        Rational lenderShare = Rational.fromInt(BigInteger.valueOf(21_984_388_515L));
+        OraclePriceFeed fldt = feed(21_785_609L, 100_000_000L);
+
+        BigInteger oldBuggyShortcut = LoanFinance.toLovelace(lenderShare, fldt).ceil();
+
+        assertEquals(BigInteger.valueOf(4_789_432_923L), oldBuggyShortcut,
+                "the one-feed shortcut this wall replaces — kept here so the magnitude of the bug "
+                        + "this fixes is never lost");
+    }
+
+    /**
+     * ADA principal: {@code bFeed} is the 1:1 unit feed, so {@code fromLovelace(x, unit) == x} and
+     * {@code convertFromAToBWithOracles} reduces exactly to today's {@code toLovelace(..).ceil()} —
+     * the INVARIANT that keeps the ada pay-in-advance path byte-identical.
+     */
+    @Test
+    void adaPrincipalReducesToTodaysNumber() {
+        Rational share = Rational.fromInt(BigInteger.valueOf(21_984_388_515L));
+        OraclePriceFeed collateralFeed = feed(21_785_609L, 100_000_000L);
+
+        BigInteger viaTwoFeedComposition =
+                LoanFinance.convertFromAToBWithOracles(collateralFeed, OraclePriceFeed.unit(), share);
+        BigInteger viaTodaysFormula = LoanFinance.toLovelace(share, collateralFeed).ceil();
+
+        assertEquals(viaTodaysFormula, viaTwoFeedComposition,
+                "an ada principal must produce EXACTLY what the pre-existing single-feed arithmetic did");
+    }
+
+    /**
+     * ⚠ The rounding ORDER hazard named in the slice contract: ceil-then-divide (ceiling the
+     * intermediate lovelace amount to an integer, THEN dividing by the principal feed and ceiling
+     * again) and divide-then-ceil (the validator's own order — one ceil, at the end, over the exact
+     * rational) CAN differ by one. Feeds chosen so they do: a=1 at feed 1/3 -> 1/3 lovelace;
+     * <ul>
+     *   <li>correct (divide-then-ceil): {@code ceil( (1/3) / (1/2) ) = ceil(2/3) = 1}</li>
+     *   <li>wrong (ceil-then-divide): {@code ceil( ceil(1/3) / (1/2) ) = ceil( 1 / (1/2) ) = ceil(2) = 2}</li>
+     * </ul>
+     * The pinned mainnet candidate does NOT exercise this — checked at three equity samples, all
+     * diff 0 — so this synthetic pair is what proves the ORDER, not merely the composition.
+     */
+    @Test
+    void roundingOrderMattersAndTheValidatorsOrderIsDivideThenCeil() {
+        OraclePriceFeed aFeed = feed(1, 3);
+        OraclePriceFeed bFeed = feed(1, 2);
+        Rational aAmount = Rational.fromInt(BigInteger.ONE);
+
+        BigInteger correct = LoanFinance.convertFromAToBWithOracles(aFeed, bFeed, aAmount);
+        BigInteger ceilThenDivide = LoanFinance
+                .fromLovelace(Rational.fromInt(LoanFinance.toLovelace(aAmount, aFeed).ceil()), bFeed)
+                .ceil();
+
+        assertEquals(BigInteger.ONE, correct, "divide-then-ceil, the validator's order");
+        assertEquals(BigInteger.TWO, ceilThenDivide, "ceil-then-divide — one lovelace higher here");
+        org.junit.jupiter.api.Assertions.assertNotEquals(correct, ceilThenDivide,
+                "the two orders must genuinely differ for this test to prove anything about ORDER");
+    }
 }

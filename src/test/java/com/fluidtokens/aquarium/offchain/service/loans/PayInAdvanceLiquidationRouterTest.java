@@ -21,6 +21,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.junit.jupiter.api.Test;
@@ -154,6 +155,13 @@ class PayInAdvanceLiquidationRouterTest {
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 60_000_000L);
 
+    /**
+     * Part 3's {@code principalBalance} argument — "ample" for every test in this class that is not
+     * itself about the balance check, so MarketGate's cap (not its balance term) stays the thing under
+     * test, exactly as {@code anyWallet()} keeps the SELECTOR out of the way for tests not about T-052.
+     */
+    private static final BigInteger AMPLE_BALANCE = BigInteger.valueOf(1_000_000_000_000L);
+
     /** A selector that supplies the fixture wallet whatever the payout — for tests not about T-052. */
     private static Function<BigInteger, Optional<Utxo>> anyWallet() {
         return payout -> Optional.of(WALLET_UTXO);
@@ -174,7 +182,7 @@ class PayInAdvanceLiquidationRouterTest {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
 
         Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), anyWallet(), NOW, VALID_TO_MILLIS);
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS);
 
         // The parent LenderManager redeemer carries LiquidateAndPayInAdvance (constructor index 3).
         String parentReward = LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash());
@@ -223,20 +231,185 @@ class PayInAdvanceLiquidationRouterTest {
         PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
                 PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), anyWallet(), NOW, VALID_TO_MILLIS));
+                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS));
         assertEquals("pay-in-advance not yet modelled for non-positive equity", refusal.getMessage());
     }
 
-    /** A convert loan whose principal is not ada is refused cleanly, before the builder runs. */
+    /**
+     * ⛔ A non-ada principal is now MODELLED (the whole point of the token-principals slice) — it is
+     * refused only when the executor's {@code oraclesByUnit} snapshot has no entry for the loan's
+     * OWN {@code principalOracleAsset}, exactly as WALL 3 requires: looked up by the oracle NFT the
+     * datum names, not by the priced asset.
+     */
     @Test
-    void nonAdaPrincipalIsRefusedCleanly() {
+    void nonAdaPrincipalWithNoMatchingOracleIsRefusedCleanly() {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY),
                 nonAdaPrincipalLoanDatum());
         PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
                 PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), anyWallet(), NOW, VALID_TO_MILLIS));
-        assertEquals("pay-in-advance not yet modelled for non-ada principal", refusal.getMessage());
+                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS));
+        assertTrue(refusal.getMessage().contains("no oracle entry for principal oracle asset"),
+                refusal.getMessage());
+    }
+
+    // ======================================================================================
+    // (4) a TOKEN PRINCIPAL, routed and built end to end — WALLS 1-4 exercised off the built body
+    // ======================================================================================
+    //
+    // ⚠ No real registered oracle asset besides tFLDT (the collateral one) is available offline —
+    // see docs/lending-v4-findings.md §59 on why a second REAL Charli3-recognised token cannot be
+    // fabricated (charlie_specs is a closed, deployment-time validator parameter). This principal
+    // oracle is therefore SYNTHETIC — its own fake script hash / reference input / reward address,
+    // the same style LiquidationSubmitVetoTest and LiquidationExecutorTest already use for their
+    // oracle fixtures. It is real enough to prove every piece of OFF-CHAIN wiring (WALLS 1-4, all
+    // Java-side), but this class evaluates no script (see its own class javadoc) — it never did, and
+    // still does not. The genuinely on-chain-validated proof is LoanFinanceTest's exact arithmetic
+    // vectors, which need no chain data at all.
+
+    private static final AssetType TOKEN_PRINCIPAL =
+            new AssetType("cc".repeat(28), "0014df105553444d");
+    private static final AssetType TOKEN_PRINCIPAL_ORACLE_NFT =
+            new AssetType("8a".repeat(28), "8a".repeat(10));
+    private static final String TOKEN_PRINCIPAL_ORACLE_CREDENTIAL = "8b".repeat(28);
+    // ⚠ "fe" — deliberately NOT the hex-lowest reference input in this fixture (see
+    // TransactionInputComparator), so its sorted position is provably non-zero. A hardcoded
+    // principalOracleRefIndex == 0 mutant must be DISTINGUISHABLE from the real derived position —
+    // choosing a coordinate that happens to sort first would let that mutant survive by coincidence.
+    private static final TransactionInput TOKEN_PRINCIPAL_ORACLE_REF_INPUT =
+            LoanFixtures.input("fe".repeat(32), 0);
+    private static final TransactionInput TOKEN_PRINCIPAL_ORACLE_REF_SCRIPT =
+            LoanFixtures.input("8d".repeat(32), 0);
+    private static final TransactionInput TOKEN_PRINCIPAL_C3_PROVIDER =
+            LoanFixtures.input("8e".repeat(32), 0);
+
+    private static LoanDatum tokenPrincipalLoanDatum() {
+        LoanDatum ada = loanDatum();
+        return new LoanDatum(ada.doneRecasts(), ada.principalAmount(), ada.lendDate(),
+                ada.repaidInstallments(), ada.interestRate(), ada.totalInstallments(), TOKEN_PRINCIPAL,
+                TOKEN_PRINCIPAL_ORACLE_NFT, ada.installmentPeriod(), ada.initialGracePeriod(),
+                ada.liquidationMode(), ada.repaymentMode(), ada.repaymentTimeWindow(),
+                ada.penaltyFeeForLateRepayment(), ada.repaymentReceipts(), ada.originId(),
+                ada.collateral());
+    }
+
+    /**
+     * ⚠ Priced 1:1 — the same numeric ratio {@link OraclePriceFeed#unit()} carries — DELIBERATELY, so
+     * this fixture's remaining debt and equity come out exactly as the frozen ada fixture's do
+     * ({@code EQUITY}, below) and the loan stays solvent. This test proves the WIRING (a distinct
+     * reference input, a distinct withdraw-0, the payout landing in the principal asset, the output
+     * shape) — the EXACT two-feed ARITHMETIC at a genuinely different price is
+     * {@code LoanFinanceTest.convertFromAToBWithOraclesMatchesThePinnedMainnetCandidate}, which needs
+     * no chain-shaped fixture at all.
+     */
+    private static OracleEntry tokenPrincipalOracle() {
+        return LoanFixtures.charli3(TOKEN_PRINCIPAL, TOKEN_PRINCIPAL_ORACLE_NFT,
+                TOKEN_PRINCIPAL_ORACLE_CREDENTIAL,
+                OraclePriceFeed.priceDataCharlie(TOKEN_PRINCIPAL,
+                        BigInteger.ONE, BigInteger.ONE,
+                        FEED_VALID_FROM, FEED_VALID_TO),
+                TOKEN_PRINCIPAL_ORACLE_REF_INPUT, TOKEN_PRINCIPAL_ORACLE_REF_SCRIPT,
+                TOKEN_PRINCIPAL_C3_PROVIDER);
+    }
+
+    private static Map<String, OracleEntry> oraclesByUnitWithTokenPrincipal() {
+        Map<String, OracleEntry> byUnit = new java.util.LinkedHashMap<>(oraclesByUnit());
+        OracleEntry principal = tokenPrincipalOracle();
+        byUnit.put(principal.oracleToken().toUnit(), principal);
+        return byUnit;
+    }
+
+    private static AppConfig.LiquidationConfiguration configurationWithTokenMarket() {
+        AppConfig.LiquidationConfiguration cfg = configuration();
+        List<AppConfig.LiquidationConfiguration.Market> markets = new ArrayList<>(cfg.getMarkets());
+        markets.add(anticipateMarket(TOKEN_PRINCIPAL.toUnit(), 1_500_000_000L));
+        cfg.setMarkets(markets);
+        return cfg;
+    }
+
+    private static PayInAdvanceLiquidationRouter tokenPrincipalRouter() {
+        // Reads the reference inputs it needs from a universe that ALSO carries the synthetic
+        // principal oracle's three coordinates — the same additive pattern universe(fixture) uses
+        // for the collateral leg's oracle in the dry-eval rig.
+        List<Utxo> universeWithPrincipalOracle = new ArrayList<>(universe());
+        universeWithPrincipalOracle.add(LoanFixtures.utxo(
+                TOKEN_PRINCIPAL_ORACLE_REF_INPUT.getTransactionId(), TOKEN_PRINCIPAL_ORACLE_REF_INPUT.getIndex(),
+                LoanFixtures.rewardAddress(TOKEN_PRINCIPAL_ORACLE_CREDENTIAL), List.of(
+                        Amount.lovelace(BigInteger.valueOf(1_038_710L)),
+                        Amount.asset(LoanFixtures.unit(TOKEN_PRINCIPAL_ORACLE_NFT), BigInteger.ONE)), null));
+        return new PayInAdvanceLiquidationRouter(REGISTRY, converters(), configurationWithTokenMarket(),
+                new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universeWithPrincipalOracle), EvalFixtures.protocolParams()));
+    }
+
+    /**
+     * WALL 1 — the built transaction pays the lender the two-feed composition, in the PRINCIPAL
+     * asset, never a one-feed lovelace shortcut. WALL 4 — that output is the token plus its min-ada
+     * rider (flatten == 2), not ada. Both measured off the BUILT body, the same discipline
+     * {@code LiquidatePayInAdvanceTransactionBuilder}'s own {@code assertStructure} uses — this test
+     * would fail if that internal assertion were ever weakened, because it re-derives the same figure
+     * independently via {@link LoanFinance#convertFromAToBWithOracles} rather than trusting the
+     * builder's own number.
+     */
+    @Test
+    void aTokenPrincipalLoanIsRoutedAndPaysTheLenderInTheTokenWithTheTwoFeedComposition() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY), tokenPrincipalLoanDatum());
+
+        Transaction tx = tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(),
+                bondUtxo(), CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnitWithTokenPrincipal(),
+                AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS);
+
+        BigInteger collateralLenderShouldReceive = BigInteger.valueOf(COLLATERAL_AMOUNT)
+                .subtract(BigInteger.valueOf(EQUITY)).subtract(BigInteger.valueOf(LIQUIDATION_FEE));
+        BigInteger expectedPayout = LoanFinance.convertFromAToBWithOracles(
+                oracle().feed(), tokenPrincipalOracle().feed(), Rational.fromInt(collateralLenderShouldReceive));
+
+        List<TransactionOutput> assetManagerOutputs = assetManagerOutputs(tx);
+        assertEquals(2, assetManagerOutputs.size());
+        TransactionOutput lenderOutput = assetManagerOutputs.stream()
+                .filter(o -> quantityOf(o, TOKEN_PRINCIPAL).signum() > 0)
+                .findFirst().orElseThrow(() -> new AssertionError("no output pays the principal token"));
+        assertEquals(expectedPayout, quantityOf(lenderOutput, TOKEN_PRINCIPAL),
+                "the lender must be paid EXACTLY the two-feed composition, not a one-feed shortcut");
+        assertEquals(0, lenderOutput.getValue().getMultiAssets().size() == 1
+                        ? 0 : lenderOutput.getValue().getMultiAssets().size() - 1,
+                "the lender output must carry exactly the principal token (plus its min-ada rider, "
+                        + "which is lovelace, not a second multi-asset entry)");
+
+        // WALL 3 — TWO distinct oracle withdrawals (collateral and principal are different oracle
+        // credentials here), and the principal oracle's own reference input is among the tx's.
+        String collateralOracleReward = oracle().rewardAddress();
+        String principalOracleReward = tokenPrincipalOracle().rewardAddress();
+        assertTrue(!collateralOracleReward.equals(principalOracleReward),
+                "fixture sanity: the two oracle legs must be distinct credentials for this to prove WALL 3");
+        List<Withdrawal> withdrawals = tx.getBody().getWithdrawals();
+        assertTrue(withdrawals.stream().anyMatch(w -> w.getRewardAddress().equals(collateralOracleReward)));
+        assertTrue(withdrawals.stream().anyMatch(w -> w.getRewardAddress().equals(principalOracleReward)),
+                "the principal oracle must get its OWN withdraw-0 invocation");
+        assertTrue(tx.getBody().getReferenceInputs().stream()
+                        .anyMatch(i -> i.getTransactionId().equals(TOKEN_PRINCIPAL_ORACLE_REF_INPUT.getTransactionId())
+                                && i.getIndex() == TOKEN_PRINCIPAL_ORACLE_REF_INPUT.getIndex()),
+                "the principal oracle's own reference input must be among the transaction's");
+
+        // WALL 3 — the redeemer's principalOracleRefInputIndex must be the REAL derived position of
+        // the principal oracle's reference input, never a hardcoded value: a hardcoded 0 would name
+        // whatever reference input happens to sort first, which is neither oracle here (config and
+        // lm-config sort ahead of both by TransactionInputComparator on this fixture's tx hashes).
+        String lmActionReward =
+                LoanFixtures.rewardAddress(REGISTRY.getLmLiquidateAndPayInAdvanceActionScriptHash());
+        ConstrPlutusData lmRedeemer = (ConstrPlutusData) rewardRedeemer(tx, lmActionReward).getData();
+        com.bloxbean.cardano.client.plutus.spec.ListPlutusData pairsListData =
+                (com.bloxbean.cardano.client.plutus.spec.ListPlutusData) lmRedeemer.getData().getPlutusDataList().get(3);
+        com.bloxbean.cardano.client.plutus.spec.ListPlutusData firstPair =
+                (com.bloxbean.cardano.client.plutus.spec.ListPlutusData) pairsListData.getPlutusDataList().get(0);
+        BigInteger encodedPrincipalOracleRefIndex =
+                ((com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData) firstPair.getPlutusDataList().get(0))
+                        .getValue();
+        int actualPosition = tx.getBody().getReferenceInputs().indexOf(TOKEN_PRINCIPAL_ORACLE_REF_INPUT);
+        assertTrue(actualPosition >= 0, "the principal oracle reference input must be in the body");
+        assertEquals(BigInteger.valueOf(actualPosition), encodedPrincipalOracleRefIndex,
+                "the redeemer's principalOracleRefInputIndex must be the REAL sorted position (" + actualPosition
+                        + "), not hardcoded to 0 or any other fixed value");
     }
 
     // ======================================================================================
@@ -390,6 +563,18 @@ class PayInAdvanceLiquidationRouterTest {
                 .getPaymentCredentialHash().map(HexUtil::encodeHexString).orElse("");
     }
 
+    private static BigInteger quantityOf(TransactionOutput output, AssetType asset) {
+        if (output.getValue().getMultiAssets() == null) {
+            return BigInteger.ZERO;
+        }
+        return output.getValue().getMultiAssets().stream()
+                .filter(m -> m.getPolicyId().equalsIgnoreCase(asset.policyId()))
+                .flatMap(m -> m.getAssets().stream())
+                .filter(a -> HexUtil.encodeHexString(a.getNameAsBytes()).equalsIgnoreCase(asset.assetName()))
+                .map(com.bloxbean.cardano.client.transaction.spec.Asset::getValue)
+                .reduce(BigInteger.ZERO, BigInteger::add);
+    }
+
     // ======================================================================================
     // T-052 — the wallet input is selected to cover THIS liquidation's lender payout
     // ======================================================================================
@@ -408,7 +593,7 @@ class PayInAdvanceLiquidationRouterTest {
         List<BigInteger> asked = new ArrayList<>();
 
         Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(),
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE,
                 payout -> {
                     asked.add(payout);
                     return Optional.of(WALLET_UTXO);
@@ -443,7 +628,7 @@ class PayInAdvanceLiquidationRouterTest {
         PayInAdvanceLiquidationRouter.WalletInputTooSmallException refusal = assertThrows(
                 PayInAdvanceLiquidationRouter.WalletInputTooSmallException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(),
+                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE,
                         payout -> Optional.empty(), NOW, VALID_TO_MILLIS));
 
         assertTrue(refusal.getMessage().contains("repays the lender"),
@@ -461,7 +646,7 @@ class PayInAdvanceLiquidationRouterTest {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
 
         Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), anyWallet(), NOW, VALID_TO_MILLIS);
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS);
 
         assertTrue(tx.getBody().getInputs().stream()
                         .anyMatch(i -> i.getTransactionId().equals(WALLET_UTXO.getTxHash())

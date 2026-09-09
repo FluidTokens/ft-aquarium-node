@@ -172,6 +172,16 @@ public record LiquidationDecision(long decidedAt,
          * record is not a record of absence.</b> Confirmed 2026-08-25 by waiting out a real 30-minute
          * quarantine and observing the first decision land at the first cycle past expiry.
          */
-        QUARANTINED
+        QUARANTINED,
+        /**
+         * The economics gate could not price a leg of the candidate into lovelace — {@code
+         * PricingService.toLovelace} refused (no feed, a feed not usable at the instant asked, or a
+         * {@code POOLED} variant). Landed live for the pay-in-advance path's token outlay
+         * (token-principals slice, 2026-09-10): before this it was RESERVED here — see
+         * {@code CompoundExclusion.PRICE_UNAVAILABLE} for the sibling that has carried the compound
+         * path's equivalent refusal since the oracle-pricing slice. Not quarantined: a feed coming
+         * back into its validity window cures it without the bot's own state changing.
+         */
+        PRICE_UNAVAILABLE
     }
 }
