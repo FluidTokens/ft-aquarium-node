@@ -14,8 +14,8 @@ build
 # `git add -A` from the remote. The " copy" form is the one that has already leaked a wallet
 # mnemonic on another repo: a duplicate nobody names and no pattern anticipated.
 # ⚠ Kept as explicit names rather than a blanket `.env*`, which would leave the tracked
-# `.env.preview.example` / `docker/.env.example` tracked-but-ignored — a state that reads as a
-# mistake and invites a "fix" that untracks them.
+# `docker/.env.example` tracked-but-ignored — a state that reads as a mistake and invites a
+# "fix" that untracks it.
 .env
 .env copy
 .env*copy*

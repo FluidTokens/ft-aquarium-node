@@ -177,6 +177,32 @@ If you see something that resembles this line:
 
 if means your node is up to tip and is processing 1 block at the time (i.e. the latest block).
 
+## Arming the liquidation bot on mainnet
+
+**The node ships with the liquidation bot OFF.** Everything else is tuning; these are the dials that decide whether it does anything at all.
+
+| env var | ships | to arm |
+|---|---|---|
+| `SCHEDULING_TRANSACTION_PROCESSOR_ENABLED` | `false` | `"true"` — the Aquarium scheduled-transaction processor |
+| `AQUARIUM_LIQUIDATION_MODE` | `disabled` | `live` (or `shadow` to rehearse: builds and prices, never submits) |
+| `AQUARIUM_COMPOUND_ENABLED` | `false` | `"true"` |
+| `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `5000000` | lower it, or **the one margin** refuses work you want done |
+| `LOANS_LIQUIDATION_CONVERT_ENABLED` | `true` | nothing — already on. `"false"` stops **all** conversions |
+| `LOANS_LIQUIDATION_MARKETS_<n>_*` | empty | nothing — an empty list means **convert every market at the node mode**. Listing a market is how you *deviate* (see the next section) |
+
+**One margin, then the market list.** A single `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` governs every mode — plain, anticipate and convert — and the only per-market control is the market list. ⚠ The margin is what surprises people: leave it at 5 ADA on a path that earns less and the node looks armed and does nothing. Lowering it for convert lowers it for anticipate too — that is deliberate.
+
+**Three ways to be armed and idle, all silent:** the global convert switch off; every market `DISABLED`, or `ANTICIPATE` with a cap below what the loan requires; or the shared margin above what the work earns. None is an error and all three read as a quiet market. `GET /api/v1/loans/liquidations` shows every decision the bot took and why — it is in memory, so read it before restarting.
+
+**Removed keys — a deployment must NOT pass these.** They are silently ignored, which reads exactly like them working:
+
+| gone | why |
+|---|---|
+| `LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` | merged into the shared margin above; a chart still setting it gets the shared default, not the number it thinks it set |
+| `AQUARIUM_LIQUIDATION_ENABLED` | redundant with the mode |
+| `LOANS_ENABLED` | v4 indexing is unconditional |
+| `AQUARIUM_X_SUBMIT` / `loans.submittable-network` | a barrier that silently blocks submission when everything else is armed is a bug, not a safeguard |
+
 ## Lending v4 liquidations: the market specification
 
 ⛔ **`unit` is the loan's PRINCIPAL asset — what was lent — not the collateral.** An entry keyed by
