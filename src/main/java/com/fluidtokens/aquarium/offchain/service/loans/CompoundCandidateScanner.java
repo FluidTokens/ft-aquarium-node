@@ -149,11 +149,19 @@ public class CompoundCandidateScanner {
         long feePerMille = compoundingFeePerMille(pair.poolManager());
 
         if (!principalIsAda) {
+            // ⛔ Still refused, but no longer because CompoundEconomics "cannot compare" the fee —
+            // it can now price a token fee via PricingService. This is a structural gate: the
+            // compound TRANSACTION BUILDER assumes an ada principal throughout, and lifting the
+            // refusal is also held on a product ruling from Giovanni (FAB-77, 2026-09-09) about
+            // whether the bot should acquire a token this way at all. See
+            // CompoundExclusion.PRINCIPAL_NOT_ADA's javadoc for both reasons.
             return new CompoundCandidate(loanId, escrow, datum, addedLiquidity, bond, poolId,
                     pair.pool(), pair.poolManager(), feePerMille, false,
                     CompoundExclusion.PRINCIPAL_NOT_ADA,
                     "pool principal is " + bond.datum().principalAsset()
-                            + "; its fee is denominated in that token and cannot be compared to a lovelace tx fee");
+                            + "; refused structurally — the compound builder does not yet pay out "
+                            + "a non-ada principal, and lifting this is held on a product ruling "
+                            + "(FAB-77), not merely a pricing gap");
         }
 
         return new CompoundCandidate(loanId, escrow, datum, addedLiquidity, bond, poolId,

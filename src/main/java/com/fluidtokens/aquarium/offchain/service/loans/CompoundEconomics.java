@@ -1,6 +1,7 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion;
 import jakarta.annotation.PostConstruct;
@@ -24,12 +25,22 @@ import java.math.BigInteger;
  * carries no oracle risk — which is why the floor here defaults to 0 rather than to the liquidation
  * path's 1_500_000 premium. See {@code AppConfig.CompoundConfiguration#profitMarginLovelace}.
  *
- * <h2>⛔ The unit trap this gate refuses rather than papers over</h2>
+ * <h2>⛔ The unit trap this gate no longer papers over by refusing outright</h2>
  * {@code compoudingFeePerMille} applies to the <b>principal asset</b>. For an ADA-principal pool the
- * fee is lovelace and comparing it to a lovelace transaction fee is sound. For a token-principal pool
- * it is a token quantity, and subtracting a lovelace cost from it produces a number that looks like
- * profit and means nothing. Pricing that token needs an oracle this path does not have, so a
- * non-ADA principal is {@link CompoundExclusion#PRINCIPAL_NOT_ADA} — refused, not guessed.
+ * fee is already lovelace and comparing it to a lovelace transaction fee is direct. For a
+ * token-principal pool it is a token quantity, and subtracting a lovelace cost from it directly
+ * would produce a number that looks like profit and means nothing — so it is priced first, through
+ * {@link PricingService} (the ONE place a token quantity becomes lovelace in this path), and only
+ * refused, as {@link CompoundExclusion#PRICE_UNAVAILABLE}, when that pricing itself fails: no oracle
+ * feed, a feed that is not usable at the instant asked, or a feed that is a {@code POOLED} variant.
+ * ADA is the identity in {@link PricingService#toLovelace} — no oracle is consulted for it, so this
+ * gate's ada behaviour is unchanged from before this class knew how to price anything else.
+ * <p>
+ * ⚑ <b>This method alone no longer refuses a non-ADA principal.</b> A candidate still never reaches
+ * here with one today — {@code CompoundCandidateScanner} keeps its own, separate,
+ * {@link CompoundExclusion#PRINCIPAL_NOT_ADA} refusal upstream, for reasons that have nothing to do
+ * with pricing (see that constant's javadoc). This class is written to be correct regardless, ready
+ * for the day that upstream gate lifts.
  */
 @Service
 @Slf4j
@@ -39,10 +50,13 @@ public class CompoundEconomics {
 
     private final AppConfig.CompoundConfiguration configuration;
     private final AppConfig.Network network;
+    private final PricingService pricingService;
 
-    public CompoundEconomics(AppConfig.CompoundConfiguration configuration, AppConfig.Network network) {
+    public CompoundEconomics(AppConfig.CompoundConfiguration configuration, AppConfig.Network network,
+                             PricingService pricingService) {
         this.configuration = configuration;
         this.network = network;
+        this.pricingService = pricingService;
     }
 
     /**
@@ -92,17 +106,21 @@ public class CompoundEconomics {
      * @param poolAndManagerLive whether BOTH the pool NFT and the pool-manager NFT carrying that
      *                           {@code poolId} are live — the two {@code quantity_of(...) == 1}
      *                           checks {@code lm_compound_action} performs
-     * @param principalIsAda  whether the pool's {@code principalAsset} is ADA
+     * @param principalAsset  the pool's {@code principalAsset} — priced via {@link PricingService},
+     *                        which is the identity for ada and consults the oracle for anything else
      * @param escrow          principal held in the asset manager, in the principal's own unit
      * @param feePerMille     {@code compoudingFeePerMille} from the live {@code PoolManagerDatum}
      * @param txFee           the measured fee of the built transaction, in lovelace
+     * @param atMillis        the instant to price the fee slice at — the transaction's own
+     *                        {@code validFrom} is the caller's usual choice
      */
     public CompoundAssessment assess(boolean bondNamesAPool,
                                      boolean poolAndManagerLive,
-                                     boolean principalIsAda,
+                                     AssetType principalAsset,
                                      BigInteger escrow,
                                      long feePerMille,
-                                     BigInteger txFee) {
+                                     BigInteger txFee,
+                                     long atMillis) {
         if (!configuration.isEnabled()) {
             return CompoundAssessment.refused(CompoundExclusion.NOT_ARMED);
         }
@@ -112,18 +130,24 @@ public class CompoundEconomics {
         if (!poolAndManagerLive) {
             return CompoundAssessment.refused(CompoundExclusion.POOL_NOT_LIVE);
         }
-        if (!principalIsAda) {
-            return CompoundAssessment.refused(CompoundExclusion.PRINCIPAL_NOT_ADA);
-        }
 
         BigInteger expectedFee = expectedFee(escrow, feePerMille);
-        BigInteger net = expectedFee.subtract(txFee);
+
+        PricingService.Priced priced = pricingService.toLovelace(principalAsset, expectedFee, atMillis);
+        if (!priced.isPriced()) {
+            log.info("compound: cannot price the {} fee slice ({} base units) at {}: {}",
+                    principalAsset.toUnit(), expectedFee, atMillis, priced.refusal());
+            return CompoundAssessment.refused(CompoundExclusion.PRICE_UNAVAILABLE);
+        }
+
+        BigInteger expectedFeeLovelace = priced.lovelace();
+        BigInteger net = expectedFeeLovelace.subtract(txFee);
         BigInteger floor = configuration.getProfitMarginLovelace();
         boolean approved = net.compareTo(floor) >= 0;
 
         return new CompoundAssessment(approved,
                 approved ? null : CompoundExclusion.NET_BELOW_FLOOR,
-                escrow, feePerMille, expectedFee, txFee, net, floor);
+                escrow, feePerMille, expectedFee, expectedFeeLovelace, txFee, net, floor);
     }
 
     /**

@@ -259,7 +259,13 @@ class CompoundCandidateScannerTest {
         assertEquals(CompoundExclusion.BOND_NOT_FOUND, scan.candidates().getFirst().exclusion());
     }
 
-    /** A token-principal pool: refused rather than compared against a lovelace fee. */
+    /**
+     * A token-principal pool: still refused structurally here — NOT because
+     * {@code CompoundEconomics} cannot compare a token fee to a lovelace tx fee any more (it can, via
+     * {@code PricingService}, see {@code CompoundEconomicsTest}), but because the compound builder
+     * does not yet pay out a non-ada principal and lifting this is held on a product ruling
+     * (FAB-77). See {@code CompoundExclusion.PRINCIPAL_NOT_ADA}'s javadoc.
+     */
     @Test
     void aTokenPrincipalPoolIsRefused() {
         var principal = new AssetType("0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62",
@@ -275,6 +281,8 @@ class CompoundCandidateScannerTest {
         assertEquals(CompoundExclusion.PRINCIPAL_NOT_ADA, c.exclusion());
         assertEquals(BigInteger.valueOf(200_000_000L), c.addedLiquidity(),
                 "the principal quantity is still reported, in the principal's own unit");
+        assertFalse(c.detail().contains("cannot be compared"),
+                "the old reason is stale now that CompoundEconomics CAN price a token fee: " + c.detail());
     }
 
     /** An unreadable pool-manager datum must read as a zero fee, never as a high one. */

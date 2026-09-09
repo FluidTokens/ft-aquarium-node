@@ -151,9 +151,14 @@ class ExecutorContextResolutionTest {
         }
 
         @Bean
+        PricingService pricingService() {
+            return new PricingService(new FluidOracleClient("http://unused.invalid"));
+        }
+
+        @Bean
         CompoundEconomics economics(AppConfig.CompoundConfiguration configuration,
-                                    AppConfig.Network network) {
-            return new CompoundEconomics(configuration, network);
+                                    AppConfig.Network network, PricingService pricingService) {
+            return new CompoundEconomics(configuration, network, pricingService);
         }
 
         @Bean

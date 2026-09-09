@@ -11,9 +11,15 @@ import java.math.BigInteger;
  * @param escrow        the principal sitting in the asset manager, in the pool's principal unit
  * @param feePerMille   {@code compoudingFeePerMille} read from the live {@code PoolManagerDatum} —
  *                      <b>set by the pool owner, not by us and not by the protocol</b>
- * @param expectedFee   {@code escrow * feePerMille / 1000}, the on-chain formula, integer division
+ * @param expectedFee   {@code escrow * feePerMille / 1000}, the on-chain formula, integer division —
+ *                      in the <b>principal's own unit</b>, exactly what the pool is entitled to
+ *                      withhold on chain
+ * @param expectedFeeLovelace {@link #expectedFee} priced into lovelace via
+ *                      {@code PricingService} — the identity for an ada principal, so this equals
+ *                      {@link #expectedFee} exactly whenever the principal is ada
  * @param txFee         the measured transaction fee this compound would pay
- * @param net           {@code expectedFee - txFee}; negative means the bot pays to do the work
+ * @param net           {@code expectedFeeLovelace - txFee}; negative means the bot pays to do the
+ *                      work
  * @param floor         {@code loans.compound.profit-margin-lovelace}, the operator's stated bound
  */
 public record CompoundAssessment(boolean approved,
@@ -21,12 +27,13 @@ public record CompoundAssessment(boolean approved,
                                  BigInteger escrow,
                                  long feePerMille,
                                  BigInteger expectedFee,
+                                 BigInteger expectedFeeLovelace,
                                  BigInteger txFee,
                                  BigInteger net,
                                  BigInteger floor) {
 
     public static CompoundAssessment refused(CompoundExclusion why) {
-        return new CompoundAssessment(false, why, null, 0L, null, null, null, null);
+        return new CompoundAssessment(false, why, null, 0L, null, null, null, null, null);
     }
 
     /** True when the pool owner has set no compounding fee, so this work pays nothing. */
