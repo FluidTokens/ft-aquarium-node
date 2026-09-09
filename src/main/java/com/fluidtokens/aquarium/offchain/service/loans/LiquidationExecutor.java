@@ -1004,12 +1004,25 @@ public class LiquidationExecutor {
                 // generic ("… for non-ada principal" / "… for non-positive equity") and does not say
                 // WHICH asset, so the line below names the principal unit; the message itself is what
                 // lets a reader tell the two triggers apart.
+                //
+                // ⛔ AND THE REMEDY IS CONDITIONAL, because only ONE of the two triggers has one.
+                // "Set this market to CONVERT" is sound advice for a non-ada principal — the convert
+                // router genuinely supports one (it resolves a collateral/principal pool and prices the
+                // principal leg through its own feed). It is WRONG advice for non-positive equity,
+                // which says nothing about the mechanism and everything about this loan right now.
+                // ⚠ And the cost of the wrong advice is not a wasted cycle: `action` is a MARKET-level
+                // setting keyed by principal asset, so taking it re-routes EVERY loan in that market
+                // away from pay-in-advance. The substitution between these two mechanisms is the one
+                // this file already calls "the one substitution that spends money nobody authorised".
+                // An equity-sign refusal must never be the reason an operator makes it.
                 String principalUnit = assessment.loan().datum().principalAsset().toUnit();
+                String remedy = assessment.loan().datum().principalAsset().isAda()
+                        ? ""
+                        : "; this market's principal is not ada — if it should still be liquidated, set "
+                                + "its action to CONVERT so Minswap fronts the principal instead";
                 log.info("the pay-in-advance liquidation of {} (principal {}) was refused: {} — not "
-                                + "quarantined, reconsidered every cycle; if this market should still be "
-                                + "liquidated, set its action to CONVERT so Minswap fronts the principal "
-                                + "instead",
-                        loanUtxoRef, principalUnit, e.getMessage());
+                                + "quarantined, reconsidered every cycle{}",
+                        loanUtxoRef, principalUnit, e.getMessage(), remedy);
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         e.getMessage(), e.getMessage()));
                 return;

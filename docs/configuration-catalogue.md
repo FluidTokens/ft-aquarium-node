@@ -395,8 +395,19 @@ for a good reason" and "quietly did nothing" indistinguishable to the operator r
 
 Read the log line together with the recorded decision (`outcome`/`reason`/`detail` at §5.8): the
 record is what survives past the log's own retention, the log line is what a `journalctl`/
-`docker logs` tail shows as it happens. The two always carry the **same** detail text for a given
-decision — nothing here re-derives one from memory of the other.
+`docker logs` tail shows as it happens.
+
+⚠ **They are not always the same string, and the difference is deliberate — do not read a mismatch
+as a stale surface or an overwritten decision.** Where both exist, the log line is the record's text
+or a **superset** of it; nothing re-derives one from memory of the other. Two exits below add
+operator context that the stored `detail` does not carry:
+
+| exit | recorded `detail` | log line adds |
+|---|---|---|
+| `NO_UTXO` | `loan utxo present=…, bond utxo present=… — spent since the scan` | the actual loan and bond **refs**, and which of the two was missing |
+| pay-in-advance not modelled | the router's own message | the **principal asset unit**, and — only when that principal is not ada — the remedy |
+
+Everywhere else the two are byte-identical, computed once and shared.
 
 | exit (`LiquidationExecutor`, approx. line) | outcome / reason | level | meaning |
 |---|---|---|---|

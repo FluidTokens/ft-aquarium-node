@@ -1799,6 +1799,82 @@ class LiquidationExecutorTest {
         assertTrue(message.contains("non-positive equity"),
                 "must carry the router's own message verbatim — it is what distinguishes the two "
                         + "triggers: " + message);
+        // ⛔ AND THE REMEDY MUST BE ABSENT HERE. The principal IS ada, so "set this market to CONVERT"
+        // is not merely unhelpful — `action` is a MARKET-level setting keyed by principal asset, so an
+        // operator taking that advice re-routes EVERY loan in the market away from pay-in-advance on
+        // the strength of one loan's equity sign. This assertion is the whole point of the pair: the
+        // sibling test below proves the remedy DOES appear when it is the right advice.
+        assertFalse(message.contains("action to CONVERT"),
+                "a non-positive-equity refusal must NOT advise a market-wide routing change — the "
+                        + "equity sign says nothing about the mechanism: " + message);
+    }
+
+    /**
+     * The OTHER trigger behind the same exception, and the one the remedy is actually for.
+     *
+     * <p>{@code PayInAdvanceLiquidationRouter:143} refuses a non-ada principal outright, before equity
+     * is looked at. Here the advice is sound — the convert router genuinely supports a non-ada
+     * principal (it resolves a {@code collateral/principal} pool and prices the principal leg through
+     * its own feed) — so the line must carry it, and must name the asset that makes it apply.
+     *
+     * <p>⚠ This pair exists because the two triggers share ONE exception type. A single test can only
+     * ever prove the message fits the trigger it happened to fire; it takes both to prove the message
+     * fits <em>each</em>.
+     */
+    @Test
+    void aNonAdaPrincipalNotModelledRefusalCarriesTheConvertRemedy() {
+        Scenario convert = tokenPrincipalConvertScenario();
+        AppConfig.LiquidationConfiguration configuration =
+                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, SMALL_MARGIN, 200);
+        configuration.setMarkets(java.util.List.of(
+                anticipateMarket(COLLATERAL_TOKEN.toUnit(), 1_000_000_000_000L)));
+        Wiring wiring = wiring(configuration, convert, false);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        List<ILoggingEvent> infos = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .filter(event -> event.getFormattedMessage().contains("not yet modelled"))
+                .toList();
+        assertEquals(1, infos.size(), "expected exactly one INFO line for the not-modelled refusal: "
+                + appender.list);
+        String message = infos.getFirst().getFormattedMessage();
+        assertTrue(message.contains("non-ada principal"),
+                "must carry the router's own message, which is what names this trigger: " + message);
+        assertTrue(message.contains(COLLATERAL_TOKEN.toUnit()),
+                "must name the principal unit that makes the remedy apply: " + message);
+        assertTrue(message.contains("action to CONVERT"),
+                "a non-ada-principal refusal MUST carry the remedy — it is the one trigger the advice "
+                        + "is correct for: " + message);
+    }
+
+    /**
+     * A convert-flagged loan whose PRINCIPAL is a token. Nothing past
+     * {@code PayInAdvanceLiquidationRouter:143} is reached, so the feeds here need only be present.
+     */
+    private static Scenario tokenPrincipalConvertScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(COLLATERAL_TOKEN, BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum,
+                COLLATERAL_LOVELACE, List.of());
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.convertToPrincipalBondDatum(FAT_FEE_PER_MILLE,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), COLLATERAL_TOKEN),
+                2_000_000L);
+
+        LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.unit(), OraclePriceFeed.unit(), VALID_FROM);
+        return new Scenario(loan, bond, assessment);
     }
 
     /**
