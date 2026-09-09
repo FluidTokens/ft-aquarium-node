@@ -77,6 +77,7 @@ class EnvironmentVariableBindingTest {
                 // day, merged into the shared loans.liquidation.profit-margin-lovelace.
                 .withPropertyValues("loans.enabled=true", "network=preview",
                         "loans.config.asset-name=706172616d6574657273",
+                        "loans.liquidation.profit-margin-lovelace=5000000",
                         "loans.liquidation.convert.enabled=true",
                         "loans.liquidation.convert.dex-cost-floor-lovelace=5000000");
     }
@@ -131,6 +132,7 @@ class EnvironmentVariableBindingTest {
                     // Same reason as withEnv(): the no-default keys have no home but the yaml.
                     .withPropertyValues("loans.enabled=true",
                             "loans.config.asset-name=706172616d6574657273",
+                        "loans.liquidation.profit-margin-lovelace=5000000",
                             "loans.liquidation.convert.enabled=true",
                             "loans.liquidation.convert.dex-cost-floor-lovelace=5000000")
                     .run(ctx -> assertEquals(target, ctx.getBean(AppConfig.Network.class).getNetwork(),

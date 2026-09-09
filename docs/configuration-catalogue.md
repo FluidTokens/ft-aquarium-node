@@ -269,6 +269,11 @@ while every candidate reports `ORACLE_WINDOW_MARGIN_TOO_SMALL`.
 
 ### 5.4 Markets — per-market policy (A)
 
+⛔ **`unit` is the loan's PRINCIPAL asset — what was lent — not the collateral.** `MarketGate` matches
+on `principalAsset()` at all three call sites. **A collateral-keyed entry matches nothing, and an
+unmatched market is UNLISTED, which converts by default** — so a `mode: DISABLED` on the wrong asset
+silently converts. *Found by audit 2026-09-10, before it reached an operator.*
+
 An **object list**, so a chart must render indexed names or a YAML fragment.
 
 ```yaml

@@ -476,6 +476,10 @@ loans:
     reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}
 
   liquidation:
+    # Stated, not defaulted: the annotation carries no inline default since 2026-09-10, so
+    # a document that omits this does not start. Preview matches mainnet deliberately —
+    # a rehearsal priced differently from production rehearses the wrong thing.
+    profit-margin-lovelace: 5000000
     convert:
       # ⛔ Minswap V2 has no preview deployment, so a convert cannot be built here at all -- the blank
       # minswap pool-address below is what makes the path SKIP, and that is the honest reason.

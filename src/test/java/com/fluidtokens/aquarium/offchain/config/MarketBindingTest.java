@@ -52,7 +52,10 @@ class MarketBindingTest {
         // the bean is simply absent and every assertion below would fail on a missing bean rather
         // than on the binding it is about.
         return new ApplicationContextRunner().withUserConfiguration(Ctx.class)
-                .withPropertyValues("loans.enabled=true");
+                .withPropertyValues("loans.enabled=true",
+                        // ⚠ No inline default: application.yaml is this margin's only
+                        // source, so a synthetic context must state it as a node must.
+                        "loans.liquidation.profit-margin-lovelace=5000000");
     }
 
     /** The canonical form: a list of objects with named fields. */

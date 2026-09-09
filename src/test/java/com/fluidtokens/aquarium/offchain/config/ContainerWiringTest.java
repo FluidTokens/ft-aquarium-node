@@ -93,7 +93,10 @@ class ContainerWiringTest {
 
         return new ApplicationContextRunner()
                 .withUserConfiguration(YaciConfig.class)
-                .withPropertyValues("loans.enabled=true")
+                .withPropertyValues("loans.enabled=true",
+                        // ⚠ No inline default: application.yaml is this margin's only
+                        // source, so a synthetic context must state it as a node must.
+                        "loans.liquidation.profit-margin-lovelace=5000000")
                 .withBean(BFBackendService.class,
                         () -> new BFBackendService("https://cardano-preview.blockfrost.io/api/v0/", "test"))
                 .withBean(AppConfig.Network.class, () -> network)
@@ -194,6 +197,10 @@ class ContainerWiringTest {
         var network = new AppConfig.Network();
         network.setNetworkForTest("preview");
         new ApplicationContextRunner()
+                // ⚠ The container also creates the @Component LiquidationConfiguration beside the
+                // withBean() one, and the shared margin has no inline default since 2026-09-10 — the
+                // yaml is its only source, and this runner does not read the yaml.
+                .withPropertyValues("loans.liquidation.profit-margin-lovelace=5000000")
                 .withUserConfiguration(YaciConfig.class)
                 .withBean(BFBackendService.class,
                         () -> new BFBackendService("https://cardano-preview.blockfrost.io/api/v0/", "test"))

@@ -78,6 +78,15 @@ class MinswapPoolAddressIsPerProfileTest {
         // margin convert answers to is the shared loans.liquidation.profit-margin-lovelace. Both
         // survivors keep the same no-inline-default rule, because the reason for it did not change —
         // convert is a money path.
+        // ⛔ The SHARED margin too, since 2026-09-10. It shipped 1,500,000 in the annotation while
+        // the yaml shipped 5,000,000 — one documented knob with two answers, and after the margin
+        // merge the wrong one governed convert as well.
+        assertEquals("${loans.liquidation.profit-margin-lovelace}",
+                AppConfig.LiquidationConfiguration.class.getDeclaredField("profitMarginLovelace")
+                        .getAnnotation(Value.class).value(),
+                "the shared margin must carry NO inline default: the yaml is its single source, and "
+                        + "an inline one is a second answer that only non-Spring paths ever read");
+
         for (var e : java.util.Map.of(
                 "enabled", "loans.liquidation.convert.enabled",
                 "dexCostFloorLovelace", "loans.liquidation.convert.dex-cost-floor-lovelace").entrySet()) {

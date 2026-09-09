@@ -379,9 +379,11 @@ class ConvertEconomicsTest {
         // margin this replaced carried its own field default and this class asserted it — the merge
         // moved the read and would otherwise have left the invariant unenforced for the number
         // convert relies on.
-        assertEquals(BigInteger.valueOf(1_500_000L),
-                new AppConfig.LiquidationConfiguration().getProfitMarginLovelace(),
-                "the shared margin must have a FIELD default matching its annotation, or a non-Spring "
-                        + "construction hands convert a null floor");
+        // ⛔ INVERTED 2026-09-10. The shared margin now has NO default anywhere but the yaml, so a
+        // bare construction leaves it null BY DESIGN — and init() refuses the context by name rather
+        // than letting ConvertEconomics.assess dereference it three classes away.
+        assertNull(new AppConfig.LiquidationConfiguration().getProfitMarginLovelace(),
+                "a bare LiquidationConfiguration must NOT invent a margin: an inline default here is "
+                        + "a second answer to a question application.yaml already answers");
     }
 }

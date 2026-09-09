@@ -383,14 +383,15 @@ public class AppConfig {
          * this reason; the merge must not lose that (§26.2 — a {@code @Value} default is not a
          * default of the class).
          *
-         * <p>⚠ <b>KNOWN AND PRE-EXISTING: this annotation says 1,500,000 while
-         * {@code application.yaml} ships 5,000,000.</b> A Spring-bound node always reads the yaml, so
-         * the shipped default IS 5 ada — but any non-Spring construction reads 1.5, and that number
-         * now governs convert too. <b>Not changed here because this slice's invariant was that the
-         * code default is untouched; it wants one deliberate fix, not a silent one.</b>
+         * <p>✅ <b>FIXED 2026-09-10. The annotation used to say 1,500,000 while
+         * {@code application.yaml} shipped 5,000,000</b> — so a Spring-bound node read 5 ada and any
+         * other construction read 1.5, for the same documented knob, and after the margin merge that
+         * number governed convert too. <b>There is now no inline default at all: the yaml is the
+         * single source, and a configuration that omits this does not start.</b> That keeps "the
+         * shipped default" true by construction rather than by two places agreeing.
          */
-        @Value("${loans.liquidation.profit-margin-lovelace:1500000}")
-        private BigInteger profitMarginLovelace = BigInteger.valueOf(1_500_000L);
+        @Value("${loans.liquidation.profit-margin-lovelace}")
+        private BigInteger profitMarginLovelace;
 
         /**
          * Whether the profitability floors run at all. {@code false} is the operator's "liquidate
@@ -788,6 +789,17 @@ public class AppConfig {
             // must see the same list the gate will.
             if (marketProperties != null) {
                 setMarkets(marketProperties.getMarkets());
+            }
+            // ⛔ A NAMED failure, not an NPE three classes away. The margin has no inline default
+            // (the yaml is its only source) and since the 2026-09-10 merge it gates convert as well,
+            // where `net.compareTo(floor)` would dereference it. A context that never bound it must
+            // say so here, in words an operator can act on.
+            if (profitMarginLovelace == null) {
+                throw new IllegalStateException(
+                        "loans.liquidation.profit-margin-lovelace is not set. It has no inline "
+                                + "default on purpose — application.yaml is its only source — and it "
+                                + "is the single margin gating every liquidation mode, convert "
+                                + "included. Set it, or bind the shipped application.yaml.");
             }
             parseMode();
             validateMarkets();

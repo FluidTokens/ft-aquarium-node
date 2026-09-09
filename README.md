@@ -179,6 +179,11 @@ if means your node is up to tip and is processing 1 block at the time (i.e. the 
 
 ## Lending v4 liquidations: the market specification
 
+⛔ **`unit` is the loan's PRINCIPAL asset — what was lent — not the collateral.** An entry keyed by
+the collateral is well-formed, boots cleanly and logs at startup, and then **matches no loan** — so
+that market is treated as unlisted, **and an unlisted market CONVERTS by default.** A `mode: DISABLED`
+written against the wrong asset therefore does the opposite of what it says, silently.
+
 > Only relevant if you run the node's **lending v4 auto-liquidation** bot. It is off until you set
 > `AQUARIUM_LIQUIDATION_MODE`, and nothing below happens on a node that leaves it `disabled`.
 
