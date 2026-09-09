@@ -384,6 +384,69 @@ every candidate refusing on a size the operator believed they had fixed. Every r
 key. Coordinates are **verified resolvable on chain at startup**, and a hash mismatch is fatal, so
 a stale coordinate is worse than an absent one.
 
+### 5.7 Reading the refusal log — every reason an operator can meet, and what it means
+
+⚑ **Why this section exists.** On 2026-09-09 a mainnet cycle logged "1 buildable", logged its wallet
+UTxOs and its validity window, and then went silent — no outcome, no reason, nothing. Diagnosing it
+cost an afternoon and the answer was only recoverable from the in-memory endpoint in §5.8. Three exits
+used to leave the candidate's fate untraceable at INFO, and one of them recorded a `REFUSED` decision
+while **logging nothing at all** — closed 2026-09-09. A money path that exits silently makes "refused
+for a good reason" and "quietly did nothing" indistinguishable to the operator reading the log.
+
+Read the log line together with the recorded decision (`outcome`/`reason`/`detail` at §5.8): the
+record is what survives past the log's own retention, the log line is what a `journalctl`/
+`docker logs` tail shows as it happens. The two always carry the **same** detail text for a given
+decision — nothing here re-derives one from memory of the other.
+
+| exit (`LiquidationExecutor`, approx. line) | outcome / reason | level | meaning |
+|---|---|---|---|
+| ~821 config/lm-config utxo missing | *(no decision — the whole cycle returns)* | WARN | the node's own config or lm-config UTxO could not be resolved; nothing this cycle could have built |
+| ~871 quarantine hold | `QUARANTINED` | INFO | this loan utxo failed to build on an earlier cycle and is held for the rest of its quarantine window; **the hold is IN-MEMORY ONLY and does not survive a restart** — restarting the node is itself the remedy if the hold should lift now |
+| ~889 utxo spent since the scan | `NO_UTXO` | INFO | the loan or bond utxo the scanner saw is no longer unspent — repaid, or liquidated by somebody else, between the scan and the build; not an error, never quarantined; names both refs and which of the two was missing |
+| ~929 no convert capability | `REFUSED` / `CONVERT_UNAVAILABLE` | WARN | the market is `action: CONVERT` but this node has no `ConvertLiquidationRouter` bean (`loans.minswap.*` unset, or belongs to another network); **never falls back to pay-in-advance** — that would front capital the operator never authorised |
+| ~945 no Minswap pool | `REFUSED` / `NO_MINSWAP_POOL` | INFO | no Minswap pool exists for this pair — impossible, not unprofitable; the operator's remedy is `action: ANTICIPATE` on that market if it should still liquidate |
+| ~950 convert unprofitable | `UNPROFITABLE` | INFO | the Minswap convert was built and priced, but its fee does not clear the operator's floor |
+| ~957 convert build failed | `REFUSED` / the exception's root class name | ERROR | a genuine machinery fault assembling the convert transaction (a Blockfrost timeout, say); quarantined |
+| ~992 wallet input too small (pay-in-advance) | `REFUSED` / `WALLET_INPUT_TOO_SMALL` | WARN | no wallet utxo covers the lender payout this pay-in-advance liquidation must fund; not quarantined — a wallet top-up cures it |
+| ~1000 market gate refusal (pay-in-advance) | `REFUSED` / the gate's own reason | INFO | the market is disabled, or the principal this candidate requires the bot to front exceeds the operator's stated cap |
+| ~1015 pay-in-advance shape not modelled | `REFUSED` / the router's own message | INFO | the convert shape (non-ada principal, or non-positive equity) this seam cannot yet build for; the log line names the principal asset unit and, for a non-ada principal, the remedy — set that market's `action` to `CONVERT` so Minswap fronts it instead |
+| ~1033 pay-in-advance build failed | `REFUSED` / the exception's root class name | ERROR | a genuine machinery fault; quarantined |
+| ~1057 wallet input too small (plain path) | `REFUSED` / `WALLET_INPUT_TOO_SMALL` | WARN | no wallet utxo covers the fee for a fee-only liquidation; not quarantined |
+| ~1094 plain-path builder refusal | `REFUSED` / the builder's own `Refusal` name (one of fifty) | **INFO** for 48 of the 50 reasons — a clean verdict on the candidate, reproducible next cycle; **ERROR** for the two that wrap a real fault underneath (`SCRIPT_COST_EVALUATION_FAILED`, `TRANSACTION_NOT_BUILDABLE`) | the level is the discriminator: INFO means "this candidate is not liquidatable", ERROR means "the machinery broke while checking" — logging every refusal at ERROR would bury the two that matter under the forty-eight that do not |
+| ~1115 plain-path build failed | `REFUSED` / the exception's root class name | ERROR | a genuine machinery fault; quarantined |
+| ~1299 priced verdict | `WOULD_SUBMIT` \| `UNPROFITABLE` \| `SUBMIT_VETOED` \| `SUBMITTED` \| `SUBMIT_FAILED` | INFO | the candidate was built and priced; every armed-vs-shadow and profitable-vs-not question is answered from this line — read `submit_veto` alongside it |
+| — | `PRICE_UNAVAILABLE` | **RESERVED, not yet emitted** | arriving with the oracle-pricing slice; grepping for it today and finding nothing is a deliberate gap, not a missing feature |
+
+Line numbers are a reading aid against `HEAD`, not ground truth — re-derive them from the file when
+they drift.
+
+**The compound path's exclusions** (`CompoundExclusion`, carried per-candidate on the
+`CompoundCandidate` rather than logged — see `CompoundCandidateScanner.classify`):
+
+| exclusion | meaning |
+|---|---|
+| `NOT_ARMED` | `loans.compound.enabled` is false — the default, not a fault |
+| `BOND_NAMES_NO_POOL` | the lender bond names no pool (`poolId == ""`); this escrow is **permanently** uncompoundable by anyone |
+| `POOL_NOT_LIVE` | the pool or its pool manager is not live — burned, or missing the right NFT quantity |
+| `PRINCIPAL_NOT_ADA` | the pool's principal is not ada; this path has no oracle to price a token fee against a lovelace tx fee |
+| `ESCROW_SHAPE_REJECTED` | the escrow carries assets the validator will not accept for its principal type (an ada-principal escrow must hold lovelace alone, plus receipt NFTs) |
+| `NOT_LENDER_OWNED` | the escrow is owned by a borrower bond, not a lender bond — `lm_compound_action`'s bond lookup does not apply |
+| `ESCROW_NOT_TOKEN_OWNED` | no inline datum, or not `AssetManagerDatumWithToken` — **except** when the utxo carries a reference script: that is FluidTokens' own asset-manager script published at its own address (verified on chain 2026-09-09: `83d1c5393a53e365eb15a7bdfd1feff560f43f9560bc60c23c4e41de709bae33#0`), a protocol object that must **never** be spent, not datum-less junk. The detail line names the reference script hash by name when that is the shape; the genuinely no-datum case keeps its original wording. |
+| `BOND_NOT_FOUND` | no unspent lender bond for this escrow's loan is in the index |
+| `NET_BELOW_FLOOR` | built and priced, but does not clear the operator's stated floor — the ordinary outcome for a pool whose fee is zero |
+
+### 5.8 The decision log endpoint — the ONLY place a held-but-unsubmitted decision can be read
+
+`GET ${apiPrefix}/loans/liquidations?limit=N` (`LiquidationController`; add `&include_cbor=true` to
+also get the built transaction's hex) returns, newest first, the ring buffer of the last
+`decision-log-size` decisions (§5.1) plus the last cycle's exclusion histogram. Every field from
+`expected_fee_lovelace` down is null unless a transaction was actually built for that decision.
+
+⛔ **It is IN-MEMORY.** `LiquidationDecisionLog` backs it with no persistence, so **it must be read
+BEFORE a restart** — a restart clears it exactly as it clears the quarantine map (§5.7). This endpoint
+is what made the 2026-09-09 diagnosis possible at all, and until this section it was documented
+nowhere an operator would find it.
+
 ---
 
 ## 6. The compound path

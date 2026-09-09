@@ -179,6 +179,58 @@ class CompoundCandidateScannerTest {
         assertTrue(scan.ready().isEmpty());
     }
 
+    /**
+     * Slice 1, task 4 (the Q3 fix). Before this, a genuinely no-datum escrow and FluidTokens' own
+     * published asset-manager reference script were refused with the SAME wording — "nothing
+     * token-owned can collect it" — which reads as junk when the reference-script one is a protocol
+     * object that must never be spent. This is the positive control: the classification is unchanged
+     * (still {@code ESCROW_NOT_TOKEN_OWNED}) and the ORIGINAL wording survives for the shape it was
+     * built around.
+     */
+    @Test
+    void aGenuinelyDatumlessEscrowKeepsTheOriginalWording() {
+        var noDatum = Utxo.builder()
+                .txHash("22".repeat(32)).outputIndex(0).address("addr_test1_escrow")
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(2_000_000L))))
+                .build();
+
+        var scan = scanner(List.of(noDatum), List.of(), Map.of()).scan();
+
+        var c = scan.candidates().getFirst();
+        assertEquals(CompoundExclusion.ESCROW_NOT_TOKEN_OWNED, c.exclusion());
+        assertEquals("no inline datum, or not AssetManagerDatumWithToken; nothing token-owned can "
+                + "collect it", c.detail());
+    }
+
+    /**
+     * Slice 1, task 4. The exact shape verified on chain 2026-09-09: the asset-manager script published
+     * AS A REFERENCE SCRIPT at its own address, no datum, 5,896,080 lovelace. It appears in this census
+     * on every cycle, forever, and it must be named as a protocol object, not left reading as junk.
+     */
+    @Test
+    void aReferenceScriptBearingEscrowIsIdentifiedAsAProtocolObject() {
+        var referenceScriptHash = "3644da1df258e17319505a9227fd7056285a051d64c6fd3b15ab7c07";
+        var assetManagerRefScript = Utxo.builder()
+                .txHash("83d1c5393a53e365eb15a7bdfd1feff560f43f9560bc60c23c4e41de709bae33")
+                .outputIndex(0).address("addr_test1_asset_manager")
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_896_080L))))
+                .referenceScriptHash(referenceScriptHash)
+                .build();
+
+        var scan = scanner(List.of(assetManagerRefScript), List.of(), Map.of()).scan();
+
+        var c = scan.candidates().getFirst();
+        assertEquals(CompoundExclusion.ESCROW_NOT_TOKEN_OWNED, c.exclusion(),
+                "the classification is unchanged — only the explanation");
+        assertTrue(c.detail().contains(referenceScriptHash),
+                "must name the reference script hash: " + c.detail());
+        assertTrue(c.detail().contains("protocol object"),
+                "must say it is a protocol object, not datum-less junk: " + c.detail());
+        assertTrue(c.detail().contains("never collectable"), c.detail());
+        assertFalse(c.detail().contains("nothing token-owned can collect it"),
+                "must not read like the genuine no-datum case: " + c.detail());
+    }
+
     @Test
     void aBorrowerOwnedEscrowIsExcludedStructurally() {
         var borrowerOwned = Utxo.builder()

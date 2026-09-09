@@ -275,6 +275,34 @@ class LiquidationExecutorTest {
     }
 
     /**
+     * A canned convert-router stand-in for task 8 (ADDENDA): it returns a REAL, already-built
+     * transaction rather than assembling a genuine Minswap order, because these tests only need
+     * {@code record()} to be REACHED under a CONVERT-routed (Minswap) candidate — proving the
+     * {@code record()} construction site consults the market and not just the bond flag. A working
+     * Minswap integration is exercised elsewhere ({@code ConvertReferenceScriptWiringTest} and
+     * friends); duplicating that here would test the router, not {@code variantOf}.
+     */
+    private static final class FakeConvertRouter extends ConvertLiquidationRouter {
+
+        private final Transaction canned;
+
+        FakeConvertRouter(Transaction canned) {
+            super(null, null, null, null, null, null, null, null);
+            this.canned = canned;
+        }
+
+        @Override
+        public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
+                                                    Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
+                                                    Utxo walletUtxo,
+                                                    Map<String, OracleEntry> oraclesByOracleTokenUnit,
+                                                    String changeAddress, long validFromMillis,
+                                                    long validToMillis) {
+            return canned;
+        }
+    }
+
+    /**
      * Counts how often the loop asks for the oracle registry, and hands out a <em>different</em>
      * client from the second ask onwards.
      * <p>
@@ -841,6 +869,49 @@ class LiquidationExecutorTest {
         return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
     }
 
+    /**
+     * Task 8 (ADDENDA). Wired like {@link #convertWiring()} but with the market UNLISTED, so
+     * {@code MarketGate.actionFor} answers CONVERT (Minswap) — the default per
+     * {@code MarketGate}'s own javadoc — rather than the ANTICIPATE every other convert fixture in
+     * this class forces via {@link #shadow}'s explicit {@code lovelace} market entry.
+     * {@code convertRouter} is the {@link FakeConvertRouter} stand-in, so this reaches {@code record()}
+     * — the OTHER {@code LiquidationDecision} construction site from {@link #decision} — under a
+     * CONVERT-routed candidate.
+     */
+    private static Wiring convertViaMinswapWiring(Transaction canned) {
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+        // markets left EMPTY: an unlisted market is action: CONVERT at the node's own mode.
+
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+                convert.loan().utxo(), convert.bond().utxo());
+
+        LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+
+        FakeScanner scanner = new FakeScanner(List.of(convert.assessment()));
+        FakeResolver resolver = new FakeResolver(allUnspent(List.of(convert)));
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        CountingOracleProvider oracles = noOracle();
+
+        PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
+                payInAdvanceRouter, new FakeConvertRouter(canned), LoanFixtures.registry(), log, oracles,
+                previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
+                EXPLODING_SUBMITTER);
+        return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
+    }
+
     // ======================================================================================
     // the two gates
     // ======================================================================================
@@ -997,6 +1068,46 @@ class LiquidationExecutorTest {
         assertNull(decision.txHash());
         assertEquals(0, wiring.executor().quarantinedCount(),
                 "and it must not quarantine a loan whose only problem is that its bond moved");
+    }
+
+    /**
+     * Slice 1, task 2. Exit 3 (NO_UTXO) logged nothing at all before this: the recorded detail had
+     * only the two booleans ("loan utxo present=%s, bond utxo present=%s"), which is not actionable —
+     * "spent since the scan" only means something if an operator can look the ref up. The log line
+     * must name the ACTUAL refs and say which of the two was missing.
+     */
+    @Test
+    void aNoUtxoSkipLogsAtInfoNamingBothRefsAndWhichWasMissing() {
+        Scenario scenario = scenario(FAT_FEE_PER_MILLE);
+        Map<String, Utxo> loanOnly = Map.of(scenario.loan().loan().utxoRef(), scenario.loan().utxo());
+
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(scenario.assessment()), List.of(scenario),
+                loanOnly, List.of(WALLET_UTXO), noOracle(), false);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.NO_UTXO, decision.outcome());
+
+        List<ILoggingEvent> infos = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .filter(event -> event.getFormattedMessage().contains("spent since the scan"))
+                .toList();
+        assertEquals(1, infos.size(), "expected exactly one INFO line for the missing utxo: "
+                + appender.list);
+        String message = infos.getFirst().getFormattedMessage();
+        assertTrue(message.contains(TX_LOAN + "#0"), "must name the loan utxo ref: " + message);
+        assertTrue(message.contains(TX_BOND + "#0"), "must name the bond utxo ref: " + message);
+        assertTrue(message.contains("the bond utxo"),
+                "must say WHICH of the two was missing, not just the booleans: " + message);
     }
 
     /**
@@ -1529,6 +1640,49 @@ class LiquidationExecutorTest {
                 "and only that one — nothing else is evicted to make room");
     }
 
+    /**
+     * Slice 1, task 1. The quarantine skip used to log at DEBUG only — invisible on an INFO-level
+     * node — and said nothing about WHY the hold exists or whether it survives a restart. Promoted to
+     * INFO, and the log line must carry the SAME detail string the decision record does (reused, not
+     * re-derived) plus the in-memory / restart fact the {@code ConcurrentHashMap} quarantine map
+     * implies but does not say on its own.
+     */
+    @Test
+    void aQuarantinedLoanLogsAtInfoNamingTheHoldAndItsInMemoryNature() {
+        Scenario scenario = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario, false);
+        wiring.executor().quarantineUntil(TX_LOAN + "#0", NOW + 3_600_000L);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.QUARANTINED, decision.outcome());
+
+        List<ILoggingEvent> infos = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .filter(event -> event.getFormattedMessage().contains("quarantined"))
+                .toList();
+        assertEquals(1, infos.size(), "expected exactly one INFO line for the quarantine hold: "
+                + appender.list);
+        String message = infos.getFirst().getFormattedMessage();
+        assertTrue(message.contains(TX_LOAN + "#0"), "must name the loan utxo ref: " + message);
+        assertTrue(message.contains(decision.detail()),
+                "the log line must carry the SAME detail the record does, reused not re-derived: "
+                        + message);
+        assertTrue(message.toUpperCase().contains("IN-MEMORY"),
+                "must say the hold does not survive a restart: " + message);
+        assertTrue(message.toLowerCase().contains("restart"),
+                "must name the restart remedy an operator would reach for: " + message);
+    }
+
     // ======================================================================================
     // the executor's convert branch: routing + the two failure mappings (A3 Part 2)
     // ======================================================================================
@@ -1606,6 +1760,45 @@ class LiquidationExecutorTest {
         assertNull(decision.txCborHex());
         assertEquals(0, wiring.executor().quarantinedCount(),
                 "a shape the seam cannot model is a REFUSED row, never a quarantine");
+    }
+
+    /**
+     * Slice 1, task 3. Exit 7 recorded REFUSED and logged NOTHING. The router's own message is
+     * generic ("… for non-positive equity" / "… for non-ada principal") and never says which asset —
+     * the log line must, because the operator's next question is always "which loan, which token".
+     * The message itself is what lets a reader tell the two triggers apart, so it must be carried
+     * verbatim.
+     */
+    @Test
+    void aPayInAdvanceNotModelledRefusalLogsAtInfoNamingThePrincipalAsset() {
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), convert, false);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertEquals("pay-in-advance not yet modelled for non-positive equity", decision.reason());
+
+        List<ILoggingEvent> infos = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .filter(event -> event.getFormattedMessage().contains("not yet modelled"))
+                .toList();
+        assertEquals(1, infos.size(), "expected exactly one INFO line for the not-modelled refusal: "
+                + appender.list);
+        String message = infos.getFirst().getFormattedMessage();
+        assertTrue(message.contains("lovelace"), "must name the principal asset (the unit): " + message);
+        assertTrue(message.contains("non-positive equity"),
+                "must carry the router's own message verbatim — it is what distinguishes the two "
+                        + "triggers: " + message);
     }
 
     /**
@@ -2104,9 +2297,15 @@ class LiquidationExecutorTest {
      * The other half of the same rule: a refusal that is a genuine verdict on the candidate — no cause
      * — keeps its clean message and produces NO error log. Forty-eight of the fifty refusals are this
      * shape, and turning them all into ERROR rows would bury the two that matter.
+     *
+     * <p>Slice 1, task 7 (ADDENDA): before this slice the causeless forty-eight logged NOTHING at any
+     * level — {@code if (e.getCause() != null)} was the ENTIRE log statement. The remedy is a level,
+     * not a flood: INFO for the causeless verdict, ERROR kept for the two that carry a fault (proven
+     * by the sibling test above). So this test now asserts BOTH halves: still no ERROR line, and now
+     * exactly one INFO line naming the refusal and carrying its detail.
      */
     @Test
-    void aPlainVerdictRefusalStaysCleanAndSilent() {
+    void aPlainVerdictRefusalLogsAtInfoInsteadOfSilence() {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Scenario tampered = honest.withAssessment(LoanFixtures.withNumbers(honest.assessment(),
                 honest.assessment().remainingDebt(), honest.assessment().equity(),
@@ -2132,6 +2331,19 @@ class LiquidationExecutorTest {
                         + decision.detail());
         assertTrue(appender.list.stream().noneMatch(event -> event.getLevel() == Level.ERROR),
                 "a clean verdict must not produce an ERROR line: " + appender.list);
+
+        List<ILoggingEvent> infos = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .filter(event -> event.getFormattedMessage().contains("was refused as"))
+                .toList();
+        assertEquals(1, infos.size(), "the causeless forty-eight must now log at INFO, not silently: "
+                + appender.list);
+        String message = infos.getFirst().getFormattedMessage();
+        assertTrue(message.contains(
+                        LiquidateTransactionBuilder.Refusal.LIQUIDATION_FEE_NOT_REPRODUCIBLE.name()),
+                "must name the refusal reason: " + message);
+        assertTrue(message.contains(decision.detail()),
+                "must carry the same detail the record does: " + message);
     }
 
     /**
@@ -2497,6 +2709,67 @@ class LiquidationExecutorTest {
         wiring.executor().cycle(NOW);
 
         assertEquals(LiquidationDecision.VARIANT, onlyDecision(wiring).variant());
+    }
+
+    /**
+     * Slice 1, task 8 (ADDENDA). {@code variantOf} used to read ONLY the bond's
+     * {@code shouldLiquidationConvertToPrincipal} flag, so every convert loan recorded itself as
+     * {@code LiquidateAndPayInAdvance} — whose own javadoc says the bot PAID the lender out of its own
+     * wallet — <b>even when the market routes it through Minswap, which fronts nothing.</b> That is the
+     * opposite sign of what happened; the live record on 2026-09-08 proved it for real.
+     * <p>
+     * This is the {@code decision()} helper's construction site: an UNLISTED market is CONVERT by
+     * default (no {@code shadow()} override here, unlike every other convert fixture in this class),
+     * and {@code convertRouter} is absent (the 7-arg {@code wiring} overload never wires one), so the
+     * candidate is refused as {@code CONVERT_UNAVAILABLE} — a REFUSED row built through
+     * {@code decision()}, not {@code record()}. It must still say Minswap: the market and the bond flag
+     * both say CONVERT; only the capability is missing.
+     */
+    @Test
+    void aConvertUnavailableRefusalIsStillRecordedWithTheMinswapVariant() {
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+        // markets left EMPTY: an unlisted market is action: CONVERT at the node's own mode.
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+
+        Wiring wiring = wiring(configuration, List.of(convert.assessment()), List.of(convert),
+                allUnspent(List.of(convert)), List.of(WALLET_UTXO), noOracle(), false);
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertEquals("CONVERT_UNAVAILABLE", decision.reason());
+        assertEquals(LiquidationDecision.VARIANT_CONVERT_MINSWAP, decision.variant(),
+                "the decision() construction site must consult the SAME market the routing did, not "
+                        + "just the bond flag: " + decision.variant());
+    }
+
+    /**
+     * Slice 1, task 8 (ADDENDA), the OTHER construction site. The file's own comment on
+     * {@code variantOf} records that fixing only one site previously left refusals and successes
+     * labelled inconsistently, "which is worse than the original defect" — so this proves
+     * {@code record()} too, with a candidate that is actually ROUTED and PRICED (not refused) under a
+     * CONVERT market. {@link FakeConvertRouter} returns a real, already-built transaction so
+     * {@code record()}'s pricing math has something real to run against; the routing decision under
+     * test is {@code variantOf}, not the Minswap integration itself.
+     */
+    @Test
+    void aRoutedConvertCandidateIsRecordedWithTheMinswapVariant() throws Exception {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring plain = wiring(shadow(SMALL_MARGIN), honest, false);
+        plain.executor().cycle(NOW);
+        Transaction canned = Transaction.deserialize(
+                HexUtil.decodeHexString(onlyDecision(plain).txCborHex()));
+
+        Wiring wiring = convertViaMinswapWiring(canned);
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertNotNull(decision.txHash(), "record() must have been reached, not decision(): "
+                + decision.detail());
+        assertEquals(LiquidationDecision.VARIANT_CONVERT_MINSWAP, decision.variant(),
+                "a Minswap convert must record its OWN variant, not the pay-in-advance one, at the "
+                        + "record() construction site too: " + decision.variant());
     }
 
     /**

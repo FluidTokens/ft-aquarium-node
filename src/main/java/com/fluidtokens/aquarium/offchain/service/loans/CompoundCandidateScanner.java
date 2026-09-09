@@ -93,8 +93,18 @@ public class CompoundCandidateScanner {
     private CompoundCandidate classify(Utxo escrow, Map<String, LenderBond> bondsByLoanId) {
         String datumHex = escrow.getInlineDatum();
         if (datumHex == null || !converter.isTokenOwned(datumHex)) {
-            return refuse(escrow, null, CompoundExclusion.ESCROW_NOT_TOKEN_OWNED,
-                    "no inline datum, or not AssetManagerDatumWithToken; nothing token-owned can collect it");
+            // The Q3 fix: FluidTokens publishes the asset-manager script AS A REFERENCE SCRIPT at its
+            // own address (verified on chain 2026-09-09), so it appears in this census on every cycle,
+            // forever, and it is not datum-less junk — it is a protocol object that must NEVER be
+            // spent. Naming it by its reference script hash, the same shape LiquidationExecutor's
+            // whyNotSpendable already uses, is what stops an operator reading this line as "clean up
+            // this junk". The classification is unchanged (still ESCROW_NOT_TOKEN_OWNED); only the
+            // wording for this one shape changes. The genuinely no-datum case keeps its original text.
+            String detail = escrow.getReferenceScriptHash() != null
+                    ? "reference script " + escrow.getReferenceScriptHash()
+                            + " published at its own address — protocol object, never collectable"
+                    : "no inline datum, or not AssetManagerDatumWithToken; nothing token-owned can collect it";
+            return refuse(escrow, null, CompoundExclusion.ESCROW_NOT_TOKEN_OWNED, detail);
         }
 
         var datum = converter.deserialize(datumHex);

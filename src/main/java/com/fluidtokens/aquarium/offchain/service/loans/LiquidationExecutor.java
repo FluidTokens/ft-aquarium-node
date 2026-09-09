@@ -853,17 +853,19 @@ public class LiquidationExecutor {
         String loanUtxoRef = assessment.loan().utxoRef();
         Long heldUntil = quarantine.get(loanUtxoRef);
         if (isQuarantined(loanUtxoRef, now)) {
-            // Recorded, not merely logged. This was the ONLY path out of consider() that returned
-            // without a decision, so a held loan was indistinguishable from one that was never
-            // considered — and the hold is the bot's own doing, which is exactly the fact an operator
-            // needs to see. The debug line stays: it is per-cycle and the record is what persists.
-            log.debug("loan {} is quarantined until {}", loanUtxoRef, heldUntil);
+            // Recorded, not merely logged (task 1): a held loan must not be indistinguishable from one
+            // never considered — the hold is the bot's own doing. Detail computed ONCE, shared by the
+            // log line and the record, so the two can never disagree about why the loan is held.
+            // IN-MEMORY: quarantine is a ConcurrentHashMap (see its field javadoc) — a restart clears
+            // every hold, which is the remedy an operator reaches for.
+            String detail = heldUntil == null
+                    ? "held by an earlier failure; the hold lapses shortly"
+                    : "held by an earlier failure for another %d s (until epoch-millis %d)"
+                            .formatted(Math.max(0L, (heldUntil - now) / 1000L), heldUntil);
+            log.info("loan {} is quarantined: {} — IN-MEMORY ONLY, does not survive a restart",
+                    loanUtxoRef, detail);
             decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.QUARANTINED,
-                    LiquidationDecision.Outcome.QUARANTINED.name(),
-                    heldUntil == null
-                            ? "held by an earlier failure; the hold lapses shortly"
-                            : "held by an earlier failure for another %d s (until epoch-millis %d)"
-                                    .formatted(Math.max(0L, (heldUntil - now) / 1000L), heldUntil)));
+                    LiquidationDecision.Outcome.QUARANTINED.name(), detail));
             return;
         }
 
@@ -872,6 +874,17 @@ public class LiquidationExecutor {
         if (loanUtxo.isEmpty() || bondUtxo.isEmpty()) {
             // Spent between the scan and now. Not an error and not quarantined: the ref is gone for
             // good, so it will simply not be scanned again.
+            //
+            // Task 2: the recorded detail already had the two booleans; the log line names the ACTUAL
+            // refs, because "spent since the scan" is only actionable if an operator can look the ref
+            // up — a boolean alone cannot be pasted into an explorer.
+            String bondUtxoRef = assessment.bond().utxoRef();
+            log.info("loan {} skipped: {} missing — loan utxo {} present={}, bond utxo {} present={} "
+                            + "— spent since the scan",
+                    loanUtxoRef,
+                    loanUtxo.isEmpty() && bondUtxo.isEmpty() ? "both utxos"
+                            : loanUtxo.isEmpty() ? "the loan utxo" : "the bond utxo",
+                    loanUtxoRef, loanUtxo.isPresent(), bondUtxoRef, bondUtxo.isPresent());
             decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.NO_UTXO,
                     LiquidationDecision.Outcome.NO_UTXO.name(),
                     "loan utxo present=%s, bond utxo present=%s — spent since the scan"
@@ -986,6 +999,17 @@ public class LiquidationExecutor {
                 // A convert shape the seam cannot yet model (non-ada principal / non-positive equity):
                 // a clean statement about this candidate, reproducible next cycle. Not quarantined, and
                 // no transaction was built — exactly the plain path's RefusedException treatment.
+                //
+                // Task 3: this used to record REFUSED and log NOTHING. The router's own message is
+                // generic ("… for non-ada principal" / "… for non-positive equity") and does not say
+                // WHICH asset, so the line below names the principal unit; the message itself is what
+                // lets a reader tell the two triggers apart.
+                String principalUnit = assessment.loan().datum().principalAsset().toUnit();
+                log.info("the pay-in-advance liquidation of {} (principal {}) was refused: {} — not "
+                                + "quarantined, reconsidered every cycle; if this market should still be "
+                                + "liquidated, set its action to CONVERT so Minswap fronts the principal "
+                                + "instead",
+                        loanUtxoRef, principalUnit, e.getMessage());
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         e.getMessage(), e.getMessage()));
                 return;
@@ -1065,6 +1089,13 @@ public class LiquidationExecutor {
                 if (e.getCause() != null) {
                     log.error("the liquidation of {} was refused as {} by a failure underneath: {}",
                             loanUtxoRef, e.getReason(), causeChain(e.getCause()), e);
+                } else {
+                    // Task 7 (ADDENDA). The remedy is a LEVEL, not a flood: the forty-eight causeless
+                    // refusals are a verdict on the candidate, not a fault, so ERROR would bury the two
+                    // above under noise every cycle. INFO records that a verdict was reached without
+                    // promoting every refusal to the level reserved for a fault.
+                    log.info("the liquidation of {} was refused as {}: {}",
+                            loanUtxoRef, e.getReason(), refusalDetail(e));
                 }
                 return;
             } catch (Exception e) {
@@ -1750,11 +1781,25 @@ public class LiquidationExecutor {
      * added and the field was not.</b> The convert path also emits no log line of its own, so
      * between the two it was armed, executable, and invisible except by inferring a FALLING wallet
      * balance from chain.
+     *
+     * <p>⚠ Task 8 (ADDENDA). The bond flag alone only says a loan MAY be converted; it does not say
+     * BY WHICH mechanism. {@code consider()} routes CONVERT candidates to either
+     * {@link ConvertLiquidationRouter} (Minswap, fronts nothing) or {@link #payInAdvanceRouter} (the
+     * bot pays the lender out of its own wallet) by reading {@code MarketGate.actionFor}, the SAME
+     * gate the routing itself asks. Reading only the bond flag here recorded every Minswap convert as
+     * {@code LiquidateAndPayInAdvance} — whose own javadoc says the bot paid the lender out of its own
+     * wallet, the OPPOSITE sign of what a Minswap convert does. Consulting the same gate the routing
+     * uses is what keeps the record from disagreeing with the routing decision it describes.
      */
-    private static String variantOf(LiquidationAssessment assessment) {
-        return assessment.bond().datum().shouldLiquidationConvertToPrincipal()
-                ? LiquidationDecision.VARIANT_CONVERT
-                : LiquidationDecision.VARIANT;
+    private String variantOf(LiquidationAssessment assessment) {
+        if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
+            return LiquidationDecision.VARIANT;
+        }
+        AppConfig.LiquidationConfiguration.Action action =
+                new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset());
+        return action == AppConfig.LiquidationConfiguration.Action.CONVERT
+                ? LiquidationDecision.VARIANT_CONVERT_MINSWAP
+                : LiquidationDecision.VARIANT_CONVERT;
     }
 
     private LiquidationDecision decision(LiquidationAssessment assessment, long now,
