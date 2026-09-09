@@ -70,7 +70,23 @@ import java.math.BigInteger;
  * pay-in-advance floor went wrong by refusing to value an acquired asset at all, and the opposite
  * mistake — crediting a token position as though it were cash — is just as available.
  * <b>The margin is the lever for that risk:</b> an operator who does not trust the oracle valuation,
- * or the liquidity behind it, raises {@code profit-margin-lovelace} until they do.
+ * or the liquidity behind it, raises {@code loans.liquidation.profit-margin-lovelace} until they do.
+ *
+ * <h2>⚑ ONE MARGIN, SHARED WITH EVERY OTHER MODE (2026-09-09)</h2>
+ * The margin this gate applies is the <b>shared</b> {@code loans.liquidation.profit-margin-lovelace},
+ * the same number every other liquidation mode answers to. Giovanni's ruling: <i>"for me convert is a
+ * liquidation and profitMarginLovelace is literally the same as liquidation … it's just one knob, the
+ * additional protection is the market specification where we can enable/override convert w/
+ * anticipate."</i> <b>The convert path's own margin key is gone</b> — lowering the margin for convert
+ * lowers it for anticipate too, and that is the intended trade.
+ *
+ * <h2>Arming: one global switch, then the market list</h2>
+ * {@code loans.liquidation.convert.enabled} (default {@code true}) turns the mechanism off
+ * <b>globally</b>, and it is checked first in {@link #assess}. With it on,
+ * {@code loans.liquidation.markets[]} decides per market: an entry's {@code action} chooses
+ * {@code CONVERT} or {@code ANTICIPATE}, its {@code mode} can disable that market outright, and an
+ * unlisted market converts at the node's mode. {@code MarketGate} applies that before this gate is
+ * reached, so the two <b>compose</b> rather than duplicate — global off beats any market entry.
  *
  * <h2>Why default-ON is defensible, and where the safety actually comes from</h2>
  * FluidTokens (Matteo, relayed 2026-09-03) confirmed the failure mode first-hand: if the Minswap order
@@ -106,10 +122,20 @@ public class ConvertEconomics {
     static final BigInteger MINSWAP_ORDER_OVERHEAD = BigInteger.valueOf(4_000_000L);
 
     private final AppConfig.ConvertConfiguration configuration;
+    private final AppConfig.LiquidationConfiguration liquidationConfiguration;
     private final AppConfig.Network network;
 
-    public ConvertEconomics(AppConfig.ConvertConfiguration configuration, AppConfig.Network network) {
+    /**
+     * ⚑ <b>The margin arrives from {@link AppConfig.LiquidationConfiguration}, not from the convert
+     * block</b>, since 2026-09-09. Giovanni: <i>"for me convert is a liquidation and
+     * profitMarginLovelace is literally the same as liquidation … it's just one knob."</i> The convert
+     * block still supplies the DEX cost floor, which is a cost input rather than a margin.
+     */
+    public ConvertEconomics(AppConfig.ConvertConfiguration configuration,
+                            AppConfig.LiquidationConfiguration liquidationConfiguration,
+                            AppConfig.Network network) {
         this.configuration = configuration;
+        this.liquidationConfiguration = liquidationConfiguration;
         this.network = network;
     }
 
@@ -123,19 +149,25 @@ public class ConvertEconomics {
      * loss MUST be implemented even on mainnet."</i> A convert that clears a loan nobody will
      * profitably touch is the intended public-good function of this bot.
      *
-     * <p><b>The protection is the DEFAULT, not a guard.</b> The margin ships at 0 — net-positive — on
-     * every network, so an operator who states nothing refuses every loss. Only an explicitly negative
-     * value operates at a loss, which no copy-paste of a zero or positive config can produce.
+     * <p><b>The protection is the DEFAULT, not a guard.</b> The shared margin ships positive on every
+     * network, so an operator who states nothing refuses every loss. Only an explicitly negative value
+     * operates at a loss, which no copy-paste of a zero or positive config can produce.
+     *
+     * <p>⚠ <b>The number announced here is the SHARED one</b>, and lowering it for convert lowers it
+     * for every other liquidation mode too. That is the point of the merge, and it is exactly the
+     * thing an operator reading only this line could miss — so the line names the key.
      *
      * <p>⚠ The DEX-cost floor is different and still fatal: it is not a bound an operator states about
      * their own appetite, it is an assumed cost of doing the work, and a negative one is a typo.
      */
     @PostConstruct
     void announceAndGuard() {
-        BigInteger floor = configuration.getProfitMarginLovelace();
+        BigInteger floor = liquidationConfiguration.getProfitMarginLovelace();
         log.info("CONVERT ECONOMICS enabled={} (default ON: this path fronts no capital and holds "
-                        + "nothing); dex-cost-floor={} lovelace, profit-margin={} lovelace. The oracle "
-                        + "value of the collateral-denominated liquidation fee, less "
+                        + "nothing; markets[] turns it off or swaps it for ANTICIPATE per market); "
+                        + "dex-cost-floor={} lovelace, profit-margin={} lovelace (the SHARED "
+                        + "loans.liquidation.profit-margin-lovelace — convert has no margin of its "
+                        + "own). The oracle value of the collateral-denominated liquidation fee, less "
                         + "max(txFee + order ada, dex-cost-floor), must reach the margin.",
                 configuration.isEnabled(), configuration.getDexCostFloorLovelace(), floor);
 
@@ -157,7 +189,7 @@ public class ConvertEconomics {
                 || (!"preview".equalsIgnoreCase(networkName) && !"preprod".equalsIgnoreCase(networkName));
         if (mainnet) {
             log.warn("⛔ OPERATING AT A LOSS ON MAINNET, BY OPERATOR CONFIGURATION — path: convert; "
-                            + "loans.liquidation.convert.profit-margin-lovelace = {} lovelace (network "
+                            + "loans.liquidation.profit-margin-lovelace = {} lovelace (network "
                             + "{}). This node will build Minswap conversions that cost the operator more "
                             + "than they earn — including for lender bonds whose liquidationFeePerMille "
                             + "is 0 — down to that stated floor. A deliberate protocol-health setting, "
@@ -165,7 +197,7 @@ public class ConvertEconomics {
                     floor, networkName);
             return;
         }
-        log.warn("⛔ loans.liquidation.convert.profit-margin-lovelace is {} (negative) on network {} — "
+        log.warn("⛔ loans.liquidation.profit-margin-lovelace is {} (negative) on network {} — "
                         + "the bot will convert AT A LOSS down to that bound, including for bonds whose "
                         + "liquidationFeePerMille is 0. This is a stated operator bound, not a disabled "
                         + "check.", floor, networkName);
@@ -190,6 +222,10 @@ public class ConvertEconomics {
                                     boolean collateralIsAda,
                                     OraclePriceFeed collateralFeed,
                                     BigInteger txFee) {
+        // The GLOBAL switch, first of everything THIS gate checks: `loans.liquidation.convert.enabled`
+        // false means no convert anywhere. Per-market control is `markets[]` and is applied EARLIER
+        // still, by MarketGate in LiquidationExecutor — so a market routed to ANTICIPATE never gets
+        // here. The two compose (both must permit), they do not duplicate.
         if (!configuration.isEnabled()) {
             return ConvertAssessment.refused(ConvertExclusion.NOT_ARMED);
         }
@@ -224,7 +260,8 @@ public class ConvertEconomics {
         // max(), never sum: the floor already covers the batcher fee, so adding it would double-count.
         BigInteger outlay = measuredOutlay.max(dexCostFloor);
         BigInteger net = feeValue.subtract(outlay);
-        BigInteger floor = configuration.getProfitMarginLovelace();
+        // The SHARED margin: one knob for every liquidation mode, convert included.
+        BigInteger floor = liquidationConfiguration.getProfitMarginLovelace();
         boolean approved = net.compareTo(floor) >= 0;
 
         return new ConvertAssessment(approved,

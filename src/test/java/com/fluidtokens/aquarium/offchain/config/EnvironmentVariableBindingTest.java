@@ -26,13 +26,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code application.yaml}</b> ({@code mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}}), so their env
  * name is spelled out in the file and there is nothing to infer.
  *
- * <p>⚠ <b>Six do not.</b> {@code loans.submittable-network}, the three
- * {@code loans.liquidation.convert.*} keys, {@code loans.verify-config.fail-on-unreachable} and
- * {@code loans.liquidation.reference-scripts.lm-liquidate-and-convert-action} exist ONLY as
- * {@code @Value} annotations with inline defaults. They are settable exclusively through Spring
- * Boot's <b>relaxed environment binding</b> — {@code SystemEnvironmentPropertySource} mapping
- * {@code loans.liquidation.convert.enabled} to {@code LOANS_LIQUIDATION_CONVERT_ENABLED}, dashes
- * and dots alike becoming underscores.
+ * <p>⚠ <b>Some do not.</b> The two {@code loans.liquidation.convert.*} keys,
+ * {@code loans.verify-config.fail-on-unreachable} and
+ * {@code loans.liquidation.reference-scripts.lm-liquidate-and-convert-action} have no placeholder of
+ * their own. They are settable exclusively through Spring Boot's <b>relaxed environment binding</b> —
+ * {@code SystemEnvironmentPropertySource} mapping {@code loans.liquidation.convert.enabled} to
+ * {@code LOANS_LIQUIDATION_CONVERT_ENABLED}, dashes and dots alike becoming underscores.
+ *
+ * <p>⚑ <b>One of them stopped existing on 2026-09-09</b> and is NOT re-pointed at something else
+ * here: {@code loans.liquidation.convert.profit-margin-lovelace} was deleted when the convert margin
+ * was merged into the shared {@code loans.liquidation.profit-margin-lovelace}. That key <b>does</b>
+ * have an {@code application.yaml} placeholder ({@code AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE}),
+ * so it is out of this file's scope by construction — its env name is spelled out in the file rather
+ * than inferred, which is the whole distinction this test exists to police.
  *
  * <p>⇒ <b>That mapping is an assumption a whole chart rests on, and until now nothing in this repo
  * measured it.</b> A catalogue that told a chart author to write
@@ -67,22 +73,22 @@ class EnvironmentVariableBindingTest {
                 // 2026-09-09 — application.yaml is their only home (§57.12). A synthetic context
                 // does not read that file, so it must state them, exactly as a node's configuration
                 // must. This is the intended behaviour: a context that omits them does not start.
+                // Two convert keys are left to state: `profit-margin-lovelace` was deleted the same
+                // day, merged into the shared loans.liquidation.profit-margin-lovelace.
                 .withPropertyValues("loans.enabled=true", "network=preview",
                         "loans.config.asset-name=706172616d6574657273",
-                        "loans.liquidation.convert.enabled=false",
-                        "loans.liquidation.convert.profit-margin-lovelace=0",
+                        "loans.liquidation.convert.enabled=true",
                         "loans.liquidation.convert.dex-cost-floor-lovelace=5000000");
     }
 
     /**
-     * The five keys with NO {@code application.yaml} placeholder. Each is named the way a chart would
-     * have to name it, and asserted to reach the bean that reads it.
+     * The keys with NO {@code application.yaml} placeholder. Each is named the way a chart would have
+     * to name it, and asserted to reach the bean that reads it.
      */
     @Test
     void theKeysWithNoYamlPlaceholderAreReachableAsEnvironmentVariables() {
         withEnv(Map.of(
                 "LOANS_LIQUIDATION_CONVERT_ENABLED", "false",
-                "LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE", "-2000000",
                 "LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE", "4000000",
                 "LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION",
                 "56840ffb07ca0ad4e1eb921695bad5d2719f838612008e13bfe7f775933a7def#0"))
@@ -92,8 +98,9 @@ class EnvironmentVariableBindingTest {
 
                     var convert = ctx.getBean(AppConfig.ConvertConfiguration.class);
                     assertFalse(convert.isEnabled(),
-                            "LOANS_LIQUIDATION_CONVERT_ENABLED=false must override the default TRUE");
-                    assertEquals(BigInteger.valueOf(-2_000_000), convert.getProfitMarginLovelace());
+                            "LOANS_LIQUIDATION_CONVERT_ENABLED=false must override the default TRUE — "
+                                    + "this is the global off switch, and an operator who wants no "
+                                    + "conversions anywhere has no other way to say so");
                     assertEquals(BigInteger.valueOf(4_000_000), convert.getDexCostFloorLovelace());
 
                     var liquidation = ctx.getBean(AppConfig.LiquidationConfiguration.class);
@@ -124,8 +131,7 @@ class EnvironmentVariableBindingTest {
                     // Same reason as withEnv(): the no-default keys have no home but the yaml.
                     .withPropertyValues("loans.enabled=true",
                             "loans.config.asset-name=706172616d6574657273",
-                            "loans.liquidation.convert.enabled=false",
-                            "loans.liquidation.convert.profit-margin-lovelace=0",
+                            "loans.liquidation.convert.enabled=true",
                             "loans.liquidation.convert.dex-cost-floor-lovelace=5000000")
                     .run(ctx -> assertEquals(target, ctx.getBean(AppConfig.Network.class).getNetwork(),
                             "NETWORK must reach the bean: it is the only thing that decides where "

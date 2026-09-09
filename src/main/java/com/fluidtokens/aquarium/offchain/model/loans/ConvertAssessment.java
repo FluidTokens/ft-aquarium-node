@@ -29,7 +29,9 @@ import java.math.BigInteger;
  *                         incidence the measurement cannot attribute
  * @param outlay           {@code max(measuredOutlay, dexCostFloor)} — what the gate charges
  * @param net              {@code feeValueLovelace - outlay}
- * @param floor            {@code loans.liquidation.convert.profit-margin-lovelace}
+ * @param floor            {@code loans.liquidation.profit-margin-lovelace} — the SHARED margin.
+ *                         The convert path had its own until 2026-09-10; one knob now gates every
+ *                         mode, on Giovanni's ruling that "convert is a liquidation".
  */
 public record ConvertAssessment(boolean approved,
                                 ConvertExclusion exclusion,

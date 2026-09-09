@@ -177,6 +177,100 @@ If you see something that resembles this line:
 
 if means your node is up to tip and is processing 1 block at the time (i.e. the latest block).
 
+## Lending v4 liquidations: the market specification
+
+> Only relevant if you run the node's **lending v4 auto-liquidation** bot. It is off until you set
+> `AQUARIUM_LIQUIDATION_MODE`, and nothing below happens on a node that leaves it `disabled`.
+
+When a loan is liquidated, the bot builds one of two transactions:
+
+| action | what it does | what it costs you |
+|---|---|---|
+| `CONVERT` | Sells the collateral through a Minswap V2 order to repay the lender. | **No capital.** A transaction fee and the ~4 ADA the validator makes the order carry. |
+| `ANTICIPATE` | Repays the lender **from your own wallet** and keeps the collateral. | **Your capital**, up to a `cap` you must state. |
+
+⚠ **Both descriptions mention the collateral, and neither is what the entry is keyed by.** A market
+is identified by its **principal** — see `unit` below.
+
+**`CONVERT` is the default, everywhere.** You do not list a market to get it —
+**no markets listed ⇒ every market converts by default; markets[] is now the only convert control**,
+provided `LOANS_LIQUIDATION_CONVERT_ENABLED` is true (it ships `true`). Listing a market is how you
+*deviate* from converting.
+
+Two controls, and a convert needs **both** to permit it:
+
+1. `LOANS_LIQUIDATION_CONVERT_ENABLED` — global. Set it `false` and the node converts **nothing**,
+   whatever any market says. This is the switch for "I do not want this node touching a DEX".
+2. `LOANS_LIQUIDATION_MARKETS_*` — per market. Override the action, cap what you will front, or
+   disable one market while the rest keep working.
+
+⛔ **One margin governs every mode**, convert included: `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE`
+(default `5000000` — 5 ADA of profit per liquidation). There is no separate convert margin. Lowering
+it to take on convert work lowers it for `ANTICIPATE` work too.
+
+### Worked example — three markets
+
+Convert ADA-principal loans, anticipate a token-principal market you do not trust a pool for
+(capped at 500 **of that token**, not of ada — see `cap` below), and stay out of a third entirely.
+
+```yaml
+loans:
+  liquidation:
+    markets:
+      # 1. ADA: convert through Minswap. Fronts nothing.
+      - unit: lovelace
+        action: CONVERT
+      # 2. A token with no reliable pool: front the principal instead, never more than 500 FLDT.
+      #    (policy id + asset name, both hex — this one is FLDT, CIP-68 reference name 0014df10.)
+      - unit: 577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e0014df10464c4454
+        action: ANTICIPATE
+        cap: 500000000
+      # 3. Sit this one out completely. Replace with the unit of the market you want no part of.
+      - unit: 1111111111111111111111111111111111111111111111111111111144554d4d59
+        mode: DISABLED
+```
+
+The same three markets as environment variables — this is the form a Docker `.env` or a Helm chart
+has to render, and the index is what groups the fields of one market:
+
+```bash
+LOANS_LIQUIDATION_MARKETS_0_UNIT=lovelace
+LOANS_LIQUIDATION_MARKETS_0_ACTION=CONVERT
+
+LOANS_LIQUIDATION_MARKETS_1_UNIT=577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e0014df10464c4454
+LOANS_LIQUIDATION_MARKETS_1_ACTION=ANTICIPATE
+LOANS_LIQUIDATION_MARKETS_1_CAP=500000000
+
+LOANS_LIQUIDATION_MARKETS_2_UNIT=1111111111111111111111111111111111111111111111111111111144554d4d59
+LOANS_LIQUIDATION_MARKETS_2_MODE=DISABLED
+```
+
+**Field reference**
+
+- `unit` — ⛔ **the loan's PRINCIPAL asset — what was lent, not what secures it.** `lovelace`, or the
+  principal's **policy id (56 hex chars) followed by its asset name in hex**, with no separator.
+  **Required.** Anything else aborts startup by name.
+  ⚠ **Keying an entry by the COLLATERAL is the mistake to avoid**, and it is silent: the unit is
+  well-formed, the node boots, the entry logs at startup — and it matches no loan, so that market is
+  treated as **unlisted, which converts.** The exact opposite of a `mode: DISABLED` you thought you
+  wrote, with no error anywhere.
+- `action` — `CONVERT` or `ANTICIPATE`. Defaults to `CONVERT`; never inferred from `cap`.
+- `cap` — the most principal the bot may front in that market, in that asset's own unit.
+  **Mandatory for `ANTICIPATE`, and the node refuses to start without it** — anticipating uncapped is
+  unbounded exposure. Ignored (with a warning) on a `CONVERT` market.
+- `mode` — `DISABLED`, `SHADOW` or `LIVE` for that market alone. Omit it to inherit
+  `AQUARIUM_LIQUIDATION_MODE`.
+
+⚠ **The node mode is a ceiling, not a suggestion.** A market asking for `LIVE` on a node running
+`shadow` runs as `SHADOW`, and says so at boot. A market may be *more* restrictive than the node,
+never less.
+
+⛔ **The node refuses to start** on a market entry that cannot mean anything: a missing or malformed
+`unit`, a duplicate `unit`, an `ANTICIPATE` entry with no `cap`, or a negative `cap` **on an
+`ANTICIPATE` entry** — a `cap` on a `CONVERT` entry is meaningless, so it only warns. That is
+deliberate — a typo that quietly disabled one market would look exactly like a market with no
+liquidations in it.
+
 ## Development Notes
 
 ### How to Setup local Postgres for dev

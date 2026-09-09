@@ -306,11 +306,36 @@ loans:
 
 ### 5.5 The convert path — ⚑ **now yaml, per profile** (was layer 2, closed 2026-09-09)
 
+⛔ **The convert margin was DELETED on 2026-09-09.** Giovanni: *"for me convert is a liquidation and
+profitMarginLovelace is literally the same as liquidation. can we get rid of convert and merge into
+liquidation? … it's just one knob, the additional protection is the market specification where we can
+enable/override convert w/ anticipate."* Convert now answers to the **shared**
+`AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` in §5.3, like every other mode. **Two keys are left in
+this block, and neither is a margin.**
+
 | env var | property | plain English | type | default | class |
 |---|---|---|---|---|---|
-| `LOANS_LIQUIDATION_CONVERT_ENABLED` | `loans.liquidation.convert.enabled` | The Minswap conversion mechanism, globally. | bool | ⛔ **`false`** | **C** — ⚑ **REVERSED 2026-09-09.** It defaulted `true` on an earlier ruling (fronts no capital, failure mode a no-op). It now ships **disarmed** under the later standing rule that every mode is exposed and documented but **none ships armed** — convert spends the bot's own ada on a batcher fee and an order's min-ada. ⚠ **A mainnet deployment MUST set this to `true` explicitly and the chart MUST pass it, or the node runs with convert silently off.** |
-| `LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` | `loans.liquidation.convert.profit-margin-lovelace` | What `feeValue − (txFee + orderAda)` must reach. `0` refuses every net loss while allowing break-even — which is what refuses a `liquidationFeePerMille = 0` bond out of the box. | lovelace, **may be negative** | `0` | **A** — honoured on **every** network, mainnet included. A negative value WARNs loudly at boot; it never hard-fails. |
-| `LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE` | `loans.liquidation.convert.dex-cost-floor-lovelace` | The assumed cost of one DEX interaction (batcher + fee), as a **floor** on the charged outlay, not an addend: the gate charges `max(txFee + orderAda, this)`. | lovelace, **≥ 0** | `5000000` | ⛔ **C** — **negative or unset throws at startup, on every network.** A negative cost of doing work is a typo, not a bound. |
+| `LOANS_LIQUIDATION_CONVERT_ENABLED` | `loans.liquidation.convert.enabled` | The Minswap conversion mechanism, **globally**. `false` = no converts anywhere, whatever any market says. | bool | ⚑ **`true`** | **C** — ⚠ **the one arming flag in this app that defaults ON.** Flipped to `false` on 2026-09-09 and **restored to `true` on 2026-09-10** on Giovanni's ruling: *"convert should remain but under liquidation and be enabled by default. there is a case we want to disable conversions."* Defensible here and nowhere else: the bot fronts no capital on this path and an unfilled order returns the collateral to the lender, so the failure mode is a no-op, not a loss. Still subject to `AQUARIUM_LIQUIDATION_MODE`. |
+| `LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE` | `loans.liquidation.convert.dex-cost-floor-lovelace` | The assumed cost of one DEX interaction (batcher + fee), as a **floor** on the charged outlay, not an addend: the gate charges `max(txFee + orderAda, this)`. **A cost input, not a margin** — which is why the merge left it standing. | lovelace, **≥ 0** | `5000000` | ⛔ **C** — **negative or unset throws at startup, on every network.** A negative cost of doing work is a typo, not a bound. |
+
+#### ⇒ The two convert controls, and how they compose
+
+There are exactly two, and **neither substitutes for the other. Both must permit a convert.**
+
+1. **`LOANS_LIQUIDATION_CONVERT_ENABLED`** — global, and it wins: `false` ⇒ no converts anywhere,
+   whatever any market says. A candidate that reaches the gate is refused `NOT_ARMED` before any
+   arithmetic runs.
+2. **`markets[]` (§5.4)** — per market. `action: ANTICIPATE` fronts capital in that market instead of
+   converting; `mode: DISABLED` sits that market out entirely; **an unlisted market converts.**
+
+⚠ *In the code the market list is consulted first* — `MarketGate` routes in `LiquidationExecutor`,
+before `ConvertEconomics` sees the candidate — *so a market routed to `ANTICIPATE` never reaches the
+global switch at all.* That is an implementation detail and not a precedence: the outcome is the AND
+of the two, in either order.
+
+⚠ **So "no markets listed" means convert everywhere — provided the global switch is true.** Both
+failure modes look identical from the outside (zero candidates, no error), which is why both are
+listed in §6.5.
 
 ### 5.6 Reference scripts — **nine named slots** (A, but not a tuning knob)
 
@@ -366,20 +391,29 @@ liquidation key above.
 
 ## 6.5 ⇒ THE MINIMUM MAINNET ARMING SET — what actually turns the bot on
 
-**Everything else is tuning. These are the dials that decide whether the node does anything**, and
-each ships in the safe position, so a node that is merely installed and started **spends nothing**.
+**Everything else is tuning. These are the dials that decide whether the node does anything.**
 
 | env var | ships | to arm |
 |---|---|---|
 | `SCHEDULING_TRANSACTION_PROCESSOR_ENABLED` | `false` | `"true"` — the Aquarium scheduled-transaction processor |
 | `AQUARIUM_LIQUIDATION_MODE` | `disabled` | `live` (or `shadow` to rehearse) |
-| `LOANS_LIQUIDATION_CONVERT_ENABLED` | `false` | `"true"` — ⚑ **new requirement as of 2026-09-09** |
 | `AQUARIUM_COMPOUND_ENABLED` | `false` | `"true"` |
-| `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `5000000` | lower it, or the shared floor refuses work the operator wants |
+| `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `5000000` | lower it, or **the one margin** refuses work the operator wants |
+| `LOANS_LIQUIDATION_CONVERT_ENABLED` | ⚑ `true` | nothing — it is already on. Set `"false"` to stop **all** conversions |
+| `loans.liquidation.markets[]` | empty | nothing — an empty list means **convert every market at the node mode**. Listing a market is how an operator *deviates* |
+
+⇒ **ONE MARGIN, then the market list.** Since 2026-09-09 there is a single
+`AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` governing every mode — convert included — and the only
+per-mode, per-market control is `markets[]`. The convert path's own margin key is gone (§6.7).
 
 ⚠ **The margin is the one that surprises people.** It is **shared across every mode** and it is what
 refused the first live convert. Arming a path and leaving this at 5 ada is a node that looks armed
-and does nothing.
+and does nothing. ⛔ **And now it cuts both ways: lowering it for convert lowers it for anticipate
+too.** That is the trade the one-knob merge makes, deliberately.
+
+⚠ **Three ways to be armed and idle, all silent:** the global convert switch off, every market
+`DISABLED` or `ANTICIPATE` without a cap that fits, or the shared margin above what the work earns.
+None of them is an error, and all three read as a quiet market.
 
 ## 6.6 ⛔ NEVER OPERATOR-SETTABLE — validator literals, not configuration
 
@@ -399,6 +433,7 @@ only when FluidTokens redeploy, **in the same commit as the reference-script coo
 | `AQUARIUM_X_SUBMIT` / `loans.submittable-network` | removed on Giovanni's ruling: *"a barrier that silently blocks submission even when everything else is armed is a bug, not a safeguard"* |
 | `LOANS_ENABLED` (`loans.enabled`) | removed: v4 indexing is unconditional — *"if the flag is flipped later we won't see old loans"* |
 | `AQUARIUM_LIQUIDATION_ENABLED` | removed: redundant with the mode |
+| `LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` (`loans.liquidation.convert.profit-margin-lovelace`) | ⚑ removed 2026-09-09, merged into the shared `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE`: *"convert is a liquidation and profitMarginLovelace is literally the same as liquidation … it's just one knob"*. A chart still passing it silently gets the shared default instead of the number it thinks it set. |
 
 ⚠ **Passing a removed key is not an error and produces no warning** — it is simply ignored, which
 reads exactly like it working.
@@ -480,9 +515,10 @@ Three things a values file must say, because two of them are actively counter-in
 
 1. **A negative `profit-margin-lovelace` does NOT hard-fail on mainnet.** Findings §31 removed that
    guard on Giovanni's ruling — *"operating at a loss MUST be implemented even on mainnet"*.
-   `guardMainnetNegativeMargin()` **warns**; it does not throw. The same is true of the compound and
-   convert margins. ⚠ Two stale comments in the tree still claim otherwise; this catalogue is the
-   correct account. **Only `ignore-profit-check` is startup-fatal on mainnet**, and only
+   `guardMainnetNegativeMargin()` **warns**; it does not throw. The same is true of the compound
+   margin, and of the convert path — which since 2026-09-09 **reads this very key**, so a negative
+   value here now warns twice, once per path, and lowers the bar for both. ⚠ Two stale comments in
+   the tree still claim otherwise; this catalogue is the correct account. **Only `ignore-profit-check` is startup-fatal on mainnet**, and only
    `convert.dex-cost-floor-lovelace` is fatal when negative on *every* network.
 2. **A negative margin ALONE changes nothing.** The absolute floor refuses a negative `floorProfit`
    *independently*, and the margin is deliberately outside that number. Measured on preview
@@ -585,9 +621,13 @@ AQUARIUM_LIQUIDATION_MIN_PROFIT_ABSOLUTE_LOVELACE: "0"
 AQUARIUM_LIQUIDATION_MIN_EXPECTED_PROFIT_LOVELACE: "0"
 AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY: "true"
 LOANS_LIQUIDATION_CONVERT_ENABLED: "true"     # fronts no capital; failure mode is a no-op
-LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE: "0"
 LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE: "5000000"
+# markets[] deliberately EMPTY: with the mode disabled above it changes nothing, and an empty list
+# means "convert every market at the node mode" the moment the mode is raised (§5.5).
 ```
+
+⚑ **`LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE` is absent from this list because it no longer
+exists** (2026-09-09, §6.7). The margin above is the only one, and it governs convert too.
 
 **Arming is now targeting plus two deliberate acts**, and the runbook
 (`docs/operating-the-liquidation-bot.md` §14) is what walks them:

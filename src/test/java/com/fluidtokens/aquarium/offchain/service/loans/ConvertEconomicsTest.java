@@ -42,15 +42,26 @@ class ConvertEconomicsTest {
      * its own tests below; leaving the shipped 5 ada in every case would make every other assertion a
      * test of the floor instead.
      */
-    private static ConvertEconomics economics(boolean enabled, long floorLovelace) {
-        return economics(enabled, floorLovelace, 0L);
+    private static ConvertEconomics economics(boolean enabled, long marginLovelace) {
+        return economics(enabled, marginLovelace, 0L);
     }
 
-    private static ConvertEconomics economics(boolean enabled, long floorLovelace, long dexCostFloor) {
+    /**
+     * ⚑ <b>The margin arrives in the LIQUIDATION configuration, not the convert one</b> (2026-09-09):
+     * {@code loans.liquidation.convert.profit-margin-lovelace} was deleted and every mode now answers
+     * to the shared knob. The {@code enabled} argument is still the convert block's, and still global.
+     */
+    private static ConvertEconomics economics(boolean enabled, long marginLovelace, long dexCostFloor) {
         return new ConvertEconomics(
-                new AppConfig.ConvertConfiguration(enabled, BigInteger.valueOf(floorLovelace),
-                        BigInteger.valueOf(dexCostFloor)),
+                new AppConfig.ConvertConfiguration(enabled, BigInteger.valueOf(dexCostFloor)),
+                liquidation(BigInteger.valueOf(marginLovelace)),
                 network("preview"));
+    }
+
+    /** The shared margin, and the only margin this gate answers to. */
+    private static AppConfig.LiquidationConfiguration liquidation(BigInteger margin) {
+        return new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, margin, 200, 30);
     }
 
     private static AppConfig.Network network(String name) {
@@ -61,6 +72,16 @@ class ConvertEconomicsTest {
 
     // ---- arming and eligibility -------------------------------------------------------------
 
+    /**
+     * The GLOBAL switch, {@code loans.liquidation.convert.enabled}. It is the first thing
+     * {@code assess} looks at, ahead of the lender's own conjunct and ahead of any arithmetic.
+     *
+     * <p>⚠ <b>It is not the only convert control, and the other one is not tested here.</b>
+     * Per-market policy lives in {@code markets[]} and is applied by {@code MarketGate} before this
+     * gate is ever called — see {@code MarketGateTest#aDisabledMarketRefusesBeforeAnythingElse} and
+     * {@code #payInAdvanceNeedsTheMarketToSayAnticipateExplicitly}. The two compose: global off means
+     * no converts anywhere, whatever a market entry says.
+     */
     @Test
     void aDisabledPathRefusesBeforeAnythingElseIsEvenLookedAt() {
         ConvertAssessment a = economics(false, 0)
@@ -225,14 +246,16 @@ class ConvertEconomicsTest {
     @Test
     void aNegativeOrAbsentDexCostFloorIsRefusedOnEveryNetwork() {
         for (String net : new String[]{"preview", "mainnet"}) {
-            var bad = new AppConfig.ConvertConfiguration(true, BigInteger.ZERO, BigInteger.valueOf(-1L));
+            var bad = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(-1L));
             assertThrows(IllegalStateException.class,
-                    () -> new ConvertEconomics(bad, network(net)).announceAndGuard(),
+                    () -> new ConvertEconomics(bad, liquidation(BigInteger.ZERO), network(net))
+                            .announceAndGuard(),
                     "a negative cost of doing work is a typo, not a bound an operator can state");
 
-            var unset = new AppConfig.ConvertConfiguration(true, BigInteger.ZERO, null);
+            var unset = new AppConfig.ConvertConfiguration(true, null);
             assertThrows(IllegalStateException.class,
-                    () -> new ConvertEconomics(unset, network(net)).announceAndGuard());
+                    () -> new ConvertEconomics(unset, liquidation(BigInteger.ZERO), network(net))
+                            .announceAndGuard());
         }
     }
 
@@ -289,7 +312,11 @@ class ConvertEconomicsTest {
      */
     @Test
     void aNegativeMarginIsHonouredOnEveryNetworkAndAnnouncedLoudlyOnMainnet() {
-        var negative = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(-1L));
+        // ⚑ The negative margin now lives in the SHARED liquidation configuration; the convert block
+        // holds only the DEX cost floor, which must stay valid or the guard throws for a different
+        // reason and this test would pass on the wrong exception.
+        var convert = new AppConfig.ConvertConfiguration(true, BigInteger.ZERO);
+        var negative = liquidation(BigInteger.valueOf(-1L));
         var logger = (ch.qos.logback.classic.Logger)
                 org.slf4j.LoggerFactory.getLogger(ConvertEconomics.class);
         var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
@@ -298,10 +325,10 @@ class ConvertEconomicsTest {
         try {
             // None of these may throw: an unrecognised network is treated as mainnet for the LOUDER
             // line, not for a refusal.
-            new ConvertEconomics(negative, network("mainnet")).announceAndGuard();
-            new ConvertEconomics(negative, network("sanchonet")).announceAndGuard();
-            new ConvertEconomics(negative, null).announceAndGuard();
-            new ConvertEconomics(negative, network("preview")).announceAndGuard();
+            new ConvertEconomics(convert, negative, network("mainnet")).announceAndGuard();
+            new ConvertEconomics(convert, negative, network("sanchonet")).announceAndGuard();
+            new ConvertEconomics(convert, negative, null).announceAndGuard();
+            new ConvertEconomics(convert, negative, network("preview")).announceAndGuard();
         } finally {
             logger.detachAppender(appender);
         }
@@ -321,28 +348,40 @@ class ConvertEconomicsTest {
      * class. Every construction path that is not Spring's must agree with what the shipped
      * configuration says, or the effective default silently differs from the documented one.
      *
-     * <p>⛔ <b>THE ARMING DEFAULT WAS REVERSED ON 2026-09-09, and the earlier ruling is recorded here
-     * rather than erased.</b> This test previously asserted <i>"convert defaults ON per Giovanni's
-     * ruling"</i>. It now ships OFF, under the later standing rule that every mode is exposed to the
-     * chart user and documented but <b>none ships armed</b> — the same rule that put
-     * {@code scheduling.transaction-processor.enabled} at false. <b>Convert spends the bot's own ada
-     * on a batcher fee and an order's min-ada, so on-by-default was the wrong way round.</b>
+     * <p>⚑ <b>THE ARMING DEFAULT WENT FALSE ON 2026-09-09 AND CAME BACK TRUE ON 2026-09-10. Both
+     * moves are recorded here rather than erased</b>, because the file otherwise reads as though the
+     * reversal never happened. The 09-09 flip applied the standing "every mode is exposed and
+     * documented, none ships armed" rule — the same rule that put
+     * {@code scheduling.transaction-processor.enabled} at false. Giovanni took it back the next day,
+     * first-hand: <i>"convert should remain but under liquidation and be enabled by default. there is
+     * a case we want to disable conversions. so please if delete put it back."</i> <b>Convert is the
+     * documented exception to that rule</b>, and the reason is the one in this class's javadoc: the
+     * bot fronts no capital here, so the failure mode is a no-op rather than a loss.
      *
-     * <p>⚠ <b>CONSEQUENCE, and it is the reason to read this paragraph:</b> a mainnet deployment must
-     * now set {@code LOANS_LIQUIDATION_CONVERT_ENABLED=true} explicitly and the chart must pass it,
-     * or the next image runs with convert silently off. <b>If that trade is not what was intended,
-     * this is the line to revisit — the two rulings genuinely conflict and the later one was taken.</b>
+     * <p>⚠ <b>What did NOT come back is the convert margin.</b>
+     * {@code loans.liquidation.convert.profit-margin-lovelace} stays deleted, merged into the shared
+     * {@code loans.liquidation.profit-margin-lovelace}, which {@code LiquidationConfiguration} owns
+     * and tests. Two fields are left in this block and this test pins both.
      */
     @Test
     void theDefaultsLiveOnTheFieldsNotOnlyInTheAnnotation() {
         var fresh = new AppConfig.ConvertConfiguration();
 
-        assertFalse(fresh.isEnabled(), "convert must ship DISARMED: application.yaml states "
-                + "enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:false}, and a field left true would "
-                + "make every non-Spring construction disagree with it — armed where the shipped "
-                + "configuration says disarmed is the worst direction for that disagreement");
-        assertEquals(BigInteger.ZERO, fresh.getProfitMarginLovelace());
+        assertTrue(fresh.isEnabled(), "convert ships ARMED: application.yaml states "
+                + "enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:true}, and a field left false would "
+                + "make every non-Spring construction disagree with it — a gate that silently "
+                + "refuses everything is the worst direction for that disagreement, because it "
+                + "presents as a quiet market");
         assertEquals(BigInteger.valueOf(5_000_000L), fresh.getDexCostFloorLovelace(),
                 "the conservative end of Giovanni's \"4 ada or 5 ada\"");
+        // ⛔ THE SHARED MARGIN'S FIELD DEFAULT, pinned here because convert now depends on it.
+        // ConvertEconomics.assess does net.compareTo(floor) unguarded; a null floor NPEs. The convert
+        // margin this replaced carried its own field default and this class asserted it — the merge
+        // moved the read and would otherwise have left the invariant unenforced for the number
+        // convert relies on.
+        assertEquals(BigInteger.valueOf(1_500_000L),
+                new AppConfig.LiquidationConfiguration().getProfitMarginLovelace(),
+                "the shared margin must have a FIELD default matching its annotation, or a non-Spring "
+                        + "construction hands convert a null floor");
     }
 }

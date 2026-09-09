@@ -98,18 +98,22 @@ class MainnetConvertCandidateTest {
      */
     @Test
     void atTheShippedDefaultsThisCandidateIsRefusedAndTheOperatorMustStateALossToTakeIt() {
-        // ⚠ ARMED EXPLICITLY. Convert ships DISARMED as of 2026-09-09, and this test is about the
-        // MARGIN gate — a candidate refused because the mechanism is off would assert nothing about
-        // the economics it exists to pin, while still reading green.
-        var shipped = new AppConfig.ConvertConfiguration(
-                true, BigInteger.ZERO, BigInteger.valueOf(5_000_000L));
+        // ⚠ ARMED EXPLICITLY, though the shipped default is now true again (2026-09-10). This test is
+        // about the MARGIN gate — a candidate refused because the mechanism is off would assert
+        // nothing about the economics it exists to pin, while still reading green, so the flag is
+        // stated rather than inherited.
+        // ⚑ The margin no longer comes from this block: it is the SHARED
+        // loans.liquidation.profit-margin-lovelace, stated at 0 below so this test measures the same
+        // gate it always did — the shipped 5 ada would refuse this candidate on the margin before the
+        // outlay arithmetic could say anything.
+        var shipped = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(5_000_000L));
         var network = new AppConfig.Network();
         ReflectionTestUtils.setField(network, "network", "mainnet");
 
         BigInteger collateral = BigInteger.valueOf(100_000_000L);
         BigInteger txFee = BigInteger.valueOf(500_000L);      // generous; the floor governs regardless
 
-        ConvertAssessment a = new ConvertEconomics(shipped, network)
+        ConvertAssessment a = new ConvertEconomics(shipped, liquidation(BigInteger.ZERO), network)
                 .assess(true, collateral, 50L, false, poolImpliedPrice(), txFee);
 
         assertEquals(BigInteger.valueOf(5_000_000L), a.liquidationFee(),
@@ -127,11 +131,19 @@ class MainnetConvertCandidateTest {
         assertEquals(BigInteger.valueOf(-3_886_096L), a.net());
 
         // And the number an operator would have to state to take it anyway — legal on mainnet since
-        // findings §31, and announced loudly at boot when they do.
-        var atALoss = new AppConfig.ConvertConfiguration(true, BigInteger.valueOf(-3_886_096L));
-        assertTrue(new ConvertEconomics(atALoss, network)
+        // findings §31, and announced loudly at boot when they do. ⚠ It is now the SHARED margin, so
+        // stating it here states it for every other liquidation mode as well: that is the trade the
+        // one-knob merge makes, and it belongs in the test that shows the number being stated.
+        var atALoss = liquidation(BigInteger.valueOf(-3_886_096L));
+        assertTrue(new ConvertEconomics(shipped, atALoss, network)
                         .assess(true, collateral, 50L, false, poolImpliedPrice(), txFee).approved(),
                 "a stated floor at exactly the net must ACCEPT it: the margin is inclusive, and an "
                         + "operator cleaning up a loan nobody will profitably touch is the point");
+    }
+
+    /** The shared margin — {@code loans.liquidation.profit-margin-lovelace} — and nothing else. */
+    private static AppConfig.LiquidationConfiguration liquidation(BigInteger margin) {
+        return new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, margin, 200, 30);
     }
 }

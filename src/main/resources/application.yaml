@@ -331,15 +331,30 @@ loans:
     # No coordinates on mainnet: lending is disabled there, and a stale coordinate is worse than an
     # absent one — LoansReferenceScriptVerifier hard-fails on a hash that does not match.
     convert:
-      # ⛔ OFF UNLESS ARMED. The convert path creates a Minswap order and spends the bot's own ada
-      # on the batcher fee and the order's min-ada; it is a money path, so it ships disabled.
-      # ⚠ A MAINNET DEPLOYMENT MUST SET THIS TO "true" EXPLICITLY, and the chart must pass it, or
-      # the node runs with convert silently off. Changed from an on-by-default inline value on
-      # 2026-09-09: every mode is exposed and documented, and none ships armed.
-      enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:false}
-      # What feeValue - (txFee + orderAda) must reach. 0 refuses every net loss, allows break-even.
-      profit-margin-lovelace: ${LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE:0}
-      # The operator's stated cost of a DEX interaction: a max() against the measured cost, never a sum.
+      # ⚑ NO MARGIN KEY HERE since 2026-09-09. `profit-margin-lovelace` is GONE -- Giovanni's ruling:
+      # "for me convert is a liquidation and profitMarginLovelace is literally the same as
+      # liquidation ... it's just one knob, the additional protection is the market specification
+      # where we can enable/override convert w/ anticipate". The margin convert answers to is the
+      # SHARED profit-margin-lovelace above, the same number every other mode uses.
+      # ⚠ Passing LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE now sets nothing and warns
+      # nowhere (catalogue §6.7).
+      #
+      # ⚑ THE GLOBAL SWITCH, and it defaults ON -- the one arming flag in this file that does.
+      # Restored 2026-09-10 after a day at false: "convert should remain but under liquidation and be
+      # enabled by default. there is a case we want to disable conversions." It is defensible here
+      # and nowhere else: the bot fronts no capital on this path and an order that never fills
+      # returns the collateral to the lender, so the failure mode is a no-op, not a loss.
+      #
+      # TWO CONTROLS, AND THEY COMPOSE IN THIS ORDER:
+      #   1. this flag false => NO converts anywhere, whatever any market says;
+      #   2. this flag true  => each market's `markets[]` entry decides -- action: ANTICIPATE to
+      #      front capital instead, mode: DISABLED to sit that market out. NO markets listed =>
+      #      every market converts.
+      # It is still subject to liquidation `mode` above, like everything else on this path.
+      enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:true}
+      # The operator's stated cost of a DEX interaction: a max() against the measured cost, never a
+      # sum. NOT a margin -- it says what the work COSTS, not what the operator will accept to lose,
+      # which is why the merge above left it standing. Negative or unset throws at startup.
       dex-cost-floor-lovelace: ${LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE:5000000}
 
     reference-scripts:
@@ -462,10 +477,13 @@ loans:
 
   liquidation:
     convert:
-      # ⛔ Minswap V2 has no preview deployment, so a convert cannot be built here at all. Off, and
-      # the two amounts stated so every key exists on every profile (§57.12).
-      enabled: false
-      profit-margin-lovelace: 0
+      # ⛔ Minswap V2 has no preview deployment, so a convert cannot be built here at all -- the blank
+      # minswap pool-address below is what makes the path SKIP, and that is the honest reason.
+      # ⚠ So this stays TRUE, matching the mainnet default: turning it off here would state a SECOND
+      # reason to be off and hide the first one, and a preview node that then acquired a pool address
+      # would be silently disabled by a line nobody remembered.
+      # Both keys are stated explicitly so every key exists on every profile (§57.12).
+      enabled: true
       dex-cost-floor-lovelace: 5000000
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
     # Six of the seven, verified on chain: each of these UTxOs publishes a reference_script_hash

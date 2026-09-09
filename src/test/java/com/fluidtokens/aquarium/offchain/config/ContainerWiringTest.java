@@ -107,9 +107,16 @@ class ContainerWiringTest {
                         new AppConfig.LiquidationConfiguration(
                                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
                                 java.math.BigInteger.ZERO, 200, 30))
+                // ⚑ 2026-09-09: ConvertEconomics now takes the LiquidationConfiguration too — the
+                // convert margin was merged into the shared loans.liquidation.profit-margin-lovelace.
+                // Same lesson as the line above: the constructor grew and this runner is what says so.
                 .withBean(com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics.class,
                         () -> new com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics(
-                                new AppConfig.ConvertConfiguration(), network))
+                                new AppConfig.ConvertConfiguration(),
+                                new AppConfig.LiquidationConfiguration(
+                                        AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
+                                        java.math.BigInteger.ZERO, 200, 30),
+                                network))
                 .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
                         () -> org.cardanofoundation.conversions.ClasspathConversionsFactory
                                 .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW));
@@ -205,9 +212,16 @@ class ContainerWiringTest {
                         new AppConfig.LiquidationConfiguration(
                                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
                                 java.math.BigInteger.ZERO, 200, 30))
+                // ⚑ 2026-09-09: ConvertEconomics now takes the LiquidationConfiguration too — the
+                // convert margin was merged into the shared loans.liquidation.profit-margin-lovelace.
+                // Same lesson as the line above: the constructor grew and this runner is what says so.
                 .withBean(com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics.class,
                         () -> new com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics(
-                                new AppConfig.ConvertConfiguration(), network))
+                                new AppConfig.ConvertConfiguration(),
+                                new AppConfig.LiquidationConfiguration(
+                                        AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
+                                        java.math.BigInteger.ZERO, 200, 30),
+                                network))
                 .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
                         () -> org.cardanofoundation.conversions.ClasspathConversionsFactory
                                 .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW))

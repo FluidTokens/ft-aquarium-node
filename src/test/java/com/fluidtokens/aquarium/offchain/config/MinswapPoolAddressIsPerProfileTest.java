@@ -74,9 +74,12 @@ class MinswapPoolAddressIsPerProfileTest {
             assertEquals("${" + e.getValue() + "}", f.getAnnotation(Value.class).value(),
                     e.getKey() + " must carry no inline default at all");
         }
+        // ⚑ TWO KEYS LEFT (2026-09-09). `profitMarginLovelace` was DELETED, not re-pointed: the
+        // margin convert answers to is the shared loans.liquidation.profit-margin-lovelace. Both
+        // survivors keep the same no-inline-default rule, because the reason for it did not change —
+        // convert is a money path.
         for (var e : java.util.Map.of(
                 "enabled", "loans.liquidation.convert.enabled",
-                "profitMarginLovelace", "loans.liquidation.convert.profit-margin-lovelace",
                 "dexCostFloorLovelace", "loans.liquidation.convert.dex-cost-floor-lovelace").entrySet()) {
             Field f = AppConfig.ConvertConfiguration.class.getDeclaredField(e.getKey());
             assertEquals("${" + e.getValue() + "}", f.getAnnotation(Value.class).value(),
@@ -86,14 +89,86 @@ class MinswapPoolAddressIsPerProfileTest {
 
         String yaml = Files.readString(YAML);
         int preview = yaml.indexOf("on-profile: preview");
-        // ⛔ THE ARMING DEFAULT. Exposed, documented, and OFF.
+        // ⛔ THE ARMING DEFAULT. Exposed, documented, and ON — the documented exception to "nothing
+        // ships armed", restored 2026-09-10 after a day at false: "convert should remain but under
+        // liquidation and be enabled by default. there is a case we want to disable conversions."
         assertTrue(yaml.substring(0, preview)
-                        .contains("enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:false}"),
-                "convert must ship DISABLED on mainnet and be armed explicitly; an on-by-default "
-                        + "money path is the wrong way round, whatever else gates it");
-        assertTrue(yaml.indexOf("enabled: false", preview) > preview,
-                "the preview document must state convert disabled — Minswap V2 has no preview "
-                        + "deployment, so a convert cannot be built there at all");
+                        .contains("enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:true}"),
+                "convert must ship ARMED on mainnet with its env override intact; the case for "
+                        + "disabling conversions is what the key exists for, not what it defaults to");
+        // ⛔ PARSED, not positional. `yaml.indexOf("enabled: true", preview)` matched ANY later
+        // `enabled: true` — including an unrelated key's — so it passed with the convert flag set to
+        // false. It read as the strongest line here and exercised nothing.
+        for (Object document : new org.yaml.snakeyaml.Yaml().loadAll(yaml)) {
+            java.util.Map<?, ?> convert = convertBlock(document);
+            if (convert == null || !isPreview(document)) {
+                continue;
+            }
+            assertEquals(Boolean.TRUE, convert.get("enabled"),
+                    "the preview document must state the convert flag, and state it TRUE: a document "
+                            + "that omits a no-default key does not start, and preview is prevented "
+                            + "from converting by the blank Minswap pool address — one honest reason, "
+                            + "not two");
+        }
+
+        // ⛔ AND THE COST FLOOR MUST BE STATED IN BOTH DOCUMENTS, for the same reason.
+        assertTrue(yaml.substring(0, preview)
+                        .contains("dex-cost-floor-lovelace: ${LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE:5000000}"),
+                "the mainnet document must declare the DEX cost floor with its env override");
+        assertTrue(yaml.indexOf("dex-cost-floor-lovelace: 5000000", preview) > preview,
+                "the preview document must state the DEX cost floor as a literal — every key exists "
+                        + "on every profile, or the profile that omits it fails to start");
+
+        // ⛔ THE DELETED KEY MUST NOT COME BACK, in either document. A chart still passing
+        // LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE sets nothing and warns nowhere
+        // (catalogue §6.7); a yaml key resurrected under the same name would look like it works.
+        //
+        // ⚠ PARSED, not grepped. The convert block's COMMENT names the dead env var on purpose — so
+        // an operator reading the file learns it is dead — and a text search cannot tell a warning
+        // about a key from the key itself. Only the parsed key set can.
+        for (Object document : new org.yaml.snakeyaml.Yaml().loadAll(yaml)) {
+            java.util.Map<?, ?> convert = convertBlock(document);
+            if (convert == null) {
+                continue;
+            }
+            assertEquals(java.util.Set.of("enabled", "dex-cost-floor-lovelace"),
+                    new java.util.LinkedHashSet<>(convert.keySet()),
+                    "the convert block holds exactly the global switch and the DEX cost floor. "
+                            + "profit-margin-lovelace was deleted on 2026-09-09 — the margin is the "
+                            + "shared loans.liquidation.profit-margin-lovelace, for every mode — and "
+                            + "a new key here is a knob nothing documents");
+        }
+    }
+
+    /** {@code loans.liquidation.convert} in one yaml document, or {@code null} if it has none. */
+    @SuppressWarnings("unchecked")
+    /** True for the {@code on-profile: preview} document only. */
+    private static boolean isPreview(Object document) {
+        if (!(document instanceof java.util.Map<?, ?> m)) {
+            return false;
+        }
+        Object spring = m.get("spring");
+        if (!(spring instanceof java.util.Map<?, ?> sm)) {
+            return false;
+        }
+        Object config = sm.get("config");
+        if (!(config instanceof java.util.Map<?, ?> cm)) {
+            return false;
+        }
+        Object activate = cm.get("activate");
+        return activate instanceof java.util.Map<?, ?> am
+                && "preview".equals(am.get("on-profile"));
+    }
+
+    private static java.util.Map<?, ?> convertBlock(Object document) {
+        Object cursor = document;
+        for (String segment : new String[]{"loans", "liquidation", "convert"}) {
+            if (!(cursor instanceof java.util.Map<?, ?> map) || !map.containsKey(segment)) {
+                return null;
+            }
+            cursor = map.get(segment);
+        }
+        return (java.util.Map<Object, Object>) cursor;
     }
 
     @Test

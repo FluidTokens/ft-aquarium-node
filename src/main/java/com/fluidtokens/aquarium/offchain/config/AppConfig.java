@@ -373,9 +373,24 @@ public class AppConfig {
         @Value("${loans.liquidation.oracle-window-margin-seconds:30}")
         private long oracleWindowMarginSeconds;
 
-        /** The lovelace a liquidation must clear over its own tx fee before it is worth doing. */
+        /**
+         * The lovelace a liquidation must clear over its own tx fee before it is worth doing.
+         *
+         * <p>⛔ <b>The field default is not decoration.</b> Since 2026-09-10 this ONE margin gates
+         * convert as well, and {@code ConvertEconomics.assess} does {@code net.compareTo(floor)}
+         * unguarded — so a bare {@code new LiquidationConfiguration()} with a null here NPEs. The
+         * convert margin it replaced carried {@code = BigInteger.ZERO} on its own field for exactly
+         * this reason; the merge must not lose that (§26.2 — a {@code @Value} default is not a
+         * default of the class).
+         *
+         * <p>⚠ <b>KNOWN AND PRE-EXISTING: this annotation says 1,500,000 while
+         * {@code application.yaml} ships 5,000,000.</b> A Spring-bound node always reads the yaml, so
+         * the shipped default IS 5 ada — but any non-Spring construction reads 1.5, and that number
+         * now governs convert too. <b>Not changed here because this slice's invariant was that the
+         * code default is untouched; it wants one deliberate fix, not a silent one.</b>
+         */
         @Value("${loans.liquidation.profit-margin-lovelace:1500000}")
-        private BigInteger profitMarginLovelace;
+        private BigInteger profitMarginLovelace = BigInteger.valueOf(1_500_000L);
 
         /**
          * Whether the profitability floors run at all. {@code false} is the operator's "liquidate
@@ -989,12 +1004,23 @@ public class AppConfig {
      * swap order inside the liquidation transaction, so the collateral is converted to the principal
      * and lands in the lender's asset manager (findings §25).
      *
-     * <p>⚑ <b>Its own block, and its own margin key, for the reason {@link CompoundConfiguration}
-     * gives:</b> convert and pay-in-advance share the word "liquidation" and almost nothing else.
-     * Pay-in-advance fronts the whole principal and is bounded by {@code MarketGate}'s per-market cap;
-     * convert fronts nothing and its outlay is a transaction fee plus, for a token collateral, the
-     * 2.8 ada the validator makes the order output carry. A shared margin would let a number reasoned
-     * about for one silently govern the other.
+     * <p>⚑ <b>NO MARGIN OF ITS OWN SINCE 2026-09-09.</b> Giovanni's ruling: <i>"for me convert is a
+     * liquidation and profitMarginLovelace is literally the same as liquidation. can we get rid of
+     * convert and merge into liquidation? … it's just one knob, the additional protection is the
+     * market specification where we can enable/override convert w/ anticipate or whatever that
+     * is."</i> So the margin every mode answers to — convert included — is
+     * {@link LiquidationConfiguration#profitMarginLovelace}, one number an operator sets once.
+     *
+     * <p><b>Two things survive here, and neither is a margin.</b> {@link #enabled} is the global
+     * on/off for the mechanism, kept on Giovanni's follow-up ruling of 2026-09-10 — <i>"convert should
+     * remain but under liquidation and be enabled by default. there is a case we want to disable
+     * conversions"</i> — and {@link #dexCostFloorLovelace} states what one DEX interaction
+     * <em>costs</em>, not how much the operator is willing to lose.
+     *
+     * <p><b>How the two controls compose:</b> {@link #enabled} {@code false} means no convert
+     * anywhere, whatever any market says; with it {@code true}, each market's
+     * {@code loans.liquidation.markets[]} entry decides — {@code action: ANTICIPATE} to front capital
+     * instead, {@code mode: DISABLED} to sit that market out, and an unlisted market converts.
      */
     @Component
     @Getter
@@ -1002,65 +1028,37 @@ public class AppConfig {
     public static class ConvertConfiguration {
 
         /**
-         * ⚑ <b>Default {@code true} — the one arming flag in this codebase that defaults ON</b>, on
-         * Giovanni's first-hand ruling (2026-09-03): <i>"with the convert path, liquidation by
-         * minswap/conversion should always be enabled by default, additional configuration can be
-         * provided to disable a market OR to force anticipate instead of convert."</i>
+         * The Minswap conversion mechanism, globally. <b>Default {@code true}</b>, and it is the one
+         * arming flag in this codebase that defaults ON.
          *
-         * <p>That does not weaken the defensive-defaults rule, it applies it. The bot fronts no
-         * capital on this path and holds nothing: FluidTokens confirmed that an order which does not
-         * fill returns the original collateral to the asset manager for the lender to reclaim, and the
-         * bot's fee is taken before the swap either way. <b>Its failure mode is a no-op, not a
-         * loss</b> — unlike pay-in-advance, which is the capital-hungry path and stays opt-in behind a
-         * per-market cap.
+         * <p>⚑ <b>Flipped to {@code false} on 2026-09-09 and RESTORED to {@code true} on 2026-09-10.
+         * The reversal is recorded rather than erased</b>, because both rulings are Giovanni's and the
+         * later one wins. The 09-09 flip applied the standing "nothing ships armed" rule; the 09-10
+         * ruling took it back with the reason: <i>"convert should remain but under liquidation and be
+         * enabled by default. there is a case we want to disable conversions. so please if delete put
+         * it back."</i>
+         *
+         * <p>Default-ON is defensible on this path specifically, and the reason is measured, not
+         * assumed: the bot fronts no capital and holds nothing. FluidTokens confirmed that an order
+         * which does not fill returns the original collateral to the asset manager for the lender to
+         * reclaim, and the bot's fee is taken before the swap either way. <b>Its failure mode is a
+         * no-op, not a loss</b> — unlike pay-in-advance, which is the capital-hungry path and stays
+         * opt-in behind a per-market cap.
          *
          * <p>And "on by default" is on only for a node whose operator has already armed liquidation:
-         * {@code loans.liquidation.mode} and
-         * {@code loans.submittable-network} all still apply, ahead of this. This flag turns the
-         * mechanism off globally; {@code loans.liquidation.markets} turns it off per market.
-         */
-        /**
-         * ⛔ <b>DEFAULT FALSE since 2026-09-09, and the previous {@code true} was the wrong way round
-         * on a path that spends.</b> Giovanni's standing rule for this node: every mode and parameter
-         * is EXPOSED to the chart user and documented, and ships with a SAFE default — never armed.
+         * {@code loans.liquidation.mode} still applies ahead of this. <b>This flag turns the mechanism
+         * off globally; {@code loans.liquidation.markets} turns it off, or swaps it for
+         * {@code ANTICIPATE}, per market.</b> The two compose in that order — global off means no
+         * converts anywhere, whatever a market entry says.
          *
-         * <p>⚠ <b>CONSEQUENCE: a mainnet deployment must now set
-         * {@code LOANS_LIQUIDATION_CONVERT_ENABLED=true} explicitly, and the chart must pass it,
-         * or the next image runs with convert silently off.</b>
-         *
-         * <p>⚠ <b>No default at all, not an empty one.</b> {@code ${key:}} binds the empty STRING,
+         * <p>⚠ <b>No inline default, not an empty one.</b> {@code ${key:}} binds the empty STRING,
          * which cannot convert to a boolean — so the safe-looking form would fail at startup with a
          * conversion error instead of a missing-key error. The no-default form says what is meant:
          * <b>application.yaml must state this, and a node whose configuration omits it does not
-         * boot.</b> Same reasoning for the two amounts below and for {@code loans.config.asset-name}.
+         * boot.</b> Same reasoning for the amount below and for {@code loans.config.asset-name}.
          */
         @Value("${loans.liquidation.convert.enabled}")
-        private boolean enabled = false;
-
-        /**
-         * What {@code feeValueLovelace - (txFee + orderAda)} must reach for a convert to be built.
-         *
-         * <p><b>Default {@code 0} refuses every net loss</b> while allowing exact break-even, matching
-         * the compound floor and for the same reason: this path advances no principal and carries no
-         * position, so demanding the liquidation path's 1_500_000 premium would refuse sound work.
-         * It is also what refuses a bond with {@code liquidationFeePerMille = 0} out of the box — such
-         * a bond pays nothing, so the net is exactly minus the outlay.
-         *
-         * <p>⚠ <b>This is also the operator's lever on a modelling risk</b>, not only on margin. The
-         * income side is the collateral-denominated fee valued at the oracle price — real, but held in
-         * tokens and unrealised. An operator who doubts the price, or the liquidity behind it, raises
-         * this until they are paid enough ada-equivalent to be worth the exposure. See
-         * {@code ConvertEconomics}.
-         *
-         * <p>A negative value is a number the operator STATES rather than a protection they switch
-         * off — and it is <b>honoured on every network, mainnet included</b> (Giovanni, 2026-09-03:
-         * <i>"operating at a loss MUST be implemented even on mainnet"</i>). The bot is a
-         * protocol-health tool and a stated-loss convert that clears a loan nobody else will touch is
-         * the point. What protects an operator is this default of 0, which no copy-paste can turn
-         * negative; a node that does state a negative announces it loudly at boot.
-         */
-        @Value("${loans.liquidation.convert.profit-margin-lovelace}")
-        private BigInteger profitMarginLovelace = BigInteger.ZERO;
+        private boolean enabled = true;
 
         /**
          * ⛔ <b>The floor under what one DEX interaction is assumed to cost the operator, in
@@ -1082,8 +1080,11 @@ public class AppConfig {
          * false attribution. A floor captures Giovanni's conservatism <b>without asserting who pays
          * what</b>, which is the honest instrument for a cost whose incidence is genuinely split.
          *
-         * <p>It is separable from {@link #profitMarginLovelace} and cannot contradict it: this one says
-         * what the interaction costs, that one says how far above break-even the operator wants to be.
+         * <p>⚑ <b>THIS IS WHY IT SURVIVED THE MERGE OF 2026-09-09 while the convert margin did not.</b>
+         * It is separable from {@link LiquidationConfiguration#profitMarginLovelace} and cannot
+         * contradict it: this one says what the interaction <em>costs</em>, that one says how far above
+         * break-even the operator wants to be. A cost input is not a second margin, so folding it into
+         * the shared knob would have merged two different questions rather than one duplicated answer.
          *
          * <p>Refused at startup when negative, on any network — a negative cost floor is not a bound an
          * operator can meaningfully state, it is a typo.
@@ -1092,15 +1093,18 @@ public class AppConfig {
         private BigInteger dexCostFloorLovelace = BigInteger.valueOf(5_000_000L);
 
         /** Test seam: {@code @Value} owns these in production. */
-        public ConvertConfiguration(boolean enabled, BigInteger profitMarginLovelace) {
-            this(enabled, profitMarginLovelace, BigInteger.valueOf(5_000_000L));
+        public ConvertConfiguration(boolean enabled) {
+            this(enabled, BigInteger.valueOf(5_000_000L));
         }
 
-        /** Test seam: {@code @Value} owns these in production. */
-        public ConvertConfiguration(boolean enabled, BigInteger profitMarginLovelace,
-                                    BigInteger dexCostFloorLovelace) {
+        /**
+         * Test seam: {@code @Value} owns these in production. <b>There is no margin argument</b> — the
+         * convert margin was merged into {@link LiquidationConfiguration#profitMarginLovelace} on
+         * 2026-09-09, and a constructor that still took one would let a test express a distinction the
+         * app no longer has.
+         */
+        public ConvertConfiguration(boolean enabled, BigInteger dexCostFloorLovelace) {
             this.enabled = enabled;
-            this.profitMarginLovelace = profitMarginLovelace;
             this.dexCostFloorLovelace = dexCostFloorLovelace;
         }
     }
