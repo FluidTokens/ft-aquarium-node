@@ -35,7 +35,12 @@ services:
       timeout: 5s
       retries: 5
     environment:
-      - JAVA_OPTS="-Xms256m -Xmx512m"
+      # NOT JAVA_OPTS. The image entrypoint is a bare ["java","-jar","app.jar"] with no shell, so
+      # nothing ever expands $JAVA_OPTS and any value set there is silently ignored -- as the old
+      # line here was, quotes included, for the life of this file. JAVA_TOOL_OPTIONS is read by the
+      # JVM itself, so it works without the entrypoint's cooperation. Prefer a percentage over a
+      # fixed -Xmx so the heap tracks the container limit instead of contradicting it.
+      - JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75
       - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE}
       - DB_DRIVER=${DB_DRIVER}
       - DB_DIALECT=${DB_DIALECT}

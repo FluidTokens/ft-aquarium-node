@@ -1,0 +1,75 @@
+package com.fluidtokens.aquarium.offchain.model.loans;
+
+import java.math.BigInteger;
+
+/**
+ * The arithmetic behind one LiquidateAndConvert decision, kept whole so a log line or an operator
+ * can see the numbers that produced it rather than only the verdict.
+ *
+ * <p>⚠ <b>Two of these fields are in different currencies and that is the whole point.</b>
+ * {@link #liquidationFee} is a quantity of the <em>collateral</em> asset; every other figure is
+ * lovelace. {@link #feeValueLovelace} is the bridge between them and it is an <b>oracle valuation of
+ * an unrealised position</b>, not cash received. A reader who forgets that will read
+ * {@link #net} as realised profit, which it is not.
+ *
+ * @param approved         whether the candidate clears the operator's stated floor
+ * @param exclusion        why not, or {@code null} when approved
+ * @param liquidationFee   {@code loanCollateralAmount * liquidationFeePerMille / 1000}, floored —
+ *                         <b>in the collateral asset</b>, the residue the validator leaves
+ *                         unconstrained and the builder pays to the bot (findings §25.3)
+ * @param feeValueLovelace {@link #liquidationFee} at the collateral oracle price, floored;
+ *                         income the bot holds in tokens, not ada
+ * @param txFee            the measured fee of the built transaction, in lovelace
+ * @param orderAdaFunded   {@code loans.liquidation.convert.minswap-order-cost-lovelace} — what THIS
+ *                         conversion SPENDS on the Minswap order, in both collateral kinds since
+ *                         {@code db5069e}, and default {@code 4_000_000}. That ada leaves with the
+ *                         order. <b>Not</b> what the order must carry — that is
+ *                         {@code ConvertEconomics.MINSWAP_ORDER_OVERHEAD}, a separate,
+ *                         non-configurable validator literal the builder always sends and this
+ *                         field can only ever equal or exceed (the gate refuses a lower configured
+ *                         value at startup)
+ * @param measuredOutlay   {@code txFee + orderAdaFunded} — the ada this transaction demonstrably costs
+ * @param dexCostFloor     {@code loans.liquidation.convert.dex-cost-floor-lovelace}: the operator's
+ *                         stated minimum cost of one DEX interaction, covering the batcher fee whose
+ *                         incidence the measurement cannot attribute
+ * @param outlay           {@code max(measuredOutlay, dexCostFloor)} — what the gate charges
+ * @param net              {@code feeValueLovelace - outlay}
+ * @param floor            {@code loans.liquidation.profit-margin-lovelace} — the SHARED margin.
+ *                         The convert path had its own until 2026-09-10; one knob now gates every
+ *                         mode, on Giovanni's ruling that "convert is a liquidation".
+ */
+public record ConvertAssessment(boolean approved,
+                                ConvertExclusion exclusion,
+                                BigInteger liquidationFee,
+                                BigInteger feeValueLovelace,
+                                BigInteger txFee,
+                                BigInteger orderAdaFunded,
+                                BigInteger measuredOutlay,
+                                BigInteger dexCostFloor,
+                                BigInteger outlay,
+                                BigInteger net,
+                                BigInteger floor) {
+
+    public static ConvertAssessment refused(ConvertExclusion why) {
+        return new ConvertAssessment(false, why, null, null, null, null, null, null, null, null, null);
+    }
+
+    /**
+     * True when the lender set no liquidation fee, so this work pays the bot nothing at all. Not a
+     * refusal in itself — {@link ConvertExclusion#NET_BELOW_FLOOR} is what refuses it — but worth
+     * saying out loud in a decision log, because the operator can only ever authorise it by stating
+     * a negative floor.
+     */
+    /**
+     * True when the operator's stated DEX-cost floor, not this transaction's measured cost, is what the
+     * gate charged. Worth showing in a decision log: it tells an operator that lowering the floor —
+     * not the transaction — is the lever on this refusal.
+     */
+    public boolean boundByDexCostFloor() {
+        return outlay != null && measuredOutlay != null && outlay.compareTo(measuredOutlay) > 0;
+    }
+
+    public boolean zeroFeeBond() {
+        return liquidationFee != null && liquidationFee.signum() == 0;
+    }
+}

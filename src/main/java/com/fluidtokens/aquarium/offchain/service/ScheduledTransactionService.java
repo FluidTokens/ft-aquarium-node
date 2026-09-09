@@ -4,8 +4,15 @@ import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
+import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
+import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptSafeUtxoSelection;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
+import java.util.Comparator;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
+import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
@@ -34,9 +41,30 @@ import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 import static com.fluidtokens.aquarium.offchain.util.UtxoUtil.toUtxo;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+
 import static java.math.BigInteger.ZERO;
 
+/**
+ * ⛔ <b>OFF BY DEFAULT.</b> {@code scheduling.transaction-processor.enabled} must be set to
+ * {@code true} for this service to exist at all — there is no {@code matchIfMissing}, so an operator
+ * who says nothing gets a node that indexes and serves but never builds or submits a transaction.
+ *
+ * <p>⚠ <b>This is a deliberate change of default for an operator-facing image</b>, and it is the
+ * safe direction: the previous behaviour was that pulling the image and starting it began
+ * <em>spending from the configured wallet</em> on the next scheduling tick. Arming is now something
+ * an operator does on purpose. ⇒ An operator upgrading across this change and expecting the
+ * processor to keep running <b>must set the flag</b>; nothing else in the node will complain,
+ * because a quiet processor and a disabled one look identical from outside — which is exactly why
+ * this logs its own absence at startup rather than staying silent.
+ *
+ * <p>The gate is on the BEAN, not on the scheduled method, so a disabled processor costs nothing and
+ * cannot be re-armed by a stray call. Nothing injects this class — its many mentions elsewhere are
+ * javadoc cross-references — so removing it from the context is safe.
+ */
 @Service
+@ConditionalOnProperty(prefix = "scheduling.transaction-processor", name = "enabled",
+        havingValue = "true")
 @RequiredArgsConstructor
 @Slf4j
 public class ScheduledTransactionService {
@@ -56,6 +84,18 @@ public class ScheduledTransactionService {
     private final Account account;
 
     private final QuickTxBuilder quickTxBuilder;
+
+
+    /**
+     * Only used to build the reference-script-safe coin selection; see the guard at compose().
+     * <p>
+     * <b>Deliberately the backend and not the {@code UtxoSupplier} bean.</b> That bean is
+     * {@code @ConditionalOnProperty(loans.enabled=true)}, and this service is the Aquarium tank
+     * subsystem, which runs on mainnet where lending is disabled by default — injecting it here
+     * would have failed startup on exactly the production deployment this repo ships. The backend
+     * is unconditional, and this is the same construction {@code YaciConfig} performs.
+     */
+    private final BFBackendService bfBackendService;
 
     private final UtxoRepository utxoRepository;
 
@@ -84,6 +124,11 @@ public class ScheduledTransactionService {
         return new RefInputIndexes(BigInteger.valueOf(parametersRefInputIndex), BigInteger.valueOf(stakingRefInputIndex));
     }
 
+
+    /** The supplier the selection guard reads through; see the field javadoc for why it is built here. */
+    private UtxoSupplier referenceScriptSafeSupplier() {
+        return new DefaultUtxoSupplier(bfBackendService.getUtxoService());
+    }
 
     @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelayString = "${scheduling.transaction-processor.delay-minutes}")
     public void processPayments() {
@@ -146,14 +191,41 @@ public class ScheduledTransactionService {
                     return;
                 }
 
-                // Ensure to use utxo with just ada
+                // The wallet input must be ada-only, must not carry a reference script, and must
+                // PROVABLY COVER what this transaction can cost (T-053).
+                //
+                // It used to be `findFirst()` with no size floor, which takes an ARBITRARY ada-only
+                // utxo — dust included. That is the shape that starved the liquidation path on a
+                // 1 ADA output on 2026-08-25.
+                //
+                // ⚠ SMALLEST THAT SUFFICES, not largest-first. Largest-first would spend the biggest
+                // utxo to pay a fee and fragment the wallet against the case where a large one is
+                // genuinely needed; Giovanni's own words are "a 5 ada utxo would be perfect". The
+                // requirement is DERIVED from the protocol parameters, never assumed — see
+                // LedgerCeilings, which exists because cardano-client-lib answers this same question
+                // with a hardcoded Amount.ada(5.0).
+                // ⚠ Derived from the BACKEND, not from a ProtocolParamsSupplier bean: that bean is
+                // @ConditionalOnProperty(loans.enabled) and lending is DISABLED ON MAINNET, so
+                // depending on it here would break the context on the one path operators run.
+                var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
+                        .getProtocolParams();
+                var required = LedgerCeilings.maxPossibleFee(protocolParams);
+
                 var walletUtxoOpt = walletUtxos
                         .stream()
                         .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
-                        .findFirst();
+                        .filter(utxo -> LedgerCeilings.lovelaceOf(utxo).compareTo(required) >= 0)
+                        .min(Comparator.comparing(LedgerCeilings::lovelaceOf));
 
                 if (walletUtxoOpt.isEmpty()) {
-                    log.warn("no valid utxos found. please ensure wallet has at least one utxo which contains ONLY ADA");
+                    var largest = walletUtxos.stream()
+                            .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
+                            .map(LedgerCeilings::lovelaceOf)
+                            .max(java.math.BigInteger::compareTo);
+                    log.warn("no ada-only wallet utxo covers the {} lovelace this ledger could charge; "
+                                    + "largest available is {}. Fund the wallet with a single ada-only "
+                                    + "utxo of at least that amount.",
+                            required, largest.map(Object::toString).orElse("none at all"));
                     return;
                 }
 
@@ -192,6 +264,23 @@ public class ScheduledTransactionService {
                         .readFrom(tankContractRefInput);
 
                 quickTxBuilder.compose(tx)
+                        // ⛔ NEVER SPEND A UTxO CARRYING A REFERENCE SCRIPT.
+                        //
+                        // This service reaches coin selection through the SHARED QuickTxBuilder bean
+                        // (YaciConfig), so there is no tx.from(...) here to grep for — the hazard
+                        // arrives by injection and is invisible to a search for the dangerous call.
+                        // That is how it was missed: the two liquidation builders construct their own
+                        // builders and were guarded, and this third site was not.
+                        //
+                        // It spends from the same wallet as the liquidation bot. Nothing with a
+                        // scriptRef is in that wallet today, but a guard whose absence depends on a
+                        // wallet staying empty of a particular UTxO shape is not a guard -- and this
+                        // repo published a reference script to its own address on 2026-08-17 and had
+                        // it consumed by an unguarded builder on 2026-08-25.
+                        .withUtxoSelectionStrategy(
+                                ReferenceScriptSafeUtxoSelection.strategy(referenceScriptSafeSupplier()))
+                        .preBalanceTx((ctx, txn) -> ctx.setUtxoSelector(
+                                ReferenceScriptSafeUtxoSelection.selector(referenceScriptSafeSupplier())))
                         .withSigner(SignerProviders.signerFrom(account))
                         .withSigner(SignerProviders.stakeKeySignerFrom(account))
                         .withRequiredSigners(account.getBaseAddress().getDelegationCredentialHash().get())
@@ -201,6 +290,23 @@ public class ScheduledTransactionService {
                         .collateralPayer(account.baseAddress())
                         .mergeOutputs(false)
                         .ignoreScriptCostEvaluationError(false)
+                        // T-059 — THE ONLY MAINNET PATH NOW ASSERTS ITS OWN STRUCTURE.
+                        //
+                        // Every guarantee the lending-v4 review added lives on the PREVIEW paths;
+                        // this one had none. And `withVerifier` is genuinely reached here because the
+                        // tank submits through completeAndWait() — the one place in that whole arc
+                        // where the obviously-named API is the right one, after three that were not.
+                        //
+                        // ⚠ It COMPOSES (QuickTxBuilder:863-868 uses andThen), unlike preBalanceTx
+                        // above, which is a SETTER whose second call silently discards the first.
+                        // Two hooks on one builder with opposite semantics.
+                        .withVerifier(TankStructureVerifier.of(
+                                tankPaymentUtxo,
+                                parametersRefInput, stakerRefInput,
+                                refInputIndexes.paramsIndex(), refInputIndexes.stakingIndex(),
+                                ZERO,
+                                payeeAddress.getAddress(), amountToSend.getCoin(),
+                                rewardsAddress.getAddress(), reward.getCoin()))
                         .completeAndWait();
 
             } catch (Exception e) {

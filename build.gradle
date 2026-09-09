@@ -11,6 +11,16 @@ java {
 	sourceCompatibility = '21'
 }
 
+// The Dockerfile does `ADD ./build/libs/*.jar /app/app.jar`, and Docker refuses a multi-source ADD
+// to a destination that is not a directory. Spring Boot's plugin otherwise emits TWO artifacts --
+// the executable boot jar and a `-plain` library jar -- so `docker build` fails on a clean tree with
+// "when using ADD with more than one source file, the destination must be a directory". Nothing here
+// consumes the plain jar, so the honest fix is to stop producing it rather than to delete it in a
+// build step somebody has to remember. See docker/README or the Dockerfile comment.
+tasks.named('jar') {
+	enabled = false
+}
+
 repositories {
 	mavenCentral()
 	mavenLocal()
@@ -20,6 +30,11 @@ dependencies {
 
 	implementation 'org.springframework.boot:spring-boot-starter'
 	implementation 'org.springframework.boot:spring-boot-starter-web'
+	// Server-rendered operator UI (controller/LiquidationReadinessController). The whole UI is
+	// behind loans.ui.enabled, default FALSE, so an operator who does not turn it on serves
+	// nothing new and constructs no extra bean. NOTE: this dependency is in the image either
+	// way — the flag makes the node behave identically, not the jar byte-identical.
+	implementation 'org.springframework.boot:spring-boot-starter-thymeleaf'
 	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
 	implementation 'org.springframework.boot:spring-boot-starter-webflux'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
@@ -33,10 +48,17 @@ dependencies {
 	implementation('com.bloxbean.cardano:cardano-client-backend-blockfrost:0.7.2')
 	implementation('com.bloxbean.cardano:cardano-client-backend-ogmios:0.7.2')
 
-	implementation 'io.micrometer:micrometer-registry-prometheus:latest.release'
+	// Applies parameters to unapplied Aiken validators at runtime (multi-network parameterisation)
+	implementation('com.bloxbean.cardano:aiken-java-binding:0.1.0')
+
+	implementation 'io.micrometer:micrometer-registry-prometheus:1.13.4'
 
 	implementation 'org.postgresql:postgresql:42.6.0'
 	testImplementation 'com.h2database:h2:2.1.214'
+
+	// Already on the runtime classpath via cardano-client-lib; declared here only so
+	// OracleFeedSignatureTest can verify the oracle's ed25519 signatures at compile time.
+	testImplementation 'org.bouncycastle:bcprov-jdk18on:1.78'
 
 	compileOnly 'com.bloxbean.cardano:cardano-client-annotation-processor:0.7.2'
 	annotationProcessor 'com.bloxbean.cardano:cardano-client-annotation-processor:0.7.2'

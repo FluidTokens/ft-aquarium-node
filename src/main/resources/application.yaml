@@ -1,4 +1,25 @@
 spring:
+  # ⛔ The template engine exists only when the readiness operator UI does (loans.ui.enabled). Boot's
+  # ThymeleafAutoConfiguration is @ConditionalOnProperty(spring.thymeleaf.enabled, matchIfMissing =
+  # true), so binding it to the same variable means a node with the UI off constructs NO Thymeleaf
+  # bean at all — the dependency sits in the jar unused. That is as close to "unchanged when off" as
+  # an added dependency can honestly get: the node's behaviour is identical, the jar's bytes are not.
+  #
+  # ⚠ It lives HERE, inside the one root `spring:` block, deliberately. A second root `spring:` key in
+  # the same YAML document is not an error to SnakeYAML — the last one WINS and the first is silently
+  # discarded, which would have taken flyway and the scheduler pool with it. Measured while writing
+  # this: the duplicate parsed clean and the suite stayed green.
+  thymeleaf:
+    enabled: ${LOANS_UI_ENABLED:false}
+  task:
+    scheduling:
+      # Spring's default is a single scheduler thread, shared by the transaction processor and the
+      # oracle refresh. The processor builds and submits transactions, so it can occupy that thread
+      # for minutes — during which the 30s oracle refresh never runs and every price silently ages
+      # past its validity window. Observed: feeds lagging several minutes past expiry, blanking the
+      # health of every loan exactly while transactions were being processed.
+      pool:
+        size: ${SPRING_TASK_SCHEDULING_POOL_SIZE:4}
   flyway:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/aquarium}
     user: ${DB_USERNAME:fluidtokens}
@@ -18,6 +39,13 @@ wallet:
   mnemonic: ""
 
 aquarium:
+  # Genesis one-shot UTxO that parameterises the `parameters` validator.
+  # With the staking token below (= FLDT policy/asset) this derives every
+  # Aquarium script hash at startup (see ContractRegistry). Network is chosen
+  # by the active Spring profile, so no per-network branch/blueprint is needed.
+  genesis:
+    tx-hash: 45f379b3436263146ab3a5423506ce11555113384d45655b50c77dab8a3473ff
+    output-index: 0
   staking:
     token:
       policy: 577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e
@@ -27,8 +55,363 @@ aquarium:
       txHash: 354ffe7958d62a8a2bf0b0bd97a06694d59dc49b6d02f1ab40165a3955257168
       outputIndex: 0
 
+# FluidTokens Lending v4.
+#
+# ⛔ `loans.enabled` IS GONE (2026-09-04, Giovanni's ruling). v4 indexing is UNCONDITIONAL, because
+# the flag itself was the defect: TankUtxoStorage builds its credential set ONCE at startup, so with
+# the flag off v4 UTxOs were DISCARDED AT WRITE TIME while the cursor advanced anyway — and turning
+# it back on only widened the filter for blocks indexed from then on. Worse, saveSpent kept working,
+# so a loan indexed BEFORE the off-window that MOVED during it had its old row marked spent and its
+# new output dropped: the loan vanished from the index while still live on chain. No flag, no gap.
+#
+# ⇒ WHAT DECIDES WHETHER ANYTHING IS INDEXED IS NOW THE COORDINATES BELOW. Absent or malformed
+# config policy ids mean "not configured yet": the node starts CLEAN, indexes nothing for v4, says so
+# at WARN, and contacts nothing. Supply both and it indexes from the sync-start slot.
+# ⚠ ABSENT is not MISMATCHED. A stale policy id still HARD-FAILS at startup (LoansConfigVerifier) —
+# that check is what catches a redeploy, which otherwise verifies cleanly forever against a dead
+# deployment while the node reports an empty world (findings section 12). Do not soften it.
+#
+# ⚠ AND INDEXING IS NOT ARMING. Reading v4 arms nothing; the switch is `liquidation.mode: live`
+# on that path and `compound.enabled` on the other. Both off below.
+# (see LoansContractRegistry / docs/lending-v4-findings.md)
+loans:
+  # FluidTokens oracle registry. Same endpoint ada-watch polls for Lending v3. Read-only price
+  # feeds for the health-factor engine; it also carries the multisig signatures a liquidation tx
+  # needs, which we do not consume yet. NOTE: serves mainnet assets, so on preview most
+  # collaterals have no feed and health is reported as unavailable rather than guessed.
+  oracle:
+    enabled: ${LOANS_ORACLE_ENABLED:true}
+    url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
+  # The auto-liquidation bot. `mode` is disabled / shadow / live, and it is the WHOLE node-level dial.
+  #
+  # ⛔ `liquidation.enabled` IS GONE (2026-09-04). It was a second arming boolean that had to agree
+  # with the mode, justified as "one switch is too easy to flip by accident". Giovanni: "it's
+  # redundant with mode -- mode == disabled already IS off, so a separate enabled boolean makes no
+  # sense ... the gates are too much; it's a bot, if you use it you know it's risky, so gates don't
+  # really help." A redundant gate is not free: it made `disabled` and `live` + `enabled: false` two
+  # spellings of "off", and gave an operator who HAD decided to arm one more silent way not to have.
+  #
+  # This is not a drill: when mode is live and all seven submit-vetoes pass, the
+  # executor SIGNS AND SUBMITS the liquidation on preview (LiquidationExecutor wires the real
+  # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
+  # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely.
+  # ⛔ THERE IS NO NETWORK GATE ANY MORE. `loans.submittable-network` existed until 2026-09-04 and
+  # was removed on Giovanni's ruling: a node correctly targeted at mainnet, armed and profitable,
+  # would still refuse to submit and say so only in a decision row — "arming that works everywhere
+  # except the last step, silently." `network` (this file / the Spring profile) is now the SINGLE
+  # source of truth for where this node acts. What holds a submission back is exactly: loans.enabled,
+  # mode == live, the market's effective mode, and the profit floors.
+  # The repayment-escrow COMPOUND path (lm_compound_action): collect a repaid loan's principal from
+  # the asset manager and deliver it into the lender's pool, keeping the pool owner's compounding fee.
+  # A different action from every `liquidation:` key above -- see docs/lending-v4-findings.md section 20.
+  compound:
+    enabled: ${AQUARIUM_COMPOUND_ENABLED:false}
+    delay-seconds: ${AQUARIUM_COMPOUND_DELAY_SECONDS:60}
+    # What `expectedFee - txFee` must reach, in lovelace, for a compound to be built.
+    #
+    # 0 (the default) refuses every net loss while allowing exact break-even. That is what makes a
+    # ZERO-FEE POOL refused out of the box: it pays nothing, so the net is exactly minus the tx fee.
+    #
+    # The fee rate is `compoudingFeePerMille` in the live PoolManagerDatum -- set by the POOL OWNER,
+    # not by this node and not fixed by the protocol. Measured 2026-09-02: the only live preview pool
+    # published 0, so out of the box that work pays nothing and is declined.
+    #
+    # A NEGATIVE value is a number the operator STATES, not a protection they switch off -- the same
+    # distinction `liquidation.profit-margin-lovelace` draws, and the reason there is no
+    # `ignore-profit-check` twin here. Setting it negative arms compounding for pools that pay
+    # nothing, and still bounds the loss: a candidate worse than the stated figure is refused.
+    # Giovanni's ruling, 2026-09-02: acceptable "as long as operator checks this himself and owns it".
+    #
+    # ⚠ STALE UNTIL 2026-09-04: this said "negative on mainnet is a hard startup failure, exactly
+    # as the liquidation margin is". BOTH halves were false. `CompoundEconomics.announceAndGuard`
+    # only WARNs — loudly, naming the network — and the liquidation margin's mainnet hard-fail was
+    # removed by findings section 31 on Giovanni's ruling that operating at a loss must be possible
+    # on every network. The one knob that IS fatal on mainnet is `liquidation.ignore-profit-check`.
+    # A chart author read the old wording and built around a crash that does not happen.
+    profit-margin-lovelace: ${AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE:0}
+    # Published reference scripts: a comma-separated list of txHash#index coordinates.
+    #
+    # NOT one named key per validator. The `liquidation.reference-scripts` block above has eight of
+    # those, and a key named for a validator holds a COORDINATE -- nothing checks the two agree. Here
+    # the node reads referenceScriptHash off the chain, so a mislabelled coordinate is not expressible.
+    #
+    # Empty (the default) means every validator travels inline, which is correct and TOO BIG TO
+    # SUBMIT: eleven inline validators build a 24,912-byte transaction against a 16,384 max_tx_size.
+    # Referencing the four largest measures 10,414 bytes, 5,970 of margin (findings section 22.9).
+    #
+    # Deployment-specific, so it is set in the deployment's own values, never defaulted in this image.
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:83d1c5393a53e365eb15a7bdfd1feff560f43f9560bc60c23c4e41de709bae33#0,55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0,d0549a87da42d048eb1c3b5b8f7811fd2ccd882ad36c85ee209d3a8d1ca0265f#0,d52f3f88e44ca798d9f45313b83267a7ffa01a6105603ed2b2aebcd8383c45ea#0,e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0,ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0,954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0,5215ca557800881b044ce92c77018b92b9d5b6c56f835d6217bc7e1435000f8a#0,8340312072cd352519e01d7e294d3a4cb84a7f0b63f44adef027abf84d2e0bee#0,8bfb510d6d90573280d9a47b94411477f0992228e0b43cb7cb864f2af66b6812#0,15d88c19c9841e7b5cdd125613ff2013993aeb89f871f340c7a2e43fce1373f5#0}
+
+  # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
+  #
+  # Quoted first-hand from FluidTokens' own (TypeScript) tooling and then VERIFIED read-only against
+  # the chain: both NFTs exist in tx 7b9f20db…, asset name `parameters`, the ConfigDatum has the
+  # expected 29 fields, and — the load-bearing check — the vendored loans-v4.plutus.json DERIVES
+  # every credential the mainnet datum publishes. Their mainnet build IS the artifact we ship.
+  # See MainnetRegistryMatchesConfigTest and docs/lending-v4-findings.md section 23.
+  #
+  # ⚠ CONFIGURED IS NOT ARMED. `loans.enabled` above is false on mainnet, the liquidation mode is
+  # `disabled` — and that single dial is the whole node-level question now.
+  # ⚠ The fourth item here used to read "the compound gate HARD-FAILS a negative profit margin on
+  # mainnet" — it does not; see the compound margin above. Three gates, not four. These values let
+  # the node DERIVE and READ the mainnet deployment; nothing here lets it act on one.
+  #
+  # The preview profile overrides all four, so this block is inert on every preview deployment.
+  config:
+    ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:7b9f20dbadaebe1400915e4a63444a9eb7515c21c1114d4bc9c77f1455148cb0}
+    policy-id: ${LOANS_CONFIG_POLICY_ID:db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416}
+    # The config NFTs' asset name, "parameters" in hex. Identical on every network — stated
+    # rather than inlined, because a key that exists nowhere can be neither overridden nor
+    # documented (§57.12).
+    asset-name: ${LOANS_CONFIG_ASSET_NAME:706172616d6574657273}
+  lm-config:
+    policy-id: ${LOANS_LM_CONFIG_POLICY_ID:a56b0ac2654663f395601601a7825649e5488905648747e912d870e4}
+  # Published in the ConfigDatum (field 0) and NOT derivable from the blueprint — the same value on
+  # both networks, because it is not parameterised by the config policy id.
+  smart-tokens-spend-script-hash: ${LOANS_SMART_TOKENS_SPEND_SCRIPT_HASH:fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa}
+
+  minswap:
+    # The Minswap V2 mainnet credentials the convert action is parameterised with (§25.1).
+    # ⚠ Blank on a network without a Minswap deployment — see the preview document.
+    pool-policy-id: ${LOANS_MINSWAP_POOL_POLICY_ID:f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c}
+    pool-spend-script-hash: ${LOANS_MINSWAP_POOL_SPEND_SCRIPT_HASH:ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b}
+    order-spend-script-hash: ${LOANS_MINSWAP_ORDER_SPEND_SCRIPT_HASH:c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c}
+    # ⛔ THE MAINNET Minswap V2 pool address. It lived ONLY as an inline @Value default in
+    # AppConfig, which meant no profile could blank it: the preview document has no key to
+    # override, so a preview node resolved this MAINNET address and every convert candidate
+    # died at the pool lookup with "Invalid address for this network", once per cycle, at ERROR.
+    # A default that no configuration layer can reach is not a default; it is a hardcoding.
+    # ⚠ Blank means "this network has no Minswap deployment" and converts are SKIPPED, not failed.
+    pool-address: ${LOANS_MINSWAP_POOL_ADDRESS:addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a}
+
+  # ── The operator readiness UI (server-rendered, GET /api/v1/loans/readiness) ────────────────
+  #
+  # DECISION SUPPORT, not profit tracking: a list of loans sorted by health factor ascending —
+  # closest to liquidation first — INCLUDING loans that are only approaching it, because the whole
+  # point is runway to find capital before one goes sour. Per loan it shows identity, health, the
+  # liquidation fee slice, and the route: Minswap convert available, or capital-in-advance required
+  # and how much principal must be ready.
+  #
+  # ⛔ OFF BY DEFAULT, AND THERE IS NO AUTHENTICATION. It is a run-it-locally tool: the page exposes
+  # loan positions and the operator's own routing, and anything reachable on a public port is
+  # reachable by anyone. Turn it on behind a loopback bind or a reverse proxy, or not at all.
+  #
+  # With this false the controller bean is never constructed and no route is mapped — the node
+  # behaves exactly as it did before the UI existed. (The Thymeleaf dependency is in the image
+  # either way; the flag governs behaviour, not the jar's bytes.)
+  #
+  # Requires loans.enabled=true — the page reads the same scanner, health service and economics the
+  # bot acts on. With lending off it renders a single line saying so rather than failing to start.
+  ui:
+    enabled: ${LOANS_UI_ENABLED:false}
+
+  liquidation:
+    mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
+    delay-seconds: ${AQUARIUM_LIQUIDATION_DELAY_SECONDS:60}
+    # The two window values are one piece of arithmetic, so read them together. A preview Charli3
+    # feed publishes a 600 s window (measured, design §6.7), and the builder's V3 demands
+    #     feed.validTo - tx.validTo >= oracle-window-margin-seconds
+    # so a candidate is only buildable while at least (validity-window + margin) of the feed's
+    # window is still ahead of it: 120 + 30 = 150 s of the 600 s, leaving 450 s usable. Raising the
+    # margin shortens that usable stretch one second for one; a margin near 600 silently disables
+    # the bot for most of every window while every candidate simply reports
+    # ORACLE_WINDOW_MARGIN_TOO_SMALL.
+    #
+    # ⛔ AND DO NOT NARROW validity-window-seconds TO BUY BACK ORACLE HEADROOM. That is the move the
+    # feed-staleness finding (T-065/T-067) makes tempting — the registry serves windows ~323 s after
+    # their own validFrom, so shrinking our 150 s would widen the usable stretch — and there is now
+    # empirical cost data against it, from outside this codebase. Measured on preview by steward-d0,
+    # 2026-08-26/27: FIVE independent OutsideValidityIntervalUTxO rejections belonging to some other
+    # actor, all EXACTLY 58 slots wide — distinct widths [58], a signature rather than a coincidence.
+    #
+    #   overshoot   total delay   inside our ~149?
+    #        +161           219   no
+    #        +124           182   no
+    #         +42           100   yes
+    #         +53           111   yes
+    #         +19            77   yes
+    #
+    # ⇒ THE HONEST CLAIM IS "149 IS BETTER, NOT SUFFICIENT": it would have caught 3 of 5. The two
+    # survivors needed 182 and 219 slots, i.e. ~3.8x the current window, which this data does NOT
+    # settle. ⚠ And the counterfactual assumes widening extends the UPPER bound with invalidBefore
+    # unmoved — which is what validity-window-seconds does. If a change also moved the start, every
+    # number above is void.
+    #
+    # ⛔ DO NOT READ OUR 149 AS VALIDATED. It is UNEXERCISED: the bot has built nothing since
+    # 2026-08-26 23:20, so "ours has never failed" is equally consistent with having submitted no
+    # transactions at all — which is the actual case. "Ours has not failed" and "ours would have
+    # survived these" are different claims and only the second is about the width.
+    #
+    # What survives all of that is the DIRECTION, and only the direction: narrowing moves us toward
+    # the one width that demonstrably fails on this network, and 3-of-5 beats 0-of-5. It agrees with
+    # the block-gap arithmetic behind the anchor fix — preview gaps reach 182 s, so a window narrower
+    # than the tail is a bet on gap length. WIDER, NOT TIGHTER — but "wide enough" is unmeasured.
+    validity-window-seconds: ${AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS:120}
+    oracle-window-margin-seconds: ${AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS:30}
+    # Expected profit = fee value - tx fee - this. The reference-script surcharge is the dominant
+    # term and depends on how much gets published: at minFeeRefScriptCostPerByte 15, referencing
+    # only the two large validators (12_749 B) costs ~0.19 ADA, and referencing all six (18_584 B)
+    # costs ~0.28 ADA. On top of that come the size and execution-unit components of the ordinary
+    # fee. 1.5 ADA leaves headroom for either shape and still refuses dust liquidations, whose fee
+    # slice would not repay the transaction that claims it.
+    #
+    # ⇑ RAISED 1.5 -> 5 ADA on Giovanni's instruction (2026-08-27, relayed): the bot must clear
+    # "at least 5 ADA of profit" per liquidation, not merely cover its costs. The analysis above is
+    # what the transaction COSTS; this is what the operator wants to EARN, and they are different
+    # questions. The cost figures are kept because they are measured rather than chosen, and because
+    # they are the floor below which this number must never be set.
+    profit-margin-lovelace: ${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:5000000}
+
+    # ⛔ TEST-ONLY. Bypasses BOTH profitability gates -- the absolute floor
+    # (min-profit-absolute-lovelace) AND the margin (profit-margin-lovelace) -- and liquidates
+    # regardless of loss. It is a boolean rather than a third threshold on purpose: a switch that
+    # reached only one of the two gates would look enabled and change nothing, because a loan whose
+    # floored profit is negative is refused by the floor whatever the margin says.
+    #
+    # It replaces the negative-margin idiom, which is a magic number that looks like it does this and
+    # does not. LiquidationExecutor REFUSES TO START when this is true on mainnet -- the same hard
+    # failure a negative margin gets, for the same reason: it disables loss protection on someone
+    # else's collateral, and "copy the working preview config" is the foreseeable operator action.
+    # When enabled it announces itself at boot and logs every decision it lets through, with the
+    # profit figure it ignored.
+    ignore-profit-check: ${AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK:false}
+    # THE ABSOLUTE FLOOR, and it is a SECOND gate that profit-margin-lovelace cannot reach.
+    # S4 tests two independent things: (a) floorProfit = feeSlice - txFee - minAdaFunded against
+    # min-profit-absolute-lovelace, and only then (b) the margin lever. The margin is deliberately
+    # OUTSIDE the floor's number, so lowering it -- even to a large negative -- can never rescue a
+    # candidate the floor refuses. Measured on preview 2026-08-24: a convert liquidation logged
+    # "floor -27303331; - margin -100000000 = 72696669" and was still refused NOT_PROFITABLE,
+    # because -27303331 < 0 and the floor is what (a) tests. The positive number on that line is
+    # real but is not what gated it.
+    #
+    # Why the floor is so negative on a CONVERT liquidation: minAdaFunded is the bot FRONTING the
+    # loan's principal, counted here as a cost, while the collateral it receives in exchange is not
+    # counted as a benefit at all -- the fee term is a mark-to-oracle token slice (T-027, SPEC O-2).
+    # So this floor currently compares ADA out against tokens in. Setting it negative is therefore a
+    # DELIBERATE statement that mark-to-oracle economics are accepted for these liquidations, not a
+    # tuning knob. Default 0 is unchanged.
+    min-profit-absolute-lovelace: ${AQUARIUM_LIQUIDATION_MIN_PROFIT_ABSOLUTE_LOVELACE:0}
+    # THE MARGIN-ADJUSTED FLOOR, gate (c). expectedProfit = floorProfit - profit-margin-lovelace must
+    # exceed this. Default 0, which is exactly the hardcoded `expectedProfit > 0` it replaced.
+    #
+    # It MAY BE NEGATIVE, and that is why it exists. Giovanni, 2026-08-27: "we need to allow operating
+    # at a loss on mainnet. not the default setting but it must be possible. or the bot is unusable."
+    # The intended operator is a team clearing bad debt to protect their own platform, for whom a
+    # liquidation that loses ada is still worth making.
+    #
+    # A negative value is a number the operator STATES, not a protection they SWITCH OFF -- unlike
+    # ignore-profit-check, which is a boolean, disables both gates and hard-fails on mainnet. The loss
+    # stays bounded: a liquidation worse than this figure is still refused.
+    #
+    # To actually run at a loss BOTH floors must be moved, this one and min-profit-absolute-lovelace
+    # above, because they test different numbers. Setting only one leaves the bot refusing exactly as
+    # before; LiquidationExecutor says so by name at boot rather than leaving it to be discovered.
+    min-expected-profit-lovelace: ${AQUARIUM_LIQUIDATION_MIN_EXPECTED_PROFIT_LOVELACE:0}
+    # Whether the absolute floor above is applied at all. Turning it off removes gate (a) entirely
+    # and leaves only the margin lever.
+    check-profitability: ${AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY:true}
+    decision-log-size: ${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}
+    quarantine-minutes: ${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}
+    # Published reference-script UTxOs, one `txHash#index` per validator a Liquidate invokes. Empty
+    # means "not published" and that validator travels in the witness set instead.
+    #
+    # Resolution rule, per validator: a coordinate configured here for a validator -- and verified
+    # resolvable on chain by LoansReferenceScriptVerifier at startup -- means that validator travels
+    # by reference; an unconfigured (empty) coordinate means it travels inline in the witness set.
+    # At least one validator must be referenced: six inline validators total 18_584 bytes, over the
+    # 16_384-byte maxTxSize, so "all inline" cannot build.
+    #
+    # This is not a tuning knob, it is the difference between a buildable and an unbuildable
+    # transaction. Measured: the six applied validators total 18_584 bytes against a maxTxSize of
+    # 16_384, and a real single-loan liquidation measured in shadow mode came to 19_838 bytes with no
+    # reference scripts at all. Referencing them costs fee instead of size: at
+    # minFeeRefScriptCostPerByte 15, all six cost ~0.28 ADA per liquidation, which
+    # profit-margin-lovelace has to cover.
+    #
+    # No coordinates on mainnet: lending is disabled there, and a stale coordinate is worse than an
+    # absent one — LoansReferenceScriptVerifier hard-fails on a hash that does not match.
+    convert:
+      # ⚑ NO MARGIN KEY HERE since 2026-09-09. `profit-margin-lovelace` is GONE -- Giovanni's ruling:
+      # "for me convert is a liquidation and profitMarginLovelace is literally the same as
+      # liquidation ... it's just one knob, the additional protection is the market specification
+      # where we can enable/override convert w/ anticipate". The margin convert answers to is the
+      # SHARED profit-margin-lovelace above, the same number every other mode uses.
+      # ⚠ Passing LOANS_LIQUIDATION_CONVERT_PROFIT_MARGIN_LOVELACE now sets nothing and warns
+      # nowhere (catalogue §6.7).
+      #
+      # ⚑ THE GLOBAL SWITCH, and it defaults ON -- the one arming flag in this file that does.
+      # Restored 2026-09-10 after a day at false: "convert should remain but under liquidation and be
+      # enabled by default. there is a case we want to disable conversions." It is defensible here
+      # and nowhere else: the bot fronts no capital on this path and an order that never fills
+      # returns the collateral to the lender, so the failure mode is a no-op, not a loss.
+      #
+      # TWO CONTROLS, AND THEY COMPOSE IN THIS ORDER:
+      #   1. this flag false => NO converts anywhere, whatever any market says;
+      #   2. this flag true  => each market's `markets[]` entry decides -- action: ANTICIPATE to
+      #      front capital instead, mode: DISABLED to sit that market out. NO markets listed =>
+      #      every market converts.
+      # It is still subject to liquidation `mode` above, like everything else on this path.
+      enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:true}
+      # The operator's stated cost of a DEX interaction: a max() against the measured cost, never a
+      # sum. NOT a margin -- it says what the work COSTS, not what the operator will accept to lose,
+      # which is why the merge above left it standing. Negative or unset throws at startup.
+      dex-cost-floor-lovelace: ${LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE:5000000}
+      # ⛔ WHAT A CONVERSION SPENDS on the Minswap order -- a FIXED EXPENSE, charged before the
+      # conversion counts as break-even. This is why `profit-margin-lovelace: 0` is honest on this
+      # path: at 0 the conversion must still cover the OUTLAY.
+      # ⚠ AND THE OUTLAY IS USUALLY 5 ADA, NOT 4 -- corrected this round. `dex-cost-floor-lovelace`
+      # above is a FLOOR over the whole measurement (max(txFee + this, that)), not an addend, and it
+      # binds whenever txFee < 1,000,000 -- true of most liquidation transactions. So at the shipped
+      # defaults (this = 4,000,000, floor = 5,000,000) a margin of 0 must clear 5,000,000 lovelace of
+      # outlay, and the operator-facing number nobody wrote down: at the shipped 5,000,000 margin too,
+      # a convert needs >= 10,000,000 lovelace of oracle-valued fee slice to be approved.
+      # ⚠ IT IS NOT THE BUILDER'S NUMBER. ConvertEconomics.MINSWAP_ORDER_OVERHEAD is what the order
+      # output must CARRY -- the validator checks it -- and stays a non-configurable Java constant
+      # (catalogue §6.6). Stating MORE here is a legitimate belief about cost; stating LESS is
+      # refused at startup, because the chain will spend the 4 ada regardless.
+      minswap-order-cost-lovelace: ${LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE:4000000}
+
+    reference-scripts:
+      loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f#0}
+      loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:46d7195856788885fd4a488dff7bde8bbaf46d5dc4a2fa3dbd12e9cb42129c96#0}
+      lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0}
+      lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0}
+      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:51eaf4994ee313bf4c95be65656e092d7366b0f397f7ecc1e0113c063fab5f98#0}
+      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:8ba0dfb30d40361b9bc775f032e2427c799a6cfefce0cbf13e8f1242c990249a#0}
+      # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
+      # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
+      # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
+      # at all, so it could not be referenced however much else was published -- which is why a convert
+      # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
+      # referenced and working. Referencing this one alone sheds ~7,051 bytes.
+      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:2ed58f66779acd64f9add3755dd0686d6841001c90683b369cae0f5f07287476#0}
+      asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0}
+      # ⚑ The CONVERT action. It has NO AQUARIUM_LIQUIDATION_REF_* alias -- the only route in is
+      # the relaxed name LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION.
+      #
+      # ⛔ CORRECTED 2026-09-05. This was 56840ffb...#0, which publishes ed8d41e4... -- the SUPERSEDED
+      # convert action, from before FluidTokens' in-place LMConfig fix. The node derives dc715410...
+      # from the vendored blueprint, so the transaction withdrew from dc715410's reward address while
+      # the only script offered was ed8d41e4's: `withdraw:3 missingRequiredScripts`, found four walls
+      # deep in a live mainnet build.
+      #
+      # ⚠ The coordinate below was in Giovanni's own config paste that morning
+      # (LM_LIQUIDATE_AND_CONVERT_SCRIPT_REF). It was baked from findings section 24's older verified
+      # set instead, and the check that would have caught it -- comparing the published hash against
+      # the DERIVED one -- was not run: the coordinate was only confirmed to resolve and to carry
+      # *a* script. Verified now: e4e47ab1...#0 publishes dc715410..., 5,516 bytes, unspent.
+      #
+      # ⇒ And LoansReferenceScriptVerifier now covers this slot too, so a future staleness here
+      # hard-fails at boot naming the key, exactly like the other eight.
+      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:8ab0c6d168746f5827aeb0d8981f9edbb9ae00a17db95d7d44e8a8a1b86ea0bf#0}
+
 scheduling:
   transaction-processor:
+    # ⛔ OFF BY DEFAULT. The transaction processor builds and SUBMITS transactions from the
+    # configured wallet, so an operator who has not said "yes" gets a node that indexes and serves
+    # and spends nothing. Set to true to arm it.
+    # ⚠ Upgrading across this change: a processor that was running will STOP until this is set.
+    enabled: ${SCHEDULING_TRANSACTION_PROCESSOR_ENABLED:false}
     delay-minutes: ${SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES:5}
 
 blockfrost:
@@ -67,6 +450,9 @@ wallet:
   mnemonic: ""
 
 aquarium:
+  genesis:
+    tx-hash: d35f81f6bc88babe5dcf088e3a800ecbb4d75373df6b144f7561d393cb5d9b2f
+    output-index: 1
   staking:
     token:
       policy: 0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62
@@ -75,6 +461,191 @@ aquarium:
     ref-input:
       txHash: 782106250a8327d54bcd52d608e72bfa92d5263e8d009a53c1570a1aee1d2662
       outputIndex: 0
+
+loans:
+  # FluidTokens runs a separate registry for preview. Unlike mainnet it prices tFLDT — the
+  # collateral on the loans we index — so health is fully computable here.
+  oracle:
+    url: ${LOANS_ORACLE_URL:https://testapi.fluidtokens.com/get-oracle-tokens}
+  # Preview is where the bot is exercised, so the loop runs by default here — in shadow, which
+  # scans, builds, prices and records without ever signing or submitting. Every other liquidation
+  # key keeps its base-document value.
+  # Preview is the only place the compound path is exercised, and it STAYS DISARMED HERE.
+  #
+  # This file ships inside the public operator image: anyone running it with the preview profile gets
+  # these values, so arming here would arm it for every operator, not for us. That is the same rule
+  # that keeps the liquidation mode unarmed in this document while the preview bot runs armed --
+  # arming is a deliberate act in the deployment's own values (the Steward's Argo application),
+  # never a default anybody inherits by choosing a profile. See docs/k8s-deployment-requirements.md
+  # section 3 and section 8.
+  #
+  # To arm OUR preview deployment, set these in the Argo values, not here:
+  #     AQUARIUM_COMPOUND_ENABLED: "true"
+  #     AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE: "-2000000"
+  # which mirrors the liquidation side's stated -2000000 bound.
+  compound:
+    enabled: ${AQUARIUM_COMPOUND_ENABLED:false}
+    # ⛔ BLANKED for the same reason as the liquidation keys below: the base document bakes the
+    # ELEVEN mainnet compound coordinates, and preview must not inherit them.
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}
+
+  liquidation:
+    # Stated, not defaulted: the annotation carries no inline default since 2026-09-10, so
+    # a document that omits this does not start. Preview matches mainnet deliberately —
+    # a rehearsal priced differently from production rehearses the wrong thing.
+    profit-margin-lovelace: 5000000
+    convert:
+      # ⛔ Minswap V2 has no preview deployment, so a convert cannot be built here at all -- the blank
+      # minswap pool-address below is what makes the path SKIP, and that is the honest reason.
+      # ⚠ So this stays TRUE, matching the mainnet default: turning it off here would state a SECOND
+      # reason to be off and hide the first one, and a preview node that then acquired a pool address
+      # would be silently disabled by a line nobody remembered.
+      # Both keys are stated explicitly so every key exists on every profile (§57.12).
+      enabled: true
+      dex-cost-floor-lovelace: 5000000
+      # Stated as a literal, like every other key on this profile: the annotation carries no inline
+      # default, so an environment that OMITS this key entirely does not start. Matches mainnet
+      # deliberately -- the order ada the validator demands is not a per-network figure.
+      #
+      # ⚠ "Does not start" is true for omitted, not for BLANK -- docker/.env's actual failure shape.
+      # LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE set to the empty string makes
+      # ${LOANS_LIQUIDATION_CONVERT_MINSWAP_ORDER_COST_LOVELACE:4000000} resolve to "", and Spring's
+      # String->BigInteger conversion returns no value for blank text -- the @Value field injection
+      # is silently SKIPPED rather than throwing. The field then keeps its Java default
+      # (AppConfig.ConvertConfiguration.minswapOrderCostLovelace = 4,000,000, pinned equal to
+      # ConvertEconomics.MINSWAP_ORDER_OVERHEAD) and THIS LINE is never consulted. Verified by probe
+      # (this round): the context boots clean with orderCost=4000000 on a blank env value. Harmless
+      # here only because the field default matches the builder constant announceAndGuard() refuses
+      # to let it fall below -- it would not be harmless if the two were ever allowed to diverge.
+      minswap-order-cost-lovelace: 4000000
+    mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
+    # Six of the seven, verified on chain: each of these UTxOs publishes a reference_script_hash
+    # equal to the hash this repo derives for that validator, and LoansReferenceScriptVerifier
+    # re-checks that at every startup — a redeploy turns these into a hard startup failure, which is
+    # an answer and not an outage. asset-manager is deliberately left empty: a plain Liquidate only
+    # *creates* asset-manager outputs and never spends one, so its script is neither attached nor
+    # needed; publishing a coordinate for it would only add a reference input and its fee.
+    #
+    # Resolution rule, per validator: a coordinate configured here for a validator -- and verified
+    # resolvable on chain by LoansReferenceScriptVerifier at startup -- means that validator travels
+    # by reference; an unconfigured (empty) coordinate means it travels inline in the witness set.
+    # At least one validator must be referenced: six inline validators total 18_584 bytes, over the
+    # 16_384-byte maxTxSize, so "all inline" cannot build.
+    #
+    # Without these the transaction cannot fit: 18_584 bytes of validators against a 16_384-byte
+    # maxTxSize, and a measured 19_838-byte single-loan liquidation with none of them referenced.
+    # With them, the size moves into the fee — ~0.28 ADA per liquidation at
+    # minFeeRefScriptCostPerByte 15, which profit-margin-lovelace must cover.
+    # BLANKED 2026-08-17 for the third redeploy, deliberately and temporarily.
+    #
+    # The six coordinates below used to point at published reference-script UTxOs for the SECOND
+    # deployment. They are not stale -- they are DEAD. Script hashes are derived by applying the
+    # config NFT policy ids as parameters, so new policy ids move 25 of 28 hashes, which moves the
+    # script addresses, which means the old reference UTxOs hold scripts this deployment never uses.
+    #
+    # Left empty rather than wrong on purpose. LoansReferenceScriptVerifier compares each published
+    # coordinate's on-chain reference_script_hash against the freshly derived hash and hard-fails at
+    # boot on a mismatch -- so leaving the old values here would block startup entirely, whereas the
+    # empty case is a supported path that skips the check. The consequence is bounded and specific:
+    # indexing, health, the scanner and shadow mode all work; SUBMISSION does not, because six
+    # validators total ~18.6 KB against a 16,384-byte maxTxSize and cannot travel in the witness set.
+    #
+    # The new scripts ARE on chain (Blockfrost /scripts/<hash> resolves all of them), so the
+    # coordinates exist and need discovering, not creating. That is the next task.
+    #
+    # Old (second-deployment) values, kept only so the diff is legible:
+    #   loan                 00a4e9f6...1f7aa693#0
+    #   loan-spend           5c10900c...46b669da#0
+    #   lender-manager       fe791b23...024ffc07#0
+    #   lender-manager-spend 13dd3329...663c2571#0
+    #   loan-claim-action    b09e23dc...19f243fe#0
+    # ONE of the six is published, and that is deliberate rather than incomplete. Only enough
+    # validators have to travel by reference to bring the liquidation under maxTxSize; the rest stay
+    # in the witness set and lock nothing. loan_claim_action is 8,662 of the 18,720 validator bytes,
+    # so shedding that one alone suffices: measured on the real loan, five inline + this one
+    # referenced is 11,713 bytes unsigned / 11,819 signed against 16,384. All six inline is 20,342
+    # and does not fit; all six referenced would lock 86.84 ADA to buy bytes we do not need.
+    #
+    # Published by US, not by FluidTokens, who have not republished for this deployment:
+    #   tx 48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0, preview block 4579719.
+    # It sits at an ordinary key address we control and holds 38.359 ADA of min-ada, recoverable by
+    # spending it back when the bot no longer needs it. LoansReferenceScriptVerifier checks its
+    # on-chain reference_script_hash against the freshly derived hash at every boot, so the next
+    # redeploy turns it into a startup failure rather than a silent wrong-script.
+    #   lm-liquidate-action  549b438c...49a47fe0#0
+    reference-scripts:
+      loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}
+      loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:}
+      lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:}
+      lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:}
+      # BLANKED 2026-08-25 for the FOURTH deployment (e0b818e), exactly as the comment above
+      # predicted: the script hash is derived by applying the config NFT policy ids as parameters,
+      # so new policy ids move this hash, and the published UTxO at 48c102c0...#0 holds a script
+      # THIS deployment never uses. LoansReferenceScriptVerifier compares published against derived
+      # and hard-fails at boot on a mismatch, so leaving it here would block startup entirely.
+      # CONSEQUENCE, and it is not cosmetic: with every coordinate blank all six validators travel
+      # inline, which does not fit under maxTxSize -- so liquidations cannot BUILD until this script
+      # is republished under the fourth deployment. Scanning, health and pricing are unaffected.
+      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
+      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
+      # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
+      # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
+      # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
+      # at all, so it could not be referenced however much else was published -- which is why a convert
+      # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
+      # referenced and working. Referencing this one alone sheds ~7,051 bytes.
+      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:}
+      # ⛔ BLANKED EXPLICITLY, not omitted. The base document now BAKES mainnet coordinates as its
+      # defaults, and a preview node inherits every base key it does not override. A mainnet
+      # coordinate reaching a preview node is not inert: LoansReferenceScriptVerifier resolves it,
+      # finds a hash that is not what preview derives, and HARD-FAILS AT BOOT. These two were
+      # previously absent here and harmless only because the base default was empty too.
+      asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:}
+      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:}
+  config:
+    # FOURTH preview deployment (14 Jul -> 5 Aug -> 17 Aug -> 25 Aug 2026). Both config NFTs are
+    # minted in the single tx 8dd38e97...091c at outputs 0 and 1.
+    #
+    # THE DEPLOYED CODE IS e0b818e, and loans-v4.plutus.json is that commit's plutus.json copied
+    # byte-for-byte (sha256 a55a1c2e723a6d1222e464bb32adc1abe1d669ca6d00205d50459122adf7b98f).
+    # Blueprint and coordinates are a MATCHED PAIR: either half alone cannot boot.
+    #
+    # Measured against the live chain 2026-08-25, both arms against THESE coordinates, with the
+    # loaded blueprint's sha256 printed from the classpath on each run:
+    #   e0b818e + these coordinates -> 0 mismatches, GREEN
+    #   ff005fb + these coordinates -> 10 mismatches (ConfigDatum[3,9,11,12,14,15],
+    #                                  LMConfigDatum[2,3,4,6]) -- exactly the boot failure the
+    #                                  deployed image produced.
+    #
+    # An earlier revision of this comment claimed the reverse. It was wrong, and HOW it was wrong is
+    # worth keeping: the measurement behind it ran LoansConfigVerifierLiveTest, which HARDCODES the
+    # THIRD deployment's policy ids and never reads this file. Both of its arms were therefore
+    # scored against the third deployment, where ff005fb-green and e0b818e-red are simply correct
+    # and say nothing about the fourth. The blueprint variant was asserted by sha256; the COORDINATE
+    # variant was not -- and the unasserted input was the one that never propagated.
+    #
+    # The coordinates matter independently of the code: the config NFT policy ids are applied as
+    # parameters, so 25 of 28 derived script hashes move on a re-mint alone.
+    ref-utxo-tx-hash: 8dd38e97b79cc7c8a3c59400944b7cd9f724876a1d49ea17ffb5e49b3785091c
+    policy-id: d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e
+    asset-name: 706172616d6574657273
+  lm-config:
+    policy-id: a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13
+  # Published in the ConfigDatum; the blueprint ships no smart_tokens validator so this
+  # one cannot be derived. Only the pool-manager branch needs it.
+  smart-tokens-spend-script-hash: fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa
+
+  minswap:
+    # ⛔ BLANK ON PURPOSE, all four. Minswap V2 has no preview deployment, so none of these
+    # credentials exists here and the convert action cannot be derived, let alone used.
+    pool-policy-id: ""
+    pool-spend-script-hash: ""
+    order-spend-script-hash: ""
+    # Minswap V2 has no preview deployment, so there is no pool to swap
+    # against and a convert cannot be built here at all. Blank makes the convert path SKIP with
+    # one line naming the reason, instead of sending a mainnet address to a preview provider and
+    # failing at ERROR every scheduling cycle (findings §57.12).
+    pool-address: ""
 
 blockfrost:
   url: https://cardano-preview.blockfrost.io/api/v0/
@@ -85,7 +656,15 @@ store:
     host: ""
     port: 0
     protocol-magic: 2
-    # Start from the block that minted the ref input for the contract
+    # Start from the block that minted the ref input for the contract.
+    #
+    # DELIBERATELY NOT CHANGED for the 2026-08-17 v4 redeploy, and do not "fix" it. This is a
+    # START point and indexing runs FORWARD from it, so an earlier value is inclusive of every
+    # later deployment -- the dangerous direction is a sync-start AFTER the deployment you care
+    # about. The only cost of an early value is sync time. (A previous session claimed a stale
+    # sync-start would make the node blind to the new deployment; that was wrong. The empty world
+    # comes from the payment-credential filter in TankUtxoStorage, which derives from the config
+    # policy ids above -- findings 12.)
     sync-start-blockhash: 0e459daa0813334b79da2bac23d3324b604ee04209679bed08b6f49cac82cb4e
     sync-start-slot: 71971209
     keep-alive-interval: 1000

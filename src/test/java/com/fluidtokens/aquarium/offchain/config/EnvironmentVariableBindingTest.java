@@ -1,0 +1,249 @@
+package com.fluidtokens.aquarium.offchain.config;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.core.env.StandardEnvironment;
+import org.springframework.core.env.SystemEnvironmentPropertySource;
+
+import java.math.BigInteger;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * ⛔ <b>Can a Helm chart actually set these keys as environment variables?</b>
+ *
+ * <p>Every operator-facing deployment of this node drives it through env vars — {@code docker/.env},
+ * or a chart's {@code env:} block. <b>Most keys have an explicit placeholder in
+ * {@code application.yaml}</b> ({@code mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}}), so their env
+ * name is spelled out in the file and there is nothing to infer.
+ *
+ * <p>⚠ <b>Corrected this round — both halves of the previous account were stale.</b> Only
+ * {@code loans.verify-config.fail-on-unreachable} genuinely has no placeholder of its own today: it
+ * is not declared in {@code application.yaml} at all, so its only route in is relaxed binding plus
+ * its inline {@code @Value("${loans.verify-config.fail-on-unreachable:false}")} default, and it is
+ * <b>out of this file's scope</b> — no test here exercises it; a future one should.
+ *
+ * <p><b>The other two families no longer belong on this list, and BOTH already carried an explicit
+ * placeholder at {@code ba5ef4c}, before this correction.</b> There are THREE
+ * {@code loans.liquidation.convert.*} keys, not two ({@code enabled}, {@code dex-cost-floor-lovelace},
+ * {@code minswap-order-cost-lovelace}), and every one of them is spelled out in
+ * {@code application.yaml} as {@code ${LOANS_LIQUIDATION_CONVERT_*:default}} — {@code enabled} and
+ * {@code dex-cost-floor-lovelace} already did before this file was last touched;
+ * {@code minswap-order-cost-lovelace} gained one when it was added. Likewise
+ * {@code loans.liquidation.reference-scripts.lm-liquidate-and-convert-action} is declared as
+ * {@code ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:default}} in both
+ * profile documents — an explicit placeholder, just one that happens to spell out the same name
+ * relaxed binding would derive anyway (its eight sibling reference-script keys use short
+ * {@code AQUARIUM_LIQUIDATION_REF_*} names instead, which is the real thing that sets it apart from
+ * them, not an absent mapping). <b>The tests below are kept anyway</b>, as regression coverage for
+ * the relaxed-binding mechanism itself — these four keys gained their placeholders only recently, a
+ * placeholder line can be deleted again, and relaxed binding is what would still carry the value if
+ * that happened.
+ *
+ * <p>⚑ <b>{@code loans.liquidation.convert.profit-margin-lovelace} stopped existing on 2026-09-09</b>
+ * and is NOT re-pointed at something else here: it was deleted when the convert margin was merged
+ * into the shared {@code loans.liquidation.profit-margin-lovelace}. That key <b>does</b> have an
+ * {@code application.yaml} placeholder ({@code AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE}), so it
+ * was always out of this file's scope by construction — its env name is spelled out in the file
+ * rather than inferred, which is the whole distinction this test exists to police.
+ *
+ * <p>⇒ <b>That mapping is an assumption a whole chart rests on, and until now nothing in this repo
+ * measured it.</b> A catalogue that told a chart author to write
+ * {@code LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION} and was wrong about the
+ * dash handling would produce a value that binds nowhere and reports nothing — the same silence as
+ * an unset key.
+ *
+ * <p>The property source here is a <b>real {@link SystemEnvironmentPropertySource}</b> over a map of
+ * UPPERCASE names, which is the exact class Spring Boot installs for the process environment. Nothing
+ * is pre-lowercased and no property alias is supplied: if the mapping did not hold, these go red.
+ */
+class EnvironmentVariableBindingTest {
+
+    @Configuration
+    @EnableConfigurationProperties
+    @Import({AppConfig.LiquidationConfiguration.class, AppConfig.MarketProperties.class,
+            AppConfig.ConvertConfiguration.class, AppConfig.CompoundConfiguration.class,
+            AppConfig.Network.class})
+    static class Beans {
+    }
+
+    /** A runner whose environment carries {@code env} as the process environment would. */
+    private static ApplicationContextRunner withEnv(Map<String, Object> env) {
+        return new ApplicationContextRunner()
+                .withInitializer(ctx -> {
+                    StandardEnvironment environment = (StandardEnvironment) ctx.getEnvironment();
+                    environment.getPropertySources().addFirst(new SystemEnvironmentPropertySource(
+                            StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME, env));
+                })
+                .withUserConfiguration(Beans.class)
+                // ⚠ The convert block and the config asset name carry NO inline default as of
+                // 2026-09-09 — application.yaml is their only home (§57.12). A synthetic context
+                // does not read that file, so it must state them, exactly as a node's configuration
+                // must. This is the intended behaviour: a context that omits them does not start.
+                // THREE convert keys are left to state: `profit-margin-lovelace` was deleted the same
+                // day, merged into the shared loans.liquidation.profit-margin-lovelace, and
+                // `minswap-order-cost-lovelace` was added when the Minswap order's ada became an
+                // explicit configurable expense.
+                .withPropertyValues("loans.enabled=true", "network=preview",
+                        "loans.config.asset-name=706172616d6574657273",
+                        "loans.liquidation.profit-margin-lovelace=5000000",
+                        "loans.liquidation.convert.enabled=true",
+                        "loans.liquidation.convert.dex-cost-floor-lovelace=5000000",
+                        "loans.liquidation.convert.minswap-order-cost-lovelace=4000000");
+    }
+
+    /**
+     * ⚠ <b>Renamed this round</b> — these four keys now carry an explicit {@code application.yaml}
+     * placeholder each (see the class javadoc's correction), so "no yaml placeholder" no longer
+     * describes them. Kept as regression coverage for the relaxed-binding mechanism itself: each is
+     * named the way a chart would have to name it if its placeholder line were ever removed again,
+     * and asserted to reach the bean that reads it.
+     */
+    @Test
+    void theseFourKeysAreReachableThroughRelaxedEnvironmentBindingRegardlessOfTheirYamlPlaceholder() {
+        withEnv(Map.of(
+                "LOANS_LIQUIDATION_CONVERT_ENABLED", "false",
+                "LOANS_LIQUIDATION_CONVERT_DEX_COST_FLOOR_LOVELACE", "4000000",
+                "LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION",
+                "56840ffb07ca0ad4e1eb921695bad5d2719f838612008e13bfe7f775933a7def#0"))
+                .run(ctx -> {
+                    assertFalse(ctx.getStartupFailure() != null,
+                            () -> "context failed: " + ctx.getStartupFailure());
+
+                    var convert = ctx.getBean(AppConfig.ConvertConfiguration.class);
+                    assertFalse(convert.isEnabled(),
+                            "LOANS_LIQUIDATION_CONVERT_ENABLED=false must override the default TRUE — "
+                                    + "this is the global off switch, and an operator who wants no "
+                                    + "conversions anywhere has no other way to say so");
+                    assertEquals(BigInteger.valueOf(4_000_000), convert.getDexCostFloorLovelace());
+
+                    var liquidation = ctx.getBean(AppConfig.LiquidationConfiguration.class);
+                    var refs = liquidation.getReferenceScripts();
+                    assertNotNull(refs.lmLiquidateAndConvertAction(),
+                            "the ninth reference-script slot is the ONLY one with no "
+                                    + "AQUARIUM_LIQUIDATION_REF_* placeholder in application.yaml, so "
+                                    + "relaxed env binding is its only route in");
+                    assertEquals(0, refs.lmLiquidateAndConvertAction().getIndex());
+                    assertEquals("56840ffb07ca0ad4e1eb921695bad5d2719f838612008e13bfe7f775933a7def",
+                            refs.lmLiquidateAndConvertAction().getTransactionId());
+                });
+    }
+
+    /**
+     * ⛔ {@code NETWORK} — the one value that decides which chain this node acts on — binds from a
+     * real environment variable. Asserted for both networks, so a default cannot make it pass.
+     */
+    @Test
+    void theTargetNetworkBindsFromTheEnvironmentAndIsTheOnlyNetworkValue() {
+        for (String target : new String[]{"mainnet", "preview", "preprod"}) {
+            new ApplicationContextRunner()
+                    .withInitializer(ctx -> ((StandardEnvironment) ctx.getEnvironment())
+                            .getPropertySources().addFirst(new SystemEnvironmentPropertySource(
+                                    StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                                    Map.of("NETWORK", target))))
+                    .withUserConfiguration(Beans.class)
+                    // Same reason as withEnv(): the no-default keys have no home but the yaml.
+                    .withPropertyValues("loans.enabled=true",
+                            "loans.config.asset-name=706172616d6574657273",
+                        "loans.liquidation.profit-margin-lovelace=5000000",
+                            "loans.liquidation.convert.enabled=true",
+                            "loans.liquidation.convert.dex-cost-floor-lovelace=5000000",
+                            "loans.liquidation.convert.minswap-order-cost-lovelace=4000000")
+                    .run(ctx -> assertEquals(target, ctx.getBean(AppConfig.Network.class).getNetwork(),
+                            "NETWORK must reach the bean: it is the only thing that decides where "
+                                    + "this node submits, and a value that binds nowhere points a "
+                                    + "node at the wrong chain with no error"));
+        }
+    }
+
+    /**
+     * The market list — an object list, so the chart needs INDEXED names. This is the shape a values
+     * file has to render, and getting the index syntax wrong yields an empty list rather than an
+     * error, i.e. "convert everywhere at the node mode" silently.
+     */
+    @Test
+    void theMarketListBindsFromIndexedEnvironmentVariableNames() {
+        withEnv(Map.of(
+                "LOANS_LIQUIDATION_MARKETS_0_UNIT", "lovelace",
+                "LOANS_LIQUIDATION_MARKETS_0_ACTION", "ANTICIPATE",
+                "LOANS_LIQUIDATION_MARKETS_0_CAP", "30000000",
+                "LOANS_LIQUIDATION_MARKETS_0_MODE", "SHADOW"))
+                .run(ctx -> {
+                    assertFalse(ctx.getStartupFailure() != null,
+                            () -> "context failed: " + ctx.getStartupFailure());
+                    var markets = ctx.getBean(AppConfig.LiquidationConfiguration.class).getMarkets();
+                    assertEquals(1, markets.size(),
+                            "an unbound market list is EMPTY, not an error — the failure mode is the "
+                                    + "node silently converting everywhere instead of anticipating");
+                    assertEquals("lovelace", markets.getFirst().getUnit());
+                    assertEquals(AppConfig.LiquidationConfiguration.Action.ANTICIPATE,
+                            markets.getFirst().getAction());
+                    assertEquals(BigInteger.valueOf(30_000_000), markets.getFirst().getCap());
+                });
+    }
+
+    /**
+     * ⚠ <b>Casing and dashes on the enum-valued keys.</b> The catalogue tells a chart author what to
+     * write, and "it must be UPPERCASE" would be a rule invented rather than measured. The node mode
+     * is compared with {@code equalsIgnoreCase} in {@code parseMode()}; the per-market {@code mode}
+     * and {@code action} go through Spring's lenient enum converter. Both accept either case, so the
+     * catalogue can say so instead of imposing a superstition.
+     */
+    @ParameterizedTest
+    @CsvSource({"shadow,SHADOW", "SHADOW,shadow", "Shadow,ShAdOw", "live,LIVE"})
+    void enumValuedKeysAreCaseInsensitiveOnBothTheNodeModeAndTheMarketMode(String nodeMode,
+                                                                          String marketMode) {
+        withEnv(Map.of(
+                "AQUARIUM_LIQUIDATION_MODE", nodeMode,
+                "LOANS_LIQUIDATION_MARKETS_0_UNIT", "lovelace",
+                "LOANS_LIQUIDATION_MARKETS_0_MODE", marketMode))
+                .withPropertyValues("loans.liquidation.mode=" + nodeMode)
+                .run(ctx -> {
+                    assertFalse(ctx.getStartupFailure() != null,
+                            () -> "context failed for node '" + nodeMode + "' / market '" + marketMode
+                                    + "': " + ctx.getStartupFailure());
+                    var cfg = ctx.getBean(AppConfig.LiquidationConfiguration.class);
+                    assertEquals(nodeMode.toUpperCase(), cfg.getMode().name());
+                    assertEquals(marketMode.toUpperCase(), cfg.getMarkets().getFirst().getMode().name());
+                });
+    }
+
+    /**
+     * ⛔ The mutation that proves the harness: an unrecognised mode must ABORT STARTUP. If the env
+     * name did not bind at all, this value would never be seen and the context would come up on the
+     * default {@code disabled} — green, and meaningless.
+     */
+    @Test
+    void anUnrecognisedModeFailsTheContextRatherThanDefaultingQuietly() {
+        withEnv(Map.of())
+                .withPropertyValues("loans.liquidation.mode=shadowy")
+                .run(ctx -> {
+                    assertNotNull(ctx.getStartupFailure(),
+                            "a typo'd mode must fail the context, not resolve to a safe-looking default");
+                    assertTrue(ctx.getStartupFailure().getMessage() != null
+                                    && ctx.getStartupFailure().getMessage().contains("shadowy")
+                            || rootMessage(ctx.getStartupFailure()).contains("shadowy"),
+                            "the failure must name the offending value: "
+                                    + rootMessage(ctx.getStartupFailure()));
+                });
+    }
+
+    private static String rootMessage(Throwable t) {
+        Throwable cursor = t;
+        StringBuilder all = new StringBuilder();
+        while (cursor != null) {
+            all.append(cursor.getMessage()).append(" | ");
+            cursor = cursor.getCause();
+        }
+        return all.toString();
+    }
+}

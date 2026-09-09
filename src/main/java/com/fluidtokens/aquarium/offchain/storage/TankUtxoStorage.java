@@ -9,15 +9,19 @@ import com.bloxbean.cardano.yaci.store.utxo.storage.impl.UtxoStorageImpl;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.UtxoId;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.TxInputRepository;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
+import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.ParametersContractService;
 import com.fluidtokens.aquarium.offchain.service.StakerContractService;
 import com.fluidtokens.aquarium.offchain.service.TankContractService;
 import lombok.extern.slf4j.Slf4j;
 import org.jooq.DSLContext;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.PlatformTransactionManager;
 
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 @Repository
 @Slf4j
@@ -25,7 +29,7 @@ public class TankUtxoStorage extends UtxoStorageImpl {
 
     private final UtxoRepository utxoRepository;
 
-    private final List<String> contractPaymentPkh;
+    private final Set<String> contractPaymentPkh;
 
     public TankUtxoStorage(UtxoRepository utxoRepository,
                            TxInputRepository spentOutputRepository,
@@ -35,15 +39,30 @@ public class TankUtxoStorage extends UtxoStorageImpl {
                            Account account,
                            ParametersContractService parametersContractService,
                            StakerContractService stakerContractService,
-                           TankContractService tankContractService) {
+                           TankContractService tankContractService,
+                           ObjectProvider<LoansContractRegistry> loansContractRegistry) {
         super(utxoRepository, spentOutputRepository, dsl, utxoCache, platformTransactionManager);
         this.utxoRepository = utxoRepository;
-        contractPaymentPkh = List.of(
+        var pkhs = new LinkedHashSet<>(List.of(
                 account.getBaseAddress().getPaymentCredentialHash().map(HexUtil::encodeHexString).get(),
                 parametersContractService.getScriptHashHex(),
                 stakerContractService.getScriptHashHex(),
                 tankContractService.getScriptHashHex()
-        );
+        ));
+        // ⛔ THE REGISTRY IS ALWAYS PRESENT NOW — `loans.enabled` was removed on 2026-09-04 and v4
+        // indexing is unconditional. What varies is whether it has COORDINATES: an unconfigured
+        // registry returns an EMPTY credential list, so a fresh install indexes the Aquarium set and
+        // nothing else. The ObjectProvider is kept because a test may still wire this class without
+        // one, not because the bean is conditional.
+        //
+        // ⚠ THIS SET IS BUILT ONCE, HERE, AND IT IS WHY THE FLAG HAD TO GO. `saveUnspent` drops
+        // everything not in it, at write time, leaving no trace the row was ever offered — while the
+        // cursor advances regardless. A credential added later therefore only ever sees blocks from
+        // that moment on; the ones that passed meanwhile are unrecoverable short of a cursor delete
+        // and a full re-sync. A filter that narrows at startup is a filter that loses history.
+        loansContractRegistry.ifAvailable(loans -> pkhs.addAll(loans.indexedPaymentCredentials()));
+        this.contractPaymentPkh = Set.copyOf(pkhs);
+        log.info("Indexing UTxOs for {} payment credentials: {}", contractPaymentPkh.size(), contractPaymentPkh);
     }
 
     @Override
