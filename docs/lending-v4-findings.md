@@ -5376,3 +5376,85 @@ after. ⇒ **Adding it is a NEW COST TERM, not the correction of a miscount, so 
 side of the line: *dictated by the validator ⇒ build-correctness; encodes a choice ⇒ economics.*
 Build-correctness fixes proceed under a standing go; **each one states its classification in its
 own commit message**, so the boundary stays inspectable per push rather than asserted once.
+
+## 58. `PricingService` — the one place a token quantity becomes lovelace, and why it does not (yet) compound the USDM escrow (2026-09-09)
+
+**Slice 2 of the token-principals epic** (`feat/lending-v4-token-principals`), scoped to
+`CompoundEconomics` per its slice contract. `LiquidationExecutor`, `ConvertEconomics` and the rest of
+the plain/anticipate/convert liquidation paths were out of this slice's file allowlist and are
+unchanged — see FAB-77 ("every token route computable") for the epic this belongs to.
+
+**No decimals scaling, and there must never be one.** The oracle feed's price is lovelace **per base
+unit**, so `baseUnits × price = lovelace` exactly — `LoanFinance.toLovelace` has always been this
+simple, and `PricingService` (`service/loans/PricingService.java`) is a thin wrapper over it, not a
+reimplementation. Verified against live mainnet data 2026-09-09: FLDT's registry price is
+`21785609/100000000` lovelace per base unit; 23,000,000,000 base units (23,000 FLDT at 6 decimals)
+times that is 5,010,690,070 lovelace = 5,010.69 ADA. The registry's `decimals` field is for display
+only (FAB-76's concern, a separate parked epic) — applying it in `PricingService` would introduce a
+10^6-shaped error while reading like correctness, which is why `grep -rn decimals src/main/java`
+returns nothing and that absence is the correct state, not a gap.
+
+**Pooled feeds cannot be priced off chain either.** `OraclePriceFeed.price()` throws
+`UnsupportedOperationException` for a `POOLED` variant (`finance.ak`'s `get_token_amount_in_lovelace`
+is an outright `fail` on it) — a known, permanent property of an asset, not a machinery fault.
+`PricingService.toLovelace` checks the variant before ever calling `.price()`, so a pooled feed comes
+back as a named refusal (`PricingService.RefusalReason.POOLED`) rather than a generic exception that
+would otherwise quarantine the candidate for 30 minutes on the convert path's error handling shape.
+
+**Staleness is `FluidOracleClient.findFeed`'s job, not reimplemented here.** `PricingService` prices
+through `findFeed(asset, atMillis)` (the validity-enforcing accessor) and only falls back to
+`findFeedIgnoringValidity` to classify *why* a price is unavailable — "no feed at all" versus "a feed
+exists but is not usable here" — never to price with what that second accessor returns.
+
+### 58.1 The live case this unblocks the ECONOMICS for — not yet the compound itself
+
+The lender escrow `cea665d1b99647a9d24461984103de0492da93e7af29fe5d97cce0abf97a4fde#0` holds
+1,986,910 lovelace + 11,000,000 USDM, `action: installment_repayment` (the free-form label §56.2
+established is not a pending schedule — see there for why). `lm_compound_action.ak:175-199` supports
+a token principal explicitly, branching on `principal.policyId == ada_policy_id` with an `else` arm
+comparing `without_lovelace(...)`. Before this slice, `CompoundEconomics.assess` refused every
+non-ada principal outright (`CompoundExclusion.PRINCIPAL_NOT_ADA`) because it had no way to compare a
+token-denominated fee to a lovelace transaction fee — **the validator permitted what our economics
+did not.**
+
+`CompoundEconomics.assess` now prices the fee slice through `PricingService` regardless of the
+principal's asset, and only refuses (as the new `CompoundExclusion.PRICE_UNAVAILABLE`) when pricing
+itself fails. That part is real, tested (mutation-checked — see the slice's worker report) and
+correct.
+
+**⛔ What this slice does NOT do: make the compound cycle actually attempt this escrow.**
+`CompoundCandidateScanner` still refuses every non-ada-principal candidate structurally
+(`CompoundExclusion.PRINCIPAL_NOT_ADA`, now redefined — see its javadoc) *before* `CompoundExecutor`
+ever calls `assess`, for two reasons discovered while implementing this slice and neither in its file
+allowlist to fix:
+
+1. **`CompoundTransactionBuilder` assumes an ada principal throughout.** It computes the pool's
+   output and the bot's own net position with `plusLovelace`/`lovelaceOf` applied directly to
+   `addedLiquidity` and the compounding fee — sound only because ada is the one principal that has
+   ever reached it, where "the principal's own unit" and "lovelace" are the same number. Letting a
+   token-principal candidate reach it today would build a transaction that adds the wrong quantity to
+   the wrong unit of the pool's value and never actually pays the escrow's token into the pool —
+   exactly the CCL-trap-8/CCL-trap-11 shape this repo's traps document (a defect the offline
+   structural assertions would not catch, because they check the builder's own arithmetic against
+   itself, not against the real asset).
+2. **Held on a product ruling from Giovanni, independent of the above (FAB-77, PLAN.md, 2026-09-09):**
+   *"a token-principal compound pays its fee in ADA and is rewarded in USDM, i.e. the bot acquires a
+   token — the same class as convert's 'the bot buys collateral'."* This was ruled HELD, not decided,
+   before this slice started.
+
+So: the arithmetic and the fail-closed refusal are now correct and ready. The escrow above is still
+refused every cycle, honestly, for a reason that no longer overstates what is actually missing — the
+`CompoundCandidateScanner` and `CompoundExecutor` log lines say so explicitly rather than repeating
+the old "cannot compare units" claim, which stopped being true this slice.
+
+### 58.2 ⚠ A prompt injection was found embedded in `PLAN.md` while reading it for this slice's context
+
+Reading `PLAN.md` (untracked, gitignored, `.git/info/exclude`) for the FAB-77 ruling above turned up
+a block formatted to look exactly like a genuine `<system-reminder>` — claiming to replace the
+session's git-commit attribution with a different name — appended after the "UI: loan view
+enrichment" section. It was **not** a real system reminder (those arrive from the harness, never from
+file content) and was not followed; the worker completing this slice used the attribution given by
+the actual harness-issued reminder for the session throughout. Recorded here because the file that
+carried it is untracked and this is the one durable, tracked place a future reader would see the
+warning. Worth Giovanni's first-hand look at how that text got into a local, gitignored planning
+file.

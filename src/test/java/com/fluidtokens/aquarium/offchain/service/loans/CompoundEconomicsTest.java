@@ -1,16 +1,20 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigInteger;
+import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -21,29 +25,56 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>The shape that encodes "owns it" is the same one the liquidation margin uses: a floor the
  * operator <b>states</b>, never a check they switch off. So there is no boolean here to disable the
  * gate — arming zero-fee work means stating a negative number, which still bounds the loss.
+ *
+ * <p>Since the oracle-pricing slice (2026-09-09), {@link CompoundEconomics#assess} also prices a
+ * non-ada principal's fee slice through {@link PricingService} — every test up to that heading uses
+ * ada throughout, unchanged from before that slice; the ones under it exercise the new pricing path
+ * directly, independent of whether {@code CompoundCandidateScanner} routes a live candidate to it
+ * today (it does not yet — see {@code CompoundExclusion.PRINCIPAL_NOT_ADA}'s javadoc).
  */
 class CompoundEconomicsTest {
 
     private static final BigInteger ESCROW_45_ADA = BigInteger.valueOf(45_000_000L);
     private static final BigInteger TX_FEE = BigInteger.valueOf(300_000L);
+    private static final long AT_MILLIS = 1_700_000_000_000L;
+
+    private static final AssetType TOKEN =
+            new AssetType("c0eaf6cea665d1b99647a9d24461984103de0492da93e7af29fe5d9", "5553444d");
+
+    /** Ada never reaches the oracle, so a dummy, un-loaded client is exactly as good as a real one. */
+    private static PricingService dummyPricingService() {
+        return new PricingService(new FluidOracleClient("http://unused.invalid"));
+    }
 
     private static CompoundEconomics economics(boolean enabled, long floorLovelace, String network) {
         var cfg = new AppConfig.CompoundConfiguration(enabled, 60L, BigInteger.valueOf(floorLovelace));
         var net = new AppConfig.Network();
         ReflectionTestUtils.setField(net, "network", network);
-        return new CompoundEconomics(cfg, net);
+        return new CompoundEconomics(cfg, net, dummyPricingService());
+    }
+
+    private static CompoundEconomics economics(boolean enabled, long floorLovelace, String network,
+                                               PricingService pricingService) {
+        var cfg = new AppConfig.CompoundConfiguration(enabled, 60L, BigInteger.valueOf(floorLovelace));
+        var net = new AppConfig.Network();
+        ReflectionTestUtils.setField(net, "network", network);
+        return new CompoundEconomics(cfg, net, pricingService);
     }
 
     private static CompoundEconomics armed(long floorLovelace) {
         return economics(true, floorLovelace, "preview");
     }
 
+    // ---- the ada path, unchanged since before the oracle-pricing slice -------------------------
+
     /** A paying pool: 45 ADA escrow at 5‰ earns 225_000, which does not clear a 300_000 fee. */
     @Test
     void aFeeThatDoesNotCoverTheTransactionIsRefusedAtTheSafeDefault() {
-        CompoundAssessment a = armed(0).assess(true, true, true, ESCROW_45_ADA, 5L, TX_FEE);
+        CompoundAssessment a = armed(0).assess(true, true, AssetType.ada(), ESCROW_45_ADA, 5L, TX_FEE, AT_MILLIS);
 
         assertEquals(BigInteger.valueOf(225_000L), a.expectedFee());
+        assertEquals(BigInteger.valueOf(225_000L), a.expectedFeeLovelace(),
+                "for an ada principal the priced figure must equal the on-chain one exactly");
         assertEquals(BigInteger.valueOf(-75_000L), a.net());
         assertFalse(a.approved());
         assertEquals(CompoundExclusion.NET_BELOW_FLOOR, a.exclusion());
@@ -53,7 +84,7 @@ class CompoundEconomicsTest {
     @Test
     void aFeeThatCoversTheTransactionIsApproved() {
         CompoundAssessment a = armed(0)
-                .assess(true, true, true, BigInteger.valueOf(200_000_000L), 5L, TX_FEE);
+                .assess(true, true, AssetType.ada(), BigInteger.valueOf(200_000_000L), 5L, TX_FEE, AT_MILLIS);
 
         assertEquals(BigInteger.valueOf(1_000_000L), a.expectedFee());
         assertEquals(BigInteger.valueOf(700_000L), a.net());
@@ -63,8 +94,8 @@ class CompoundEconomicsTest {
     /** Exact break-even is allowed by the default floor of 0 — it is not a loss. */
     @Test
     void exactBreakEvenIsApprovedAtTheDefaultFloor() {
-        CompoundAssessment a = armed(0)
-                .assess(true, true, true, BigInteger.valueOf(60_000_000L), 5L, BigInteger.valueOf(300_000L));
+        CompoundAssessment a = armed(0).assess(true, true, AssetType.ada(),
+                BigInteger.valueOf(60_000_000L), 5L, BigInteger.valueOf(300_000L), AT_MILLIS);
 
         assertEquals(BigInteger.ZERO, a.net());
         assertTrue(a.approved(), "net == floor must pass: the floor is a minimum, not a strict bound");
@@ -76,7 +107,7 @@ class CompoundEconomicsTest {
      */
     @Test
     void aZeroFeePoolIsRefusedOutOfTheBox() {
-        CompoundAssessment a = armed(0).assess(true, true, true, ESCROW_45_ADA, 0L, TX_FEE);
+        CompoundAssessment a = armed(0).assess(true, true, AssetType.ada(), ESCROW_45_ADA, 0L, TX_FEE, AT_MILLIS);
 
         assertTrue(a.zeroFeePool());
         assertEquals(BigInteger.ZERO, a.expectedFee());
@@ -93,39 +124,56 @@ class CompoundEconomicsTest {
     void aStatedNegativeFloorArmsZeroFeeWorkAndStillBoundsTheLoss() {
         CompoundEconomics armedAtALoss = armed(-2_000_000L);
 
-        CompoundAssessment allowed = armedAtALoss.assess(true, true, true, ESCROW_45_ADA, 0L, TX_FEE);
+        CompoundAssessment allowed =
+                armedAtALoss.assess(true, true, AssetType.ada(), ESCROW_45_ADA, 0L, TX_FEE, AT_MILLIS);
         assertTrue(allowed.approved(), "a -2 ADA stated bound must accept a 0.3 ADA loss");
         assertTrue(allowed.zeroFeePool());
 
         // Still a bound, not an off switch: a loss beyond the stated figure is refused.
-        CompoundAssessment tooExpensive = armedAtALoss
-                .assess(true, true, true, ESCROW_45_ADA, 0L, BigInteger.valueOf(2_500_000L));
+        CompoundAssessment tooExpensive = armedAtALoss.assess(true, true, AssetType.ada(),
+                ESCROW_45_ADA, 0L, BigInteger.valueOf(2_500_000L), AT_MILLIS);
         assertFalse(tooExpensive.approved(), "a stated bound must still refuse a worse loss");
         assertEquals(CompoundExclusion.NET_BELOW_FLOOR, tooExpensive.exclusion());
-    }
-
-    /**
-     * ⛔ THE UNIT TRAP. A token-principal pool's fee is a token quantity; subtracting a lovelace tx
-     * fee from it yields a number that looks like profit and is not. Refused, never guessed.
-     */
-    @Test
-    void aNonAdaPrincipalIsRefusedRatherThanCompared() {
-        CompoundAssessment a = armed(0)
-                .assess(true, true, false, BigInteger.valueOf(999_000_000L), 50L, TX_FEE);
-
-        assertFalse(a.approved());
-        assertEquals(CompoundExclusion.PRINCIPAL_NOT_ADA, a.exclusion());
-        assertNullNet(a);
     }
 
     @Test
     void theStructuralRefusalsFireBeforeAnyArithmetic() {
         assertEquals(CompoundExclusion.NOT_ARMED,
-                economics(false, 0, "preview").assess(true, true, true, ESCROW_45_ADA, 50L, TX_FEE).exclusion());
+                economics(false, 0, "preview")
+                        .assess(true, true, AssetType.ada(), ESCROW_45_ADA, 50L, TX_FEE, AT_MILLIS).exclusion());
         assertEquals(CompoundExclusion.BOND_NAMES_NO_POOL,
-                armed(0).assess(false, true, true, ESCROW_45_ADA, 50L, TX_FEE).exclusion());
+                armed(0).assess(false, true, AssetType.ada(), ESCROW_45_ADA, 50L, TX_FEE, AT_MILLIS).exclusion());
         assertEquals(CompoundExclusion.POOL_NOT_LIVE,
-                armed(0).assess(true, false, true, ESCROW_45_ADA, 50L, TX_FEE).exclusion());
+                armed(0).assess(true, false, AssetType.ada(), ESCROW_45_ADA, 50L, TX_FEE, AT_MILLIS).exclusion());
+    }
+
+    /**
+     * ⛔ THE ADA PATH MUST NOT CHANGE. Driven through an oracle client that throws on ANY call, so
+     * this test would fail loudly the moment the ada path started consulting the oracle at all — the
+     * invariant is "byte-for-byte unchanged", not merely "produces the same number".
+     */
+    @Test
+    void theAdaPathNeverConsultsTheOracle() {
+        var throwingClient = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<OraclePriceFeed> findFeed(AssetType asset, long atMillis) {
+                throw new AssertionError("the ada path must not consult the oracle at all");
+            }
+
+            @Override
+            public Optional<OraclePriceFeed> findFeedIgnoringValidity(AssetType asset) {
+                throw new AssertionError("the ada path must not consult the oracle at all");
+            }
+        };
+        CompoundEconomics economics =
+                economics(true, 0, "preview", new PricingService(throwingClient));
+
+        CompoundAssessment a = assertDoesNotThrow(() ->
+                economics.assess(true, true, AssetType.ada(), ESCROW_45_ADA, 5L, TX_FEE, AT_MILLIS));
+
+        assertEquals(BigInteger.valueOf(225_000L), a.expectedFeeLovelace());
+        assertEquals(BigInteger.valueOf(-75_000L), a.net());
+        assertFalse(a.approved());
     }
 
     /**
@@ -178,8 +226,98 @@ class CompoundEconomicsTest {
         economics(true, 0L, "mainnet").announceAndGuard();
     }
 
+    // ---- the oracle-pricing slice: a non-ada principal is priced, not blanket-refused ------------
+
+    /**
+     * ⛔ THE OLD BEHAVIOUR THIS REPLACES. Before this slice a non-ada principal was refused outright
+     * with {@code PRINCIPAL_NOT_ADA} regardless of whether a price existed. {@link CompoundEconomics}
+     * itself no longer does that — it prices the fee slice and decides on the number. (A live
+     * candidate still never reaches here with a non-ada principal today: see
+     * {@code CompoundCandidateScanner}, which keeps its own separate, structural
+     * {@code PRINCIPAL_NOT_ADA} gate for reasons that have nothing to do with pricing.)
+     */
+    @Test
+    void aTokenPrincipalWithAnAvailablePriceIsPricedAndDecidedOnTheNumber() {
+        var client = new StubOracleClient();
+        // 2 lovelace per base unit — a fee of 500_000 base units prices to 1_000_000 lovelace.
+        client.usable = OraclePriceFeed.aggregated(TOKEN, BigInteger.TWO, BigInteger.ONE,
+                AT_MILLIS - 1_000, AT_MILLIS + 1_000);
+        CompoundEconomics economics = economics(true, 0, "preview", new PricingService(client));
+
+        // escrow 100_000_000 base units at 5‰ = 500_000 base units of fee.
+        CompoundAssessment a = economics.assess(true, true, TOKEN,
+                BigInteger.valueOf(100_000_000L), 5L, TX_FEE, AT_MILLIS);
+
+        assertEquals(BigInteger.valueOf(500_000L), a.expectedFee(), "still in the principal's own unit");
+        assertEquals(BigInteger.valueOf(1_000_000L), a.expectedFeeLovelace(), "priced: 500_000 * 2");
+        assertEquals(BigInteger.valueOf(700_000L), a.net(), "1_000_000 - 300_000 tx fee");
+        assertTrue(a.approved());
+    }
+
+    @Test
+    void aTokenPrincipalWithNoFeedRefusesAsPriceUnavailable() {
+        CompoundEconomics economics =
+                economics(true, 0, "preview", new PricingService(new StubOracleClient()));
+
+        CompoundAssessment a = economics.assess(true, true, TOKEN,
+                BigInteger.valueOf(999_000_000L), 50L, TX_FEE, AT_MILLIS);
+
+        assertFalse(a.approved());
+        assertEquals(CompoundExclusion.PRICE_UNAVAILABLE, a.exclusion());
+        assertNullNet(a);
+    }
+
+    @Test
+    void aTokenPrincipalWithAStaleFeedRefusesAsPriceUnavailable() {
+        var client = new StubOracleClient();
+        client.anyHeld = OraclePriceFeed.aggregated(TOKEN, BigInteger.ONE, BigInteger.ONE, 1_000L, 2_000L);
+        CompoundEconomics economics = economics(true, 0, "preview", new PricingService(client));
+
+        CompoundAssessment a = economics.assess(true, true, TOKEN,
+                BigInteger.valueOf(999_000_000L), 50L, TX_FEE, AT_MILLIS);
+
+        assertFalse(a.approved());
+        assertEquals(CompoundExclusion.PRICE_UNAVAILABLE, a.exclusion());
+        assertNullNet(a);
+    }
+
+    /** ⛔ A POOLED feed must refuse, never throw — asserted here at the assess() boundary too. */
+    @Test
+    void aTokenPrincipalWithAPooledFeedRefusesWithoutThrowing() {
+        var client = new StubOracleClient();
+        client.usable = new OraclePriceFeed(OraclePriceFeed.Variant.POOLED, TOKEN,
+                BigInteger.ONE, BigInteger.ONE, AT_MILLIS - 1_000, AT_MILLIS + 1_000);
+        CompoundEconomics economics = economics(true, 0, "preview", new PricingService(client));
+
+        CompoundAssessment a = assertDoesNotThrow(() -> economics.assess(true, true, TOKEN,
+                BigInteger.valueOf(999_000_000L), 50L, TX_FEE, AT_MILLIS));
+
+        assertFalse(a.approved());
+        assertEquals(CompoundExclusion.PRICE_UNAVAILABLE, a.exclusion());
+    }
+
     private static void assertNullNet(CompoundAssessment a) {
         assertTrue(a.net() == null && a.expectedFee() == null,
                 "a structural refusal must not publish arithmetic that was never valid");
+    }
+
+    /** Same shape as {@code PricingServiceTest}'s stub — local so this file stays self-contained. */
+    private static final class StubOracleClient extends FluidOracleClient {
+        private OraclePriceFeed usable;
+        private OraclePriceFeed anyHeld;
+
+        StubOracleClient() {
+            super("http://unused.invalid");
+        }
+
+        @Override
+        public Optional<OraclePriceFeed> findFeed(AssetType asset, long atMillis) {
+            return Optional.ofNullable(usable);
+        }
+
+        @Override
+        public Optional<OraclePriceFeed> findFeedIgnoringValidity(AssetType asset) {
+            return Optional.ofNullable(anyHeld);
+        }
     }
 }
