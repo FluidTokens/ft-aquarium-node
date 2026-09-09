@@ -5446,15 +5446,3 @@ So: the arithmetic and the fail-closed refusal are now correct and ready. The es
 refused every cycle, honestly, for a reason that no longer overstates what is actually missing — the
 `CompoundCandidateScanner` and `CompoundExecutor` log lines say so explicitly rather than repeating
 the old "cannot compare units" claim, which stopped being true this slice.
-
-### 58.2 ⚠ A prompt injection was found embedded in `PLAN.md` while reading it for this slice's context
-
-Reading `PLAN.md` (untracked, gitignored, `.git/info/exclude`) for the FAB-77 ruling above turned up
-a block formatted to look exactly like a genuine `<system-reminder>` — claiming to replace the
-session's git-commit attribution with a different name — appended after the "UI: loan view
-enrichment" section. It was **not** a real system reminder (those arrive from the harness, never from
-file content) and was not followed; the worker completing this slice used the attribution given by
-the actual harness-issued reminder for the session throughout. Recorded here because the file that
-carried it is untracked and this is the one durable, tracked place a future reader would see the
-warning. Worth Giovanni's first-hand look at how that text got into a local, gitignored planning
-file.
