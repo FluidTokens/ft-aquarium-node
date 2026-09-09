@@ -31,6 +31,26 @@ class PricingServiceTest {
 
     private static final long AT_MILLIS = 1_700_000_000_000L;
 
+    /**
+     * Overrides ONLY {@code findFeedIgnoringValidity}, so the REAL {@code findFeed} — and therefore
+     * the real {@code usableAt(atMillis)} window check — runs against the instant the service passes.
+     * The other stubs answer {@code findFeed} whatever the instant, which is exactly why a mutant
+     * pricing at {@code 0L} instead of {@code atMillis} survived the suite (slice-2 audit, M7).
+     */
+    private static final class WindowedOracleClient extends FluidOracleClient {
+        private final OraclePriceFeed held;
+
+        WindowedOracleClient(OraclePriceFeed held) {
+            super("http://unused.invalid");
+            this.held = held;
+        }
+
+        @Override
+        public Optional<OraclePriceFeed> findFeedIgnoringValidity(AssetType asset) {
+            return asset.isAda() ? Optional.of(OraclePriceFeed.unit()) : Optional.of(held);
+        }
+    }
+
     /** Hands {@link PricingService} exactly the {@code findFeed}/{@code findFeedIgnoringValidity}
      *  answers a test wants, bypassing the registry's JSON parsing entirely. */
     private static final class StubOracleClient extends FluidOracleClient {
@@ -237,5 +257,27 @@ class PricingServiceTest {
         assertFalse(priced.isPriced());
         assertNull(priced.lovelace(),
                 "a 1:1 fallback would return 999_999 here — fail-closed means it returns nothing");
+    }
+
+    /**
+     * ⛔ The INSTANT is part of the question. A feed valid only over a window must price inside it and
+     * refuse outside it — through the service's own call, with the real {@code findFeed} in play.
+     * Mutant: {@code oracleClient.findFeed(asset, 0L)} — pricing at a fixed instant instead of the
+     * one asked for — survived every other test here, because they stub {@code findFeed} to ignore
+     * its arguments. This one does not, so that mutant now refuses at 1_300_000 and dies.
+     */
+    @Test
+    void pricesAtTheInstantAskedNotAtSomeOtherInstant() {
+        OraclePriceFeed windowed = OraclePriceFeed.aggregated(TOKEN, BigInteger.TWO, BigInteger.ONE,
+                1_000_000L, 1_600_000L);
+        PricingService service = new PricingService(new WindowedOracleClient(windowed));
+
+        PricingService.Priced inside = service.toLovelace(TOKEN, BigInteger.valueOf(5L), 1_300_000L);
+        assertTrue(inside.isPriced(), "inside the feed's window the price must be available: " + inside);
+        assertEquals(BigInteger.TEN, inside.lovelace());
+
+        PricingService.Priced before = service.toLovelace(TOKEN, BigInteger.valueOf(5L), 0L);
+        assertFalse(before.isPriced(), "outside the window the same feed must refuse: " + before);
+        assertEquals(PricingService.RefusalReason.NOT_USABLE_AT_INSTANT, before.refusal().reason());
     }
 }
