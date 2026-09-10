@@ -49,9 +49,52 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>Read-only; gated on {@code BLOCKFROST_KEY}. The recorded datum is checked against the live chain
  * rather than trusted, because a recording is only safe when something derived independently is
  * compared against it — this suite has now had two config datums age out from under it.
+ *
+ * <h2>⛔ PARKED — FAB-86, ruling of 2026-09-10. The failure is the FIXTURE'S ABSENCE.</h2>
+ * <ol>
+ *   <li>The pool manager NFT this class pins — {@code getPoolManagerPolicyId() +
+ *       0046337bd27d65a63574039b6293da11701ed2da01bcfaf626c18cccbe} — <b>is no longer held by any
+ *       address</b>, so {@link #theOnlyLiveMainnetPoolManagerStillPublishesAZeroCompoundingFee()}
+ *       fails at <i>"the pool manager NFT has vanished"</i> with the key present. That is a <b>stale
+ *       fixture, not a code fault</b>: nothing in this repo decides whether a pool manager stays
+ *       minted. <b>Do not "repair" it.</b></li>
+ *   <li>That measurement is not a side note here, it is the class's <em>thesis</em>. The whole point
+ *       of the file, said in its own words above, is to keep "there is finally something to
+ *       compound" apart from "compounding it is worth doing" — and the second half is answered
+ *       <em>only</em> by reading the live pool manager's {@code compoudingFeePerMille}. With that
+ *       NFT gone the fee cannot be read at all, so
+ *       {@link #atTheShippedMarginTheOnlyMainnetPoolWouldRefuseThisEscrow()} would still pass while
+ *       having stopped being a fact about mainnet — a green test asserting a number nothing on chain
+ *       supplies any more. The park is class-level for that reason: the remaining tests are not
+ *       independently meaningful once the measurement behind them is gone.</li>
+ *   <li>Re-enabling takes a <b>live mainnet pool manager to read the fee from</b>, and its unit
+ *       written in below in place of the dead one. The two immutable-history tests
+ *       ({@link #aRealRepaymentEscrowExistsAtTheAssetManagerCredential()} and
+ *       {@link #theEscrowNamesTheLenderBondOfTheRepaidLoan()}) come back with it; the repayment
+ *       transaction they read is history and cannot expire.</li>
+ * </ol>
+ * The dead unit is left pinned on purpose — it records what was last measured on mainnet, so
+ * re-enabling means replacing it consciously rather than inheriting it.
+ *
+ * <h3>Why a second gate rather than {@code @Disabled}</h3>
+ * The CI run summary lists, for every class that did not run, the environment variables it was
+ * waiting for. Under {@code @Disabled} this class would still scan as <em>"waiting on
+ * BLOCKFROST_KEY"</em> — a deliberate park reported as a rig waiting for a credential — and
+ * {@code disabledReason} never reaches the JUnit XML, which leaves a bare {@code <skipped/>} and the
+ * gate NAME as the only thing an operator ever reads. A second gate named
+ * {@code AQUARIUM_COMPOUND_RIG_POOL_MANAGER} makes that line say what is actually missing. It is
+ * deliberately <b>not</b> defined in any {@code .env.*} file, and {@code EnvGatedRigReachabilityTest}
+ * carries a narrow, named exemption for this class that keeps it that way.
  */
 @EnabledIfEnvironmentVariable(named = "BLOCKFROST_KEY", matches = ".+",
         disabledReason = "reads mainnet: run with `set -a; . ./.env.mainnet; set +a`")
+@EnabledIfEnvironmentVariable(named = "AQUARIUM_COMPOUND_RIG_POOL_MANAGER", matches = ".+",
+        disabledReason = "FAB-86, parked 2026-09-10: the pinned pool manager NFT "
+                + "…0046337bd27d65a63574039b6293da11701ed2da01bcfaf626c18cccbe is held by no address "
+                + "any more, so the live fee this class exists to measure cannot be read. That is a "
+                + "STALE FIXTURE, not a code fault — do not repair it. Re-enable only with a live "
+                + "mainnet pool manager whose compoudingFeePerMille can actually be read; without "
+                + "one, the refusal test still passes but has stopped being a fact about mainnet.")
 class MainnetCompoundEscrowTest {
 
     private static final String CONFIG_POLICY_ID = "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416";
