@@ -3481,6 +3481,48 @@ class LiquidationExecutorTest {
     }
 
     /**
+     * ⛔ <b>F1 — A WALLET TOO SMALL IS A VERDICT ABOUT THE WALLET, NOT A BROKEN BOT.</b>
+     *
+     * <p>Round-1 audit: mutant M12 — neuter this catch so the exception falls to the generic
+     * {@code catch (Exception)} and its 30-minute machinery quarantine — killed <b>0 of 1062</b>
+     * tests. The catch existed, behaved correctly, and nothing held it there; reordering the ladder
+     * (the refactor r1 flags as "tempting, separate slice") would have silently restored pre-slice
+     * behaviour.
+     *
+     * <p>⚠ The operator can top the wallet up between cycles, so holding this for thirty minutes
+     * keeps refusing a convert that has already become fundable. Same treatment the pay-in-advance
+     * path gives its own {@code WalletInputTooSmallException}.
+     *
+     * <p>The THROW side is pinned separately, in {@code ConvertLiquidationRouterTest} — a fake router
+     * can prove what the executor does with the exception and nothing about whether it is ever raised.
+     */
+    @Test
+    void aWalletTooSmallForTheConvertOrderIsRecordedAndNeverQuarantined() {
+        ConvertWiring wiring = convertWiringThrowing(
+                new ConvertLiquidationRouter.WalletInputTooSmallException(
+                        "no nominable wallet utxo can fund this convert: the Minswap order carries "
+                                + "4000000 lovelace (the order overhead; the collateral is a token)"));
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = wiring.log().newestFirst(10).getFirst();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+        assertEquals("WALLET_INPUT_TOO_SMALL", decision.reason(),
+                "recorded under its own name, not under the exception class the generic catch uses");
+        assertTrue(decision.detail().contains("4000000"),
+                "the operator needs the figure to fund against: " + decision.detail());
+        assertEquals(0, wiring.executor().quarantinedCount(),
+                "a wallet the operator can top up between cycles must not be held for 30 minutes");
+        assertTrue(wiring.executor().quarantinedRefs().isEmpty(),
+                "and the quarantine map must be untouched, not merely small");
+
+        // Reconsidered on the very next cycle — which is what "not held" has to mean to be worth it.
+        wiring.executor().cycle(NOW + 1_000L);
+        assertEquals(2, wiring.router().calls,
+                "a topped-up wallet must be retried immediately, not after a machinery quarantine");
+    }
+
+    /**
      * The resolver's OTHER refusals are facts about the chain — reproducible next cycle and unaffected
      * by waiting — so they are verdicts, held no longer than any other verdict. Only
      * {@code LOOKUP_FAILED} is transport.
