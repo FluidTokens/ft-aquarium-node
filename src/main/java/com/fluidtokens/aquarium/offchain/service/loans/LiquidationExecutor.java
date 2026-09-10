@@ -740,13 +740,30 @@ public class LiquidationExecutor {
         //
         // Nothing is loosened for LIVE: a liquidation still cannot be built without a wallet input,
         // and the refusal is now explicit and counted rather than a silent early return.
-        List<Utxo> walletUtxos = nominableWalletUtxos();
-        if (walletUtxos.isEmpty()) {
+        List<Utxo> allWalletUtxos = appUtxoService.listWalletUtxo();
+        if (nominableWalletUtxos(allWalletUtxos).isEmpty()) {
             log.warn("{} buildable candidate(s) found but no ada-only wallet utxo is available, so "
                     + "none can be built; the scan above is still a complete record of what was seen "
                     + "and priced", buildable.size());
             return;
         }
+        // ⛔ F3/F7 (round 2) — THE FULL WALLET, NOT THE GATE'S OWN ADA-ONLY SUBSET.
+        //
+        // nominableWalletUtxos() above answers ONE question — "is there an ada-only utxo to fund
+        // ANYTHING with at all" — and that gate is correct to keep: every liquidation, whatever its
+        // principal, needs one for the fee/collateral input. But before this fix its FILTERED RESULT
+        // was what got threaded through the rest of this method, and every multi-asset (token-
+        // carrying) wallet utxo was gone before nominate() or the principal-balance sum ever ran. A
+        // TOKEN-PRINCIPAL candidate's market-gate balance was therefore ALWAYS zero, and no wallet
+        // utxo the operator could ever fund would change that — the USDM-funded bot in this ticket's
+        // own motivating scenario could not have been fixed by F0 alone.
+        //
+        // WalletInputSelection's own functions each filter for their OWN purpose already —
+        // `nominable` (ada-only) for the fee/collateral path, `nominableForToken` for the
+        // token-principal one, both applied downstream (nominate(), the principal-balance sum,
+        // collateralGate, walletDiagnosis) — so handing them the UNFILTERED wallet is what makes each
+        // one see what it is actually looking for.
+        List<Utxo> walletUtxos = allWalletUtxos;
         // T-052 — the fee ceiling every liquidation must cover regardless of its shape. The
         // principal-repaying path adds its lender payout on top; the fee-only path needs nothing more,
         // which is the whole point: it must not be made to demand an input sized for the other case.
@@ -981,6 +998,16 @@ public class LiquidationExecutor {
                                 .map(LedgerCeilings::lovelaceOf).reduce(BigInteger.ZERO, BigInteger::add)
                         : walletUtxos.stream()
                                 .filter(u -> WalletInputSelection.nominableForToken(u, payInAdvancePrincipal))
+                                // ⛔ F7 (round 2) — count ONLY utxos the selector could actually pick.
+                                // nominableForToken alone says "carries the token, no datum, no
+                                // reference script" — it says NOTHING about whether the utxo also
+                                // carries enough ada to fund a build, so a 2,000 USDM + 1.4 ADA utxo
+                                // passed it and inflated the balance MarketGate saw by a candidate the
+                                // wallet could never actually fund (M13). requiredAda mirrors
+                                // nominate()'s own formula exactly — the same figure the SELECTOR this
+                                // balance is supposed to describe is bound by.
+                                .filter(u -> LedgerCeilings.lovelaceOf(u).compareTo(feeCeiling
+                                        .orElse(BigInteger.ZERO).add(TOKEN_PRINCIPAL_MIN_ADA_CEILING)) >= 0)
                                 .map(u -> WalletInputSelection.tokenQuantityOf(u, payInAdvancePrincipal))
                                 .reduce(BigInteger.ZERO, BigInteger::add);
                 transaction = payInAdvanceRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
@@ -1032,20 +1059,33 @@ public class LiquidationExecutor {
                 // lets a reader tell the two triggers apart.
                 //
                 // ⛔ AND THE REMEDY IS CONDITIONAL, because only ONE of the two triggers has one.
-                // "Set this market to CONVERT" is sound advice for a non-ada principal — the convert
+                // "Set this market to CONVERT" is routable advice for a non-ada principal — the convert
                 // router genuinely supports one (it resolves a collateral/principal pool and prices the
-                // principal leg through its own feed). It is WRONG advice for non-positive equity,
-                // which says nothing about the mechanism and everything about this loan right now.
+                // principal leg through its own feed). It is WRONG advice for a negative equity, which
+                // says nothing about the mechanism and everything about this loan right now.
                 // ⚠ And the cost of the wrong advice is not a wasted cycle: `action` is a MARKET-level
                 // setting keyed by principal asset, so taking it re-routes EVERY loan in that market
                 // away from pay-in-advance. The substitution between these two mechanisms is the one
                 // this file already calls "the one substitution that spends money nobody authorised".
                 // An equity-sign refusal must never be the reason an operator makes it.
+                //
+                // ⛔ REMEDY WORDING (Machine Owner ruling, 2026-09-09) — "routable" is not "profitable".
+                // For the live USDM loan the FLDT/USDM Minswap pool returns ~827M against a 980M
+                // minimum_receive: a convert order there would build, submit, and REFUND — it does not
+                // fill the debt. Until PR3's POOL_TOO_THIN pre-check exists, the remedy must carry that
+                // caveat rather than read as an unconditional fix.
+                // ⚠ On feat/token-principals the router's outright non-ada-principal refusal no longer
+                // exists (6d8427f), and F0 (round 2) means the negative-equity trigger this fires from
+                // is unreachable in practice (LoanFinance.redeemerEquity floors it to zero) — so this
+                // branch is a rare, defence-in-depth line here. `main` still carries the outright
+                // non-ada refusal, and this wording lands there via PR2's merge — so the conditional
+                // shape (and its pair test) stays intact rather than being simplified away.
                 String principalUnit = assessment.loan().datum().principalAsset().toUnit();
                 String remedy = assessment.loan().datum().principalAsset().isAda()
                         ? ""
                         : "; this market's principal is not ada — if it should still be liquidated, set "
-                                + "its action to CONVERT so Minswap fronts the principal instead";
+                                + "its action to CONVERT — only if a Minswap pool can fill the debt; a "
+                                + "thin pool refunds rather than fills";
                 log.info("the pay-in-advance liquidation of {} (principal {}) was refused: {} — not "
                                 + "quarantined, reconsidered every cycle{}",
                         loanUtxoRef, principalUnit, e.getMessage(), remedy);
@@ -1267,44 +1307,70 @@ public class LiquidationExecutor {
         // FIX 1/FIX 2: the floors test this margin-EXCLUDED number; the margin is applied separately.
         BigInteger floorProfit = expectedFee.subtract(txFee).subtract(minAdaFunded);
 
-        // ⛔ ECONOMICS GATE — the pay-in-advance TOKEN OUTLAY, token-principals slice.
+        // ⛔ ECONOMICS GATE — THE REAL TRADE, token-principals slice, F1 (round 2).
         //
         // ada principal: PricingService.toLovelace is the IDENTITY for ada (no oracle lookup at all),
         // and this branch is scoped to a NON-ada principal specifically, so the ada gate's arithmetic
-        // is UNCHANGED — pin it. Before this, nothing subtracted the pay-in-advance payout at all: for
-        // ada that is correct (the ada paid out and the collateral value received are the same mark,
-        // through the SAME oracle feed used to build the transaction, so they cancel and only the fee
-        // slice is real profit). For a TOKEN principal that cancellation is NOT guaranteed here: this
-        // gate prices the outlay through PricingService's OWN, independently-sourced feed — which can
-        // disagree with the oracle feed the validator actually priced the transaction against — so it
-        // must be subtracted as a real, separately-priced cost rather than assumed away.
+        // is UNCHANGED — pin it. For ada the ada paid out and the collateral value received are the
+        // same mark, through the SAME oracle feed used to build the transaction, so they cancel and
+        // floorProfit above (fee slice - tx fee - min-ada) already is the real number — untouched here.
         //
-        // Direction: PricingService.toLovelace ROUNDS FLOOR (its own javadoc: correct for pricing
-        // EARNED amounts, which is what expectedFee above is). Applied to an OUTLAY, floor would
-        // UNDERSTATE the cost and flatter the bot — the wrong direction for a number being subtracted.
-        // So the outlay is taken at floor()+1: a cheap, always-safe correction to the ceiling side
-        // (never below the true value; at most one lovelace above it) without needing Rational's own
-        // ceil() through a code path PricingService does not expose.
+        // For a TOKEN principal that cancellation is NOT guaranteed: F1 found that the PREVIOUS fix
+        // subtracted the outlay ALONE against expectedFee (the liquidation-fee SLICE, a small number),
+        // which is arithmetically always negative — pinned mainnet figures 200,427,602 lovelace fee
+        // slice minus a 4,789,432,924-lovelace outlay is -4,591 ADA on a genuinely profitable trade.
+        // The missing term was the CREDIT for what the bot actually acquires: the FULL collateral
+        // share it takes (collateralAmount - equity, fee included — LiquidatePayInAdvanceTransaction
+        // Builder's own botCollateral, S-15's named output), not just the liquidationFee slice.
+        //
+        // floorProfit is therefore REPLACED (not added to) for this branch: acquired - outlay - txFee
+        // - riders, exactly the plain path's shape (fee slice - txFee - riders) with "fee slice"
+        // widened to the REAL trade this path actually makes. Both acquired and outlay are priced
+        // through PricingService, at the SAME instant (`now`) — never mixed with collateralFeed above,
+        // which is a DIFFERENT, validator-pinned source that can disagree with PricingService's own.
+        //
+        // Direction: PricingService.toLovelace ROUNDS FLOOR — correct for acquired (an EARNED amount)
+        // and WRONG for the outlay, where floor would UNDERSTATE the cost and flatter the bot. So the
+        // outlay alone is taken at floor()+1 (outlayCeilBiased): a cheap, always-safe correction to the
+        // ceiling side (never below the true value; at most one lovelace above it).
         String tokenOutlayDetail = "";
         if (isPayInAdvanceRoute(assessment)) {
             AssetType payInAdvancePrincipal = assessment.loan().datum().principalAsset();
             if (!payInAdvancePrincipal.isAda()) {
                 BigInteger payout = payInAdvanceAmountPaid(transaction, payInAdvancePrincipal);
+                AssetType collateralAsset = assessment.loan().datum().collateral().assetType();
+                BigInteger acquiredQuantity = assessment.loan().collateralAmount().subtract(assessment.equity());
                 FluidOracleClient client = oracleClient.getIfAvailable();
                 if (client == null) {
-                    String priceDetail = ("PRICE_UNAVAILABLE: no oracle client bean, so the pay-in-advance "
-                            + "outlay of %s %s cannot be priced into lovelace")
-                            .formatted(payout, payInAdvancePrincipal.toUnit());
+                    String priceDetail = ("PRICE_UNAVAILABLE: no oracle client bean, so neither the "
+                            + "acquired collateral (%s %s) nor the pay-in-advance outlay (%s %s) can be "
+                            + "priced into lovelace").formatted(acquiredQuantity, collateralAsset.toUnit(),
+                            payout, payInAdvancePrincipal.toUnit());
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
                             "PRICE_UNAVAILABLE", priceDetail));
                     log.info("the pay-in-advance liquidation of {} was refused: {}",
                             assessment.loan().utxoRef(), priceDetail);
                     return;
                 }
-                PricingService.Priced priced = new PricingService(client)
-                        .toLovelace(payInAdvancePrincipal, payout, now);
-                if (!priced.isPriced()) {
-                    PricingService.PriceRefusal refusal = priced.refusal();
+                PricingService pricingService = new PricingService(client);
+                PricingService.Priced pricedAcquired = pricingService.toLovelace(collateralAsset,
+                        acquiredQuantity, now);
+                if (!pricedAcquired.isPriced()) {
+                    PricingService.PriceRefusal refusal = pricedAcquired.refusal();
+                    String priceDetail = ("PRICE_UNAVAILABLE: cannot price the acquired collateral of "
+                            + "%s %s into lovelace — %s (feed window [%s,%s], age %sms at %s)").formatted(
+                            acquiredQuantity, collateralAsset.toUnit(), refusal.reason(),
+                            refusal.feedValidFrom(), refusal.feedValidTo(), refusal.feedAgeMillis(), now);
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
+                            "PRICE_UNAVAILABLE", priceDetail));
+                    log.info("the pay-in-advance liquidation of {} was refused: {}",
+                            assessment.loan().utxoRef(), priceDetail);
+                    return;
+                }
+                PricingService.Priced pricedOutlay = pricingService.toLovelace(payInAdvancePrincipal,
+                        payout, now);
+                if (!pricedOutlay.isPriced()) {
+                    PricingService.PriceRefusal refusal = pricedOutlay.refusal();
                     String priceDetail = ("PRICE_UNAVAILABLE: cannot price the pay-in-advance outlay of "
                             + "%s %s into lovelace — %s (feed window [%s,%s], age %sms at %s)").formatted(
                             payout, payInAdvancePrincipal.toUnit(), refusal.reason(),
@@ -1315,10 +1381,19 @@ public class LiquidationExecutor {
                             assessment.loan().utxoRef(), priceDetail);
                     return;
                 }
-                BigInteger tokenOutlayLovelace = outlayCeilBiased(priced.lovelace());
-                floorProfit = floorProfit.subtract(tokenOutlayLovelace);
-                tokenOutlayDetail = " - token outlay %s %s (%s lovelace, ceil-biased)"
-                        .formatted(payout, payInAdvancePrincipal.toUnit(), tokenOutlayLovelace);
+                BigInteger acquiredLovelace = pricedAcquired.lovelace();
+                BigInteger tokenOutlayLovelace = outlayCeilBiased(pricedOutlay.lovelace());
+                // REPLACES floorProfit — expectedFee (the fee-slice-only figure) is not part of this
+                // trade's real economics; acquiredLovelace already includes it (botCollateral =
+                // collateralAmount - equity, the FULL share, fee included).
+                floorProfit = acquiredLovelace.subtract(tokenOutlayLovelace).subtract(txFee).subtract(minAdaFunded);
+                // The fee-slice number the OUTER detail line below is about to print is not this
+                // trade's real economics (F1) — REPLACED means exactly that: ignore "fee slice .. =
+                // floor" for this candidate and read this bracket instead.
+                tokenOutlayDetail = (" [REPLACED (F1, token principal): acquired %s %s (%s lovelace) - "
+                        + "outlay %s %s (%s lovelace, ceil-biased)]")
+                        .formatted(acquiredQuantity, collateralAsset.toUnit(), acquiredLovelace,
+                                payout, payInAdvancePrincipal.toUnit(), tokenOutlayLovelace);
             }
         }
 
@@ -1809,13 +1884,28 @@ public class LiquidationExecutor {
         //
         // ⇒ The discriminator is now the ROUTING'S OWN — the same MarketGate call, on the same loan —
         // rather than a proxy for it. A proxy that was true when written is exactly what drifted.
+        //
+        // ⛔ F2 (round 2) — IDENTIFY THE RIDER BY ROLE, NEVER BY "TOKEN-BEARING AT MY ADDRESS".
+        // "carriesTokens" above (2026-09-05's fix) narrowed the SCOPE (which routes) but not the
+        // PREDICATE (which outputs), and the predicate is what a token-principal candidate breaks: the
+        // wallet utxo funding the lender's principal payout can carry MORE of that principal (e.g.
+        // USDM) than the payout needs, and the leftover comes back as the bot's own CHANGE at the same
+        // address — a token-bearing output that is not S-15's collateral rider at all. "carriesTokens"
+        // cannot tell the two apart, so it counted the bot's own returning USDM as an expense.
+        //
+        // The S-15 rider is identified by what it actually IS: the output the builder pays the
+        // ACQUIRED COLLATERAL to, by name (LiquidatePayInAdvanceTransactionBuilder's named collateral
+        // output). Filtering on the COLLATERAL asset specifically — never "any asset" — is filtering by
+        // ROLE: a principal-token change output does not carry the collateral asset (a single loan has
+        // exactly one collateral type), so it can never be mistaken for the rider, regardless of how
+        // much of the principal happens to ride along in the bot's own wallet input.
         if (isPayInAdvanceRoute(assessment)) {
+            AssetType collateralAsset = assessment.loan().datum().collateral().assetType();
             BigInteger rider = BigInteger.ZERO;
             for (TransactionOutput output : transaction.getBody().getOutputs()) {
                 boolean mine = account != null && account.baseAddress().equals(output.getAddress());
-                boolean carriesTokens = output.getValue().getMultiAssets() != null
-                        && !output.getValue().getMultiAssets().isEmpty();
-                if (mine && carriesTokens) {
+                boolean isTheCollateralRider = quantityOf(output, collateralAsset).signum() > 0;
+                if (mine && isTheCollateralRider) {
                     rider = rider.add(output.getValue().getCoin());
                 }
             }
@@ -1961,9 +2051,18 @@ public class LiquidationExecutor {
      * long as it sat in the wallet — and a refusal is not quarantined, so nothing would ever break
      * the loop out of it. Filtering it out here costs one clause; not filtering it costs the slice
      * its entire output, with no symptom louder than a repeated refusal reason.
+     * <p>
+     * ⛔ <b>THIS IS A GATE, NOT A SELECTION LIST — its RETURN VALUE must never be threaded through the
+     * rest of a cycle (F3, round 2).</b> It used to be: {@code cycle()} called this with no argument,
+     * fetched the wallet itself, filtered to ada-only, and handed that ada-only subset to everything
+     * downstream — including the token-principal balance sum and {@code nominate()}'s token branch.
+     * Every multi-asset (token-carrying) wallet utxo was therefore gone before either ever ran, so a
+     * token-principal candidate's market-gate balance was ALWAYS zero regardless of what the wallet
+     * actually held — discovered writing the first executor-level test to fund one for real. The
+     * caller now passes the wallet in (fetched once) and keeps the UNFILTERED list for everything
+     * else; this method now answers only "is there at least one ada-only utxo to fund ANYTHING with".
      */
-    private List<Utxo> nominableWalletUtxos() {
-        List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
+    private List<Utxo> nominableWalletUtxos(List<Utxo> walletUtxos) {
         if (walletUtxos.isEmpty()) {
             log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
             return List.of();
@@ -2023,6 +2122,30 @@ public class LiquidationExecutor {
     private Optional<Utxo> nominate(List<Utxo> walletUtxos, Optional<BigInteger> feeCeiling,
                                     AssetType principal, BigInteger extraOutlay, String loanUtxoRef) {
         if (principal != null && !principal.isAda() && extraOutlay.signum() > 0) {
+            // ⛔ F8 (round 2) — WHICH RIDERS requiredAda COVERS, AND WHICH IT DOES NOT.
+            //
+            // requiredAda = feeCeiling + TOKEN_PRINCIPAL_MIN_ADA_CEILING covers the fee ceiling PLUS
+            // ONE rider: the min-ada on the LENDER's own converted output. It does NOT sum the S-15
+            // collateral rider (the bot's own acquired-collateral output — measured 1,176,630 lovelace
+            // on the pinned rig) or the change output's own min-ada. Measured together those riders
+            // exceed what a bare 2 ADA ceiling covers.
+            //
+            // That is a DELIBERATE reliance on CCL's balancer, not an oversight: ReferenceScriptSafe
+            // UtxoSelection's own selector (wired in LiquidatePayInAdvanceTransactionBuilder#complete)
+            // picks MORE ada-only wallet utxos automatically whenever the nominated one falls short
+            // during balancing — the exact mechanism trap 21 / T-050 already rely on for the plain
+            // path's fee. It only holds when the wallet actually CARRIES ada-only headroom besides the
+            // token-carrying utxo nominated here, so a wallet that does not is logged rather than
+            // discovered for the first time at build failure.
+            long adaOnlySpares = walletUtxos.stream().filter(WalletInputSelection::nominable).count();
+            if (adaOnlySpares < 2) {
+                log.warn("{} nominates a token-principal wallet utxo with only {} ada-only utxo(s) "
+                                + "besides it; the S-15 collateral rider and the change output's own "
+                                + "min-ada are funded by CCL's balancer picking MORE of them during "
+                                + "build, not by requiredAda here — fund at least 2 ada-only utxos "
+                                + "alongside the {} wallet utxo to be safe",
+                        loanUtxoRef, adaOnlySpares, principal.toUnit());
+            }
             BigInteger requiredAda = feeCeiling.orElse(BigInteger.ZERO).add(TOKEN_PRINCIPAL_MIN_ADA_CEILING);
             Optional<Utxo> chosen = WalletInputSelection.smallestSufficientToken(
                     walletUtxos, principal, extraOutlay, requiredAda);

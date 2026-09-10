@@ -292,6 +292,29 @@ class MarketGateTest {
         assertEquals(n(500_000_000), d.anticipatable(), "min(balance, cap) with an ample balance is the cap");
     }
 
+    /**
+     * F6 (round 2) — THE ORDERING THAT ACTUALLY DISTINGUISHES THE TWO REFUSALS: {@code balance < cap
+     * < required}. The sibling test above ({@code aBalanceAboveTheCapStillRefusesAsAboveMarketCap...})
+     * has {@code balance >= cap}, so {@code balance.compareTo(cap) < 0} was already false there under
+     * the PRE-FIX code too — it could not have caught a mutant that checked the balance-vs-cap
+     * ordering instead of the cap-vs-required one. Here the balance is BELOW the cap (100M < 500M)
+     * AND the cap is itself below the requirement (500M < 600M): the cap is the binding constraint
+     * regardless of the balance, so the refusal must be {@code ABOVE_MARKET_CAP}, never {@code
+     * INSUFFICIENT_BALANCE} — "fund the wallet" would be true but useless advice when the cap itself
+     * could never have covered the requirement.
+     */
+    @Test
+    void aCapBelowTheRequirementRefusesAsAboveMarketCapEvenWhenTheBalanceIsAlsoBelowTheCap() {
+        MarketGate.Decision d = gate(Mode.LIVE, market(TOKEN.toUnit(), Mode.LIVE, Action.ANTICIPATE, 500_000_000L))
+                .decide(TOKEN, n(600_000_000), n(100_000_000));
+
+        assertFalse(d.allowed());
+        assertEquals(MarketGate.Refusal.ABOVE_MARKET_CAP, d.refusal(),
+                "the cap is below the requirement, so it is the binding constraint — the balance being "
+                        + "ALSO short must not relabel this as INSUFFICIENT_BALANCE");
+        assertEquals(n(100_000_000), d.anticipatable(), "min(balance, cap) with balance the smaller of the two");
+    }
+
     // ---- startup validation ------------------------------------------------------------------------
 
     /**

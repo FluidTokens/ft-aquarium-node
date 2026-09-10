@@ -173,14 +173,22 @@ public final class MarketGate {
         // nomination was the de-facto balance check; on a token path there was none at all.
         BigInteger anticipatable = balance.min(cap);
         if (anticipatable.compareTo(required) < 0) {
-            boolean balanceLimited = balance.compareTo(cap) < 0;
-            Refusal why = balanceLimited ? Refusal.INSUFFICIENT_BALANCE : Refusal.ABOVE_MARKET_CAP;
-            String detail = balanceLimited
-                    ? ("market %s holds %s %s, needs %s to front this candidate (cap %s)")
-                            .formatted(unit, balance, unit, required, cap)
-                    : ("market %s is capped at %s but this candidate requires %s to be fronted; the "
+            // F6 (round 2) — CHECK THE CAP FIRST. `balance.compareTo(cap) < 0` alone conflates two
+            // independent facts: it is true whenever the cap ITSELF is already below what the
+            // protocol requires (required > cap), regardless of the balance, because a balance that
+            // is merely "less than an insufficient cap" says nothing about whether the wallet could
+            // have funded it. The two refusals demand OPPOSITE operator responses ("raise the cap" vs
+            // "fund the wallet"), so the cap — the binding constraint whenever it is the smaller one —
+            // must be checked BEFORE any balance reasoning. Only when the cap WOULD allow this
+            // candidate (cap >= required) does a shortfall mean the balance itself is what is short.
+            boolean capItselfInsufficient = cap.compareTo(required) < 0;
+            Refusal why = capItselfInsufficient ? Refusal.ABOVE_MARKET_CAP : Refusal.INSUFFICIENT_BALANCE;
+            String detail = capItselfInsufficient
+                    ? ("market %s is capped at %s but this candidate requires %s to be fronted; the "
                             + "protocol does not allow fronting part of a loan, so it is refused "
-                            + "rather than reduced").formatted(unit, cap, required);
+                            + "rather than reduced").formatted(unit, cap, required)
+                    : ("market %s holds %s %s, needs %s to front this candidate (cap %s)")
+                            .formatted(unit, balance, unit, required, cap);
             return new Decision(anticipatable, required, cap, why, detail);
         }
         return new Decision(anticipatable, required, cap, null,

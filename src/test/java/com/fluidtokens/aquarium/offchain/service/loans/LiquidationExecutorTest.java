@@ -291,6 +291,16 @@ class LiquidationExecutorTest {
         public Collection<OracleEntry> entries() {
             return entries;
         }
+
+        // F1 (round 2) — findEntry is what PricingService actually calls (never entries()); it is
+        // keyed by the PRICED asset (entry.token()), never the oracle NFT (entry.oracleToken(), which
+        // is the OTHER lookup, findEntryByOracleToken's). No existing test before this round drove a
+        // convert candidate's economics far enough to need this — see
+        // LiquidationExecutorTest#tokenPrincipalConvertEconomicsWiring, the first to.
+        @Override
+        public Optional<OracleEntry> findEntry(AssetType token) {
+            return entries.stream().filter(e -> e.token().equals(token)).findFirst();
+        }
     }
 
     /**
@@ -829,6 +839,42 @@ class LiquidationExecutorTest {
                     BigInteger.valueOf(REMAINING_DEBT), BigInteger.valueOf(EQUITY), false,
                     BigInteger.valueOf(LIQUIDATION_FEE));
         }
+
+        /**
+         * F0 (round 2) — the frozen loan with a custom datum, and an assessment whose {@code equity}
+         * field is set to {@code assessedEquity} for the router's PRECONDITION check only. The router
+         * recomputes the REAL equity fresh from {@code loan(datum).datum()} + the oracle feed via
+         * {@code builder.numbers()} — {@code assessedEquity} never reaches the built transaction, so a
+         * caller proving a specific built shape must ALSO make {@code datum} compute to the same figure.
+         */
+        static LiquidationAssessment assessment(LoanDatum datum, BigInteger assessedEquity) {
+            return LiquidationAssessment.buildable(bond(), loan(datum), "f855 convert fixture (custom)",
+                    BigInteger.valueOf(REMAINING_DEBT), assessedEquity, false,
+                    BigInteger.valueOf(LIQUIDATION_FEE));
+        }
+
+        static Loan loan(LoanDatum datum) {
+            return new Loan(LOAN_TX, LOAN_INDEX, LOAN_ADDRESS, LOAN_ID,
+                    BigInteger.valueOf(COLLATERAL_AMOUNT), BigInteger.valueOf(LOAN_LOVELACE), datum);
+        }
+
+        /**
+         * F0 (round 2) — {@link #loanDatum()} with ONLY {@code principalAmount}/{@code interestRate}
+         * tuned so the REAL computed equity lands on exactly zero against the FIXED {@code
+         * COLLATERAL_AMOUNT} and the FIXED oracle {@code PRICE} — the identical derivation
+         * {@code PayInAdvanceLiquidationRouterTest.equityZeroLoanDatum()} pins, because it is the same
+         * collateral amount and the same oracle price: solving {@code collateralInLovelace - D -
+         * 0.05·D = 0} for the ada-denominated debt {@code D} gives {@code D = 32,206,000} exactly.
+         */
+        static LoanDatum equityZeroLoanDatum() {
+            LoanDatum ada = loanDatum();
+            return new LoanDatum(ada.doneRecasts(), BigInteger.valueOf(32_206_000L), ada.lendDate(),
+                    ada.repaidInstallments(), BigInteger.ZERO, ada.totalInstallments(),
+                    ada.principalAsset(), ada.principalOracleAsset(), ada.installmentPeriod(),
+                    ada.initialGracePeriod(), ada.liquidationMode(), ada.repaymentMode(),
+                    ada.repaymentTimeWindow(), ada.penaltyFeeForLateRepayment(), ada.repaymentReceipts(),
+                    ada.originId(), ada.collateral());
+        }
     }
 
     /**
@@ -851,6 +897,18 @@ class LiquidationExecutorTest {
      * by the fixture.
      */
     private static Wiring convertWiring(ProtocolParamsSupplier payInAdvanceParams) {
+        return convertWiring(payInAdvanceParams, F855.assessment());
+    }
+
+    /**
+     * As above, with the {@link LiquidationAssessment} made explicit too — F0 (round 2)'s
+     * {@code equityZeroIsBuildableAndRecorded} swaps in {@link F855#assessment(LoanDatum)} against a
+     * tuned datum whose REAL computed equity (through {@code builder.numbers()}, never {@code
+     * assessment.equity()} — the router recomputes fresh from the loan's own datum) lands on exactly
+     * zero, while keeping the SAME oracle/wallet/config universe F855's other tests already prove.
+     */
+    private static Wiring convertWiring(ProtocolParamsSupplier payInAdvanceParams,
+                                        LiquidationAssessment assessment) {
         AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
 
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
@@ -864,7 +922,6 @@ class LiquidationExecutorTest {
         BlockEventListener blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(false);
 
-        LiquidationAssessment assessment = F855.assessment();
         FakeScanner scanner = new FakeScanner(List.of(assessment));
 
         Map<String, Utxo> unspent = new LinkedHashMap<>();
@@ -1756,25 +1813,35 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * (b) A convert assessment the seam cannot model — here a non-positive equity — is mapped to a
-     * clean {@code REFUSED} row under the router's own message, <b>not</b> quarantined and with no
-     * transaction built. The ada/ada convert fixture is under water, so its equity is exactly zero: the
-     * shape {@code PayInAdvanceLiquidationRouter} refuses before it ever calls the builder.
+     * (b) F0 (round 2) — REPURPOSED. This used to pin the ada/ada convert fixture's naturally-zero
+     * equity as a clean REFUSED row; it is exactly backwards now. {@code loan_claim_action.ak:240-259}
+     * accepts equity 0 outright — it is the validator's normal case and the common liquidation, so the
+     * seam must build it, not refuse it (see {@code equityZeroNowBuildsAndIsRecordedRatherThanRefused}
+     * below, which is what this test used to disprove).
+     * <p>
+     * What is STILL refused cleanly (never quarantined) is a genuinely NEGATIVE equity — unreachable
+     * through a real assessment ({@code LoanFinance.redeemerEquity} floors it to zero), so this
+     * overrides the assessment's equity field directly via {@link Scenario#withAssessment}, defence in
+     * depth for the router's own precondition rather than a scenario the loan/oracle data produces.
      */
     @Test
-    void aConvertAssessmentWithNonPositiveEquityIsRefusedNotQuarantined() {
+    void aNegativeEquityAssessmentIsRefusedNotQuarantined() {
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
         assertTrue(convert.bond().bond().datum().shouldLiquidationConvertToPrincipal(),
                 "the fixture must be a convert bond, or the executor would not route it");
-        assertEquals(BigInteger.ZERO, convert.assessment().equity(),
-                "the ada/ada fixture is under water: equity is zero, the non-positive shape the seam refuses");
+        LiquidationAssessment negativeEquity = LiquidationAssessment.buildable(
+                convert.assessment().bond(), convert.assessment().loan(),
+                "negative equity (defence in depth, unreachable through a real assessment)",
+                convert.assessment().remainingDebt(), BigInteger.valueOf(-1),
+                convert.assessment().late(), convert.assessment().liquidationFee());
+        convert = convert.withAssessment(negativeEquity);
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), convert, false);
         wiring.executor().cycle(NOW);
 
         LiquidationDecision decision = onlyDecision(wiring);
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
-        assertEquals("pay-in-advance not yet modelled for non-positive equity", decision.reason());
+        assertEquals("pay-in-advance not yet modelled for a negative equity", decision.reason());
         assertNull(decision.txHash(), "a clean not-modelled refusal builds no transaction");
         assertNull(decision.txCborHex());
         assertEquals(0, wiring.executor().quarantinedCount(),
@@ -1782,15 +1849,282 @@ class LiquidationExecutorTest {
     }
 
     /**
+     * F0 (round 2) — THE POSITIVE CASE, and the whole point of this round: an equity-0 convert loan
+     * (the live USDM loan's shape as of 2026-09-09) reaches {@code record()} and is priced, exactly
+     * like the positive-equity f855 loan {@code aBuildableConvertLoanIsRoutedAndRecordedButNeverSubmitted}
+     * already proves — never refused. {@link F855#equityZeroLoanDatum()} is tuned so
+     * {@code builder.numbers()} (which the router calls fresh, never trusting
+     * {@code assessment.equity()}) computes equity 0 against the SAME collateral amount and oracle
+     * price the rest of {@code F855}'s tests use.
+     * <p>
+     * Mutant: restoring the old equity {@code <= 0} refusal in the router makes this test fail (a
+     * REFUSED decision instead of a priced WOULD_SUBMIT/UNPROFITABLE one).
+     */
+    @Test
+    void equityZeroNowBuildsAndIsRecordedRatherThanRefused() {
+        LiquidationAssessment assessment = F855.assessment(F855.equityZeroLoanDatum(), BigInteger.ZERO);
+        Wiring wiring = convertWiring(LoanFixtures.protocolParams(), assessment);
+
+        wiring.executor().cycle(F855.NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertNotNull(decision.txHash(), decision.detail());
+        assertTrue(decision.outcome() == LiquidationDecision.Outcome.WOULD_SUBMIT
+                        || decision.outcome() == LiquidationDecision.Outcome.UNPROFITABLE,
+                "an equity-0 convert tx is priced, not refused: " + decision.outcome() + " " + decision.detail());
+        assertEquals(0, wiring.executor().quarantinedCount(), "a clean build is not quarantined (equityZero)");
+    }
+
+    // ======================================================================================
+    // F3 (round 2) — THE EXECUTOR-LEVEL SCENARIO: nominate -> gate -> announce -> economics, with a
+    // USDM+ada wallet AND a NON-UNIT principal feed. A 1:1 principal feed cannot distinguish the
+    // two-feed WALL-1 composition from the old one-feed shortcut (M1b/M8's escape), and an ada-only
+    // wallet cannot even reach the token nomination branch (M18) — this fixture is built specifically
+    // so it cannot pass by taking either shortcut.
+    // ======================================================================================
+
+    private static final AssetType PRINCIPAL_TOKEN_2 = new AssetType("d0".repeat(28), "5553444d");
+    private static final AssetType PRINCIPAL_TOKEN_2_ORACLE_NFT = new AssetType("d1".repeat(28), "555344"
+            + "4d4f5241434c45");
+    private static final String PRINCIPAL_TOKEN_2_CREDENTIAL = "d2".repeat(28);
+    private static final String TX_PRINCIPAL_ORACLE_NFT = "d3".repeat(32);
+    private static final String TX_PRINCIPAL_ORACLE_SCRIPT = "d4".repeat(32);
+    private static final String TX_PRINCIPAL_C3_PROVIDER = "d5".repeat(32);
+    private static final String TX_TOKEN_WALLET = "d6".repeat(32);
+
+    /**
+     * The fixture arithmetic, pinned by hand (collateralFeed = 50 lovelace/unit, principalFeed = 5
+     * lovelace/unit — deliberately NOT 1:1, and deliberately DIFFERENT from the collateral's price, so
+     * neither feed's ratio could stand in for the other by coincidence):
+     * <pre>
+     *   collateralAmount 1,000,000 TOK   -> collateralInLovelace   = 1,000,000 * 50 = 50,000,000
+     *   remainingDebt    2,000,000 USDM  -> remainingDebtInLovelace = 2,000,000 * 5 = 10,000,000
+     *   penalty (5%)                     -> 500,000
+     *   equityInLovelace = 50,000,000 - 10,000,000 - 500,000 = 39,500,000
+     *   equity (collateral currency)     = floor(39,500,000 / 50) = 790,000 TOK
+     *   liquidationFee (5%, bond's OWN rate) = floor(1,000,000 * 50 / 1000) = 50,000 TOK
+     *   collateralLenderShouldReceive    = 1,000,000 - 790,000 - 50,000 = 160,000 TOK
+     *   converted (WALL 1, two-feed)     = ceil(160,000 * 50 / 5) = 1,600,000 USDM
+     *   [the OLD one-feed shortcut would instead pay toLovelace(160,000, collFeed).ceil() =
+     *    8,000,000 USDM — 5x too much; this is M1b/M8's escape route, closed by using a non-1:1 feed]
+     *   botCollateral (S-15 rider)       = collateralAmount - equity = 1,000,000 - 790,000 = 210,000 TOK
+     *   acquired (F1)  = value(210,000 TOK)   = 210,000 * 50 = 10,500,000 lovelace
+     *   outlay   (F1)  = value(1,600,000 USDM) = 1,600,000 * 5 = 8,000,000 lovelace (+1, ceil-biased)
+     *   net before tx fee / riders = 10,500,000 - 8,000,001 = 2,499,999 lovelace
+     * </pre>
+     */
+    private static Scenario tokenPrincipalConvertEconomicsScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN_2, PRINCIPAL_TOKEN_2_ORACLE_NFT,
+                BigInteger.valueOf(2_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, ORACLE_TOKEN), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum, 2_000_000L,
+                List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), PRINCIPAL_TOKEN_2),
+                2_000_000L);
+
+        LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(),
+                principalFeed(), collateralFeed(), NOW);
+        return new Scenario(loan, bond, assessment);
+    }
+
+    private static OraclePriceFeed principalFeed() {
+        return OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN_2, BigInteger.valueOf(5), BigInteger.ONE,
+                NOW - 60_000L, NOW + 600_000L);
+    }
+
+    private static OracleEntry principalOracle() {
+        return LoanFixtures.charli3(PRINCIPAL_TOKEN_2, PRINCIPAL_TOKEN_2_ORACLE_NFT,
+                PRINCIPAL_TOKEN_2_CREDENTIAL, principalFeed(),
+                LoanFixtures.input(TX_PRINCIPAL_ORACLE_NFT, 0), LoanFixtures.input(TX_PRINCIPAL_ORACLE_SCRIPT, 0),
+                LoanFixtures.input(TX_PRINCIPAL_C3_PROVIDER, 0));
+    }
+
+    /**
+     * ⛔ F2's OWN scenario: 3,000,000 USDM in the wallet against a ~1,600,000 payout — the leftover
+     * ~1,400,000 comes back as the bot's own CHANGE, at the SAME address the S-15 collateral rider
+     * lands at, in a DIFFERENT asset (USDM, never the collateral token). A rider filter keyed on "any
+     * token at my address" cannot tell the two apart; one keyed on the COLLATERAL asset specifically
+     * can (F2).
+     */
+    private static final Utxo TOKEN_WALLET_UTXO = LoanFixtures.utxo(TX_TOKEN_WALLET, 0,
+            ACCOUNT.baseAddress(), List.of(
+                    Amount.lovelace(BigInteger.valueOf(60_000_000L)),
+                    Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(3_000_000L))),
+            null);
+
+    private static Wiring tokenPrincipalConvertEconomicsWiring() {
+        return tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, TOKEN_WALLET_UTXO));
+    }
+
+    /** As above, with the wallet contents made explicit — F7's own scenario overrides these. */
+    private static Wiring tokenPrincipalConvertEconomicsWiring(List<Utxo> walletUtxos) {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_500_000_000L)));
+
+        // No evaluator is wired (offline, non-evaluating build — the same shape
+        // theBuildPricesWithTheOracleSnapshotTheScanWasTakenWith uses), so reference inputs are
+        // declared by COORDINATE only (from the OracleEntry objects the CountingOracleProvider below
+        // hands out) and never fetched through the UtxoSupplier — the universe needs no physical
+        // oracle utxos at all.
+        Scenario convert = tokenPrincipalConvertEconomicsScenario();
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO,
+                convert.loan().utxo(), convert.bond().utxo()));
+        universe.addAll(walletUtxos);
+
+        LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+
+        FakeScanner scanner = new FakeScanner(List.of(convert.assessment()));
+        FakeResolver resolver = new FakeResolver(allUnspent(List.of(convert)));
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        CountingOracleProvider oracles = new CountingOracleProvider(
+                new FakeOracleClient(List.of(collateralOracle(), principalOracle())),
+                new FakeOracleClient(List.of(collateralOracle(), principalOracle())));
+
+        PayInAdvanceLiquidationRouter router = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver,
+                plainBuilder, router, LoanFixtures.registry(), log, oracles, previewNetwork(),
+                LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
+        return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
+    }
+
+    /**
+     * ⛔ THE WHOLE SCENARIO, end to end: M18 (nominate must pick the USDM+ada utxo, not fail on an
+     * ada-only one), M12 (the announce line must name USDM, never "ada"), M1b/M8 (the two-feed
+     * composition, not the one-feed shortcut — provable only because the principal feed is non-1:1),
+     * F1 (acquired credited, outlay debited — a real positive net, not the always-negative old
+     * formula), F2 (the wallet's own leftover USDM change is not counted as a rider).
+     */
+    @Test
+    void theExecutorLevelTokenPrincipalScenarioNominatesGatesAnnouncesAndPricesCorrectly() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring();
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertNotNull(decision.txHash(), "M18 — nominate() must pick the USDM+ada wallet utxo and "
+                + "actually build; got: " + decision.detail());
+
+        // ⛔ M18 — nominate() must ACTUALLY TAKE the token branch, named by its OWN nominated utxo and
+        // log shape. This is NOT provable by "the build succeeded" alone: cardano-client-lib's own
+        // balancer scans the whole wallet during balanceTx and will happily source the missing USDM
+        // from TOKEN_WALLET_UTXO even if nominate() itself picked the WRONG (ada-only) input — measured
+        // disabling the branch outright and finding every OTHER assertion in this test still passed.
+        // The nominate() log line is the only observable that actually pins WHICH utxo was chosen and
+        // by WHICH branch's logic (its message shape differs from the ada-only branch's).
+        boolean nominatedTheTokenUtxoByName = appender.list.stream()
+                .anyMatch(e -> e.getFormattedMessage().contains(TX_TOKEN_WALLET)
+                        && e.getFormattedMessage().contains("fee ceiling + min-ada rider"));
+        assertTrue(nominatedTheTokenUtxoByName, "nominate() must log choosing " + TX_TOKEN_WALLET
+                + " through its TOKEN branch (\"fee ceiling + min-ada rider\"), not fall through to the "
+                + "ada-only branch and rely on the balancer to paper over the wrong nomination: "
+                + appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList());
+
+        // M12 — the announce line must name USDM, never "ada", for a token principal.
+        boolean announcedTheToken = appender.list.stream()
+                .anyMatch(e -> e.getFormattedMessage().contains(PRINCIPAL_TOKEN_2.toUnit())
+                        && e.getFormattedMessage().contains("PAY-IN-ADVANCE"));
+        assertTrue(announcedTheToken, "the PAY-IN-ADVANCE announce line must name " + PRINCIPAL_TOKEN_2.toUnit()
+                + ", never \"ada\": " + appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList());
+
+        // F1/F2 — the economics detail carries the REPLACED bracket with the exact pinned figures.
+        String detail = decision.detail();
+        assertTrue(detail.contains("REPLACED (F1, token principal)"),
+                "a token-principal candidate must go through the REPLACED acquired/outlay economics: "
+                        + detail);
+        assertTrue(detail.contains("acquired 210000 " + COLLATERAL_TOKEN.toUnit() + " (10500000 lovelace)"),
+                "acquired must be the FULL botCollateral share (collateralAmount - equity), priced "
+                        + "through PricingService — M1b/M8 killed by this being the two-feed number: "
+                        + detail);
+        assertTrue(detail.contains("outlay 1600000 " + PRINCIPAL_TOKEN_2.toUnit() + " (8000001 lovelace"),
+                "outlay must be the two-feed WALL-1 payout (1,600,000 USDM, not the one-feed shortcut's "
+                        + "8,000,000), ceil-biased by exactly +1 (F1's second mutant, M7b): " + detail);
+
+        // ⛔ THE EXACT FLOOR, MEASURED AND PINNED — this is what makes F1's two mutants (dropping the
+        // acquired credit, or dropping the outlay's ceil-bias) and F2's (counting the USDM change as
+        // a rider) each change an OBSERVABLE number here, not just a bracket of text that could stay
+        // correct-looking while the real arithmetic drifted. Measured once (txFee 1,206,413, min-ada
+        // 2,245,350 — both protocol-param-derived and not hand-derivable), then pinned: floorProfit =
+        // 10,500,000 - 8,000,001 - 1,206,413 - 2,245,350 = -951,764. Note this is UNPROFITABLE at
+        // SMALL_MARGIN, which is itself informative: the OLD bug (subtracting the outlay alone against
+        // a puny fee slice) would have been far more negative still — this fixture does not need to
+        // clear a margin to prove the fix, only to prove the CORRECT number is being computed.
+        assertTrue(detail.contains("= floor -951764"),
+                "the exact pinned floorProfit — a mutant removing the acquired credit, weakening the "
+                        + "outlay's ceil-bias, or counting the USDM change as a rider each move this "
+                        + "number: " + detail);
+        assertEquals(LiquidationDecision.Outcome.UNPROFITABLE, decision.outcome(),
+                "pinned alongside the floor above — a routed convert tx is priced, not refused: " + detail);
+        assertEquals(0, wiring.executor().quarantinedCount(), "a clean build is not quarantined: " + detail);
+    }
+
+    /**
+     * F7 (round 2) — a token-carrying utxo with too little ada alongside it is NOT a candidate the
+     * selector could ever actually pick, so it must not count toward the balance {@link MarketGate}
+     * sees. 2,000 USDM base units against a bare 1.4 ADA — well short of {@code nominate()}'s own
+     * {@code requiredAda} (fee ceiling + {@code TOKEN_PRINCIPAL_MIN_ADA_CEILING}) — must be excluded
+     * entirely, so the gate sees balance ZERO, never 2,000. Kills M13 (balance summed over ALL
+     * nominable-for-token utxos, ignoring the ada-sufficiency filter).
+     */
+    @Test
+    void aTokenUtxoWithTooLittleAdaAlongsideItDoesNotCountTowardTheMarketBalance() {
+        Utxo tooLittleAda = LoanFixtures.utxo("d7".repeat(32), 0, ACCOUNT.baseAddress(), List.of(
+                Amount.lovelace(BigInteger.valueOf(1_400_000L)),
+                Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(2_000L))), null);
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, tooLittleAda));
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertTrue(decision.detail().contains("holds 0 "),
+                "the 2,000-USDM-but-1.4-ADA utxo must not count at all — the gate must see zero, not "
+                        + "2000: " + decision.detail());
+        assertFalse(decision.detail().contains("holds 2000 "),
+                "M13's exact escape: summing balance over every nominable-for-token utxo regardless of "
+                        + "whether it carries enough ada to ever be selected: " + decision.detail());
+    }
+
+    /**
      * Slice 1, task 3. Exit 7 recorded REFUSED and logged NOTHING. The router's own message is
-     * generic ("… for non-positive equity" / "… for non-ada principal") and never says which asset —
-     * the log line must, because the operator's next question is always "which loan, which token".
-     * The message itself is what lets a reader tell the two triggers apart, so it must be carried
-     * verbatim.
+     * generic ("… for a negative equity" / "… no oracle entry for principal oracle asset") and never
+     * says which asset — the log line must, because the operator's next question is always "which
+     * loan, which token". The message itself is what lets a reader tell the two triggers apart, so it
+     * must be carried verbatim. (F0, round 2: the equity trigger is now a genuinely negative equity,
+     * not "non-positive" — equity 0 is buildable.)
      */
     @Test
     void aPayInAdvanceNotModelledRefusalLogsAtInfoNamingThePrincipalAsset() {
+        // F0 (round 2) — a genuinely negative equity, overridden directly on the assessment (defence
+        // in depth for the router's precondition; see aNegativeEquityAssessmentIsRefusedNotQuarantined
+        // for why the ada/ada fixture's naturally-zero equity no longer refuses at all).
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        LiquidationAssessment negativeEquity = LiquidationAssessment.buildable(
+                convert.assessment().bond(), convert.assessment().loan(),
+                "negative equity (defence in depth, unreachable through a real assessment)",
+                convert.assessment().remainingDebt(), BigInteger.valueOf(-1),
+                convert.assessment().late(), convert.assessment().liquidationFee());
+        convert = convert.withAssessment(negativeEquity);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), convert, false);
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
@@ -1805,7 +2139,7 @@ class LiquidationExecutorTest {
 
         LiquidationDecision decision = onlyDecision(wiring);
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
-        assertEquals("pay-in-advance not yet modelled for non-positive equity", decision.reason());
+        assertEquals("pay-in-advance not yet modelled for a negative equity", decision.reason());
 
         List<ILoggingEvent> infos = appender.list.stream()
                 .filter(event -> event.getLevel() == Level.INFO)
@@ -1815,7 +2149,7 @@ class LiquidationExecutorTest {
                 + appender.list);
         String message = infos.getFirst().getFormattedMessage();
         assertTrue(message.contains("lovelace"), "must name the principal asset (the unit): " + message);
-        assertTrue(message.contains("non-positive equity"),
+        assertTrue(message.contains("negative equity"),
                 "must carry the router's own message verbatim — it is what distinguishes the two "
                         + "triggers: " + message);
         // ⛔ AND THE REMEDY MUST BE ABSENT HERE. The principal IS ada, so "set this market to CONVERT"
@@ -1871,6 +2205,14 @@ class LiquidationExecutorTest {
         assertTrue(message.contains("action to CONVERT"),
                 "a non-ada-principal refusal MUST carry the remedy — it is the one trigger the advice "
                         + "is correct for: " + message);
+        // REMEDY WORDING (Machine Owner ruling, 2026-09-09) — "routable" is not "profitable": for the
+        // live USDM loan the FLDT/USDM pool returns ~827M against a 980M minimum_receive, so CONVERT
+        // would build, submit and REFUND rather than fill the debt. The remedy must carry that caveat
+        // until PR3's POOL_TOO_THIN pre-check exists, or it reads as an unconditional fix it is not.
+        assertTrue(message.contains("only if a Minswap pool can fill the debt")
+                        && message.contains("thin pool refunds rather than fills"),
+                "the CONVERT remedy must carry the pool-depth caveat, not read as unconditional advice: "
+                        + message);
     }
 
     /**

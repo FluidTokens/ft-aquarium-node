@@ -435,14 +435,20 @@ class LiquidatePayInAdvanceLiveDryEvalTest {
                 + " | USDM price=" + usdmEntry.feed().priceInLovelaces() + "/"
                 + usdmEntry.feed().priceDenominator() + " lovelace";
         System.out.println("candidate state: " + candidateState);
-        // Same precondition PayInAdvanceLiquidationRouter checks BEFORE ever touching the builder
-        // (and that the builder itself re-checks at build() as its own first guard) — mirrored here
-        // so a non-positive-equity candidate is refused before wasting a wallet-selection round trip,
-        // exactly as production would. This is a LIVE rig: the pinned candidate's equity is a fact
-        // about the CHAIN at query time, not something this test controls, and a thin-margin position
-        // can cross zero between the ticket's pin and this run (interest accrual + oracle drift).
-        assertTrue(numbers.equity().signum() > 0,
-                "the pinned candidate no longer has positive equity — " + candidateState);
+        // F0 (round 2) — EQUITY 0 IS BUILDABLE, NOT A REFUSAL. This used to mirror the OLD precondition
+        // PayInAdvanceLiquidationRouter and the builder's own build() checked (equity > 0), refusing a
+        // non-positive-equity candidate before ever reaching the builder. That precondition was ours,
+        // not the validator's: loan_claim_action.ak:240-259 accepts equity == 0 outright — the
+        // underwater loan, the common liquidation, and (measured against this run) the live candidate's
+        // actual state today. Only a genuinely NEGATIVE equity is still refused — unreachable here,
+        // since LoanFinance.redeemerEquity floors it to zero, exactly as production's own builder does.
+        // This is a LIVE rig: the pinned candidate's equity is a fact about the CHAIN at query time,
+        // not something this test controls, and a thin-margin position can cross zero between the
+        // ticket's pin and this run (interest accrual + oracle drift) — which is exactly what happened:
+        // the candidate crossed from positive to zero, and F0 is what keeps this rig buildable through it.
+        assertTrue(numbers.equity().signum() >= 0,
+                "the pinned candidate has gone NEGATIVE equity — unreachable through LoanFinance's own "
+                        + "floor, so this would mean that floor itself broke — " + candidateState);
         BigInteger lenderPayout = numbers.convertedLoanCollateralToPrincipalAmount();
 
         // T-052 / MarketGate's Part 2: the smallest wallet utxo carrying enough USDM plus enough ada

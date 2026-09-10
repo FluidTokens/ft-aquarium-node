@@ -33,13 +33,17 @@ import java.util.Map;
  * here signs, submits, or flips a veto.
  *
  * <h2>Refusal is a clean REFUSED row, not a crash</h2>
- * The promoted builder models only the real {@code f855d1b4…} shape: an <b>ada principal</b> priced
- * through the collateral oracle, and a <b>strictly positive equity</b> (it throws
- * {@code IllegalStateException} on equity ≤ 0). A convert loan outside that shape is not an error to
- * quarantine — it is a candidate this seam cannot yet model — so both preconditions are checked
- * <em>before</em> the builder is ever called and signalled with {@link PayInAdvanceNotModelledException},
- * which the executor maps to a {@code REFUSED} decision. The builder is never handed a shape it would
- * throw on, and no {@link Transaction} is produced for one.
+ * The promoted builder models {@code equity >= 0} — F0 (round 2) lifted the outright refusal of
+ * equity 0, which is the validator's normal case ({@code loan_claim_action.ak:240-259} accepts it
+ * outright) and the common liquidation, not an edge case. It still throws
+ * {@code IllegalStateException} on a genuinely negative equity, which
+ * {@code LoanFinance.redeemerEquity}'s own floor makes unreachable — defence in depth, never the
+ * expected path. A convert loan outside what the seam can model (a non-ada principal with no
+ * matching oracle entry) is not an error to quarantine — it is a candidate this seam cannot yet
+ * model — so that precondition is checked <em>before</em> the builder is ever called and signalled
+ * with {@link PayInAdvanceNotModelledException}, which the executor maps to a {@code REFUSED}
+ * decision. The builder is never handed a shape it would throw on, and no {@link Transaction} is
+ * produced for one.
  */
 @Service
 @Slf4j
@@ -122,8 +126,10 @@ public class PayInAdvanceLiquidationRouter {
      *                        path passes
      * @throws WalletInputTooSmallException      when no nominable wallet utxo covers the lender
      *                                          payout this liquidation must fund
-     * @throws PayInAdvanceNotModelledException when the principal is not ada, or the equity is not
-     *                                          strictly positive — a clean refusal, no transaction built
+     * @throws PayInAdvanceNotModelledException when the loan's own principal-oracle asset has no
+     *                                          matching oracle entry — a clean refusal, no transaction
+     *                                          built. (F0, round 2: equity 0 is no longer a trigger —
+     *                                          it is the validator's normal, buildable case.)
      */
     Transaction buildConvertLiquidation(LiquidationAssessment assessment,
                                         Utxo loanUtxo,
@@ -137,13 +143,15 @@ public class PayInAdvanceLiquidationRouter {
                                         long validToMillis) {
         LoanDatum datum = assessment.loan().datum();
 
-        // Precondition guard, before the builder is touched. The promoted builder throws
-        // IllegalStateException on equity <= 0; a convert loan outside that shape is a candidate this
-        // seam cannot yet model, so it is a CLEAN refusal here rather than a crash or a quarantine
-        // downstream.
-        if (assessment.equity() == null || assessment.equity().signum() <= 0) {
+        // Precondition guard, before the builder is touched. F0 (round 2): equity 0 is now MODELLED
+        // — it is the validator's normal case and the common liquidation (the live USDM loan today) —
+        // so this only refuses a genuinely negative equity, which LoanFinance.redeemerEquity's own
+        // floor makes unreachable in practice. Kept as a clean refusal (never a crash) purely as
+        // defence in depth: if that floor ever changed, this seam still would not know how to model a
+        // negative equity, and the promoted builder still throws IllegalStateException on one.
+        if (assessment.equity() == null || assessment.equity().signum() < 0) {
             throw new PayInAdvanceNotModelledException(
-                    "pay-in-advance not yet modelled for non-positive equity");
+                    "pay-in-advance not yet modelled for a negative equity");
         }
 
         // The collateral oracle is found by the oracle NFT the loan datum names — the same key the

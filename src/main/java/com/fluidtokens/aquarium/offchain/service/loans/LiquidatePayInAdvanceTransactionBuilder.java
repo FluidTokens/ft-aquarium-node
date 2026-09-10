@@ -460,9 +460,24 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      */
     public Transaction build(Request request) {
         Numbers numbers = numbers(request);
-        if (numbers.equity().signum() <= 0) {
+        // F0 (round 2) — EQUITY 0 IS THE VALIDATOR'S NORMAL CASE, NOT A SHAPE THIS BUILDER REFUSES.
+        //
+        // loan_claim_action.ak:240-259 (deployed ff005fb) accepts `inputAction.equity == 0` outright
+        // — an `or { equity == 0, <borrower-compensation check> }` that SHORT-CIRCUITS before ever
+        // looking at a compensation output — and otherwise requires `equity >= 0 && equity ==
+        // max(computed_equity, 0)`. LoanFinance.redeemerEquity already floors a negative computed
+        // equity to ZERO, so "equity <= 0" this builder used to refuse was, in practice, ALWAYS
+        // exactly "equity == 0" — the underwater loan, which is the common liquidation and (2026-09-09)
+        // the live USDM loan today. Refusing it here was a precondition THIS BUILDER invented, not one
+        // the validator asked for.
+        //
+        // Only a genuinely negative equity — which redeemerEquity's own floor makes unreachable, kept
+        // here as defence in depth against a future change to that floor — is still refused: this
+        // builder still would not know what to pay the borrower a NEGATIVE compensation would mean.
+        if (numbers.equity().signum() < 0) {
             throw new IllegalStateException(
-                    "this builder models the positive-equity pay-in-advance layout; equity was "
+                    "this builder never models a negative equity (LoanFinance.redeemerEquity floors "
+                            + "it to zero; this is defence in depth, not the expected path); equity was "
                             + numbers.equity());
         }
         if (!request.bond().datum().shouldLiquidationConvertToPrincipal()) {
@@ -543,27 +558,35 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         }
 
         // The output indexes, COMPUTED from the emission order rather than observed off a throwaway
-        // probe body (T-051, 2026-08-26). assemble() emits exactly three outputs, in this order:
+        // probe body (T-051, 2026-08-26). assemble() emits the bond echo, then EITHER two OR one
+        // asset-manager outputs depending on equity (F0, round 2):
         //
         //   1. the bond echo, at the LenderManager credential  -> absolute body index
-        //   2. the borrower's equity compensation              -> asset-manager filtered slot 0
-        //   3. the lender's paid-in-advance ada                -> asset-manager filtered slot 1
+        //   2. the borrower's equity compensation, EQUITY > 0 ONLY -> asset-manager filtered slot 0
+        //   3. the lender's paid-in-advance principal          -> asset-manager filtered slot 0 or 1
         //
         // The bond echo is the FIRST output this builder adds, so its absolute position is whatever
         // cardano-client-lib prepended and nothing else — see OutputLayout.CCL_PREPENDED_OUTPUTS. The
         // asset index is into the FILTERED list, so it needs no such offset: the prepended dummy and
         // the appended change sit at the change address and the echo at the LenderManager credential,
-        // so none of them survives the asset-manager filter. loan_claim_action reads the borrower's
-        // compensation at the bare loan index, which pins it to slot 0 and leaves the lender's output
-        // at slot 1 — the constraint V5 re-asserts as `assetOutputIndex != 0`.
+        // so none of them survives the asset-manager filter.
+        //
+        // At equity > 0, loan_claim_action reads the borrower's compensation at the bare loan index,
+        // which pins it to slot 0 and leaves the lender's output at slot 1 — the constraint V5
+        // re-asserts as `assetOutputIndex != 0`. At equity == 0 the validator's own `or { equity == 0,
+        // .. }` never looks at slot 0 for a compensation output AT ALL (loan_claim_action.ak:273), so
+        // omitting that output (mirroring LiquidateTransactionBuilder:795's `if (equity.signum() > 0)`)
+        // and landing the lender's output at slot 0 is equally valid — there is no "bare loan index"
+        // constraint to satisfy when nothing reads that slot for this loan.
         //
         // ⚠ Unlike the plain path, this layout is NOT corroborated by an accepted transaction: no
         // convert-path liquidation has ever been submitted. What makes it safe is the same thing that
         // made the probe safe — V5 re-derives BOTH indexes from the FINISHED body, via the very same
         // locateBondOutput / locateLenderConvertedOutput helpers the probe used, and refuses on any
         // disagreement. A layout mistake is a build-time refusal, not a chain failure.
+        boolean payBorrowerCompensation = numbers.equity().signum() > 0;
         long lenderBondOutputIndex = OutputLayout.CCL_PREPENDED_OUTPUTS;
-        long assetOutputIndex = 1L;
+        long assetOutputIndex = payBorrowerCompensation ? 1L : 0L;
 
         Transaction transaction = complete(request, assemble(request, numbers, configRefIndex,
                 lmConfigRefIndex, collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex,
@@ -595,13 +618,23 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                 LiquidationTxEncoder.loanMintRedeemer(configRefIndex, false, 0));
 
         // Outputs. The bond echo first, then — in the filtered asset-manager list — the borrower's
-        // equity compensation at slot 0 (loan_claim_action reads it at the bare loan index) and the
-        // lender's paid-in-advance ada at slot 1 (lm_liquidate_and_pay_in_advance_action reaches it
-        // through assetOutputIndexes).
+        // equity compensation (EQUITY > 0 ONLY, at slot 0 — loan_claim_action reads it at the bare
+        // loan index) and the lender's paid-in-advance principal (slot 1 when a compensation output
+        // exists, otherwise slot 0 — lm_liquidate_and_pay_in_advance_action reaches it through
+        // assetOutputIndexes, whichever slot that is).
+        //
+        // F0 (round 2) — AT EQUITY == 0, NO COMPENSATION OUTPUT IS EMITTED AT ALL. Mirrors
+        // LiquidateTransactionBuilder:795's `if (equity.signum() > 0)` exactly: loan_claim_action's own
+        // `or { inputAction.equity == 0, equity_sent_to_borrower(..) }` (ak:273) short-circuits on the
+        // first branch and never reads a compensation output for this loan, so emitting one anyway
+        // would be an unread, wasted min-ada outlay for a candidate that is already the bot's worst
+        // case (an underwater loan).
         tx.payToContract(request.bondUtxo().getAddress(), List.copyOf(request.bondUtxo().getAmount()),
                 bondEchoDatum(request));
-        tx.payToContract(assetManagerAddress(), collateralEquityAmounts(request, numbers.equity()),
-                borrowerCompensationDatum(request));
+        if (numbers.equity().signum() > 0) {
+            tx.payToContract(assetManagerAddress(), collateralEquityAmounts(request, numbers.equity()),
+                    borrowerCompensationDatum(request));
+        }
         // WALL 4 — paid in the PRINCIPAL ASSET. For ada: unchanged, ada-only (flatten == 1). For a
         // token principal: the converted quantity of that token, min-ada left to cardano-client-lib to
         // top up (trap 6) — the output becomes [min-ada rider, converted × principal], flatten == 2,
@@ -1206,7 +1239,12 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     // ---- structural re-derivation from the finished body ------------------------------------------
 
-    private void assertStructure(Transaction transaction, Request request, Numbers numbers,
+    // Package-private (not private) for the same reason LiquidateTransactionBuilder's
+    // assetOutputIndexesForEquities is: M19 (F4, slice-3 round-2 audit) needs to prove the
+    // flatten == 2 boundary is actually ENFORCED, not merely coincidentally true of every fixture's
+    // OUTPUT — see LiquidatePayInAdvanceTransactionBuilderTest, which hand-mutates a real built body
+    // and re-invokes this method directly rather than going through reflection.
+    void assertStructure(Transaction transaction, Request request, Numbers numbers,
                                  long lenderBondOutputIndex, long assetOutputIndex) {
         // The bond echo is where the claim redeemer says, and it is byte-identical to the input.
         structural(lenderBondOutputIndex == locateBondOutput(transaction, request),
@@ -1215,14 +1253,22 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         structural(request.bondUtxo().getInlineDatum().equalsIgnoreCase(echo.getInlineDatum().serializeToHex()),
                 "the bond echo datum is not byte-identical to the bond input datum");
 
-        // The asset-manager filtered list is [borrower compensation, lender converted], and
-        // assetOutputIndexes points at the lender one.
+        // F0 (round 2) — the asset-manager filtered list is [borrower compensation, lender converted]
+        // at EQUITY > 0, and JUST [lender converted] at EQUITY == 0 (assemble() emits no compensation
+        // output at all — loan_claim_action.ak:273's `or { equity == 0, .. }` never reads one).
+        // assetOutputIndexes points at the lender one either way.
+        boolean hasBorrowerCompensation = numbers.equity().signum() > 0;
         List<TransactionOutput> assetOutputs = assetManagerOutputs(transaction);
-        structural(assetOutputs.size() == 2, "expected exactly two asset-manager outputs, got " + assetOutputs.size());
+        int expectedAssetOutputs = hasBorrowerCompensation ? 2 : 1;
+        structural(assetOutputs.size() == expectedAssetOutputs,
+                "expected exactly " + expectedAssetOutputs + " asset-manager output(s), got "
+                        + assetOutputs.size());
         structural(assetOutputIndex == locateLenderConvertedOutput(transaction, request, numbers),
                 "assetOutputIndex " + assetOutputIndex + " no longer points at the lender converted output");
-        structural(assetOutputIndex != 0,
-                "the borrower compensation output must occupy filtered slot 0 (the bare loan index)");
+        if (hasBorrowerCompensation) {
+            structural(assetOutputIndex != 0,
+                    "the borrower compensation output must occupy filtered slot 0 (the bare loan index)");
+        }
 
         // WALL 4 — the lender's paid-in-advance output's shape depends on the principal asset.
         // Ada: dosProtection demands flatten == 1 and the coin itself is the converted amount.
@@ -1246,13 +1292,16 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                             + " than convertedLoanCollateralToPrincipalAmount");
         }
 
-        // The borrower compensation output carries at least the equity in collateral tokens, flatten == 2.
-        TransactionOutput borrowerOutput = assetOutputs.get(0);
-        AssetType collateral = request.loan().datum().collateral().assetType();
-        structural(quantityOf(borrowerOutput, collateral).compareTo(numbers.equity()) >= 0,
-                "the borrower compensation output holds less collateral than the equity");
-        structural(flattenedCount(borrowerOutput) == 2,
-                "the borrower compensation output must be a token plus its min-ada rider (flatten == 2)");
+        // The borrower compensation output, WHEN IT EXISTS (equity > 0), carries at least the equity
+        // in collateral tokens, flatten == 2. At equity == 0 (F0) there is no such output to check.
+        if (hasBorrowerCompensation) {
+            TransactionOutput borrowerOutput = assetOutputs.get(0);
+            AssetType collateral = request.loan().datum().collateral().assetType();
+            structural(quantityOf(borrowerOutput, collateral).compareTo(numbers.equity()) >= 0,
+                    "the borrower compensation output holds less collateral than the equity");
+            structural(flattenedCount(borrowerOutput) == 2,
+                    "the borrower compensation output must be a token plus its min-ada rider (flatten == 2)");
+        }
 
         // ⛔ S-15: the change that comes back must be SPENDABLE NEXT CYCLE.
         //
