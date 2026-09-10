@@ -948,7 +948,18 @@ public class LiquidationExecutor {
                 try {
                     transaction = convertRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
                             bondUtxo.get(), configUtxo, lmConfigUtxo,
-                            walletUtxos.isEmpty() ? null : walletUtxos.get(0), oraclesByUnit,
+                            // ⛔ NOMINABLE, not raw. Round 2 of the token-principals slice (fbcf6b1)
+                            // made `walletUtxos` the UNFILTERED listing so the token path could see
+                            // multi-asset utxos — and this line, unchanged, silently went from "first
+                            // ada-only utxo" to "first utxo Blockfrost returns": the OLDEST one at the
+                            // bot's address, which is where the published reference scripts sit. A
+                            // convert would have SPENT the loan_claim_action reference script (the
+                            // 2026-08-24 incident class WalletInputSelection.nominable exists to
+                            // prevent). Sizing this input properly is PR3's job; until then it is the
+                            // first NOMINABLE utxo, exactly what it was before fbcf6b1.
+                            nominableWalletUtxos(walletUtxos).isEmpty()
+                                    ? null : nominableWalletUtxos(walletUtxos).get(0),
+                            oraclesByUnit,
                             account.baseAddress(), validFromMillis, validToMillis);
                 } catch (ConvertLiquidationRouter.NoPoolException e) {
                     // Impossible, not unprofitable — and the fix is the operator's: set this market to

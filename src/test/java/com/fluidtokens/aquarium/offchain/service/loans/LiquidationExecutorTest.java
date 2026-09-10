@@ -3224,4 +3224,70 @@ class LiquidationExecutorTest {
         m.setCap(java.math.BigInteger.valueOf(cap));
         return m;
     }
+
+    // ===== the CONVERT route must be handed a NOMINABLE wallet utxo, never the first raw one =====
+
+    /** Captures the wallet utxo the executor hands the convert router, then stops the build. */
+    private static final class CapturingConvertRouter extends ConvertLiquidationRouter {
+        Utxo captured;
+        CapturingConvertRouter() { super(null, null, null, null, null, null, null, null); }
+        @Override
+        public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
+                                                    Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
+                                                    Utxo walletUtxo, Map<String, OracleEntry> oracles,
+                                                    String changeAddress, long validFromMillis, long validToMillis) {
+            captured = walletUtxo;
+            throw new RuntimeException("captured the wallet input; nothing past this point is under test");
+        }
+    }
+
+    /**
+     * ⛔ The regression the slice-3 round-2 audit caught, pinned. fbcf6b1 made the cycle's wallet list
+     * the UNFILTERED listing (so the token path could see multi-asset utxos), and the convert hand-off
+     * — {@code walletUtxos.get(0)}, untouched — silently became "the first utxo Blockfrost returns".
+     * Blockfrost lists ascending, so that is the OLDEST utxo at the bot's address: the published
+     * reference scripts. A convert would have spent {@code loan_claim_action}'s reference script.
+     *
+     * <p>The listing here puts a reference-script utxo FIRST on purpose; the captured input must be
+     * the ada-only one. Mutant: hand the router {@code walletUtxos.get(0)} again — this test fails with
+     * the reference-script hash in the message.
+     */
+    @Test
+    void theConvertRouteIsHandedANominableWalletUtxoNeverTheFirstRawOne() {
+        Utxo refScriptUtxo = Utxo.builder().txHash("f9".repeat(32)).outputIndex(0)
+                .address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(30_000_000L))))
+                .referenceScriptHash("9ae63b26c98d90024a45f9cdb57e4154f72144d44325f0a261b8bc1d").build();
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO, refScriptUtxo,
+                convert.loan().utxo(), convert.bond().utxo());
+        LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        FakeScanner scanner = new FakeScanner(List.of(convert.assessment()));
+        FakeResolver resolver = new FakeResolver(allUnspent(List.of(convert)));
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        CountingOracleProvider oracles = noOracle();
+        PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+        CapturingConvertRouter capturing = new CapturingConvertRouter();
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(List.of(refScriptUtxo, WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
+                payInAdvanceRouter, capturing, LoanFixtures.registry(), log, oracles,
+                previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
+                EXPLODING_SUBMITTER);
+        executor.cycle(NOW);
+        assertNotNull(capturing.captured, "the convert route was never reached");
+        assertNull(capturing.captured.getReferenceScriptHash(),
+                "the CONVERT route was handed the published REFERENCE-SCRIPT utxo as its wallet input: "
+                        + capturing.captured.getTxHash() + "#" + capturing.captured.getOutputIndex());
+        assertEquals(WALLET_UTXO.getTxHash(), capturing.captured.getTxHash(),
+                "the convert route must receive the first NOMINABLE utxo");
+    }
 }
