@@ -27,6 +27,16 @@ import java.util.List;
  * <p>⚠ <b>The arity check is the load-bearing part.</b> Every field this converter reads is at a fixed
  * position, so a Minswap type change that inserted a field would otherwise be read as a pool with
  * different assets — a well-formed order for the wrong pair.
+ *
+ * <p>⛔ <b>Indices 6, 7 and 9 are the pool's own fee, and they are read HERE or nowhere.</b> They used
+ * to be decoded away, which left the convert quote with no honest fee to use — and the only way to
+ * reach them from elsewhere would be a second positional decoder over the same ten-field type, outside
+ * this arity guard. Two decoders of one positional type is how a field insertion gets caught in one
+ * place and silently mis-read in the other, so the fee is modelled here instead.
+ *
+ * <p>Index 8 ({@code fee_sharing_numerator_opt}) is deliberately left undecoded: it splits the fee
+ * between Minswap and a fee recipient <em>after</em> the swap arithmetic and does not change the output
+ * a swap produces, which is the only thing this node quotes. It is still COUNTED by the arity check.
  */
 public class MinswapPoolDatumConverter {
 
@@ -62,7 +72,11 @@ public class MinswapPoolDatumConverter {
                 asset(f.get(2)),
                 integer(f.get(3)),
                 integer(f.get(4)),
-                integer(f.get(5)));
+                integer(f.get(5)),
+                integer(f.get(6)),
+                integer(f.get(7)),
+                // index 8 is fee_sharing_numerator_opt — counted by the arity check, not read
+                bool(f.get(9)));
     }
 
     /** {@code Asset { policy_id, asset_name }} — constructor 0. ADA is the empty/empty pair. */
@@ -81,5 +95,18 @@ public class MinswapPoolDatumConverter {
             throw new CborRuntimeException("expected an Int, got " + d);
         }
         return i.getValue();
+    }
+
+    /**
+     * Aiken's {@code Bool}: {@code False} is constructor 0 and {@code True} constructor 1, both
+     * fieldless. Refused rather than defaulted — {@code allow_dynamic_fee} decides whether this pool's
+     * base numerators are the whole fee, so guessing it wrong quotes a price the pool does not charge.
+     */
+    private static boolean bool(PlutusData d) {
+        if (!(d instanceof ConstrPlutusData c) || !c.getData().getPlutusDataList().isEmpty()
+                || (c.getAlternative() != 0 && c.getAlternative() != 1)) {
+            throw new CborRuntimeException("expected a Bool constructor (0 or 1, fieldless), got " + d);
+        }
+        return c.getAlternative() == 1;
     }
 }
