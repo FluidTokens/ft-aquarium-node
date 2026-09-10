@@ -151,7 +151,8 @@ jobs:
       #   +1   EnvGatedRigReachabilityTest        (the CI-gate slice, squashed into main as #25)
       #   +1   ConvertLiquidationRouterTest       (#24)
       #   +1   config/BuildProvenanceTest         (11 tests)
-      #   +1   service/loans/MarketCoverageReporterTest  (FAB-81-1, 8 tests)
+      #   +1   service/loans/MarketCoverageReporterTest  (FAB-81-1, 8 tests at round 1; 14 after
+      #                                                   the r2 rework -- same one class, same floor)
       #   = 139
       #
       # FAB-81-1 measured both sides of its own change, keyless, with `rm -rf build/test-results/test`
@@ -167,6 +168,15 @@ jobs:
       # Recorded rather than corrected silently: a number measured on a base that has since moved is
       # not wrong, it is a measurement OF SOMETHING ELSE -- and that is exactly how a stale figure
       # survives, by having been true once.
+      #
+      #
+      # FAB-81-1 r2 (the rework) measured both sides again on d3abf03, keyless, same procedure:
+      #   before  139 files / 1098 tests / 0 failures / 45 skipped
+      #   after   139 files / 1105 tests / 0 failures / 45 skipped   (+6 in MarketCoverageReporterTest,
+      #                                                              +1 in LiquidationExecutorTest)
+      # NO class was added, so the floor stays 139 -- and that is the case worth stating out loud,
+      # because "the floor did not move" is indistinguishable from "nobody re-measured" unless the
+      # measurement is written down. Orphan check re-run: 139 files, 0 orphans.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.

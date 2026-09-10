@@ -31,6 +31,8 @@ import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.prometheusmetrics.PrometheusConfig;
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -1402,6 +1404,52 @@ class LiquidationExecutorTest {
                         .anyMatch(event -> event.getFormattedMessage()
                                 .contains("market-coverage reporting failed")),
                 "a swallowed fault is worse than the fault: the cycle carries on, and says so");
+    }
+
+    /**
+     * ⛔ <b>THE SEAM: the executor must hand the reporter the WHOLE scan, not the buildable part.</b>
+     *
+     * <p>The failure this exists for is a one-word edit — {@code report(assessments)} to
+     * {@code report(buildable)} — after which <b>no market is ever reported unservable again, on any
+     * node, forever</b>, and the whole suite stays green. It survived because the seam was unowned:
+     * the only executor-level test touching the reporter drove it through a mock that throws on
+     * {@code any()}, so the argument was never inspected, and every other wiring hands it a real
+     * reporter on a registry <b>nothing ever scrapes</b>. "The cycle survives the reporter" is not
+     * "the reporter receives what makes it work".
+     *
+     * <p>So this one scrapes. A real {@link PrometheusMeterRegistry}, a scan whose only assessment is
+     * an EXCLUDED one — precisely the kind {@code buildable} filters out — and the assertion is the
+     * labelled series existing at all. Under {@code report(buildable)} the reporter is handed an
+     * empty list and the series is absent.
+     */
+    @Test
+    void theExecutorHandsTheReporterEveryAssessmentAndNotOnlyTheBuildableOnes() {
+        PrometheusMeterRegistry prometheus = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+        LiquidationAssessment blind = LiquidationAssessment.excluded(usdmBond(), null,
+                LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE,
+                "principal leg: no oracle entry for " + USDM_UNIT);
+
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(blind), List.of(), Map.of(),
+                List.of(WALLET_UTXO), noOracle(), false, false, LoanFixtures.protocolParams(),
+                null, null, new MarketCoverageReporter(prometheus));
+        wiring.executor().cycle(NOW);
+
+        assertTrue(prometheus.scrape().contains(
+                        "loans_market_unservable{leg=\"principal\",market=\"" + USDM_UNIT
+                                + "\",reason=\"PRINCIPAL_ORACLE_UNUSABLE\"} 1.0"),
+                () -> "the excluded assessment never reached the reporter, so the market the bot "
+                        + "cannot serve is nameless — scrape was:\n" + prometheus.scrape());
+    }
+
+    /** {@code c48c…47ad} + the CIP-68 (222) prefix and {@code USDM}, as USDM appears on chain. */
+    private static final String USDM_UNIT =
+            "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad" + "0014df105553444d";
+
+    /** A bond whose principal — and therefore whose MARKET — is USDM rather than ada. */
+    private static LenderBond usdmBond() {
+        return new LenderBond("00".repeat(32), 0, "addr_test1", "usdmbond01", "d87980",
+                new LenderManagerDatum(null, null, false, BigInteger.ZERO, "",
+                        AssetType.fromUnit(USDM_UNIT)));
     }
 
     // ======================================================================================
