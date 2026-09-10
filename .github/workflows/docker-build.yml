@@ -139,15 +139,25 @@ jobs:
       # src/test/java. Raise the floor deliberately when classes are added; a drop is a deletion to
       # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
       #
-      # Floor measured 2026-09-10 on this tree, keyless: 137 files / 1076 tests / 0 failures /
-      # 45 skipped. Raised 136 -> 137 in the merge that brought this branch up to origin/main:
-      # #24 added ConvertLiquidationRouterTest, so the tree grew by one class and the old floor
-      # stopped matching it. A floor is only a measurement while it equals something someone
-      # measured; left at 136 it would have tolerated losing a class silently -- which is the
-      # exact defect this step exists to catch, so it is corrected here rather than carried.
+      # Floor measured 2026-09-10 on THIS tree, keyless (the shape CI runs in): 138 files.
+      #
+      # (config/BuildProvenanceTest carries 11 tests: 9 at round 1, plus two the rework added -- one
+      # asserting the startup wiring actually installs the banner's default properties, one asserting
+      # the banner says the word 'unknown' rather than rendering a hole. Same one class, same floor.)
+      #
+      # Provenance, because this number has now been raised three times by three branches that each
+      # measured a different tree and each proposed 137:
+      #   135  base e75ecf9 (#23)
+      #   +1   EnvGatedRigReachabilityTest        (the CI-gate slice, squashed into main as #25)
+      #   +1   ConvertLiquidationRouterTest       (#24)
+      #   +1   config/BuildProvenanceTest         (this slice, 11 tests)
+      #   = 138
+      #
+      # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
+      # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '137'
+          RESULT_FILE_FLOOR: '138'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

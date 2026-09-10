@@ -1,0 +1,3 @@
+FluidTokens Aquarium Node :: commit ${aquarium.build.commitShort:unknown} (dirty=${aquarium.build.dirty:unknown}) :: built ${aquarium.build.time:unknown}
+  full commit  ${aquarium.build.commit:unknown}
+  the same values are served on /actuator/info; the image tag is a DATE and does not identify code

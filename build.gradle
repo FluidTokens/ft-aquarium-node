@@ -53,6 +53,22 @@ dependencies {
 
 	implementation 'io.micrometer:micrometer-registry-prometheus:1.13.4'
 
+	// Declared here because NOTHING in this repo asked for actuator until now: the only thing putting
+	// it on the runtime classpath was a third-level transitive of
+	// yaci-store-spring-boot-starter:0.1.7. /actuator/prometheus -- which is how an operator watches
+	// this node -- therefore depended on a third party's dependency graph, and a yaci-store bump that
+	// dropped it would 404 the endpoint with no compile error and no failing test. Measured
+	// 2026-09-10: declaring it explicitly changes nothing on the classpath -- EMPTY DIFF on
+	// `runtimeClasspath`, `testRuntimeClasspath`, `compileClasspath` and `testCompileClasspath`.
+	// Method: `configurations.<name>.resolvedConfiguration.resolvedArtifacts` diffed before/after,
+	// which for `runtimeClasspath` is 217 resolved artifacts / 213 unique module ids / 217 files.
+	// (An earlier revision of this comment said "244 artifacts". That figure came from grepping
+	// `group:artifact:version` out of `./gradlew dependencies` printed text, which double-counts
+	// every `->` version resolution -- it was never a count of artifacts. A number with no method
+	// beside it is how a stale figure becomes the baseline everyone reconciles to.)
+	// A fragility fix, not a new dependency.
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
 	implementation 'org.postgresql:postgresql:42.6.0'
 	testImplementation 'com.h2database:h2:2.1.214'
 
@@ -70,6 +86,104 @@ dependencies {
 	testCompileOnly 'org.projectlombok:lombok:1.18.30'
 	testAnnotationProcessor 'org.projectlombok:lombok:1.18.30'
 
+}
+
+// ---------------------------------------------------------------------------------------------
+// Build provenance: what this jar was built FROM, recorded into
+// build/resources/main/META-INF/build-info.properties and served on /actuator/info.
+//
+// Why it exists: the CI image tag is `date +'%Y.%m.%d'`, so two pushes on the same day produce the
+// SAME TAG over DIFFERENT CODE. Nothing in the running process closed that gap; now the process
+// itself can say which commit it is.
+// ---------------------------------------------------------------------------------------------
+
+// Runs git at configuration time and returns null -- never the empty string, never a throw -- when
+// git cannot be reached at all: not installed, not a repository, a source tarball, a Docker context
+// with no `.git`. `providers.exec` rather than the older `exec { }` because the latter adds to the
+// Gradle 9 deprecation output this build already emits.
+def gitOutput = { String... arguments ->
+	try {
+		def execution = providers.exec {
+			commandLine(['git'] + (arguments as List))
+			ignoreExitValue = true
+		}
+		return execution.result.get().exitValue == 0 ? execution.standardOutput.asText.get().trim() : null
+	} catch (Exception ignored) {
+		return null
+	}
+}
+
+// ⛔ GIT REPOSITORY DISCOVERY WALKS UPWARD, and that turns "no repository" into a CONFIDENT WRONG
+// ANSWER rather than into no answer. A directory with no `.git` placed inside an unrelated
+// repository -- a release tarball unpacked inside a checkout, a Docker build context nested in one:
+// exactly the scenarios this block exists to survive -- answers `git rev-parse HEAD` with the
+// ENCLOSING repository's HEAD and `git status --porcelain` with the enclosing tree's state. That is
+// strictly worse than `unknown`: `commit=unknown, dirty=false` contradicts itself and is visible by
+// eye, while a valid 40-hex sha from some other repository passes every shape assertion, names code
+// this jar was NOT built from, and gives the operator no signal at all.
+//
+// So the repository must be proven to be THIS project before any of its answers are used.
+// `--show-toplevel` compared against `projectDir` is preferred over `file("${projectDir}/.git").exists()`
+// because `.git` is a FILE, not a directory, in a worktree or a submodule -- both legitimate places
+// to build from, and `exists()` happens to hold there, but the toplevel comparison is the property
+// actually being asserted rather than a proxy for it. Canonicalised on both sides so a symlinked
+// checkout does not read as a different repository.
+def repositoryToplevel = gitOutput('rev-parse', '--show-toplevel')
+def gitDescribesThisProject =
+		repositoryToplevel != null && new File(repositoryToplevel).canonicalFile == projectDir.canonicalFile
+
+def headCommit = gitDescribesThisProject ? gitOutput('rev-parse', 'HEAD') : null
+def headCommitShort = gitDescribesThisProject ? gitOutput('rev-parse', '--short=12', 'HEAD') : null
+def workingTreeStatus = gitDescribesThisProject ? gitOutput('status', '--porcelain') : null
+
+def buildCommit = headCommit ?: 'unknown'
+def buildCommitShort = headCommitShort ?: 'unknown'
+
+// UNAVAILABLE IS NOT CLEAN, and this line is the whole point of the block. `workingTreeStatus` has
+// THREE states, not two: null means git could not be reached (or reached the WRONG repository, see
+// above), "" means git WAS reached and the tree was clean, non-empty means dirty. The naive version
+// returns "" from the fallback, finds it empty, and records dirty=false -- so a build that cannot
+// vouch for its own tree would instead assert a clean one, on an unauthenticated endpoint an
+// operator reads to decide whether an image is trustworthy. Silence must not be able to render as a
+// clean tree.
+def buildDirty = workingTreeStatus == null ? 'unknown'
+		: (workingTreeStatus.isEmpty() ? 'false' : 'true')
+
+// ⛔ Build-time self-consistency. The three fields come from ONE decision -- is git usable and is it
+// this repository -- so they are all `unknown` together or none of them is. Any mixture means the
+// three-state handling above has been edited back to a two-state form, and the shape that mixture
+// takes in practice is `commit=unknown` beside `dirty=false`: a build asserting a clean tree it
+// could not read.
+//
+// ⚠ ALL THREE `unknown` is CORRECT and must keep building green -- no `.git` is a supported state,
+// not a startup or build condition. Only the inconsistent combination fails.
+//
+// ⚠ And be honest about its reach: where `.git` is present this check is VACUOUS, which is every
+// developer machine and every CI run. It is a tripwire for someone editing this Groovy, not a test
+// of the git-absent path; a load-bearing harness for that path needs a GradleRunner build of a
+// scratch project and is ticketed separately.
+def provenanceFields = [commit: buildCommit, commitShort: buildCommitShort, dirty: buildDirty]
+def unknownFields = provenanceFields.findAll { name, value -> value == 'unknown' }
+if (!unknownFields.isEmpty() && unknownFields.size() != provenanceFields.size()) {
+	throw new GradleException(
+			"build provenance is internally inconsistent: " +
+					provenanceFields.collect { name, value -> "${name}=${value}" }.join(', ') +
+					". These fields answer one question -- is git usable and is it THIS repository -- " +
+					"so they are all 'unknown' or none of them is. A mixture means unavailability is " +
+					"being reported as a fact (typically 'dirty=false' beside 'commit=unknown'), " +
+					"which is a false statement on an unauthenticated endpoint.")
+}
+
+springBoot {
+	buildInfo {
+		properties {
+			additional = [
+					commit     : buildCommit,
+					commitShort: buildCommitShort,
+					dirty      : buildDirty,
+			]
+		}
+	}
 }
 
 tasks.named('test') {
