@@ -131,6 +131,129 @@ class ConvertOrderPlanTest {
                 "the refusal must name the arity it saw and the one it expected: " + e.getMessage());
     }
 
+    /**
+     * ⛔ <b>F3 — THE FEE INDICES ARE NOT INTERCHANGEABLE, and only UNEQUAL numerators can say so.</b>
+     *
+     * <p>Round-1 audit: mutant M16 (swap the converter's index 6 and index 7 reads) killed <b>0 of
+     * 1062</b> tests, because the only converter-level fee assertion used the live fixture — where
+     * both numerators are 80. r2's own reasoning ("a direction bug is invisible on the pools the tests
+     * use") had been applied at {@code feeNumeratorFor} and not at the DECODE layer, one call earlier.
+     *
+     * <p>⚠ 80 and 70 are the two real mainnet fees, so this fixture is the two live pools' numerators
+     * put on ONE pool — the smallest change that makes the positions distinguishable.
+     */
+    @Test
+    void theTwoFeeNumeratorsAreDecodedIntoTheirOwnComponentsAndNotSwapped() {
+        MinswapPoolDatum decoded = new MinswapPoolDatumConverter().fromPlutusData(
+                poolDatum(BigIntPlutusData.of(80), BigIntPlutusData.of(70), bool(false)));
+
+        assertEquals(FEE_80, decoded.baseFeeANumerator(),
+                "on-chain index 6 is base_fee_a_numerator and must land in baseFeeANumerator");
+        assertEquals(FEE_70, decoded.baseFeeBNumerator(),
+                "on-chain index 7 is base_fee_b_numerator; swapping the two reads is invisible on "
+                        + "every live pool, because both real pools declare equal numerators");
+    }
+
+    /**
+     * ⛔ <b>F2 — THE {@code allow_dynamic_fee} DECODE MUST BE ABLE TO SAY TRUE.</b>
+     *
+     * <p>Round-1 audit: mutants M15/M19 ({@code bool()} stuck at {@code false}, or validating nothing)
+     * killed <b>0 of 1062</b>. The only assertion on this field used the live fixture and read
+     * {@code assertFalse(...)} — green whether the decoder works or is nailed shut — and the refusal
+     * test constructed the record directly, never touching the converter. <b>No path under test
+     * produced {@code true} from the decoder.</b>
+     *
+     * <p>The failure that leaves open: Minswap enables dynamic fees, the decoder reports false, the
+     * quote understates the fee and OVERSTATES the output, {@code POOL_TOO_THIN} does not fire, and
+     * the order is built, submitted and refunded at the operator's expense.
+     */
+    @Test
+    void aPoolThatSetsAllowDynamicFeeDecodesAsTrue() {
+        MinswapPoolDatum decoded = new MinswapPoolDatumConverter().fromPlutusData(
+                poolDatum(BigIntPlutusData.of(80), BigIntPlutusData.of(80), bool(true)));
+
+        assertTrue(decoded.allowDynamicFee(),
+                "constructor 1 at on-chain index 9 is True; a decoder that can only answer false "
+                        + "silently quotes a price the pool does not charge");
+
+        // …and the plan refuses it, so the decode is connected to the guard rather than merely correct.
+        var e = assertThrows(ConvertOrderPlan.RefusedException.class, () -> planAgainst(decoded));
+        assertEquals(ConvertOrderPlan.Refusal.POOL_HAS_DYNAMIC_FEE, e.refusal());
+    }
+
+    /**
+     * A {@code Bool} is constructor 0 or 1 and fieldless. Anything else is refused rather than
+     * defaulted — {@code allow_dynamic_fee} decides whether the base numerators are the whole fee, so
+     * a decoder that guesses it is a decoder that quotes a price nobody charges.
+     */
+    @Test
+    void aMalformedBoolAtTheDynamicFeeIndexIsRefusedRatherThanDefaulted() {
+        PlutusData constructorTwo = ConstrPlutusData.builder().alternative(2)
+                .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of()).build();
+        var e = assertThrows(RuntimeException.class,
+                () -> new MinswapPoolDatumConverter().fromPlutusData(
+                        poolDatum(BigIntPlutusData.of(80), BigIntPlutusData.of(80), constructorTwo)));
+        assertTrue(e.getMessage().contains("Bool"),
+                "the refusal must name what it expected: " + e.getMessage());
+
+        // A Bool constructor that CARRIES a field is the other malformation, and it is not the same
+        // mistake: the alternative is in range, so only the field check refuses it.
+        PlutusData trueWithAField = ConstrPlutusData.builder().alternative(1)
+                .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of(
+                        BigIntPlutusData.of(1))).build();
+        assertTrue(assertThrows(RuntimeException.class,
+                        () -> new MinswapPoolDatumConverter().fromPlutusData(
+                                poolDatum(BigIntPlutusData.of(80), BigIntPlutusData.of(80),
+                                        trueWithAField)))
+                .getMessage().contains("Bool"));
+    }
+
+    /**
+     * R2 — the arity guard's other side. A datum one field SHORT must refuse by name, not by an
+     * index-out-of-bounds from whichever read runs off the end.
+     */
+    @Test
+    void aPoolDatumWithONEFEWERFieldIsRefusedByTheArityGuard() {
+        var nineFields = ConstrPlutusData.builder().alternative(0)
+                .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of(
+                        BigIntPlutusData.of(0), asset("cc".repeat(28), "beef"),
+                        asset("dd".repeat(28), "cafe"), BigIntPlutusData.of(1),
+                        BigIntPlutusData.of(2), BigIntPlutusData.of(3), BigIntPlutusData.of(80),
+                        BigIntPlutusData.of(80), bool(false)))       // NINE fields
+                .build();
+
+        var e = assertThrows(RuntimeException.class,
+                () -> new MinswapPoolDatumConverter().fromPlutusData(nineFields));
+        assertTrue(e.getMessage().contains("9") && e.getMessage().contains("10"),
+                "the refusal must name the arity it saw and the one it expected: " + e.getMessage());
+    }
+
+    /**
+     * A well-formed ten-field Minswap {@code PoolDatum} with the fee fields under test at on-chain
+     * indices 6, 7 and 9. Index 8 (fee sharing) is present because the arity guard counts it.
+     */
+    private static ConstrPlutusData poolDatum(PlutusData feeA, PlutusData feeB, PlutusData dynamicFee) {
+        return ConstrPlutusData.builder().alternative(0)
+                .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of(
+                        BigIntPlutusData.of(0),                    // 0 pool_batching_stake_credential
+                        asset("", ""),                             // 1 asset_a — ADA
+                        asset(FLDT.policyId(), FLDT.assetName()),  // 2 asset_b
+                        BigIntPlutusData.of(1),                    // 3 total_liquidity
+                        BigIntPlutusData.of(2),                    // 4 reserve_a
+                        BigIntPlutusData.of(3),                    // 5 reserve_b
+                        feeA,                                      // 6 base_fee_a_numerator
+                        feeB,                                      // 7 base_fee_b_numerator
+                        BigIntPlutusData.of(1666),                 // 8 fee_sharing_numerator_opt
+                        dynamicFee))                               // 9 allow_dynamic_fee
+                .build();
+    }
+
+    /** Aiken's {@code Bool}: False is constructor 0, True is constructor 1, both fieldless. */
+    private static PlutusData bool(boolean value) {
+        return ConstrPlutusData.builder().alternative(value ? 1 : 0)
+                .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of()).build();
+    }
+
     private static PlutusData asset(String policyHex, String nameHex) {
         return ConstrPlutusData.builder().alternative(0)
                 .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of(
@@ -290,10 +413,17 @@ class ConvertOrderPlanTest {
      * have filled), quoting MORE is the failure this whole pre-check exists to prevent — it lets a
      * futile order through to be built, submitted and refunded at the operator's expense.
      *
-     * <p>⚠ <b>And this is the test that forbids a constant.</b> The 24/10000 and 30/10000 figures
-     * quoted for AMMs generally BOTH over-quote this batch by about half a percent — on the wrong side
-     * — while the pool's own declared 80 lands 272 lovelace under it. Two live mainnet pools declare
-     * two different fees (ADA/FLDT 80, FLDT/USDM 70), so no single constant is even available.
+     * <p>⚠ <b>What this test does NOT do, corrected after the round-1 audit (R1): it does not forbid a
+     * constant.</b> It calls {@code constantProductOut} with the fee passed EXPLICITLY, so replacing
+     * the production fee LOOKUP with a hardcoded 24 leaves it green (mutant M3). What it pins is the
+     * ARITHMETIC — that the formula, given the pool's real fee, reproduces a batch that really
+     * settled, and that the two constants a future reader might reach for would over-quote it.
+     *
+     * <p>The property "the fee is READ FROM THE DATUM, per direction" is defended by three other
+     * tests, and those are the ones a constant has to get past:
+     * {@link #aPoolThatCannotDeliverTheDebtIsRefusedByNameBeforeAnythingIsBuilt},
+     * {@link #aPoolOneUnitTooThinRefusesAndOneUnitDeeperProceeds} and
+     * {@link #eachSwapDirectionIsQuotedWithItsOwnFeeNumerator} — M3 kills all three.
      */
     @Test
     void theQuoteIsCalibratedAgainstTheRealMainnetBatchAndNeverOverQuotesIt() {

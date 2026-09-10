@@ -2450,16 +2450,6 @@ public class LiquidationExecutor {
     }
 
     /**
-     * Quarantines one <b>loan UTxO ref</b> — {@code txHash#index}, never a loan id. The distinction
-     * is load-bearing: a loan id outlives the UTxO that carries it (it is minted once and burned at
-     * the end), so keying on it would exclude a borrower's loan across every re-creation of its
-     * UTxO, while keying on the ref means a quarantine dies naturally the moment the output is
-     * spent by anyone.
-     * <p>
-     * Package-private so the eviction and expiry rules can be driven directly from a test; nothing
-     * outside this package quarantines anything.
-     */
-    /**
      * How many scheduling cycles a TRANSPORT failure on the Minswap pool lookup is held for.
      *
      * <p>⛔ <b>Neither of the other two holds, deliberately.</b> A {@code LOOKUP_FAILED} is not a
@@ -2474,6 +2464,16 @@ public class LiquidationExecutor {
      */
     private static final long LOOKUP_FAILED_HOLD_CYCLES = 2L;
 
+    /**
+     * Quarantines one <b>loan UTxO ref</b> — {@code txHash#index}, never a loan id. The distinction
+     * is load-bearing: a loan id outlives the UTxO that carries it (it is minted once and burned at
+     * the end), so keying on it would exclude a borrower's loan across every re-creation of its
+     * UTxO, while keying on the ref means a quarantine dies naturally the moment the output is
+     * spent by anyone.
+     * <p>
+     * Package-private so the eviction and expiry rules can be driven directly from a test; nothing
+     * outside this package quarantines anything.
+     */
     void quarantineUntil(String loanUtxoRef, long until) {
         if (quarantine.size() >= MAX_QUARANTINED && !quarantine.containsKey(loanUtxoRef)) {
             List<Map.Entry<String, Long>> soonest = new ArrayList<>(quarantine.entrySet());
