@@ -139,15 +139,28 @@ jobs:
       # src/test/java. Raise the floor deliberately when classes are added; a drop is a deletion to
       # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
       #
-      # Floor measured 2026-09-10 on this tree, keyless: 137 files / 1076 tests / 0 failures /
-      # 45 skipped. Raised 136 -> 137 in the merge that brought this branch up to origin/main:
-      # #24 added ConvertLiquidationRouterTest, so the tree grew by one class and the old floor
-      # stopped matching it. A floor is only a measurement while it equals something someone
-      # measured; left at 136 it would have tolerated losing a class silently -- which is the
-      # exact defect this step exists to catch, so it is corrected here rather than carried.
+      # Floor measured 2026-09-10 on THIS merged tree, keyless (no credentials set -- the shape CI
+      # runs in): 138 files / 1087 tests / 0 failures / 45 skipped, zero orphans.
+      #
+      # Provenance of the number, because three separate raises collided here and a floor is only a
+      # measurement while it equals something someone actually measured:
+      #   135  base e75ecf9 (#23)
+      #   +1   FAB-84-1  EnvGatedRigReachabilityTest        -> 136
+      #   +1   FAB-80-1  config/BuildProvenanceTest         -> 137   (11 tests; 9 at round 1, the
+      #                                                               rework added two)
+      #   +1   #24       ConvertLiquidationRouterTest       -> 138   (arrived via the merge)
+      #
+      # Each of the three raises independently proposed 137 and each was right about its own tree and
+      # wrong about this one. Left at 137 the gate would have tolerated losing a class in silence --
+      # the exact defect this step exists to catch.
+      #
+      # NOTE an earlier revision of this comment recorded 1056 keyless tests for 136 files. A keyless
+      # run of that same tree reads 1059 -- same files, same 45 skips, three more tests; the figure was
+      # taken mid-rework rather than at the tip. Corrected rather than carried, because a recorded
+      # count nobody re-measures is how a stale number becomes the baseline everyone reconciles to.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '137'
+          RESULT_FILE_FLOOR: '138'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
