@@ -1246,6 +1246,26 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                             + "builder does not model — only PRICE_DATA_CHARLIE and the signed "
                             + "(AGGREGATED/DEDICATED) variants can be encoded");
         }
+        // FAB-83-1 audit F1 — THE ENTRY MUST BE USABLE NOW, NOT MERELY OF A MODELLED VARIANT. The
+        // scanner checked usableForLiquidation() when it assessed the candidate, but the registry
+        // refreshes every 30 s and the executor takes its oracle snapshot AFTER the scan; a refresh
+        // landing in that window can hand this builder a signed entry with ZERO signatures, and
+        // oracleRedeemer(entry, ...) would ship the empty list — the exact shape the deployed
+        // validator refuses (measured 2026-09-10: a real script denial, not an assembly failure).
+        // The convert builder guards this in build(); this one did not. Refused by NAME, so the
+        // executor records a verdict and re-considers next cycle, rather than a fault.
+        if (!entry.usableForLiquidation()) {
+            String why = switch (entry.feed().variant()) {
+                case AGGREGATED, DEDICATED -> "a signed feed carrying " + entry.signatures().size()
+                        + " signature(s) against a threshold of " + entry.threshold();
+                case PRICE_DATA_CHARLIE -> "a PRICE_DATA_CHARLIE feed with no Charli3 provider reference input";
+                default -> "no reference input";
+            };
+            throw new PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException(
+                    ("the %s oracle entry is not usable for liquidation right now: %s — the registry "
+                            + "snapshot this cycle cannot prove the price on chain; reconsidered next cycle")
+                            .formatted(leg, why));
+        }
     }
 
     /**

@@ -207,6 +207,33 @@ class LiquidatePayInAdvanceTransactionBuilderTest {
                 "the refusal must name the leg: " + refusal.getMessage());
     }
 
+    /**
+     * FAB-83-1 audit F1. A SIGNED feed whose registry entry currently carries NO signatures is not
+     * usable, and must be refused by name before anything is assembled — otherwise the redeemer ships
+     * an empty signature list, the exact shape the deployed validator refuses (a real script denial,
+     * measured on mainnet 2026-09-10). Reachable when a 30-second registry refresh lands between the
+     * scanner's usableForLiquidation() check and the executor's oracle snapshot. The convert builder
+     * guards this in build(); this builder did not.
+     *
+     * <p>Mutant: delete the usableForLiquidation() guard — the build then SUCCEEDS with an empty
+     * signature list and this assertThrows fails.
+     */
+    @Test
+    void aSignedFeedWithNoSignaturesIsRefusedByNameBeforeAnythingIsBuilt() {
+        var base = LiquidatePayInAdvanceDryEvalTest.fixture();
+        OracleEntry unsigned = multisigLike(base.request().oracle(), List.of());
+        var request = withOracles(base.request(), unsigned, null);
+
+        var refusal = assertThrows(
+                PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
+                () -> build(request));
+
+        assertTrue(refusal.getMessage().contains("0 signature(s)"),
+                "the refusal must name the missing signatures: " + refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("collateral"),
+                "the refusal must name the leg: " + refusal.getMessage());
+    }
+
     // ---- fixtures ------------------------------------------------------------------------------
 
     /** The same asset, the same deployment, the same window — published MULTISIG instead of c3. */
