@@ -140,9 +140,13 @@ jobs:
       # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
       #
       # Raised 136 -> 137 on 2026-09-10 by FAB-80-1, which adds exactly one class:
-      # config/BuildProvenanceTest (9 tests). Measured on this tree with NO credentials set, which is
+      # config/BuildProvenanceTest (11 tests). Measured on this tree with NO credentials set, which is
       # the shape CI runs in: 136 files / 1059 tests / 0 failures / 45 skipped before the class,
-      # 137 files / 1068 tests / 0 failures / 45 skipped after it.
+      # 137 files / 1070 tests / 0 failures / 45 skipped after it.
+      #
+      # (That class read 9 tests at FAB-80-1 round 1; the rework round added two -- one asserting the
+      # startup wiring actually installs the banner's default properties, one asserting the banner
+      # says the word 'unknown' rather than rendering a hole. Same one class, same floor.)
       #
       # NOTE the line above previously recorded 1056 keyless tests for 136 files. A keyless run of
       # that same 136-file tree today reads 1059 -- same files, same 45 skips, three more tests. The
