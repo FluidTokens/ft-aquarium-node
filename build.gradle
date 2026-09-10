@@ -53,6 +53,15 @@ dependencies {
 
 	implementation 'io.micrometer:micrometer-registry-prometheus:1.13.4'
 
+	// Declared here because NOTHING in this repo asked for actuator until now: the only thing putting
+	// it on the runtime classpath was a third-level transitive of
+	// yaci-store-spring-boot-starter:0.1.7. /actuator/prometheus -- which is how an operator watches
+	// this node -- therefore depended on a third party's dependency graph, and a yaci-store bump that
+	// dropped it would 404 the endpoint with no compile error and no failing test. Measured
+	// 2026-09-10: declaring it explicitly changes nothing on the classpath (runtimeClasspath resolves
+	// to the same 244 artifacts before and after, empty diff). A fragility fix, not a new dependency.
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
 	implementation 'org.postgresql:postgresql:42.6.0'
 	testImplementation 'com.h2database:h2:2.1.214'
 
@@ -70,6 +79,57 @@ dependencies {
 	testCompileOnly 'org.projectlombok:lombok:1.18.30'
 	testAnnotationProcessor 'org.projectlombok:lombok:1.18.30'
 
+}
+
+// ---------------------------------------------------------------------------------------------
+// Build provenance: what this jar was built FROM, recorded into
+// build/resources/main/META-INF/build-info.properties and served on /actuator/info.
+//
+// Why it exists: the CI image tag is `date +'%Y.%m.%d'`, so two pushes on the same day produce the
+// SAME TAG over DIFFERENT CODE. Nothing in the running process closed that gap; now the process
+// itself can say which commit it is.
+// ---------------------------------------------------------------------------------------------
+
+// Runs git at configuration time and returns null -- never the empty string, never a throw -- when
+// git cannot be reached at all: not installed, not a repository, a source tarball, a Docker context
+// with no `.git`. `providers.exec` rather than the older `exec { }` because the latter adds to the
+// Gradle 9 deprecation output this build already emits.
+def gitOutput = { String... arguments ->
+	try {
+		def execution = providers.exec {
+			commandLine(['git'] + (arguments as List))
+			ignoreExitValue = true
+		}
+		return execution.result.get().exitValue == 0 ? execution.standardOutput.asText.get().trim() : null
+	} catch (Exception ignored) {
+		return null
+	}
+}
+
+def headCommit = gitOutput('rev-parse', 'HEAD')
+def headCommitShort = gitOutput('rev-parse', '--short=12', 'HEAD')
+def workingTreeStatus = gitOutput('status', '--porcelain')
+
+springBoot {
+	buildInfo {
+		properties {
+			additional = [
+					commit     : headCommit ?: 'unknown',
+					commitShort: headCommitShort ?: 'unknown',
+
+					// UNAVAILABLE IS NOT CLEAN, and this line is the whole point of the block.
+					// `workingTreeStatus` has THREE states, not two: null means git could not be
+					// reached, "" means git WAS reached and the tree was clean, non-empty means
+					// dirty. The naive version returns "" from the fallback, finds it empty, and
+					// records dirty=false -- so a build that cannot vouch for its own tree would
+					// instead assert a clean one, on an unauthenticated endpoint an operator reads
+					// to decide whether an image is trustworthy. Silence must not be able to render
+					// as a clean tree.
+					dirty      : workingTreeStatus == null ? 'unknown'
+							: (workingTreeStatus.isEmpty() ? 'false' : 'true'),
+			]
+		}
+	}
 }
 
 tasks.named('test') {

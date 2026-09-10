@@ -139,11 +139,19 @@ jobs:
       # src/test/java. Raise the floor deliberately when classes are added; a drop is a deletion to
       # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
       #
-      # Floor measured 2026-09-10 on this tree, keyless: 136 files / 1056 tests / 0 failures /
-      # 45 skipped.
+      # Raised 136 -> 137 on 2026-09-10 by FAB-80-1, which adds exactly one class:
+      # config/BuildProvenanceTest (9 tests). Measured on this tree with NO credentials set, which is
+      # the shape CI runs in: 136 files / 1059 tests / 0 failures / 45 skipped before the class,
+      # 137 files / 1068 tests / 0 failures / 45 skipped after it.
+      #
+      # NOTE the line above previously recorded 1056 keyless tests for 136 files. A keyless run of
+      # that same 136-file tree today reads 1059 -- same files, same 45 skips, three more tests. The
+      # earlier figure was probably taken mid-rework rather than at the tip. It is corrected rather
+      # than carried forward, because a recorded count nobody re-measures is how a stale number
+      # becomes the baseline everyone reconciles to.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '136'
+          RESULT_FILE_FLOOR: '137'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
