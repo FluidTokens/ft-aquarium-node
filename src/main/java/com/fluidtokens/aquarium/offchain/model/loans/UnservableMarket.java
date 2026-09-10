@@ -2,20 +2,36 @@ package com.fluidtokens.aquarium.offchain.model.loans;
 
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.Locale;
 import java.util.SortedMap;
 import java.util.TreeMap;
 
 /**
  * ⛔ <b>A MARKET THE BOT MET AND COULD NOT SERVE, AND WHY.</b>
  *
- * <h2>A market is the token for the principal</h2>
+ * <h2>A market is the token for the principal — and a loan has TWO legs</h2>
  * Giovanni's vocabulary, adopted verbatim: <i>"for market is the token for the principal"</i>. Same
  * keying as {@code MarketGate}, which caps per-market exposure on the same identity, and the same
  * string {@code CompoundCandidateScanner} already logs — {@code principalAsset().toUnit()}.
  * <p>
- * The market is read off the <b>bond</b>, never the loan: an assessment may carry a {@code null}
- * loan ({@link LiquidationExclusion#LOAN_NOT_FOUND}) but never a null bond, so the bond is the only
- * place the market is always available.
+ * ⚠ <b>But a liquidation prices two assets, and either can be the one we cannot price.</b>
+ * {@link LiquidationExclusion#COLLATERAL_ORACLE_UNUSABLE} is a gap in the <em>collateral</em> token's
+ * coverage, and keying it by the principal was a real defect: two ada-principal loans whose different
+ * collateral tokens had no feed collapsed into one series saying {@code market="lovelace"}, which
+ * pages the operator about <b>ada</b> — a market that is always priceable — while the token that
+ * actually needs a feed appears nowhere. Giovanni's <i>"a new stablecoin loan appears"</i> arrives as
+ * collateral as often as as principal.
+ * <p>
+ * So the key names <b>the leg's own asset</b> and carries {@link Leg} to say which leg it is. The
+ * asset is read from the only place it is reliably available for that leg:
+ * <ul>
+ *   <li>{@link Leg#PRINCIPAL} — off the <b>bond</b>. An assessment may carry a {@code null} loan
+ *       ({@link LiquidationExclusion#LOAN_NOT_FOUND}) but never a null bond.</li>
+ *   <li>{@link Leg#COLLATERAL} — off the <b>loan</b>, which is the only carrier of
+ *       {@code CollateralAsset}. It is never null for a collateral-leg refusal: the scanner returns
+ *       {@code LOAN_NOT_FOUND} before it ever reaches the collateral feed lookup, and
+ *       {@code LOAN_NOT_FOUND} is classified servable and so is never reported.</li>
+ * </ul>
  *
  * <h2>⚠ This class DECIDES NOTHING. It re-reads a verdict that already exists</h2>
  * Every value here is derived from {@link LiquidationAssessment}s the scanner has already produced.
@@ -32,17 +48,34 @@ import java.util.TreeMap;
  * the <em>validator itself</em> forbids liquidation, and no change to this node could ever serve
  * them — reporting those would page an operator about work that does not exist.
  *
- * @param market the token for the principal, as {@code policyId + assetName} (or {@code lovelace}) —
- *               the same canonical unit string used everywhere else in this package. Never a human
+ * @param market the token for this LEG, as {@code policyId + assetName} (or {@code lovelace}) — the
+ *               same canonical unit string used everywhere else in this package. Never a human
  *               name: {@link com.fluidtokens.aquarium.offchain.model.AssetType#unsafeHumanAssetName()}
  *               decodes attacker-chosen bytes, which must not reach a log line or a metric label.
+ * @param leg    which side of the loan {@link #market} is — the label that stops a collateral-side
+ *               gap reading as a principal-side one
  * @param reason the scanner's own machine-readable reason, unchanged
  */
-public record UnservableMarket(String market, LiquidationExclusion reason)
+public record UnservableMarket(String market, Leg leg, LiquidationExclusion reason)
         implements Comparable<UnservableMarket> {
+
+    /**
+     * Which side of the loan an unservable reason is about. A liquidation prices the principal and
+     * the collateral separately, and the two are different tokens with different feeds.
+     */
+    public enum Leg {
+        PRINCIPAL,
+        COLLATERAL;
+
+        /** The metric label value: lower case, so {@code leg="collateral"} reads as prose. */
+        public String label() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+    }
 
     private static final Comparator<UnservableMarket> ORDER =
             Comparator.comparing(UnservableMarket::market)
+                    .thenComparing(m -> m.leg().name())
                     .thenComparing(m -> m.reason().name());
 
     /**
@@ -107,20 +140,80 @@ public record UnservableMarket(String market, LiquidationExclusion reason)
         };
     }
 
-    /** The market one assessment sits in: the token for the principal, off the bond. */
-    public static String marketOf(LiquidationAssessment assessment) {
-        return assessment.bond().datum().principalAsset().toUnit();
+    /**
+     * ⛔ <b>Which leg of the loan a refusal is about</b> — the thing that decides which token gets
+     * named.
+     *
+     * <p>Exhaustive and {@code default}-less for the same reason as {@link #isUnservable}: a new
+     * constant must not compile until someone has said which asset it is about. The seven servable
+     * reasons throw rather than picking a leg, because they are never reported and a leg for them
+     * would be a guess that nothing would ever contradict.
+     *
+     * <p>{@link LiquidationExclusion#HEALTH_NOT_COMPUTABLE} and
+     * {@link LiquidationExclusion#CONVERSION_TO_PRINCIPAL_REQUIRED} are about the loan as a whole
+     * rather than about one feed, so they take the principal — which is Giovanni's market — rather
+     * than being split across both legs.
+     */
+    public static Leg legOf(LiquidationExclusion reason) {
+        return switch (reason) {
+            case COLLATERAL_ORACLE_UNUSABLE -> Leg.COLLATERAL;
+            case PRINCIPAL_ORACLE_UNUSABLE,
+                 HEALTH_NOT_COMPUTABLE,
+                 CONVERSION_TO_PRINCIPAL_REQUIRED -> Leg.PRINCIPAL;
+            case LOAN_NOT_FOUND,
+                 NOT_LIQUIDATABLE,
+                 MODE_NOT_LIQUIDATION,
+                 EQUITY_IN_PRINCIPAL_CURRENCY,
+                 COLLATERAL_IS_COLLECTION,
+                 COLLATERAL_AMOUNT_TOO_SMALL,
+                 BOND_NOT_DELEGATED -> throw new IllegalArgumentException(
+                    reason + " is servable — isUnservable() says so — and a servable reason has no "
+                            + "leg, because nothing reports it and nothing would contradict a guess");
+        };
     }
 
     /**
-     * Every distinct (market, reason) pair one scan met and could not serve, each with <b>one</b>
-     * example {@code detail} — the scanner's own sentence about the first assessment that produced
-     * that pair.
+     * The asset one leg of one assessment names.
+     *
+     * <p>⛔ <b>There is no fallback to the principal.</b> A collateral-leg refusal whose loan is
+     * missing would be a violation of {@link LiquidationAssessment}'s own contract (a null loan is
+     * possible only for {@code LOAN_NOT_FOUND}, which is servable and never reported), and naming
+     * the principal instead would be exactly the mis-attribution this leg label exists to end. It
+     * throws instead; {@code LiquidationExecutor} calls the reporter inside a guard, so the cycle is
+     * unaffected and the fault is logged every cycle until someone looks.
+     */
+    public static String assetOf(LiquidationAssessment assessment, Leg leg) {
+        return switch (leg) {
+            case PRINCIPAL -> assessment.bond().datum().principalAsset().toUnit();
+            case COLLATERAL -> {
+                Loan loan = assessment.loan();
+                if (loan == null) {
+                    throw new IllegalStateException(
+                            "collateral-leg refusal " + assessment.exclusion() + " on bond "
+                                    + assessment.bond().utxoRef() + " carries no loan, so the "
+                                    + "collateral token cannot be named; refusing to report the "
+                                    + "principal in its place");
+                }
+                yield loan.datum().collateral().assetType().toUnit();
+            }
+        };
+    }
+
+    /** The (asset, leg, reason) triple one unservable assessment sits in. */
+    public static UnservableMarket of(LiquidationAssessment assessment) {
+        Leg leg = legOf(assessment.exclusion());
+        return new UnservableMarket(assetOf(assessment, leg), leg, assessment.exclusion());
+    }
+
+    /**
+     * Every distinct {@code (market, leg, reason)} triple one scan met and could not serve, each with
+     * <b>one</b> example {@code detail} — the scanner's own sentence about the first assessment that
+     * produced that triple.
      *
      * <p>⚠ <b>The detail is a value, never part of the key.</b> It carries an instant
      * ({@code "outside its validity window at 1757…"}), so keying on it would mint a new metric
      * series every cycle — the unbounded-cardinality failure this slice is forbidden to ship. The
-     * key is the pair; the detail only ever reaches a log line.
+     * key is the triple; the detail only ever reaches a log line.
      *
      * <p>Sorted, so the log and the gauge order are stable between cycles and a test can assert
      * them.
@@ -132,8 +225,7 @@ public record UnservableMarket(String market, LiquidationExclusion reason)
             if (assessment.buildable() || !isUnservable(assessment.exclusion())) {
                 continue;
             }
-            seen.putIfAbsent(new UnservableMarket(marketOf(assessment), assessment.exclusion()),
-                    assessment.detail());
+            seen.putIfAbsent(of(assessment), assessment.detail());
         }
         return seen;
     }
