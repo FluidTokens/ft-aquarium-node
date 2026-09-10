@@ -46,6 +46,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
@@ -323,7 +324,7 @@ class LiquidationExecutorTest {
         @Override
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
-                                                    Utxo walletUtxo,
+                                                    Function<BigInteger, Optional<Utxo>> walletSelector,
                                                     Map<String, OracleEntry> oraclesByOracleTokenUnit,
                                                     String changeAddress, long validFromMillis,
                                                     long validToMillis) {
@@ -3227,16 +3228,27 @@ class LiquidationExecutorTest {
 
     // ===== the CONVERT route must be handed a NOMINABLE wallet utxo, never the first raw one =====
 
-    /** Captures the wallet utxo the executor hands the convert router, then stops the build. */
+    /**
+     * Captures the wallet utxo the executor's SELECTOR nominates, then stops the build.
+     *
+     * <p>⚠ It applies the selector itself, exactly as the real router does — the executor no longer
+     * hands over a utxo, it hands over the means to choose one against a stated requirement. Asking
+     * for {@code requiredLovelace} is what makes the SIZE observable as well as the nominability.
+     */
     private static final class CapturingConvertRouter extends ConvertLiquidationRouter {
         Utxo captured;
-        CapturingConvertRouter() { super(null, null, null, null, null, null, null, null); }
+        private final BigInteger requiredLovelace;
+        CapturingConvertRouter(long requiredLovelace) {
+            super(null, null, null, null, null, null, null, null);
+            this.requiredLovelace = BigInteger.valueOf(requiredLovelace);
+        }
         @Override
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
-                                                    Utxo walletUtxo, Map<String, OracleEntry> oracles,
+                                                    Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Map<String, OracleEntry> oracles,
                                                     String changeAddress, long validFromMillis, long validToMillis) {
-            captured = walletUtxo;
+            captured = walletSelector.apply(requiredLovelace).orElse(null);
             throw new RuntimeException("captured the wallet input; nothing past this point is under test");
         }
     }
@@ -3276,7 +3288,8 @@ class LiquidationExecutorTest {
                 LoanFixtures.registry(), LoanFixtures.converters(), configuration,
                 new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                         LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
-        CapturingConvertRouter capturing = new CapturingConvertRouter();
+        // The order overhead a token-collateral convert carries — what the real router asks for.
+        CapturingConvertRouter capturing = new CapturingConvertRouter(4_000_000L);
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(List.of(refScriptUtxo, WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
                 payInAdvanceRouter, capturing, LoanFixtures.registry(), log, oracles,
@@ -3288,6 +3301,199 @@ class LiquidationExecutorTest {
                 "the CONVERT route was handed the published REFERENCE-SCRIPT utxo as its wallet input: "
                         + capturing.captured.getTxHash() + "#" + capturing.captured.getOutputIndex());
         assertEquals(WALLET_UTXO.getTxHash(), capturing.captured.getTxHash(),
-                "the convert route must receive the first NOMINABLE utxo");
+                "the convert route must receive a NOMINABLE utxo");
+    }
+
+    /**
+     * ⛔ <b>NOMINABLE IS NOT ENOUGH — the input must also be big enough for the order.</b>
+     *
+     * <p>The previous test would pass against "the first nominable utxo", which is what the hand-off
+     * was before this slice. This one cannot: the first nominable utxo in the listing holds 5 ADA and
+     * the convert order needs 60, so a first-match selection returns the small one and a SIZED
+     * selection returns the large one. Together the two tests pin both halves — nominability and size —
+     * and the mutant that reverts either is failed by one of them.
+     *
+     * <p>⚠ An ADA-collateral convert is what makes this matter: its {@code orderLovelace} is the whole
+     * swappable amount PLUS the Minswap overhead, not the overhead alone, so it can be arbitrarily
+     * larger than any fixed headroom the old hand-off happened to have.
+     */
+    @Test
+    void theConvertRouteNominatesAWalletUtxoLargeEnoughForTheOrderNotMerelyTheFirstNominableOne() {
+        Utxo tooSmall = LoanFixtures.adaUtxo("ab".repeat(32), 0, ACCOUNT.baseAddress(), 5_000_000L);
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, tooSmall, WALLET_UTXO,
+                convert.loan().utxo(), convert.bond().utxo());
+        LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        FakeScanner scanner = new FakeScanner(List.of(convert.assessment()));
+        FakeResolver resolver = new FakeResolver(allUnspent(List.of(convert)));
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+        // 60 ADA: more than the 5 ADA utxo listed FIRST, less than the 200 ADA one listed second.
+        CapturingConvertRouter capturing = new CapturingConvertRouter(60_000_000L);
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(List.of(tooSmall, WALLET_UTXO)), ACCOUNT, scanner, resolver,
+                plainBuilder, payInAdvanceRouter, capturing, LoanFixtures.registry(), log, noOracle(),
+                previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
+                EXPLODING_SUBMITTER);
+        executor.cycle(NOW);
+
+        assertNotNull(capturing.captured, "the convert route was never reached");
+        assertEquals(WALLET_UTXO.getTxHash(), capturing.captured.getTxHash(),
+                "the convert route nominated the FIRST nominable utxo (5 ADA) for an order needing "
+                        + "60 ADA; the nomination must be sized to the order, not to list position");
+    }
+
+    // ===== a VERDICT on the convert route is recorded, never quarantined as machinery =====
+
+    /** Throws whatever it is given, and counts how often the executor actually reached it. */
+    private static final class ThrowingConvertRouter extends ConvertLiquidationRouter {
+        private final RuntimeException toThrow;
+        int calls;
+        ThrowingConvertRouter(RuntimeException toThrow) {
+            super(null, null, null, null, null, null, null, null);
+            this.toThrow = toThrow;
+        }
+        @Override
+        public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
+                                                    Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
+                                                    Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Map<String, OracleEntry> oracles,
+                                                    String changeAddress, long validFromMillis, long validToMillis) {
+            calls++;
+            throw toThrow;
+        }
+    }
+
+    /** Wires a shadow executor whose convert router throws, sharing the fixtures of the tests above. */
+    private static ConvertWiring convertWiringThrowing(RuntimeException toThrow) {
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+                convert.loan().utxo(), convert.bond().utxo());
+        LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+        ThrowingConvertRouter router = new ThrowingConvertRouter(toThrow);
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT,
+                new FakeScanner(List.of(convert.assessment())),
+                new FakeResolver(allUnspent(List.of(convert))), plainBuilder, payInAdvanceRouter,
+                router, LoanFixtures.registry(), log, noOracle(), previewNetwork(),
+                LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
+        return new ConvertWiring(executor, log, router);
+    }
+
+    private record ConvertWiring(LiquidationExecutor executor, LiquidationDecisionLog log,
+                                 ThrowingConvertRouter router) {
+    }
+
+    /**
+     * ⛔ <b>A CLEAN VERDICT IS NOT A MACHINERY FAULT.</b> {@code POOL_TOO_THIN} — like the other four
+     * {@code ConvertOrderPlan} refusals — is a statement about this loan against this pool: no
+     * transaction was built, nothing broke, and one Minswap swap can make it viable again. It must be
+     * recorded under its own name and NOT held.
+     *
+     * <p>Before this slice every one of these fell to the executor's generic {@code catch (Exception)}
+     * and was quarantined for thirty minutes at ERROR, indistinguishable from a broken bot.
+     *
+     * <p>Mutant: remove the {@code ConvertOrderPlan.RefusedException} catch so it falls through again —
+     * the reason becomes the exception class and the quarantine count becomes 1.
+     */
+    @Test
+    void aConvertPlanRefusalIsRecordedUnderItsOwnNameAndNeverQuarantined() {
+        ConvertWiring wiring = convertWiringThrowing(new ConvertOrderPlan.RefusedException(
+                ConvertOrderPlan.Refusal.POOL_TOO_THIN,
+                "swapping 22003200000 would return about 824348402, but minimum_receive is 980001429"));
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = wiring.log().newestFirst(10).getFirst();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+        assertEquals("POOL_TOO_THIN", decision.reason(),
+                "the refusal's own name, not the exception class the generic catch would have used");
+        assertTrue(decision.detail().contains("824348402"),
+                "the operator needs the numbers, not just the verdict: " + decision.detail());
+        assertEquals(0, wiring.executor().quarantinedCount(),
+                "a verdict about the candidate must not be held as though the bot were broken");
+
+        // …and it is genuinely reconsidered on the very next cycle, which is what "not held" means.
+        wiring.executor().cycle(NOW + 1_000L);
+        assertEquals(2, wiring.router().calls,
+                "the candidate must be reconsidered immediately, not suppressed");
+    }
+
+    /**
+     * ⛔ <b>A TRANSPORT FAILURE GETS A SHORT HOLD — NOT NOTHING, AND NOT THIRTY MINUTES.</b>
+     *
+     * <p>Measured on mainnet 2026-09-09: one Blockfrost hiccup on the pool lookup produced <b>39
+     * {@code QUARANTINED} records</b> on a single live loan, because {@code LOOKUP_FAILED} was reaching
+     * the machinery quarantine. A provider that cannot be reached says nothing about the candidate —
+     * but retrying every cycle against a provider that is down is what the quarantine exists for, so
+     * the answer is a SHORT hold: two cycles.
+     *
+     * <p>Both bounds are asserted, because each is a different mutant. Inside one cycle it must still
+     * be held (removing the hold entirely fails here); past two cycles it must be reconsidered (setting
+     * the hold to {@code quarantine-minutes} fails there).
+     */
+    @Test
+    void aTransportFailureOnThePoolLookupIsHeldForTwoCyclesNotTheThirtyMinuteQuarantine() {
+        ConvertWiring wiring = convertWiringThrowing(new MinswapPoolResolver.RefusedException(
+                MinswapPoolResolver.Refusal.LOOKUP_FAILED, "the pool lookup failed: java.net.SocketTimeoutException"));
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = wiring.log().newestFirst(10).getFirst();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+        assertEquals("LOOKUP_FAILED", decision.reason(),
+                "a transport failure must be distinguishable from NO_MINSWAP_POOL, which is a verdict");
+        assertEquals(1, wiring.executor().quarantinedCount(),
+                "SOME hold is required: a candidate retried every cycle against a provider that is "
+                        + "down is exactly what the quarantine was built for");
+        assertEquals(1, wiring.router().calls);
+
+        // One cycle later (60s), still inside the two-cycle hold.
+        wiring.executor().cycle(NOW + 60_000L);
+        assertEquals(1, wiring.router().calls, "still held after one cycle");
+        assertEquals(LiquidationDecision.Outcome.QUARANTINED,
+                wiring.log().newestFirst(10).getFirst().outcome());
+
+        // Past two cycles (121s) it must be reconsidered — the whole point of not using 30 minutes.
+        wiring.executor().cycle(NOW + 121_000L);
+        assertEquals(2, wiring.router().calls,
+                "a transport blip must clear in two cycles, not in the 30-minute machinery quarantine");
+    }
+
+    /**
+     * The resolver's OTHER refusals are facts about the chain — reproducible next cycle and unaffected
+     * by waiting — so they are verdicts, held no longer than any other verdict. Only
+     * {@code LOOKUP_FAILED} is transport.
+     */
+    @Test
+    void anAmbiguousPoolIsAVerdictAboutTheChainAndIsNotHeld() {
+        ConvertWiring wiring = convertWiringThrowing(new MinswapPoolResolver.RefusedException(
+                MinswapPoolResolver.Refusal.AMBIGUOUS_POOL, "2 UTxOs hold the LP asset"));
+
+        wiring.executor().cycle(NOW);
+
+        assertEquals("AMBIGUOUS_POOL", wiring.log().newestFirst(10).getFirst().reason());
+        assertEquals(0, wiring.executor().quarantinedCount(),
+                "waiting cannot change how many pool UTxOs hold the LP asset");
     }
 }
