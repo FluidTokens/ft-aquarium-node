@@ -156,9 +156,17 @@ jobs:
       #
       # FAB-81-1 measured both sides of its own change, keyless, with `rm -rf build/test-results/test`
       # then `./gradlew cleanTest test`, counting the XML rather than reading BUILD SUCCESSFUL:
-      #   before  138 files / 1087 tests / 0 failures / 45 skipped
-      #   after   139 files / 1096 tests / 0 failures / 45 skipped   (+1 class, +8 tests there,
+      #   before  138 files / 1089 tests / 0 failures / 45 skipped
+      #   after   139 files / 1098 tests / 0 failures / 45 skipped   (+1 class, +8 tests there,
       #                                                              +1 in LiquidationExecutorTest)
+      #
+      # ⚠ THE TEST TOTALS ABOVE WERE RE-MEASURED ON RE-CUT. The slice was built on main before PR #28
+      # (the anticipate-rig park) merged, and was cherry-picked onto main afterwards. Its own run read
+      # 1087 -> 1096; on this tree, which carries #28's two extra park tests, the same change reads
+      # 1089 -> 1098. The FILE counts and the delta (+1 class, +9 tests) are unchanged.
+      # Recorded rather than corrected silently: a number measured on a base that has since moved is
+      # not wrong, it is a measurement OF SOMETHING ELSE -- and that is exactly how a stale figure
+      # survives, by having been true once.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
