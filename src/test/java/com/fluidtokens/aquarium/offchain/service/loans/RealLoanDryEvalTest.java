@@ -35,6 +35,7 @@ import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.Validator;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -1298,8 +1299,47 @@ class RealLoanDryEvalTest {
      * <p>
      * Gated on {@code BLOCKFROST_KEY}; it makes network calls and is not part of the cold suite. It
      * submits nothing: the builder has no {@code TransactionProcessor}, and there is no signer here.
+     *
+     * <h3>⛔ PARKED — FAB-86, ruling of 2026-09-10. The failure is the FIXTURE'S ABSENCE.</h3>
+     * <ol>
+     *   <li>With the key present this method failed at <i>"loan utxo spent — the loan may have been
+     *       liquidated"</i>: the preview loan {@code d2a85126…#1} pinned above is no longer in the
+     *       live UTxO set. Every constant in this class was read off preview on 2026-08-17 and a
+     *       loan is a thing other people close. <b>Stale fixture, not a code fault — do not "repair"
+     *       it</b>, and do not re-pin it to whatever loan is unspent today: choosing a replacement is
+     *       a judgement about what this rig should prove.</li>
+     *   <li><b>The park is METHOD-level, deliberately.</b> This is the only test here that touches
+     *       the chain; the other ten are pinned literals that run cold, need no key and are green.
+     *       They include the first evaluation ever run against a real third-party loan. A class-level
+     *       gate would switch all eleven off to park one, and ten verifications that stop running
+     *       produce no failure — they produce silence that looks like a pass.</li>
+     *   <li>Re-enabling takes an <b>unspent preview loan</b> and the constants above re-read against
+     *       it. ⚠ Whoever does that should know the diagnosis is not as sharp as the message reads:
+     *       {@code getTxOutput} yields an empty {@code Optional} for a transport failure as well as
+     *       for a spent output, so an HTTP 403 from a mainnet key pointed at this <em>preview</em>
+     *       URL — the gate is the network-agnostic {@code BLOCKFROST_KEY}, so sourcing
+     *       {@code .env.mainnet} does exactly that — reaches the same {@code orElseThrow} and prints
+     *       the same sentence. Confirm the loan against a preview key before deciding what to
+     *       re-pin.</li>
+     * </ol>
+     * The dead coordinates stay pinned on purpose: they record what was last proven against preview.
+     *
+     * <p><b>Why a second gate rather than {@code @Disabled}:</b> the CI run summary derives "waiting
+     * on X" from the gate names it finds in the source, so a disabled method would still read as
+     * waiting on {@code BLOCKFROST_KEY} — a deliberate park dressed as a missing credential. And
+     * {@code disabledReason} never reaches the JUnit XML; Gradle's writer drops it and leaves a bare
+     * {@code <skipped/>}, so the gate NAME is the only thing an operator ever reads.
+     * {@code AQUARIUM_REAL_LOAN_RIG_CANDIDATE} is deliberately absent from every {@code .env.*} file,
+     * and {@code EnvGatedRigReachabilityTest} carries a narrow, named exemption keeping it absent.
      */
     @org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable(named = "BLOCKFROST_KEY", matches = ".+")
+    @EnabledIfEnvironmentVariable(named = "AQUARIUM_REAL_LOAN_RIG_CANDIDATE", matches = ".+",
+            disabledReason = "FAB-86, parked 2026-09-10: the pinned preview loan d2a85126…#1 is no "
+                    + "longer in the live UTxO set, so this rig fails at 'loan utxo spent'. STALE "
+                    + "FIXTURE, not a code fault — do not repair it and do not re-pin it casually. "
+                    + "Re-enable only with an unspent preview loan and the constants above re-read "
+                    + "against it. Method-level on purpose: the other ten tests in this class run "
+                    + "cold and must keep running.")
     @Test
     void productionWiringPricesTheRealLoanAgainstTheRealChainThroughThePublishedReferenceScript() throws Exception {
         var bf = new com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService(

@@ -98,10 +98,21 @@ class EnvGatedRigReachabilityTest {
      * the outside, and the first is a defect while the second is a ruling. This list is where the
      * difference is written down, by name, with its reason attached.
      * <p>
-     * A park is expressed as a <b>second class-level gate whose name is not a credential</b>, so the
+     * A park is expressed as a <b>second gate whose name is not a credential</b>, so the
      * CI run summary reports the rig as waiting on that gate rather than on a key it will never be
      * handed — see {@link #theParkExemptionCoversExactlyTheClassesThatCarryAParkGate()}, which
-     * refuses a park named like a credential. The park gate is deliberately <b>absent</b> from every
+     * refuses a park named like a credential.
+     * <p>
+     * <b>Class-level or method-level is decided by what actually expired</b>, and the answer is not
+     * always the class. {@code RealLoanDryEvalTest} has one method that touches the chain and ten
+     * that are cold pinned literals; a class-level gate there would switch off ten green
+     * verifications to park one stale fixture, and ten verifications that stop running produce no
+     * failure — they produce silence that looks like a pass. So its park sits on the method.
+     * Nothing below depends on the distinction: {@link #gateNames(String)} scans the source text,
+     * not the declaration it is attached to, and so does the run summary's copy of the same pattern.
+     * Park the smallest thing that is actually stale.
+     * <p>
+     * The park gate is deliberately <b>absent</b> from every
      * {@code .env.*} file, and {@link
      * #aParkedRigStaysParkedAndCannotBeUnparkedByEditingAnEnvFile()} keeps it absent: adding it there
      * would quietly re-arm a rig somebody switched off, which then goes red for a reason that is not
@@ -114,22 +125,62 @@ class EnvGatedRigReachabilityTest {
      * #assertParkListIsIntact()} refuses the half-way state, because the two checks below iterate
      * this list and an empty list makes them assert nothing.
      */
-    private static final List<ParkedRig> PARKED_RIGS = List.of(new ParkedRig(
-            "LiquidatePayInAdvanceLiveDryEvalTest",
-            "AQUARIUM_ANTICIPATE_RIG_CANDIDATE",
-            "FAB-86, ruling of 2026-09-10 — parked, not broken: the loan it is pinned to was "
-                    + "liquidated by this bot, so the reference input and the wallet's USDM are gone "
-                    + "and the rig's 3 failures are a stale fixture rather than a code fault. It comes "
-                    + "back only with a live liquidatable loan big enough to exercise wallet sizing, "
-                    + "the balance check and POOL_TOO_THIN — see the class javadoc"));
+    private static final List<ParkedRig> PARKED_RIGS = List.of(
+            new ParkedRig(
+                    "LiquidatePayInAdvanceLiveDryEvalTest",
+                    "AQUARIUM_ANTICIPATE_RIG_CANDIDATE",
+                    "FAB-86, ruling of 2026-09-10 — parked, not broken: the loan it is pinned to was "
+                            + "liquidated by this bot, so the reference input and the wallet's USDM are gone "
+                            + "and the rig's 3 failures are a stale fixture rather than a code fault. It comes "
+                            + "back only with a live liquidatable loan big enough to exercise wallet sizing, "
+                            + "the balance check and POOL_TOO_THIN — see the class javadoc"),
+            new ParkedRig(
+                    "MainnetCompoundEscrowTest",
+                    "AQUARIUM_COMPOUND_RIG_POOL_MANAGER",
+                    "FAB-86, ruling of 2026-09-10 — parked, not broken: the mainnet pool manager NFT "
+                            + "it pins is held by no address any more, so the live compoudingFeePerMille "
+                            + "that is the whole point of the class cannot be read. Stale fixture, not a "
+                            + "code fault. It comes back with a live mainnet pool manager and its unit "
+                            + "written into the class — see the class javadoc"),
+            new ParkedRig(
+                    "RealLoanDryEvalTest",
+                    "AQUARIUM_REAL_LOAN_RIG_CANDIDATE",
+                    "FAB-86, ruling of 2026-09-10 — parked, not broken: the preview loan its ONE live "
+                            + "method is pinned to has left the UTxO set, so that method fails at 'loan "
+                            + "utxo spent'. Stale fixture, not a code fault. ⚠ The park here is "
+                            + "METHOD-level, not class-level: the other ten tests in this class are cold "
+                            + "literals that must keep running — see the class javadoc"));
+
+    /**
+     * ⛔ <b>Every rig this repo has ever parked, hard-named.</b> {@link #assertParkListIsIntact()}
+     * compares this with {@link #PARKED_RIGS} for exact equality, so <em>removing any single entry
+     * from the list above fails</em>. Naming only one of them — as this guard did while one rig was
+     * parked — would let a list of three be emptied down to that one with both park checks still
+     * reporting green over an almost-empty loop.
+     * <p>
+     * Un-parking is still allowed, and it is still one deliberate commit: delete the
+     * {@link ParkedRig} entry, delete the gate from the class, and delete the name here — and if the
+     * name here is the last one, delete the park checks too rather than leaving them as no-ops.
+     * <p>
+     * ⚠ There may be a FOURTH edit, and it will not look related.
+     * {@code theAnnotationScanAloneSeesTheFullyQualifiedGateForm} hard-codes the expected gate set for
+     * {@code RealLoanDryEvalTest}, so removing that rig's park gate makes it fail too. That coupling is
+     * deliberate — it is what keeps the scan's exactness load-bearing rather than incidental — but to
+     * whoever lifts the park it reads as an unrelated mystery failure. It is not; update the expected
+     * set in the same commit.
+     */
+    private static final Set<String> EVERY_RIG_EVER_PARKED = new TreeSet<>(List.of(
+            "LiquidatePayInAdvanceLiveDryEvalTest",  // FAB-86-1, 2026-09-10
+            "MainnetCompoundEscrowTest",             // FAB-86-2, 2026-09-10
+            "RealLoanDryEvalTest"));                 // FAB-86-2, 2026-09-10
 
     /**
      * The qualifier is optional on purpose: {@code @EnabledIfEnvironmentVariable} and
      * {@code @org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable} are the same annotation,
      * and both are in this tree. Anchoring {@code @} straight to the simple name made the second form
      * invisible — a gated rig that this class could not see and that CI reported as "waiting on
-     * disabled". Keep {@code *}, not {@code +}: of the 45 annotation usages in this tree, across 23
-     * classes, 44 carry no qualifier and exactly one is fully qualified.
+     * disabled". Keep {@code *}, not {@code +}: of the 47 annotation usages in this tree, across 23
+     * classes, 46 carry no qualifier and exactly one is fully qualified.
      */
     private static final Pattern GATE =
             Pattern.compile("@(?:[A-Za-z_][A-Za-z0-9_]*\\.)*EnabledIfEnvironmentVariable"
@@ -274,11 +325,18 @@ class EnvGatedRigReachabilityTest {
      * So the list is pinned in the same shape and for the same reason as {@link
      * #everyBlockfrostCredentialInTheTestTreeIsOneOfTheKnownNames()}'s {@code sources.size() >= 100}:
      * <em>a scan that quietly matches nothing passes every assertion built on it.</em> Non-empty,
-     * and still naming the rig FAB-86 parked.
+     * and naming <b>every</b> rig ever parked.
+     * <p>
+     * ⚠ <b>Non-empty is not enough once more than one rig is parked</b>, and hard-naming <em>one</em>
+     * of them is not either. With three entries, deleting two still leaves a list that is non-empty
+     * and still contains the one hard-named rig — so both park checks would run one iteration,
+     * report green, and cover a third of what they are supposed to cover. A partial deletion is the
+     * likelier accident than a total one: it is what a merge resolution or a half-finished un-park
+     * leaves behind, and it looks exactly like the healthy state from the outside. So the guard is
+     * an <b>exact set comparison</b> against {@link #EVERY_RIG_EVER_PARKED}: one entry short fails,
+     * and the failure names the missing rig.
      */
     private static void assertParkListIsIntact() {
-        String parkedByFab86 = "LiquidatePayInAdvanceLiveDryEvalTest";
-
         assertFalse(PARKED_RIGS.isEmpty(),
                 "PARKED_RIGS is empty, so both park checks iterate nothing and pass while asserting "
                         + "nothing. Emptying this list is NOT how a park is lifted: the gate stays on "
@@ -287,14 +345,17 @@ class EnvGatedRigReachabilityTest {
                         + "on the class in one deliberate commit. If nothing is parked any more, "
                         + "delete these checks too rather than leaving them behind as no-ops.");
 
-        assertTrue(PARKED_RIGS.stream().anyMatch(p -> p.className().equals(parkedByFab86)),
-                "PARKED_RIGS no longer names " + parkedByFab86 + ", the rig parked by FAB-86, so the "
-                        + "checks below no longer cover it. Dropping the entry is NOT how that park is "
-                        + "lifted: its AQUARIUM_ANTICIPATE_RIG_CANDIDATE gate would stay on the class "
-                        + "— skipped forever, reason gone — and nothing would then stop .env.mainnet "
-                        + "defining that gate and silently re-arming it on a dead fixture. If the "
-                        + "ruling really was reversed, remove the gate from the class in the same "
-                        + "commit and record here what reversed it.");
+        Set<String> listed = new TreeSet<>();
+        PARKED_RIGS.forEach(p -> listed.add(p.className()));
+        assertEquals(EVERY_RIG_EVER_PARKED, listed,
+                "PARKED_RIGS no longer names exactly the rigs this repo has parked, so the two checks "
+                        + "below cover less than they are meant to — and a shortened list is still "
+                        + "non-empty, so nothing else would object. Dropping an entry is NOT how a "
+                        + "park is lifted: the gate would stay on the class — skipped forever, reason "
+                        + "gone — and nothing would then stop a .env.* file defining that gate and "
+                        + "silently re-arming the rig on a dead fixture. If a ruling really was "
+                        + "reversed, remove the gate from the class and the name from "
+                        + "EVERY_RIG_EVER_PARKED in the same commit, and record what reversed it.");
     }
 
     /**
@@ -371,7 +432,14 @@ class EnvGatedRigReachabilityTest {
                             + "the run summary would report " + parked.className() + " as waiting on "
                             + "a key rather than as parked — the very confusion the second-gate shape "
                             + "exists to remove. Name it for what is actually missing.");
-            parkGates.add(parked.gate());
+            assertTrue(parkGates.add(parked.gate()),
+                    "PARKED_RIGS gives " + parked.className() + " the gate " + parked.gate()
+                            + ", which another parked rig already uses. Two rigs behind ONE gate is a "
+                            + "single switch for two unrelated expiries: setting that variable to "
+                            + "revive one silently re-arms the other on a fixture nobody looked at, "
+                            + "and it then goes red for a reason that is not a code fault — which is "
+                            + "the exact repair-reflex this mechanism exists to stop. Give each park "
+                            + "its own name.");
         }
 
         Set<String> carrying = new TreeSet<>();
@@ -429,6 +497,13 @@ class EnvGatedRigReachabilityTest {
      * <p>
      * So this asserts on {@link #gateNames(String)} — the annotation pattern by itself, with no
      * getenv fallback available to rescue it.
+     * <p>
+     * ⚠ Since FAB-86 the expected set has <b>two</b> names: the class's one live method is parked
+     * behind a second gate written in the <em>plain</em> form (see {@link #PARKED_RIGS}). That makes
+     * the <b>exactness</b> of the comparison load-bearing rather than incidental — a scan that had
+     * gone blind to the qualified form would now return {@code {AQUARIUM_REAL_LOAN_RIG_CANDIDATE}}
+     * instead of the empty set, so "non-empty" would accept the very defect this test exists to
+     * catch. Keep {@code assertEquals} on the full set; never weaken it to a {@code contains}.
      */
     @Test
     void theAnnotationScanAloneSeesTheFullyQualifiedGateForm() {
@@ -440,7 +515,7 @@ class EnvGatedRigReachabilityTest {
                         + "carries it now — do not delete the assertion, or the scan can go blind to "
                         + "the form again with nothing left to detect it.");
 
-        assertEquals(Set.of("BLOCKFROST_KEY"), gateNames(text),
+        assertEquals(Set.of("BLOCKFROST_KEY", "AQUARIUM_REAL_LOAN_RIG_CANDIDATE"), gateNames(text),
                 "the @EnabledIfEnvironmentVariable scan does not see the fully-qualified form. A rig "
                         + "gated that way is invisible to this class, and the CI step summary reports "
                         + "it as 'waiting on disabled' — the verification reads as off forever.");
@@ -448,7 +523,7 @@ class EnvGatedRigReachabilityTest {
 
     /**
      * And admitting the qualifier must not have cost the plain form. A qualifier made
-     * <em>mandatory</em> — {@code +} where the pattern has {@code *} — would miss all 44 plain
+     * <em>mandatory</em> — {@code +} where the pattern has {@code *} — would miss all 46 plain
      * occurrences in this tree while still satisfying the check above. The rig-level checks would
      * not notice for {@code ConvertLiveDryEvalTest}, because it also reads its credential with
      * {@code System.getenv}; only a gate-only assertion does.
