@@ -64,7 +64,14 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import glob, os, re, xml.etree.ElementTree as ET
 
-          GATE = re.compile(r'@EnabledIfEnvironmentVariable\s*\(\s*named\s*=\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+          # The package qualifier is optional: `@EnabledIfEnvironmentVariable` and
+          # `@org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable` are the same annotation and
+          # both occur in src/test/java. Anchoring `@` straight to the simple name made the second form
+          # invisible, and this step then printed "waiting on disabled" for a class an operator could
+          # in fact enable - a skip presented as permanently off, inside the step that exists to say a
+          # skip is not a pass. Kept textually identical to EnvGatedRigReachabilityTest.GATE, which
+          # asserts that identity.
+          GATE = re.compile(r'@(?:[A-Za-z_][A-Za-z0-9_]*\.)*EnabledIfEnvironmentVariable\s*\(\s*named\s*=\s*"([A-Za-z_][A-Za-z0-9_]*)"')
 
           def source_of(class_name):
               candidate = class_name.split('$')[0]
@@ -114,8 +121,14 @@ jobs:
               print()
               print('### Classes that ran but skipped some tests')
               print()
+              # Name the credential here too. A class gated per-METHOD runs, goes green, and hides one
+              # verification inside a passing result - the easiest kind of skip to lose sight of, and
+              # the reason RealLoanDryEvalTest is not in the list above. Without the gate name the
+              # reader cannot tell an opt-in rig from an @Disabled method.
               for name, skip in sorted(partly):
-                  print('- `%s` - %d skipped' % (name, skip))
+                  waiting = ', '.join('`%s`' % gate for gate in gates_of(name))
+                  print('- `%s` - %d skipped%s'
+                        % (name, skip, ' - waiting on ' + waiting if waiting else ''))
           PY
 
       # Step 3c: A count that can only increase is not a measurement.

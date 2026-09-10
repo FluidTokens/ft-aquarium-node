@@ -62,6 +62,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * cross-check there and passes on the source-side half alone; it is a <b>developer-local</b> guard.
  * The two structural checks — the pinned credential-variable set and the per-network gate names —
  * run everywhere, so a new credential name cannot appear without this class being updated.
+ * <p>
+ * That promise is only as wide as the scan behind it, which is why {@link
+ * #theAnnotationScanAloneSeesTheFullyQualifiedGateForm()} and {@link
+ * #theAnnotationScanAloneStillSeesThePlainGateForm()} exist: both spellings of the annotation must
+ * be visible to {@link #GATE}, and neither may be rescued by a {@code System.getenv} call that a
+ * refactor is free to delete.
  */
 class EnvGatedRigReachabilityTest {
 
@@ -78,10 +84,26 @@ class EnvGatedRigReachabilityTest {
     /** Anything named like a Blockfrost credential. Deliberately wider than the pinned set above. */
     private static final Pattern BLOCKFROST_CREDENTIAL = Pattern.compile("BLOCKFROST[A-Z0-9_]*KEY");
 
+    /**
+     * The qualifier is optional on purpose: {@code @EnabledIfEnvironmentVariable} and
+     * {@code @org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable} are the same annotation,
+     * and both are in this tree. Anchoring {@code @} straight to the simple name made the second form
+     * invisible — a gated rig that this class could not see and that CI reported as "waiting on
+     * disabled". Keep {@code *}, not {@code +}: 46 of the 47 occurrences here carry no qualifier.
+     */
     private static final Pattern GATE =
-            Pattern.compile("@EnabledIfEnvironmentVariable\\s*\\(\\s*named\\s*=\\s*\"([A-Za-z_][A-Za-z0-9_]*)\"");
+            Pattern.compile("@(?:[A-Za-z_][A-Za-z0-9_]*\\.)*EnabledIfEnvironmentVariable"
+                    + "\\s*\\(\\s*named\\s*=\\s*\"([A-Za-z_][A-Za-z0-9_]*)\"");
     private static final Pattern GETENV =
             Pattern.compile("getenv\\s*\\(\\s*\"([A-Za-z_][A-Za-z0-9_]*)\"\\s*\\)");
+
+    /**
+     * Step 3b of {@code .github/workflows/docker-build.yml} carries its own copy of {@link #GATE} in
+     * Python, because CI cannot call into this class. This locates it so the two can be pinned
+     * textually rather than left to drift.
+     */
+    private static final Pattern WORKFLOW_GATE_DECLARATION =
+            Pattern.compile("GATE\\s*=\\s*re\\.compile\\(r'([^']*)'\\)");
 
     /** An alias line, and nothing else: {@code NAME=$OTHER}, {@code NAME="${OTHER}"}. */
     private static final Pattern ALIAS_RHS =
@@ -209,6 +231,70 @@ class EnvGatedRigReachabilityTest {
                         + "the empty string when sourced and must not count as supplying the variable");
     }
 
+    /**
+     * ⚠ <b>The annotation scan alone must see the fully-qualified form.</b> The first cut of this
+     * guard anchored {@code @} directly to the simple class name, so
+     * {@code @org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable(...)} never matched.
+     * {@code RealLoanDryEvalTest} uses exactly that form, and reached the checks above only
+     * incidentally, through the {@code System.getenv} half of the scan — delete that call in some
+     * future refactor and the class leaves this guard's world with nothing to notice. Worse, the
+     * workflow's copy of the same pattern reported it as <em>"waiting on disabled"</em>: an operator
+     * is told the verification can never run, inside the one step whose stated purpose is "a skip is
+     * not a pass", when supplying the key would in fact run it.
+     * <p>
+     * So this asserts on {@link #gateNames(String)} — the annotation pattern by itself, with no
+     * getenv fallback available to rescue it.
+     */
+    @Test
+    void theAnnotationScanAloneSeesTheFullyQualifiedGateForm() {
+        String text = read(testSource("RealLoanDryEvalTest"));
+
+        assertTrue(text.contains("@org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable("),
+                "RealLoanDryEvalTest no longer carries the fully-qualified annotation form, and it is "
+                        + "the only instance of it in the tree. Point this test at whatever class "
+                        + "carries it now — do not delete the assertion, or the scan can go blind to "
+                        + "the form again with nothing left to detect it.");
+
+        assertEquals(Set.of("BLOCKFROST_KEY"), gateNames(text),
+                "the @EnabledIfEnvironmentVariable scan does not see the fully-qualified form. A rig "
+                        + "gated that way is invisible to this class, and the CI step summary reports "
+                        + "it as 'waiting on disabled' — the verification reads as off forever.");
+    }
+
+    /**
+     * And admitting the qualifier must not have cost the plain form. A qualifier made
+     * <em>mandatory</em> — {@code +} where the pattern has {@code *} — would miss all 46 plain
+     * occurrences in this tree while still satisfying the check above. The rig-level checks would
+     * not notice for {@code ConvertLiveDryEvalTest}, because it also reads its credential with
+     * {@code System.getenv}; only a gate-only assertion does.
+     */
+    @Test
+    void theAnnotationScanAloneStillSeesThePlainGateForm() {
+        assertEquals(Set.of("BLOCKFROST_MAINNET_KEY"), gateNames(read(testSource("ConvertLiveDryEvalTest"))),
+                "the @EnabledIfEnvironmentVariable scan has stopped seeing the plain, unqualified "
+                        + "annotation form — the form all but one gated class in this tree uses");
+    }
+
+    /**
+     * The workflow's step 3b holds a second, independent copy of {@link #GATE}. Two copies of one
+     * rule drift, and this drift is invisible from either side: this class can report the tree fully
+     * scanned while the run summary an operator actually reads says "disabled". Pin them textually.
+     */
+    @Test
+    void theWorkflowsCopyOfTheGatePatternIsTextuallyIdentical() {
+        String workflow = read(repoRoot().resolve(".github/workflows/docker-build.yml"));
+        Matcher declaration = WORKFLOW_GATE_DECLARATION.matcher(workflow);
+
+        assertTrue(declaration.find(),
+                ".github/workflows/docker-build.yml no longer declares GATE = re.compile(r'...'), so "
+                        + "step 3b's scanner can no longer be compared with this one and the two are "
+                        + "free to drift unseen");
+        assertEquals(GATE.pattern(), declaration.group(1),
+                "the workflow's gate pattern and this class's have drifted. They answer the same "
+                        + "question — which classes are waiting on which credential — in two places, "
+                        + "and only one of the two is what an operator reads on the run summary.");
+    }
+
     // ---- source scanning --------------------------------------------------------------------------
 
     private static List<Path> testSources() {
@@ -250,6 +336,32 @@ class EnvGatedRigReachabilityTest {
             rigs.add(new Rig(className, credentials, networks));
         }
         return rigs;
+    }
+
+    /**
+     * The variable names an {@code @EnabledIfEnvironmentVariable} scan yields <b>on its own</b>, with
+     * no {@code System.getenv} contribution mixed in. {@link #rigs(List)} deliberately unions the
+     * two, which is right for asking "what does this rig depend on" and wrong for asking "can the
+     * annotation scan see this gate at all" — the union answers yes for a gate the pattern misses
+     * whenever the class happens to read the same name a second way.
+     */
+    private static Set<String> gateNames(String source) {
+        Set<String> names = new LinkedHashSet<>();
+        Matcher matcher = GATE.matcher(source);
+        while (matcher.find()) {
+            names.add(matcher.group(1));
+        }
+        return names;
+    }
+
+    /** A named test class's source file, or an assertion failure — an absent file is not a pass. */
+    private static Path testSource(String className) {
+        return testSources().stream()
+                .filter(path -> path.getFileName().toString().equals(className + ".java"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(className + ".java is no longer under "
+                        + "src/test/java: this check has nothing to measure, which is not the same "
+                        + "thing as passing"));
     }
 
     // ---- .env parsing: NAMES ONLY -----------------------------------------------------------------
