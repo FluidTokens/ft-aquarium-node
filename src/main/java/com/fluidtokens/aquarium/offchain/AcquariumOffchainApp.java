@@ -24,12 +24,28 @@ public class AcquariumOffchainApp {
     private static final String BUILD_INFO = "/META-INF/build-info.properties";
 
     public static void main(String[] args) {
+        configuredApplication().run(args);
+    }
+
+    /**
+     * ⛔ <b>The seam, and it exists because the wiring below is otherwise untestable.</b> Everything
+     * that decides what the banner can render happens here rather than in {@link #main(String[])}:
+     * {@code main} is deliberately a single delegation with nothing of its own to get wrong, because
+     * a test can call this and cannot call {@code main}.
+     *
+     * <p>Without this split, deleting the {@code setDefaultProperties} line leaves every test green
+     * while every banner an operator ever reads says {@code commit unknown (dirty=unknown) :: built
+     * unknown} — the banner half of this feature silently off, with CI reporting success. A test that
+     * renders the banner over a map it built itself proves the placeholders resolve; it does not prove
+     * anything supplies them in production.
+     */
+    static SpringApplication configuredApplication() {
         SpringApplication application = new SpringApplication(AcquariumOffchainApp.class);
         // Default properties, so an operator's -D or environment variable still wins. This is also
         // what makes banner.txt's ${aquarium.build.*} placeholders resolvable: SpringApplication puts
         // default properties into the Environment before the banner is printed.
         application.setDefaultProperties(new LinkedHashMap<>(buildProvenance()));
-        application.run(args);
+        return application;
     }
 
     /**

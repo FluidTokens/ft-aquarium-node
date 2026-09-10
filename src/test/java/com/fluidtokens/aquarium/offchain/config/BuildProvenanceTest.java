@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.config;
 import com.fluidtokens.aquarium.offchain.AcquariumOffchainApp;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.ResourceBanner;
+import org.springframework.boot.SpringApplication;
 import org.springframework.boot.actuate.autoconfigure.endpoint.EndpointAutoConfiguration;
 import org.springframework.boot.actuate.autoconfigure.info.InfoContributorAutoConfiguration;
 import org.springframework.boot.actuate.autoconfigure.info.InfoEndpointAutoConfiguration;
@@ -17,11 +18,13 @@ import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.env.PropertySource;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
+import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
@@ -34,6 +37,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -59,11 +63,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * build.gradle comment on {@code dirty} — and the assertion here is that {@code unknown} is a value
  * the pipeline can actually carry end to end.
  *
- * <h2>Why the last two tests do not touch the container</h2>
- * Everything above them supplies the exposure property by hand, which means the feature could be
- * switched off in the shipped {@code application.yaml} and they would all keep passing. So the file
- * itself is asserted, parsed by Spring's own loader — the {@link ApplicationYamlBindsTest} discipline
- * applied to a one-word key.
+ * <h2>Why some tests here do not touch the container at all</h2>
+ * Everything that hands the exposure property to an {@link ApplicationContextRunner} by hand would
+ * keep passing with the feature switched off in the shipped {@code application.yaml}; and everything
+ * that renders the banner over a map it built itself would keep passing with nothing in production
+ * installing that map. So both wirings are asserted directly — the shipped file parsed by Spring's
+ * own loader (the {@link ApplicationYamlBindsTest} discipline applied to a one-word key), and the
+ * startup wiring's own default properties.
  */
 class BuildProvenanceTest {
 
@@ -105,12 +111,30 @@ class BuildProvenanceTest {
             BuildProperties build = context.getBean(BuildProperties.class);
             String commit = build.get("commit");
             assertNotNull(commit, "build.commit was not recorded at all");
-            assertTrue(commit.matches("[0-9a-f]{40}") || AcquariumOffchainApp.UNKNOWN.equals(commit),
+            // The literal, not AcquariumOffchainApp.UNKNOWN: this value is written by Gradle, and
+            // coupling the assertion to the Java constant would let the two drift apart unnoticed.
+            assertTrue(commit.matches("[0-9a-f]{40}") || "unknown".equals(commit),
                     "build.commit must be a full 40-char sha or exactly 'unknown', was: " + commit);
-            assertTrue(Set.of("true", "false", AcquariumOffchainApp.UNKNOWN).contains(build.get("dirty")),
+            String dirty = build.get("dirty");
+            assertTrue(Set.of("true", "false", "unknown").contains(dirty),
                     "build.dirty must be true, false or unknown -- an empty or absent value reads as "
                             + "'clean' to anyone skimming, which is the one thing it must never do. "
-                            + "Was: " + build.get("dirty"));
+                            + "Was: " + dirty);
+
+            // ⛔ THE CORRELATION, not the set. Set membership ADMITS the defect: the naive two-state
+            // implementation writes commit=unknown beside dirty=false, and 'false' is in the set, so
+            // the assertion above passes on exactly the value its own message forbids. The three
+            // fields answer ONE question -- is git usable and is it this repository -- so the
+            // property with content is that they agree.
+            assertEquals("unknown".equals(commit), "unknown".equals(dirty),
+                    "build.commit and build.dirty disagree about whether git was readable: commit="
+                            + commit + ", dirty=" + dirty + ". 'commit=unknown, dirty=false' is a "
+                            + "build that could not read its own tree asserting a clean one, on an "
+                            + "unauthenticated endpoint an operator uses to decide whether an image "
+                            + "is trustworthy.");
+            assertEquals("unknown".equals(commit), "unknown".equals(build.get("commitShort")),
+                    "build.commit and build.commitShort disagree about whether git was readable: "
+                            + commit + " / " + build.get("commitShort"));
         });
     }
 
@@ -160,8 +184,13 @@ class BuildProvenanceTest {
 
     /**
      * (c) The banner. Rendered through {@link ResourceBanner}, the same class
-     * {@code SpringApplicationBannerPrinter} uses for {@code banner.txt}, over the same default
-     * properties {@code main()} supplies.
+     * {@code SpringApplicationBannerPrinter} uses for {@code banner.txt}, over the same map
+     * {@code main()} supplies.
+     *
+     * <p>⚠ <b>"The same map" is not "the map main() supplies"</b> — this test builds its own
+     * {@link MapPropertySource} and would pass unchanged if nothing in production ever installed one.
+     * {@link #theStartupWiringInstallsTheProvenanceAsDefaultProperties()} is the half that closes
+     * that; neither is sufficient alone.
      */
     @Test
     void theBannerFirstLineCarriesTheResolvedCommitAndBuildTime() {
@@ -179,18 +208,97 @@ class BuildProvenanceTest {
     }
 
     /**
-     * ⚠ And the banner with <b>no provenance at all</b> — the shape a jar built without
-     * {@code bootBuildInfo} has. It must render {@code unknown}, not a literal {@code ${...}} and not
-     * a hole. Note {@code ${application.version}} is deliberately absent from {@code banner.txt}: it
-     * comes from the jar MANIFEST and renders EMPTY outside a boot jar, so asserting on it here would
-     * be a false red waiting to happen.
+     * ⚠ The banner with the provenance keys <b>entirely absent</b> from the environment. This is
+     * {@code banner.txt}'s own {@code ${...:unknown}} defaults firing, and nothing else — it does not
+     * exercise {@link AcquariumOffchainApp#UNKNOWN} at all. Note {@code ${application.version}} is
+     * deliberately absent from {@code banner.txt}: it comes from the jar MANIFEST and renders EMPTY
+     * outside a boot jar, so asserting on it here would be a false red waiting to happen.
+     *
+     * <p>⛔ The assertion is on the <b>literal word</b>, never on the constant. {@code contains(UNKNOWN)}
+     * says "the banner contains whatever that constant happens to be", which is trivially true the
+     * moment the constant becomes {@code ""} — the exact regression the constant's javadoc forbids.
+     * An assertion that reads its expectation out of the code under test asserts nothing.
      */
     @Test
     void theBannerDegradesToUnknownRatherThanToAHole() {
         String firstLine = renderBanner(Map.of());
         assertFalse(firstLine.contains("${"), "unresolved placeholder with no provenance: " + firstLine);
-        assertTrue(firstLine.contains(AcquariumOffchainApp.UNKNOWN),
+        assertTrue(firstLine.contains("unknown"),
                 "with no build info the banner must SAY unknown: " + firstLine);
+    }
+
+    /**
+     * ⛔ <b>And the production shape of the same failure, which the test above cannot reach.</b>
+     *
+     * <p>A jar built without {@code bootBuildInfo} does not leave the keys absent — {@code main()}
+     * installs {@link AcquariumOffchainApp#buildProvenance()} as default properties, so the keys are
+     * <b>present with whatever that method fell back to</b>. {@code banner.txt}'s {@code ${...:unknown}}
+     * defaults never fire on that path; they only cover a key that is missing. So if the fallback ever
+     * became the empty string, the banner an operator actually reads would render
+     * {@code commit  (dirty=) :: built} — a line with holes in it, reading as "fine" rather than as
+     * "this build cannot say" — while every other test in this class stayed green.
+     *
+     * <p>Rendered over the map produced under the hidden-build-info classloader, and asserted against
+     * the literal word.
+     */
+    @Test
+    void theBannerSaysUnknownWhenTheJarCarriesNoBuildInfo() throws Exception {
+        try (URLClassLoader isolated = hidingBuildInfo()) {
+            Map<String, Object> provenance = provenanceFrom(isolated);
+            String firstLine = renderBanner(provenance);
+
+            assertFalse(firstLine.contains("${"),
+                    "unresolved placeholder with no build info: " + firstLine);
+            assertTrue(firstLine.contains("unknown"),
+                    "with no build info the banner must SAY the word 'unknown'; a present-but-empty "
+                            + "fallback renders a hole that reads as 'fine': " + firstLine);
+            provenance.forEach((key, value) -> assertEquals("unknown", value,
+                    key + " must be the literal word 'unknown' with no build info -- an empty "
+                            + "fallback is present-but-blank, which banner.txt's ${...:unknown} "
+                            + "default cannot rescue because the key is not missing"));
+        }
+    }
+
+    /**
+     * ⛔ <b>THE OTHER DISCONNECTED TEST, and it guards the banner half of this feature.</b>
+     *
+     * <p>Every banner test above renders over a map it built itself. Delete the
+     * {@code setDefaultProperties} call from the startup wiring and all of them stay green, while
+     * every banner an operator ever reads says {@code commit unknown (dirty=unknown) :: built unknown}
+     * — the half of this slice that exists so {@code docker logs} identifies the build, silently off,
+     * with CI reporting success. {@link #theShippedYamlExposesInfo()} does exactly this job for the
+     * {@code /actuator/info} half; this is its counterpart, and its absence was the asymmetry.
+     *
+     * <p>Reached reflectively because {@code configuredApplication()} is package-private in
+     * {@code com.fluidtokens.aquarium.offchain} and this class is not, and because
+     * {@code defaultProperties} has no getter on {@link SpringApplication}. If a future Spring version
+     * renames that field the test goes red loudly rather than passing quietly, which is the correct
+     * direction for a fragile read.
+     */
+    @Test
+    void theStartupWiringInstallsTheProvenanceAsDefaultProperties() throws Exception {
+        Method seam = AcquariumOffchainApp.class.getDeclaredMethod("configuredApplication");
+        seam.setAccessible(true);
+        SpringApplication application = (SpringApplication) seam.invoke(null);
+
+        Object defaults = ReflectionTestUtils.getField(application, "defaultProperties");
+        assertNotNull(defaults,
+                "the startup wiring installed NO default properties at all, so banner.txt's "
+                        + "${aquarium.build.*} placeholders resolve to nothing in production and "
+                        + "every banner reads 'commit unknown (dirty=unknown) :: built unknown'");
+        assertInstanceOf(Map.class, defaults, "SpringApplication.defaultProperties is not a Map: " + defaults);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> installed = (Map<String, Object>) defaults;
+
+        Map<String, Object> expected = AcquariumOffchainApp.buildProvenance();
+        assertEquals(4, expected.size(), "buildProvenance() no longer offers four fields: " + expected.keySet());
+        expected.forEach((key, value) -> {
+            assertTrue(key.startsWith("aquarium.build."), "unexpected provenance key: " + key);
+            assertEquals(value, installed.get(key),
+                    "the default properties the startup wiring installs do not carry " + key
+                            + ", so banner.txt's ${" + key + "} resolves to nothing in production. "
+                            + "Installed: " + installed.keySet());
+        });
     }
 
     private static String renderBanner(Map<String, Object> provenance) {
@@ -217,6 +325,28 @@ class BuildProvenanceTest {
      */
     @Test
     void aMissingBuildInfoFileIsNotAStartupCondition() throws Exception {
+        try (URLClassLoader isolated = hidingBuildInfo()) {
+            Map<String, Object> provenance = provenanceFrom(isolated);
+
+            assertEquals(Set.of("aquarium.build.commit", "aquarium.build.commitShort",
+                            "aquarium.build.dirty", "aquarium.build.time"),
+                    new LinkedHashSet<>(provenance.keySet()),
+                    "with no build info the property set must still be complete -- a missing key "
+                            + "leaves the banner placeholder unresolved");
+            // The literal word, not AcquariumOffchainApp.UNKNOWN: comparing the fallback against the
+            // constant that defines it is a tautology that survives the constant becoming "".
+            provenance.forEach((key, value) -> assertEquals("unknown", value,
+                    key + " must read 'unknown' when there is no build info, never blank and never "
+                            + "'false'"));
+        }
+    }
+
+    /**
+     * A classloader over this JVM's own classpath that answers {@code null} for
+     * {@code build-info.properties}. The file is hidden rather than deleted, so the real one survives
+     * for every other test in this run.
+     */
+    private static URLClassLoader hidingBuildInfo() {
         URL[] classpath = Arrays.stream(System.getProperty("java.class.path").split(java.io.File.pathSeparator))
                 .map(entry -> Paths.get(entry).toUri())
                 .map(uri -> {
@@ -228,7 +358,7 @@ class BuildProvenanceTest {
                 })
                 .toArray(URL[]::new);
 
-        try (URLClassLoader withoutBuildInfo = new URLClassLoader(classpath, ClassLoader.getPlatformClassLoader()) {
+        return new URLClassLoader(classpath, ClassLoader.getPlatformClassLoader()) {
             @Override
             public URL getResource(String name) {
                 return name.endsWith("build-info.properties") ? null : super.getResource(name);
@@ -238,25 +368,17 @@ class BuildProvenanceTest {
             public InputStream getResourceAsStream(String name) {
                 return name.endsWith("build-info.properties") ? null : super.getResourceAsStream(name);
             }
-        }) {
-            Class<?> app = withoutBuildInfo.loadClass(AcquariumOffchainApp.class.getName());
-            assertNotSame(AcquariumOffchainApp.class, app,
-                    "the isolated classloader delegated back to the app loader, so the file was "
-                            + "never actually hidden and this test proves nothing");
+        };
+    }
 
-            @SuppressWarnings("unchecked")
-            Map<String, Object> provenance =
-                    (Map<String, Object>) app.getMethod("buildProvenance").invoke(null);
-
-            assertEquals(Set.of("aquarium.build.commit", "aquarium.build.commitShort",
-                            "aquarium.build.dirty", "aquarium.build.time"),
-                    new LinkedHashSet<>(provenance.keySet()),
-                    "with no build info the property set must still be complete -- a missing key "
-                            + "leaves the banner placeholder unresolved");
-            provenance.forEach((key, value) -> assertEquals(AcquariumOffchainApp.UNKNOWN, value,
-                    key + " must read 'unknown' when there is no build info, never blank and never "
-                            + "'false'"));
-        }
+    /** {@code buildProvenance()} as a jar with no build info would compute it. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> provenanceFrom(URLClassLoader isolated) throws Exception {
+        Class<?> app = isolated.loadClass(AcquariumOffchainApp.class.getName());
+        assertNotSame(AcquariumOffchainApp.class, app,
+                "the isolated classloader delegated back to the app loader, so the file was "
+                        + "never actually hidden and this test proves nothing");
+        return (Map<String, Object>) app.getMethod("buildProvenance").invoke(null);
     }
 
     /**
