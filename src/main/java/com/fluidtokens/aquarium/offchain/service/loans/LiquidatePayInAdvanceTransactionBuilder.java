@@ -459,6 +459,22 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * Blockfrost.
      */
     public Transaction build(Request request) {
+        // V8 — THE ORACLE VARIANT, REFUSED BY NAME BEFORE ANYTHING ELSE RUNS. Only the two shapes
+        // OracleFeedConverter can encode are modelled: PRICE_DATA_CHARLIE (proven by a provider
+        // reference input) and the SIGNED feeds, AGGREGATED/DEDICATED (proven by the published
+        // signatures). POOLED and PRICE_DATA_ORCFAX carry fields that are not a plain price.
+        //
+        // ⚠ THIS RUNS FIRST, AHEAD OF numbers(), AND THAT ORDER IS LOAD-BEARING — measured. A POOLED
+        // feed never reaches a redeemer at all: numbers() prices it, and OraclePriceFeed.price()
+        // throws a bare UnsupportedOperationException for POOLED ("a `fail` in finance.ak"). Placed
+        // any later, this check is dead code for the one variant that most needs it, and the operator
+        // sees machinery breakage where the truth is a candidate this builder does not model.
+        // OracleEntry.usableForLiquidation() already refuses both upstream; this is the builder
+        // saying so in its own voice, so the executor records a REFUSED decision rather than a fault.
+        refuseUnmodelledVariant(request.oracle(), "collateral");
+        if (request.principalOracle() != null) {
+            refuseUnmodelledVariant(request.principalOracle(), "principal");
+        }
         Numbers numbers = numbers(request);
         // F0 (round 2) — EQUITY 0 IS THE VALIDATOR'S NORMAL CASE, NOT A SHAPE THIS BUILDER REFUSES.
         //
@@ -545,14 +561,22 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         int principalOracleRefIndex = request.principalOracle() != null
                 ? refIndex(refInputs, request.principalOracle().referenceInput(), "principal oracle")
                 : 0;
-        int providerRefIndex = refIndex(refInputs, request.oracle().charlieProviderReferenceInput(),
-                "charli3 provider");
+        // ⛔ A PROVIDER INDEX ONLY WHERE THERE IS A PROVIDER. Deriving it unconditionally is what
+        // made a multisig feed impossible: there is no provider UTxO to look up, so refIndex would
+        // hunt for a null coordinate. The variant decides — and it decides the redeemer encoding at
+        // the withdrawal too (see oracleRedeemer below); nothing else may.
+        Integer providerRefIndex = null;
+        if (request.oracle().feed().variant() == OraclePriceFeed.Variant.PRICE_DATA_CHARLIE) {
+            providerRefIndex = refIndex(refInputs, request.oracle().charlieProviderReferenceInput(),
+                    "charli3 provider");
+        }
         // WALL 3 — the principal oracle's own Charli3 provider, when it has one. lm_liquidate_and_pay_
         // in_advance_action's redeemer carries a SEPARATE providerRefInputIndex per oracle invocation
         // (one per withdraw-0 of the shared oracle validator), so this is independent of the
         // collateral leg's providerRefIndex above.
         Integer principalProviderRefIndex = null;
-        if (request.principalOracle() != null && request.principalOracle().charlieProviderReferenceInput() != null) {
+        if (request.principalOracle() != null
+                && request.principalOracle().feed().variant() == OraclePriceFeed.Variant.PRICE_DATA_CHARLIE) {
             principalProviderRefIndex = refIndex(refInputs,
                     request.principalOracle().charlieProviderReferenceInput(), "principal charli3 provider");
         }
@@ -600,7 +624,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     private ScriptTx assemble(Request request, Numbers numbers, int configRefIndex, int lmConfigRefIndex,
                               int collateralOracleRefIndex, int principalOracleRefIndex,
-                              int providerRefIndex, Integer principalProviderRefIndex,
+                              Integer providerRefIndex, Integer principalProviderRefIndex,
                               List<TransactionInput> refInputs,
                               long lenderBondOutputIndex, long assetOutputIndex) {
         ScriptTx tx = new ScriptTx();
@@ -695,7 +719,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                         List.of(assetOutputIndex)),
                 request.changeAddress());
         tx.withdraw(request.oracle().rewardAddress(), BigInteger.ZERO,
-                LiquidationTxEncoder.oracleRedeemer(request.oracle().feed(), providerRefIndex, List.of()),
+                oracleRedeemer(request.oracle(), providerRefIndex),
                 request.changeAddress());
         // WALL 3 — the principal leg is a SEPARATE withdraw-0 invocation of the oracle validator, per
         // OracleEntry's own javadoc: retrieve_oracle_data resolves its feed with
@@ -708,8 +732,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         if (request.principalOracle() != null
                 && !request.principalOracle().rewardAddress().equals(request.oracle().rewardAddress())) {
             tx.withdraw(request.principalOracle().rewardAddress(), BigInteger.ZERO,
-                    LiquidationTxEncoder.oracleRedeemer(request.principalOracle().feed(),
-                            principalProviderRefIndex == null ? 0 : principalProviderRefIndex, List.of()),
+                    oracleRedeemer(request.principalOracle(), principalProviderRefIndex),
                     request.changeAddress());
         }
 
@@ -1146,20 +1169,19 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     private List<TransactionInput> referenceInputs(Request request) {
         Set<TransactionInput> refInputs = new LinkedHashSet<>(List.of(
                 inputOf(request.configUtxo()),
-                inputOf(request.lmConfigUtxo()),
-                request.oracle().referenceInput(),
-                request.oracle().referenceScript(),
-                request.oracle().charlieProviderReferenceInput()));
+                inputOf(request.lmConfigUtxo())));
+        // ⛔ NULL-SAFE, exactly as ConvertTransactionBuilder#referenceInputs already is. A MULTISIG
+        // feed has NO Charli3 provider UTxO — and {@code List.of} refuses a null element outright, so
+        // the first-ever mainnet build died right here with a bare NullPointerException. A
+        // provider-less feed simply adds no provider input; a null is skipped rather than encoded as
+        // a coordinate that resolves to nothing.
+        oracleReferenceInputs(request.oracle()).forEach(refInputs::add);
         // WALL 3 — the principal's own reference input, reference script and (if a c3 feed) provider
         // input, ONLY for a token principal. Ada adds nothing here: the validator never reads a
         // reference input for it (retrieve_oracle_data short-circuits on the empty policy id), so
         // adding one would cost fee and change nothing — exactly the ⚠ in the Request javadoc.
         if (request.principalOracle() != null) {
-            refInputs.add(request.principalOracle().referenceInput());
-            refInputs.add(request.principalOracle().referenceScript());
-            if (request.principalOracle().charlieProviderReferenceInput() != null) {
-                refInputs.add(request.principalOracle().charlieProviderReferenceInput());
-            }
+            oracleReferenceInputs(request.principalOracle()).forEach(refInputs::add);
         }
         // Only the subset this builder attaches AND the shared record can name: lmLiquidateAction and
         // assetManager are excluded here, exactly as in publishedScripts().
@@ -1170,6 +1192,72 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                 .filter(Objects::nonNull)
                 .forEach(refInputs::add);
         return refInputs.stream().sorted(new TransactionInputComparator()).toList();
+    }
+
+    /**
+     * ⛔ <b>THE ORACLE REDEEMER, DECIDED BY THE FEED'S VARIANT AND BY NOTHING ELSE.</b>
+     * <p>
+     * A {@code PRICE_DATA_CHARLIE} feed carries no signature over its own bytes: {@code oracle.ak}
+     * validates it structurally against the Charli3 provider UTxO named by
+     * {@code provider_ref_input_index}, so the redeemer names that index and its signature list is
+     * legitimately EMPTY. A signed feed — {@code AGGREGATED} on mainnet, {@code DEDICATED} — takes
+     * the other branch, which runs {@code verify_ed25519_signature} against the feed's published
+     * signatures and has no provider index at all.
+     * <p>
+     * <b>The two are not interchangeable, and getting it wrong is PHASE 2.</b> Until 2026-09-10 this
+     * builder emitted the Charli3 shape unconditionally — a provider index plus
+     * {@code List.of()} — for every feed. Against a multisig deployment that assembles perfectly and
+     * fails the signature threshold on chain, after the fee is spent and with the collateral input
+     * consumed (CCL trap 8's failure tier). {@link ConvertTransactionBuilder} — the only builder that
+     * has ever built on mainnet — has encoded the signed shape since findings §40, and its comment at
+     * the collateral withdrawal names this builder's old call as exactly the fatal one. This is that
+     * lesson carried across, not a third encoding.
+     *
+     * @param providerRefIndex the provider's position among the reference inputs, non-null for a
+     *                         {@code PRICE_DATA_CHARLIE} feed and null for every other variant
+     */
+    private static PlutusData oracleRedeemer(OracleEntry entry, Integer providerRefIndex) {
+        return switch (entry.feed().variant()) {
+            case PRICE_DATA_CHARLIE -> LiquidationTxEncoder.oracleRedeemer(entry.feed(),
+                    Objects.requireNonNull(providerRefIndex,
+                            "a PRICE_DATA_CHARLIE feed has no provider reference-input index"),
+                    List.of());
+            case AGGREGATED, DEDICATED -> LiquidationTxEncoder.oracleRedeemer(entry.feed(),
+                    entry.signatures());
+            // Unreachable: refuseUnmodelledVariant rejects both before anything is assembled. Kept so
+            // the switch stays exhaustive and a new variant is a compile error, not a silent branch.
+            case POOLED, PRICE_DATA_ORCFAX -> throw new IllegalStateException(
+                    "unmodelled oracle variant " + entry.feed().variant() + " reached assembly");
+        };
+    }
+
+    /**
+     * Refuses a feed variant this builder cannot encode, <em>by name and before building</em> — a
+     * clean {@code REFUSED} decision about a candidate rather than an
+     * {@code UnsupportedOperationException} out of {@link OracleFeedConverter}.
+     */
+    private static void refuseUnmodelledVariant(OracleEntry entry, String leg) {
+        switch (entry.feed().variant()) {
+            case PRICE_DATA_CHARLIE, AGGREGATED, DEDICATED -> {
+            }
+            case POOLED, PRICE_DATA_ORCFAX -> throw new PayInAdvanceLiquidationRouter
+                    .PayInAdvanceNotModelledException("the %s oracle publishes a %s feed, which this "
+                            .formatted(leg, entry.feed().variant())
+                            + "builder does not model — only PRICE_DATA_CHARLIE and the signed "
+                            + "(AGGREGATED/DEDICATED) variants can be encoded");
+        }
+    }
+
+    /**
+     * One oracle leg's reference inputs — the NFT-bearing UTxO the validator reads the credential and
+     * value from, its published script, and (a {@code PRICE_DATA_CHARLIE} feed only) the Charli3
+     * provider UTxO. Any of them may be null, and a null is dropped rather than offered to
+     * {@code List.of}.
+     */
+    private static Stream<TransactionInput> oracleReferenceInputs(OracleEntry entry) {
+        return Stream.of(entry.referenceInput(), entry.referenceScript(),
+                        entry.charlieProviderReferenceInput())
+                .filter(Objects::nonNull);
     }
 
     private static int refIndex(List<TransactionInput> refInputs, TransactionInput input, String what) {
