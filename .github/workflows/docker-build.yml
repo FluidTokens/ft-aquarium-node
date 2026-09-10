@@ -32,6 +32,157 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
+      # Step 3a: Run the suite BEFORE anything is packaged, authenticated for, or pushed.
+      #
+      # `:latest` from `main` is what operators pull, so this job IS the supply chain. Until now it
+      # ran `bootJar` and pushed without ever running a test - which is worse than no CI, because it
+      # looks gated. It runs ahead of `bootJar` (step 4) as well as ahead of the Docker Hub login
+      # (step 6): a passing suite does not imply a packageable jar, but a red tree should not spend
+      # the runner's time packaging one, and the first failing step should name the real problem.
+      #
+      # `cleanTest` is not decoration: a bare `test` on an unchanged tree serves a Gradle UP-TO-DATE
+      # cache hit and proves nothing ran. The `rm -rf` is the same defence one layer down - a stale
+      # XML file from an earlier run is counted by steps 3b/3c as if this run had produced it.
+      # (CLAUDE.md `## Commands`.)
+      #
+      # CI HOLDS NO CREDENTIALS, deliberately. The env-gated live rigs therefore skip here, which is
+      # correct - and is exactly why step 3b exists.
+      - name: Run the test suite
+        run: |
+          rm -rf build/test-results/test
+          ./gradlew cleanTest test
+
+      # Step 3b: Say out loud what did NOT run.
+      #
+      # A skipped test and a passing test are indistinguishable in a green build. This writes the
+      # totals AND the name of every class that did not run at all, with the environment variables it
+      # was waiting for, onto the run's own summary page - not into a log nobody opens.
+      # `if: always()` so a red suite still reports what it managed to cover.
+      - name: Summarise the suite, including everything that was skipped
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, os, re, xml.etree.ElementTree as ET
+
+          # The package qualifier is optional: `@EnabledIfEnvironmentVariable` and
+          # `@org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable` are the same annotation and
+          # both occur in src/test/java. Anchoring `@` straight to the simple name made the second form
+          # invisible, and this step then printed "waiting on disabled" for a class an operator could
+          # in fact enable - a skip presented as permanently off, inside the step that exists to say a
+          # skip is not a pass. Kept textually identical to EnvGatedRigReachabilityTest.GATE, which
+          # asserts that identity.
+          GATE = re.compile(r'@(?:[A-Za-z_][A-Za-z0-9_]*\.)*EnabledIfEnvironmentVariable\s*\(\s*named\s*=\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+
+          def source_of(class_name):
+              candidate = class_name.split('$')[0]
+              while candidate:
+                  path = 'src/test/java/' + candidate.replace('.', '/') + '.java'
+                  if os.path.exists(path):
+                      return path
+                  candidate = candidate.rpartition('.')[0]
+              return None
+
+          def gates_of(class_name):
+              path = source_of(class_name)
+              if not path:
+                  return []
+              with open(path, encoding='utf-8') as handle:
+                  return sorted(set(GATE.findall(handle.read())))
+
+          files = sorted(glob.glob('build/test-results/test/*.xml'))
+          tests = failures = errors = skipped = 0
+          fully, partly = [], []
+          for path in files:
+              root = ET.parse(path).getroot()
+              ran, skip = int(root.get('tests')), int(root.get('skipped'))
+              tests += ran
+              failures += int(root.get('failures'))
+              errors += int(root.get('errors'))
+              skipped += skip
+              if ran and ran == skip:
+                  fully.append((root.get('name'), skip))
+              elif skip:
+                  partly.append((root.get('name'), skip))
+
+          print('## Test suite (keyless: CI holds no credentials)')
+          print()
+          print('| result files | tests | failures | errors | skipped |')
+          print('| ---: | ---: | ---: | ---: | ---: |')
+          print('| %d | %d | %d | %d | %d |' % (len(files), tests, failures, errors, skipped))
+          print()
+          print('### %d classes did not run at all' % len(fully))
+          print()
+          print('These are verifications this run did **not** perform. A skip is not a pass.')
+          print()
+          for name, skip in sorted(fully):
+              waiting = ', '.join('`%s`' % gate for gate in gates_of(name)) or 'disabled'
+              print('- `%s` (%d) - waiting on %s' % (name, skip, waiting))
+          if partly:
+              print()
+              print('### Classes that ran but skipped some tests')
+              print()
+              # Name the credential here too. A class gated per-METHOD runs, goes green, and hides one
+              # verification inside a passing result - the easiest kind of skip to lose sight of, and
+              # the reason RealLoanDryEvalTest is not in the list above. Without the gate name the
+              # reader cannot tell an opt-in rig from an @Disabled method.
+              for name, skip in sorted(partly):
+                  waiting = ', '.join('`%s`' % gate for gate in gates_of(name))
+                  print('- `%s` - %d skipped%s'
+                        % (name, skip, ' - waiting on ' + waiting if waiting else ''))
+          PY
+
+      # Step 3c: A count that can only increase is not a measurement.
+      #
+      # A deleted or renamed test class produces no failure - it produces silence. The total keeps
+      # rising from the classes that remain, and the loss reads as progress. So assert the number of
+      # RESULT FILES against a floor, and assert that every result file still maps to a class under
+      # src/test/java. Raise the floor deliberately when classes are added; a drop is a deletion to
+      # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
+      #
+      # Floor measured 2026-09-10 on this tree, keyless: 137 files / 1076 tests / 0 failures /
+      # 45 skipped. Raised 136 -> 137 in the merge that brought this branch up to origin/main:
+      # #24 added ConvertLiquidationRouterTest, so the tree grew by one class and the old floor
+      # stopped matching it. A floor is only a measurement while it equals something someone
+      # measured; left at 136 it would have tolerated losing a class silently -- which is the
+      # exact defect this step exists to catch, so it is corrected here rather than carried.
+      - name: Assert the suite did not quietly shrink
+        env:
+          RESULT_FILE_FLOOR: '137'
+        run: |
+          python3 - <<'PY'
+          import glob, os, sys, xml.etree.ElementTree as ET
+
+          floor = int(os.environ['RESULT_FILE_FLOOR'])
+          files = sorted(glob.glob('build/test-results/test/*.xml'))
+          problems = []
+
+          if len(files) < floor:
+              problems.append(
+                  '%d result files, floor is %d: %d test class(es) stopped producing results. '
+                  'A class that no longer runs cannot fail.' % (len(files), floor, floor - len(files)))
+
+          for path in files:
+              name = ET.parse(path).getroot().get('name')
+              candidate = name.split('$')[0]
+              while candidate and not os.path.exists('src/test/java/' + candidate.replace('.', '/') + '.java'):
+                  candidate = candidate.rpartition('.')[0]
+              if not candidate:
+                  problems.append(
+                      'orphan result file for `%s`: no such class under src/test/java, so it is a '
+                      'stale artefact counted as if it had run.' % name)
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if problems and summary:
+              with open(summary, 'a', encoding='utf-8') as handle:
+                  handle.write('\n### Suite integrity check FAILED\n\n')
+                  for problem in problems:
+                      handle.write('- %s\n' % problem)
+
+          for problem in problems:
+              print(problem, file=sys.stderr)
+          sys.exit(1 if problems else 0)
+          PY
+
       # Step 4: Build the JAR file with Gradle
       - name: Build JAR file
         run: |
