@@ -104,8 +104,12 @@ class ConvertTransactionBuilderGuardTest {
     // ---- the post-assert, driven against hand-built bodies -----------------------------------------
 
     private static ConvertOrderPlan plan() {
-        var pool = new MinswapPoolDatum(AssetType.ada(), FLDT,
-                BigInteger.TEN, BigInteger.TEN, BigInteger.TEN);
+        // ⚠ Reserves and fee are the LIVE ADA/FLDT pool's. They were BigInteger.TEN, which the
+        // POOL_TOO_THIN pre-check now (correctly) refuses: a ten-unit pool cannot deliver a
+        // twenty-million debt, and this test is about the builder's post-assert, not the quote.
+        var pool = new MinswapPoolDatum(AssetType.ada(), FLDT, BigInteger.TEN,
+                new BigInteger("1692342884761"), new BigInteger("7596442927398"),
+                BigInteger.valueOf(80L), BigInteger.valueOf(80L), false);
         return ConvertOrderPlan.plan(FLDT, AssetType.ada(),
                 BigInteger.valueOf(100_000_000L), BigInteger.ZERO, BigInteger.valueOf(20_000_000L),
                 50L, true, false, pool,
