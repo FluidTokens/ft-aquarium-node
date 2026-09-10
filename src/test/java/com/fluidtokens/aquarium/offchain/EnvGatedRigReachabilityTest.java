@@ -161,6 +161,13 @@ class EnvGatedRigReachabilityTest {
      * Un-parking is still allowed, and it is still one deliberate commit: delete the
      * {@link ParkedRig} entry, delete the gate from the class, and delete the name here — and if the
      * name here is the last one, delete the park checks too rather than leaving them as no-ops.
+     * <p>
+     * ⚠ There may be a FOURTH edit, and it will not look related.
+     * {@code theAnnotationScanAloneSeesTheFullyQualifiedGateForm} hard-codes the expected gate set for
+     * {@code RealLoanDryEvalTest}, so removing that rig's park gate makes it fail too. That coupling is
+     * deliberate — it is what keeps the scan's exactness load-bearing rather than incidental — but to
+     * whoever lifts the park it reads as an unrelated mystery failure. It is not; update the expected
+     * set in the same commit.
      */
     private static final Set<String> EVERY_RIG_EVER_PARKED = new TreeSet<>(List.of(
             "LiquidatePayInAdvanceLiveDryEvalTest",  // FAB-86-1, 2026-09-10
@@ -425,7 +432,14 @@ class EnvGatedRigReachabilityTest {
                             + "the run summary would report " + parked.className() + " as waiting on "
                             + "a key rather than as parked — the very confusion the second-gate shape "
                             + "exists to remove. Name it for what is actually missing.");
-            parkGates.add(parked.gate());
+            assertTrue(parkGates.add(parked.gate()),
+                    "PARKED_RIGS gives " + parked.className() + " the gate " + parked.gate()
+                            + ", which another parked rig already uses. Two rigs behind ONE gate is a "
+                            + "single switch for two unrelated expiries: setting that variable to "
+                            + "revive one silently re-arms the other on a fixture nobody looked at, "
+                            + "and it then goes red for a reason that is not a code fault — which is "
+                            + "the exact repair-reflex this mechanism exists to stop. Give each park "
+                            + "its own name.");
         }
 
         Set<String> carrying = new TreeSet<>();
