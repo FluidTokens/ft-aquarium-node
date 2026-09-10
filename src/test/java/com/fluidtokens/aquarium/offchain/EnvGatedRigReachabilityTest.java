@@ -89,7 +89,8 @@ class EnvGatedRigReachabilityTest {
      * {@code @org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable} are the same annotation,
      * and both are in this tree. Anchoring {@code @} straight to the simple name made the second form
      * invisible — a gated rig that this class could not see and that CI reported as "waiting on
-     * disabled". Keep {@code *}, not {@code +}: 46 of the 47 occurrences here carry no qualifier.
+     * disabled". Keep {@code *}, not {@code +}: of the 44 annotation usages in this tree, across 23
+     * classes, 43 carry no qualifier and exactly one is fully qualified.
      */
     private static final Pattern GATE =
             Pattern.compile("@(?:[A-Za-z_][A-Za-z0-9_]*\\.)*EnabledIfEnvironmentVariable"
@@ -263,7 +264,7 @@ class EnvGatedRigReachabilityTest {
 
     /**
      * And admitting the qualifier must not have cost the plain form. A qualifier made
-     * <em>mandatory</em> — {@code +} where the pattern has {@code *} — would miss all 46 plain
+     * <em>mandatory</em> — {@code +} where the pattern has {@code *} — would miss all 43 plain
      * occurrences in this tree while still satisfying the check above. The rig-level checks would
      * not notice for {@code ConvertLiveDryEvalTest}, because it also reads its credential with
      * {@code System.getenv}; only a gate-only assertion does.
