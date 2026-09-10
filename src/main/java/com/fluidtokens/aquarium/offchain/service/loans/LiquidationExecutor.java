@@ -948,17 +948,26 @@ public class LiquidationExecutor {
                 try {
                     transaction = convertRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
                             bondUtxo.get(), configUtxo, lmConfigUtxo,
-                            // ⛔ NOMINABLE, not raw. Round 2 of the token-principals slice (fbcf6b1)
-                            // made `walletUtxos` the UNFILTERED listing so the token path could see
-                            // multi-asset utxos — and this line, unchanged, silently went from "first
-                            // ada-only utxo" to "first utxo Blockfrost returns": the OLDEST one at the
-                            // bot's address, which is where the published reference scripts sit. A
-                            // convert would have SPENT the loan_claim_action reference script (the
-                            // 2026-08-24 incident class WalletInputSelection.nominable exists to
-                            // prevent). Sizing this input properly is PR3's job; until then it is the
-                            // first NOMINABLE utxo, exactly what it was before fbcf6b1.
-                            nominableWalletUtxos(walletUtxos).isEmpty()
-                                    ? null : nominableWalletUtxos(walletUtxos).get(0),
+                            // ⛔ SIZED, via the sibling's selector shape — PR3's job, now done.
+                            //
+                            // This was `nominableWalletUtxos(walletUtxos).get(0)`: the first nominable
+                            // utxo, whatever its size, funding an order whose ada requirement it never
+                            // consulted. Two defects in one line. It could under-fund an ADA-collateral
+                            // convert, whose order carries the whole swappable amount plus the Minswap
+                            // overhead rather than the overhead alone. And an unsized `get(0)` over a
+                            // list is one list-semantics change away from selecting a published
+                            // REFERENCE SCRIPT — which this exact line already survived once, when
+                            // fbcf6b1 widened `walletUtxos` to the raw Blockfrost listing and turned
+                            // "first ada-only utxo" into "oldest utxo at the address" (CCL trap
+                            // 9b/26a, the 2026-08-24 incident class).
+                            //
+                            // The router now asks for what the order actually costs and this supplies
+                            // the SMALLEST nominable utxo covering that plus the fee ceiling —
+                            // `nominate()`'s ada-only branch, which filters to nominable at source. The
+                            // reference-script hazard is closed structurally, not by this call site
+                            // remembering to filter.
+                            orderLovelace -> nominate(walletUtxos, feeCeiling, null, orderLovelace,
+                                    loanUtxoRef),
                             oraclesByUnit,
                             account.baseAddress(), validFromMillis, validToMillis);
                 } catch (ConvertLiquidationRouter.NoPoolException e) {
@@ -974,7 +983,80 @@ public class LiquidationExecutor {
                     log.info("the convert liquidation of {} is not worth doing: {}", loanUtxoRef,
                             e.getMessage());
                     return;
+                } catch (ConvertOrderPlan.RefusedException e) {
+                    // ⛔ A VERDICT ABOUT THE CANDIDATE, NOT A FAULT — so it is recorded and NOT held.
+                    //
+                    // The five ConvertOrderPlan refusals (the bond forbids conversion, equity is in the
+                    // principal currency, the pool is for a different pair, nothing is left to swap,
+                    // the pool is too thin) are all statements about this loan against this pool. Each
+                    // is reproducible next cycle, each costs one plan and no transaction, and none of
+                    // them is evidence that anything is broken. Quarantining them for thirty minutes
+                    // would suppress a candidate that a single Minswap swap can make viable again.
+                    //
+                    // ⚑ This is the plain path's RefusedException treatment, arrived at for the same
+                    // reason: before this catch existed EVERY one of these fell to the generic branch
+                    // below and was recorded as machinery failure at ERROR.
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                            e.refusal().name(), e.getMessage()));
+                    log.info("the convert liquidation of {} was refused as {}: {}",
+                            loanUtxoRef, e.refusal(), e.getMessage());
+                    return;
+                } catch (MinswapPoolResolver.RefusedException e) {
+                    // ⛔ THE POOL LOOKUP REFUSED — and WHICH refusal decides whether this is a verdict
+                    // or a transport problem. They are not the same fact and must not share a hold.
+                    //
+                    // Measured on mainnet 2026-09-09: ONE Blockfrost hiccup on the pool lookup put a
+                    // live loan into the 30-minute machinery quarantine — 39 QUARANTINED records on
+                    // loan 279499ff, from a single transport error. A provider that cannot be reached
+                    // says NOTHING about the candidate; holding it as though the bot were broken is
+                    // how one bad second becomes half an hour of not liquidating.
+                    if (e.refusal() == MinswapPoolResolver.Refusal.LOOKUP_FAILED) {
+                        // ⚠ A SHORT hold, and it is deliberately neither of the other two.
+                        //   · the verdict path holds NOTHING — but a candidate retried every cycle
+                        //     against a provider that is down is exactly what the quarantine is for;
+                        //   · the machinery path holds THIRTY MINUTES — far too long for a transient
+                        //     that typically clears within one cycle.
+                        // Two cycles is enough for a blip to pass and short enough that a recovered
+                        // provider is noticed almost immediately. It is a code constant with its reason
+                        // beside it, not a knob: an operator asked to tune this would be being asked to
+                        // guess how long their provider stays down.
+                        long holdMillis = LOOKUP_FAILED_HOLD_CYCLES * configuration.getDelaySeconds()
+                                * 1000L;
+                        quarantineUntil(loanUtxoRef, now + holdMillis);
+                        decisionLog.record(decision(assessment, now,
+                                LiquidationDecision.Outcome.REFUSED, e.refusal().name(),
+                                e.getMessage() + " \u21d2 held for " + LOOKUP_FAILED_HOLD_CYCLES
+                                        + " cycles (" + holdMillis / 1000L + "s). This is a TRANSPORT "
+                                        + "failure, not a verdict: it says nothing about whether a "
+                                        + "pool exists, which is what NO_MINSWAP_POOL reports."));
+                        log.warn("the pool lookup for {} failed in transport ({}); held for {} cycles "
+                                        + "({}s) rather than the {}-minute machinery quarantine — the "
+                                        + "candidate itself was never assessed",
+                                loanUtxoRef, e.getMessage(), LOOKUP_FAILED_HOLD_CYCLES,
+                                holdMillis / 1000L, configuration.getQuarantineMinutes());
+                        return;
+                    }
+                    // AMBIGUOUS_POOL and POOL_DATUM_UNREADABLE are facts about the CHAIN, reproducible
+                    // next cycle and unaffected by waiting — a verdict, held no longer than any other.
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                            e.refusal().name(), e.getMessage()));
+                    log.info("the convert liquidation of {} was refused as {}: {}",
+                            loanUtxoRef, e.refusal(), e.getMessage());
+                    return;
+                } catch (ConvertLiquidationRouter.WalletInputTooSmallException e) {
+                    // A fact about the WALLET, not the candidate — and the operator can top it up
+                    // between cycles, so holding it would keep refusing a convert that had become
+                    // fundable. Same treatment the pay-in-advance path already gives its own.
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                            "WALLET_INPUT_TOO_SMALL", e.getMessage()));
+                    log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef,
+                            e.getMessage());
+                    return;
                 } catch (Exception e) {
+                    // ⚠ WHAT IS LEFT HERE IS A GENUINE MACHINERY FAULT, and that is the point of the
+                    // four catches above: this branch used to swallow every verdict on the convert
+                    // route as well, so "the pool cannot fill the debt" and "the bot is broken" reached
+                    // the operator identically, both at ERROR, both held for thirty minutes.
                     quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             rootReason(e), causeChain(e)));
@@ -2366,6 +2448,21 @@ public class LiquidationExecutor {
     private void expireQuarantine(long now) {
         quarantine.entrySet().removeIf(entry -> entry.getValue() <= now);
     }
+
+    /**
+     * How many scheduling cycles a TRANSPORT failure on the Minswap pool lookup is held for.
+     *
+     * <p>⛔ <b>Neither of the other two holds, deliberately.</b> A {@code LOOKUP_FAILED} is not a
+     * verdict (those are recorded and reconsidered immediately) and not a machinery fault (those get
+     * {@code quarantine-minutes}, thirty by default). Measured on mainnet 2026-09-09: one Blockfrost
+     * hiccup on the pool lookup produced <b>39 {@code QUARANTINED} records</b> on a single live loan,
+     * because a transport error was being priced as though the bot were broken.
+     *
+     * <p>⚠ A code constant and not a configuration key: the hold exists so a candidate does not retry
+     * every cycle against a provider that is down, and an operator asked to tune it would be being
+     * asked to guess how long their own provider stays down.
+     */
+    private static final long LOOKUP_FAILED_HOLD_CYCLES = 2L;
 
     /**
      * Quarantines one <b>loan UTxO ref</b> — {@code txHash#index}, never a loan id. The distinction

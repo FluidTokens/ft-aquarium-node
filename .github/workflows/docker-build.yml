@@ -139,23 +139,28 @@ jobs:
       # src/test/java. Raise the floor deliberately when classes are added; a drop is a deletion to
       # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
       #
-      # Raised 136 -> 137 on 2026-09-10 by FAB-80-1, which adds exactly one class:
-      # config/BuildProvenanceTest (11 tests). Measured on this tree with NO credentials set, which is
-      # the shape CI runs in: 136 files / 1059 tests / 0 failures / 45 skipped before the class,
-      # 137 files / 1070 tests / 0 failures / 45 skipped after it.
+      # Floor measured 2026-09-10 on THIS merged tree, keyless (no credentials set -- the shape CI
+      # runs in): 138 files / 1087 tests / 0 failures / 45 skipped, zero orphans.
       #
-      # (That class read 9 tests at FAB-80-1 round 1; the rework round added two -- one asserting the
-      # startup wiring actually installs the banner's default properties, one asserting the banner
-      # says the word 'unknown' rather than rendering a hole. Same one class, same floor.)
+      # Provenance of the number, because three separate raises collided here and a floor is only a
+      # measurement while it equals something someone actually measured:
+      #   135  base e75ecf9 (#23)
+      #   +1   FAB-84-1  EnvGatedRigReachabilityTest        -> 136
+      #   +1   FAB-80-1  config/BuildProvenanceTest         -> 137   (11 tests; 9 at round 1, the
+      #                                                               rework added two)
+      #   +1   #24       ConvertLiquidationRouterTest       -> 138   (arrived via the merge)
       #
-      # NOTE the line above previously recorded 1056 keyless tests for 136 files. A keyless run of
-      # that same 136-file tree today reads 1059 -- same files, same 45 skips, three more tests. The
-      # earlier figure was probably taken mid-rework rather than at the tip. It is corrected rather
-      # than carried forward, because a recorded count nobody re-measures is how a stale number
-      # becomes the baseline everyone reconciles to.
+      # Each of the three raises independently proposed 137 and each was right about its own tree and
+      # wrong about this one. Left at 137 the gate would have tolerated losing a class in silence --
+      # the exact defect this step exists to catch.
+      #
+      # NOTE an earlier revision of this comment recorded 1056 keyless tests for 136 files. A keyless
+      # run of that same tree reads 1059 -- same files, same 45 skips, three more tests; the figure was
+      # taken mid-rework rather than at the tip. Corrected rather than carried, because a recorded
+      # count nobody re-measures is how a stale number becomes the baseline everyone reconciles to.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '137'
+          RESULT_FILE_FLOOR: '138'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

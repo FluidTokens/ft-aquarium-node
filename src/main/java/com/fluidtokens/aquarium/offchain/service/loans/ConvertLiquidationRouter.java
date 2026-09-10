@@ -27,6 +27,8 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * Routes one convert-eligible candidate to {@link ConvertTransactionBuilder}, or refuses it cleanly.
@@ -64,6 +66,20 @@ public class ConvertLiquidationRouter {
 
         public ConvertAssessment assessment() {
             return assessment;
+        }
+    }
+
+    /**
+     * No single nominable wallet UTxO covers what this order takes from the bot's own wallet.
+     *
+     * <p>⚠ A fact about the WALLET, not about the candidate — the operator can top it up between
+     * cycles, so it is reported and reconsidered rather than held. Mirrors
+     * {@code PayInAdvanceLiquidationRouter.WalletInputTooSmallException}, which is the sibling that
+     * already had a sized nomination.
+     */
+    public static final class WalletInputTooSmallException extends RuntimeException {
+        public WalletInputTooSmallException(String message) {
+            super(message);
         }
     }
 
@@ -306,7 +322,7 @@ public class ConvertLiquidationRouter {
                                                Utxo bondUtxo,
                                                Utxo configUtxo,
                                                Utxo lmConfigUtxo,
-                                               Utxo walletUtxo,
+                                               Function<BigInteger, Optional<Utxo>> walletSelector,
                                                Map<String, OracleEntry> oraclesByOracleTokenUnit,
                                                String changeAddress,
                                                long validFromMillis,
@@ -397,6 +413,37 @@ public class ConvertLiquidationRouter {
                 assessment.bond().datum().lenderAuth(),
                 ConvertTxEncoder.plainScriptAddress(registry.getAssetManagerSpendScriptHash()),
                 loanUtxo.getTxHash(), loanUtxo.getOutputIndex());
+
+        // ⛔ NOMINATE THE WALLET INPUT AGAINST WHAT THE ORDER ACTUALLY TAKES — sized, not "the first one".
+        //
+        // This used to be the executor's `nominableWalletUtxos(walletUtxos).get(0)`: the first
+        // NOMINABLE utxo, whatever its size. Two things were wrong with it. It funded an order whose
+        // ada requirement it never consulted — `orderLovelace` is the Minswap overhead alone for a
+        // token collateral but the whole swappable amount PLUS the overhead for an ada one, which can
+        // be arbitrarily large. And an unsized `get(0)` over a list is one list-semantics change away
+        // from selecting a published REFERENCE SCRIPT (CCL trap 9b/26a — this exact line already
+        // survived that once, when fbcf6b1 widened `walletUtxos` to the raw listing).
+        //
+        // ⚑ The selector is the sibling's shape (`PayInAdvanceLiquidationRouter`): the ROUTER knows
+        // what the order costs, the EXECUTOR knows the wallet and the fee ceiling, and neither has to
+        // learn the other's job. The selection it performs is nominable-filtered at source
+        // (`WalletInputSelection.smallestSufficient`), so the reference-script hazard is closed
+        // structurally rather than by this call site remembering to filter.
+        //
+        // ⚠ `plan.orderLovelace()` and not a re-derivation: the plan already computed it from the
+        // validator's own rule, and a second derivation here could disagree with the one the order is
+        // actually built from — the figures on this path are taken at the BODY's validFrom, not the
+        // assessment's, which is precisely how such a pair drifts apart.
+        Utxo walletUtxo = walletSelector.apply(plan.orderLovelace())
+                .orElseThrow(() -> new WalletInputTooSmallException(
+                        ("no nominable wallet utxo can fund this convert: the Minswap order carries %s "
+                                + "lovelace (%s), and no single ada-only utxo with no datum and no "
+                                + "reference script covers that plus the fee ceiling. Fund the wallet "
+                                + "with one such utxo of at least that amount plus fee headroom.")
+                                .formatted(plan.orderLovelace(),
+                                        collateral.isAda()
+                                                ? "the swappable ada plus the order overhead"
+                                                : "the order overhead; the collateral is a token")));
 
         ClaimData claim = new ClaimData((LiquidationMode.Liquidation) loan.liquidationMode(),
                 BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
