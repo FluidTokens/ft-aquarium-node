@@ -30,6 +30,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -91,6 +92,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@link LiquidationSubmitVetoTest}.
  */
 class LiquidationExecutorTest {
+
+    /**
+     * A live {@link MarketCoverageReporter} for every wiring in this class, on a throwaway registry.
+     *
+     * <p>⚠ <b>Not a stub, and deliberately not.</b> Every cycle these tests run therefore executes the
+     * real reporting path, so the claim this slice makes — that observing which market cannot be
+     * served changes no decision — is carried by this whole class rather than asserted once. The
+     * dedicated proof is {@code aThrowingReporterChangesNothingAboutTheTransactionThatIsRecorded()}.
+     */
+    private static MarketCoverageReporter metrics() {
+        return new MarketCoverageReporter(new SimpleMeterRegistry());
+    }
 
     // ---- ECONOMICS GATE direction (token-principals slice) -----------------------------------------
 
@@ -547,7 +560,7 @@ class LiquidationExecutorTest {
                                  boolean syncing,
                                  boolean honestExUnits) {
         return wiring(configuration, scanned, inUniverse, stillUnspent, walletUtxos, oracles, syncing,
-                honestExUnits, LoanFixtures.protocolParams(), null, null);
+                honestExUnits, LoanFixtures.protocolParams(), null, null, metrics());
     }
 
     /**
@@ -575,7 +588,8 @@ class LiquidationExecutorTest {
                                  boolean honestExUnits,
                                  ProtocolParamsSupplier builderParams,
                                  RuntimeException resolverThrows,
-                                 LiquidateTransactionBuilder plainBuilder) {
+                                 LiquidateTransactionBuilder plainBuilder,
+                                 MarketCoverageReporter marketCoverage) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
         universe.addAll(walletUtxos);
         for (Scenario scenario : inUniverse) {
@@ -603,7 +617,7 @@ class LiquidationExecutorTest {
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder,
-                payInAdvanceRouter, LoanFixtures.registry(), log, oracles,
+                payInAdvanceRouter, LoanFixtures.registry(), log, marketCoverage, oracles,
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
@@ -666,6 +680,17 @@ class LiquidationExecutorTest {
                                  boolean syncing) {
         return wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
                 allUnspent(List.of(scenario)), List.of(WALLET_UTXO), noOracle(), syncing);
+    }
+
+    /**
+     * The common case with the market-coverage reporter STATED, so a test can hand the loop one that
+     * fails and show the decision is the same either way.
+     */
+    private static Wiring wiring(AppConfig.LiquidationConfiguration configuration, Scenario scenario,
+                                 boolean syncing, MarketCoverageReporter marketCoverage) {
+        return wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
+                allUnspent(List.of(scenario)), List.of(WALLET_UTXO), noOracle(), syncing, false,
+                LoanFixtures.protocolParams(), null, null, marketCoverage);
     }
 
     /** As above with the scanner's verdicts supplied whole, for the exclusion histogram. */
@@ -941,7 +966,7 @@ class LiquidationExecutorTest {
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT, scanner, resolver, builder,
-                router, LoanFixtures.registry(), log, oracles, previewNetwork(),
+                router, LoanFixtures.registry(), log, metrics(), oracles, previewNetwork(),
                 LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
     }
@@ -983,7 +1008,7 @@ class LiquidationExecutorTest {
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
-                payInAdvanceRouter, new FakeConvertRouter(canned), LoanFixtures.registry(), log, oracles,
+                payInAdvanceRouter, new FakeConvertRouter(canned), LoanFixtures.registry(), log, metrics(), oracles,
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
@@ -1324,6 +1349,59 @@ class LiquidationExecutorTest {
                 ("the transaction is %d bytes, at or under the 16_384 maxTxSize — that contradicts "
                         + "the measured 18_584 bytes of validators this plan rests on, so the "
                         + "measurement has to be redone before slice 3").formatted(size));
+    }
+
+    // ======================================================================================
+    // market coverage: the slice that OBSERVES, and must not decide
+    // ======================================================================================
+
+    /**
+     * ⛔ <b>THE INVARIANT THE MARKET-COVERAGE SLICE MUST NOT BREAK: it observes, it does not decide.</b>
+     *
+     * <p>{@code MarketCoverageReporter} is called from inside {@code cycle()}, before the exclusion
+     * histogram throws the asset identity away, and it touches a {@code MeterRegistry} — something
+     * outside this loop's contract, that can fail for reasons that have nothing to do with a loan.
+     * A reporting fault must therefore cost a metric and never a liquidation.
+     *
+     * <p>The proof is a comparison rather than an assertion about intent: the same candidate, the
+     * same instant, the same wiring, run twice — once with a working reporter and once with one that
+     * throws on contact — and the recorded decision must be <b>equal in every field</b>, the built
+     * transaction's CBOR included. A change that let observation influence the decision path, or an
+     * unguarded call that lost the cycle, both fail here.
+     */
+    @Test
+    void aThrowingReporterChangesNothingAboutTheTransactionThatIsRecorded() {
+        Wiring observed = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false,
+                new MarketCoverageReporter(new SimpleMeterRegistry()));
+        observed.executor().cycle(NOW);
+        LiquidationDecision withReporting = onlyDecision(observed);
+
+        MarketCoverageReporter broken = mock(MarketCoverageReporter.class);
+        doThrow(new IllegalStateException("the metrics backend is down")).when(broken).report(any());
+        Wiring unobserved = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false, broken);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            unobserved.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+        LiquidationDecision withoutReporting = onlyDecision(unobserved);
+
+        assertEquals(withReporting.txCborHex(), withoutReporting.txCborHex(),
+                "the built transaction must be byte-identical whether or not the market-coverage "
+                        + "reporting worked");
+        assertEquals(withReporting, withoutReporting,
+                "no field of the decision may depend on observation — outcome, veto, fee, size and "
+                        + "hash included");
+        assertTrue(appender.list.stream()
+                        .filter(event -> event.getLevel() == Level.WARN)
+                        .anyMatch(event -> event.getFormattedMessage()
+                                .contains("market-coverage reporting failed")),
+                "a swallowed fault is worse than the fault: the cycle carries on, and says so");
     }
 
     // ======================================================================================
@@ -1996,7 +2074,7 @@ class LiquidationExecutorTest {
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver,
-                plainBuilder, router, LoanFixtures.registry(), log, oracles, previewNetwork(),
+                plainBuilder, router, LoanFixtures.registry(), log, metrics(), oracles, previewNetwork(),
                 LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
     }
@@ -2602,7 +2680,7 @@ class LiquidationExecutorTest {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
                 allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
-                LoanFixtures.protocolParams(), null, brokenBuilder);
+                LoanFixtures.protocolParams(), null, brokenBuilder, metrics());
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -2651,7 +2729,7 @@ class LiquidationExecutorTest {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
                 allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
-                LoanFixtures.protocolParams(), boom, null);
+                LoanFixtures.protocolParams(), boom, null, metrics());
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -2701,7 +2779,7 @@ class LiquidationExecutorTest {
         Scenario honest = scenario(FAT_FEE_PER_MILLE);
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
                 allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
-                throwingParams(), null, null);
+                throwingParams(), null, null, metrics());
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -2815,7 +2893,7 @@ class LiquidationExecutorTest {
 
         Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
                 allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
-                LoanFixtures.protocolParams(), null, unserialisable);
+                LoanFixtures.protocolParams(), null, unserialisable, metrics());
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -3292,7 +3370,7 @@ class LiquidationExecutorTest {
         CapturingConvertRouter capturing = new CapturingConvertRouter(4_000_000L);
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(List.of(refScriptUtxo, WALLET_UTXO)), ACCOUNT, scanner, resolver, plainBuilder,
-                payInAdvanceRouter, capturing, LoanFixtures.registry(), log, oracles,
+                payInAdvanceRouter, capturing, LoanFixtures.registry(), log, metrics(), oracles,
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
         executor.cycle(NOW);
@@ -3341,7 +3419,7 @@ class LiquidationExecutorTest {
         CapturingConvertRouter capturing = new CapturingConvertRouter(60_000_000L);
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(List.of(tooSmall, WALLET_UTXO)), ACCOUNT, scanner, resolver,
-                plainBuilder, payInAdvanceRouter, capturing, LoanFixtures.registry(), log, noOracle(),
+                plainBuilder, payInAdvanceRouter, capturing, LoanFixtures.registry(), log, metrics(), noOracle(),
                 previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
                 EXPLODING_SUBMITTER);
         executor.cycle(NOW);
@@ -3395,7 +3473,7 @@ class LiquidationExecutorTest {
                 new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT,
                 new FakeScanner(List.of(convert.assessment())),
                 new FakeResolver(allUnspent(List.of(convert))), plainBuilder, payInAdvanceRouter,
-                router, LoanFixtures.registry(), log, noOracle(), previewNetwork(),
+                router, LoanFixtures.registry(), log, metrics(), noOracle(), previewNetwork(),
                 LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
         return new ConvertWiring(executor, log, router);
     }

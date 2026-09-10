@@ -139,7 +139,7 @@ jobs:
       # src/test/java. Raise the floor deliberately when classes are added; a drop is a deletion to
       # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
       #
-      # Floor measured 2026-09-10 on THIS tree, keyless (the shape CI runs in): 138 files.
+      # Floor measured 2026-09-10 on THIS tree, keyless (the shape CI runs in): 139 files.
       #
       # (config/BuildProvenanceTest carries 11 tests: 9 at round 1, plus two the rework added -- one
       # asserting the startup wiring actually installs the banner's default properties, one asserting
@@ -150,14 +150,21 @@ jobs:
       #   135  base e75ecf9 (#23)
       #   +1   EnvGatedRigReachabilityTest        (the CI-gate slice, squashed into main as #25)
       #   +1   ConvertLiquidationRouterTest       (#24)
-      #   +1   config/BuildProvenanceTest         (this slice, 11 tests)
-      #   = 138
+      #   +1   config/BuildProvenanceTest         (11 tests)
+      #   +1   service/loans/MarketCoverageReporterTest  (FAB-81-1, 8 tests)
+      #   = 139
+      #
+      # FAB-81-1 measured both sides of its own change, keyless, with `rm -rf build/test-results/test`
+      # then `./gradlew cleanTest test`, counting the XML rather than reading BUILD SUCCESSFUL:
+      #   before  138 files / 1087 tests / 0 failures / 45 skipped
+      #   after   139 files / 1096 tests / 0 failures / 45 skipped   (+1 class, +8 tests there,
+      #                                                              +1 in LiquidationExecutorTest)
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '138'
+          RESULT_FILE_FLOOR: '139'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
