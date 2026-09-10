@@ -95,7 +95,11 @@ public class LiquidationReadinessController {
                       String feeUnknownReason,
                       String route,
                       String routeDetail,
-                      BigInteger advanceLovelace) {
+                      // F5 (round 2) — RENAMED from advanceLovelace: the figure is denominated in the
+                      // LOAN'S OWN PRINCIPAL asset (principalUnit, above), never lovelace — a USDM loan
+                      // reported here in a field named "…Lovelace" was 4.63x wrong in the wrong unit,
+                      // read literally as lovelace by an operator acting on it.
+                      BigInteger advancePrincipalAmount) {
 
         /** Sorting key: lower is closer to liquidation. Unknown health sorts last, never first. */
         public double sortKey() {
@@ -285,10 +289,17 @@ public class LiquidationReadinessController {
 
     /**
      * ⛔ The PRODUCTION figure — {@code convertedLoanCollateralToPrincipalAmount}, taken from the
-     * builder, never {@code remainingDebt}. Null when the collateral has no oracle entry, because
-     * the amount genuinely cannot be known then.
+     * builder, never {@code remainingDebt}. Null when the collateral (or, for a non-ada principal,
+     * the principal) has no oracle entry, because the amount genuinely cannot be known then.
+     * <p>
+     * F5 (round 2) — routed through the REAL {@code numbers()} overload with the loan's own principal
+     * oracle, never the deprecated 4-arg one that silently priced every principal as ada. That
+     * silent substitution was a 4.63x wrong number in a field an operator acts on directly.
      */
-    private BigInteger advanceAmount(Loan loan, LenderBond bond, long now) {
+    // Package-private (not private) so LiquidationReadinessControllerTest can prove F5's fix directly
+    // — that a real principalOracle actually reaches numbers(), not just that the deprecated 4-arg
+    // overload got deleted — without standing up the full readiness()/rows() Spring plumbing.
+    BigInteger advanceAmount(Loan loan, LenderBond bond, long now) {
         FluidOracleClient client = oracleClient.getIfAvailable();
         LoansContractRegistry reg = registry.getIfAvailable();
         if (client == null || reg == null) {
@@ -298,11 +309,25 @@ public class LiquidationReadinessController {
         if (oracle.isEmpty()) {
             return null;
         }
+        AssetType principalAsset = loan.datum().principalAsset();
+        OracleEntry principalOracle = null;
+        if (!principalAsset.isAda()) {
+            // Same lookup style already used for the collateral leg above — findEntry is keyed by the
+            // PRICED asset (byToken), never the oracle NFT (that is findEntryByOracleToken's job, for
+            // building a real transaction where the exact reference-input coordinate matters). A
+            // controller-only simplification unchanged by this fix; see the class javadoc on where a
+            // re-derivation is and is not tolerated here.
+            Optional<OracleEntry> principalEntry = client.findEntry(principalAsset);
+            if (principalEntry.isEmpty()) {
+                return null;
+            }
+            principalOracle = principalEntry.get();
+        }
         try {
             return new LiquidatePayInAdvanceTransactionBuilder(reg, network.getCardanoNetwork(),
                     (com.bloxbean.cardano.client.api.UtxoSupplier) null,
                     (com.bloxbean.cardano.client.api.ProtocolParamsSupplier) null)
-                    .numbers(loan, bond, oracle.get(), now)
+                    .numbers(loan, bond, oracle.get(), principalOracle, now)
                     .convertedLoanCollateralToPrincipalAmount();
         } catch (RuntimeException e) {
             log.debug("could not compute the advance amount for {}: {}", loan.utxoRef(), e.toString());

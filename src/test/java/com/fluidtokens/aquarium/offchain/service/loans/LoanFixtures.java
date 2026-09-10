@@ -30,6 +30,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.OracleSignature;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
@@ -793,6 +794,24 @@ public final class LoanFixtures {
         return new OracleEntry(token, oracleToken, rewardAddress(withdrawCredentialHash),
                 withdrawCredentialHash, referenceInput, referenceScript, List.of(), 0, feed,
                 List.of(), provider);
+    }
+
+    /**
+     * A <b>MULTISIG</b> ({@code AGGREGATED}) oracle entry — the shape every FluidTokens mainnet feed
+     * is published in, and the one no offline fixture had until 2026-09-10.
+     * <p>
+     * Two things distinguish it from {@link #charli3} and both matter to the builder: there is
+     * <b>no Charli3 provider reference input</b> (so a builder that assembles one unconditionally
+     * meets a null), and the price is proven by <b>published signatures</b> rather than structurally
+     * against a provider UTxO (so the redeemer takes the signed encoding, and an empty signature list
+     * would fail the validator's threshold in phase 2).
+     */
+    public static OracleEntry multisig(AssetType token, AssetType oracleToken, String withdrawCredentialHash,
+                                       OraclePriceFeed feed, TransactionInput referenceInput,
+                                       TransactionInput referenceScript, List<OracleSignature> signatures) {
+        return new OracleEntry(token, oracleToken, rewardAddress(withdrawCredentialHash),
+                withdrawCredentialHash, referenceInput, referenceScript,
+                List.of("00".repeat(32)), 1, feed, signatures, null);
     }
 
     // ---- suppliers ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ package com.fluidtokens.aquarium.offchain.util;
 
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
@@ -121,5 +122,89 @@ class WalletInputSelectionTest {
         String large = WalletInputSelection.smallestSufficient(wallet(), ada(45)).orElseThrow().getTxHash();
         assertFalse(small.equals(large),
                 "if the requirement does not change which utxo is chosen, it is not being applied");
+    }
+
+    // ---- token-principal nomination (Part 2, token-principals slice) -------------------------------
+
+    private static final AssetType USDM =
+            new AssetType("c48cbb3d000000000000000000000000000000000002da47ad", "0014df105553444d");
+
+    private static Utxo token(String hash, int ix, long usdmBaseUnits, long lovelace) {
+        Utxo utxo = new Utxo();
+        utxo.setTxHash(hash);
+        utxo.setOutputIndex(ix);
+        utxo.setAmount(List.of(Amount.lovelace(BigInteger.valueOf(lovelace)),
+                Amount.asset(USDM.policyId() + USDM.assetName(), BigInteger.valueOf(usdmBaseUnits))));
+        return utxo;
+    }
+
+    /**
+     * ⛔ THE FIXTURE GIOVANNI'S FUNDING TRANSACTION ACTUALLY PRODUCED — USDM sitting in a MULTI-ASSET
+     * UTxO alongside its min-ada. {@code nominable} (ada-only) filters this out by construction; a
+     * test built on a PURE-USDM UTxO (no such thing exists on a real ledger — every UTxO carries some
+     * ada) would pass today's bug and fail production. This is the positive control the contract
+     * names explicitly.
+     */
+    @Test
+    void aMultiAssetUsdmUtxoIsNominatedForATokenPrincipal() {
+        Utxo usdmAndAda = token("usdm1", 0, 1_100_000_000L, 1_400_000L);
+        List<Utxo> wallet = List.of(ada("plain", 0, 60_000_000L), usdmAndAda);
+
+        assertTrue(WalletInputSelection.nominableForToken(usdmAndAda, USDM),
+                "a token + min-ada utxo must be nominable for that token");
+        Optional<Utxo> chosen = WalletInputSelection.smallestSufficientToken(
+                wallet, USDM, BigInteger.valueOf(1_033_850_765L), BigInteger.valueOf(1_000_000L));
+        assertTrue(chosen.isPresent());
+        assertEquals("usdm1", chosen.get().getTxHash());
+    }
+
+    /**
+     * The ada-only rule is UNTOUCHED — a token-carrying utxo must never be selected by the plain
+     * ada-only path, exactly as {@link #ineligibleUtxosAreNotNominable} already pins. Restated here
+     * against a REAL token-and-min-ada shape (not a throwaway "policy"+"name" pair), so the two rules'
+     * independence is visible from this class alone.
+     */
+    @Test
+    void theMultiAssetUsdmUtxoIsNeverNominableOnThePlainAdaOnlyPath() {
+        Utxo usdmAndAda = token("usdm1", 0, 1_100_000_000L, 1_400_000L);
+        assertFalse(WalletInputSelection.nominable(usdmAndAda),
+                "the token rule is ADDITIVE — it must never loosen the ada-only rule");
+    }
+
+    /** A pure-ada wallet cannot fund a USDM payout, however large — nothing to nominate. */
+    @Test
+    void aPureAdaWalletIsRefusedForAUsdmPayout() {
+        List<Utxo> pureAda = List.of(ada("aa", 0, 5_000_000L), ada("bb", 1, 500_000_000L));
+        Optional<Utxo> chosen = WalletInputSelection.smallestSufficientToken(
+                pureAda, USDM, BigInteger.valueOf(1_033_850_765L), BigInteger.valueOf(1_000_000L));
+        assertTrue(chosen.isEmpty(), "a pure-ada wallet holds none of the principal token");
+        assertTrue(WalletInputSelection.largestNominableToken(pureAda, USDM).isEmpty());
+    }
+
+    /** The utxo must carry ADA alongside the token too — the fee ceiling and min-ada rider. */
+    @Test
+    void aTokenUtxoWithTooLittleAdaAlongsideItIsRefused() {
+        Utxo thinAda = token("thin", 0, 5_000_000_000L, 900_000L);
+        Optional<Utxo> chosen = WalletInputSelection.smallestSufficientToken(
+                List.of(thinAda), USDM, BigInteger.valueOf(1_033_850_765L), BigInteger.valueOf(1_000_000L));
+        assertTrue(chosen.isEmpty(), "1,000,000 required ada > 900,000 held, however much USDM sits alongside it");
+    }
+
+    /** Smallest-that-suffices applies to the PRINCIPAL quantity too, not just ada. */
+    @Test
+    void smallestSufficientTokenPicksTheSmallestTokenQuantityThatCoversTheRequirement() {
+        Utxo small = token("small", 0, 1_100_000_000L, 2_000_000L);
+        Utxo large = token("large", 0, 5_000_000_000L, 2_000_000L);
+        Optional<Utxo> chosen = WalletInputSelection.smallestSufficientToken(
+                List.of(large, small), USDM, BigInteger.valueOf(1_033_850_765L), BigInteger.valueOf(1_000_000L));
+        assertEquals("small", chosen.orElseThrow().getTxHash(),
+                "the smaller token-sufficient utxo must be preferred, leaving the larger for a candidate that needs it");
+    }
+
+    @Test
+    void tokenQuantityOfSumsMatchingUnitsAndIgnoresOthers() {
+        Utxo usdmAndAda = token("usdm1", 0, 1_100_000_000L, 1_400_000L);
+        assertEquals(BigInteger.valueOf(1_100_000_000L), WalletInputSelection.tokenQuantityOf(usdmAndAda, USDM));
+        assertEquals(BigInteger.ZERO, WalletInputSelection.tokenQuantityOf(ada("aa", 0, 5_000_000L), USDM));
     }
 }

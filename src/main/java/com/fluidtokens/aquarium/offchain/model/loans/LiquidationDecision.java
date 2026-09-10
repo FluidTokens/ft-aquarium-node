@@ -18,8 +18,11 @@ import java.math.BigInteger;
  * @param decidedAt              epoch millis at which the decision was taken
  * @param loanUtxoRef            {@code txHash#index} of the loan UTxO
  * @param bondUtxoRef            {@code txHash#index} of the lender-bond UTxO
- * @param variant                which action this decision is about — {@link #VARIANT} or
- *                               {@link #VARIANT_CONVERT}. A field rather than an implicit fact so a
+ * @param variant                which action this decision is about — {@link #VARIANT},
+ *                               {@link #VARIANT_CONVERT} or {@link #VARIANT_CONVERT_MINSWAP}. All
+ *                               THREE are emitted in production: the third since 22573f9, when
+ *                               {@code variantOf} began consulting the market gate instead of the
+ *                               lender's bond flag alone. A field rather than an implicit fact so a
  *                               second action can be added without every stored decision becoming
  *                               ambiguous. ⚠ <b>It was hardcoded to the plain value for the whole
  *                               time the convert path was live</b>, so every convert decision would
@@ -169,6 +172,16 @@ public record LiquidationDecision(long decidedAt,
          * record is not a record of absence.</b> Confirmed 2026-08-25 by waiting out a real 30-minute
          * quarantine and observing the first decision land at the first cycle past expiry.
          */
-        QUARANTINED
+        QUARANTINED,
+        /**
+         * The economics gate could not price a leg of the candidate into lovelace — {@code
+         * PricingService.toLovelace} refused (no feed, a feed not usable at the instant asked, or a
+         * {@code POOLED} variant). Landed live for the pay-in-advance path's token outlay
+         * (token-principals slice, 2026-09-10): before this it was RESERVED here — see
+         * {@code CompoundExclusion.PRICE_UNAVAILABLE} for the sibling that has carried the compound
+         * path's equivalent refusal since the oracle-pricing slice. Not quarantined: a feed coming
+         * back into its validity window cures it without the bot's own state changing.
+         */
+        PRICE_UNAVAILABLE
     }
 }

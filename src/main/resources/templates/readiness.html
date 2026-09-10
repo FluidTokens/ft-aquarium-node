@@ -132,12 +132,17 @@
           <span class="reason" th:text="${r.routeDetail}">why</span>
         </td>
         <td class="mono">
-          <span th:if="${r.advanceLovelace != null}" th:text="${r.advanceLovelace}">0</span>
-          <span th:if="${r.advanceLovelace == null and r.route == 'CAPITAL IN ADVANCE'}"
+          <!-- F5 (round 2) — name the UNIT beside the figure: r.principalUnit is the SAME asset this
+               amount is denominated in, never lovelace, and a 4.63x-wrong number in the wrong unit is
+               exactly the failure this caption exists to prevent. -->
+          <span th:if="${r.advancePrincipalAmount != null}" th:text="${r.advancePrincipalAmount}">0</span>
+          <span class="reason" th:if="${r.advancePrincipalAmount != null}"
+                th:text="${#strings.abbreviate(r.principalUnit, 24)}">unit</span>
+          <span th:if="${r.advancePrincipalAmount == null and r.route == 'CAPITAL IN ADVANCE'}"
                 class="unknown">unknown</span>
-          <span th:if="${r.advanceLovelace == null and r.route != 'CAPITAL IN ADVANCE'}"
+          <span th:if="${r.advancePrincipalAmount == null and r.route != 'CAPITAL IN ADVANCE'}"
                 class="reason">&mdash;</span>
-          <span class="reason" th:if="${r.advanceLovelace != null}">principal the operator must have ready</span>
+          <span class="reason" th:if="${r.advancePrincipalAmount != null}">principal the operator must have ready</span>
         </td>
       </tr>
       <tr th:if="${#lists.isEmpty(rows)}">

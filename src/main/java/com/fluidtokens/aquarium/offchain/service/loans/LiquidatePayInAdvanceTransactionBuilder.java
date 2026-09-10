@@ -235,6 +235,15 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * @param configUtxo       the main config reference input
      * @param lmConfigUtxo     the LenderManager config reference input
      * @param oracle           the Charli3-backed collateral oracle entry
+     * @param principalOracle  WALL 2/3 (token-principals slice) — the principal's own oracle entry, or
+     *                         {@code null} for an ada principal. {@code null} means "ada": {@code numbers()}
+     *                         uses {@link OraclePriceFeed#unit()} for the principal feed exactly as before,
+     *                         and {@link #referenceInputs} adds no extra reference input for it — the
+     *                         validator never reads one for ada ({@code retrieve_oracle_data} short-circuits
+     *                         on an empty policy id). Non-null for a token principal: its
+     *                         {@code referenceInput}, {@code referenceScript} and (if a c3 feed)
+     *                         {@code charlieProviderReferenceInput} join the reference-input set, and its
+     *                         feed prices both the redeemer equity and the lender payout.
      * @param validFromMillis  the instant the debt and equity are computed at — must be the POSIX time
      *                         {@code validFromSlot} converts back to, so the on-chain recomputation matches
      * @param validFromSlot    the validity range lower bound, in slots
@@ -254,6 +263,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                           Utxo configUtxo,
                           Utxo lmConfigUtxo,
                           OracleEntry oracle,
+                          OracleEntry principalOracle,
                           long validFromMillis,
                           /**
                            * The validity upper bound in milliseconds, derived from {@code validToSlot}
@@ -286,40 +296,66 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * The five numbers, computed exactly as {@code LiquidateTransactionBuilder} and the on-chain
      * validators do: the debt and equity at {@code validFromMillis}, the fee from the bond's per-mille
      * rate, and — the pay-in-advance-specific one — the collateral the lender should receive converted
-     * to the principal currency (ADA) through the two oracles. Since the principal is ADA its feed is
-     * the 1:1 unit feed, so {@code convertFromAToBWithOracles} reduces to
-     * {@code ceil(collateralReceive priced in lovelace)}.
+     * to the principal currency through the two oracles
+     * ({@link LoanFinance#convertFromAToBWithOracles}, WALL 1). For an ADA principal
+     * {@code request.principalOracle()} is {@code null} and the principal feed is the 1:1 unit feed, so
+     * the composition reduces exactly to {@code ceil(collateralReceive priced in lovelace)} — today's
+     * number, unchanged (see {@link LoanFinance#convertFromAToBWithOracles}'s javadoc).
      */
     public Numbers numbers(Request request) {
-        return numbers(request.loan(), request.bond(), request.oracle(), request.validFromMillis());
+        return numbers(request.loan(), request.bond(), request.oracle(), request.principalOracle(),
+                request.validFromMillis());
     }
 
     /**
-     * The same five numbers, computed from the four things they actually depend on — <b>and notably
+     * The same five numbers, computed from the five things they actually depend on — <b>and notably
      * NOT from the wallet UTxO.</b>
      * <p>
-     * That is what makes T-052 possible: the ada this liquidation will ask the bot to pay the lender
+     * That is what makes T-052 possible: the amount this liquidation will ask the bot to pay the lender
      * ({@code convertedLoanCollateralToPrincipalAmount}) is knowable <em>before</em> a wallet input has
      * been chosen, so the input can be selected to cover it instead of being picked blind and hoped
-     * over. Every field below reads the loan, the bond, the oracle or the instant; none reads the
+     * over. Every field below reads the loan, the bond, the two oracles or the instant; none reads the
      * wallet. <b>Keep it that way</b> — a wallet read here would make the requirement depend on the
      * answer it is being used to compute.
+     *
+     * @deprecated kept ONLY for {@code LiquidationReadinessController} (out of this slice's file
+     * allowlist), which is unchanged by this overload — it always passed {@code null} for "the
+     * principal feed", by not knowing about one at all, and this preserves that exact behaviour rather
+     * than silently changing a caller this ticket does not touch. Every caller that knows the
+     * principal (the router, the dry-eval rigs) uses the five-argument form below.
      */
+    @Deprecated
     public Numbers numbers(Loan loan, LenderBond bond, OracleEntry oracle, long validFromMillis) {
+        return numbers(loan, bond, oracle, null, validFromMillis);
+    }
+
+    /**
+     * @param principalOracle WALL 2 — the principal's own oracle entry, or {@code null} for ada. The
+     *                        redeemer equity ({@code loan_claim_action}'s own recomputation) and the
+     *                        lender payout ({@code lm_liquidate_and_pay_in_advance_action}'s) both use
+     *                        this feed, never {@link OraclePriceFeed#unit()}, for a token principal —
+     *                        the two must agree bit-for-bit or the loan spend fails phase 2.
+     */
+    public Numbers numbers(Loan loan, LenderBond bond, OracleEntry oracle, OracleEntry principalOracle,
+                           long validFromMillis) {
         LoanDatum datum = loan.datum();
         LiquidationMode.Liquidation mode = (LiquidationMode.Liquidation) datum.liquidationMode();
         BigInteger collateralAmount = loan.collateralAmount();
+        OraclePriceFeed principalFeed = principalOracle != null ? principalOracle.feed() : OraclePriceFeed.unit();
 
         BigInteger remainingDebt = LoanFinance.remainingDebt(datum, validFromMillis);
         BigInteger equity = LoanFinance.redeemerEquity(mode, Rational.fromInt(collateralAmount),
-                Rational.fromInt(remainingDebt), OraclePriceFeed.unit(), oracle.feed());
+                Rational.fromInt(remainingDebt), principalFeed, oracle.feed());
         BigInteger liquidationFee = Rational.required(
                         collateralAmount.multiply(bond.datum().liquidationFeePerMille()),
                         BigInteger.valueOf(1000))
                 .floor();
         BigInteger collateralLenderShouldReceive = collateralAmount.subtract(equity).subtract(liquidationFee);
-        BigInteger converted = LoanFinance.toLovelace(
-                Rational.fromInt(collateralLenderShouldReceive), oracle.feed()).ceil();
+        // WALL 1 — the validator's exact composition, ONE ceil at the end. NOT
+        // toLovelace(...).ceil(): that shortcut skips the division by the principal feed entirely and
+        // coincides with this only when principalFeed is the unit feed (ada).
+        BigInteger converted = LoanFinance.convertFromAToBWithOracles(oracle.feed(), principalFeed,
+                Rational.fromInt(collateralLenderShouldReceive));
         return new Numbers(remainingDebt, equity, liquidationFee, collateralLenderShouldReceive, converted);
     }
 
@@ -423,10 +459,41 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
      * Blockfrost.
      */
     public Transaction build(Request request) {
+        // V8 — THE ORACLE VARIANT, REFUSED BY NAME BEFORE ANYTHING ELSE RUNS. Only the two shapes
+        // OracleFeedConverter can encode are modelled: PRICE_DATA_CHARLIE (proven by a provider
+        // reference input) and the SIGNED feeds, AGGREGATED/DEDICATED (proven by the published
+        // signatures). POOLED and PRICE_DATA_ORCFAX carry fields that are not a plain price.
+        //
+        // ⚠ THIS RUNS FIRST, AHEAD OF numbers(), AND THAT ORDER IS LOAD-BEARING — measured. A POOLED
+        // feed never reaches a redeemer at all: numbers() prices it, and OraclePriceFeed.price()
+        // throws a bare UnsupportedOperationException for POOLED ("a `fail` in finance.ak"). Placed
+        // any later, this check is dead code for the one variant that most needs it, and the operator
+        // sees machinery breakage where the truth is a candidate this builder does not model.
+        // OracleEntry.usableForLiquidation() already refuses both upstream; this is the builder
+        // saying so in its own voice, so the executor records a REFUSED decision rather than a fault.
+        refuseUnmodelledVariant(request.oracle(), "collateral");
+        if (request.principalOracle() != null) {
+            refuseUnmodelledVariant(request.principalOracle(), "principal");
+        }
         Numbers numbers = numbers(request);
-        if (numbers.equity().signum() <= 0) {
+        // F0 (round 2) — EQUITY 0 IS THE VALIDATOR'S NORMAL CASE, NOT A SHAPE THIS BUILDER REFUSES.
+        //
+        // loan_claim_action.ak:240-259 (deployed ff005fb) accepts `inputAction.equity == 0` outright
+        // — an `or { equity == 0, <borrower-compensation check> }` that SHORT-CIRCUITS before ever
+        // looking at a compensation output — and otherwise requires `equity >= 0 && equity ==
+        // max(computed_equity, 0)`. LoanFinance.redeemerEquity already floors a negative computed
+        // equity to ZERO, so "equity <= 0" this builder used to refuse was, in practice, ALWAYS
+        // exactly "equity == 0" — the underwater loan, which is the common liquidation and (2026-09-09)
+        // the live USDM loan today. Refusing it here was a precondition THIS BUILDER invented, not one
+        // the validator asked for.
+        //
+        // Only a genuinely negative equity — which redeemerEquity's own floor makes unreachable, kept
+        // here as defence in depth against a future change to that floor — is still refused: this
+        // builder still would not know what to pay the borrower a NEGATIVE compensation would mean.
+        if (numbers.equity().signum() < 0) {
             throw new IllegalStateException(
-                    "this builder models the positive-equity pay-in-advance layout; equity was "
+                    "this builder never models a negative equity (LoanFinance.redeemerEquity floors "
+                            + "it to zero; this is defence in depth, not the expected path); equity was "
                             + numbers.equity());
         }
         if (!request.bond().datum().shouldLiquidationConvertToPrincipal()) {
@@ -462,44 +529,92 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                     "only %dms of oracle feed window left after validTo, %dms required".formatted(
                             feedRemainingAfterValidTo, request.oracleWindowMarginMillis()));
         }
+        // WALL 3 — the SAME V3 window check the collateral feed gets, applied to the principal feed
+        // too when it is real. Skipped for ada: OraclePriceFeed.unit()'s validFrom/validTo are 0/0 by
+        // construction and retrieve_oracle_data never reads them for an empty policy id.
+        if (request.principalOracle() != null) {
+            OraclePriceFeed principalFeed = request.principalOracle().feed();
+            long principalFeedRemainingAfterValidTo = principalFeed.validTo() - request.validToMillis();
+            if (!principalFeed.usableOver(request.validFromMillis(), request.validToMillis())) {
+                throw new PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException(
+                        "principal oracle feed window [%d,%d] does not cover tx window [%d,%d]".formatted(
+                                principalFeed.validFrom(), principalFeed.validTo(),
+                                request.validFromMillis(), request.validToMillis()));
+            }
+            if (principalFeedRemainingAfterValidTo < request.oracleWindowMarginMillis()) {
+                throw new PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException(
+                        "only %dms of principal oracle feed window left after validTo, %dms required"
+                                .formatted(principalFeedRemainingAfterValidTo,
+                                        request.oracleWindowMarginMillis()));
+            }
+        }
 
         List<TransactionInput> refInputs = referenceInputs(request);
         int configRefIndex = refIndex(refInputs, inputOf(request.configUtxo()), "main config");
         int lmConfigRefIndex = refIndex(refInputs, inputOf(request.lmConfigUtxo()), "lm config");
         int collateralOracleRefIndex = refIndex(refInputs, request.oracle().referenceInput(), "collateral oracle");
-        // Principal is ADA: retrieve_oracle_data short-circuits on policyId == "" and never reads the
-        // reference input, but the index must still be in range. Index 0 of the canonically sorted
-        // reference inputs always is — the same value LiquidateTransactionBuilder gives an ada leg.
-        int principalOracleRefIndex = 0;
-        int providerRefIndex = refIndex(refInputs, request.oracle().charlieProviderReferenceInput(),
-                "charli3 provider");
+        // WALL 3 — for a token principal, a REAL reference input, derived by lookup exactly as the
+        // collateral one is. For ADA: retrieve_oracle_data short-circuits on policyId == "" and never
+        // reads the reference input, but the index must still be in range — index 0 of the canonically
+        // sorted reference inputs always is (the same value LiquidateTransactionBuilder gives an ada
+        // leg), and no extra reference input is added for it (see referenceInputs()).
+        int principalOracleRefIndex = request.principalOracle() != null
+                ? refIndex(refInputs, request.principalOracle().referenceInput(), "principal oracle")
+                : 0;
+        // ⛔ A PROVIDER INDEX ONLY WHERE THERE IS A PROVIDER. Deriving it unconditionally is what
+        // made a multisig feed impossible: there is no provider UTxO to look up, so refIndex would
+        // hunt for a null coordinate. The variant decides — and it decides the redeemer encoding at
+        // the withdrawal too (see oracleRedeemer below); nothing else may.
+        Integer providerRefIndex = null;
+        if (request.oracle().feed().variant() == OraclePriceFeed.Variant.PRICE_DATA_CHARLIE) {
+            providerRefIndex = refIndex(refInputs, request.oracle().charlieProviderReferenceInput(),
+                    "charli3 provider");
+        }
+        // WALL 3 — the principal oracle's own Charli3 provider, when it has one. lm_liquidate_and_pay_
+        // in_advance_action's redeemer carries a SEPARATE providerRefInputIndex per oracle invocation
+        // (one per withdraw-0 of the shared oracle validator), so this is independent of the
+        // collateral leg's providerRefIndex above.
+        Integer principalProviderRefIndex = null;
+        if (request.principalOracle() != null
+                && request.principalOracle().feed().variant() == OraclePriceFeed.Variant.PRICE_DATA_CHARLIE) {
+            principalProviderRefIndex = refIndex(refInputs,
+                    request.principalOracle().charlieProviderReferenceInput(), "principal charli3 provider");
+        }
 
         // The output indexes, COMPUTED from the emission order rather than observed off a throwaway
-        // probe body (T-051, 2026-08-26). assemble() emits exactly three outputs, in this order:
+        // probe body (T-051, 2026-08-26). assemble() emits the bond echo, then EITHER two OR one
+        // asset-manager outputs depending on equity (F0, round 2):
         //
         //   1. the bond echo, at the LenderManager credential  -> absolute body index
-        //   2. the borrower's equity compensation              -> asset-manager filtered slot 0
-        //   3. the lender's paid-in-advance ada                -> asset-manager filtered slot 1
+        //   2. the borrower's equity compensation, EQUITY > 0 ONLY -> asset-manager filtered slot 0
+        //   3. the lender's paid-in-advance principal          -> asset-manager filtered slot 0 or 1
         //
         // The bond echo is the FIRST output this builder adds, so its absolute position is whatever
         // cardano-client-lib prepended and nothing else — see OutputLayout.CCL_PREPENDED_OUTPUTS. The
         // asset index is into the FILTERED list, so it needs no such offset: the prepended dummy and
         // the appended change sit at the change address and the echo at the LenderManager credential,
-        // so none of them survives the asset-manager filter. loan_claim_action reads the borrower's
-        // compensation at the bare loan index, which pins it to slot 0 and leaves the lender's output
-        // at slot 1 — the constraint V5 re-asserts as `assetOutputIndex != 0`.
+        // so none of them survives the asset-manager filter.
+        //
+        // At equity > 0, loan_claim_action reads the borrower's compensation at the bare loan index,
+        // which pins it to slot 0 and leaves the lender's output at slot 1 — the constraint V5
+        // re-asserts as `assetOutputIndex != 0`. At equity == 0 the validator's own `or { equity == 0,
+        // .. }` never looks at slot 0 for a compensation output AT ALL (loan_claim_action.ak:273), so
+        // omitting that output (mirroring LiquidateTransactionBuilder:795's `if (equity.signum() > 0)`)
+        // and landing the lender's output at slot 0 is equally valid — there is no "bare loan index"
+        // constraint to satisfy when nothing reads that slot for this loan.
         //
         // ⚠ Unlike the plain path, this layout is NOT corroborated by an accepted transaction: no
         // convert-path liquidation has ever been submitted. What makes it safe is the same thing that
         // made the probe safe — V5 re-derives BOTH indexes from the FINISHED body, via the very same
         // locateBondOutput / locateLenderConvertedOutput helpers the probe used, and refuses on any
         // disagreement. A layout mistake is a build-time refusal, not a chain failure.
+        boolean payBorrowerCompensation = numbers.equity().signum() > 0;
         long lenderBondOutputIndex = OutputLayout.CCL_PREPENDED_OUTPUTS;
-        long assetOutputIndex = 1L;
+        long assetOutputIndex = payBorrowerCompensation ? 1L : 0L;
 
         Transaction transaction = complete(request, assemble(request, numbers, configRefIndex,
                 lmConfigRefIndex, collateralOracleRefIndex, principalOracleRefIndex, providerRefIndex,
-                refInputs, lenderBondOutputIndex, assetOutputIndex),
+                principalProviderRefIndex, refInputs, lenderBondOutputIndex, assetOutputIndex),
                 (ctx, txn) -> assertStructure(txn, request, numbers, lenderBondOutputIndex,
                         assetOutputIndex));
         return transaction;
@@ -509,7 +624,8 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     private ScriptTx assemble(Request request, Numbers numbers, int configRefIndex, int lmConfigRefIndex,
                               int collateralOracleRefIndex, int principalOracleRefIndex,
-                              int providerRefIndex, List<TransactionInput> refInputs,
+                              Integer providerRefIndex, Integer principalProviderRefIndex,
+                              List<TransactionInput> refInputs,
                               long lenderBondOutputIndex, long assetOutputIndex) {
         ScriptTx tx = new ScriptTx();
         String loanId = request.loan().loanId();
@@ -526,15 +642,28 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                 LiquidationTxEncoder.loanMintRedeemer(configRefIndex, false, 0));
 
         // Outputs. The bond echo first, then — in the filtered asset-manager list — the borrower's
-        // equity compensation at slot 0 (loan_claim_action reads it at the bare loan index) and the
-        // lender's paid-in-advance ada at slot 1 (lm_liquidate_and_pay_in_advance_action reaches it
-        // through assetOutputIndexes).
+        // equity compensation (EQUITY > 0 ONLY, at slot 0 — loan_claim_action reads it at the bare
+        // loan index) and the lender's paid-in-advance principal (slot 1 when a compensation output
+        // exists, otherwise slot 0 — lm_liquidate_and_pay_in_advance_action reaches it through
+        // assetOutputIndexes, whichever slot that is).
+        //
+        // F0 (round 2) — AT EQUITY == 0, NO COMPENSATION OUTPUT IS EMITTED AT ALL. Mirrors
+        // LiquidateTransactionBuilder:795's `if (equity.signum() > 0)` exactly: loan_claim_action's own
+        // `or { inputAction.equity == 0, equity_sent_to_borrower(..) }` (ak:273) short-circuits on the
+        // first branch and never reads a compensation output for this loan, so emitting one anyway
+        // would be an unread, wasted min-ada outlay for a candidate that is already the bot's worst
+        // case (an underwater loan).
         tx.payToContract(request.bondUtxo().getAddress(), List.copyOf(request.bondUtxo().getAmount()),
                 bondEchoDatum(request));
-        tx.payToContract(assetManagerAddress(), collateralEquityAmounts(request, numbers.equity()),
-                borrowerCompensationDatum(request));
-        tx.payToContract(assetManagerAddress(),
-                List.of(Amount.lovelace(numbers.convertedLoanCollateralToPrincipalAmount())),
+        if (numbers.equity().signum() > 0) {
+            tx.payToContract(assetManagerAddress(), collateralEquityAmounts(request, numbers.equity()),
+                    borrowerCompensationDatum(request));
+        }
+        // WALL 4 — paid in the PRINCIPAL ASSET. For ada: unchanged, ada-only (flatten == 1). For a
+        // token principal: the converted quantity of that token, min-ada left to cardano-client-lib to
+        // top up (trap 6) — the output becomes [min-ada rider, converted × principal], flatten == 2,
+        // exactly what validate_repayment_output's dosProtection demands for a non-ada repaymentAsset.
+        tx.payToContract(assetManagerAddress(), lenderConvertedAmounts(request, numbers),
                 lenderConvertedDatum(request));
 
         // ⛔ THE BOT'S COLLATERAL, PAID OUT BY NAME — and this output is the whole of S-15.
@@ -590,8 +719,22 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                         List.of(assetOutputIndex)),
                 request.changeAddress());
         tx.withdraw(request.oracle().rewardAddress(), BigInteger.ZERO,
-                LiquidationTxEncoder.oracleRedeemer(request.oracle().feed(), providerRefIndex, List.of()),
+                oracleRedeemer(request.oracle(), providerRefIndex),
                 request.changeAddress());
+        // WALL 3 — the principal leg is a SEPARATE withdraw-0 invocation of the oracle validator, per
+        // OracleEntry's own javadoc: retrieve_oracle_data resolves its feed with
+        // pairs.get_first(self.redeemers, Withdraw(oraclePaymentCredential)) — one redeemer PER
+        // CREDENTIAL, and a token principal's oracle is deployed separately from the collateral's
+        // (its own verification keys / charlie_specs / oracle-asset parameters), so it carries its own
+        // reward address. Skipped when the two legs happen to share one credential (the same priced
+        // asset on both legs), because the ledger permits only one withdrawal per reward address and
+        // get_first would already resolve the collateral leg's own entry for it.
+        if (request.principalOracle() != null
+                && !request.principalOracle().rewardAddress().equals(request.oracle().rewardAddress())) {
+            tx.withdraw(request.principalOracle().rewardAddress(), BigInteger.ZERO,
+                    oracleRedeemer(request.principalOracle(), principalProviderRefIndex),
+                    request.changeAddress());
+        }
 
         tx.readFrom(refInputs.toArray(TransactionInput[]::new));
 
@@ -983,6 +1126,22 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         return List.of(Amount.asset(collateral.policyId() + collateral.assetName(), equity));
     }
 
+    /**
+     * WALL 4 — the lender's paid-in-advance value, in the PRINCIPAL asset. Ada: a plain lovelace
+     * amount (unchanged, {@code flatten == 1}). A token principal: the converted quantity of that
+     * token, min-ada left to cardano-client-lib to top up (trap 6) — {@code flatten == 2}, exactly
+     * what {@code validate_repayment_output}'s {@code dosProtection} demands for a non-ada
+     * {@code repaymentAsset}.
+     */
+    private List<Amount> lenderConvertedAmounts(Request request, Numbers numbers) {
+        AssetType principal = request.loan().datum().principalAsset();
+        if (principal.isAda()) {
+            return List.of(Amount.lovelace(numbers.convertedLoanCollateralToPrincipalAmount()));
+        }
+        return List.of(Amount.asset(principal.policyId() + principal.assetName(),
+                numbers.convertedLoanCollateralToPrincipalAmount()));
+    }
+
     // ---- addresses --------------------------------------------------------------------------------
 
     /**
@@ -1010,10 +1169,20 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     private List<TransactionInput> referenceInputs(Request request) {
         Set<TransactionInput> refInputs = new LinkedHashSet<>(List.of(
                 inputOf(request.configUtxo()),
-                inputOf(request.lmConfigUtxo()),
-                request.oracle().referenceInput(),
-                request.oracle().referenceScript(),
-                request.oracle().charlieProviderReferenceInput()));
+                inputOf(request.lmConfigUtxo())));
+        // ⛔ NULL-SAFE, exactly as ConvertTransactionBuilder#referenceInputs already is. A MULTISIG
+        // feed has NO Charli3 provider UTxO — and {@code List.of} refuses a null element outright, so
+        // the first-ever mainnet build died right here with a bare NullPointerException. A
+        // provider-less feed simply adds no provider input; a null is skipped rather than encoded as
+        // a coordinate that resolves to nothing.
+        oracleReferenceInputs(request.oracle()).forEach(refInputs::add);
+        // WALL 3 — the principal's own reference input, reference script and (if a c3 feed) provider
+        // input, ONLY for a token principal. Ada adds nothing here: the validator never reads a
+        // reference input for it (retrieve_oracle_data short-circuits on the empty policy id), so
+        // adding one would cost fee and change nothing — exactly the ⚠ in the Request javadoc.
+        if (request.principalOracle() != null) {
+            oracleReferenceInputs(request.principalOracle()).forEach(refInputs::add);
+        }
         // Only the subset this builder attaches AND the shared record can name: lmLiquidateAction and
         // assetManager are excluded here, exactly as in publishedScripts().
         LiquidateTransactionBuilder.ReferenceScripts scripts = request.referenceScripts();
@@ -1023,6 +1192,92 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                 .filter(Objects::nonNull)
                 .forEach(refInputs::add);
         return refInputs.stream().sorted(new TransactionInputComparator()).toList();
+    }
+
+    /**
+     * ⛔ <b>THE ORACLE REDEEMER, DECIDED BY THE FEED'S VARIANT AND BY NOTHING ELSE.</b>
+     * <p>
+     * A {@code PRICE_DATA_CHARLIE} feed carries no signature over its own bytes: {@code oracle.ak}
+     * validates it structurally against the Charli3 provider UTxO named by
+     * {@code provider_ref_input_index}, so the redeemer names that index and its signature list is
+     * legitimately EMPTY. A signed feed — {@code AGGREGATED} on mainnet, {@code DEDICATED} — takes
+     * the other branch, which runs {@code verify_ed25519_signature} against the feed's published
+     * signatures and has no provider index at all.
+     * <p>
+     * <b>The two are not interchangeable, and getting it wrong is PHASE 2.</b> Until 2026-09-10 this
+     * builder emitted the Charli3 shape unconditionally — a provider index plus
+     * {@code List.of()} — for every feed. Against a multisig deployment that assembles perfectly and
+     * fails the signature threshold on chain, after the fee is spent and with the collateral input
+     * consumed (CCL trap 8's failure tier). {@link ConvertTransactionBuilder} — the only builder that
+     * has ever built on mainnet — has encoded the signed shape since findings §40, and its comment at
+     * the collateral withdrawal names this builder's old call as exactly the fatal one. This is that
+     * lesson carried across, not a third encoding.
+     *
+     * @param providerRefIndex the provider's position among the reference inputs, non-null for a
+     *                         {@code PRICE_DATA_CHARLIE} feed and null for every other variant
+     */
+    private static PlutusData oracleRedeemer(OracleEntry entry, Integer providerRefIndex) {
+        return switch (entry.feed().variant()) {
+            case PRICE_DATA_CHARLIE -> LiquidationTxEncoder.oracleRedeemer(entry.feed(),
+                    Objects.requireNonNull(providerRefIndex,
+                            "a PRICE_DATA_CHARLIE feed has no provider reference-input index"),
+                    List.of());
+            case AGGREGATED, DEDICATED -> LiquidationTxEncoder.oracleRedeemer(entry.feed(),
+                    entry.signatures());
+            // Unreachable: refuseUnmodelledVariant rejects both before anything is assembled. Kept so
+            // the switch stays exhaustive and a new variant is a compile error, not a silent branch.
+            case POOLED, PRICE_DATA_ORCFAX -> throw new IllegalStateException(
+                    "unmodelled oracle variant " + entry.feed().variant() + " reached assembly");
+        };
+    }
+
+    /**
+     * Refuses a feed variant this builder cannot encode, <em>by name and before building</em> — a
+     * clean {@code REFUSED} decision about a candidate rather than an
+     * {@code UnsupportedOperationException} out of {@link OracleFeedConverter}.
+     */
+    private static void refuseUnmodelledVariant(OracleEntry entry, String leg) {
+        switch (entry.feed().variant()) {
+            case PRICE_DATA_CHARLIE, AGGREGATED, DEDICATED -> {
+            }
+            case POOLED, PRICE_DATA_ORCFAX -> throw new PayInAdvanceLiquidationRouter
+                    .PayInAdvanceNotModelledException("the %s oracle publishes a %s feed, which this "
+                            .formatted(leg, entry.feed().variant())
+                            + "builder does not model — only PRICE_DATA_CHARLIE and the signed "
+                            + "(AGGREGATED/DEDICATED) variants can be encoded");
+        }
+        // FAB-83-1 audit F1 — THE ENTRY MUST BE USABLE NOW, NOT MERELY OF A MODELLED VARIANT. The
+        // scanner checked usableForLiquidation() when it assessed the candidate, but the registry
+        // refreshes every 30 s and the executor takes its oracle snapshot AFTER the scan; a refresh
+        // landing in that window can hand this builder a signed entry with ZERO signatures, and
+        // oracleRedeemer(entry, ...) would ship the empty list — the exact shape the deployed
+        // validator refuses (measured 2026-09-10: a real script denial, not an assembly failure).
+        // The convert builder guards this in build(); this one did not. Refused by NAME, so the
+        // executor records a verdict and re-considers next cycle, rather than a fault.
+        if (!entry.usableForLiquidation()) {
+            String why = switch (entry.feed().variant()) {
+                case AGGREGATED, DEDICATED -> "a signed feed carrying " + entry.signatures().size()
+                        + " signature(s) against a threshold of " + entry.threshold();
+                case PRICE_DATA_CHARLIE -> "a PRICE_DATA_CHARLIE feed with no Charli3 provider reference input";
+                default -> "no reference input";
+            };
+            throw new PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException(
+                    ("the %s oracle entry is not usable for liquidation right now: %s — the registry "
+                            + "snapshot this cycle cannot prove the price on chain; reconsidered next cycle")
+                            .formatted(leg, why));
+        }
+    }
+
+    /**
+     * One oracle leg's reference inputs — the NFT-bearing UTxO the validator reads the credential and
+     * value from, its published script, and (a {@code PRICE_DATA_CHARLIE} feed only) the Charli3
+     * provider UTxO. Any of them may be null, and a null is dropped rather than offered to
+     * {@code List.of}.
+     */
+    private static Stream<TransactionInput> oracleReferenceInputs(OracleEntry entry) {
+        return Stream.of(entry.referenceInput(), entry.referenceScript(),
+                        entry.charlieProviderReferenceInput())
+                .filter(Objects::nonNull);
     }
 
     private static int refIndex(List<TransactionInput> refInputs, TransactionInput input, String what) {
@@ -1092,7 +1347,12 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
 
     // ---- structural re-derivation from the finished body ------------------------------------------
 
-    private void assertStructure(Transaction transaction, Request request, Numbers numbers,
+    // Package-private (not private) for the same reason LiquidateTransactionBuilder's
+    // assetOutputIndexesForEquities is: M19 (F4, slice-3 round-2 audit) needs to prove the
+    // flatten == 2 boundary is actually ENFORCED, not merely coincidentally true of every fixture's
+    // OUTPUT — see LiquidatePayInAdvanceTransactionBuilderTest, which hand-mutates a real built body
+    // and re-invokes this method directly rather than going through reflection.
+    void assertStructure(Transaction transaction, Request request, Numbers numbers,
                                  long lenderBondOutputIndex, long assetOutputIndex) {
         // The bond echo is where the claim redeemer says, and it is byte-identical to the input.
         structural(lenderBondOutputIndex == locateBondOutput(transaction, request),
@@ -1101,29 +1361,55 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         structural(request.bondUtxo().getInlineDatum().equalsIgnoreCase(echo.getInlineDatum().serializeToHex()),
                 "the bond echo datum is not byte-identical to the bond input datum");
 
-        // The asset-manager filtered list is [borrower compensation, lender converted], and
-        // assetOutputIndexes points at the lender one.
+        // F0 (round 2) — the asset-manager filtered list is [borrower compensation, lender converted]
+        // at EQUITY > 0, and JUST [lender converted] at EQUITY == 0 (assemble() emits no compensation
+        // output at all — loan_claim_action.ak:273's `or { equity == 0, .. }` never reads one).
+        // assetOutputIndexes points at the lender one either way.
+        boolean hasBorrowerCompensation = numbers.equity().signum() > 0;
         List<TransactionOutput> assetOutputs = assetManagerOutputs(transaction);
-        structural(assetOutputs.size() == 2, "expected exactly two asset-manager outputs, got " + assetOutputs.size());
+        int expectedAssetOutputs = hasBorrowerCompensation ? 2 : 1;
+        structural(assetOutputs.size() == expectedAssetOutputs,
+                "expected exactly " + expectedAssetOutputs + " asset-manager output(s), got "
+                        + assetOutputs.size());
         structural(assetOutputIndex == locateLenderConvertedOutput(transaction, request, numbers),
                 "assetOutputIndex " + assetOutputIndex + " no longer points at the lender converted output");
-        structural(assetOutputIndex != 0,
-                "the borrower compensation output must occupy filtered slot 0 (the bare loan index)");
+        if (hasBorrowerCompensation) {
+            structural(assetOutputIndex != 0,
+                    "the borrower compensation output must occupy filtered slot 0 (the bare loan index)");
+        }
 
-        // The lender's paid-in-advance output is ada-only (dosProtection flatten == 1) and covers the amount.
+        // WALL 4 — the lender's paid-in-advance output's shape depends on the principal asset.
+        // Ada: dosProtection demands flatten == 1 and the coin itself is the converted amount.
+        // Token: dosProtection demands flatten == 2 (the token plus its min-ada rider) and the
+        // VALIDATOR-CHECKED quantity is quantity_of(output, principalAsset), never the coin.
         TransactionOutput lenderOutput = assetOutputs.get((int) assetOutputIndex);
-        structural(flattenedCount(lenderOutput) == 1, "the lender converted output must be ada-only (flatten == 1)");
-        structural(lenderOutput.getValue().getCoin()
-                        .compareTo(numbers.convertedLoanCollateralToPrincipalAmount()) >= 0,
-                "the lender converted output holds less ada than convertedLoanCollateralToPrincipalAmount");
+        AssetType principal = request.loan().datum().principalAsset();
+        if (principal.isAda()) {
+            structural(flattenedCount(lenderOutput) == 1,
+                    "the lender converted output must be ada-only (flatten == 1)");
+            structural(lenderOutput.getValue().getCoin()
+                            .compareTo(numbers.convertedLoanCollateralToPrincipalAmount()) >= 0,
+                    "the lender converted output holds less ada than convertedLoanCollateralToPrincipalAmount");
+        } else {
+            structural(flattenedCount(lenderOutput) == 2,
+                    "the lender converted output must be the principal token plus its min-ada rider "
+                            + "(flatten == 2) for a non-ada principal");
+            structural(quantityOf(lenderOutput, principal)
+                            .compareTo(numbers.convertedLoanCollateralToPrincipalAmount()) >= 0,
+                    "the lender converted output holds less " + principal.toUnit()
+                            + " than convertedLoanCollateralToPrincipalAmount");
+        }
 
-        // The borrower compensation output carries at least the equity in collateral tokens, flatten == 2.
-        TransactionOutput borrowerOutput = assetOutputs.get(0);
-        AssetType collateral = request.loan().datum().collateral().assetType();
-        structural(quantityOf(borrowerOutput, collateral).compareTo(numbers.equity()) >= 0,
-                "the borrower compensation output holds less collateral than the equity");
-        structural(flattenedCount(borrowerOutput) == 2,
-                "the borrower compensation output must be a token plus its min-ada rider (flatten == 2)");
+        // The borrower compensation output, WHEN IT EXISTS (equity > 0), carries at least the equity
+        // in collateral tokens, flatten == 2. At equity == 0 (F0) there is no such output to check.
+        if (hasBorrowerCompensation) {
+            TransactionOutput borrowerOutput = assetOutputs.get(0);
+            AssetType collateral = request.loan().datum().collateral().assetType();
+            structural(quantityOf(borrowerOutput, collateral).compareTo(numbers.equity()) >= 0,
+                    "the borrower compensation output holds less collateral than the equity");
+            structural(flattenedCount(borrowerOutput) == 2,
+                    "the borrower compensation output must be a token plus its min-ada rider (flatten == 2)");
+        }
 
         // ⛔ S-15: the change that comes back must be SPENDABLE NEXT CYCLE.
         //

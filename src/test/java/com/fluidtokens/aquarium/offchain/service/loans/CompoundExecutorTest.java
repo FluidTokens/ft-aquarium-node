@@ -38,6 +38,11 @@ class CompoundExecutorTest {
     private static final LoansContractRegistry REGISTRY = LoanFixtures.shippedPreviewRegistry();
     private static final Account ACCOUNT = new Account(LoanFixtures.NETWORK);
     private static final String LOAN_ID = "e833a769ea3a480343175e253eab799ec0b058c99de30cc17160dc37";
+
+    /** Every candidate here is ada-principal, so this never actually reaches the oracle. */
+    private static PricingService pricingService() {
+        return new PricingService(new FluidOracleClient("http://unused.invalid"));
+    }
     private static final String POOL_ID = "00d3513725536642b6fe985ce9ec87d1ebb880497d92e0a8495bc6d0bf";
     private static final BigInteger ESCROW = BigInteger.valueOf(29_109_268L);
 
@@ -126,7 +131,7 @@ class CompoundExecutorTest {
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
         var executor = new CompoundExecutor(configuration, network, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT,
-                new FakeScanner(candidates), new CompoundEconomics(configuration, network),
+                new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
                 builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
         return new Wiring(executor, submitted);
     }
@@ -201,7 +206,7 @@ class CompoundExecutorTest {
         };
         var executor = new CompoundExecutor(configuration, network, blockEventListener,
                 new FakeAppUtxoService(List.of(wallet())), ACCOUNT, scanner,
-                new CompoundEconomics(configuration, network),
+                new CompoundEconomics(configuration, network, pricingService()),
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),

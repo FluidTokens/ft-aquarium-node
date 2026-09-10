@@ -7,6 +7,7 @@ import com.bloxbean.cardano.client.util.HexUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -152,13 +153,15 @@ class MainnetCompoundEscrowTest {
         ReflectionTestUtils.setField(configuration, "enabled", true);
         ReflectionTestUtils.setField(configuration, "profitMarginLovelace", BigInteger.ZERO);
 
-        var assessment = new CompoundEconomics(configuration, network).assess(
+        var pricingService = new PricingService(new FluidOracleClient("http://unused.invalid"));
+        var assessment = new CompoundEconomics(configuration, network, pricingService).assess(
                 true,                                   // the bond names a pool
                 true,                                   // pool and manager are both live
-                true,                                   // ada principal
+                AssetType.ada(),                        // ada principal
                 BigInteger.valueOf(ESCROW_LOVELACE),
                 0L,                                     // compoudingFeePerMille, read from chain
-                BigInteger.valueOf(300_000L));          // a representative tx fee
+                BigInteger.valueOf(300_000L),            // a representative tx fee
+                System.currentTimeMillis());
 
         assertFalse(assessment.approved(),
                 "a zero-fee pool must be refused at the shipped margin: the compound pays nothing and "

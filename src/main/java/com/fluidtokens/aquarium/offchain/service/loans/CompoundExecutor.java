@@ -237,14 +237,19 @@ public class CompoundExecutor {
         }
 
         // ⛔ The gate runs on the BUILT transaction's own fee — measured, not estimated.
-        CompoundAssessment assessment = economics.assess(true, true, candidate.principalIsAda(),
-                candidate.addedLiquidity(), candidate.feePerMille(), transaction.getBody().getFee());
+        // The principal asset is passed honestly (never a boolean smuggling a pricing decision) —
+        // CompoundEconomics prices it via PricingService itself. Every candidate reaching here is
+        // still ada-principal (CompoundCandidateScanner's own gate, see PRINCIPAL_NOT_ADA), so this
+        // is always AssetType.ada() today, but it is spelled out in full for when that gate lifts.
+        CompoundAssessment assessment = economics.assess(true, true,
+                candidate.bond().datum().principalAsset(), candidate.addedLiquidity(),
+                candidate.feePerMille(), transaction.getBody().getFee(), now);
 
         if (!assessment.approved()) {
             log.info("compound NOT APPROVED {} escrow {}: {} — escrow {} at {}/1000 earns {}, tx fee {}, "
                             + "net {} against floor {}{}",
                     candidate.loanId(), candidate.escrowRef(), assessment.exclusion(),
-                    assessment.escrow(), assessment.feePerMille(), assessment.expectedFee(),
+                    assessment.escrow(), assessment.feePerMille(), assessment.expectedFeeLovelace(),
                     assessment.txFee(), assessment.net(), assessment.floor(),
                     assessment.zeroFeePool()
                             ? " (this pool publishes NO compounding fee; a negative floor is the only "
@@ -290,7 +295,7 @@ public class CompoundExecutor {
                 log.info("COMPOUNDED {} escrow {}: {} lovelace into pool {}, fee earned {}, tx fee {}, "
                                 + "net {} — tx {}",
                         candidate.loanId(), candidate.escrowRef(), candidate.addedLiquidity(),
-                        candidate.poolId(), assessment.expectedFee(), assessment.txFee(),
+                        candidate.poolId(), assessment.expectedFeeLovelace(), assessment.txFee(),
                         assessment.net(), result.getValue());
                 return;
             }
