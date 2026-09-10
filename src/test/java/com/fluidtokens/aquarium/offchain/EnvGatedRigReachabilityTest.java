@@ -347,10 +347,9 @@ class EnvGatedRigReachabilityTest {
      * <p>
      * What has to stay narrow is the reverse direction: a list that quietly covers a second rig is
      * how a real defect gets filed under a past decision. So the list and the tree must agree
-     * <b>in both directions</b>: every
-     * listed class carries a park gate, and every class carrying a listed park gate is on the list.
-     * Broadening the list to a class that is not parked fails here; copying a park gate onto another
-     * rig without listing it fails here too.
+     * <b>in both directions</b>: every listed class carries a park gate, and every class carrying a
+     * listed park gate is on the list. Broadening the list to a class that is not parked fails here;
+     * copying a park gate onto another rig without listing it fails here too.
      * <p>
      * And a park gate may never be <em>named</em> like a credential. That is the whole point of the
      * shape: the run summary prints the gate names it finds, so a park called
