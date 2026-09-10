@@ -21,6 +21,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -84,13 +85,47 @@ class EnvGatedRigReachabilityTest {
     /** Anything named like a Blockfrost credential. Deliberately wider than the pinned set above. */
     private static final Pattern BLOCKFROST_CREDENTIAL = Pattern.compile("BLOCKFROST[A-Z0-9_]*KEY");
 
+    /** One rig switched off on purpose: the class, the gate that parks it, and why. */
+    private record ParkedRig(String className, String gate, String reason) {
+    }
+
+    /**
+     * ⛔ <b>The parked rigs — unreachable ON PURPOSE, named one by one.</b>
+     * <p>
+     * The checks in this class answer "can a developer reach this rig by following CLAUDE.md". For a
+     * rig that has been deliberately switched off, the honest answer is <em>no, and that is the
+     * decision</em> — but "unreachable by accident" and "unreachable on purpose" look identical from
+     * the outside, and the first is a defect while the second is a ruling. This list is where the
+     * difference is written down, by name, with its reason attached.
+     * <p>
+     * A park is expressed as a <b>second class-level gate whose name is not a credential</b>, so the
+     * CI run summary reports the rig as waiting on that gate rather than on a key it will never be
+     * handed — see {@link #theParkExemptionCoversExactlyTheClassesThatCarryAParkGate()}, which
+     * refuses a park named like a credential. The park gate is deliberately <b>absent</b> from every
+     * {@code .env.*} file, and {@link
+     * #aParkedRigStaysParkedAndCannotBeUnparkedByEditingAnEnvFile()} keeps it absent: adding it there
+     * would quietly re-arm a rig somebody switched off, which then goes red for a reason that is not
+     * a code fault and invites exactly the "repair" the park exists to prevent.
+     * <p>
+     * Adding an entry here is a decision, not a maintenance step. Removing one is how a rig comes
+     * back.
+     */
+    private static final List<ParkedRig> PARKED_RIGS = List.of(new ParkedRig(
+            "LiquidatePayInAdvanceLiveDryEvalTest",
+            "AQUARIUM_ANTICIPATE_RIG_CANDIDATE",
+            "FAB-86, ruling of 2026-09-10 — parked, not broken: the loan it is pinned to was "
+                    + "liquidated by this bot, so the reference input and the wallet's USDM are gone "
+                    + "and the rig's 3 failures are a stale fixture rather than a code fault. It comes "
+                    + "back only with a live liquidatable loan big enough to exercise wallet sizing, "
+                    + "the balance check and POOL_TOO_THIN — see the class javadoc"));
+
     /**
      * The qualifier is optional on purpose: {@code @EnabledIfEnvironmentVariable} and
      * {@code @org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable} are the same annotation,
      * and both are in this tree. Anchoring {@code @} straight to the simple name made the second form
      * invisible — a gated rig that this class could not see and that CI reported as "waiting on
-     * disabled". Keep {@code *}, not {@code +}: of the 44 annotation usages in this tree, across 23
-     * classes, 43 carry no qualifier and exactly one is fully qualified.
+     * disabled". Keep {@code *}, not {@code +}: of the 45 annotation usages in this tree, across 23
+     * classes, 44 carry no qualifier and exactly one is fully qualified.
      */
     private static final Pattern GATE =
             Pattern.compile("@(?:[A-Za-z_][A-Za-z0-9_]*\\.)*EnabledIfEnvironmentVariable"
@@ -147,6 +182,15 @@ class EnvGatedRigReachabilityTest {
      * ⚠ <b>The A3 check.</b> Sourcing {@code .env.<network>} must be enough to make every rig that
      * talks to that network actually run. A rig whose gate names a variable the file does not define
      * skips, and a skip reads as "not failing".
+     * <p>
+     * <b>Scope:</b> this measures <em>credentials</em> — the things a developer is entitled to have
+     * and the {@code .env.*} files exist to supply. It deliberately says nothing about the
+     * opt-in gates ({@code AQUARIUM_*}, {@code SUBMITTABLE_NETWORK}, {@code BUILD_STAKE_REG} …) that
+     * several rigs also carry: those are switches a human is supposed to throw one run at a time,
+     * and a credential file that pre-threw them would be a bug. A rig held shut by one of those is
+     * therefore invisible here — which is fine when the switch is an opt-in and <em>not</em> fine
+     * when it is a park, because a park is permanent. Parks are named in {@link #PARKED_RIGS} and
+     * checked by the two tests below.
      */
     @Test
     void sourcingTheNetworkEnvFileEnablesEveryRigThatTalksToThatNetwork() {
@@ -187,6 +231,12 @@ class EnvGatedRigReachabilityTest {
      * happens to be in the environment (a preview key, if {@code .env.preview} was sourced) at
      * mainnet, which is the HTTP 403 that reads as a code failure. This pins the separation so the
      * wrong fix cannot grow back quietly.
+     * <p>
+     * ⚠ Read this as a statement about the <b>key</b> only. Since FAB-86,
+     * {@code LiquidatePayInAdvanceLiveDryEvalTest} is also parked (see {@link #PARKED_RIGS}), so
+     * sourcing {@code .env.mainnet} runs {@code ConvertLiveDryEvalTest} and not the other one. The
+     * assertions below stay as they are on purpose: the park must not become an excuse for the
+     * mainnet key separation to rot while the rig is off.
      */
     @Test
     void theMainnetDryEvalRigsGateOnTheMainnetSpecificKey() {
@@ -201,6 +251,84 @@ class EnvGatedRigReachabilityTest {
                             + "per network is what keeps a preview key from being pointed at mainnet");
             assertEquals(Set.of("mainnet"), rig.networks(), className + " must talk to mainnet only");
         }
+    }
+
+    /**
+     * A park is only a park while both halves hold: the gate is still on the class, and no
+     * {@code .env.*} file supplies it.
+     * <p>
+     * The second half is the one with teeth. When {@link
+     * #sourcingTheNetworkEnvFileEnablesEveryRigThatTalksToThatNetwork()} reports a rig as
+     * unreachable, the reflex fix is to add the missing variable to the credential file — that was
+     * the correct fix once and it is the wrong one here, because it re-arms a rig that was switched
+     * off deliberately. The rig then fails on a fixture nobody meant to restore, and the next
+     * reader "repairs" it. Nothing else in this tree would notice, so it is pinned here.
+     */
+    @Test
+    void aParkedRigStaysParkedAndCannotBeUnparkedByEditingAnEnvFile() {
+        for (ParkedRig parked : PARKED_RIGS) {
+            assertTrue(gateNames(read(testSource(parked.className()))).contains(parked.gate()),
+                    parked.className() + " no longer carries its park gate " + parked.gate()
+                            + ". If it was deliberately brought back, delete its PARKED_RIGS entry in "
+                            + "the same commit: an entry left behind is a standing exemption for a rig "
+                            + "nobody is parking any more. Reason on record — " + parked.reason());
+
+            for (String network : List.of("mainnet", "preview")) {
+                Path envFile = repoRoot().resolve(".env." + network);
+                if (!Files.exists(envFile)) {
+                    continue; // CI holds no .env.* files, by design: nothing to cross-check here
+                }
+                assertFalse(effectivelyDefinedNames(envFile).contains(parked.gate()),
+                        ".env." + network + " now defines " + parked.gate() + ", which silently "
+                                + "un-parks " + parked.className() + ": sourcing that file would run a "
+                                + "rig that was switched off on purpose, and it would go red for "
+                                + "something that is not a code fault. Un-park it by deleting the "
+                                + "PARKED_RIGS entry and the gate, deliberately — not by editing a "
+                                + "credential file. Reason on record — " + parked.reason());
+            }
+        }
+    }
+
+    /**
+     * ⚠ <b>The exemption must stay narrow.</b> {@link #PARKED_RIGS} excuses named classes from being
+     * reachable, and an exemption that quietly covers a second rig is how a real defect gets filed
+     * under a past decision. So the list and the tree must agree <b>in both directions</b>: every
+     * listed class carries a park gate, and every class carrying a listed park gate is on the list.
+     * Broadening the list to a class that is not parked fails here; copying a park gate onto another
+     * rig without listing it fails here too.
+     * <p>
+     * And a park gate may never be <em>named</em> like a credential. That is the whole point of the
+     * shape: the run summary prints the gate names it finds, so a park called
+     * {@code BLOCKFROST_SOMETHING_KEY} would be reported as a rig waiting for a key it will never be
+     * handed — indistinguishable from the credential skip this class exists to make visible.
+     */
+    @Test
+    void theParkExemptionCoversExactlyTheClassesThatCarryAParkGate() {
+        Set<String> listed = new TreeSet<>();
+        Set<String> parkGates = new TreeSet<>();
+        for (ParkedRig parked : PARKED_RIGS) {
+            assertTrue(listed.add(parked.className()),
+                    "PARKED_RIGS lists " + parked.className() + " twice: two reasons for one park "
+                            + "means one of them is not being read");
+            assertFalse(BLOCKFROST_CREDENTIAL.matcher(parked.gate()).matches(),
+                    "the park gate " + parked.gate() + " is named like a Blockfrost credential, so "
+                            + "the run summary would report " + parked.className() + " as waiting on "
+                            + "a key rather than as parked — the very confusion the second-gate shape "
+                            + "exists to remove. Name it for what is actually missing.");
+            parkGates.add(parked.gate());
+        }
+
+        Set<String> carrying = new TreeSet<>();
+        for (Path source : testSources()) {
+            if (gateNames(read(source)).stream().anyMatch(parkGates::contains)) {
+                carrying.add(source.getFileName().toString().replace(".java", ""));
+            }
+        }
+
+        assertEquals(listed, carrying,
+                "PARKED_RIGS and the test tree disagree about which rigs are parked. A listed class "
+                        + "that carries no park gate is an exemption covering a rig nobody switched "
+                        + "off; an unlisted class carrying one is a park with no reason written down.");
     }
 
     /**

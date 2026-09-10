@@ -90,8 +90,46 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * It proves the scripts pass — phase 2, the failure that forfeits collateral — for the token-principal
  * shape, for real, against both real oracles. It says nothing about the ledger's phase 1 (fees,
  * min-ada, witness sets, collateral adequacy — CCL trap 11).
+ *
+ * <h2>⛔ PARKED — FAB-86, ruling of 2026-09-10. The failures are the FIXTURE'S ABSENCE.</h2>
+ * <ol>
+ *   <li>The candidate pinned below, loan {@code 279499ff77d9c8efacda5940a06659f091e1aaa15ce929f779d8d3fd},
+ *       <b>was liquidated by this very bot</b> as {@code fa16e8eb0376…} in block 13,921,999. The loan
+ *       reference input {@code 0d080eb2…#1} is no longer in the live UTxO set, and {@link #BOT_WALLET}
+ *       no longer carries the USDM because the bot spent it in that same liquidation.</li>
+ *   <li>So with {@code BLOCKFROST_MAINNET_KEY} set this class was 3 tests / 3 failures — a <b>stale
+ *       fixture, not a code fault</b>. Mainnet is healthy and the bot is live and armed. <b>Do not
+ *       "repair" these failures</b>: there is nothing here to fix, and re-pinning to whatever loan
+ *       happens to be liquidatable today is the wrong reflex (see below).</li>
+ *   <li>Re-enabling it takes a live liquidatable loan <em>of a scale that actually exercises</em>
+ *       wallet sizing, the balance check and {@code POOL_TOO_THIN}. The only other USDM loan on chain
+ *       today is <b>10 USDM at 71% LTV</b> and exercises none of the three — a green rig that proves
+ *       nothing is worse than a disabled one. The durable answer is the offline synthetic-oracle rig,
+ *       which is FAB-86's own future work and deliberately not this change.</li>
+ * </ol>
+ * The coordinates below are left pinned to the dead loan on purpose: they are the record of what was
+ * last proven on mainnet, so re-enabling means replacing them consciously rather than inheriting them.
+ *
+ * <h3>Why a second gate rather than {@code @Disabled}</h3>
+ * The CI run summary lists, for every class that did not run, the environment variables it was waiting
+ * for. Under {@code @Disabled} this class would still scan as <em>"waiting on BLOCKFROST_MAINNET_KEY"</em>
+ * — a deliberate park reported as a rig waiting for a credential, which is exactly the
+ * skip-that-reads-as-a-pass this repo has already been bitten by. A second gate named
+ * {@code AQUARIUM_ANTICIPATE_RIG_CANDIDATE} makes the summary line read
+ * <em>"waiting on AQUARIUM_ANTICIPATE_RIG_CANDIDATE, BLOCKFROST_MAINNET_KEY"</em>: self-describing, and
+ * credential-independent by construction. The variable is deliberately <b>not</b> defined in
+ * {@code .env.mainnet} — defining it would re-enable the rig and undo the ruling — which is why
+ * {@code EnvGatedRigReachabilityTest} carries a narrow, named exemption for this one class.
  */
 @EnabledIfEnvironmentVariable(named = "BLOCKFROST_MAINNET_KEY", matches = ".+")
+@EnabledIfEnvironmentVariable(named = "AQUARIUM_ANTICIPATE_RIG_CANDIDATE", matches = ".+",
+        disabledReason = "FAB-86, parked 2026-09-10: the pinned candidate 279499ff was liquidated by "
+                + "this bot as fa16e8eb in block 13,921,999, so the loan reference input and the "
+                + "wallet's USDM are both gone. The 3 failures are a STALE FIXTURE, not a code fault "
+                + "— do not repair them. Re-enable only with a live liquidatable loan large enough to "
+                + "exercise wallet sizing, the balance check and POOL_TOO_THIN; the only other USDM "
+                + "loan today (10 USDM at 71% LTV) exercises none of them, and a green rig that "
+                + "proves nothing is worse than a disabled one.")
 class LiquidatePayInAdvanceLiveDryEvalTest {
 
     private static final String URL = "https://cardano-mainnet.blockfrost.io/api/v0/";
