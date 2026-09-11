@@ -139,7 +139,7 @@ jobs:
       # src/test/java. Raise the floor deliberately when classes are added; a drop is a deletion to
       # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
       #
-      # Floor measured 2026-09-10 on THIS tree, keyless (the shape CI runs in): 139 files.
+      # Floor measured 2026-09-11 on THIS tree, keyless (the shape CI runs in): 140 files.
       #
       # (config/BuildProvenanceTest carries 11 tests: 9 at round 1, plus two the rework added -- one
       # asserting the startup wiring actually installs the banner's default properties, one asserting
