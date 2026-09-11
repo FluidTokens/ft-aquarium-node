@@ -88,8 +88,9 @@ class ConvertLiveDryEvalTest {
     private static final AssetType FLDT =
             new AssetType("577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e", "0014df10464c4454");
 
-    /** The main config NFT, minted here and never spent. */
-    private static final String CONFIG_TX = "7b9f20dbadaebe1400915e4a63444a9eb7515c21c1114d4bc9c77f1455148cb0";
+    /** Current Config NFT holder; its original mint and every superseded pin remain documented below. */
+    private static final String CONFIG_TX = "ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b";
+    private static final int CONFIG_IX = 0;
 
     /**
      * ⛔ <b>The LM config is NOT at {@code CONFIG_TX#1} any more, and reading it there is silent.</b>
@@ -112,8 +113,10 @@ class ConvertLiveDryEvalTest {
      * the symptom was a refusal at {@code lender_manager.withdraw} — which resolves the action hash
      * from THIS datum — rather than anywhere near the convert action itself.
      */
+    // Repointed again 2026-09-11: the current datum publishes the new compound action while keeping
+    // the convert action unchanged. The live-set assertion below is what prevents this pin rotting.
     private static final String LM_CONFIG_TX =
-            "78d4a273b15382a671bb04fe647a9b621665427f1405e3903817beecfde35bfa";
+            "1c4a91283f9fc2bffe13c0b10584b1d1492f770e910bd858da8586c395a8bdaa";
     private static final int LM_CONFIG_IX = 0;
 
     // ---- mainnet deployment coordinates -----------------------------------------------------------
@@ -122,6 +125,7 @@ class ConvertLiveDryEvalTest {
     private static final String LM_CONFIG_POLICY = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
     private static final String ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
+    private static final String BLUEPRINT_RESOURCE = "loans-v4-mainnet.plutus.json";
 
     private static final String MS_POOL_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
     private static final String MS_POOL_SPEND = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
@@ -217,7 +221,8 @@ class ConvertLiveDryEvalTest {
     }
 
     private static LoansContractRegistry registry() {
-        return new LoansContractRegistry(CONFIG_POLICY, LM_CONFIG_POLICY, ASSET_NAME, SMART_TOKENS,
+        return new LoansContractRegistry(BLUEPRINT_RESOURCE,
+                CONFIG_POLICY, LM_CONFIG_POLICY, ASSET_NAME, SMART_TOKENS,
                 MS_POOL_POLICY, MS_POOL_SPEND, MS_ORDER_SPEND);
     }
 
@@ -275,7 +280,7 @@ class ConvertLiveDryEvalTest {
 
         Utxo loanUtxo = output(backend, LOAN_TX, LOAN_IX);
         Utxo bondUtxo = output(backend, LOAN_TX, BOND_IX);
-        Utxo configUtxo = output(backend, CONFIG_TX, 0);
+        Utxo configUtxo = output(backend, CONFIG_TX, CONFIG_IX);
         Utxo lmConfigUtxo = output(backend, LM_CONFIG_TX, LM_CONFIG_IX);
         repointConfigDatum(configUtxo);
         repointConfigDatum(lmConfigUtxo);
@@ -469,20 +474,43 @@ class ConvertLiveDryEvalTest {
     @Test
     void thePinnedLmConfigIsStillTheLiveOne() throws Exception {
         BFBackendService backend = backend();
+        Utxo config = output(backend, CONFIG_TX, CONFIG_IX);
         Utxo lmConfig = output(backend, LM_CONFIG_TX, LM_CONFIG_IX);
 
-        String nft = LM_CONFIG_POLICY + ASSET_NAME;
-        assertTrue(lmConfig.getAmount().stream().anyMatch(a -> nft.equals(a.getUnit())),
-                "the pinned LM config UTxO no longer carries the LM config NFT " + nft
-                        + " — FluidTokens have respent it, and this rig is reading a superseded datum "
-                        + "exactly as it did before (CCL trap 12: reading a spent output never fails)");
+        assertCurrentConfigNft(backend, config, CONFIG_POLICY, "Config");
+        assertCurrentConfigNft(backend, lmConfig, LM_CONFIG_POLICY, "LM config");
 
-        String derived = registry().getLmLiquidateAndConvertActionScriptHash();
+        LoansContractRegistry registry = registry();
+        String derived = registry.getLmLiquidateAndConvertActionScriptHash();
+        assertNotNull(config.getInlineDatum(), "the Config UTxO carries no inline datum");
+        assertTrue(config.getInlineDatum().contains(registry.getPoolSellLenderPositionActionScriptHash()),
+                "the current Config datum does not name the pool-sell action selected by the mainnet artifact");
         assertNotNull(lmConfig.getInlineDatum(), "the LM config UTxO carries no inline datum");
+        assertTrue(lmConfig.getInlineDatum().contains(registry.getLmCompoundActionScriptHash()),
+                "the current LM config datum does not name the compound action selected by the mainnet artifact");
         assertTrue(lmConfig.getInlineDatum().contains(derived),
                 "the live LM config names a different convert action than this node derives. Either "
                         + "the vendored blueprint or the pinned LM config is stale — derived "
                         + derived + ", and the datum does not contain it");
+    }
+
+    private static void assertCurrentConfigNft(BFBackendService backend, Utxo pinned,
+                                               String policy, String label) throws Exception {
+        String nft = policy + ASSET_NAME;
+        BigInteger quantity = pinned.getAmount().stream()
+                .filter(a -> nft.equals(a.getUnit())).map(Amount::getQuantity)
+                .reduce(BigInteger.ZERO, BigInteger::add);
+        assertEquals(BigInteger.ONE, quantity, label + " output must carry exactly one NFT " + nft);
+
+        String address = AddressProvider.getEntAddress(
+                Credential.fromScript(HexUtil.decodeHexString(policy)), Networks.mainnet()).getAddress();
+        Result<List<Utxo>> current = backend.getUtxoService().getUtxos(address, nft, 100, 1);
+        assertTrue(current.isSuccessful(), "could not query current " + label + " NFT UTxOs: "
+                + current.getResponse());
+        assertTrue(current.getValue().stream().anyMatch(u -> pinned.getTxHash().equals(u.getTxHash())
+                        && pinned.getOutputIndex() == u.getOutputIndex()),
+                "the pinned " + label + " output " + pinned.getTxHash() + "#" + pinned.getOutputIndex()
+                        + " is not current — getTxOutput also returns spent history (CCL trap 12)");
     }
 
     @Test

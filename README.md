@@ -181,6 +181,17 @@ if means your node is up to tip and is processing 1 block at the time (i.e. the 
 
 **The node ships with the liquidation bot OFF.** Everything else is tuning; these are the dials that decide whether it does anything at all.
 
+The September 2026 mainnet parameter update bundles separate Lending v4 blueprints per profile:
+mainnet selects `loans-v4-mainnet.plutus.json`, while preview keeps `loans-v4.plutus.json`. Before
+upgrading, review any deployment overrides for `LOANS_BLUEPRINT_RESOURCE`,
+`LOANS_CONFIG_REF_UTXO_TX_HASH`, and `AQUARIUM_COMPOUND_REFERENCE_SCRIPTS`; stale overrides take
+precedence over the verified defaults in the image. The current mainnet Config reference is
+`ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b#0`, and the compound set
+includes `8d92115bb26dece0f197b110b0cf2c9bfa5f542cb1fd4dc53e595f1a1b73341a#0` in place of the
+superseded compound reference. This update does not require resetting the sync cursor. Deploying or
+starting the new image and arming liquidation or compound remain separate, deliberate operator
+actions.
+
 | env var | ships | to arm |
 |---|---|---|
 | `SCHEDULING_TRANSACTION_PROCESSOR_ENABLED` | `false` | `"true"` — the Aquarium scheduled-transaction processor |

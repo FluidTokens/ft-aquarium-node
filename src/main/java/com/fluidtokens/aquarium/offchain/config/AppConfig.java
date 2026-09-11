@@ -57,9 +57,9 @@ public class AppConfig {
          * where a transaction goes, so there is no second value to keep in step with it and no way
          * for the two to disagree. Arming is coherent: target a network, arm the bot, it acts there.
          *
-         * <p>⚠ <b>What still stops a submission</b>, and it is the whole list: {@code loans.enabled},
-         * {@code loans.liquidation.mode == live}, the per-market
-         * effective mode, and the profitability floors. On the compound path it is
+         * <p>⚠ <b>What still stops a submission</b>, and it is the whole list:
+         * {@code loans.liquidation.mode == live}, the per-market effective mode, and the
+         * profitability floors. On the compound path it is
          * {@code loans.compound.enabled} and its floor — see {@code CompoundExecutor#submit}, which
          * records that this leaves compound with one boolean where liquidation has three.
          */
@@ -123,6 +123,13 @@ public class AppConfig {
     @Component
     @Getter
     public static class LoansConfiguration {
+
+        /**
+         * Bundled Lending v4 blueprint selected by the active profile. This is a classpath resource,
+         * not a filesystem path; the Java default preserves legacy and historical construction.
+         */
+        @Value("${loans.blueprint-resource:loans-v4.plutus.json}")
+        private String blueprintResource = "loans-v4.plutus.json";
 
         /**
          * ⛔ <b>{@code loans.enabled} IS GONE (2026-09-04). Lending v4 indexing is UNCONDITIONAL.</b>
@@ -242,7 +249,11 @@ public class AppConfig {
         @Value("${loans.minswap.pool-address:}")
         private String minswapPoolAddress = "";
 
-        /** The tx that minted both config NFTs; the point history has to be indexed from. */
+        /**
+         * Transaction containing the current main Config NFT output. Runtime discovery uses the
+         * policy id and asset name above; this coordinate is retained for operator provenance and
+         * verification, and does not change the indexer's sync starting point.
+         */
         @Value("${loans.config.ref-utxo-tx-hash:}")
         private String configRefUtxoTxHash = "";
 
@@ -251,15 +262,11 @@ public class AppConfig {
 
     /**
      * The auto-liquidation bot's own knobs. Split out of {@link LoansConfiguration} because they
-     * govern <em>acting</em> on lending data rather than reading it: {@code loans.enabled} decides
-     * whether v4 is indexed at all, these decide what the bot does with what it sees.
+     * govern <em>acting</em> on lending data rather than reading it: deployment coordinates decide
+     * whether v4 is indexed at all, while these decide what the bot does with what it sees.
      * <p>
-     * <b>Conditional on {@code loans.enabled}</b>, unlike its sibling configuration classes, and for
-     * a reason that only applies to this one: {@link #parseMode()} <em>aborts startup</em> on an
-     * unrecognised mode. On a mainnet node lending is off and every bean that reads these values is
-     * absent, so binding them there would let a typo in {@code AQUARIUM_LIQUIDATION_MODE} refuse to
-     * start production software over a knob that governs nothing on it. Where the fail-fast is
-     * useful — a node that actually runs the bot — the condition is satisfied and it still fires.
+     * This configuration is present on every node. {@link #parseMode()} deliberately aborts startup
+     * on an unrecognised mode: a malformed arming control must never be treated as a quiet default.
      */
     /**
      * ⛔ <b>The ONLY {@code @ConfigurationProperties} bean over {@code loans.liquidation}, and it
@@ -568,8 +575,8 @@ public class AppConfig {
          * {@code ANTICIPATE} market, a unit that is neither {@code lovelace} nor a well-formed hex unit,
          * a duplicate — and the same fail-fast that {@link #parseMode()} applies is the honest response.
          *
-         * <p>Gated behind {@code loans.enabled} with the rest of this class, so a typo can never refuse
-         * to start a production node that does not run the bot.
+         * <p>The configuration is always bound, so malformed market intent fails visibly even while
+         * the shipped mode remains disabled.
          */
         public void validateMarkets() {
             Set<String> seen = new LinkedHashSet<>();

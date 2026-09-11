@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -41,6 +42,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ShippedDefaultsTest {
 
     private static final String RESOURCE = "application.yaml";
+    private static final String MAINNET_CONFIG_TX =
+            "ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b";
+    private static final String OLD_COMPOUND_REFERENCE =
+            "954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0";
+    private static final String NEW_COMPOUND_REFERENCE =
+            "8d92115bb26dece0f197b110b0cf2c9bfa5f542cb1fd4dc53e595f1a1b73341a#0";
 
     /** The base document and the {@code preview}-profile document, in file order. */
     private static List<Map<String, Object>> documents() throws IOException {
@@ -109,10 +116,53 @@ class ShippedDefaultsTest {
 
     // ======================================================================================
 
+    @Test
+    void theBaseDocumentShipsTheCurrentMainnetDeployment() throws IOException {
+        Map<String, Object> mainnet = base(documents());
+
+        assertEquals("${LOANS_CONFIG_REF_UTXO_TX_HASH:" + MAINNET_CONFIG_TX + "}",
+                at(mainnet, "loans.config.ref-utxo-tx-hash"),
+                "the shipped mainnet config transaction is stale");
+        assertEquals("${LOANS_CONFIG_POLICY_ID:db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416}",
+                at(mainnet, "loans.config.policy-id"));
+        assertEquals("${LOANS_LM_CONFIG_POLICY_ID:a56b0ac2654663f395601601a7825649e5488905648747e912d870e4}",
+                at(mainnet, "loans.lm-config.policy-id"));
+        assertEquals("${LOANS_CONFIG_ASSET_NAME:706172616d6574657273}",
+                at(mainnet, "loans.config.asset-name"));
+    }
+
+    @Test
+    void theBaseDocumentShipsExactlyTheCurrentCompoundReferences() throws IOException {
+        String configured = (String) at(base(documents()), "loans.compound.reference-scripts");
+        String value = configured.substring(configured.indexOf(':') + 1, configured.length() - 1);
+        List<String> references = List.of(value.split(","));
+
+        assertEquals(11, references.size(), "mainnet must ship exactly eleven compound references");
+        assertEquals(11, new LinkedHashSet<>(references).size(),
+                "mainnet compound references must be unique");
+        assertTrue(references.contains(NEW_COMPOUND_REFERENCE),
+                "the current lm_compound reference is absent");
+        assertTrue(!references.contains(OLD_COMPOUND_REFERENCE),
+                "the superseded lm_compound reference is still shipped");
+    }
+
+    @Test
+    void thePreviewDocumentPreservesItsDeploymentAndBlankCompoundReferences() throws IOException {
+        Map<String, Object> preview = preview(documents());
+
+        assertEquals("8dd38e97b79cc7c8a3c59400944b7cd9f724876a1d49ea17ffb5e49b3785091c",
+                at(preview, "loans.config.ref-utxo-tx-hash"));
+        assertEquals("d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e",
+                at(preview, "loans.config.policy-id"));
+        assertEquals("a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13",
+                at(preview, "loans.lm-config.policy-id"));
+        assertEquals("${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}",
+                at(preview, "loans.compound.reference-scripts"));
+    }
+
     /**
-     * The base document ships the bot switched off entirely. This is what a mainnet operator runs,
-     * where {@code loans.enabled} is false as well — but the mode is the value that would decide if
-     * lending were ever switched on there.
+     * The base document ships the liquidation bot switched off. Indexing remains unconditional once
+     * deployment coordinates are present; the mode is the operator's separate arming decision.
      */
     @Test
     void theBaseDocumentShipsTheModeDisabled() throws IOException {
@@ -150,8 +200,7 @@ class ShippedDefaultsTest {
 
     /**
      * Preview is where the bot runs, and it runs in shadow: it builds, prices and records, and the
-     * mode veto stops every candidate before the wire. {@code live} here would arm every preview node
-     * that also set the enabled flag.
+     * mode veto stops every candidate before the wire. {@code live} here would arm the preview node.
      */
     @Test
     void thePreviewProfileShipsTheModeShadow() throws IOException {
