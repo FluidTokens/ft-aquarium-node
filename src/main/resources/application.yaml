@@ -155,8 +155,8 @@ loans:
   # ⚠ CONFIGURED IS NOT ARMED. The liquidation mode is `disabled`, compound is disabled, and the
   # scheduled-transaction processor is disabled. These values derive and read mainnet only.
   #
-  # The preview profile overrides the deployment coordinates and artifact, so this block is inert
-  # on every preview deployment.
+  # The preview profile overrides the deployment coordinates, while the image keeps the single
+  # latest artifact; it remains incompatible with the captured old preview deployment until Fluid migrates it.
   config:
     # Current Config NFT output. Runtime discovery uses policy id + asset name; this transaction is
     # provenance and operator configuration, not a mint point or a sync-start instruction.
