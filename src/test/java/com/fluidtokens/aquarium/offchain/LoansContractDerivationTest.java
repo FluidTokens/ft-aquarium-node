@@ -12,18 +12,20 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * Proves that {@link LoansContractRegistry} — the code the node actually runs — derives
- * the ft-cardano-loans-v4 script hashes that are really deployed on preview, starting from
- * nothing but the two config NFT policy ids.
+ * the ft-cardano-loans-v4 script hashes from the single latest blueprint, starting from nothing
+ * but the two config NFT policy ids.
  * <p>
  * Ground truth is tx {@code 8dd38e97…091c} on preview — the FOURTH deployment: output 0 holds the
  * main config NFT ({@code ConfigDatum}), output 1 holds the LenderManager config NFT
- * ({@code LMConfigDatum}). Every constant below was read off those two datums, transcribed from
- * the inline datum bytes the chain carries rather than produced by the derivation it checks. See
- * docs/lending-v4-findings.md.
+ * ({@code LMConfigDatum}). Most deployment expectations below were transcribed from those inline
+ * datum bytes rather than produced by the derivation they check. The two latest action values and
+ * the two derived-only LenderManager validator hashes are labelled separately. See
+ * {@code docs/lending-v4-findings.md}.
  * <p>
- * If this test is green, the bundled blueprint matches the deployed contracts and no v4
- * address is ever hardcoded. If it goes red, either our clone is the wrong commit or the
- * contracts were redeployed — nothing built on top of it can be trusted until it is fixed.
+ * The fourth-deployment preview datum remains historical ground truth, but the latest blueprint
+ * intentionally differs at pool-sell and LM-compound pending Fluid's preview migration. Those two
+ * expected latest hashes are labelled separately below; verifier tests pin the exact old-state
+ * mismatch. No v4 address is hardcoded by production code.
  */
 class LoansContractDerivationTest {
 
@@ -43,8 +45,8 @@ class LoansContractDerivationTest {
     // ---- Ground truth: ConfigDatum, output 0 of 8dd38e97…091c (FOURTH deployment) ----------
     //
     // ⛔ Moved from the THIRD deployment (7374a985…e781) on 2026-09-04, with LoanFixtures.
-    // These are what the LIVE datum publishes; the vendored blueprint derives exactly them,
-    // which is the pairing ShippedRegistryMatchesPinnedConfigTest asserts independently.
+    // These are what the LIVE datum publishes. The vendored latest blueprint still derives all
+    // except the explicitly labelled pool-sell value below.
 
     private static final String POOL_POLICY_ID = "a33aee4034165f1772e57af5fb975f26c35f7e9080b7e44b4634f227";
     private static final String REQUEST_POLICY_ID = "39bef32eb5f696f6d0b1cc0446903311f04fe008797c0e349a672acb";
@@ -59,7 +61,8 @@ class LoansContractDerivationTest {
     private static final String ASSET_MANAGER_SPEND = "de8f81868054fe87019230b9c33e1d18d668689ee201f3f57fbfa69c";
     private static final String POOL_CANCEL_ACTION = "a4f2d030b2348582335038135cb7b59bbe7145d44d2dab9a409dde50";
     private static final String POOL_BORROW_ACTION = "344755c30db0617ff43cb41e5212379b729985352a213371b15c90cd";
-    private static final String POOL_SELL_LENDER_POSITION_ACTION = "db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56";
+    /** Latest blueprint value; captured fourth-deployment preview publishes db9a5bf0…d9c56. */
+    private static final String POOL_SELL_LENDER_POSITION_ACTION = "cdfa58c27aee3458983247dcde6419e6e8ca13b30e5ba34f95feccb0";
     private static final String POOL_COMPOUND_ACTION = "33128ca352b5472f593104d5884ced5cba5e980b3177353eb2116c62";
     private static final String POOL_MANAGER_SPEND = "b4ad9a6f2710d68067177e0de5a4378ebe4fcdfdc929c7488479c313";
     private static final String POOL_MANAGER_POLICY_ID = "45ce890c9bcf70f6eed629b5db7c0622e44ca1003e001a2cf951518f";
@@ -88,17 +91,17 @@ class LoansContractDerivationTest {
 
     private static final String LM_WITHDRAW_BONDS_ACTION = "42c4a0d6f33f21ccc694c6620d6485331df6528da8b8d16acf1589fe";
     private static final String LM_LIQUIDATE_ACTION = "e0a13838d176cea9de466afe2075f38f682603013604021a3959700f";
-    private static final String LM_COMPOUND_ACTION = "dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457";
+    /** Latest blueprint value; captured fourth-deployment preview publishes dd47090…00457. */
+    private static final String LM_COMPOUND_ACTION = "7dbcad0e76f5c639c96dd7ffc52f730d1ac0290c46c04fe343edc49b";
     private static final String LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION = "00b8a30bd2f18962e527d7c03712e86077a688bfce7e2934ef70034d";
     private static final String LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION = "70b149e7c84a4cf47fb273d87ed2fe97562f0148bfce0b4681afa480";
     /** Unchanged across the third redeploy: the parameterless stub takes no config policy id. */
     private static final String LM_LIQUIDATE_CONVERT_AND_COMPOUND_ACTION = "435b42cc200719c3868dfe01689ee07e2eeff5f5809f25408cbe4e7d";
 
-    // ---- Not published anywhere on chain -------------------------------------------------
+    // ---- Derived values not directly published ---------------------------------------------
     //
-    // Neither config datum carries the LenderManager hashes, so they can only be derived. These are
-    // therefore the only two constants in this file NOT transcribed from a live datum — every other
-    // one is. lm_withdraw_bonds_action is parameterised by the spend hash, so the
+    // Neither config datum carries the two LenderManager validator hashes below, so they can only be
+    // derived. lm_withdraw_bonds_action is parameterised by the spend hash, so the
     // LM_WITHDRAW_BONDS_ACTION assertion below (whose expected value IS on chain) is an indirect
     // on-chain proof of both: it could not match the live LMConfigDatum if the derived spend hash
     // that went into it were wrong. Pinned here so an accidental change to the derivation is caught
@@ -115,7 +118,7 @@ class LoansContractDerivationTest {
     // ---- The proof ----------------------------------------------------------------------
 
     @Test
-    void registryDerivesTheDeployedPreviewHashes() {
+    void registryDerivesLatestBlueprintHashesWithTheDocumentedPreviewDelta() {
         LoansContractRegistry r = registry(SMART_TOKENS_SPEND);
         r.derivedHashes().forEach((k, v) -> System.out.printf("%-52s %s%n", k, v));
 

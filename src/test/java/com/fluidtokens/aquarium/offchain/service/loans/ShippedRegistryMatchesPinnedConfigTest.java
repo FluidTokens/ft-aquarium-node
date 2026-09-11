@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * ⛔ <b>The hashes we DERIVE must equal the hashes the config PUBLISHES — offline, every build.</b>
+ * <b>The old preview deployment is captured honestly after the single-blueprint amendment.</b>
  *
  * <h2>Why this exists</h2>
  * On 2026-09-01 this repo published a finding (§19.3) that the vendored blueprint had gone stale,
@@ -34,11 +34,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code ./gradlew test}.
  *
  * <h2>What green means, and what it does not</h2>
- * Green means <em>the code derives what this snapshot publishes</em>. It does <b>not</b> mean the
- * snapshot is current: the admin key can spend those config UTxOs and replace the datums in place at
- * the same policy ids, and nothing here would notice. <b>{@code LoansConfigVerifierLiveTest} is the
- * only thing that answers that question</b> — when it fails, re-capture the fixtures (see
- * {@code fourth-deployment-config-datum.PROVENANCE.md}), never the reverse.
+ * Green means the captured fourth preview deployment remains byte-honest and differs from the
+ * latest shipped artifact at exactly the two fields FluidTokens has not migrated. It does not mean
+ * preview is compatible: production startup verification must report this mismatch and refuse the
+ * stale pairing. The live test answers whether the captured datums themselves moved.
  */
 class ShippedRegistryMatchesPinnedConfigTest {
 
@@ -46,6 +45,11 @@ class ShippedRegistryMatchesPinnedConfigTest {
     private static final String LM_CONFIG = "/loans-v4/fourth-deployment-lm-config-datum.hex";
     /** The THIRD deployment — deliberately kept, and the thing §19.3 confused for a baseline. */
     private static final String THIRD_DEPLOYMENT = "/loans-v4/preview-config-datum.hex";
+    private static final List<String> OLD_PREVIEW_MISMATCHES = List.of(
+            "ConfigDatum[24]: derived cdfa58c27aee3458983247dcde6419e6e8ca13b30e5ba34f95feccb0, "
+                    + "chain db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56",
+            "LMConfigDatum[3]: derived 7dbcad0e76f5c639c96dd7ffc52f730d1ac0290c46c04fe343edc49b, "
+                    + "chain dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457");
 
     private static String fixture(String path) throws IOException {
         try (InputStream is = ShippedRegistryMatchesPinnedConfigTest.class.getResourceAsStream(path)) {
@@ -64,19 +68,15 @@ class ShippedRegistryMatchesPinnedConfigTest {
     }
 
     /**
-     * ⛔ THE ASSERTION THAT WOULD HAVE STOPPED §19.3. The registry built from what the image ships
-     * derives every credential the live config publishes.
+     * The exact accepted mismatch between the one latest artifact and preview's old deployment.
      */
     @Test
-    void theShippedRegistryDerivesEveryCredentialThePinnedConfigPublishes() throws IOException {
+    void theLatestArtifactDiffersFromOldPreviewAtExactlyTheTwoMigratedFields() throws IOException {
         List<String> mismatches = verifierFor(LoanFixtures.shippedPreviewRegistry())
                 .verifyAgainst(fixture(CONFIG), fixture(LM_CONFIG));
 
-        assertTrue(mismatches.isEmpty(),
-                "the SHIPPED registry disagrees with the pinned live config. Before concluding the "
-                        + "blueprint is stale, read findings §21: check WHICH registry is being "
-                        + "compared, then run LoansConfigVerifierLiveTest to see whether the config "
-                        + "itself moved. Mismatches: " + mismatches);
+        assertEquals(OLD_PREVIEW_MISMATCHES, mismatches,
+                "the old-preview mismatch changed; do not update captured bytes to make this green");
     }
 
     /**
@@ -129,8 +129,13 @@ class ShippedRegistryMatchesPinnedConfigTest {
         List<String> mismatches = verifierFor(LoanFixtures.shippedPreviewRegistry())
                 .verifyAgainst(mutated, fixture(LM_CONFIG));
 
-        assertEquals(1, mismatches.size(), "exactly one field was corrupted: " + mismatches);
-        assertTrue(mismatches.get(0).contains(real),
+        assertEquals(3, mismatches.size(),
+                "the corruption must add exactly one mismatch to the two accepted old-preview mismatches: "
+                        + mismatches);
+        assertTrue(mismatches.getFirst().contains("ConfigDatum[10]")
+                        && mismatches.getFirst().contains(real),
                 "the mismatch must name the value the registry expected: " + mismatches.get(0));
+        assertEquals(OLD_PREVIEW_MISMATCHES, mismatches.subList(1, mismatches.size()),
+                "the independent old-preview controls moved while testing the corruption");
     }
 }

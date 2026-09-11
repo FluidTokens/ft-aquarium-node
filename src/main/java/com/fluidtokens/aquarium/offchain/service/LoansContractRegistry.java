@@ -15,7 +15,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import lombok.AccessLevel;
 import lombok.Getter;
-import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
@@ -34,14 +33,14 @@ import java.util.stream.Stream;
 /**
  * Derives the FluidTokens Lending v4 script hashes at startup from the two one-shot
  * config NFT policy ids, by applying parameters to the <em>unapplied</em>
- * {@code ft-cardano-loans-v4} blueprint ({@code loans-v4.plutus.json}).
+ * bundled {@code ft-cardano-loans-v4} blueprint.
  * <p>
  * Same approach as {@link ContractRegistry}: the committed {@code compiledCode} is
  * parameterised, never recompiled, so the aiken compiler version is irrelevant.
  * <p>
- * {@code LoansContractDerivationTest} asserts every value produced here against the
- * hashes published in the live preview config datums. If that test is green, no v4
- * address is ever hardcoded.
+ * Every constructor loads the single latest artifact shipped at {@code loans-v4.plutus.json}.
+ * Network deployments still have independent config datums, and startup verification rejects
+ * any derived-versus-published mismatch. No v4 address is hardcoded.
  *
  * <h2>Three rules that are easy to get wrong</h2>
  * <ol>
@@ -61,7 +60,6 @@ import java.util.stream.Stream;
 public class LoansContractRegistry {
 
     private static final String BLUEPRINT_RESOURCE = "loans-v4.plutus.json";
-
     private final String configPolicyId;
     private final String lmConfigPolicyId;
     private final String configAssetName;
@@ -169,7 +167,6 @@ public class LoansContractRegistry {
                 null, null, null);
     }
 
-    @SneakyThrows
     public LoansContractRegistry(String configPolicyId, String lmConfigPolicyId,
                                  String configAssetName, String smartTokensSpendScriptHash,
                                  String minswapPoolPolicyId, String minswapPoolSpendScriptHash,
@@ -704,14 +701,24 @@ public class LoansContractRegistry {
         return trimmed;
     }
 
-    private static Map<String, String> loadUnappliedCompiledCodes() throws Exception {
+    private static Map<String, String> loadUnappliedCompiledCodes() {
         Map<String, String> m = new HashMap<>();
         try (InputStream is = new ClassPathResource(BLUEPRINT_RESOURCE).getInputStream()) {
             JsonNode root = new ObjectMapper().readTree(is);
-            for (JsonNode v : root.get("validators")) {
+            JsonNode validators = root.get("validators");
+            if (validators == null || !validators.isArray()) {
+                throw new IllegalStateException("loans blueprint classpath resource '" + BLUEPRINT_RESOURCE
+                        + "' has no validators array");
+            }
+            for (JsonNode v : validators) {
                 // All handlers of a validator share one compiled code / hash; first wins.
                 m.putIfAbsent(v.get("title").asText().replaceAll("\\.[^.]+$", ""), v.get("compiledCode").asText());
             }
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot read loans blueprint classpath resource '"
+                    + BLUEPRINT_RESOURCE + "'", e);
         }
         return m;
     }

@@ -15,8 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Exercises {@link LoansConfigVerifier}'s comparison against the two config datums as they
- * were actually recorded from preview tx {@code 7374a985…e781} — the THIRD deployment (fixtures
- * under {@code src/test/resources/loans-v4}, re-recorded from that transaction's inline datums).
+ * were actually recorded from preview tx {@code 8dd38e97…091c} — the FOURTH deployment (fixtures
+ * under {@code src/test/resources/loans-v4}, copied from that transaction's inline datums).
  * <p>
  * The fragile part of the verifier is the set of hardcoded datum field indices — if one is
  * wrong, the verifier compares the wrong field and either passes vacuously or blocks startup
@@ -28,6 +28,12 @@ class LoansConfigVerifierTest {
     private static final String LM_CONFIG_POLICY_ID = "a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13";
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
+    private static final String PREVIEW_POOL_SELL_MISMATCH =
+            "ConfigDatum[24]: derived cdfa58c27aee3458983247dcde6419e6e8ca13b30e5ba34f95feccb0, "
+                    + "chain db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56";
+    private static final String PREVIEW_LM_COMPOUND_MISMATCH =
+            "LMConfigDatum[3]: derived 7dbcad0e76f5c639c96dd7ffc52f730d1ac0290c46c04fe343edc49b, "
+                    + "chain dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457";
 
     private static final String CONFIG_DATUM = fixture("fourth-deployment-config-datum.hex");
     private static final String LM_CONFIG_DATUM = fixture("fourth-deployment-lm-config-datum.hex");
@@ -47,12 +53,13 @@ class LoansConfigVerifierTest {
     }
 
     @Test
-    void acceptsTheDeploymentItWasConfiguredFor() {
+    void reportsTheAcceptedLatestBlueprintDeltaFromCapturedPreview() {
         LoansConfigVerifier v = verifier(CONFIG_POLICY_ID, SMART_TOKENS_SPEND);
 
         List<String> mismatches = v.verifyAgainst(CONFIG_DATUM, LM_CONFIG_DATUM);
 
-        assertEquals(List.of(), mismatches, "a correctly configured node must verify clean");
+        assertEquals(List.of(PREVIEW_POOL_SELL_MISMATCH, PREVIEW_LM_COMPOUND_MISMATCH), mismatches,
+                "captured preview remains honest while the latest artifact is ahead of that deployment");
         assertEquals(SMART_TOKENS_SPEND, v.getOnChainSmartTokensSpendScriptHash(),
                 "smartTokensSpendScriptHash read back from ConfigDatum field 0");
     }
@@ -88,13 +95,14 @@ class LoansConfigVerifierTest {
 
     /**
      * Without smartTokensSpendScriptHash the pool-manager hashes cannot be derived. Those
-     * fields must be skipped, not reported as mismatches — the liquidation path still starts.
+     * fields must be skipped, not reported as mismatches. The independently derivable pool-sell
+     * field still reports the accepted latest-blueprint delta from captured preview.
      */
     @Test
     void skipsUnderivableFieldsInsteadOfFailing() {
         LoansConfigVerifier v = verifier(CONFIG_POLICY_ID, null);
 
-        assertEquals(List.of(), v.verifyAgainst(CONFIG_DATUM, LM_CONFIG_DATUM),
-                "a partial derivation must verify clean on the fields it can derive");
+        assertEquals(List.of(PREVIEW_POOL_SELL_MISMATCH), v.verifyAgainst(CONFIG_DATUM, LM_CONFIG_DATUM),
+                "partial derivation must retain only the independently derivable preview delta");
     }
 }

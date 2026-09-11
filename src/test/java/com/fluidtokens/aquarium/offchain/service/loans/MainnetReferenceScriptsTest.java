@@ -5,12 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.yaml.snakeyaml.Yaml;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -20,6 +23,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -55,31 +59,26 @@ class MainnetReferenceScriptsTest {
     private static final String LM_CONFIG_POLICY_ID = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
+    private static final String MS_POOL_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+    private static final String MS_POOL_SPEND = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+    private static final String MS_ORDER_SPEND = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
+    private static final String CONFIG = "ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b#0";
+    private static final String LM_CONFIG = "1c4a91283f9fc2bffe13c0b10584b1d1492f770e910bd858da8586c395a8bdaa#0";
+    private static final String COMPOUND = "8d92115bb26dece0f197b110b0cf2c9bfa5f542cb1fd4dc53e595f1a1b73341a#0";
+    private static final String OLD_COMPOUND = "954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0";
+    private static final String COMPOUND_HASH = "ad34c3db53d20c1e368d7fea64724a0b0249b603a57c8f2a1670bda6";
 
     private static final String BF = "https://cardano-mainnet.blockfrost.io/api/v0";
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20)).build();
+    private static final Map<String, JsonNode> GET_CACHE = new LinkedHashMap<>();
 
     /**
      * ⛔ The EIGHT named liquidation coordinates, exactly as findings §24.4 publishes them and as
      * {@code docker/.env.example} now ships them. Key → {@code txHash#index}.
      */
     private static final Map<String, String> LIQUIDATION = new LinkedHashMap<>();
-
-    /** The ELEVEN compound coordinates, one comma-separated property in production. */
-    private static final List<String> COMPOUND = List.of(
-            "83d1c5393a53e365eb15a7bdfd1feff560f43f9560bc60c23c4e41de709bae33#0",
-            "55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0",
-            "d0549a87da42d048eb1c3b5b8f7811fd2ccd882ad36c85ee209d3a8d1ca0265f#0",
-            "d52f3f88e44ca798d9f45313b83267a7ffa01a6105603ed2b2aebcd8383c45ea#0",
-            "e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0",
-            "ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0",
-            "954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0",
-            "5215ca557800881b044ce92c77018b92b9d5b6c56f835d6217bc7e1435000f8a#0",
-            "8340312072cd352519e01d7e294d3a4cb84a7f0b63f44adef027abf84d2e0bee#0",
-            "8bfb510d6d90573280d9a47b94411477f0992228e0b43cb7cb864f2af66b6812#0",
-            "15d88c19c9841e7b5cdd125613ff2013993aeb89f871f340c7a2e43fce1373f5#0");
 
     static {
         LIQUIDATION.put("loan", "f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f#0");
@@ -94,6 +93,8 @@ class MainnetReferenceScriptsTest {
     }
 
     private static JsonNode get(String path) throws IOException, InterruptedException {
+        JsonNode cached = GET_CACHE.get(path);
+        if (cached != null) return cached;
         var request = HttpRequest.newBuilder(URI.create(BF + path))
                 .header("project_id", System.getenv("BLOCKFROST_KEY"))
                 .timeout(Duration.ofSeconds(30)).GET().build();
@@ -102,25 +103,84 @@ class MainnetReferenceScriptsTest {
             throw new IllegalStateException("blockfrost " + path + " -> " + response.statusCode()
                     + " (a 404 here IS the finding: the coordinate is stale or on another network)");
         }
-        return MAPPER.readTree(response.body());
+        JsonNode body = MAPPER.readTree(response.body());
+        GET_CACHE.put(path, body);
+        return body;
     }
 
-    /** The {@code reference_script_hash} the chain reports at one {@code txHash#index}. */
-    private static String publishedHash(String coordinate) throws IOException, InterruptedException {
+    private static JsonNode publishedOutput(String coordinate) throws IOException, InterruptedException {
         String[] parts = coordinate.split("#");
         int index = Integer.parseInt(parts[1]);
         for (JsonNode output : get("/txs/" + parts[0] + "/utxos").get("outputs")) {
             if (output.get("output_index").asInt() == index) {
-                return output.hasNonNull("reference_script_hash")
-                        ? output.get("reference_script_hash").asText() : null;
+                return output;
             }
         }
         return null;
     }
 
+    /** The {@code reference_script_hash} the chain reports at one {@code txHash#index}. */
+    private static String publishedHash(String coordinate) throws IOException, InterruptedException {
+        JsonNode output = publishedOutput(coordinate);
+        return output != null && output.hasNonNull("reference_script_hash")
+                ? output.get("reference_script_hash").asText() : null;
+    }
+
+    private static void assertUnspent(String coordinate, JsonNode output) throws Exception {
+        assertTrue(output != null, coordinate + " is absent from its creating transaction");
+        String[] parts = coordinate.split("#");
+        for (int page = 1; page <= 20; page++) {
+            JsonNode current = get("/addresses/" + output.get("address").asText()
+                    + "/utxos?count=100&page=" + page + "&order=asc");
+            for (JsonNode utxo : current) {
+                if (parts[0].equals(utxo.get("tx_hash").asText())
+                        && Integer.parseInt(parts[1]) == utxo.get("output_index").asInt()) return;
+            }
+            if (current.size() < 100) break;
+        }
+        throw new AssertionError(coordinate + " is not in the current UTxO set at its address");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> shippedCompoundReferences() throws IOException {
+        try (InputStream in = MainnetReferenceScriptsTest.class.getClassLoader()
+                .getResourceAsStream("application.yaml")) {
+            assertTrue(in != null, "application.yaml is absent from the test classpath");
+            Iterable<Object> documents = new Yaml().loadAll(
+                    new String(in.readAllBytes(), StandardCharsets.UTF_8));
+            Map<String, Object> root = (Map<String, Object>) documents.iterator().next();
+            Map<String, Object> loans = (Map<String, Object>) root.get("loans");
+            Map<String, Object> compound = (Map<String, Object>) loans.get("compound");
+            String placeholder = (String) compound.get("reference-scripts");
+            int colon = placeholder.indexOf(':');
+            assertTrue(placeholder.startsWith("${") && colon > 1 && placeholder.endsWith("}"),
+                    "compound references are not an env-overridable shipped default");
+            return List.of(placeholder.substring(colon + 1, placeholder.length() - 1).split(","));
+        }
+    }
+
     private static LoansContractRegistry mainnetRegistry() {
-        return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME,
-                SMART_TOKENS_SPEND);
+        return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID,
+                CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
+                MS_POOL_POLICY, MS_POOL_SPEND, MS_ORDER_SPEND);
+    }
+
+    private static Set<String> liveCompoundHashes(List<String> coordinates) throws Exception {
+        List<String> problems = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (String coordinate : coordinates) {
+            JsonNode output = publishedOutput(coordinate);
+            assertUnspent(coordinate, output);
+            String published = output != null && output.hasNonNull("reference_script_hash")
+                    ? output.get("reference_script_hash").asText() : null;
+            if (published == null) {
+                problems.add(coordinate + " holds no reference script");
+            } else if (!seen.add(published)) {
+                problems.add(coordinate + " publishes " + published + " a second time");
+            }
+        }
+        assertTrue(problems.isEmpty(), "compound reference-script coordinates: " + problems);
+        return seen;
     }
 
     /**
@@ -147,7 +207,10 @@ class MainnetReferenceScriptsTest {
 
         List<String> mismatches = new ArrayList<>();
         for (var entry : LIQUIDATION.entrySet()) {
-            String published = publishedHash(entry.getValue());
+            JsonNode output = publishedOutput(entry.getValue());
+            assertUnspent(entry.getValue(), output);
+            String published = output.hasNonNull("reference_script_hash")
+                    ? output.get("reference_script_hash").asText() : null;
             if (!expected.get(entry.getKey()).equals(published)) {
                 mismatches.add(entry.getKey() + " at " + entry.getValue() + " publishes " + published
                         + ", but this node derives " + expected.get(entry.getKey()));
@@ -163,38 +226,59 @@ class MainnetReferenceScriptsTest {
     /**
      * The compound list resolves, and every hash it publishes belongs to <b>this</b> deployment.
      *
-     * <p>⚠ A weaker check than the one above <b>by design</b>, because the hazard is different: the
-     * compound property is an unnamed list and the node reads the hash off the chain, so mislabelling
-     * is not expressible. What can still go wrong is a coordinate from a <b>different deployment or
-     * network</b> — which is what deployment membership catches.
+     * <p>The property is an unnamed list, so the relevant identity is the exact set of eleven
+     * validators consumed by {@code CompoundTransactionBuilder}, not a copied coordinate list.
      */
     @Test
     void everyCompoundCoordinateResolvesAndBelongsToThisDeployment() throws Exception {
         LoansContractRegistry registry = mainnetRegistry();
-        // ⚠ derivedHashes() is NOT "every hash this registry derives" — it is the set the ConfigDatum
-        // PUBLISHES, which is what LoansConfigVerifier cross-checks. Two withdraw hashes are derived
-        // and deliberately absent from it, and asset_manager's is one of them — so using that map
-        // alone as a membership oracle understates the deployment and reads a correct coordinate as
-        // foreign. (Measured: it rejected e5e5bab0…#0, which the NAMED test above proves is exactly
-        // this deployment's asset_manager withdraw validator.)
-        Set<String> ofThisDeployment = new LinkedHashSet<>(registry.derivedHashes().values());
-        ofThisDeployment.add(registry.getAssetManagerWithdrawScriptHash());
-        ofThisDeployment.add(registry.getLockedBorrowerManagerWithdrawScriptHash());
+        List<String> coordinates = shippedCompoundReferences();
+        Set<String> requiredByBuilder = new LinkedHashSet<>(List.of(
+                registry.getAssetManagerSpendScriptHash(), registry.getLenderManagerSpendScriptHash(),
+                registry.getPoolSpendScriptHash(), registry.getPoolManagerSpendScriptHash(),
+                registry.getAssetManagerWithdrawScriptHash(), registry.getLenderManagerWithdrawScriptHash(),
+                registry.getLmCompoundActionScriptHash(), registry.getPoolPolicyId(),
+                registry.getPoolCompoundActionScriptHash(), registry.getPoolManagerPolicyId(),
+                registry.getPmCompoundLiquidityScriptHash()));
 
-        List<String> problems = new ArrayList<>();
-        Set<String> seen = new LinkedHashSet<>();
-        for (String coordinate : COMPOUND) {
-            String published = publishedHash(coordinate);
-            if (published == null) {
-                problems.add(coordinate + " holds no reference script");
-            } else if (!ofThisDeployment.contains(published)) {
-                problems.add(coordinate + " publishes " + published
-                        + ", which is not a validator this deployment derives");
-            } else if (!seen.add(published)) {
-                problems.add(coordinate + " publishes " + published + " a second time");
-            }
+        Set<String> seen = liveCompoundHashes(coordinates);
+        assertEquals(11, coordinates.size(), "the shipped builder set has exactly eleven coordinates");
+        assertEquals(requiredByBuilder, seen,
+                "the shipped coordinates must publish exactly the eleven hashes CompoundTransactionBuilder needs");
+        assertEquals(COMPOUND_HASH, publishedHash(COMPOUND), "the supplied compound coordinate identity");
+
+        // Mutation control: the superseded coordinate still resolves and is unspent. Its rejection
+        // therefore proves the assertion depends on validator identity, not on auth or existence.
+        List<String> wrongExistingOutput = new ArrayList<>(coordinates);
+        assertTrue(wrongExistingOutput.remove(COMPOUND), "current compound coordinate missing from YAML");
+        wrongExistingOutput.add(OLD_COMPOUND);
+        Set<String> wrongHashes = liveCompoundHashes(wrongExistingOutput);
+        AssertionError rejection = assertThrows(AssertionError.class,
+                () -> assertEquals(requiredByBuilder, wrongHashes,
+                        "a different unspent reference output must not satisfy the builder set"));
+        assertTrue(rejection.getMessage().contains(COMPOUND_HASH),
+                "the mutation was rejected for something other than the current compound identity");
+    }
+
+    @Test
+    void currentConfigOutputsAreUnspentExactNftsWithCapturedDatums() throws Exception {
+        assertCurrentConfig(CONFIG, CONFIG_POLICY_ID + CONFIG_ASSET_NAME, "mainnet-config-datum.hex");
+        assertCurrentConfig(LM_CONFIG, LM_CONFIG_POLICY_ID + CONFIG_ASSET_NAME,
+                "mainnet-lm-config-datum.hex");
+    }
+
+    private static void assertCurrentConfig(String coordinate, String nft, String fixture) throws Exception {
+        JsonNode output = publishedOutput(coordinate);
+        assertUnspent(coordinate, output);
+        long quantity = 0;
+        for (JsonNode amount : output.get("amount")) {
+            if (nft.equals(amount.get("unit").asText())) quantity += amount.get("quantity").asLong();
         }
-        assertTrue(problems.isEmpty(), "compound reference-script coordinates: " + problems);
-        assertEquals(COMPOUND.size(), seen.size(), "eleven coordinates, eleven distinct validators");
+        assertEquals(1, quantity, coordinate + " must carry exactly one config NFT " + nft);
+        try (InputStream in = MainnetReferenceScriptsTest.class.getResourceAsStream("/loans-v4/" + fixture)) {
+            assertTrue(in != null, "missing fixture " + fixture);
+            assertEquals(new String(in.readAllBytes(), StandardCharsets.UTF_8).trim(),
+                    output.get("inline_datum").asText(), coordinate + " inline datum differs from capture");
+        }
     }
 }

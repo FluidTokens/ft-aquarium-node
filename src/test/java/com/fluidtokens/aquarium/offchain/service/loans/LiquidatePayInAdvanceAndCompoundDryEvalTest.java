@@ -48,19 +48,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * ⛔ <b>FOUR OF THESE NINE TESTS ARE DISABLED AS HISTORICAL — read this before re-enabling them.</b>
  *
- * <p>On 2026-09-04 the fixtures moved from the THIRD preview deployment to the FOURTH, so that the
- * recorded config datums and the vendored blueprint come from one build (findings §53, Giovanni's
- * ruling). Five of the tests here followed cleanly: their addresses and asset policies are now
- * DERIVED from the registry rather than pinned as literals, which is the fix, and they are green.
+ * <p>On 2026-09-11 the image moved to one latest blueprint. The enabled construction checks use
+ * explicitly synthetic copies of preview's config datums with only the two changed action hashes
+ * replaced; the captured bytes remain unchanged and separately prove the accepted preview mismatch.
  *
  * <p><b>The other four cannot follow, and the obstacle is a fact about the chain.</b> This rig
  * replays {@code POOL_DATUM_HEX} — the verbatim inline datum of a real third-deployment pool — and
  * that datum <em>embeds</em> two credentials that are parameterised by the config policy id: the
  * pool's {@code lenderAuth} names {@code poolManagerPolicyId}, and it carries
  * {@code lenderManagerSpendScriptHash}. The compound action requires a withdrawal at the credential
- * the datum names, so against a blueprint that derives the fourth deployment it fails at
- * {@code Withdraw index 2}, and pointing the rig back at the third deployment does not help: the
- * blueprint still derives the fourth.
+ * the datum names, so against the latest blueprint it fails at
+ * {@code Withdraw index 2}. Pointing the rig back at the third deployment does not help because the
+ * old compiled artifact is no longer shipped.
  *
  * <p>⚠ <b>Substituting those hashes inside the recording was tried and reverted.</b> It is two
  * fixed-width fields and it compiles, but it turns a recording into a fabrication — and a rig whose
@@ -232,8 +231,8 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
     private static final String TX_LM_CONFIG = "f2".repeat(32);
     private static final String TX_WALLET = "e0".repeat(32);
 
-    private static final Utxo CONFIG_UTXO = LoanFixtures.configUtxo(TX_CONFIG, 0);
-    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.lmConfigUtxo(TX_LM_CONFIG, 0);
+    private static final Utxo CONFIG_UTXO = LoanFixtures.syntheticLatestConfigUtxo(TX_CONFIG, 0);
+    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 60_000_000L);
 
@@ -283,7 +282,7 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
      * {@code pm_compound_liquidity} and the oracle.
      */
     @Test
-    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy a blueprint that derives the FOURTH deployment, and substituting them makes it a fabrication rather than a recording. Re-found it on a fourth-deployment preview pool "
+    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy the latest blueprint, and substituting them makes it a fabrication rather than a recording. Re-found it on a latest-compatible preview pool "
             + "and delete this annotation.")
     void theRealLoanCompoundLiquidationEvaluatesAgainstTheDeployedValidators() {
         Fixture fixture = fixture();
@@ -394,7 +393,7 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
      * arithmetic is the risk this test defends.)
      */
     @Test
-    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy a blueprint that derives the FOURTH deployment, and substituting them makes it a fabrication rather than a recording. Re-found it on a fourth-deployment preview pool "
+    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy the latest blueprint, and substituting them makes it a fabrication rather than a recording. Re-found it on a latest-compatible preview pool "
             + "and delete this annotation.")
     void aWrongCompoundedPoolValueIsRejectedByTheCompoundAction() {
         Fixture fixture = fixture();
@@ -428,7 +427,7 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
      * it, so this isolates the one field that moved.
      */
     @Test
-    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy a blueprint that derives the FOURTH deployment, and substituting them makes it a fabrication rather than a recording. Re-found it on a fourth-deployment preview pool "
+    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy the latest blueprint, and substituting them makes it a fabrication rather than a recording. Re-found it on a latest-compatible preview pool "
             + "and delete this annotation.")
     void aWrongCompoundedPoolDatumIsRejected() {
         Fixture fixture = fixture();
@@ -464,7 +463,7 @@ class LiquidatePayInAdvanceAndCompoundDryEvalTest {
      * withdrawal index; the clean build passes it, so this isolates the one pointer that moved.
      */
     @Test
-    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy a blueprint that derives the FOURTH deployment, and substituting them makes it a fabrication rather than a recording. Re-found it on a fourth-deployment preview pool "
+    @Disabled("HISTORICAL — replays a THIRD-deployment pool that cannot be re-hosted. See the class javadoc: the recorded pool datum embeds credentials parameterised by the config policy id, so it cannot satisfy the latest blueprint, and substituting them makes it a fabrication rather than a recording. Re-found it on a latest-compatible preview pool "
             + "and delete this annotation.")
     void aWrongPmCompoundLiquidityRedeemerIndexIsRejected() {
         Fixture fixture = fixture();

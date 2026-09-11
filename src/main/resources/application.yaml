@@ -75,6 +75,9 @@ aquarium:
 # on that path and `compound.enabled` on the other. Both off below.
 # (see LoansContractRegistry / docs/lending-v4-findings.md)
 loans:
+  # The image contains one Lending v4 blueprint: FluidTokens revision 4c4d143. Preview still uses
+  # its older deployment coordinates, so startup verification intentionally reports the two
+  # derived-versus-published mismatches until FluidTokens migrates preview.
   # FluidTokens oracle registry. Same endpoint ada-watch polls for Lending v3. Read-only price
   # feeds for the health-factor engine; it also carries the multisig signatures a liquidation tx
   # needs, which we do not consume yet. NOTE: serves mainnet assets, so on preview most
@@ -99,7 +102,7 @@ loans:
   # was removed on Giovanni's ruling: a node correctly targeted at mainnet, armed and profitable,
   # would still refuse to submit and say so only in a decision row — "arming that works everywhere
   # except the last step, silently." `network` (this file / the Spring profile) is now the SINGLE
-  # source of truth for where this node acts. What holds a submission back is exactly: loans.enabled,
+  # source of truth for where this node acts. What holds a liquidation submission back is exactly:
   # mode == live, the market's effective mode, and the profit floors.
   # The repayment-escrow COMPOUND path (lm_compound_action): collect a repaid loan's principal from
   # the asset manager and deliver it into the lender's pool, keeping the pool owner's compounding fee.
@@ -139,26 +142,25 @@ loans:
     # SUBMIT: eleven inline validators build a 24,912-byte transaction against a 16,384 max_tx_size.
     # Referencing the four largest measures 10,414 bytes, 5,970 of margin (findings section 22.9).
     #
-    # Deployment-specific, so it is set in the deployment's own values, never defaulted in this image.
-    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:83d1c5393a53e365eb15a7bdfd1feff560f43f9560bc60c23c4e41de709bae33#0,55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0,d0549a87da42d048eb1c3b5b8f7811fd2ccd882ad36c85ee209d3a8d1ca0265f#0,d52f3f88e44ca798d9f45313b83267a7ffa01a6105603ed2b2aebcd8383c45ea#0,e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0,ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0,954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0,5215ca557800881b044ce92c77018b92b9d5b6c56f835d6217bc7e1435000f8a#0,8340312072cd352519e01d7e294d3a4cb84a7f0b63f44adef027abf84d2e0bee#0,8bfb510d6d90573280d9a47b94411477f0992228e0b43cb7cb864f2af66b6812#0,15d88c19c9841e7b5cdd125613ff2013993aeb89f871f340c7a2e43fce1373f5#0}
+    # Deployment-specific and env-overridable. The verified mainnet set is the shipped default so
+    # the public image is buildable; preview explicitly blanks it below.
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:83d1c5393a53e365eb15a7bdfd1feff560f43f9560bc60c23c4e41de709bae33#0,55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0,d0549a87da42d048eb1c3b5b8f7811fd2ccd882ad36c85ee209d3a8d1ca0265f#0,d52f3f88e44ca798d9f45313b83267a7ffa01a6105603ed2b2aebcd8383c45ea#0,e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0,ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0,8d92115bb26dece0f197b110b0cf2c9bfa5f542cb1fd4dc53e595f1a1b73341a#0,5215ca557800881b044ce92c77018b92b9d5b6c56f835d6217bc7e1435000f8a#0,8340312072cd352519e01d7e294d3a4cb84a7f0b63f44adef027abf84d2e0bee#0,8bfb510d6d90573280d9a47b94411477f0992228e0b43cb7cb864f2af66b6812#0,15d88c19c9841e7b5cdd125613ff2013993aeb89f871f340c7a2e43fce1373f5#0}
 
   # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
   #
-  # Quoted first-hand from FluidTokens' own (TypeScript) tooling and then VERIFIED read-only against
-  # the chain: both NFTs exist in tx 7b9f20db…, asset name `parameters`, the ConfigDatum has the
-  # expected 29 fields, and — the load-bearing check — the vendored loans-v4.plutus.json DERIVES
-  # every credential the mainnet datum publishes. Their mainnet build IS the artifact we ship.
-  # See MainnetRegistryMatchesConfigTest and docs/lending-v4-findings.md section 23.
+  # Verified read-only against the chain on 2026-09-11: the current config NFTs are unspent at
+  # ffced74c…#0 and 1c4a9128…#0, asset name `parameters`, and the mainnet blueprint derives every
+  # credential their datums publish. See MainnetRegistryMatchesConfigTest.
   #
-  # ⚠ CONFIGURED IS NOT ARMED. `loans.enabled` above is false on mainnet, the liquidation mode is
-  # `disabled` — and that single dial is the whole node-level question now.
-  # ⚠ The fourth item here used to read "the compound gate HARD-FAILS a negative profit margin on
-  # mainnet" — it does not; see the compound margin above. Three gates, not four. These values let
-  # the node DERIVE and READ the mainnet deployment; nothing here lets it act on one.
+  # ⚠ CONFIGURED IS NOT ARMED. The liquidation mode is `disabled`, compound is disabled, and the
+  # scheduled-transaction processor is disabled. These values derive and read mainnet only.
   #
-  # The preview profile overrides all four, so this block is inert on every preview deployment.
+  # The preview profile overrides the deployment coordinates, while the image keeps the single
+  # latest artifact; it remains incompatible with the captured old preview deployment until Fluid migrates it.
   config:
-    ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:7b9f20dbadaebe1400915e4a63444a9eb7515c21c1114d4bc9c77f1455148cb0}
+    # Current Config NFT output. Runtime discovery uses policy id + asset name; this transaction is
+    # provenance and operator configuration, not a mint point or a sync-start instruction.
+    ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b}
     policy-id: ${LOANS_CONFIG_POLICY_ID:db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416}
     # The config NFTs' asset name, "parameters" in hex. Identical on every network — stated
     # rather than inlined, because a key that exists nowhere can be neither overridden nor
@@ -200,8 +202,8 @@ loans:
   # behaves exactly as it did before the UI existed. (The Thymeleaf dependency is in the image
   # either way; the flag governs behaviour, not the jar's bytes.)
   #
-  # Requires loans.enabled=true — the page reads the same scanner, health service and economics the
-  # bot acts on. With lending off it renders a single line saying so rather than failing to start.
+  # The page reads the same scanner, health service and economics the bot acts on. With lending
+  # coordinates absent it renders a single line saying so rather than failing to start.
   ui:
     enabled: ${LOANS_UI_ENABLED:false}
 

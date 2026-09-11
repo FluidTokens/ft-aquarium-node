@@ -43,6 +43,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * assumption held by accident. <b>The fixture supplied what production has to earn</b> — this repo's
  * own recorded failure shape, arriving again in a new place. These tests therefore run the wallet
  * <em>thin</em>, which is what a real bot wallet looks like after it has been paying fees.
+ *
+ * <p>The candidate JSON remains the captured preview transaction shape. Its two config inputs are
+ * explicitly synthetic copies with only the latest blueprint's changed action credentials, so the
+ * evaluator measures current validator behavior without misrepresenting deployed preview state.
  */
 @Slf4j
 class CompoundAccountingTest {
@@ -87,9 +91,19 @@ class CompoundAccountingTest {
                 POOL_ID, utxo("pool"), utxo("poolManager"), 0L, true, null, "recorded preview candidate");
     }
 
+    private static Utxo syntheticConfig() {
+        Utxo captured = utxo("config");
+        return LoanFixtures.syntheticLatestConfigUtxo(captured.getTxHash(), captured.getOutputIndex());
+    }
+
+    private static Utxo syntheticLmConfig() {
+        Utxo captured = utxo("lmConfig");
+        return LoanFixtures.syntheticLatestLmConfigUtxo(captured.getTxHash(), captured.getOutputIndex());
+    }
+
     private static Transaction build(List<Utxo> walletUtxos) {
         List<Utxo> universe = new ArrayList<>(List.of(utxo("escrow"), utxo("bond"), utxo("pool"),
-                utxo("poolManager"), utxo("config"), utxo("lmConfig")));
+                utxo("poolManager"), syntheticConfig(), syntheticLmConfig()));
         universe.addAll(walletUtxos);
         TransactionEvaluator evaluator = new AikenTransactionEvaluator(
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
@@ -97,7 +111,7 @@ class CompoundAccountingTest {
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), evaluator);
         return builder.build(new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
-                utxo("config"), utxo("lmConfig"), walletUtxos.getFirst(), BOT,
+                syntheticConfig(), syntheticLmConfig(), walletUtxos.getFirst(), BOT,
                 BigInteger.ZERO, 70_000_000L, 70_000_300L));
     }
 

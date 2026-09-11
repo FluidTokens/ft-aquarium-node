@@ -22,13 +22,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * artefact we vendor is the artefact they built. Same test as
  * {@link ShippedRegistryMatchesPinnedConfigTest}, pointed at mainnet.
  *
- * <p>Green means the mainnet deployment derives from the same {@code loans-v4.plutus.json} we ship,
- * so every credential downstream is knowable. <b>Red would mean their mainnet build differs from our
- * vendored artefact</b> — a finding about what is possible at all, not a configuration error.
+ * <p>Green means the mainnet deployment derives from the single
+ * {@code loans-v4.plutus.json} we ship, so every credential downstream is knowable.
+ * <b>Red would mean their mainnet build differs from our vendored artefact</b> — a finding about
+ * what is possible at all, not a configuration error.
  *
- * <p>⚠ This asserts DERIVATION only. It says nothing about whether the node should run on mainnet;
- * lending is {@code enabled: false} there, the tank path is untested, and the compound gate
- * hard-fails a negative margin on mainnet by design.
+ * <p>⚠ This asserts DERIVATION only. It does not arm or run anything; the shipped liquidation mode
+ * and compound flag remain off, and operator deployment is outside this test.
  */
 class MainnetRegistryMatchesConfigTest {
 
@@ -38,6 +38,12 @@ class MainnetRegistryMatchesConfigTest {
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     /** Published by the mainnet ConfigDatum itself (field 0); not derivable from the blueprint. */
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
+    private static final String MINSWAP_POOL_POLICY =
+            "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+    private static final String MINSWAP_POOL_SPEND =
+            "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+    private static final String MINSWAP_ORDER_SPEND =
+            "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
 
     private static String fixture(String path) throws IOException {
         try (InputStream is = MainnetRegistryMatchesConfigTest.class.getResourceAsStream(path)) {
@@ -49,8 +55,9 @@ class MainnetRegistryMatchesConfigTest {
     }
 
     private static LoansContractRegistry mainnetRegistry() {
-        return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME,
-                SMART_TOKENS_SPEND);
+        return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID,
+                CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
+                MINSWAP_POOL_POLICY, MINSWAP_POOL_SPEND, MINSWAP_ORDER_SPEND);
     }
 
     /** ⛔ THE VERDICT: does the vendored blueprint derive FluidTokens' mainnet credentials? */
@@ -65,7 +72,7 @@ class MainnetRegistryMatchesConfigTest {
                         fixture("/loans-v4/mainnet-lm-config-datum.hex"));
 
         assertTrue(mismatches.isEmpty(),
-                "the vendored loans-v4.plutus.json does NOT derive FluidTokens' mainnet credentials. "
+                "the selected mainnet blueprint does NOT derive FluidTokens' mainnet credentials. "
                         + "That is a finding about what is possible on mainnet at all, not a "
                         + "misconfiguration: their mainnet build differs from the artefact we vendor. "
                         + "Mismatches: " + mismatches);

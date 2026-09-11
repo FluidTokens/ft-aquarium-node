@@ -181,6 +181,22 @@ if means your node is up to tip and is processing 1 block at the time (i.e. the 
 
 **The node ships with the liquidation bot OFF.** Everything else is tuning; these are the dials that decide whether it does anything at all.
 
+The September 2026 mainnet parameter update ships one Lending v4 blueprint at
+`loans-v4.plutus.json`: FluidTokens revision
+`4c4d14346b42078ca1680a8ca9c28364319c933b`, SHA-256
+`63f5fcf395c5a3e76c211e71e8a327aeb1009205e0773b2bdb732ab8020904a5`. There is no
+`LOANS_BLUEPRINT_RESOURCE` selector or legacy fallback. Before upgrading, review any deployment
+overrides for `LOANS_CONFIG_REF_UTXO_TX_HASH` and `AQUARIUM_COMPOUND_REFERENCE_SCRIPTS`; stale
+overrides take precedence over the verified defaults in the image. The current mainnet Config reference is
+`ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b#0`, and the compound set
+includes `8d92115bb26dece0f197b110b0cf2c9bfa5f542cb1fd4dc53e595f1a1b73341a#0` in place of the
+superseded compound reference. The latest artifact intentionally does not verify against the
+currently captured preview ConfigDatum pool-sell field or LMConfigDatum compound field; preview
+must be migrated by Fluid before that profile can pass the unchanged startup guard. This accepted
+preview incompatibility does not affect the verified mainnet parameters. The update does not
+require resetting the sync cursor. Deploying or starting the new image and arming liquidation or
+compound remain separate, deliberate operator actions.
+
 | env var | ships | to arm |
 |---|---|---|
 | `SCHEDULING_TRANSACTION_PROCESSOR_ENABLED` | `false` | `"true"` — the Aquarium scheduled-transaction processor |
