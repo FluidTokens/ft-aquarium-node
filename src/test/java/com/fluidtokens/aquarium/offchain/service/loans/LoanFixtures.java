@@ -191,44 +191,30 @@ public final class LoanFixtures {
             THIRD_CONFIG_POLICY_ID, THIRD_LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
 
     /**
-     * ⛔ <b>The THIRD preview deployment &mdash; NOT a leftover, and not a candidate for the next
-     * clean-up.</b>
+     * Registry parameterised with preview's historical third-deployment policy ids.
      *
-     * <h2>Why one family of rigs cannot move to the fourth deployment</h2>
-     * The 2026-09-04 re-point moved {@link #registry()} to the FOURTH deployment so that fixtures and
-     * the vendored blueprint come from one build. <b>The pool-origination rigs cannot follow, and the
-     * reason is a fact about the chain rather than about this code.</b>
+     * <p>Every {@link LoansContractRegistry}, including this one and {@link #registry()}, derives its
+     * scripts from the single latest {@code loans-v4.plutus.json}. The retained third- and
+     * fourth-deployment coordinates and captured config datums are historical chain evidence; neither
+     * snapshot is claimed to match that artifact completely.
      *
-     * <p>{@link PoolFixtures#PUBLISHED_REFERENCE_SCRIPTS} is a record of <b>reference-script UTxOs
-     * FluidTokens actually published on preview</b>, keyed by the script hash each one publishes.
-     * Those publications exist for the <b>third</b> deployment only: every hash is parameterised by the
-     * config policy id, so the fourth deployment moved them all, and nothing was republished
-     * (see {@code application.yaml}'s preview block, where every liquidation coordinate is blank for
-     * exactly this reason). <b>Re-keying that map to fourth-deployment hashes with invented
-     * coordinates would not fix anything — it would delete the map's meaning</b>, and with it the
-     * {@code LoanFactory} gate that refuses to create a PoolManager-bearing pool whose cancel could
-     * never be submitted.
-     *
-     * <p>⇒ <b>The split is by what a rig REPLAYS, which is the only honest boundary.</b> A rig that
-     * replays published third-deployment reference scripts stays here; a rig that derives from the
-     * shipped blueprint uses {@link #registry()}. Both are internally consistent, and neither is
-     * pretending to be the other.
-     *
-     * <p>⚠ These rigs prove the same thing they proved before &mdash; the pool validators' shape,
-     * arbitrated by the real compiled scripts. What they do <b>not</b> prove is anything about the
-     * deployment the node is pinned to, which is what {@link #registry()} is now for.
+     * <p>{@link PoolFixtures#PUBLISHED_REFERENCE_SCRIPTS} likewise records reference-script UTxOs that
+     * FluidTokens actually published for the third deployment's parameterised hashes. Re-keying that
+     * map to newer hashes with invented coordinates would erase its provenance and disable the
+     * {@code LoanFactory} guard against creating a PoolManager-bearing pool whose cancel cannot use a
+     * published reference script.
      */
     public static LoansContractRegistry thirdDeploymentRegistry() {
         return THIRD_DEPLOYMENT_REGISTRY;
     }
 
-    /** The third deployment's main config reference input, paired with {@link #thirdDeploymentRegistry()}. */
+    /** Captured third-deployment main config reference input; historical chain evidence. */
     public static Utxo thirdDeploymentConfigUtxo(String txHash, int outputIndex) {
         return configUtxo(txHash, outputIndex, THIRD_CONFIG_POLICY_ID,
                 fixture("preview-config-datum.hex"));
     }
 
-    /** The third deployment's LenderManager config reference input. */
+    /** Captured third-deployment LenderManager config reference input; historical chain evidence. */
     public static Utxo thirdDeploymentLmConfigUtxo(String txHash, int outputIndex) {
         return configUtxo(txHash, outputIndex, THIRD_LM_CONFIG_POLICY_ID,
                 fixture("preview-lm-config-datum.hex"));
