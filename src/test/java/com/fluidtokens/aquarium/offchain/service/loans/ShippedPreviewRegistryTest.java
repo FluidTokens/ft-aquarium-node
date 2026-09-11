@@ -5,10 +5,9 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The coordinates anything on-chain must use — <b>read from what ships, not typed here.</b>
+ * The old preview coordinates retained in the profile — <b>read from what ships, not typed here.</b>
  *
  * <h2>What this exists to stop</h2>
  * {@code LoanFactoryOnChainRunnerTest} builds real loans on preview and was pointed, through
@@ -29,12 +28,12 @@ class ShippedPreviewRegistryTest {
     private static final LoansContractRegistry SHIPPED = LoanFixtures.shippedPreviewRegistry();
 
     /**
-     * ⛔ THE ASSERTION THAT MATTERS: the parsed policy id is the one the running pod is pinned to.
-     * Checked against the value in {@code application.yaml}'s preview profile, which is what the
-     * image carries — not against a constant re-typed in this test, which could drift with it.
+     * The parsed policy ids are the fourth deployment still recorded in the preview profile.
+     * The single latest blueprint intentionally does not verify against two fields in that old
+     * deployment; {@link ShippedRegistryMatchesPinnedConfigTest} pins the exact mismatch.
      */
     @Test
-    void theShippedRegistryIsTheFourthDeploymentThePodRuns() {
+    void thePreviewProfileStillNamesTheFourthDeployment() {
         assertEquals("d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e",
                 SHIPPED.getConfigPolicyId(),
                 "the parsed config policy id is not the fourth deployment — either application.yaml "
@@ -57,18 +56,16 @@ class ShippedPreviewRegistryTest {
      *
      * <p>⇒ <b>So the assertion is that they AGREE</b>, and it is the same guard doing the same job
      * from the other side: {@link LoanFixtures#shippedPreviewRegistry()} is a <b>generator</b> that
-     * cannot disagree with what ships, {@link LoanFixtures#registry()} is a <b>constant</b>, and this
-     * is what makes the constant's staleness loud instead of silent. <b>Do not "simplify" it by
-     * deleting one of them</b>: a constant compared against nothing is exactly what drifted last time.
+     * cannot disagree with the preview coordinates in the shipped profile, while
+     * {@link LoanFixtures#registry()} uses explicit constants. Their agreement catches coordinate
+     * drift; neither claims the old preview datums match the latest artifact.
      */
     @Test
     void theFixtureRegistryAgreesWithWhatShips() {
         assertEquals(SHIPPED.getConfigPolicyId(), LoanFixtures.registry().getConfigPolicyId(),
                 "the fixture registry and the shipped config have diverged. If application.yaml was "
                         + "re-pointed at a FIFTH deployment, LoanFixtures.CONFIG_POLICY_ID and the "
-                        + "recorded config datums must move with it — otherwise every dry-eval rig is "
-                        + "back to validating a blueprint against a datum from a different build, "
-                        + "which is findings §53 all over again");
+                        + "captured datum provenance must be reviewed with it");
         assertEquals(SHIPPED.getLmConfigPolicyId(), LoanFixtures.registry().getLmConfigPolicyId());
     }
 

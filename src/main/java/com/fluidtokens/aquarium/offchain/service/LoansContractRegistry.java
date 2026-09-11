@@ -33,13 +33,14 @@ import java.util.stream.Stream;
 /**
  * Derives the FluidTokens Lending v4 script hashes at startup from the two one-shot
  * config NFT policy ids, by applying parameters to the <em>unapplied</em>
- * selected bundled {@code ft-cardano-loans-v4} blueprint.
+ * bundled {@code ft-cardano-loans-v4} blueprint.
  * <p>
  * Same approach as {@link ContractRegistry}: the committed {@code compiledCode} is
  * parameterised, never recompiled, so the aiken compiler version is irrelevant.
  * <p>
- * Preview and mainnet have independent artifacts and config datums; the selection tests assert
- * that Spring binds the correct pair. No v4 address is hardcoded.
+ * Every constructor loads the single latest artifact shipped at {@code loans-v4.plutus.json}.
+ * Network deployments still have independent config datums, and startup verification rejects
+ * any derived-versus-published mismatch. No v4 address is hardcoded.
  *
  * <h2>Three rules that are easy to get wrong</h2>
  * <ol>
@@ -58,10 +59,7 @@ import java.util.stream.Stream;
 @Slf4j
 public class LoansContractRegistry {
 
-    private static final String LEGACY_BLUEPRINT_RESOURCE = "loans-v4.plutus.json";
-    private static final String MAINNET_BLUEPRINT_RESOURCE = "loans-v4-mainnet.plutus.json";
-
-    private final String blueprintResource;
+    private static final String BLUEPRINT_RESOURCE = "loans-v4.plutus.json";
     private final String configPolicyId;
     private final String lmConfigPolicyId;
     private final String configAssetName;
@@ -155,8 +153,7 @@ public class LoansContractRegistry {
 
     @Autowired
     public LoansContractRegistry(AppConfig.LoansConfiguration cfg) {
-        this(cfg.getBlueprintResource(),
-                coordinate(cfg.getConfigPolicyId(), "loans.config.policy-id"),
+        this(coordinate(cfg.getConfigPolicyId(), "loans.config.policy-id"),
                 coordinate(cfg.getLmConfigPolicyId(), "loans.lm-config.policy-id"),
                 cfg.getConfigAssetName(),
                 cfg.getSmartTokensSpendScriptHash(),
@@ -166,8 +163,7 @@ public class LoansContractRegistry {
 
     public LoansContractRegistry(String configPolicyId, String lmConfigPolicyId,
                                  String configAssetName, String smartTokensSpendScriptHash) {
-        this(LEGACY_BLUEPRINT_RESOURCE,
-                configPolicyId, lmConfigPolicyId, configAssetName, smartTokensSpendScriptHash,
+        this(configPolicyId, lmConfigPolicyId, configAssetName, smartTokensSpendScriptHash,
                 null, null, null);
     }
 
@@ -175,18 +171,7 @@ public class LoansContractRegistry {
                                  String configAssetName, String smartTokensSpendScriptHash,
                                  String minswapPoolPolicyId, String minswapPoolSpendScriptHash,
                                  String minswapOrderSpendScriptHash) {
-        this(LEGACY_BLUEPRINT_RESOURCE,
-                configPolicyId, lmConfigPolicyId, configAssetName, smartTokensSpendScriptHash,
-                minswapPoolPolicyId, minswapPoolSpendScriptHash, minswapOrderSpendScriptHash);
-    }
-
-    public LoansContractRegistry(String blueprintResource,
-                                 String configPolicyId, String lmConfigPolicyId,
-                                 String configAssetName, String smartTokensSpendScriptHash,
-                                 String minswapPoolPolicyId, String minswapPoolSpendScriptHash,
-                                 String minswapOrderSpendScriptHash) {
-        this.blueprintResource = blueprintResource(blueprintResource);
-        this.code = loadUnappliedCompiledCodes(this.blueprintResource);
+        this.code = loadUnappliedCompiledCodes();
         this.configPolicyId = configPolicyId;
         this.lmConfigPolicyId = lmConfigPolicyId;
         this.configAssetName = configAssetName;
@@ -640,7 +625,7 @@ public class LoansContractRegistry {
     private String derive(String validator, PlutusData... params) {
         String unapplied = code.get(validator);
         if (unapplied == null) {
-            throw new IllegalStateException("no such validator in " + blueprintResource + ": " + validator);
+            throw new IllegalStateException("no such validator in " + BLUEPRINT_RESOURCE + ": " + validator);
         }
         ListPlutusData list = ListPlutusData.builder().build();
         for (PlutusData p : params) {
@@ -716,27 +701,13 @@ public class LoansContractRegistry {
         return trimmed;
     }
 
-    private static String blueprintResource(String value) {
-        if (value == null || value.isBlank()) {
-            throw new IllegalStateException("loans.blueprint-resource must name a bundled classpath "
-                    + "artifact; blank does not select one");
-        }
-        String resource = value.trim();
-        if (!LEGACY_BLUEPRINT_RESOURCE.equals(resource) && !MAINNET_BLUEPRINT_RESOURCE.equals(resource)) {
-            throw new IllegalStateException("loans.blueprint-resource '" + value + "' is not one of "
-                    + "the bundled classpath artifacts: " + LEGACY_BLUEPRINT_RESOURCE + ", "
-                    + MAINNET_BLUEPRINT_RESOURCE);
-        }
-        return resource;
-    }
-
-    private static Map<String, String> loadUnappliedCompiledCodes(String resource) {
+    private static Map<String, String> loadUnappliedCompiledCodes() {
         Map<String, String> m = new HashMap<>();
-        try (InputStream is = new ClassPathResource(resource).getInputStream()) {
+        try (InputStream is = new ClassPathResource(BLUEPRINT_RESOURCE).getInputStream()) {
             JsonNode root = new ObjectMapper().readTree(is);
             JsonNode validators = root.get("validators");
             if (validators == null || !validators.isArray()) {
-                throw new IllegalStateException("loans blueprint classpath resource '" + resource
+                throw new IllegalStateException("loans blueprint classpath resource '" + BLUEPRINT_RESOURCE
                         + "' has no validators array");
             }
             for (JsonNode v : validators) {
@@ -747,7 +718,7 @@ public class LoansContractRegistry {
             throw e;
         } catch (Exception e) {
             throw new IllegalStateException("cannot read loans blueprint classpath resource '"
-                    + resource + "'", e);
+                    + BLUEPRINT_RESOURCE + "'", e);
         }
         return m;
     }

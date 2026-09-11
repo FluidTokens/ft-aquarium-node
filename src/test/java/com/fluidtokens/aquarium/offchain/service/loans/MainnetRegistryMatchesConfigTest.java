@@ -22,8 +22,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * artefact we vendor is the artefact they built. Same test as
  * {@link ShippedRegistryMatchesPinnedConfigTest}, pointed at mainnet.
  *
- * <p>Green means the mainnet deployment derives from the selected
- * {@code loans-v4-mainnet.plutus.json} we ship, so every credential downstream is knowable.
+ * <p>Green means the mainnet deployment derives from the single
+ * {@code loans-v4.plutus.json} we ship, so every credential downstream is knowable.
  * <b>Red would mean their mainnet build differs from our vendored artefact</b> — a finding about
  * what is possible at all, not a configuration error.
  *
@@ -32,7 +32,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class MainnetRegistryMatchesConfigTest {
 
-    private static final String BLUEPRINT_RESOURCE = "loans-v4-mainnet.plutus.json";
     /** Quoted first-hand from FluidTokens' own tooling, 2026-09-02. */
     private static final String CONFIG_POLICY_ID = "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416";
     private static final String LM_CONFIG_POLICY_ID = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
@@ -56,8 +55,8 @@ class MainnetRegistryMatchesConfigTest {
     }
 
     private static LoansContractRegistry mainnetRegistry() {
-        return new LoansContractRegistry(BLUEPRINT_RESOURCE,
-                CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
+        return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID,
+                CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
                 MINSWAP_POOL_POLICY, MINSWAP_POOL_SPEND, MINSWAP_ORDER_SPEND);
     }
 

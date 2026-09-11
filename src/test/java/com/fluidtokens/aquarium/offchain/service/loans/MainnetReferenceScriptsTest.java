@@ -59,7 +59,6 @@ class MainnetReferenceScriptsTest {
     private static final String LM_CONFIG_POLICY_ID = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
-    private static final String BLUEPRINT_RESOURCE = "loans-v4-mainnet.plutus.json";
     private static final String MS_POOL_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
     private static final String MS_POOL_SPEND = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
     private static final String MS_ORDER_SPEND = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
@@ -161,8 +160,8 @@ class MainnetReferenceScriptsTest {
     }
 
     private static LoansContractRegistry mainnetRegistry() {
-        return new LoansContractRegistry(BLUEPRINT_RESOURCE,
-                CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
+        return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID,
+                CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
                 MS_POOL_POLICY, MS_POOL_SPEND, MS_ORDER_SPEND);
     }
 

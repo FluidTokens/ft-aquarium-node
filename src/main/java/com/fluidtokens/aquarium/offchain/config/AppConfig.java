@@ -125,13 +125,6 @@ public class AppConfig {
     public static class LoansConfiguration {
 
         /**
-         * Bundled Lending v4 blueprint selected by the active profile. This is a classpath resource,
-         * not a filesystem path; the Java default preserves legacy and historical construction.
-         */
-        @Value("${loans.blueprint-resource:loans-v4.plutus.json}")
-        private String blueprintResource = "loans-v4.plutus.json";
-
-        /**
          * ⛔ <b>{@code loans.enabled} IS GONE (2026-09-04). Lending v4 indexing is UNCONDITIONAL.</b>
          *
          * <p>Giovanni: <i>"we must index loans; if the flag is flipped later we won't see old

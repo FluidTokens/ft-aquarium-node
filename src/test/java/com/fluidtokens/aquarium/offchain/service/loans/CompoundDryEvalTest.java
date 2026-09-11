@@ -27,13 +27,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Offline PlutusV3 evaluation of the compound transaction against <b>recorded on-chain reality</b>.
  *
  * <h2>What is real and what is not</h2>
- * <b>Real</b>, captured from preview on 2026-09-02 and replayed verbatim: the escrow
+ * <b>Captured</b> from preview on 2026-09-02 and replayed verbatim: the escrow
  * ({@code fb482b5a…#2}, 29,109,268 lovelace), the lender bond ({@code fb482b5a…#1}), the pool
- * ({@code 40c06048…#0}), the pool manager ({@code 1ad93a03…#1}), and both config UTxOs
- * ({@code 8dd38e97…#0/#1}) with their real datums. The validators are the vendored blueprint's,
- * derived through the SHIPPED registry.
- * <b>Synthetic</b>: only the bot's own wallet UTxO, because that wallet is ours and its contents are
- * not a property of the candidate. Nothing about the protocol side is invented.
+ * ({@code 40c06048…#0}) and the pool manager ({@code 1ad93a03…#1}).
+ * <b>Synthetic</b>: the bot's own wallet UTxO, plus copies of the two captured config datums with
+ * only ConfigDatum[24] and LMConfigDatum[3] replaced by the credentials derived from the latest
+ * artifact. The captured files and JSON remain unchanged and are asserted separately as the known
+ * old-preview mismatch; this test proves latest-validator behavior, not a deployed preview state.
  *
  * <h2>⚠ What this proves and what it cannot</h2>
  * CCL trap 11: an offline evaluator runs the validators. It does <b>not</b> check fees, min-ada,
@@ -91,7 +91,17 @@ class CompoundDryEvalTest {
 
     private static List<Utxo> universe() {
         return List.of(utxo("escrow"), utxo("bond"), utxo("pool"), utxo("poolManager"),
-                utxo("config"), utxo("lmConfig"), wallet());
+                syntheticConfig(), syntheticLmConfig(), wallet());
+    }
+
+    private static Utxo syntheticConfig() {
+        Utxo captured = utxo("config");
+        return LoanFixtures.syntheticLatestConfigUtxo(captured.getTxHash(), captured.getOutputIndex());
+    }
+
+    private static Utxo syntheticLmConfig() {
+        Utxo captured = utxo("lmConfig");
+        return LoanFixtures.syntheticLatestLmConfigUtxo(captured.getTxHash(), captured.getOutputIndex());
     }
 
     private static CompoundCandidate candidate() {
@@ -112,7 +122,7 @@ class CompoundDryEvalTest {
 
     private static CompoundTransactionBuilder.Request request(BigInteger fee) {
         return new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
-                utxo("config"), utxo("lmConfig"), wallet(), BOT, fee,
+                syntheticConfig(), syntheticLmConfig(), wallet(), BOT, fee,
                 VALID_FROM_SLOT, VALID_TO_SLOT);
     }
 
@@ -206,8 +216,9 @@ class CompoundDryEvalTest {
                 null, POOL_ID, null, null, 0L, true,
                 com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion.POOL_NOT_LIVE, "burned");
 
-        var request = new CompoundTransactionBuilder.Request(excluded, java.util.Map.of(), utxo("bond"), utxo("config"),
-                utxo("lmConfig"), wallet(), BOT, FEE, VALID_FROM_SLOT, VALID_TO_SLOT);
+        var request = new CompoundTransactionBuilder.Request(excluded, java.util.Map.of(), utxo("bond"),
+                syntheticConfig(), syntheticLmConfig(), wallet(), BOT, FEE,
+                VALID_FROM_SLOT, VALID_TO_SLOT);
 
         var e = assertThrows(CompoundTransactionBuilder.RefusedException.class,
                 () -> builder().build(request));

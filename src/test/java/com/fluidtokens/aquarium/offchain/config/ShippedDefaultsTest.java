@@ -120,6 +120,8 @@ class ShippedDefaultsTest {
     void theBaseDocumentShipsTheCurrentMainnetDeployment() throws IOException {
         Map<String, Object> mainnet = base(documents());
 
+        assertNull(loansBlockOf(mainnet).get("blueprint-resource"),
+                "the removed blueprint selector must not reappear in the base document");
         assertEquals("${LOANS_CONFIG_REF_UTXO_TX_HASH:" + MAINNET_CONFIG_TX + "}",
                 at(mainnet, "loans.config.ref-utxo-tx-hash"),
                 "the shipped mainnet config transaction is stale");
@@ -150,6 +152,8 @@ class ShippedDefaultsTest {
     void thePreviewDocumentPreservesItsDeploymentAndBlankCompoundReferences() throws IOException {
         Map<String, Object> preview = preview(documents());
 
+        assertNull(loansBlockOf(preview).get("blueprint-resource"),
+                "the removed blueprint selector must not reappear in the preview document");
         assertEquals("8dd38e97b79cc7c8a3c59400944b7cd9f724876a1d49ea17ffb5e49b3785091c",
                 at(preview, "loans.config.ref-utxo-tx-hash"));
         assertEquals("d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e",
@@ -463,10 +467,13 @@ class ShippedDefaultsTest {
     }
 
     private static Object liquidationBlockOf(Map<String, Object> document) {
+        return loansBlockOf(document).get("liquidation");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> loansBlockOf(Map<String, Object> document) {
         Object loans = document.get("loans");
-        if (!(loans instanceof Map<?, ?> loansMap)) {
-            return null;
-        }
-        return loansMap.get("liquidation");
+        assertTrue(loans instanceof Map, "document has no loans block");
+        return (Map<String, Object>) loans;
     }
 }

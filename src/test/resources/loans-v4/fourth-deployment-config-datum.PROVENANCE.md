@@ -2,7 +2,9 @@
 
 Both fixtures are the **inline datums of the two live preview config UTxOs**, copied verbatim
 from Blockfrost. They are the deployment `application.yaml`'s preview profile is pinned to and
-the one the running pod uses.
+the one observed from the running pod. They remain historical chain evidence: the single latest
+shipped blueprint intentionally differs at ConfigDatum field 24 (pool-sell action) and LMConfigDatum
+field 3 (compound action), pending Fluid's preview migration.
 
 |  | main config | LM config |
 |---|---|---|
@@ -27,11 +29,11 @@ both NFTs — their creation. So there has been no in-place update and no second
 
 > ⚠ **That is a fact with an expiry date.** The admin key can spend these UTxOs at any time and
 > replace the datums in place, at the same policy ids, leaving `application.yaml` still pointing at
-> coordinates that verify cleanly (findings §12). **If that happens these fixtures go stale and
-> `ShippedRegistryMatchesPinnedConfigTest` keeps passing** — it compares code against this snapshot,
-> not against the chain. The live counterpart is `LoansConfigVerifierLiveTest`, which is skipped
-> unless `BLOCKFROST_KEY` is set. **Re-capture these files whenever that test fails, and never the
-> other way round.**
+> coordinates whose datums have changed (findings §12). **If that happens these fixtures go stale
+> while `ShippedRegistryMatchesPinnedConfigTest` continues to prove only the exact recorded
+> old-state mismatch** — it compares code against this snapshot, not against the chain. The live
+> counterpart is `LoansConfigVerifierLiveTest`, which is skipped unless `BLOCKFROST_KEY` is set.
+> **Re-capture these files only from a verified chain response; never edit them to satisfy a test.**
 
 ## Do not confuse these with `preview-config-datum.hex`
 

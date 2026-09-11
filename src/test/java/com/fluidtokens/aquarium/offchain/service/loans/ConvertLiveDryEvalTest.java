@@ -125,7 +125,6 @@ class ConvertLiveDryEvalTest {
     private static final String LM_CONFIG_POLICY = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
     private static final String ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
-    private static final String BLUEPRINT_RESOURCE = "loans-v4-mainnet.plutus.json";
 
     private static final String MS_POOL_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
     private static final String MS_POOL_SPEND = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
@@ -221,8 +220,8 @@ class ConvertLiveDryEvalTest {
     }
 
     private static LoansContractRegistry registry() {
-        return new LoansContractRegistry(BLUEPRINT_RESOURCE,
-                CONFIG_POLICY, LM_CONFIG_POLICY, ASSET_NAME, SMART_TOKENS,
+        return new LoansContractRegistry(CONFIG_POLICY, LM_CONFIG_POLICY,
+                ASSET_NAME, SMART_TOKENS,
                 MS_POOL_POLICY, MS_POOL_SPEND, MS_ORDER_SPEND);
     }
 

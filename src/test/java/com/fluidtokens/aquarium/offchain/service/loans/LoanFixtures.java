@@ -65,11 +65,12 @@ import java.util.Set;
  * ({@code src/test/resources/loans-v4/preview-loan-datums.hex}) back to the exact bytes the chain
  * produced.
  *
- * <h2>Everything is preview</h2>
- * The registry inputs are the live preview config policy ids (the same constants
- * {@code LoansContractDerivationTest} proves against the deployed contracts), so every script hash,
- * address and reward address in a fixture is a real derived one rather than a made-up 28-byte
- * string.
+ * <h2>Preview coordinates, latest artifact</h2>
+ * The registry inputs are preview's fourth-deployment policy ids, while the production resource is
+ * now FluidTokens' latest artifact. Most derived credentials remain the deployed preview values;
+ * pool-sell and LM compound intentionally differ until FluidTokens migrates preview. Captured datum
+ * getters stay byte-honest, and explicitly named synthetic getters adapt only those two fields for
+ * offline tests of the latest validators.
  */
 public final class LoanFixtures {
 
@@ -84,14 +85,12 @@ public final class LoanFixtures {
     // ⛔ RE-POINTED 2026-09-04 FROM THE THIRD DEPLOYMENT, on Giovanni's ruling. These must stay in
     // step with the two recorded config datums this class serves below: the validators compare the
     // hashes they derive from these policy ids against the ones the datum publishes, so a mismatched
-    // pair makes every dry-eval fixture unsatisfiable — and that is exactly what the third-deployment
-    // pairing had become. The vendored loans-v4.plutus.json derives THIS deployment
-    // (ShippedRegistryMatchesPinnedConfigTest), so blueprint and fixtures are now one build.
+    // pair makes dry-eval fixtures unsatisfiable. Since the single-blueprint amendment, the vendored
+    // loans-v4.plutus.json is newer than this deployment at exactly two published action hashes.
     //
-    // ⚠ The third-deployment datums stay on disk under src/test/resources/loans-v4 and are still
-    // used, deliberately: LoansConfigVerifierTest exercises the verifier on a matched third/third
-    // pair, and ShippedRegistryMatchesPinnedConfigTest pins that a third-deployment fixture must NOT
-    // verify against the shipped blueprint. Do not delete them.
+    // ⚠ The third-deployment datums stay on disk under src/test/resources/loans-v4 deliberately.
+    // ShippedRegistryMatchesPinnedConfigTest pins that a third-deployment fixture must NOT verify
+    // against the shipped blueprint. Do not delete or rewrite them.
 
     public static final String CONFIG_POLICY_ID = "d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e";
     public static final String LM_CONFIG_POLICY_ID = "a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13";
@@ -123,8 +122,8 @@ public final class LoanFixtures {
      * <b>A registry built from the coordinates {@code application.yaml} ACTUALLY SHIPS for preview —
      * read from the file, never typed here.</b>
      *
-     * <p>⚠ <b>Since 2026-09-04 this agrees with {@link #registry()}</b>, and that agreement is now an
-     * asserted invariant rather than a coincidence ({@code ShippedPreviewRegistryTest}). It did not
+     * <p>This agrees with {@link #registry()} on coordinates, and that agreement is an asserted
+     * invariant ({@code ShippedPreviewRegistryTest}). It did not
      * always: {@code registry()} was pinned to the THIRD deployment while this parsed the FOURTH, and
      * re-pointing it was an open decision Giovanni ruled on. <b>The two methods still exist for
      * different reasons</b> — this one is a GENERATOR that cannot disagree with what ships, that one
@@ -641,9 +640,8 @@ public final class LoanFixtures {
     /**
      * The main config reference input as {@code utils.get_config_as_data_list} needs to see it: the
      * config NFT in the value (the {@code quantity_of(..) > 0} expectation) and the
-     * <em>real</em> preview {@code ConfigDatum} inline
-     * ({@code src/test/resources/loans-v4/fourth-deployment-config-datum.hex} since the 2026-09-04
-     * re-point — the live datum of the deployment the shipped blueprint actually derives).
+     * captured preview {@code ConfigDatum} inline. These bytes are the old fourth deployment as
+     * observed on chain; they are not rewritten to match the latest artifact.
      */
     public static Utxo configUtxo(String txHash, int outputIndex) {
         return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, fixture("fourth-deployment-config-datum.hex"));
@@ -652,6 +650,40 @@ public final class LoanFixtures {
     /** The LenderManager config reference input, carrying the real preview {@code LMConfigDatum}. */
     public static Utxo lmConfigUtxo(String txHash, int outputIndex) {
         return configUtxo(txHash, outputIndex, LM_CONFIG_POLICY_ID, fixture("fourth-deployment-lm-config-datum.hex"));
+    }
+
+    /**
+     * Synthetic ConfigDatum for exercising the latest validators under preview coordinates.
+     * Starts from the captured fourth-deployment bytes and replaces only the pool-sell credential
+     * that changed in FluidTokens revision 4c4d143. Never use this as chain evidence or in a live rig.
+     */
+    public static Utxo syntheticLatestConfigUtxo(String txHash, int outputIndex) {
+        String datum = replaceCapturedCredential(
+                fixture("fourth-deployment-config-datum.hex"),
+                "db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56",
+                REGISTRY.getPoolSellLenderPositionActionScriptHash(), "ConfigDatum[24]");
+        return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, datum);
+    }
+
+    /**
+     * Synthetic LMConfigDatum paired with {@link #syntheticLatestConfigUtxo(String, int)}.
+     * Replaces only the old preview LM compound credential; captured getters remain untouched.
+     */
+    public static Utxo syntheticLatestLmConfigUtxo(String txHash, int outputIndex) {
+        String datum = replaceCapturedCredential(
+                fixture("fourth-deployment-lm-config-datum.hex"),
+                "dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457",
+                REGISTRY.getLmCompoundActionScriptHash(), "LMConfigDatum[3]");
+        return configUtxo(txHash, outputIndex, LM_CONFIG_POLICY_ID, datum);
+    }
+
+    private static String replaceCapturedCredential(String captured, String oldValue,
+                                                     String latestValue, String field) {
+        int first = captured.indexOf(oldValue);
+        if (first < 0 || first != captured.lastIndexOf(oldValue)) {
+            throw new IllegalStateException(field + " is not uniquely present in the captured datum");
+        }
+        return captured.substring(0, first) + latestValue + captured.substring(first + oldValue.length());
     }
 
     private static Utxo configUtxo(String txHash, int outputIndex, String policyId, String datumHex) {

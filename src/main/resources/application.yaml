@@ -75,9 +75,9 @@ aquarium:
 # on that path and `compound.enabled` on the other. Both off below.
 # (see LoansContractRegistry / docs/lending-v4-findings.md)
 loans:
-  # The compiled validators are bundled per deployment. Mainnet uses FluidTokens revision 4c4d143;
-  # preview keeps the legacy artifact that matches its independently deployed config datums.
-  blueprint-resource: ${LOANS_BLUEPRINT_RESOURCE:loans-v4-mainnet.plutus.json}
+  # The image contains one Lending v4 blueprint: FluidTokens revision 4c4d143. Preview still uses
+  # its older deployment coordinates, so startup verification intentionally reports the two
+  # derived-versus-published mismatches until FluidTokens migrates preview.
   # FluidTokens oracle registry. Same endpoint ada-watch polls for Lending v3. Read-only price
   # feeds for the health-factor engine; it also carries the multisig signatures a liquidation tx
   # needs, which we do not consume yet. NOTE: serves mainnet assets, so on preview most
@@ -465,7 +465,6 @@ aquarium:
       outputIndex: 0
 
 loans:
-  blueprint-resource: ${LOANS_BLUEPRINT_RESOURCE:loans-v4.plutus.json}
   # FluidTokens runs a separate registry for preview. Unlike mainnet it prices tFLDT — the
   # collateral on the loans we index — so health is fully computable here.
   oracle:

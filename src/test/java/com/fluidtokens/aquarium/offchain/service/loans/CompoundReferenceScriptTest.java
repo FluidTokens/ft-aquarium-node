@@ -39,6 +39,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>These tests prove the fix <b>before anything is published on chain</b>, which is the point:
  * publishing reference scripts locks min-ada permanently, so the size arithmetic should be measured
  * against a real built body first rather than trusted from a spreadsheet.
+ * The candidate JSON remains captured preview evidence; evaluation uses explicitly synthetic copies
+ * of its config datums with only the latest blueprint's two changed credentials.
  */
 @Slf4j
 class CompoundReferenceScriptTest {
@@ -84,6 +86,16 @@ class CompoundReferenceScriptTest {
                 POOL_ID, utxo("pool"), utxo("poolManager"), 0L, true, null, "recorded");
     }
 
+    private static Utxo syntheticConfig() {
+        Utxo captured = utxo("config");
+        return LoanFixtures.syntheticLatestConfigUtxo(captured.getTxHash(), captured.getOutputIndex());
+    }
+
+    private static Utxo syntheticLmConfig() {
+        Utxo captured = utxo("lmConfig");
+        return LoanFixtures.syntheticLatestLmConfigUtxo(captured.getTxHash(), captured.getOutputIndex());
+    }
+
     /** A synthetic UTxO publishing a validator, exactly as a real publication would. */
     private static Utxo publishing(PlutusScript script, String seed) throws Exception {
         return Utxo.builder().txHash(seed.repeat(32)).outputIndex(0)
@@ -114,7 +126,7 @@ class CompoundReferenceScriptTest {
      */
     private static Built build(List<PlutusScript> referenced, boolean evaluate) throws Exception {
         List<Utxo> universe = new ArrayList<>(List.of(utxo("escrow"), utxo("bond"), utxo("pool"),
-                utxo("poolManager"), utxo("config"), utxo("lmConfig"), wallet()));
+                utxo("poolManager"), syntheticConfig(), syntheticLmConfig(), wallet()));
         Map<String, TransactionInput> refs = new LinkedHashMap<>();
         String[] seeds = {"11", "22", "33", "44", "55", "66", "77", "88", "99", "aa", "bb"};
         for (int i = 0; i < referenced.size(); i++) {
@@ -131,7 +143,7 @@ class CompoundReferenceScriptTest {
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), evaluator);
         Transaction tx = builder.build(new CompoundTransactionBuilder.Request(candidate(), refs,
-                utxo("bond"), utxo("config"), utxo("lmConfig"), wallet(), BOT,
+                utxo("bond"), syntheticConfig(), syntheticLmConfig(), wallet(), BOT,
                 BigInteger.ZERO, 70_000_000L, 70_000_300L));
         return new Built(tx, tx.serialize().length);
     }

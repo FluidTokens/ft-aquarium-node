@@ -19,13 +19,17 @@ compound action hash from `1551bd4efdef76f3184798331e1c74f6a1cef51955b0c96b8db18
 
 The matching compiled artifact is FluidTokens `ft-cardano-loans-v4` revision
 `4c4d14346b42078ca1680a8ca9c28364319c933b`, whose committed `plutus.json` SHA-256 is
-`63f5fcf395c5a3e76c211e71e8a327aeb1009205e0773b2bdb732ab8020904a5`. The preserved
-preview/legacy artifact SHA-256 is
-`768c951b65f301e697a2d08088b3ef59a596d6471300977371cc1c7258d3fb09`. Applying the mainnet
-parameters to the selected artifact reproduces every published Config and LenderManager hash. The
+`63f5fcf395c5a3e76c211e71e8a327aeb1009205e0773b2bdb732ab8020904a5`. It is the single shipped
+Lending v4 artifact at `src/main/resources/loans-v4.plutus.json`; there is no runtime selector or
+legacy fallback. Applying the mainnet parameters reproduces every published Config and LenderManager hash. The
 captured compound CBOR in `mainnet-compound-script.hex` is byte-identical to the parameterized
 registry output. The convert-action hash remains
 `c3f51e55dd156a4c29a41df0d630b0d8f1c96f396f5a317788a94b70`.
+
+The captured fourth-deployment preview datums are intentionally not rewritten to match this
+artifact. Until Fluid migrates preview, verification reports exactly two old-state differences:
+ConfigDatum field 24 (pool-sell action) and LMConfigDatum field 3 (compound action). The production
+startup guard remains enabled, so that preview profile is not compatible with this artifact yet.
 
 The actual reward account, `stake17xknfs7m20fqc83k34l75erjfg9syjdkqwjhere2zectmfs2w9fv9`,
 was reported registered (`active=false`) at `2026-09-11T19:47:54.826700Z`. Its latest registration
