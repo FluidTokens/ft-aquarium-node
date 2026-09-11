@@ -174,15 +174,19 @@ jobs:
       #   before  139 files / 1098 tests / 0 failures / 45 skipped
       #   after   139 files / 1105 tests / 0 failures / 45 skipped   (+6 in MarketCoverageReporterTest,
       #                                                              +1 in LiquidationExecutorTest)
-      # NO class was added, so the floor stays 139 -- and that is the case worth stating out loud,
-      # because "the floor did not move" is indistinguishable from "nobody re-measured" unless the
-      # measurement is written down. Orphan check re-run: 139 files, 0 orphans.
+      # No class was added in r2, so that branch's floor stayed 139. That is the case worth stating
+      # out loud, because "the floor did not move" is indistinguishable from "nobody re-measured"
+      # unless the measurement is written down. Orphan check re-run: 139 files, 0 orphans.
+      #
+      # FAB-81 reconciliation on current main measured 139 files before integration and 140 after:
+      # MarketCoverageReporterTest is the one added class. Final cold run: 140 files / 1117 tests /
+      # 0 failures / 0 errors / 46 skipped, with 0 orphans. The floor therefore rises to 140.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '139'
+          RESULT_FILE_FLOOR: '140'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
