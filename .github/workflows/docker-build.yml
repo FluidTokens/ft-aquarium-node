@@ -139,7 +139,7 @@ jobs:
       # src/test/java. Raise the floor deliberately when classes are added; a drop is a deletion to
       # justify, never a number to edit away. (CLAUDE.md `## Commands`.)
       #
-      # Floor measured 2026-09-10 on THIS tree, keyless (the shape CI runs in): 138 files.
+      # Floor measured 2026-09-11 on THIS tree, keyless (the shape CI runs in): 140 files.
       #
       # (config/BuildProvenanceTest carries 11 tests: 9 at round 1, plus two the rework added -- one
       # asserting the startup wiring actually installs the banner's default properties, one asserting
@@ -150,14 +150,43 @@ jobs:
       #   135  base e75ecf9 (#23)
       #   +1   EnvGatedRigReachabilityTest        (the CI-gate slice, squashed into main as #25)
       #   +1   ConvertLiquidationRouterTest       (#24)
-      #   +1   config/BuildProvenanceTest         (this slice, 11 tests)
-      #   = 138
+      #   +1   config/BuildProvenanceTest         (11 tests)
+      #   +1   service/loans/MarketCoverageReporterTest  (FAB-81-1, 8 tests at round 1; 14 after
+      #                                                   the r2 rework -- same one class, same floor)
+      #   = 139
+      #
+      # FAB-81-1 measured both sides of its own change, keyless, with `rm -rf build/test-results/test`
+      # then `./gradlew cleanTest test`, counting the XML rather than reading BUILD SUCCESSFUL:
+      #   before  138 files / 1089 tests / 0 failures / 45 skipped
+      #   after   139 files / 1098 tests / 0 failures / 45 skipped   (+1 class, +8 tests there,
+      #                                                              +1 in LiquidationExecutorTest)
+      #
+      # ⚠ THE TEST TOTALS ABOVE WERE RE-MEASURED ON RE-CUT. The slice was built on main before PR #28
+      # (the anticipate-rig park) merged, and was cherry-picked onto main afterwards. Its own run read
+      # 1087 -> 1096; on this tree, which carries #28's two extra park tests, the same change reads
+      # 1089 -> 1098. The FILE counts and the delta (+1 class, +9 tests) are unchanged.
+      # Recorded rather than corrected silently: a number measured on a base that has since moved is
+      # not wrong, it is a measurement OF SOMETHING ELSE -- and that is exactly how a stale figure
+      # survives, by having been true once.
+      #
+      #
+      # FAB-81-1 r2 (the rework) measured both sides again on d3abf03, keyless, same procedure:
+      #   before  139 files / 1098 tests / 0 failures / 45 skipped
+      #   after   139 files / 1105 tests / 0 failures / 45 skipped   (+6 in MarketCoverageReporterTest,
+      #                                                              +1 in LiquidationExecutorTest)
+      # No class was added in r2, so that branch's floor stayed 139. That is the case worth stating
+      # out loud, because "the floor did not move" is indistinguishable from "nobody re-measured"
+      # unless the measurement is written down. Orphan check re-run: 139 files, 0 orphans.
+      #
+      # FAB-81 reconciliation on current main measured 139 files before integration and 140 after:
+      # MarketCoverageReporterTest is the one added class. Final cold run: 140 files / 1117 tests /
+      # 0 failures / 0 errors / 46 skipped, with 0 orphans. The floor therefore rises to 140.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '138'
+          RESULT_FILE_FLOOR: '140'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
