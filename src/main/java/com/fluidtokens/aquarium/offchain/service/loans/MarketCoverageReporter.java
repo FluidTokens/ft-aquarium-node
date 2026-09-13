@@ -76,9 +76,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * has a real ~60–80 s price blackout every five minutes, upstream of us, which at the default cycle
  * makes a non-ada market flip unservable and back roughly 288 times a day. A WARN on each flip turns
  * Giovanni's floor into noise on the first network the bot runs on. So the condition must hold for
- * {@link #DEFAULT_WARN_AFTER_CYCLES} <b>consecutive</b> cycles before the first WARN, and the
- * matching INFO is emitted only if that WARN was reached — a blackout that never warned never
- * recovers out loud either.
+ * the cadence-derived number from {@link #warnAfterCyclesFor(long)} of <b>consecutive</b> cycles
+ * before the first WARN, and the matching INFO is emitted only if that WARN was reached — a
+ * blackout that never warned never recovers out loud either.
  * <p>
  * <b>The gauge still goes to 1 on the first cycle.</b> It is the continuously-true thing, and an
  * alert rule holds it with its own {@code for:} clause; the log is the thing that cannot be held
@@ -112,25 +112,51 @@ public class MarketCoverageReporter {
 
     /**
      * The cardinality ceiling: at most this many {@code (market, leg, reason)} series at once.
-     * Generous against reality — markets are tens and there are four unservable reasons — and
-     * finite against an adversary, which is the only property that matters here. Slots are
-     * reclaimed by eviction, so this is a concurrency ceiling and not a lifetime quota.
+     * Generous against reality — markets are tens and there are four unservable reasons — and finite
+     * in this JVM. It is <b>not</b> finite in the metrics backend: eviction removes the local meter,
+     * but Prometheus retains every distinct historical label set for its retention period, and the
+     * {@code market} label is derived from on-chain data. That cardinality-retention residue is
+     * backlogged; this bound, its eviction policy and their behaviour are unchanged here.
      */
     static final int MAX_TRACKED_SERIES = 256;
 
     /**
-     * How many consecutive cycles a triple must stay unservable before the first WARN.
+     * Measured upper end of preview's ~60–80 s Charli3 feed blackouts every five minutes, upstream
+     * of this service (design §6.7–6.8). This is observed provenance, not a guessed tuning value.
+     */
+    static final int MAX_BLACKOUT_SECONDS = 80;
+
+    /**
+     * How many consecutive cycles a triple must stay unservable before the first WARN at the
+     * default 60 s cadence. This is the value {@link #warnAfterCyclesFor(long)} derives there.
      *
-     * <p>Three, against a measured adversary rather than a guess: preview's oracle blackout lasts
-     * ~60–80 s and the default cycle is 60 s, so a blackout spans one or two consecutive cycles and
-     * three is the smallest value a single blackout cannot reach. Overridable with
+     * <p>Overridable with
      * {@link #WARN_AFTER_CYCLES_PROPERTY} — set it to 1 to have the log follow the gauge exactly, on
      * a network with no blackout.
      */
     static final int DEFAULT_WARN_AFTER_CYCLES = 3;
 
-    /** The property {@link #DEFAULT_WARN_AFTER_CYCLES} is the default of; asserted equal in test. */
+    /** Operator override; zero or absence selects the cadence-derived WARN gate. */
     static final String WARN_AFTER_CYCLES_PROPERTY = "loans.market-coverage.warn-after-cycles";
+
+    /**
+     * Derives the first consecutive-cycle count that one measured blackout cannot reach.
+     *
+     * <p>A blackout of {@code D} seconds, observed by scans at spacing {@code C}, falls on at most
+     * {@code floor(D/C) + 1} consecutive scans: an arithmetic progression of spacing {@code C}
+     * places at most that many points inside an interval of length {@code D}. Therefore
+     * {@code floor(D/C) + 2} is the first count a single blackout cannot reach. Spring's
+     * {@code @Scheduled(fixedDelay...)} measures the gap between completions, so the real period is
+     * at least {@code C}; this derivation consequently errs toward fewer observations, which is the
+     * conservative direction. A non-positive cadence falls back to the production default rather
+     * than producing a nonsensical debounce or preventing the node from booting.
+     */
+    static int warnAfterCyclesFor(long delaySeconds) {
+        if (delaySeconds <= 0) {
+            return DEFAULT_WARN_AFTER_CYCLES;
+        }
+        return (int) (MAX_BLACKOUT_SECONDS / delaySeconds) + 2;
+    }
 
     private final MeterRegistry registry;
 
@@ -149,12 +175,17 @@ public class MarketCoverageReporter {
 
     @Autowired
     public MarketCoverageReporter(MeterRegistry registry,
-                                  @Value("${loans.market-coverage.warn-after-cycles:3}")
-                                  int warnAfterCycles) {
+                                  @Value("${loans.market-coverage.warn-after-cycles:0}")
+                                  int warnAfterCycles,
+                                  @Value("${loans.liquidation.delay-seconds:60}")
+                                  long delaySeconds) {
         this.registry = Objects.requireNonNull(registry, "registry");
         // Clamped rather than rejected: a nonsensical value here must not stop an operator's node
         // booting over a metric, and 1 is the strictest thing the gate can mean.
-        this.warnAfterCycles = Math.max(1, warnAfterCycles);
+        int effectiveWarnAfterCycles = warnAfterCycles == 0
+                ? warnAfterCyclesFor(delaySeconds)
+                : warnAfterCycles;
+        this.warnAfterCycles = Math.max(1, effectiveWarnAfterCycles);
         Gauge.builder(UNTRACKED, untracked, AtomicInteger::doubleValue)
                 .description("Distinct (market, leg, reason) triples the bot could not serve and "
                         + "could not give a metric series to, because every series was already "
@@ -162,9 +193,9 @@ public class MarketCoverageReporter {
                 .register(registry);
     }
 
-    /** Test seam; {@code @Value} owns {@code warnAfterCycles} in production. */
+    /** Test seam; 60 s is the production-default cadence used when Spring does not supply one. */
     MarketCoverageReporter(MeterRegistry registry) {
-        this(registry, DEFAULT_WARN_AFTER_CYCLES);
+        this(registry, 0, 60);
     }
 
     /**

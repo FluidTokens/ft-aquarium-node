@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
@@ -28,6 +29,7 @@ import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Parameter;
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -390,6 +392,45 @@ class MarketCoverageReporterTest {
                 () -> "and a recovery from something never warned about is not news: " + infos(logged));
     }
 
+    /**
+     * At a 30 s cadence, an 80 s blackout can be observed on three consecutive cycles. The WARN
+     * gate must therefore be derived from that cadence instead of retaining the default-cadence
+     * value of three.
+     */
+    @Test
+    void anEightySecondBlackoutAtThirtySecondCadenceDoesNotWarn() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(MetricsAutoConfiguration.class,
+                        CompositeMeterRegistryAutoConfiguration.class,
+                        PrometheusMetricsExportAutoConfiguration.class))
+                .withUserConfiguration(MarketCoverageReporter.class)
+                .withPropertyValues("loans.liquidation.delay-seconds=30")
+                .run(context -> {
+                    List<ILoggingEvent> logged = capture();
+                    MarketCoverageReporter reporter = context.getBean(MarketCoverageReporter.class);
+                    LiquidationAssessment blacked = excluded(USDM_UNIT,
+                            LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE,
+                            "principal leg: oracle feed for " + USDM_UNIT
+                                    + " is outside its validity window at 1757500000000");
+
+                    // Observations at t=0, 30 and 60 all fit inside the 80-second blackout.
+                    reporter.report(List.of(blacked));
+                    reporter.report(List.of(blacked));
+                    reporter.report(List.of(blacked));
+
+                    assertTrue(warnings(logged).isEmpty(),
+                            () -> "an 80 s blackout at a 30 s cadence must not WARN; emitted: "
+                                    + warnings(logged));
+                });
+    }
+
+    @Test
+    void theDefaultCadenceDerivationPreservesTheExistingWarnGate() {
+        assertEquals(MarketCoverageReporter.DEFAULT_WARN_AFTER_CYCLES,
+                MarketCoverageReporter.warnAfterCyclesFor(60),
+                "the 60 s production default must continue to require exactly three cycles");
+    }
+
     // =====================================================================================
     // 3. cardinality — the invariant that makes this metric safe to ship
     // =====================================================================================
@@ -574,28 +615,35 @@ class MarketCoverageReporterTest {
                 });
     }
 
-    /**
-     * ⚠ The {@code @Value} default and {@link MarketCoverageReporter#DEFAULT_WARN_AFTER_CYCLES} are
-     * two copies of one number — the annotation cannot reference the constant — and every test in
-     * this class exercises the constant while <b>production only ever reads the annotation</b>. If
-     * they drift, the blackout suppression is measured here and absent on the node.
-     */
+    /** The reporter must derive from the exact cadence property that schedules its caller. */
     @Test
-    void theWarnGateDefaultInTheAnnotationMatchesTheConstantTheTestsUse() {
+    void theWarnGateDerivesFromTheLiquidationCadenceProperty() throws NoSuchFieldException {
         Constructor<?> injected = null;
         for (Constructor<?> candidate : MarketCoverageReporter.class.getDeclaredConstructors()) {
-            if (candidate.getParameterCount() == 2) {
+            if (candidate.getParameterCount() == 3) {
                 injected = candidate;
             }
         }
-        assertTrue(injected != null, "the two-argument constructor is the one Spring uses");
+        assertTrue(injected != null, "the three-argument constructor is the one Spring uses");
 
         Parameter gate = injected.getParameters()[1];
-        Value value = gate.getAnnotation(Value.class);
-        assertTrue(value != null, "the WARN gate must be configurable, per the blackout finding");
-        assertEquals("${" + MarketCoverageReporter.WARN_AFTER_CYCLES_PROPERTY + ":"
-                        + MarketCoverageReporter.DEFAULT_WARN_AFTER_CYCLES + "}", value.value(),
-                "the property name and its default must be the ones the tests and the javadoc claim");
+        Value gateValue = gate.getAnnotation(Value.class);
+        assertTrue(gateValue != null, "the WARN gate must be configurable, per the blackout finding");
+        assertEquals("${" + MarketCoverageReporter.WARN_AFTER_CYCLES_PROPERTY + ":0}",
+                gateValue.value(), "zero is the sentinel that enables cadence-derived debounce");
+
+        Parameter reporterCadence = injected.getParameters()[2];
+        Value reporterCadenceValue = reporterCadence.getAnnotation(Value.class);
+        assertTrue(reporterCadenceValue != null,
+                "the reporter must receive the cadence at which it is called");
+
+        Field configuredCadence = AppConfig.LiquidationConfiguration.class
+                .getDeclaredField("delaySeconds");
+        Value configuredCadenceValue = configuredCadence.getAnnotation(Value.class);
+        assertTrue(configuredCadenceValue != null,
+                "the liquidation configuration must declare its cadence property");
+        assertEquals(configuredCadenceValue.value(), reporterCadenceValue.value(),
+                "the reporter cadence property must be byte-identical to the scheduler's source");
     }
 
     // =====================================================================================
