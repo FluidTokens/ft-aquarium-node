@@ -71,6 +71,10 @@ dependencies {
 
 	implementation 'org.postgresql:postgresql:42.6.0'
 	testImplementation 'com.h2database:h2:2.1.214'
+	// Flyway already ships at runtime (transitively, via the yaci-store starters). This puts it on the
+	// TEST compile classpath so the migration under src/main/resources/db/migration can be executed by
+	// a test rather than first executed on an operator's node at boot.
+	testImplementation 'org.flywaydb:flyway-core'
 
 	// Already on the runtime classpath via cardano-client-lib; declared here only so
 	// OracleFeedSignatureTest can verify the oracle's ed25519 signatures at compile time.

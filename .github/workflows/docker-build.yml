@@ -200,11 +200,23 @@ jobs:
       # briefly carrying a floor that does not match its own reality, so a later deletion would be
       # invisible to the guard. Neither order is safe separately.
       #
+      # The loan-view enrichment branch measured both sides cold, keyless, same procedure:
+      #   before  main a54c81b   140 files / 1118 tests / 0 failures / 0 errors / 46 skipped
+      #   after   token metadata 144 files / 1145 tests / 0 failures / 0 errors / 46 skipped
+      # Four added classes: AssetDisplayTest, TokenMetadataServiceTest, TokenMetadataMigrationTest,
+      # TokenMetadataConfigTest. Measured alone against main that reads 144 files.
+      #
+      # ⚠ ON `develop` THESE TWO LINES OF WORK STACK, SO THE COUNTS ADD AND NEITHER BRANCH'S OWN
+      # NUMBER IS THE FLOOR. 140 base + 1 (ConvertLiveDryEvalRepointTest) + 4 here = 145, and the
+      # rendering commit that follows adds a fifth. Taking either branch's figure unchanged would
+      # leave the floor BELOW the tree it guards -- which is the one direction that silently
+      # tolerates a class disappearing.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '141'
+          RESULT_FILE_FLOOR: '145'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
