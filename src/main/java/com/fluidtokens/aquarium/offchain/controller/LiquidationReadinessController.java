@@ -30,6 +30,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -173,17 +174,20 @@ public class LiquidationReadinessController {
                         (first, duplicate) -> first));
 
         MarketGate gate = new MarketGate(liquidationConfiguration);
+        // ⛔ ONE render, ONE lookup per distinct pair. See resolvePool: this map lives exactly as long
+        // as this request and is never shared between renders, so nothing it holds can go stale.
+        Map<String, PoolLookup> poolMemo = new HashMap<>();
         List<Row> rows = new ArrayList<>();
         for (Loan loan : result.loanCensus().loans()) {
             LiquidationAssessment assessment = byLoanId.get(loan.loanId());
-            rows.add(row(loan, assessment, healthService.health(loan, now), gate, now));
+            rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo, now));
         }
         rows.sort(Comparator.comparingDouble(Row::sortKey));
         return rows;
     }
 
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
-                    MarketGate gate, long now) {
+                    MarketGate gate, Map<String, PoolLookup> poolMemo, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
 
@@ -242,7 +246,7 @@ public class LiquidationReadinessController {
                     + "and fronts nothing";
         } else {
             var action = gate.actionFor(datum.principalAsset());
-            var pool = resolvePool(collateralAsset, datum.principalAsset());
+            var pool = resolvePool(collateralAsset, datum.principalAsset(), poolMemo);
             if (action == AppConfig.LiquidationConfiguration.Action.CONVERT && pool.available()) {
                 route = "CONVERT";
                 routeDetail = "a Minswap pool exists for this pair, so the bot creates a swap order and "
@@ -266,10 +270,49 @@ public class LiquidationReadinessController {
                 route, routeDetail, advance);
     }
 
-    private record PoolLookup(boolean available, String reason) {
+    record PoolLookup(boolean available, String reason) {
     }
 
-    private PoolLookup resolvePool(AssetType collateral, AssetType principal) {
+    /**
+     * ⛔ <b>The pool question is per PAIR; this page was asking it per ROW.</b>
+     *
+     * <p>{@link MinswapPoolResolver#resolveEitherOrder} is a Blockfrost round trip — one call, or
+     * <b>two</b> when the first asset ordering 404s, which is always the case for a pair that has no
+     * pool at all ({@code compute_lp_asset_name} is order-sensitive). It holds no cache. So a table of
+     * N loans cost <b>N to 2N Blockfrost calls per render</b>, and every loan sharing a pair re-asked
+     * an identical question and received an identical answer.
+     *
+     * <p>This memo is <b>request-scoped</b>: created in {@link #rows}, discarded when the response is.
+     * Two loans on the same pair now produce one lookup instead of two, and the data rendered is
+     * byte-for-byte what the page would have shown anyway — <b>same request, same instant</b>.
+     *
+     * <h2>⚠ Why this is a dedupe and deliberately NOT a TTL cache</h2>
+     * {@code resolveEitherOrder} returns the pool UTxO, and <b>a pool UTxO carries reserves</b>.
+     * Reserves held across renders are stale reserves, and the same resolver is injected into
+     * {@link com.fluidtokens.aquarium.offchain.service.loans.ConvertLiquidationRouter} on the convert
+     * <b>build</b> path — where stale reserves would price a real transaction. A per-request map
+     * cannot reach that path and cannot outlive the answer it belongs to; a TTL cache would be a
+     * different and money-shaped change. <b>Do not promote this to a field.</b>
+     */
+    PoolLookup resolvePool(AssetType collateral, AssetType principal,
+                           Map<String, PoolLookup> poolMemo) {
+        return poolMemo.computeIfAbsent(pairKey(collateral, principal),
+                key -> lookupPool(collateral, principal));
+    }
+
+    /**
+     * Order-independent key. {@code resolveEitherOrder} tries both orderings and the pool exists under
+     * exactly one of them, so {@code (ada, fldt)} and {@code (fldt, ada)} are the same question and
+     * must share one entry — keying on the arguments as given would miss half the duplicates.
+     */
+    static String pairKey(AssetType collateral, AssetType principal) {
+        String a = collateral.toUnit();
+        String b = principal.toUnit();
+        return a.compareTo(b) <= 0 ? a + "|" + b : b + "|" + a;
+    }
+
+    // Package-private so the dedupe can be proven against a counting resolver without a Spring context.
+    PoolLookup lookupPool(AssetType collateral, AssetType principal) {
         MinswapPoolResolver resolver = poolResolver.getIfAvailable();
         if (resolver == null) {
             return new PoolLookup(false, "this node cannot convert — loans.minswap.* is unset or "
