@@ -1,6 +1,9 @@
 package com.fluidtokens.aquarium.offchain.controller;
 
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetDisplay;
+import com.fluidtokens.aquarium.offchain.model.LoanAge;
+import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
@@ -19,6 +22,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanService;
 import com.fluidtokens.aquarium.offchain.service.loans.MarketGate;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
+import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -30,6 +34,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -99,7 +104,14 @@ public class LiquidationReadinessController {
                       // LOAN'S OWN PRINCIPAL asset (principalUnit, above), never lovelace — a USDM loan
                       // reported here in a field named "…Lovelace" was 4.63x wrong in the wrong unit,
                       // read literally as lovelace by an operator acting on it.
-                      BigInteger advancePrincipalAmount) {
+                      BigInteger advancePrincipalAmount,
+                      // ---- display enrichment ----------------------------------------------------
+                      // The figures above stay exactly as they were: raw, unscaled, in the loan's own
+                      // units, because everything downstream reasons about them. These three are what
+                      // the page renders, and nothing computes with them.
+                      LoanAge age,
+                      AssetDisplay principalDisplay,
+                      AssetDisplay collateralDisplay) {
 
         /** Sorting key: lower is closer to liquidation. Unknown health sorts last, never first. */
         public double sortKey() {
@@ -112,6 +124,7 @@ public class LiquidationReadinessController {
     private final ObjectProvider<LoanHealthService> loanHealthService;
     private final ObjectProvider<FluidOracleClient> oracleClient;
     private final ObjectProvider<MinswapPoolResolver> poolResolver;
+    private final ObjectProvider<TokenMetadataService> tokenMetadata;
     private final ObjectProvider<LoansContractRegistry> registry;
     private final AppConfig.LiquidationConfiguration liquidationConfiguration;
     private final AppConfig.Network network;
@@ -121,6 +134,7 @@ public class LiquidationReadinessController {
                                           ObjectProvider<LoanHealthService> loanHealthService,
                                           ObjectProvider<FluidOracleClient> oracleClient,
                                           ObjectProvider<MinswapPoolResolver> poolResolver,
+                                          ObjectProvider<TokenMetadataService> tokenMetadata,
                                           ObjectProvider<LoansContractRegistry> registry,
                                           AppConfig.LiquidationConfiguration liquidationConfiguration,
                                           AppConfig.Network network) {
@@ -129,6 +143,7 @@ public class LiquidationReadinessController {
         this.loanHealthService = loanHealthService;
         this.oracleClient = oracleClient;
         this.poolResolver = poolResolver;
+        this.tokenMetadata = tokenMetadata;
         this.registry = registry;
         this.liquidationConfiguration = liquidationConfiguration;
         this.network = network;
@@ -173,17 +188,24 @@ public class LiquidationReadinessController {
                         (first, duplicate) -> first));
 
         MarketGate gate = new MarketGate(liquidationConfiguration);
+        // ⛔ ONE render, ONE lookup per distinct pair. See resolvePool: this map lives exactly as long
+        // as this request and is never shared between renders, so nothing it holds can go stale.
+        Map<String, PoolLookup> poolMemo = new HashMap<>();
+        // Same reasoning as the pool memo one level down: an asset's ticker and scale are a property
+        // of the ASSET, not of the row, and a table is mostly two or three distinct assets.
+        Map<String, TokenMetadata> metadataMemo = new HashMap<>();
         List<Row> rows = new ArrayList<>();
         for (Loan loan : result.loanCensus().loans()) {
             LiquidationAssessment assessment = byLoanId.get(loan.loanId());
-            rows.add(row(loan, assessment, healthService.health(loan, now), gate, now));
+            rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo, metadataMemo, now));
         }
         rows.sort(Comparator.comparingDouble(Row::sortKey));
         return rows;
     }
 
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
-                    MarketGate gate, long now) {
+                    MarketGate gate, Map<String, PoolLookup> poolMemo,
+                    Map<String, TokenMetadata> metadataMemo, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
 
@@ -242,7 +264,7 @@ public class LiquidationReadinessController {
                     + "and fronts nothing";
         } else {
             var action = gate.actionFor(datum.principalAsset());
-            var pool = resolvePool(collateralAsset, datum.principalAsset());
+            var pool = resolvePool(collateralAsset, datum.principalAsset(), poolMemo);
             if (action == AppConfig.LiquidationConfiguration.Action.CONVERT && pool.available()) {
                 route = "CONVERT";
                 routeDetail = "a Minswap pool exists for this pair, so the bot creates a swap order and "
@@ -263,13 +285,74 @@ public class LiquidationReadinessController {
                 healthFactor, health.currentLtvPercent(), health.liquidatable(),
                 healthFactor == null ? healthUnknown : null,
                 feeTokens, feeValue, feeUnknown,
-                route, routeDetail, advance);
+                route, routeDetail, advance,
+                LoanAge.since(datum.lendDate(), now),
+                display(datum.principalAsset().toUnit(), datum.principalAmount(), metadataMemo),
+                display(collateralAsset.toUnit(), loan.collateralAmount(), metadataMemo));
     }
 
-    private record PoolLookup(boolean available, String reason) {
+    /**
+     * The rendered form of one amount: scaled when a registry published a scale, raw and marked when
+     * nothing did. Never a guessed scale — see {@link AssetDisplay#of}.
+     *
+     * <p>When the token metadata service is absent the amount still renders, as raw base units with
+     * the unknown marker. That is the honest degradation: the page keeps working and says that it does
+     * not know, rather than inventing a scale to look complete.
+     */
+    private AssetDisplay display(String unit, BigInteger amount, Map<String, TokenMetadata> memo) {
+        TokenMetadata metadata = memo.computeIfAbsent(unit, u -> {
+            TokenMetadataService service = tokenMetadata.getIfAvailable();
+            if (service != null) {
+                return service.lookup(u);
+            }
+            return "lovelace".equals(u) ? TokenMetadata.ada() : TokenMetadata.unknown(u);
+        });
+        return AssetDisplay.of(amount, metadata);
     }
 
-    private PoolLookup resolvePool(AssetType collateral, AssetType principal) {
+    record PoolLookup(boolean available, String reason) {
+    }
+
+    /**
+     * ⛔ <b>The pool question is per PAIR; this page was asking it per ROW.</b>
+     *
+     * <p>{@link MinswapPoolResolver#resolveEitherOrder} is a Blockfrost round trip — one call, or
+     * <b>two</b> when the first asset ordering 404s, which is always the case for a pair that has no
+     * pool at all ({@code compute_lp_asset_name} is order-sensitive). It holds no cache. So a table of
+     * N loans cost <b>N to 2N Blockfrost calls per render</b>, and every loan sharing a pair re-asked
+     * an identical question and received an identical answer.
+     *
+     * <p>This memo is <b>request-scoped</b>: created in {@link #rows}, discarded when the response is.
+     * Two loans on the same pair now produce one lookup instead of two, and the data rendered is
+     * byte-for-byte what the page would have shown anyway — <b>same request, same instant</b>.
+     *
+     * <h2>⚠ Why this is a dedupe and deliberately NOT a TTL cache</h2>
+     * {@code resolveEitherOrder} returns the pool UTxO, and <b>a pool UTxO carries reserves</b>.
+     * Reserves held across renders are stale reserves, and the same resolver is injected into
+     * {@link com.fluidtokens.aquarium.offchain.service.loans.ConvertLiquidationRouter} on the convert
+     * <b>build</b> path — where stale reserves would price a real transaction. A per-request map
+     * cannot reach that path and cannot outlive the answer it belongs to; a TTL cache would be a
+     * different and money-shaped change. <b>Do not promote this to a field.</b>
+     */
+    PoolLookup resolvePool(AssetType collateral, AssetType principal,
+                           Map<String, PoolLookup> poolMemo) {
+        return poolMemo.computeIfAbsent(pairKey(collateral, principal),
+                key -> lookupPool(collateral, principal));
+    }
+
+    /**
+     * Order-independent key. {@code resolveEitherOrder} tries both orderings and the pool exists under
+     * exactly one of them, so {@code (ada, fldt)} and {@code (fldt, ada)} are the same question and
+     * must share one entry — keying on the arguments as given would miss half the duplicates.
+     */
+    static String pairKey(AssetType collateral, AssetType principal) {
+        String a = collateral.toUnit();
+        String b = principal.toUnit();
+        return a.compareTo(b) <= 0 ? a + "|" + b : b + "|" + a;
+    }
+
+    // Package-private so the dedupe can be proven against a counting resolver without a Spring context.
+    PoolLookup lookupPool(AssetType collateral, AssetType principal) {
         MinswapPoolResolver resolver = poolResolver.getIfAvailable();
         if (resolver == null) {
             return new PoolLookup(false, "this node cannot convert — loans.minswap.* is unset or "

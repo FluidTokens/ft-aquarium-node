@@ -27,6 +27,9 @@ spring:
     schemas: ${DB_SCHEMA:public}
     locations:
       - classpath:db/store/{vendor}
+      # This node's own tables, kept clear of yaci-store's version range (V1000+). `out-of-order`
+      # below is what lets two independently-versioned sets share one schema history.
+      - classpath:db/migration/{vendor}
     out-of-order: true
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/aquarium}
@@ -206,6 +209,11 @@ loans:
   # coordinates absent it renders a single line saying so rather than failing to start.
   ui:
     enabled: ${LOANS_UI_ENABLED:false}
+    # ⛔ Reached ONLY when the UI is on. TokenMetadataConfig is conditional on loans.ui.enabled, so a
+    # node with the UI off builds no client at all — there is nothing present that could call out.
+    token-registry:
+      url: ${LOANS_UI_TOKEN_REGISTRY_URL:https://tokens.cardano.org}
+      timeout-seconds: ${LOANS_UI_TOKEN_REGISTRY_TIMEOUT_SECONDS:5}
 
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
