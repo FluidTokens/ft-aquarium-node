@@ -13,6 +13,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
+import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -22,6 +23,8 @@ import org.springframework.context.annotation.Import;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Optional;
 
@@ -276,5 +279,129 @@ class LiquidationReadinessControllerTest {
 
     private static TransactionInput input(String prefix) {
         return LoanFixtures.input(prefix.repeat(32), 0);
+    }
+
+    // ================================================================================================
+    // The pool lookup is per PAIR, and this page was paying for it per ROW
+    // ================================================================================================
+
+    /**
+     * A resolver that answers instantly and counts. The real one is a Blockfrost round trip — one call,
+     * or two when the first asset ordering 404s — and holds no cache of any kind.
+     */
+    private static final class CountingPoolResolver extends MinswapPoolResolver {
+        private int calls;
+        private final boolean poolExists;
+
+        private CountingPoolResolver(boolean poolExists) {
+            super(null, "addr_pool", "00".repeat(28));
+            this.poolExists = poolExists;
+        }
+
+        @Override
+        public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
+            calls++;
+            return poolExists ? Optional.of(new ResolvedPool(null, null, "lp")) : Optional.empty();
+        }
+    }
+
+    private static LiquidationReadinessController controllerWithPool(MinswapPoolResolver resolver) {
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        return new LiquidationReadinessController(provide(null), provide(null), provide(null),
+                provide(null), provide(resolver), provide(null), null, network);
+    }
+
+    /**
+     * ⛔ <b>THE CALL COUNT COLLAPSES.</b> Two loans on the same pair asked the chain the same question
+     * twice and got the same answer twice. Within one render they now ask once.
+     *
+     * <p>Before this memo a table of N loans cost <b>N to 2N Blockfrost calls per render</b> — two
+     * whenever a pair has no pool, because {@code compute_lp_asset_name} is order-sensitive and both
+     * orderings must 404 before the answer is known.
+     */
+    @Test
+    void twoLoansOnOnePairProduceOneLookupRatherThanTwo() {
+        CountingPoolResolver resolver = new CountingPoolResolver(true);
+        LiquidationReadinessController controller = controllerWithPool(resolver);
+        Map<String, LiquidationReadinessController.PoolLookup> memo = new HashMap<>();
+
+        AssetType collateral = AssetType.ada();
+        AssetType principal = new AssetType("11".repeat(28), "464c4454");
+
+        controller.resolvePool(collateral, principal, memo);
+        controller.resolvePool(collateral, principal, memo);
+        controller.resolvePool(collateral, principal, memo);
+
+        assertEquals(1, resolver.calls,
+                "three rows on one pair must reach the resolver once, not three times");
+    }
+
+    /**
+     * ⛔ <b>THE LOAD-BEARING HALF.</b> The whole claim is "identical data, fewer calls", so a memo that
+     * returned something different from what the page would have shown would be a defect dressed as an
+     * optimisation. The second read must equal the first, and equal what an unmemoised call returns.
+     */
+    @Test
+    void theMemoReturnsExactlyWhatAFreshLookupWouldHaveReturned() {
+        AssetType collateral = AssetType.ada();
+        AssetType principal = new AssetType("11".repeat(28), "464c4454");
+
+        for (boolean poolExists : new boolean[]{true, false}) {
+            CountingPoolResolver resolver = new CountingPoolResolver(poolExists);
+            LiquidationReadinessController controller = controllerWithPool(resolver);
+
+            LiquidationReadinessController.PoolLookup direct = controller.lookupPool(collateral, principal);
+            Map<String, LiquidationReadinessController.PoolLookup> memo = new HashMap<>();
+            LiquidationReadinessController.PoolLookup first = controller.resolvePool(collateral, principal, memo);
+            LiquidationReadinessController.PoolLookup second = controller.resolvePool(collateral, principal, memo);
+
+            assertEquals(direct, first, "the memoised answer must equal an unmemoised one (pool=" + poolExists + ")");
+            assertEquals(first, second, "the second read must equal the first (pool=" + poolExists + ")");
+            assertEquals(poolExists, first.available(), "availability must survive the memo");
+        }
+    }
+
+    /**
+     * The pair is UNORDERED. {@code resolveEitherOrder} tries both orderings and the pool exists under
+     * exactly one, so (ada, FLDT) and (FLDT, ada) are the same question — keying on the arguments as
+     * given would miss half the duplicates and leave the page paying for them.
+     */
+    @Test
+    void theSamePairInTheOppositeOrderIsNotAskedTwice() {
+        CountingPoolResolver resolver = new CountingPoolResolver(true);
+        LiquidationReadinessController controller = controllerWithPool(resolver);
+        Map<String, LiquidationReadinessController.PoolLookup> memo = new HashMap<>();
+
+        AssetType ada = AssetType.ada();
+        AssetType fldt = new AssetType("11".repeat(28), "464c4454");
+
+        controller.resolvePool(ada, fldt, memo);
+        controller.resolvePool(fldt, ada, memo);
+
+        assertEquals(1, resolver.calls, "one pair, either way round, is one question");
+        assertEquals(LiquidationReadinessController.pairKey(ada, fldt),
+                LiquidationReadinessController.pairKey(fldt, ada), "the key must be order-independent");
+    }
+
+    /** A genuinely different pair must still cost its own lookup — the memo must not over-collapse. */
+    @Test
+    void twoDifferentPairsStillCostTwoLookups() {
+        CountingPoolResolver resolver = new CountingPoolResolver(true);
+        LiquidationReadinessController controller = controllerWithPool(resolver);
+        Map<String, LiquidationReadinessController.PoolLookup> memo = new HashMap<>();
+
+        AssetType ada = AssetType.ada();
+        AssetType fldt = new AssetType("11".repeat(28), "464c4454");
+        AssetType usdm = new AssetType("22".repeat(28), "5553444d");
+
+        controller.resolvePool(ada, fldt, memo);
+        controller.resolvePool(ada, usdm, memo);
+
+        assertEquals(2, resolver.calls, "distinct pairs are distinct questions");
     }
 }
