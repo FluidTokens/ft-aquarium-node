@@ -25,6 +25,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.slf4j.LoggerFactory;
@@ -80,6 +81,18 @@ import static org.mockito.Mockito.spy;
  * and fails this test.
  */
 class LiquidationSubmitVetoTest {
+
+    /**
+     * A live {@link MarketCoverageReporter} for every wiring in this class, on a throwaway registry.
+     *
+     * <p>⚠ <b>Not a stub, and deliberately not.</b> Every cycle these tests run therefore executes the
+     * real reporting path, so the claim this slice makes — that observing which market cannot be
+     * served changes no decision — is carried by this whole class rather than asserted once. The
+     * dedicated proof is {@code aThrowingReporterChangesNothingAboutTheTransactionThatIsRecorded()}.
+     */
+    private static MarketCoverageReporter metrics() {
+        return new MarketCoverageReporter(new SimpleMeterRegistry());
+    }
 
     private static final long NOW = 1_700_000_000_000L;
 
@@ -686,7 +699,8 @@ class LiquidationSubmitVetoTest {
                     new FakeAppUtxoService(), account, new FakeScanner(List.of(scenario.assessment())),
                     new FakeResolver(unspent, loanAnswersBeforeItIsGone, bondAnswersBeforeItIsGone,
                             loanThrows),
-                    builder, payInAdvanceRouter, LoanFixtures.registry(), log, provider(oracle),
+                    builder, payInAdvanceRouter, LoanFixtures.registry(), log, metrics(),
+                    provider(oracle),
                     networkNamed(networkName), params, executorConverters, submitter);
             long[] elapsed = {0};
             executor.setSubmitClock(() -> submitTime + elapsed[0]);
@@ -1871,7 +1885,8 @@ class LiquidationSubmitVetoTest {
                 new LiquidateTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                         LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
                         protocolParams()),
-                payInAdvanceRouter, LoanFixtures.registry(), log, provider(new FakeOracleClient(List.of())),
+                payInAdvanceRouter, LoanFixtures.registry(), log, metrics(),
+                provider(new FakeOracleClient(List.of())),
                 networkNamed("preview"), protocolParams(),
                 LoanFixtures.converters(), submitter);
         executor.setSubmitClock(() -> NOW);

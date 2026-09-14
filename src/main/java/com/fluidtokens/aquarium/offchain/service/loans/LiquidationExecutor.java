@@ -234,6 +234,14 @@ public class LiquidationExecutor {
 
     private final LiquidationDecisionLog decisionLog;
 
+    /**
+     * The other sink for what a scan saw, beside {@link #decisionLog}: the one that keeps the ASSET
+     * IDENTITY. {@code liveExclusions} below is a histogram keyed by reason, so by the time the scan
+     * line is logged the market is gone — which is exactly why a market the bot cannot serve could
+     * not be named. This is handed the assessments before that collapse happens.
+     */
+    private final MarketCoverageReporter marketCoverage;
+
     private final ObjectProvider<FluidOracleClient> oracleClient;
 
     private final AppConfig.Network network;
@@ -287,14 +295,15 @@ public class LiquidationExecutor {
                                ObjectProvider<ConvertLiquidationRouter> convertRouter,
                                LoansContractRegistry registry,
                                LiquidationDecisionLog decisionLog,
+                               MarketCoverageReporter marketCoverage,
                                ObjectProvider<FluidOracleClient> oracleClient,
                                AppConfig.Network network,
                                ProtocolParamsSupplier protocolParamsSupplier,
                                CardanoConverters converters,
                                BFBackendService backendService) {
         this(configuration, blockEventListener, appUtxoService, account, scanner, utxoResolver, builder,
-                payInAdvanceRouter, convertRouter.getIfAvailable(), registry, decisionLog, oracleClient,
-                network, protocolParamsSupplier, converters,
+                payInAdvanceRouter, convertRouter.getIfAvailable(), registry, decisionLog, marketCoverage,
+                oracleClient, network, protocolParamsSupplier, converters,
                 bytes -> backendService.getTransactionService().submitTransaction(bytes));
     }
 
@@ -309,13 +318,14 @@ public class LiquidationExecutor {
                                PayInAdvanceLiquidationRouter payInAdvanceRouter,
                                LoansContractRegistry registry,
                                LiquidationDecisionLog decisionLog,
+                               MarketCoverageReporter marketCoverage,
                                ObjectProvider<FluidOracleClient> oracleClient,
                                AppConfig.Network network,
                                ProtocolParamsSupplier protocolParamsSupplier,
                                CardanoConverters converters,
                                TransactionSubmitter submitter) {
         this(configuration, blockEventListener, appUtxoService, account, scanner, utxoResolver, builder,
-                payInAdvanceRouter, null, registry, decisionLog, oracleClient, network,
+                payInAdvanceRouter, null, registry, decisionLog, marketCoverage, oracleClient, network,
                 protocolParamsSupplier, converters, submitter);
     }
 
@@ -331,6 +341,7 @@ public class LiquidationExecutor {
                                ConvertLiquidationRouter convertRouter,
                                LoansContractRegistry registry,
                                LiquidationDecisionLog decisionLog,
+                               MarketCoverageReporter marketCoverage,
                                ObjectProvider<FluidOracleClient> oracleClient,
                                AppConfig.Network network,
                                ProtocolParamsSupplier protocolParamsSupplier,
@@ -347,6 +358,7 @@ public class LiquidationExecutor {
         this.convertRouter = convertRouter;
         this.registry = registry;
         this.decisionLog = decisionLog;
+        this.marketCoverage = marketCoverage;
         this.oracleClient = oracleClient;
         this.network = network;
         this.protocolParamsSupplier = protocolParamsSupplier;
@@ -667,6 +679,25 @@ public class LiquidationExecutor {
         List<LiquidationAssessment> buildable = assessments.stream()
                 .filter(LiquidationAssessment::buildable)
                 .toList();
+
+        // ⛔ BEFORE THE HISTOGRAM COLLAPSES THE ASSET IDENTITY.
+        //
+        // `histogram` below is keyed by REASON, so from the next line on the scan can say "2 bonds
+        // excluded, PRINCIPAL_ORACLE_UNUSABLE" and cannot say WHICH TOKEN. Giovanni's requirement is
+        // the token: "assume a new stable coin loan appears and I wouldn't be able to process that
+        // loan if it went sour, well I would need to know." The verdict already exists here; this
+        // line is only declining to throw it away.
+        //
+        // ⚠ GUARDED, AND THE GUARD IS THE POINT: observation must never cost a liquidation. The
+        // reporter touches a MeterRegistry, and a metrics backend is not part of this loop's
+        // contract — a fault in it is reported and the cycle carries on exactly as it would have.
+        // Nothing downstream reads anything the reporter produces.
+        try {
+            marketCoverage.report(assessments);
+        } catch (RuntimeException e) {
+            log.warn("market-coverage reporting failed; the cycle is unaffected", e);
+        }
+
         Map<LiquidationExclusion, Integer> exclusions = histogram(assessments);
 
         // T-060 PART 2 — A BOND WHOSE LOAN NO LONGER EXISTS IS NOT AN EXCLUSION.
