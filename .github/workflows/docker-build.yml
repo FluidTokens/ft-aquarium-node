@@ -187,12 +187,14 @@ jobs:
       #   after   token metadata 144 files / 1145 tests / 0 failures / 0 errors / 46 skipped
       # Four added classes: AssetDisplayTest, TokenMetadataServiceTest, TokenMetadataMigrationTest,
       # TokenMetadataConfigTest. Orphan check re-run on the after side: 144 files, 0 orphans.
+      # The rendering half then added LoanAgeTest: 145 files / 1154 tests / 0 failures / 46 skipped,
+      # 0 orphans. Floor 145.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '144'
+          RESULT_FILE_FLOOR: '145'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

@@ -3,7 +3,10 @@ package com.fluidtokens.aquarium.offchain.controller;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetDisplay;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
+import com.fluidtokens.aquarium.offchain.model.LoanAge;
+import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
@@ -94,7 +97,10 @@ class LiquidationReadinessControllerTest {
     private static LiquidationReadinessController.Row row(String id, Double healthFactor) {
         return new LiquidationReadinessController.Row(id, id + "#0", "lovelace", BigInteger.TEN,
                 "tok", BigInteger.TEN, healthFactor, null, null, null,
-                null, null, null, "PLAIN LIQUIDATE", "", null);
+                null, null, null, "PLAIN LIQUIDATE", "", null,
+                new LoanAge("1d", "2026-09-13T00:00:00Z"),
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")));
     }
 
     /**
@@ -126,7 +132,10 @@ class LiquidationReadinessControllerTest {
     void anUncomputableRowCarriesNullsAndAReasonRatherThanZeros() {
         var r = new LiquidationReadinessController.Row("id", "id#0", "lovelace", BigInteger.TEN,
                 "tok", BigInteger.TEN, null, null, null, "no usable oracle feed",
-                null, null, "no usable oracle feed", "UNKNOWN", "no bond indexed", null);
+                null, null, "no usable oracle feed", "UNKNOWN", "no bond indexed", null,
+                new LoanAge("unknown", null),
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")));
 
         assertNull(r.healthFactor());
         assertNull(r.feeValueLovelace());
@@ -204,7 +213,7 @@ class LiquidationReadinessControllerTest {
             }
         };
         return new LiquidationReadinessController(provide(null), provide(null), provide(null),
-                provide(client), provide(null), provide(registry), null, network);
+                provide(client), provide(null), provide(null), provide(registry), null, network);
     }
 
     /**
@@ -313,7 +322,7 @@ class LiquidationReadinessControllerTest {
             }
         };
         return new LiquidationReadinessController(provide(null), provide(null), provide(null),
-                provide(null), provide(resolver), provide(null), null, network);
+                provide(null), provide(resolver), provide(null), provide(null), null, network);
     }
 
     /**

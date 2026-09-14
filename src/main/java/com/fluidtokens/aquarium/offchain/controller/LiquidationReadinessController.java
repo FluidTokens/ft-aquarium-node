@@ -1,6 +1,9 @@
 package com.fluidtokens.aquarium.offchain.controller;
 
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.model.AssetDisplay;
+import com.fluidtokens.aquarium.offchain.model.LoanAge;
+import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
@@ -19,6 +22,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanService;
 import com.fluidtokens.aquarium.offchain.service.loans.MarketGate;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
+import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -100,7 +104,14 @@ public class LiquidationReadinessController {
                       // LOAN'S OWN PRINCIPAL asset (principalUnit, above), never lovelace — a USDM loan
                       // reported here in a field named "…Lovelace" was 4.63x wrong in the wrong unit,
                       // read literally as lovelace by an operator acting on it.
-                      BigInteger advancePrincipalAmount) {
+                      BigInteger advancePrincipalAmount,
+                      // ---- display enrichment ----------------------------------------------------
+                      // The figures above stay exactly as they were: raw, unscaled, in the loan's own
+                      // units, because everything downstream reasons about them. These three are what
+                      // the page renders, and nothing computes with them.
+                      LoanAge age,
+                      AssetDisplay principalDisplay,
+                      AssetDisplay collateralDisplay) {
 
         /** Sorting key: lower is closer to liquidation. Unknown health sorts last, never first. */
         public double sortKey() {
@@ -113,6 +124,7 @@ public class LiquidationReadinessController {
     private final ObjectProvider<LoanHealthService> loanHealthService;
     private final ObjectProvider<FluidOracleClient> oracleClient;
     private final ObjectProvider<MinswapPoolResolver> poolResolver;
+    private final ObjectProvider<TokenMetadataService> tokenMetadata;
     private final ObjectProvider<LoansContractRegistry> registry;
     private final AppConfig.LiquidationConfiguration liquidationConfiguration;
     private final AppConfig.Network network;
@@ -122,6 +134,7 @@ public class LiquidationReadinessController {
                                           ObjectProvider<LoanHealthService> loanHealthService,
                                           ObjectProvider<FluidOracleClient> oracleClient,
                                           ObjectProvider<MinswapPoolResolver> poolResolver,
+                                          ObjectProvider<TokenMetadataService> tokenMetadata,
                                           ObjectProvider<LoansContractRegistry> registry,
                                           AppConfig.LiquidationConfiguration liquidationConfiguration,
                                           AppConfig.Network network) {
@@ -130,6 +143,7 @@ public class LiquidationReadinessController {
         this.loanHealthService = loanHealthService;
         this.oracleClient = oracleClient;
         this.poolResolver = poolResolver;
+        this.tokenMetadata = tokenMetadata;
         this.registry = registry;
         this.liquidationConfiguration = liquidationConfiguration;
         this.network = network;
@@ -177,17 +191,21 @@ public class LiquidationReadinessController {
         // ⛔ ONE render, ONE lookup per distinct pair. See resolvePool: this map lives exactly as long
         // as this request and is never shared between renders, so nothing it holds can go stale.
         Map<String, PoolLookup> poolMemo = new HashMap<>();
+        // Same reasoning as the pool memo one level down: an asset's ticker and scale are a property
+        // of the ASSET, not of the row, and a table is mostly two or three distinct assets.
+        Map<String, TokenMetadata> metadataMemo = new HashMap<>();
         List<Row> rows = new ArrayList<>();
         for (Loan loan : result.loanCensus().loans()) {
             LiquidationAssessment assessment = byLoanId.get(loan.loanId());
-            rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo, now));
+            rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo, metadataMemo, now));
         }
         rows.sort(Comparator.comparingDouble(Row::sortKey));
         return rows;
     }
 
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
-                    MarketGate gate, Map<String, PoolLookup> poolMemo, long now) {
+                    MarketGate gate, Map<String, PoolLookup> poolMemo,
+                    Map<String, TokenMetadata> metadataMemo, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
 
@@ -267,7 +285,29 @@ public class LiquidationReadinessController {
                 healthFactor, health.currentLtvPercent(), health.liquidatable(),
                 healthFactor == null ? healthUnknown : null,
                 feeTokens, feeValue, feeUnknown,
-                route, routeDetail, advance);
+                route, routeDetail, advance,
+                LoanAge.since(datum.lendDate(), now),
+                display(datum.principalAsset().toUnit(), datum.principalAmount(), metadataMemo),
+                display(collateralAsset.toUnit(), loan.collateralAmount(), metadataMemo));
+    }
+
+    /**
+     * The rendered form of one amount: scaled when a registry published a scale, raw and marked when
+     * nothing did. Never a guessed scale — see {@link AssetDisplay#of}.
+     *
+     * <p>When the token metadata service is absent the amount still renders, as raw base units with
+     * the unknown marker. That is the honest degradation: the page keeps working and says that it does
+     * not know, rather than inventing a scale to look complete.
+     */
+    private AssetDisplay display(String unit, BigInteger amount, Map<String, TokenMetadata> memo) {
+        TokenMetadata metadata = memo.computeIfAbsent(unit, u -> {
+            TokenMetadataService service = tokenMetadata.getIfAvailable();
+            if (service != null) {
+                return service.lookup(u);
+            }
+            return "lovelace".equals(u) ? TokenMetadata.ada() : TokenMetadata.unknown(u);
+        });
+        return AssetDisplay.of(amount, metadata);
     }
 
     record PoolLookup(boolean available, String reason) {
