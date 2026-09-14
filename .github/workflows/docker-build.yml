@@ -217,11 +217,15 @@ jobs:
       # tree and neither had seen the other's class. Re-measured on the stacked tree instead of
       # composed from the two branches, which is the only way this arithmetic is trustworthy.
       #
+      # The per-loan pool verdict added PoolUsabilityTest. Re-measured on the stacked develop tree
+      # rather than composed from a delta: 147 files / 1168 tests / 0 failures / 0 errors / 46 skipped,
+      # 0 orphans. Floor 147.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '146'
+          RESULT_FILE_FLOOR: '147'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
