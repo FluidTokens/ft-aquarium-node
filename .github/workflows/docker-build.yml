@@ -182,11 +182,29 @@ jobs:
       # MarketCoverageReporterTest is the one added class. Final cold run: 140 files / 1117 tests /
       # 0 failures / 0 errors / 46 skipped, with 0 orphans. The floor therefore rises to 140.
       #
+      # FAB-91 (slice/FAB-91-repoint-fail-closed) measured both sides cold, keyless, same procedure:
+      #   before  main a54c81b   140 files / 1118 tests / 0 failures / 0 errors / 46 skipped
+      #   after   this branch    141 files / 1121 tests / 0 failures / 0 errors / 46 skipped
+      # ConvertLiveDryEvalRepointTest is the one added class (+3 tests, +0 skips). Orphan check
+      # re-run on the after side: 141 files, 0 orphans. The floor therefore rises to 141.
+      #
+      # ⚠ The paragraph above records 1117 tests for that same main; re-measuring it today reads
+      # 1118. The FILE count (140) agrees, so nothing was lost -- the test total simply drifted by
+      # one between when that line was written and when #32 landed. Recorded rather than corrected
+      # in place: the ledger's value is that each entry says what its author actually measured, and
+      # silently restating an older entry to match a newer run destroys exactly that. This is the
+      # "do not reconcile to a number written here" rule applied to the ledger itself.
+      #
+      # The floor and the class that justifies it move in ONE commit, deliberately. Bumping the
+      # floor first fails CI on a tree that has no such class; adding the class first leaves main
+      # briefly carrying a floor that does not match its own reality, so a later deletion would be
+      # invisible to the guard. Neither order is safe separately.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '140'
+          RESULT_FILE_FLOOR: '141'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
