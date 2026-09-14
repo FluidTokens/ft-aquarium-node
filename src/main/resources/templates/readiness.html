@@ -56,14 +56,49 @@
     .pill.unknown { background:var(--surface-2); color:var(--muted); }
     tr.liquidatable td { background:var(--crit-soft); }
     .empty { padding:1.4rem; color:var(--muted); }
+
+    /* ---- look and feel ------------------------------------------------------------------ */
+    header { display:flex; flex-wrap:wrap; gap:.9rem 1.4rem; align-items:baseline;
+             justify-content:space-between; }
+    .title-block { min-width:16ch; }
+    tbody tr:hover td { background:var(--surface-2); }
+    tr.liquidatable:hover td { background:var(--crit-soft); }
+    td, th { padding:.62rem .8rem; }
+    .num { text-align:right; }
+    th.num { text-align:right; }
+
+    /* The asset a figure is denominated in, beside the figure rather than under it. */
+    .ticker { font-weight:600; color:var(--ink); margin-left:.35em; cursor:help;
+              border-bottom:1px dotted var(--rule); }
+    .age { white-space:nowrap; cursor:help; }
+
+    /* ⛔ The no-metadata marker. It must be impossible to mistake a raw base-unit figure for a
+       scaled one, because the two can look identical and differ by a factor of a million. */
+    .nometa { cursor:help; margin-left:.3em; font-size:.9em; }
+    .nometa-note { display:block; font-size:.72rem; color:var(--warn); margin-top:.15rem; }
+
+    /* ---- auto-refresh control ------------------------------------------------------------ */
+    .refresh { display:flex; align-items:center; gap:.45rem; font-size:.76rem; color:var(--muted);
+               font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .refresh input { accent-color:var(--ok); }
+    .refresh label { cursor:pointer; }
+    #countdown { font-variant-numeric:tabular-nums; }
   </style>
 </head>
 <body>
 <header>
-  <h1>Liquidation readiness</h1>
-  <div class="meta">
-    <span th:text="'network ' + ${network}">network</span> &middot;
-    <span th:text="${generatedAt}">now</span> &middot; read-only &middot; no authentication
+  <div class="title-block">
+    <h1>Liquidation readiness</h1>
+    <div class="meta">
+      <span th:text="'network ' + ${network}">network</span> &middot;
+      <span th:text="${generatedAt}">now</span> &middot; read-only
+    </div>
+  </div>
+  <!-- Auto-refresh: one minute, on by default, and switchable off. The preference is remembered in
+       this browser only; it changes nothing on the node. -->
+  <div class="refresh">
+    <input type="checkbox" id="autorefresh" checked>
+    <label for="autorefresh">auto-refresh <span id="countdown">60s</span></label>
   </div>
 </header>
 
@@ -86,8 +121,8 @@
     <table>
       <thead>
       <tr>
-        <th>Loan</th><th>Principal</th><th>Collateral</th><th>Health</th>
-        <th>Fee slice at liquidation</th><th>Route</th><th>Capital needed</th>
+        <th>Loan</th><th>Age</th><th class="num">Principal</th><th class="num">Collateral</th><th>Health</th>
+        <th class="num">Fee slice at liquidation</th><th>Route</th><th class="num">Capital needed</th>
       </tr>
       </thead>
       <tbody>
@@ -96,13 +131,25 @@
           <span th:text="${#strings.abbreviate(r.loanId, 18)}">id</span>
           <span class="reason" th:text="${r.utxoRef}">utxo</span>
         </td>
-        <td class="mono">
-          <span th:text="${r.principalAmount}">0</span>
-          <span class="reason" th:text="${#strings.abbreviate(r.principalUnit, 24)}">unit</span>
+        <!-- The readable form wins the visible slot; the exact instant stays on hover, because anyone
+             reconciling against the chain needs it and rounding it away makes this useless to them. -->
+        <td class="mono age" th:title="${r.age.iso}" th:text="${r.age.text}">age</td>
+        <td class="mono num" th:with="d=${r.principalDisplay}">
+          <span th:text="${d.amountText}">0</span>
+          <span class="ticker" th:text="${d.label}" th:title="${d.policyId}">TKR</span>
+          <!-- ⛔ No registry knew this asset, so the figure above is RAW base units. The marker is the
+               difference between a number an operator can act on and one that is wrong by a factor of
+               a million, so it is never omitted. -->
+          <span th:if="${d.metadataUnknown}" class="nometa"
+                th:title="|no metadata found for ${d.unit} — the amount above is raw, unscaled base units|">&#10071;</span>
+          <span th:if="${d.metadataUnknown}" class="nometa-note">raw base units &mdash; no metadata</span>
         </td>
-        <td class="mono">
-          <span th:text="${r.collateralAmount}">0</span>
-          <span class="reason" th:text="${#strings.abbreviate(r.collateralUnit, 24)}">unit</span>
+        <td class="mono num" th:with="d=${r.collateralDisplay}">
+          <span th:text="${d.amountText}">0</span>
+          <span class="ticker" th:text="${d.label}" th:title="${d.policyId}">TKR</span>
+          <span th:if="${d.metadataUnknown}" class="nometa"
+                th:title="|no metadata found for ${d.unit} — the amount above is raw, unscaled base units|">&#10071;</span>
+          <span th:if="${d.metadataUnknown}" class="nometa-note">raw base units &mdash; no metadata</span>
         </td>
         <td>
           <span th:if="${r.healthFactor != null}" class="hf mono"
@@ -113,7 +160,7 @@
                 th:text="'LTV ' + ${#numbers.formatDecimal(r.currentLtvPercent, 1, 2)} + '%'">LTV</span>
           <span class="reason" th:if="${r.healthUnknownReason}" th:text="${r.healthUnknownReason}">why</span>
         </td>
-        <td class="mono">
+        <td class="mono num">
           <span th:if="${r.feeInCollateral != null}" th:text="${r.feeInCollateral}">0</span>
           <span th:if="${r.feeInCollateral == null}" class="unknown">unknown</span>
           <!-- ⛔ |...| literal substitution, NOT a quoted concatenation. This read
@@ -131,7 +178,7 @@
                 th:text="${r.route}">ROUTE</span>
           <span class="reason" th:text="${r.routeDetail}">why</span>
         </td>
-        <td class="mono">
+        <td class="mono num">
           <!-- F5 (round 2) — name the UNIT beside the figure: r.principalUnit is the SAME asset this
                amount is denominated in, never lovelace, and a 4.63x-wrong number in the wrong unit is
                exactly the failure this caption exists to prevent. -->
@@ -146,7 +193,7 @@
         </td>
       </tr>
       <tr th:if="${#lists.isEmpty(rows)}">
-        <td colspan="7" class="empty">No loans indexed. On a healthy node that means a quiet market
+        <td colspan="8" class="empty">No loans indexed. On a healthy node that means a quiet market
           &mdash; but it looks identical to a node pinned to a superseded deployment, or to one whose
           decoder has gone blind. <strong>Check the scan summary at
           <span class="mono">/api/v1/loans/liquidations</span></strong>, and read three numbers
@@ -163,5 +210,47 @@
     </table>
   </div>
 </main>
+
+<!-- Auto-refresh. One minute, on by default, switchable off; the choice is remembered per browser.
+     The page is a plain server render, so a refresh is a GET of the same URL and nothing else. -->
+<script>
+  (function () {
+    var PERIOD = 60;
+    var box = document.getElementById('autorefresh');
+    var countdown = document.getElementById('countdown');
+    var left = PERIOD;
+    var timer = null;
+
+    function stored() {
+      try { return localStorage.getItem('aq.readiness.autorefresh'); } catch (e) { return null; }
+    }
+    function remember(on) {
+      try { localStorage.setItem('aq.readiness.autorefresh', on ? 'on' : 'off'); } catch (e) { /* private window */ }
+    }
+
+    function tick() {
+      left -= 1;
+      if (left <= 0) { window.location.reload(); return; }
+      countdown.textContent = left + 's';
+    }
+    function start() {
+      left = PERIOD;
+      countdown.textContent = left + 's';
+      timer = window.setInterval(tick, 1000);
+    }
+    function stop() {
+      if (timer !== null) { window.clearInterval(timer); timer = null; }
+      countdown.textContent = 'off';
+    }
+
+    // On by default: only an explicit "off" turns it off.
+    box.checked = stored() !== 'off';
+    box.addEventListener('change', function () {
+      remember(box.checked);
+      if (box.checked) { start(); } else { stop(); }
+    });
+    if (box.checked) { start(); } else { stop(); }
+  })();
+</script>
 </body>
 </html>

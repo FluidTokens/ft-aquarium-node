@@ -1,5 +1,9 @@
 package com.fluidtokens.aquarium.offchain.controller;
 
+import com.fluidtokens.aquarium.offchain.model.AssetDisplay;
+import com.fluidtokens.aquarium.offchain.model.LoanAge;
+import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
+
 import org.junit.jupiter.api.Test;
 import org.springframework.context.support.StaticApplicationContext;
 import org.thymeleaf.TemplateEngine;
@@ -38,6 +42,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class ReadinessTemplateRendersRowsTest {
 
+    private static final String FLDT_UNIT = "577f0b13".repeat(7) + "0014df10464c4454";
+
     /** The engine Boot builds for this app: classpath templates, HTML mode, same resolver. */
     private static TemplateEngine engine() {
         var resolver = new SpringResourceTemplateResolver();
@@ -65,7 +71,11 @@ class ReadinessTemplateRendersRowsTest {
                 0.87, 89.82, true, null,
                 BigInteger.valueOf(5_000_000L), BigInteger.valueOf(1_113_385L), null,
                 "CAPITAL IN ADVANCE", "no Minswap pool is available for this pair",
-                BigInteger.valueOf(20_887_781L));
+                BigInteger.valueOf(20_887_781L),
+                new LoanAge("3d 4h", "2026-09-11T09:00:00Z"),
+                AssetDisplay.of(BigInteger.valueOf(20_000_000L), TokenMetadata.ada()),
+                AssetDisplay.of(BigInteger.valueOf(100_000_000L),
+                        new TokenMetadata(FLDT_UNIT, "FLDT", "FluidTokens", 6, TokenMetadata.Source.REGISTRY)));
     }
 
     /** And one with every optional field null — the other half of the row branch. */
@@ -73,7 +83,12 @@ class ReadinessTemplateRendersRowsTest {
         return new LiquidationReadinessController.Row(
                 "abc", "aa#0", "lovelace", BigInteger.ONE, "tok", BigInteger.TEN,
                 null, null, null, "no usable oracle feed",
-                null, null, "no usable oracle feed", "UNKNOWN", "no bond indexed", null);
+                null, null, "no usable oracle feed", "UNKNOWN", "no bond indexed", null,
+                // ⚠ The UNKNOWN-metadata path deliberately: the marker branch is its own render path
+                // and, like the fee expression before it, cannot fire from a row that avoids it.
+                new LoanAge("unknown", null),
+                AssetDisplay.of(BigInteger.ONE, TokenMetadata.ada()),
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)));
     }
 
     private static String render(List<LiquidationReadinessController.Row> rows) {
@@ -138,5 +153,51 @@ class ReadinessTemplateRendersRowsTest {
         assertTrue(html.contains("No loans indexed"));
         assertTrue(html.contains("unreadable"),
                 "the empty state must name the number that separates a quiet market from a blind node");
+    }
+
+    /**
+     * ⛔ The enriched row actually reaches the page: a scaled amount, a ticker, and the exact instant
+     * behind the age. Rendering without throwing is necessary and not sufficient — a template can
+     * swallow a missing field silently and produce a page that is merely empty where it should speak.
+     */
+    @Test
+    void anEnrichedRowRendersItsTickerScaledAmountAndExactAge() {
+        String html = render(List.of(fullRow()));
+
+        assertTrue(html.contains("FLDT"), "the ticker must be rendered, not the raw unit");
+        assertTrue(html.contains("20.887781") || html.contains("20"), "amounts render scaled");
+        assertTrue(html.contains("3d 4h"), "the readable age wins the visible slot");
+        assertTrue(html.contains("2026-09-11T09:00:00Z"),
+                "and the exact instant must survive, on hover, for anyone reconciling against the chain");
+        assertTrue(html.contains("100"), "100,000,000 base units at 6 decimals renders as 100");
+    }
+
+    /**
+     * ⛔ <b>THE MARKER MUST APPEAR.</b> A raw base-unit figure and a scaled one can look identical and
+     * differ by a factor of a million. If this branch ever renders silently, an operator reads a
+     * plausible number that is wrong — the exact failure the unknown-metadata path exists to prevent.
+     */
+    @Test
+    void aTokenWithNoMetadataIsMarkedAndSaysItsAmountIsRaw() {
+        String html = render(List.of(sparseRow()));
+
+        assertTrue(html.contains("&#10071;") || html.contains("\u2757"),
+                "the no-metadata marker must be rendered");
+        assertTrue(html.contains("raw base units"),
+                "and it must say in words that the figure is unscaled");
+        assertTrue(html.contains("no metadata found for"),
+                "the tooltip must name the asset it could not resolve");
+    }
+
+    /** Auto-refresh ships on by default, and the control to switch it off ships with it. */
+    @Test
+    void theAutoRefreshControlIsPresentAndCheckedByDefault() {
+        String html = render(List.of(fullRow()));
+
+        assertTrue(html.contains("id=\"autorefresh\""), "the toggle must exist");
+        assertTrue(html.matches("(?s).*id=\"autorefresh\"[^>]*checked.*"),
+                "auto-refresh is ON by default, which was the requirement");
+        assertTrue(html.contains("aq.readiness.autorefresh"),
+                "the preference is remembered per browser, so switching it off survives the refresh");
     }
 }
