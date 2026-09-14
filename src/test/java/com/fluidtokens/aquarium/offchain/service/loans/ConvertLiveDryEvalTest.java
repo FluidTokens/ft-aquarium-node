@@ -283,6 +283,7 @@ class ConvertLiveDryEvalTest {
         Utxo lmConfigUtxo = output(backend, LM_CONFIG_TX, LM_CONFIG_IX);
         repointConfigDatum(configUtxo);
         repointConfigDatum(lmConfigUtxo);
+        assertEverySubstitutionApplied();
         Utxo poolUtxo = pool(backend);
 
         // ⛔ INSTRUMENTATION, not reasoning. Every fixture the validator will read, printed as fetched,
@@ -608,6 +609,7 @@ class ConvertLiveDryEvalTest {
 
         java.util.Map<String, String> codes = (java.util.Map<String, String>) field("appliedCompiledCode").get(registry);
         SWAPPED.clear();
+        APPLIED.clear();
 
         // loan_claim_action first: the convert action takes its credential as a PARAMETER, so a
         // traced claim action changes the convert action's hash too.
@@ -632,6 +634,9 @@ class ConvertLiveDryEvalTest {
 
     /** real hash -> traced hash, for every script swapped; config datums are rewritten with these. */
     private static final java.util.Map<String, String> SWAPPED = new java.util.LinkedHashMap<>();
+
+    /** substitution -> how many datum fields it actually rewrote, across every repointed datum. */
+    private static final java.util.Map<String, Integer> APPLIED = new java.util.LinkedHashMap<>();
 
     private static void record(LoansContractRegistry registry, java.util.Map<String, String> codes,
                                String fieldName, String tracedHash, String applied) throws Exception {
@@ -673,11 +678,61 @@ class ConvertLiveDryEvalTest {
         if (SWAPPED.isEmpty() || utxo.getInlineDatum() == null) {
             return;
         }
-        String d = utxo.getInlineDatum();
-        for (var e : SWAPPED.entrySet()) {
-            d = d.replace(e.getKey(), e.getValue());
+        utxo.setInlineDatum(repoint(utxo.getInlineDatum(), SWAPPED, APPLIED));
+    }
+
+    /**
+     * Rewrite one config datum's hex with every declared substitution.
+     * Package-private so it can be exercised without a credential: the class itself is gated on
+     * {@code BLOCKFROST_MAINNET_KEY}, so a test written inside it would skip in CI and prove nothing.
+     */
+    static String repoint(String datum, java.util.Map<String, String> swapped,
+                          java.util.Map<String, Integer> applied) {
+        String d = datum;
+        for (var e : swapped.entrySet()) {
+            String real = e.getKey();
+            int first = d.indexOf(real);
+            if (first < 0) {
+                // Legitimately absent from THIS datum: loanClaimActionScriptHash lives in the main
+                // ConfigDatum, lmLiquidateAndConvertActionScriptHash in the LMConfigDatum. Neither is
+                // in both, so "must be present here" is the wrong invariant — see
+                // assertEverySubstitutionApplied for the one that holds across the pair.
+                continue;
+            }
+            if (first != d.lastIndexOf(real)) {
+                throw new IllegalStateException("substitution " + real
+                        + " occurs more than once in this config datum; it cannot say which field it "
+                        + "means, and rewriting both would silently move a field nobody declared");
+            }
+            d = d.substring(0, first) + e.getValue() + d.substring(first + real.length());
+            applied.merge(real, 1, Integer::sum);
         }
-        utxo.setInlineDatum(d);
+        return d;
+    }
+
+    /** Declared substitutions that never rewrote anything, in declaration order. */
+    static java.util.List<String> unappliedSubstitutions(java.util.Map<String, String> swapped,
+                                                         java.util.Map<String, Integer> applied) {
+        return swapped.keySet().stream().filter(k -> !applied.containsKey(k)).toList();
+    }
+
+    /**
+     * ⛔ Every declared substitution must have rewritten at least one field across the two config
+     * datums. One that rewrote nothing leaves a HALF-TRACED universe: the script supplier serves the
+     * traced script while the datum still names the real hash, the validator refuses the mismatch, and
+     * the rig reports a contract failure that is an artefact of its own plumbing. Fail here instead,
+     * where the cause is still legible.
+     */
+    private static void assertEverySubstitutionApplied() {
+        if (SWAPPED.isEmpty()) {
+            return;
+        }
+        java.util.List<String> unapplied = unappliedSubstitutions(SWAPPED, APPLIED);
+        if (!unapplied.isEmpty()) {
+            throw new IllegalStateException("traced substitutions rewrote nothing in either config "
+                    + "datum: " + unapplied + " — the universe would serve traced scripts while the "
+                    + "datums still name the real ones");
+        }
     }
 
     /**
