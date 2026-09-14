@@ -182,11 +182,17 @@ jobs:
       # MarketCoverageReporterTest is the one added class. Final cold run: 140 files / 1117 tests /
       # 0 failures / 0 errors / 46 skipped, with 0 orphans. The floor therefore rises to 140.
       #
+      # The loan-view enrichment branch measured both sides cold, keyless, same procedure:
+      #   before  main a54c81b   140 files / 1118 tests / 0 failures / 0 errors / 46 skipped
+      #   after   token metadata 144 files / 1145 tests / 0 failures / 0 errors / 46 skipped
+      # Four added classes: AssetDisplayTest, TokenMetadataServiceTest, TokenMetadataMigrationTest,
+      # TokenMetadataConfigTest. Orphan check re-run on the after side: 144 files, 0 orphans.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '140'
+          RESULT_FILE_FLOOR: '144'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
