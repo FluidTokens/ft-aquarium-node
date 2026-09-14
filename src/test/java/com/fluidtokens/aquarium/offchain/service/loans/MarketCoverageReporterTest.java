@@ -27,9 +27,11 @@ import org.springframework.boot.actuate.autoconfigure.metrics.MetricsAutoConfigu
 import org.springframework.boot.actuate.autoconfigure.metrics.export.prometheus.PrometheusMetricsExportAutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.scheduling.annotation.Scheduled;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -424,6 +426,58 @@ class MarketCoverageReporterTest {
                 });
     }
 
+    /**
+     * ⛔ <b>The positive half of the test above, and the reason it has to exist.</b>
+     *
+     * <p>Its sibling proves the gate does not fire <em>too early</em> at 30 s. Nothing proved it
+     * fires <em>at all</em> below the default cadence — and a derivation that over-returns is the
+     * natural shape of a future change trying to be conservative about blackouts. Returning
+     * {@code Integer.MAX_VALUE} for any sub-60 s cadence would switch an operator's market alerting
+     * off entirely and, without this test, leave the suite green while doing it.
+     *
+     * <p>Asserted through the <b>emitted WARN</b> rather than through
+     * {@link MarketCoverageReporter#warnAfterCyclesFor(long)}'s return value: comparing the int
+     * re-states the arithmetic, where the thing under test is the gate the arithmetic feeds. And
+     * <b>exactly one</b>, not "at least one" — the {@code warned} latch is what stops a WARN per
+     * cycle thereafter, and "at least one" would pass with that latch deleted.
+     */
+    @Test
+    void theWarnStillFiresAtThirtySecondCadenceOnceTheDerivedGateIsReached() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(MetricsAutoConfiguration.class,
+                        CompositeMeterRegistryAutoConfiguration.class,
+                        PrometheusMetricsExportAutoConfiguration.class))
+                .withUserConfiguration(MarketCoverageReporter.class)
+                .withPropertyValues("loans.liquidation.delay-seconds=30")
+                .run(context -> {
+                    List<ILoggingEvent> logged = capture();
+                    MarketCoverageReporter reporter = context.getBean(MarketCoverageReporter.class);
+                    LiquidationAssessment blacked = excluded(USDM_UNIT,
+                            LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE,
+                            "principal leg: oracle feed for " + USDM_UNIT
+                                    + " is outside its validity window at 1757500000000");
+
+                    // floor(80/30) + 2 = 4. Three is inside the blackout; the fourth is past it.
+                    reporter.report(List.of(blacked));
+                    reporter.report(List.of(blacked));
+                    reporter.report(List.of(blacked));
+                    assertTrue(warnings(logged).isEmpty(),
+                            () -> "three cycles is still inside an 80 s blackout at 30 s; emitted: "
+                                    + warnings(logged));
+
+                    reporter.report(List.of(blacked));
+                    assertEquals(1, warnings(logged).size(),
+                            () -> "a market unservable for four consecutive 30 s cycles has "
+                                    + "outlasted any single blackout and MUST warn exactly once; "
+                                    + "emitted: " + warnings(logged));
+
+                    reporter.report(List.of(blacked));
+                    assertEquals(1, warnings(logged).size(),
+                            () -> "the warned latch must suppress every later cycle; emitted: "
+                                    + warnings(logged));
+                });
+    }
+
     @Test
     void theDefaultCadenceDerivationPreservesTheExistingWarnGate() {
         assertEquals(MarketCoverageReporter.DEFAULT_WARN_AFTER_CYCLES,
@@ -615,9 +669,20 @@ class MarketCoverageReporterTest {
                 });
     }
 
-    /** The reporter must derive from the exact cadence property that schedules its caller. */
+    /**
+     * The reporter must derive from the exact cadence property that schedules its caller, and this
+     * test reaches <b>both</b> holders of that property: {@code AppConfig.LiquidationConfiguration},
+     * a sibling consumer, and the {@code @Scheduled} annotation on
+     * {@code LiquidationExecutor.runCycle()} that actually sets the interval.
+     *
+     * <p>⚠ Reaching the second one is the point. An earlier version of this test asserted
+     * byte-identity with "the scheduler's source" while touching only the first — a guard whose
+     * message named a mechanism it never exercised, which is the same defect as a false javadoc
+     * wearing a green tick.
+     */
     @Test
-    void theWarnGateDerivesFromTheLiquidationCadenceProperty() throws NoSuchFieldException {
+    void theWarnGateDerivesFromTheLiquidationCadenceProperty()
+            throws NoSuchFieldException, NoSuchMethodException {
         Constructor<?> injected = null;
         for (Constructor<?> candidate : MarketCoverageReporter.class.getDeclaredConstructors()) {
             if (candidate.getParameterCount() == 3) {
@@ -643,7 +708,41 @@ class MarketCoverageReporterTest {
         assertTrue(configuredCadenceValue != null,
                 "the liquidation configuration must declare its cadence property");
         assertEquals(configuredCadenceValue.value(), reporterCadenceValue.value(),
-                "the reporter cadence property must be byte-identical to the scheduler's source");
+                "the reporter and AppConfig.LiquidationConfiguration must read the SAME property "
+                        + "with the SAME default; these are two consumers of one value and a "
+                        + "divergence between them is silent");
+
+        // ⛔ THE LEG THAT ACTUALLY REACHES THE SCHEDULER. The assertion above pins a sibling
+        // CONSUMER of the property, not the thing that sets the cadence. What schedules the
+        // reporter's caller is the annotation below: rename its key and every assertion above
+        // still passes while the bot scans at a cadence the reporter has never heard of — which
+        // is the exact defect this test exists to prevent.
+        Method scheduledCycle = LiquidationExecutor.class.getDeclaredMethod("runCycle");
+        Scheduled schedule = scheduledCycle.getAnnotation(Scheduled.class);
+        assertTrue(schedule != null,
+                "LiquidationExecutor.runCycle() must still be the @Scheduled method; it is the one "
+                        + "that calls MarketCoverageReporter.report(...), so its cadence IS the "
+                        + "reporter's observation interval");
+        assertEquals(propertyKeyOf(reporterCadenceValue.value()),
+                propertyKeyOf(schedule.fixedDelayString()),
+                "the reporter must derive from the SAME property key that schedules the cycle "
+                        + "calling it. Byte-identity is impossible here and is deliberately not "
+                        + "asserted: the scheduler's string carries no default, the reporter's "
+                        + "carries :60. The KEY is the coupling; the default is not.");
+    }
+
+    /**
+     * The bare property name inside a {@code ${...}} placeholder, with any {@code :default}
+     * stripped. Exists because the scheduler and the reporter legitimately differ on the default
+     * and must not differ on the key.
+     */
+    private static String propertyKeyOf(String placeholder) {
+        String inner = placeholder;
+        if (inner.startsWith("${") && inner.endsWith("}")) {
+            inner = inner.substring(2, inner.length() - 1);
+        }
+        int colon = inner.indexOf(':');
+        return colon < 0 ? inner : inner.substring(0, colon);
     }
 
     // =====================================================================================

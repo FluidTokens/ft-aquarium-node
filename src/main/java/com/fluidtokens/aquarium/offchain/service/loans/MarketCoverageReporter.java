@@ -45,6 +45,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * is attacker-influenced, not a closed set of tens. An unbounded label is how a metrics backend
  * falls over, which is worse than no metric at all.
  * <p>
+ * ⚠ <b>And the cap below does not close that.</b> It bounds the series this JVM holds; it does
+ * <b>not</b> bound what the backend retains, because eviction drops a local meter while Prometheus
+ * keeps every distinct historical label set for its retention period. Read
+ * {@link #MAX_TRACKED_SERIES}'s javadoc before concluding the backend question is answered — the
+ * residue there is real and is tracked separately. What follows is about liveness of alerting
+ * inside this process, which is a different problem from backend cardinality.
+ * <p>
  * {@link #MAX_TRACKED_SERIES} caps how many {@code (market, leg, reason)} triples hold a series
  * <b>at once</b>. It is <b>not</b> a lifetime quota, and the difference is not academic: a ceiling
  * that only ever fills is a one-shot, ~1000-ada switch-off of an operator's market alerting for the
