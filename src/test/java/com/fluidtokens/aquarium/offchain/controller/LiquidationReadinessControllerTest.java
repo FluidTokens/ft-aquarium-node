@@ -10,6 +10,7 @@ import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
+import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
@@ -17,6 +18,7 @@ import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
+import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -100,7 +102,8 @@ class LiquidationReadinessControllerTest {
                 null, null, null, "PLAIN LIQUIDATE", "", null,
                 new LoanAge("1d", "2026-09-13T00:00:00Z"),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
-                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")));
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
+                PoolUsability.noPool());
     }
 
     /**
@@ -135,7 +138,8 @@ class LiquidationReadinessControllerTest {
                 null, null, "no usable oracle feed", "UNKNOWN", "no bond indexed", null,
                 new LoanAge("unknown", null),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
-                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")));
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
+                PoolUsability.noPool());
 
         assertNull(r.healthFactor());
         assertNull(r.feeValueLovelace());
@@ -310,7 +314,14 @@ class LiquidationReadinessControllerTest {
         @Override
         public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
             calls++;
-            return poolExists ? Optional.of(new ResolvedPool(null, null, "lp")) : Optional.empty();
+            // A real datum: PoolFetch now carries it through the memo, which is what lets the
+            // per-loan verdict be computed without a second lookup.
+            return poolExists
+                    ? Optional.of(new ResolvedPool(null, new MinswapPoolDatum(AssetType.ada(),
+                            new AssetType("11".repeat(28), "464c4454"), BigInteger.TEN,
+                            BigInteger.valueOf(1_000_000L), BigInteger.valueOf(2_000_000L),
+                            BigInteger.valueOf(30), BigInteger.valueOf(30), false), "lp"))
+                    : Optional.empty();
         }
     }
 
@@ -337,7 +348,7 @@ class LiquidationReadinessControllerTest {
     void twoLoansOnOnePairProduceOneLookupRatherThanTwo() {
         CountingPoolResolver resolver = new CountingPoolResolver(true);
         LiquidationReadinessController controller = controllerWithPool(resolver);
-        Map<String, LiquidationReadinessController.PoolLookup> memo = new HashMap<>();
+        Map<String, LiquidationReadinessController.PoolFetch> memo = new HashMap<>();
 
         AssetType collateral = AssetType.ada();
         AssetType principal = new AssetType("11".repeat(28), "464c4454");
@@ -364,14 +375,14 @@ class LiquidationReadinessControllerTest {
             CountingPoolResolver resolver = new CountingPoolResolver(poolExists);
             LiquidationReadinessController controller = controllerWithPool(resolver);
 
-            LiquidationReadinessController.PoolLookup direct = controller.lookupPool(collateral, principal);
-            Map<String, LiquidationReadinessController.PoolLookup> memo = new HashMap<>();
-            LiquidationReadinessController.PoolLookup first = controller.resolvePool(collateral, principal, memo);
-            LiquidationReadinessController.PoolLookup second = controller.resolvePool(collateral, principal, memo);
+            LiquidationReadinessController.PoolFetch direct = controller.lookupPool(collateral, principal);
+            Map<String, LiquidationReadinessController.PoolFetch> memo = new HashMap<>();
+            LiquidationReadinessController.PoolFetch first = controller.resolvePool(collateral, principal, memo);
+            LiquidationReadinessController.PoolFetch second = controller.resolvePool(collateral, principal, memo);
 
             assertEquals(direct, first, "the memoised answer must equal an unmemoised one (pool=" + poolExists + ")");
             assertEquals(first, second, "the second read must equal the first (pool=" + poolExists + ")");
-            assertEquals(poolExists, first.available(), "availability must survive the memo");
+            assertEquals(poolExists, first.datum() != null, "the fetched pool must survive the memo");
         }
     }
 
@@ -384,7 +395,7 @@ class LiquidationReadinessControllerTest {
     void theSamePairInTheOppositeOrderIsNotAskedTwice() {
         CountingPoolResolver resolver = new CountingPoolResolver(true);
         LiquidationReadinessController controller = controllerWithPool(resolver);
-        Map<String, LiquidationReadinessController.PoolLookup> memo = new HashMap<>();
+        Map<String, LiquidationReadinessController.PoolFetch> memo = new HashMap<>();
 
         AssetType ada = AssetType.ada();
         AssetType fldt = new AssetType("11".repeat(28), "464c4454");
@@ -402,7 +413,7 @@ class LiquidationReadinessControllerTest {
     void twoDifferentPairsStillCostTwoLookups() {
         CountingPoolResolver resolver = new CountingPoolResolver(true);
         LiquidationReadinessController controller = controllerWithPool(resolver);
-        Map<String, LiquidationReadinessController.PoolLookup> memo = new HashMap<>();
+        Map<String, LiquidationReadinessController.PoolFetch> memo = new HashMap<>();
 
         AssetType ada = AssetType.ada();
         AssetType fldt = new AssetType("11".repeat(28), "464c4454");

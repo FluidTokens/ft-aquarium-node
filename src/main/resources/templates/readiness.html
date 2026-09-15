@@ -75,6 +75,19 @@
     /* ⛔ The no-metadata marker. It must be impossible to mistake a raw base-unit figure for a
        scaled one, because the two can look identical and differ by a factor of a million. */
     .nometa { cursor:help; margin-left:.3em; font-size:.9em; }
+
+    /* ⛔ The pool verdict. One class per outcome: an operator acts differently on each, so two of
+       them rendering the same way would be the same defect the verdict type exists to prevent. */
+    .pool { display:inline-block; margin-top:.3rem; font-size:.64rem; font-weight:600;
+            letter-spacing:.05em; padding:.16em .45em; border-radius:2px; white-space:nowrap; }
+    .pool.usable        { background:var(--surface-2); color:var(--ok); }
+    .pool.too_thin      { background:var(--warn-soft); color:var(--warn); }
+    .pool.no_pool       { background:var(--surface-2); color:var(--ink-2); }
+    .pool.check_failed  { background:var(--crit-soft); color:var(--crit); }
+    .pool.cannot_quote  { background:var(--warn-soft); color:var(--warn); }
+    .pool.wrong_pair    { background:var(--crit-soft); color:var(--crit); }
+    .pool.not_configured{ background:var(--surface-2); color:var(--muted); }
+    .pool.unknown       { background:var(--surface-2); color:var(--muted); }
     .nometa-note { display:block; font-size:.72rem; color:var(--warn); margin-top:.15rem; }
 
     /* ---- auto-refresh control ------------------------------------------------------------ */
@@ -177,6 +190,14 @@
                 th:classappend="${r.route == 'CAPITAL IN ADVANCE'} ? 'advance' : (${r.route == 'CONVERT'} ? 'convert' : (${r.route == 'UNKNOWN'} ? 'unknown' : 'plain'))"
                 th:text="${r.route}">ROUTE</span>
           <span class="reason" th:text="${r.routeDetail}">why</span>
+          <!-- ⛔ The pool's own verdict, for THIS loan. Reported whatever the route, because on an
+               ANTICIPATE market it is the configuration and not the chain that fronts the capital —
+               and an operator can change a setting but cannot change a pool's depth. -->
+          <span class="pool" th:if="${r.poolUsability != null}"
+                th:classappend="${#strings.toLowerCase(r.poolUsability.verdict)}"
+                th:text="${#strings.replace(r.poolUsability.verdict, '_', ' ')}">POOL</span>
+          <span class="reason" th:if="${r.poolUsability != null}"
+                th:text="${r.poolUsability.detail}">pool detail</span>
         </td>
         <td class="mono num">
           <!-- F5 (round 2) — name the UNIT beside the figure: r.principalUnit is the SAME asset this
