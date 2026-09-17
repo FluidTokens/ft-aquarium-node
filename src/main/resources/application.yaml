@@ -147,32 +147,23 @@ loans:
     #
     # Deployment-specific and env-overridable. The verified mainnet set is the shipped default so
     # the public image is buildable; preview explicitly blanks it below.
-    # ⛔ EMPTY SINCE FluidTokens' 2026-09-17 REDEPLOY, AND THAT IS DELIBERATE — COMPOUND MUST STAY
-    # DISABLED until they publish one more script.
+    # ⛔ RE-POINTED at FluidTokens' 2026-09-17 redeploy. All ELEVEN verified: for each one, the hash
+    # this node DERIVES equals the reference_script_hash the chain publishes at that coordinate.
     #
-    # CompoundTransactionBuilder needs ELEVEN validators. Ten are published on the new deployment
-    # and verified (derived hash == published hash) below. The eleventh, lm_compound_action
-    # (68c2377b4efb7e9e...), DOES NOT EXIST ON CHAIN AT ALL — /scripts/<hash> returns 404, so it has
-    # never been referenced or witnessed. It cannot be pointed at, and a ten-entry list is not a
-    # smaller version of an eleven-entry one.
+    # ⚠ THE ELEVENTH WAS NEARLY MISREPORTED AS MISSING, and the near-miss is the lesson.
+    # lm_compound_action takes poolManagerSpendScriptHash and poolManagerPolicyId among its eight
+    # applied parameters. Deriving it with the SEVEN-parameter pool manager yields
+    # 68c2377b4efb7e9e..., which is not on chain at all -- so a stale derivation makes a PUBLISHED
+    # script look UNPUBLISHED. With the correct eight-parameter pool manager it is
+    # 2a8faf658434a5c9..., published and unspent. **A missing script and a wrong derivation present
+    # identically; only re-deriving after fixing the parameters told them apart.**
     #
-    # ⚠ Empty was chosen over partial ON PURPOSE. Empty means "nothing travels by reference", which
-    # with compound DISABLED costs nothing; a partial list would leave the largest validator inline
-    # and the failure would land inside a live build. This slot is also the one the verifier does not
-    # check at startup (FAB-108), which is exactly why it must not carry a guess.
-    #
-    # The ten that ARE ready, so re-arming is one line once FluidTokens publishes the eleventh:
-    #   assetManagerSpend     af5bc4815ec1aefb86d51e25649ffd22abc2b0385eb0909512a96adccd4048ec#0
-    #   lenderManagerSpend    691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0
-    #   poolSpend             d39ada3381d91682fd063b5f4a2351c2bddff8ec3259916b328a428394eb14ed#0
-    #   poolManagerSpend      ed3fa111c1529bb0b6a57dc7ffb255231db7fe390d21fc8bab181c7fd67e289c#0
-    #   assetManagerWithdraw  bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0
-    #   lenderManagerWithdraw b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0
-    #   poolPolicy            b35ed92547f040c6733104a810d5611edf04fc2df6a9202f3fa78d38fe1bffc6#0
-    #   poolCompoundAction    7d3ad6d0ad994c032aa1a99b49abff3ff2f79612a5407c5d96c957a3cd48708e#0
-    #   poolManagerPolicy     58b7b66d8adafc8b2e83d34c3980af24e70f6528995faa647cc66e6eaeba5ff5#0
-    #   pmCompoundLiquidity   8a2372acd140ef84fd3b62ff64874684aca683c18ae1c7fa3b8ec1fdc361c7ff#0
-    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:}
+    # Order is presentation only -- the builder matches on the SET of published hashes, not position.
+    #   assetManagerSpend b256da41  lenderManagerSpend 6743f4b6  poolSpend ecd0c0fc
+    #   poolManagerSpend dfb1d21e   assetManagerWithdraw addd060d  lenderManagerWithdraw 247065fa
+    #   lmCompoundAction 2a8faf65   poolPolicy 20f765d2  poolCompoundAction fef12ea6
+    #   poolManagerPolicy 1e0bf58a  pmCompoundLiquidity 96f1e889
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:af5bc4815ec1aefb86d51e25649ffd22abc2b0385eb0909512a96adccd4048ec#0,691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0,d39ada3381d91682fd063b5f4a2351c2bddff8ec3259916b328a428394eb14ed#0,ed3fa111c1529bb0b6a57dc7ffb255231db7fe390d21fc8bab181c7fd67e289c#0,bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0,b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0,ec592cc9e0dffdc1fdefa197cb353c4f60a07910c257cd4236293b844ceeabb7#0,b35ed92547f040c6733104a810d5611edf04fc2df6a9202f3fa78d38fe1bffc6#0,7d3ad6d0ad994c032aa1a99b49abff3ff2f79612a5407c5d96c957a3cd48708e#0,58b7b66d8adafc8b2e83d34c3980af24e70f6528995faa647cc66e6eaeba5ff5#0,8a2372acd140ef84fd3b62ff64874684aca683c18ae1c7fa3b8ec1fdc361c7ff#0}
 
   # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
   #
