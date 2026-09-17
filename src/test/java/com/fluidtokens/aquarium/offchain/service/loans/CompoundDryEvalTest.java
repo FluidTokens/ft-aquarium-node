@@ -44,7 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Slf4j
 class CompoundDryEvalTest {
 
-    private static final LoansContractRegistry REGISTRY = LoanFixtures.shippedPreviewRegistry();
+    private static final LoansContractRegistry REGISTRY = LoanFixtures.previewDeploymentRegistry();
     private static final String POOL_ID = "00d3513725536642b6fe985ce9ec87d1ebb880497d92e0a8495bc6d0bf";
     private static final String LOAN_ID = "e833a769ea3a480343175e253eab799ec0b058c99de30cc17160dc37";
     private static final BigInteger ESCROW = BigInteger.valueOf(29_109_268L);

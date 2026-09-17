@@ -162,6 +162,45 @@ public final class LoanFixtures {
                 yamlValue(section, "smart-tokens-spend-script-hash", 1));
     }
 
+    /**
+     * The shipped PREVIEW configuration, derived from the artefact <b>preview was deployed from</b>
+     * rather than the one the image now ships.
+     *
+     * <p>⛔ Use this, not {@link #shippedPreviewRegistry()}, for any rig that replays <b>recorded
+     * preview UTxOs</b>. Since FluidTokens' 2026-09-17 mainnet redeploy the shipped artefact is ahead
+     * of preview, so {@code shippedPreviewRegistry()} derives pool-family credentials that exist
+     * nowhere on preview — a rig whose fixture universe sits at the recorded credentials then fails
+     * with {@code RequiredRedeemersMismatch}, naming the new hashes as "extra" and the recorded ones
+     * as "missing". That failure is real and it is about the ARTEFACT, not the builder.
+     *
+     * <p>⚠ Accepted residue, stated so it is a decision and not an oversight: <b>nothing offline
+     * exercises the NEW artefact's compound path.</b> It cannot, until either FluidTokens migrates
+     * preview or a mainnet compound candidate under the new deployment is recorded. Tracked with the
+     * other single-sourced compound coverage in FAB-94.
+     */
+    public static LoansContractRegistry previewDeploymentRegistry() {
+        String yaml;
+        try (InputStream is = LoanFixtures.class.getResourceAsStream("/application.yaml")) {
+            if (is == null) {
+                throw new IllegalStateException("application.yaml is not on the test classpath");
+            }
+            yaml = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("could not read application.yaml", e);
+        }
+        int preview = yaml.indexOf("on-profile: preview");
+        if (preview < 0) {
+            throw new IllegalStateException("no preview profile in application.yaml");
+        }
+        String section = yaml.substring(preview);
+        return new LoansContractRegistry(
+                THIRD_DEPLOYMENT_BLUEPRINT,
+                yamlValue(section, "policy-id", 1),
+                yamlValue(section, "policy-id", 2),
+                "706172616d6574657273",
+                yamlValue(section, "smart-tokens-spend-script-hash", 1));
+    }
+
     /** The {@code n}-th occurrence of {@code key:} in {@code section}, hex value only. */
     private static String yamlValue(String section, String key, int occurrence) {
         java.util.regex.Matcher m = java.util.regex.Pattern
