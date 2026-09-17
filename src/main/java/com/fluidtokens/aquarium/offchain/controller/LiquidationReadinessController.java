@@ -10,11 +10,12 @@ import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationMode;
 import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanHealth;
+import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
-import com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
+import com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFinance;
@@ -22,6 +23,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanService;
 import com.fluidtokens.aquarium.offchain.service.loans.MarketGate;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
+import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -111,7 +113,9 @@ public class LiquidationReadinessController {
                       // the page renders, and nothing computes with them.
                       LoanAge age,
                       AssetDisplay principalDisplay,
-                      AssetDisplay collateralDisplay) {
+                      AssetDisplay collateralDisplay,
+                      // ⛔ Whether a pool could fill THIS loan — not whether one exists. See PoolUsability.
+                      PoolUsability poolUsability) {
 
         /** Sorting key: lower is closer to liquidation. Unknown health sorts last, never first. */
         public double sortKey() {
@@ -190,7 +194,7 @@ public class LiquidationReadinessController {
         MarketGate gate = new MarketGate(liquidationConfiguration);
         // ⛔ ONE render, ONE lookup per distinct pair. See resolvePool: this map lives exactly as long
         // as this request and is never shared between renders, so nothing it holds can go stale.
-        Map<String, PoolLookup> poolMemo = new HashMap<>();
+        Map<String, PoolFetch> poolMemo = new HashMap<>();
         // Same reasoning as the pool memo one level down: an asset's ticker and scale are a property
         // of the ASSET, not of the row, and a table is mostly two or three distinct assets.
         Map<String, TokenMetadata> metadataMemo = new HashMap<>();
@@ -204,7 +208,7 @@ public class LiquidationReadinessController {
     }
 
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
-                    MarketGate gate, Map<String, PoolLookup> poolMemo,
+                    MarketGate gate, Map<String, PoolFetch> poolMemo,
                     Map<String, TokenMetadata> metadataMemo, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
@@ -255,6 +259,9 @@ public class LiquidationReadinessController {
         String route;
         String routeDetail;
         BigInteger advance = null;
+        // Defaults for the branches that never reach a pool: the bond settles it before the chain does.
+        PoolUsability usability = new PoolUsability(PoolUsability.Verdict.UNKNOWN,
+                "the lender bond decides this loan's route before a pool is consulted");
         if (bond == null) {
             route = "UNKNOWN";
             routeDetail = "no lender bond indexed — the bond decides whether conversion is permitted";
@@ -264,17 +271,24 @@ public class LiquidationReadinessController {
                     + "and fronts nothing";
         } else {
             var action = gate.actionFor(datum.principalAsset());
-            var pool = resolvePool(collateralAsset, datum.principalAsset(), poolMemo);
-            if (action == AppConfig.LiquidationConfiguration.Action.CONVERT && pool.available()) {
+            // The FETCH is per pair and memoised; the VERDICT is per loan. Both come from the same
+            // already-fetched pool datum, so asking the sharper question costs no extra call.
+            PoolFetch fetched = resolvePool(collateralAsset, datum.principalAsset(), poolMemo);
+            usability = usabilityFor(fetched, loan, bond, collateralAsset, datum.principalAsset(), now);
+
+            if (action == AppConfig.LiquidationConfiguration.Action.CONVERT && usability.usable()) {
                 route = "CONVERT";
-                routeDetail = "a Minswap pool exists for this pair, so the bot creates a swap order and "
-                        + "fronts no capital";
+                routeDetail = "a Minswap pool is deep enough to clear this loan's debt, so the bot "
+                        + "creates a swap order and fronts no capital";
             } else {
                 route = "CAPITAL IN ADVANCE";
+                // ⛔ The market's configuration and the pool's state are DIFFERENT reasons, and an
+                // operator acts on them differently: a setting will not change by itself, a thin pool
+                // may. So both are reported, never one standing in for the other.
                 routeDetail = action == AppConfig.LiquidationConfiguration.Action.ANTICIPATE
-                        ? "this market is configured action: ANTICIPATE, so the bot fronts the principal"
-                        : "no Minswap pool is available for this pair (" + pool.reason()
-                                + "), so conversion cannot be used and the principal must be fronted";
+                        ? "this market is configured action: ANTICIPATE, so the bot fronts the principal "
+                                + "whatever the pool says"
+                        : "conversion is unavailable for this loan, so the principal must be fronted";
                 advance = advanceAmount(loan, bond, now);
             }
         }
@@ -288,7 +302,31 @@ public class LiquidationReadinessController {
                 route, routeDetail, advance,
                 LoanAge.since(datum.lendDate(), now),
                 display(datum.principalAsset().toUnit(), datum.principalAmount(), metadataMemo),
-                display(collateralAsset.toUnit(), loan.collateralAmount(), metadataMemo));
+                display(collateralAsset.toUnit(), loan.collateralAmount(), metadataMemo),
+                usability);
+    }
+
+    /**
+     * ⛔ Whether the fetched pool could fill THIS loan.
+     *
+     * <p>Everything here is arithmetic over values already in hand — the pool datum from the memoised
+     * fetch, and this loan's own figures from the oracle cache. <b>No external call.</b> If a lookup is
+     * unavailable the reason survives unchanged; the page must never turn "could not ask" into
+     * "no pool", because one says try again shortly and the other says hold capital from now on.
+     */
+    private PoolUsability usabilityFor(PoolFetch fetched, Loan loan, LenderBond bond,
+                                       AssetType collateral, AssetType principal, long now) {
+        if (fetched.unavailable() != null) {
+            return fetched.unavailable();
+        }
+        var numbers = numbersFor(loan, bond, now);
+        if (numbers == null) {
+            return new PoolUsability(PoolUsability.Verdict.UNKNOWN,
+                    "this loan's debt and equity cannot be priced, so pool usability is not known");
+        }
+        // collateralLenderShouldReceive IS collateral − equity − liquidationFee: what reaches the pool.
+        return PoolUsability.assess(collateral, principal,
+                numbers.collateralLenderShouldReceive(), numbers.remainingDebt(), fetched.datum());
     }
 
     /**
@@ -310,7 +348,12 @@ public class LiquidationReadinessController {
         return AssetDisplay.of(amount, metadata);
     }
 
-    record PoolLookup(boolean available, String reason) {
+    /**
+     * One pair's pool as fetched. Exactly one field is non-null: the datum when a pool was found, or
+     * the reason it could not be. The FETCH is per pair and memoised; the VERDICT is per loan and is
+     * computed from this by {@link PoolUsability#assess}.
+     */
+    record PoolFetch(MinswapPoolDatum datum, PoolUsability unavailable) {
     }
 
     /**
@@ -334,8 +377,8 @@ public class LiquidationReadinessController {
      * cannot reach that path and cannot outlive the answer it belongs to; a TTL cache would be a
      * different and money-shaped change. <b>Do not promote this to a field.</b>
      */
-    PoolLookup resolvePool(AssetType collateral, AssetType principal,
-                           Map<String, PoolLookup> poolMemo) {
+    PoolFetch resolvePool(AssetType collateral, AssetType principal,
+                          Map<String, PoolFetch> poolMemo) {
         return poolMemo.computeIfAbsent(pairKey(collateral, principal),
                 key -> lookupPool(collateral, principal));
     }
@@ -352,21 +395,21 @@ public class LiquidationReadinessController {
     }
 
     // Package-private so the dedupe can be proven against a counting resolver without a Spring context.
-    PoolLookup lookupPool(AssetType collateral, AssetType principal) {
+    PoolFetch lookupPool(AssetType collateral, AssetType principal) {
         MinswapPoolResolver resolver = poolResolver.getIfAvailable();
         if (resolver == null) {
-            return new PoolLookup(false, "this node cannot convert — loans.minswap.* is unset or "
-                    + "belongs to another network");
+            return new PoolFetch(null, PoolUsability.notConfigured());
         }
         try {
             return resolver.resolveEitherOrder(collateral, principal)
-                    .map(p -> new PoolLookup(true, null))
-                    .orElseGet(() -> new PoolLookup(false, "no pool found for the pair"));
+                    .map(p -> new PoolFetch(p.datum(), null))
+                    .orElseGet(() -> new PoolFetch(null, PoolUsability.noPool()));
         } catch (RuntimeException e) {
-            // The resolver reaches the chain, and one unreachable pool must not blank the page.
+            // ⛔ A failed lookup is NOT "no pool exists". One says hold capital for this loan from now
+            // on; the other says try again shortly. Collapsing them was the defect this now avoids.
             log.debug("pool lookup failed for {}/{}: {}", collateral.toUnit(), principal.toUnit(),
                     e.toString());
-            return new PoolLookup(false, "the pool lookup failed (" + e.getClass().getSimpleName() + ")");
+            return new PoolFetch(null, PoolUsability.checkFailed(e.getClass().getSimpleName()));
         }
     }
 
@@ -383,6 +426,16 @@ public class LiquidationReadinessController {
     // — that a real principalOracle actually reaches numbers(), not just that the deprecated 4-arg
     // overload got deleted — without standing up the full readiness()/rows() Spring plumbing.
     BigInteger advanceAmount(Loan loan, LenderBond bond, long now) {
+        var n = numbersFor(loan, bond, now);
+        return n == null ? null : n.convertedLoanCollateralToPrincipalAmount();
+    }
+
+    /**
+     * The loan's five figures, as the builder and the validators compute them. Oracle prices come from
+     * the in-memory feed cache, so this costs no network call — which is what lets the pool verdict be
+     * per-loan without changing the page's cost profile.
+     */
+    LiquidatePayInAdvanceTransactionBuilder.Numbers numbersFor(Loan loan, LenderBond bond, long now) {
         FluidOracleClient client = oracleClient.getIfAvailable();
         LoansContractRegistry reg = registry.getIfAvailable();
         if (client == null || reg == null) {
@@ -410,10 +463,9 @@ public class LiquidationReadinessController {
             return new LiquidatePayInAdvanceTransactionBuilder(reg, network.getCardanoNetwork(),
                     (com.bloxbean.cardano.client.api.UtxoSupplier) null,
                     (com.bloxbean.cardano.client.api.ProtocolParamsSupplier) null)
-                    .numbers(loan, bond, oracle.get(), principalOracle, now)
-                    .convertedLoanCollateralToPrincipalAmount();
+                    .numbers(loan, bond, oracle.get(), principalOracle, now);
         } catch (RuntimeException e) {
-            log.debug("could not compute the advance amount for {}: {}", loan.utxoRef(), e.toString());
+            log.debug("could not compute this loan's figures for {}: {}", loan.utxoRef(), e.toString());
             return null;
         }
     }

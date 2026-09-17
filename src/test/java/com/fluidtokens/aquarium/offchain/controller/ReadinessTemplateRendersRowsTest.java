@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.controller;
 import com.fluidtokens.aquarium.offchain.model.AssetDisplay;
 import com.fluidtokens.aquarium.offchain.model.LoanAge;
 import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
+import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.context.support.StaticApplicationContext;
@@ -12,7 +13,9 @@ import org.thymeleaf.spring6.SpringTemplateEngine;
 import org.thymeleaf.spring6.templateresolver.SpringResourceTemplateResolver;
 
 import java.math.BigInteger;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -75,7 +78,10 @@ class ReadinessTemplateRendersRowsTest {
                 new LoanAge("3d 4h", "2026-09-11T09:00:00Z"),
                 AssetDisplay.of(BigInteger.valueOf(20_000_000L), TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.valueOf(100_000_000L),
-                        new TokenMetadata(FLDT_UNIT, "FLDT", "FluidTokens", 6, TokenMetadata.Source.REGISTRY)));
+                        new TokenMetadata(FLDT_UNIT, "FLDT", "FluidTokens", 6, TokenMetadata.Source.REGISTRY)),
+                new PoolUsability(PoolUsability.Verdict.TOO_THIN,
+                        "the pool would return about 4 but the debt to clear is 9, short by 5 — the "
+                                + "order would be refunded at the operator's expense"));
     }
 
     /** And one with every optional field null — the other half of the row branch. */
@@ -88,7 +94,8 @@ class ReadinessTemplateRendersRowsTest {
                 // and, like the fee expression before it, cannot fire from a row that avoids it.
                 new LoanAge("unknown", null),
                 AssetDisplay.of(BigInteger.ONE, TokenMetadata.ada()),
-                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)));
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)),
+                PoolUsability.checkFailed("SocketTimeoutException"));
     }
 
     private static String render(List<LiquidationReadinessController.Row> rows) {
@@ -199,5 +206,60 @@ class ReadinessTemplateRendersRowsTest {
                 "auto-refresh is ON by default, which was the requirement");
         assertTrue(html.contains("aq.readiness.autorefresh"),
                 "the preference is remembered per browser, so switching it off survives the refresh");
+    }
+
+    /**
+     * ⛔ <b>THE FOUR STATES MUST SURVIVE THE TEMPLATE.</b> A service that distinguishes them feeding a
+     * page that renders two of them identically is the same defect one layer out — and it is the layer
+     * nobody usually tests. Each verdict must reach the page as its own label, its own CSS class and
+     * its own sentence.
+     */
+    @Test
+    void everyPoolVerdictRendersDistinguishably() {
+        List<PoolUsability> verdicts = List.of(
+                new PoolUsability(PoolUsability.Verdict.USABLE, "a pool exists and is deep enough"),
+                new PoolUsability(PoolUsability.Verdict.TOO_THIN, "short by 5 — the order would be refunded"),
+                PoolUsability.noPool(),
+                PoolUsability.checkFailed("SocketTimeoutException"));
+
+        Set<String> labels = new LinkedHashSet<>();
+        Set<String> classes = new LinkedHashSet<>();
+        for (PoolUsability v : verdicts) {
+            String html = render(List.of(rowWithPool(v)));
+            assertTrue(html.contains(v.detail()), "the reason must reach the page: " + v.detail());
+            labels.add(v.verdict().name().replace('_', ' '));
+            classes.add("pool " + v.verdict().name().toLowerCase());
+            assertTrue(html.contains(v.verdict().name().replace('_', ' ')),
+                    "the verdict label must be rendered: " + v.verdict());
+            assertTrue(html.contains(v.verdict().name().toLowerCase()),
+                    "and carry its own class so two states cannot look alike: " + v.verdict());
+        }
+        assertEquals(verdicts.size(), labels.size(), "two verdicts share a label");
+        assertEquals(verdicts.size(), classes.size(), "two verdicts share a CSS class");
+    }
+
+    /**
+     * ⛔ On an ANTICIPATE market the route is decided by configuration — and the pool's state is
+     * reported anyway. An operator can change a setting; they cannot change a pool's depth. Hiding the
+     * pool here is what stopped the page explaining which of the two was in the way.
+     */
+    @Test
+    void anAnticipateMarketStillReportsWhatThePoolSaid() {
+        String html = render(List.of(rowWithPool(
+                new PoolUsability(PoolUsability.Verdict.USABLE, "a pool exists and is deep enough"))));
+
+        assertTrue(html.contains("USABLE"),
+                "a usable pool must still be reported on a market that fronts capital by configuration");
+    }
+
+    private static LiquidationReadinessController.Row rowWithPool(PoolUsability usability) {
+        return new LiquidationReadinessController.Row(
+                "abc", "aa#0", "lovelace", BigInteger.ONE, FLDT_UNIT, BigInteger.TEN,
+                1.4, 70.0, false, null, BigInteger.ONE, BigInteger.ONE, null,
+                "CAPITAL IN ADVANCE", "this market is configured action: ANTICIPATE", BigInteger.TEN,
+                new LoanAge("2d", "2026-09-12T00:00:00Z"),
+                AssetDisplay.of(BigInteger.ONE, TokenMetadata.ada()),
+                AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)),
+                usability);
     }
 }
