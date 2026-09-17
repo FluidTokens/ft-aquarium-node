@@ -95,6 +95,12 @@ public class LoansContractRegistry {
     private final String poolBorrowActionScriptHash;
     private final String poolSellLenderPositionActionScriptHash;
     private final String poolCompoundActionScriptHash;
+    /**
+     * {@code pool/pool_edit_action} — added by FluidTokens' 2026-09-17 redeploy. Derived only so
+     * that the set this class publishes matches the set the deployment published; no path here
+     * invokes it yet.
+     */
+    private final String poolEditActionScriptHash;
 
     // Tier 5 — LenderManager. Neither hash is published on chain; both must be derived.
     private final String lenderManagerWithdrawScriptHash;
@@ -135,6 +141,16 @@ public class LoansContractRegistry {
      * {@code LoansConfigVerifier} must not grow an expectation for it either.
      */
     private final String pmCompoundLiquidityScriptHash;
+    /**
+     * {@code pool_manager/pm_edit_pool} — added by FluidTokens' 2026-09-17 redeploy, and the
+     * reason {@code pool_manager.poolManager} now takes <b>eight</b> parameters rather than seven.
+     *
+     * <p>⛔ Omitting it does not fail loudly: the seven-parameter application still produces a
+     * well-formed hash ({@code 8536884e…}) that simply is not the deployed one ({@code 1e0bf58a…}).
+     * Same standing as the other pm_* hashes — baked into {@code pool_manager.ak}'s parameters
+     * rather than published in the {@code ConfigDatum}.
+     */
+    private final String pmEditPoolScriptHash;
     private final String lmCompoundActionScriptHash;
     private final String lmLiquidatePayInAdvanceAndCompoundActionScriptHash;
 
@@ -213,6 +229,7 @@ public class LoansContractRegistry {
         this.poolSellLenderPositionActionScriptHash =
                 derive("pool/pool_sell_lender_position.pool_sell_lender_position_action", mainCfg, name);
         this.poolCompoundActionScriptHash = derive("pool/pool_compound_action.pool_compound_action", mainCfg, name);
+        this.poolEditActionScriptHash = derive("pool/pool_edit_action.pool_edit_action", mainCfg, name);
 
         // Rule 2: the LenderManager wraps with the LM config policy, not the main one.
         this.lenderManagerWithdrawScriptHash = derive("lender_manager.lenderManager", b(lmConfigPolicyId), name);
@@ -255,6 +272,7 @@ public class LoansContractRegistry {
             this.poolManagerSpendScriptHash = null;
             this.pmCancelPoolManagerScriptHash = null;
             this.pmCompoundLiquidityScriptHash = null;
+            this.pmEditPoolScriptHash = null;
             this.lmCompoundActionScriptHash = null;
             this.lmLiquidatePayInAdvanceAndCompoundActionScriptHash = null;
         } else {
@@ -267,10 +285,17 @@ public class LoansContractRegistry {
                     mainCfg, name, poolSpend, poolPolicy, smartTokensSpend);
             String pmCompound = derive("pool_manager/pm_compound_liquidity.poolManager",
                     b(lenderManagerWithdrawScriptHash), b(poolPolicyId));
+            String pmEdit = derive("pool_manager/pm_edit_pool.poolManager",
+                    mainCfg, name, poolSpend, poolPolicy, smartTokensSpend);
             this.pmCancelPoolManagerScriptHash = pmCancel;
             this.pmCompoundLiquidityScriptHash = pmCompound;
+            this.pmEditPoolScriptHash = pmEdit;
+            // ⛔ EIGHT parameters since FluidTokens' 2026-09-17 redeploy -- pmEdit is the new one.
+            // Seven still applies cleanly and yields 8536884e..., which is not deployed; the only
+            // thing that catches it is comparing against the chain. See MainnetReferenceScriptsTest.
             this.poolManagerPolicyId = derive("pool_manager.poolManager",
-                    mainCfg, name, poolSpend, poolPolicy, b(pmCancel), b(pmUpdate), b(pmCompound));
+                    mainCfg, name, poolSpend, poolPolicy, b(pmCancel), b(pmUpdate), b(pmCompound),
+                    b(pmEdit));
             this.poolManagerSpendScriptHash = generalSpend(poolManagerPolicyId, configPolicyId);
             this.lmCompoundActionScriptHash = derive("lender_manager/lm_compound_action.actionValidator",
                     mainCfg, name, lmSpend, b(lenderManagerWithdrawScriptHash), amSpend, amWithdraw,
@@ -316,6 +341,7 @@ public class LoansContractRegistry {
         m.put("poolBorrowActionScriptHash", poolBorrowActionScriptHash);
         m.put("poolSellLenderPositionActionScriptHash", poolSellLenderPositionActionScriptHash);
         m.put("poolCompoundActionScriptHash", poolCompoundActionScriptHash);
+        m.put("poolEditActionScriptHash", poolEditActionScriptHash);
         m.put("lenderManagerWithdrawScriptHash", lenderManagerWithdrawScriptHash);
         m.put("lenderManagerSpendScriptHash", lenderManagerSpendScriptHash);
         m.put("borrowerBondPolicyId", borrowerBondPolicyId);
@@ -331,6 +357,7 @@ public class LoansContractRegistry {
         // the ConfigDatum does not publish it (see the field's own javadoc).
         m.put("pmCancelPoolManagerScriptHash", pmCancelPoolManagerScriptHash);
         m.put("pmCompoundLiquidityScriptHash", pmCompoundLiquidityScriptHash);
+        m.put("pmEditPoolScriptHash", pmEditPoolScriptHash);
         m.put("lmCompoundActionScriptHash", lmCompoundActionScriptHash);
         m.put("lmLiquidatePayInAdvanceAndCompoundActionScriptHash", lmLiquidatePayInAdvanceAndCompoundActionScriptHash);
         return m;
