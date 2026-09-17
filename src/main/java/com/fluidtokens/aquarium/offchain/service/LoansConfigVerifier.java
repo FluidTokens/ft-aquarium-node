@@ -67,10 +67,31 @@ public class LoansConfigVerifier {
     private static final int CFG_POOL_BORROW_ACTION = 23;
     private static final int CFG_POOL_SELL_LENDER_POSITION_ACTION = 24;
     private static final int CFG_POOL_COMPOUND_ACTION = 25;
+    // ⛔ THE TAIL OF THIS RECORD MOVED ON 2026-09-17, AND THE SHAPE IS THE ONLY THING THAT SAYS WHICH
+    // DEPLOYMENT A DATUM CAME FROM.
+    //
+    // FluidTokens' redeploy inserted `poolEditActionScriptHash` at index 26 of ConfigDatum
+    // (lib/fluidtokens/types/config.ak), which shifts the three fields after it by one and takes the
+    // record from 29 fields to 30. Indices 0..25 are untouched.
+    //
+    // ⚠ Both shapes are accepted, and deliberately: this node must still read the CAPTURED preview
+    // datums (29 fields) that several rigs replay as historical evidence, while verifying the live
+    // mainnet datum (30 fields). The field COUNT disambiguates them completely, so it selects the
+    // mapping -- there is no version flag and no config key, because the datum is self-describing
+    // and anything else would be a second source of truth.
+    //
+    // ⛔ Guessing here is the dangerous move: had the new field been appended rather than inserted,
+    // every index would still line up and nothing would fail -- but it was INSERTED, so reading a
+    // 30-field datum with the old table returns poolEditAction where poolManagerSpend belongs and
+    // the node would verify a credential it never uses against one it does.
+    private static final int CFG_POOL_EDIT_ACTION = 26;
     private static final int CFG_POOL_MANAGER_SPEND = 26;
     private static final int CFG_POOL_MANAGER_POLICY_ID = 27;
     private static final int CFG_LOCKED_BORROWER_MANAGER_SPEND = 28;
-    private static final int CONFIG_DATUM_FIELDS = 29;
+    /** The pre-2026-09-17 record, still on chain in every captured preview datum. */
+    private static final int CONFIG_DATUM_FIELDS_LEGACY = 29;
+    /** The record FluidTokens deploys today, with {@code poolEditActionScriptHash} at index 26. */
+    private static final int CONFIG_DATUM_FIELDS = 30;
 
     // LMConfigDatum field indices.
     //
@@ -173,8 +194,9 @@ public class LoansConfigVerifier {
      */
     public List<String> verifyAgainst(String configDatumHex, String lmConfigDatumHex) {
         List<String> mismatches = new ArrayList<>();
-        mismatches.addAll(verifyMainConfig(parseFields(configDatumHex, CONFIG_DATUM_FIELDS, "ConfigDatum")));
-        mismatches.addAll(verifyLmConfig(parseFields(lmConfigDatumHex, LM_CONFIG_DATUM_FIELDS, "LMConfigDatum")));
+        mismatches.addAll(verifyMainConfig(parseFields(configDatumHex, "ConfigDatum",
+                CONFIG_DATUM_FIELDS_LEGACY, CONFIG_DATUM_FIELDS)));
+        mismatches.addAll(verifyLmConfig(parseFields(lmConfigDatumHex, "LMConfigDatum", LM_CONFIG_DATUM_FIELDS)));
         return mismatches;
     }
 
@@ -188,6 +210,10 @@ public class LoansConfigVerifier {
                             "set it to enable the pool-manager derivation branch",
                     onChainSmartTokensSpendScriptHash);
         }
+
+        // ⛔ +1 for every field after the inserted poolEditActionScriptHash. See the index block above:
+        // a 30-field record is the post-2026-09-17 shape, a 29-field one a captured legacy datum.
+        int tailShift = fields.size() == CONFIG_DATUM_FIELDS ? 1 : 0;
 
         Map<Integer, String> expected = new LinkedHashMap<>();
         expected.put(CFG_POOL_POLICY_ID, registry.getPoolPolicyId());
@@ -205,11 +231,17 @@ public class LoansConfigVerifier {
         expected.put(CFG_POOL_BORROW_ACTION, registry.getPoolBorrowActionScriptHash());
         expected.put(CFG_POOL_SELL_LENDER_POSITION_ACTION, registry.getPoolSellLenderPositionActionScriptHash());
         expected.put(CFG_POOL_COMPOUND_ACTION, registry.getPoolCompoundActionScriptHash());
-        expected.put(CFG_POOL_MANAGER_SPEND, registry.getPoolManagerSpendScriptHash());
+        // Present only when BOTH the datum and the vendored artefact carry it -- a legacy datum has
+        // no such field, and an older artefact derives no such hash.
+        if (tailShift == 1 && registry.getPoolEditActionScriptHash() != null) {
+            expected.put(CFG_POOL_EDIT_ACTION, registry.getPoolEditActionScriptHash());
+        }
+        expected.put(CFG_POOL_MANAGER_SPEND + tailShift, registry.getPoolManagerSpendScriptHash());
         expected.put(CFG_BORROWER_BOND_POLICY_ID, registry.getBorrowerBondPolicyId());
         expected.put(CFG_LENDER_BOND_POLICY_ID, registry.getLenderBondPolicyId());
-        expected.put(CFG_POOL_MANAGER_POLICY_ID, registry.getPoolManagerPolicyId());
-        expected.put(CFG_LOCKED_BORROWER_MANAGER_SPEND, registry.getLockedBorrowerManagerSpendScriptHash());
+        expected.put(CFG_POOL_MANAGER_POLICY_ID + tailShift, registry.getPoolManagerPolicyId());
+        expected.put(CFG_LOCKED_BORROWER_MANAGER_SPEND + tailShift,
+                registry.getLockedBorrowerManagerSpendScriptHash());
 
         // smartTokensSpendScriptHash is not derived but is configured, so it is worth checking:
         // a stale value here silently corrupts the whole pool-manager branch.
@@ -340,7 +372,8 @@ public class LoansConfigVerifier {
         return configUtxo.getInlineDatum();
     }
 
-    private static List<PlutusData> parseFields(String datumHex, int expectedFieldCount, String datumName) {
+    private static List<PlutusData> parseFields(String datumHex, String datumName,
+                                                int... acceptedFieldCounts) {
         PlutusData datum;
         try {
             datum = PlutusData.deserialize(HexUtil.decodeHexString(datumHex));
@@ -351,9 +384,13 @@ public class LoansConfigVerifier {
             throw new IllegalStateException(datumName + " is not a constructor-0 record: " + datum);
         }
         List<PlutusData> fields = constr.getData().getPlutusDataList();
-        if (fields.size() != expectedFieldCount) {
-            throw new IllegalStateException("%s has %d fields, expected %d — the contract types changed, so the "
-                    .formatted(datumName, fields.size(), expectedFieldCount)
+        boolean accepted = false;
+        for (int count : acceptedFieldCounts) {
+            accepted |= fields.size() == count;
+        }
+        if (!accepted) {
+            throw new IllegalStateException("%s has %d fields, expected %s — the contract types changed, so the "
+                    .formatted(datumName, fields.size(), java.util.Arrays.toString(acceptedFieldCounts))
                     + "field indices in this class are no longer valid");
         }
         return fields;

@@ -187,7 +187,32 @@ public final class LoanFixtures {
     private static final String THIRD_LM_CONFIG_POLICY_ID =
             "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
 
+    /**
+     * ⛔ The blueprint the THIRD DEPLOYMENT was built from, pinned as a test resource — <b>not</b> the
+     * shipped {@code loans-v4.plutus.json}.
+     *
+     * <p>This is the fix for a failure that arrived for real on 2026-09-17. FluidTokens redeployed
+     * mainnet from a newer upstream commit; the shipped artefact moved with it, and
+     * {@code pool.pool} / {@code pool_manager.poolManager} /
+     * {@code pool_manager/pm_compound_liquidity} changed while <b>every liquidation-path validator
+     * stayed byte-identical</b>. The pool family's derived hashes therefore moved, and
+     * {@link PoolFixtures#PUBLISHED_REFERENCE_SCRIPTS} — keyed by derived hash, holding real preview
+     * coordinates — stopped resolving. Four rigs died with a null coordinate.
+     *
+     * <p>The javadoc below used to say every registry derives from the single latest artefact, and
+     * warned that re-keying the coordinate table onto newer hashes "would erase its provenance". Both
+     * remain true; this is the other way out. <b>A rig that replays recorded publications must derive
+     * from the artefact those publications were built from</b>, or the coordinate table silently
+     * describes scripts that were never published at those addresses.
+     *
+     * <p>sha256 {@code 63f5fcf395c5a3e76c211e71e8a327aeb1009205e0773b2bdb732ab8020904a5} — byte-for-byte
+     * the artefact shipped until 2026-09-17. When FluidTokens migrates preview, re-record the
+     * coordinates and re-pin this.
+     */
+    private static final String THIRD_DEPLOYMENT_BLUEPRINT = "loans-v4-third-deployment.plutus.json";
+
     private static final LoansContractRegistry THIRD_DEPLOYMENT_REGISTRY = new LoansContractRegistry(
+            THIRD_DEPLOYMENT_BLUEPRINT,
             THIRD_CONFIG_POLICY_ID, THIRD_LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
 
     /**

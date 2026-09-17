@@ -32,8 +32,8 @@ class MainnetBlueprintSelectionTest {
     private static final String BLUEPRINT = "loans-v4.plutus.json";
     private static final String BLUEPRINT_SHA256 =
             "63f5fcf395c5a3e76c211e71e8a327aeb1009205e0773b2bdb732ab8020904a5";
-    private static final String CONFIG = "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416";
-    private static final String LM_CONFIG = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
+    private static final String CONFIG = "235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200";
+    private static final String LM_CONFIG = "fb6ae2027358b4a0b62710eb95102d87fa13f66ecf55d8943699c492";
     private static final String ASSET = "706172616d6574657273";
     private static final String SMART = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
     private static final String MS_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
