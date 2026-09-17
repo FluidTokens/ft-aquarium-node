@@ -708,11 +708,98 @@ public final class LoanFixtures {
      * that changed in FluidTokens revision 4c4d143. Never use this as chain evidence or in a live rig.
      */
     public static Utxo syntheticLatestConfigUtxo(String txHash, int outputIndex) {
-        String datum = replaceCapturedCredential(
-                fixture("fourth-deployment-config-datum.hex"),
-                "db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56",
-                REGISTRY.getPoolSellLenderPositionActionScriptHash(), "ConfigDatum[24]");
-        return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, datum);
+        return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, syntheticLatestConfigDatum());
+    }
+
+    /**
+     * ⛔ <b>REBUILT STRUCTURALLY on 2026-09-17, because a hex substitution can no longer express what
+     * this fixture means.</b>
+     *
+     * <p>It used to take the captured fourth-deployment bytes and swap one credential in place. That
+     * worked while the latest artefact differed from preview by a <em>substitution</em>. FluidTokens'
+     * redeploy <b>INSERTED</b> {@code poolEditActionScriptHash} at ConfigDatum index 26, taking the
+     * record from 29 fields to 30 — and <b>no amount of string replacement adds a field.</b>
+     *
+     * <p>⚠ The symptom was not a decode error, which is what makes it worth recording. The rig fed a
+     * 29-field datum to validators compiled against the 30-field type; they read
+     * {@code poolManagerSpendScriptHash} where {@code poolEditActionScriptHash} now lives, and
+     * rejected with {@code RedeemerError{tag:"Withdraw", index:4, EvaluationFailure}} — a validator
+     * that resolved, ran, and said no. <b>A shape change one field wide surfaced as a semantic
+     * rejection four layers away from the datum.</b>
+     *
+     * <p>So the datum is now assembled from the field list rather than patched: positions the artefact
+     * derives are taken from {@link #REGISTRY}, positions it cannot derive (the admin credential, the
+     * Dutch-auction parameters, {@code repaymentPolicyId}, {@code smartTokensSpendScriptHash}) are
+     * carried over from the captured bytes, and the new field is inserted only when the loaded
+     * artefact actually has it. Preview has NOT been redeployed — confirmed by Giovanni 2026-09-17 —
+     * so the captured bytes stay the only real evidence and this remains synthetic.
+     *
+     * <p><b>Never use this as chain evidence or in a live rig.</b>
+     */
+    static String syntheticLatestConfigDatum() {
+        PlutusData raw;
+        try {
+            raw = PlutusData.deserialize(
+                    HexUtil.decodeHexString(fixture("fourth-deployment-config-datum.hex")));
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot decode the captured fourth-deployment ConfigDatum", e);
+        }
+        if (!(raw instanceof ConstrPlutusData captured)) {
+            throw new IllegalStateException("captured ConfigDatum is not a constructor record");
+        }
+        List<PlutusData> in = captured.getData().getPlutusDataList();
+        if (in.size() != 29) {
+            throw new IllegalStateException("captured ConfigDatum has " + in.size()
+                    + " fields, expected the 29-field fourth-deployment shape");
+        }
+
+        // 0..25 keep their positions in every shape; the tail is what moved.
+        List<PlutusData> out = new ArrayList<>(in.subList(0, 26));
+        String poolEdit = REGISTRY.getPoolEditActionScriptHash();
+        if (poolEdit != null) {
+            out.add(BytesPlutusData.of(HexUtil.decodeHexString(poolEdit)));
+        }
+        out.add(in.get(26));   // poolManagerSpendScriptHash
+        out.add(in.get(27));   // poolManagerPolicyId
+        out.add(in.get(28));   // lockedBorrowerManagerSpendScriptHash
+
+        int shift = poolEdit == null ? 0 : 1;
+        LinkedHashMap<Integer, String> derived = new LinkedHashMap<>();
+        derived.put(2, REGISTRY.getPoolPolicyId());
+        derived.put(3, REGISTRY.getRequestPolicyId());
+        derived.put(4, REGISTRY.getBorrowerBondPolicyId());
+        derived.put(5, REGISTRY.getLenderBondPolicyId());
+        derived.put(6, REGISTRY.getLoanPolicyId());
+        derived.put(8, REGISTRY.getPoolSpendScriptHash());
+        derived.put(9, REGISTRY.getRequestSpendScriptHash());
+        derived.put(10, REGISTRY.getLoanSpendScriptHash());
+        derived.put(11, REGISTRY.getLoanClaimActionScriptHash());
+        derived.put(12, REGISTRY.getLoanRepayActionScriptHash());
+        derived.put(13, REGISTRY.getLoanChangeCollateralActionScriptHash());
+        derived.put(14, REGISTRY.getLoanRecastActionScriptHash());
+        derived.put(15, REGISTRY.getAssetManagerSpendScriptHash());
+        derived.put(22, REGISTRY.getPoolCancelActionScriptHash());
+        derived.put(23, REGISTRY.getPoolBorrowActionScriptHash());
+        derived.put(24, REGISTRY.getPoolSellLenderPositionActionScriptHash());
+        derived.put(25, REGISTRY.getPoolCompoundActionScriptHash());
+        derived.put(26 + shift, REGISTRY.getPoolManagerSpendScriptHash());
+        derived.put(27 + shift, REGISTRY.getPoolManagerPolicyId());
+        derived.put(28 + shift, REGISTRY.getLockedBorrowerManagerSpendScriptHash());
+        for (var e : derived.entrySet()) {
+            if (e.getValue() != null) {
+                out.set(e.getKey(), BytesPlutusData.of(HexUtil.decodeHexString(e.getValue())));
+            }
+        }
+
+        ListPlutusData list = ListPlutusData.builder().build();
+        out.forEach(list::add);
+        ConstrPlutusData rebuilt = ConstrPlutusData.builder()
+                .alternative(captured.getAlternative()).data(list).build();
+        try {
+            return HexUtil.encodeHexString(rebuilt.serializeToBytes());
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot re-serialise the synthetic ConfigDatum", e);
+        }
     }
 
     /**
