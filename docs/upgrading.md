@@ -244,6 +244,12 @@ Caused by: java.nio.file.AccessDeniedException: /etc/aquarium-secrets/spring.fly
 
 ⚠ **`AccessDenied`, not `NoSuchFile`: the file is there, the process may not read it.** Root could read a `0400` root-owned mount; uid 10001 cannot.
 
+⛔ **AND THE ERROR NAMES ONE FILE WHILE THE PROBLEM IS THE WHOLE DIRECTORY — do not fix only the credential it mentions.**
+
+Spring dies on `spring.flyway.password` because that is the first property it resolves, not because it is the only unreadable one. **Every file in that mount is unreadable to the new uid.** On the deployment where this was found, the same projected volume also carried `wallet.mnemonic` and `blockfrost.key` at the same `0400` — so repairing only the database credentials moves the crash to the mnemonic and changes nothing else.
+
+⇒ **This is a secret-DELIVERY change, not a database-credentials change.** Whatever you do below, do it for *everything* in the mount.
+
 ### The simplest fix: pass them as environment variables instead
 
 **Usually the right answer, because it removes the permission surface rather than configuring around it** — and because this application already reads these values from the environment. `application.yaml` ships:
