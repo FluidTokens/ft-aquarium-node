@@ -82,7 +82,13 @@ public class MinswapPoolResolver {
      *               name is order-sensitive, so a caller that has not established the pool's ordering
      *               must try both and take the one the chain serves
      */
+    /** The deepest pool for the pair in this ordering. See {@link #resolveAll} for why depth is only an ordering. */
     public ResolvedPool resolve(AssetType assetA, AssetType assetB) {
+        return resolveAll(assetA, assetB).getFirst();
+    }
+
+    /** Every pool for the pair in this ordering, deepest first. Never empty: refuses instead. */
+    public List<ResolvedPool> resolveAll(AssetType assetA, AssetType assetB) {
         String lpAssetName = ConvertTxEncoder.computeLpAssetName(assetA, assetB);
         String unit = poolPolicyId + lpAssetName;
 
@@ -197,12 +203,12 @@ public class MinswapPoolResolver {
                     rejected.isEmpty() ? "" : "; not candidates: " + rejected);
         }
 
-        Utxo pool = best.utxo();
-        MinswapPoolDatum datum = best.datum();
-
-        log.debug("resolved the Minswap pool for {}/{}: {}#{} (lp {})", assetA.toUnit(), assetB.toUnit(),
-                pool.getTxHash(), pool.getOutputIndex(), lpAssetName);
-        return new ResolvedPool(pool, datum, lpAssetName);
+        log.debug("resolved {} Minswap pool(s) for {}/{}: deepest {}#{} (lp {})", candidates.size(),
+                assetA.toUnit(), assetB.toUnit(), best.utxo().getTxHash(), best.utxo().getOutputIndex(),
+                lpAssetName);
+        return candidates.stream()
+                .map(c -> new ResolvedPool(c.utxo(), c.datum(), lpAssetName))
+                .toList();
     }
 
     /**
@@ -211,6 +217,39 @@ public class MinswapPoolResolver {
      * calls {@code asset_a} — so both orders are tried and the one that exists wins. The returned
      * datum then states the ordering authoritatively.
      */
+    /**
+     * ⛔ EVERY pool for the pair, deepest first — because DEPTH IS A PROXY FOR FILL AND NOT THE SAME
+     * THING.
+     *
+     * <p>Constant-product output is
+     * {@code in·(1−fee)·reserveOut / (reserveIn + in·(1−fee))}: it depends on the pool's PRICE
+     * ({@code reserveOut/reserveIn}) and its FEE, not on depth alone. Two pools of one pair are
+     * separate AMMs — arbitrage keeps their prices close but not equal, and their fee numerators can
+     * differ outright. <b>So a deeper pool at a worse price, or with a higher fee, can return LESS
+     * than a shallower one</b>, and picking purely by depth can report a pair as too thin while a
+     * pool that would have filled sits unexamined.
+     *
+     * <p>Ranking is still by depth, because it is the right order to TRY them in. The caller decides
+     * by asking each whether it clears the debt.
+     */
+    public List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
+        try {
+            return resolveAll(one, other);
+        } catch (RefusedException first) {
+            if (first.refusal() != Refusal.NO_POOL_FOR_PAIR) {
+                throw first;
+            }
+            try {
+                return resolveAll(other, one);
+            } catch (RefusedException second) {
+                if (second.refusal() == Refusal.NO_POOL_FOR_PAIR) {
+                    return List.of();
+                }
+                throw second;
+            }
+        }
+    }
+
     public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
         try {
             return Optional.of(resolve(one, other));

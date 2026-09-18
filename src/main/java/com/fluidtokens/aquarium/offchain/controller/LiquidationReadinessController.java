@@ -341,9 +341,48 @@ public class LiquidationReadinessController {
             return new PoolUsability(PoolUsability.Verdict.UNKNOWN,
                     "this loan's debt and equity cannot be priced, so pool usability is not known");
         }
+        // ⛔ ASK EVERY POOL, DEEPEST FIRST, AND STOP AT THE FIRST THAT CAN ACTUALLY FILL.
+        //
+        // The pair may have several pools and depth only orders them — output turns on price and fee
+        // too. Reporting the deepest pool's verdict would answer "can the biggest pool fill this?"
+        // when the operator's question is "can ANY pool fill this?", and those differ exactly when it
+        // matters: a deep pool at a worse price returning less than a shallow one at a better one.
+        //
+        // When none can fill, the DEEPEST one's verdict is the one reported — it carries the smallest
+        // shortfall, so it is the most useful statement of how far short the pair is.
         // collateralLenderShouldReceive IS collateral − equity − liquidationFee: what reaches the pool.
-        return PoolUsability.assess(collateral, principal,
-                numbers.collateralLenderShouldReceive(), numbers.remainingDebt(), fetched.datum());
+        return bestVerdict(fetched.datums(), collateral, principal,
+                numbers.collateralLenderShouldReceive(), numbers.remainingDebt());
+    }
+
+    /**
+     * ⛔ ASK EVERY POOL, DEEPEST FIRST, AND STOP AT THE FIRST THAT CAN ACTUALLY FILL.
+     *
+     * <p>A pair may have several pools and depth only ORDERS them — constant-product output turns on
+     * price and fee as well as reserves, so a deeper pool at a worse price can return less than a
+     * shallower one. Reporting the deepest pool's verdict answers "can the biggest pool fill this?"
+     * when the operator asked "can ANY pool fill this?", and the two differ exactly when it matters.
+     *
+     * <p>When none can fill, the DEEPEST one's verdict is reported: it carries the smallest shortfall
+     * and is therefore the most useful statement of how far short the pair is.
+     *
+     * <p>Package-private so the choice can be tested without a Spring context or a live resolver.
+     */
+    static PoolUsability bestVerdict(java.util.List<MinswapPoolDatum> candidates, AssetType collateral,
+                                     AssetType principal, java.math.BigInteger swappable,
+                                     java.math.BigInteger remainingDebt) {
+        PoolUsability deepest = null;
+        for (MinswapPoolDatum candidate : candidates) {
+            PoolUsability verdict = PoolUsability.assess(collateral, principal, swappable,
+                    remainingDebt, candidate);
+            if (verdict.usable()) {
+                return verdict;
+            }
+            if (deepest == null) {
+                deepest = verdict;
+            }
+        }
+        return deepest;
     }
 
     /**
@@ -412,7 +451,15 @@ public class LiquidationReadinessController {
      * the reason it could not be. The FETCH is per pair and memoised; the VERDICT is per loan and is
      * computed from this by {@link PoolUsability#assess}.
      */
-    record PoolFetch(MinswapPoolDatum datum, PoolUsability unavailable) {
+    /**
+     * ⛔ EVERY pool for the pair, deepest first — not just the deepest.
+     *
+     * <p>Depth orders the candidates; it does not decide the answer. Constant-product output depends
+     * on a pool's PRICE and its FEE as well as its reserves, so a deeper pool at a worse price can
+     * return less than a shallower one. Keeping only the deepest would report a pair as TOO_THIN
+     * while a pool that would have cleared the debt sat unexamined.
+     */
+    record PoolFetch(java.util.List<MinswapPoolDatum> datums, PoolUsability unavailable) {
     }
 
     /**
@@ -457,12 +504,13 @@ public class LiquidationReadinessController {
     PoolFetch lookupPool(AssetType collateral, AssetType principal) {
         MinswapPoolResolver resolver = poolResolver.getIfAvailable();
         if (resolver == null) {
-            return new PoolFetch(null, PoolUsability.notConfigured());
+            return new PoolFetch(java.util.List.of(), PoolUsability.notConfigured());
         }
         try {
-            return resolver.resolveEitherOrder(collateral, principal)
-                    .map(p -> new PoolFetch(p.datum(), null))
-                    .orElseGet(() -> new PoolFetch(null, PoolUsability.noPool()));
+            var pools = resolver.resolveAllEitherOrder(collateral, principal);
+            return pools.isEmpty()
+                    ? new PoolFetch(java.util.List.of(), PoolUsability.noPool())
+                    : new PoolFetch(pools.stream().map(MinswapPoolResolver.ResolvedPool::datum).toList(), null);
         } catch (RuntimeException e) {
             // ⛔ A failed lookup is NOT "no pool exists". One says hold capital for this loan from now
             // on; the other says try again shortly. Collapsing them was the defect this now avoids.
@@ -472,7 +520,7 @@ public class LiquidationReadinessController {
             log.warn("pool lookup failed for {}/{}: {} — the readiness page shows CHECK FAILED for "
                             + "every loan on this pair until it succeeds",
                     collateral.toUnit(), principal.toUnit(), e.toString(), e);
-            return new PoolFetch(null, PoolUsability.checkFailed(e.getClass().getSimpleName()));
+            return new PoolFetch(java.util.List.of(), PoolUsability.checkFailed(e.getClass().getSimpleName()));
         }
     }
 
