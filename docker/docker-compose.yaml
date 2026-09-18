@@ -1,3 +1,13 @@
+# FluidTokens Aquarium Node — operator deployment.
+#
+# Read docs/deploying.md before first use and docs/upgrading.md before changing versions.
+#
+# ⛔ TWO THINGS IN HERE ARE SECURITY DECISIONS, NOT STYLE:
+#   1. Postgres is bound to 127.0.0.1. It used to be published on every interface.
+#   2. The node publishes NO port at all. The operator UI is reached through an SSH tunnel or a
+#      private network — never by adding a public port mapping. See docs/deploying.md § Reaching
+#      the UI.
+
 services:
   postgres:
     container_name: aquarium-pg
@@ -8,14 +18,17 @@ services:
       - POSTGRES_PASSWORD=${DB_PASSWORD}
       - POSTGRES_USER=${DB_USERNAME}
     ports:
-      - 5432:5432
+      # ⛔ 127.0.0.1 ON PURPOSE. This was `5432:5432`, which publishes the database on EVERY
+      # interface -- on a cloud host that is a Postgres server open to the internet, protected
+      # only by DB_PASSWORD. The node reaches it over the compose network by service name and
+      # does not need this at all; it is kept, bound to loopback, so `psql` still works when you
+      # are on the box. Delete the whole block if you never need that.
+      - 127.0.0.1:5432:5432
     volumes:
       - ./postgres:/var/lib/postgresql/data
     restart: on-failure
     healthcheck:
-      # Use pg_isready to check postgres is running. Substitute different
-      # user `postgres` if you've setup differently to config/pgpass-mainnet
-      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${POSTGRES_DB}" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -24,37 +37,59 @@ services:
       options:
         max-size: "200k"
         max-file: "10"
+
   aquarium-node:
     container_name: aquarium
     image: "${AQUARIUM_DOCKER_IMAGE_NAME}:${AQUARIUM_DOCKER_IMAGE_VERSION}"
     pull_policy: always
     restart: on-failure
+
+    # ⛔ THE WHOLE .env REACHES THE CONTAINER, AND THAT IS THE POINT.
+    #
+    # This file used to forward a hand-written list of ~15 variables. `.env.example` documents 41.
+    # The other 26 -- every liquidation knob, the entire market specification, the UI flag, compound,
+    # and all seven reference-script overrides -- were read from .env by compose for variable
+    # substitution and then NEVER PASSED TO THE PROCESS. An operator could set
+    # AQUARIUM_LIQUIDATION_MODE=live, restart, and get a node that stayed `disabled`, with nothing
+    # anywhere reporting a problem: the configuration surface was inert and silent about it.
+    #
+    # `env_file` forwards the file itself, so the list cannot drift out of date again. Anything
+    # below under `environment` is either COMPUTED here or deliberately not an operator's to set.
+    env_file:
+      - .env
+
+    environment:
+      # NOT JAVA_OPTS. The image entrypoint is a bare ["java","-jar","app.jar"] with no shell, so
+      # nothing ever expands $JAVA_OPTS and any value set there is silently ignored. JAVA_TOOL_OPTIONS
+      # is read by the JVM itself. Prefer a percentage over a fixed -Xmx so the heap tracks the
+      # container limit instead of contradicting it.
+      - JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75
+      # Composed from the parts above; not a knob of its own.
+      - DB_URL=jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?currentSchema=${DB_SCHEMA}
+
+    # ⚠ MaxRAMPercentage is a percentage OF THIS LIMIT. Without a limit it is a percentage of the
+    # whole host, so the JVM will happily size its heap against RAM other things are using.
+    mem_limit: ${AQUARIUM_MEM_LIMIT:-4g}
+
+    # ⛔ NO `ports:` BLOCK, DELIBERATELY. Publishing 8080 puts the operator UI -- which shows loan
+    # positions and the bot's decisions -- on a public interface with NO AUTHENTICATION IN FRONT OF
+    # IT. Reach it with `ssh -L 8080:localhost:8080 <host>` instead, or run on a private network.
+    # docs/deploying.md § Reaching the UI explains both and why a port mapping is not the answer.
+
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://aquarium-node:8080/healthcheck"]
+      # localhost, not the service name: this runs INSIDE the container, so it needs no DNS and
+      # keeps working if the service is ever renamed.
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 5
-    environment:
-      # NOT JAVA_OPTS. The image entrypoint is a bare ["java","-jar","app.jar"] with no shell, so
-      # nothing ever expands $JAVA_OPTS and any value set there is silently ignored -- as the old
-      # line here was, quotes included, for the life of this file. JAVA_TOOL_OPTIONS is read by the
-      # JVM itself, so it works without the entrypoint's cooperation. Prefer a percentage over a
-      # fixed -Xmx so the heap tracks the container limit instead of contradicting it.
-      - JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75
-      - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE}
-      - DB_DRIVER=${DB_DRIVER}
-      - DB_DIALECT=${DB_DIALECT}
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_PORT=${POSTGRES_PORT}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - DB_SCHEMA=${DB_SCHEMA}
-      - DB_USERNAME=${DB_USERNAME}
-      - DB_PASSWORD=${DB_PASSWORD}
-      - DB_URL=jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?currentSchema=${DB_SCHEMA}
-      - STORE_CARDANO_HOST=${STORE_CARDANO_HOST}
-      - STORE_CARDANO_PORT=${STORE_CARDANO_PORT}
-      - BLOCKFROST_KEY=${BLOCKFROST_KEY}
-      - WALLET_MNEMONIC=${WALLET_MNEMONIC}
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
     depends_on:
       postgres:
         condition: service_healthy
