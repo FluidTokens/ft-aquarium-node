@@ -708,7 +708,31 @@ public final class LoanFixtures {
      * that changed in FluidTokens revision 4c4d143. Never use this as chain evidence or in a live rig.
      */
     public static Utxo syntheticLatestConfigUtxo(String txHash, int outputIndex) {
-        return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, syntheticLatestConfigDatum());
+        return syntheticConfigUtxoFor(REGISTRY, txHash, outputIndex);
+    }
+
+    /**
+     * The same synthesis, but derived from a REGISTRY YOU CHOOSE rather than {@link #REGISTRY}.
+     *
+     * <p>⛔ The two have to be the same registry the transaction is built with, and that stopped
+     * being automatic on 2026-09-17. A rig building with one artefact while its config datum names
+     * another produces {@code RequiredRedeemersMismatch} if the credentials differ, or — worse —
+     * a validator that runs and REJECTS, which is what {@code RedeemerError{tag:"Withdraw"}} is.
+     */
+    public static Utxo syntheticConfigUtxoFor(LoansContractRegistry registry, String txHash,
+                                              int outputIndex) {
+        return configUtxo(txHash, outputIndex, registry.getConfigPolicyId(),
+                syntheticConfigDatumFor(registry));
+    }
+
+    /** {@link #syntheticConfigUtxoFor} for the LenderManager config. */
+    public static Utxo syntheticLmConfigUtxoFor(LoansContractRegistry registry, String txHash,
+                                                int outputIndex) {
+        String datum = replaceCapturedCredential(
+                fixture("fourth-deployment-lm-config-datum.hex"),
+                "dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457",
+                registry.getLmCompoundActionScriptHash(), "LMConfigDatum[3]");
+        return configUtxo(txHash, outputIndex, registry.getLmConfigPolicyId(), datum);
     }
 
     /**
@@ -737,6 +761,10 @@ public final class LoanFixtures {
      * <p><b>Never use this as chain evidence or in a live rig.</b>
      */
     static String syntheticLatestConfigDatum() {
+        return syntheticConfigDatumFor(REGISTRY);
+    }
+
+    static String syntheticConfigDatumFor(LoansContractRegistry REGISTRY) {
         PlutusData raw;
         try {
             raw = PlutusData.deserialize(
