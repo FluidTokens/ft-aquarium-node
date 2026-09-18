@@ -103,7 +103,8 @@ class LiquidationReadinessControllerTest {
                 new LoanAge("1d", "2026-09-13T00:00:00Z"),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
-                PoolUsability.noPool());
+                PoolUsability.noPool(),
+                null, null, null, null, null);
     }
 
     /**
@@ -139,7 +140,8 @@ class LiquidationReadinessControllerTest {
                 new LoanAge("unknown", null),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
-                PoolUsability.noPool());
+                PoolUsability.noPool(),
+                null, null, null, null, null);
 
         assertNull(r.healthFactor());
         assertNull(r.feeValueLovelace());

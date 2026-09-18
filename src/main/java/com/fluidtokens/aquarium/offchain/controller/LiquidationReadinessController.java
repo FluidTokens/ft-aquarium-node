@@ -115,7 +115,20 @@ public class LiquidationReadinessController {
                       AssetDisplay principalDisplay,
                       AssetDisplay collateralDisplay,
                       // ⛔ Whether a pool could fill THIS loan — not whether one exists. See PoolUsability.
-                      PoolUsability poolUsability) {
+                      PoolUsability poolUsability,
+                      // ---- the fee slice and the capital, SCALED AND TICKERED ---------------------
+                      // ⚠ feeInCollateral above is in the COLLATERAL asset's own base units and
+                      // feeValueLovelace is that amount priced in lovelace. Two different assets, and
+                      // the page used to render both as bare integers side by side, which reads as one
+                      // number restated. These carry the scale and the ticker so they cannot.
+                      AssetDisplay feeDisplay,
+                      // The same fee priced in ada, so the two figures are never two bare integers.
+                      AssetDisplay feeValueDisplay,
+                      AssetDisplay advanceDisplay,
+                      // cexplorer links. Null when the network or the loan policy is unknown — a dead
+                      // link is worse than none, so the template renders plain text instead.
+                      String loanExplorerUrl,
+                      String utxoExplorerUrl) {
 
         /** Sorting key: lower is closer to liquidation. Unknown health sorts last, never first. */
         public double sortKey() {
@@ -303,7 +316,11 @@ public class LiquidationReadinessController {
                 LoanAge.since(datum.lendDate(), now),
                 display(datum.principalAsset().toUnit(), datum.principalAmount(), metadataMemo),
                 display(collateralAsset.toUnit(), loan.collateralAmount(), metadataMemo),
-                usability);
+                usability,
+                feeTokens == null ? null : display(collateralAsset.toUnit(), feeTokens, metadataMemo),
+                feeValue == null ? null : display("lovelace", feeValue, metadataMemo),
+                advance == null ? null : display(datum.principalAsset().toUnit(), advance, metadataMemo),
+                loanAssetUrl(loan.loanId()), txUrl(loan.utxoRef()));
     }
 
     /**
@@ -337,6 +354,48 @@ public class LiquidationReadinessController {
      * the unknown marker. That is the honest degradation: the page keeps working and says that it does
      * not know, rather than inventing a scale to look complete.
      */
+    /**
+     * cexplorer base for the ACTIVE network, derived from the profile rather than configured.
+     *
+     * <p>A second configuration key would be a second source of truth for something the profile
+     * already settles, and its failure mode is silent: a mainnet node linking to preview pages.
+     * Returns null on an unknown network so callers render plain text rather than a dead link.
+     */
+    private String explorerBase() {
+        String n = network == null ? null : network.getNetwork();
+        if (n == null) {
+            return null;
+        }
+        return switch (n) {
+            case "mainnet" -> "https://cexplorer.io";
+            case "preview" -> "https://preview.cexplorer.io";
+            case "preprod" -> "https://preprod.cexplorer.io";
+            default -> null;
+        };
+    }
+
+    /**
+     * The loan NFT's asset page. {@code loanId} is the asset NAME; the unit cexplorer wants is the
+     * loan POLICY concatenated with it, so this is null when the registry has no coordinates.
+     */
+    private String loanAssetUrl(String loanId) {
+        String base = explorerBase();
+        LoansContractRegistry reg = registry.getIfAvailable();
+        if (base == null || loanId == null || reg == null || !reg.isConfigured()) {
+            return null;
+        }
+        return base + "/asset/" + reg.getLoanPolicyId() + loanId;
+    }
+
+    /** The transaction that created the loan UTxO. {@code utxoRef} is {@code txHash#index}. */
+    private String txUrl(String utxoRef) {
+        String base = explorerBase();
+        if (base == null || utxoRef == null || !utxoRef.contains("#")) {
+            return null;
+        }
+        return base + "/tx/" + utxoRef.substring(0, utxoRef.indexOf('#'));
+    }
+
     private AssetDisplay display(String unit, BigInteger amount, Map<String, TokenMetadata> memo) {
         TokenMetadata metadata = memo.computeIfAbsent(unit, u -> {
             TokenMetadataService service = tokenMetadata.getIfAvailable();
@@ -407,8 +466,12 @@ public class LiquidationReadinessController {
         } catch (RuntimeException e) {
             // ⛔ A failed lookup is NOT "no pool exists". One says hold capital for this loan from now
             // on; the other says try again shortly. Collapsing them was the defect this now avoids.
-            log.debug("pool lookup failed for {}/{}: {}", collateral.toUnit(), principal.toUnit(),
-                    e.toString());
+            // ⛔ WARN, NOT DEBUG. This was log.debug, so on a node running at INFO the page told the
+            // operator the lookup "did not complete ... worth re-checking" and the logs held NOTHING
+            // to re-check. A UI that reports a fault must not be the only place the fault exists.
+            log.warn("pool lookup failed for {}/{}: {} — the readiness page shows CHECK FAILED for "
+                            + "every loan on this pair until it succeeds",
+                    collateral.toUnit(), principal.toUnit(), e.toString(), e);
             return new PoolFetch(null, PoolUsability.checkFailed(e.getClass().getSimpleName()));
         }
     }
