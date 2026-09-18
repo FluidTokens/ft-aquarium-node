@@ -234,9 +234,9 @@ docker compose exec aquarium-node env | grep AQUARIUM_
 
 Since 2026-09-18 the image runs as **uid 10001** (`aquarium`) instead of root.
 
-**If you pass configuration by environment variable — Docker Compose, `--env-file`, plain env — nothing changes.** This section does not apply to you.
+**If you pass configuration by environment variable — Docker Compose, `--env-file`, Kubernetes `env:` — nothing changes.** This section does not apply to you.
 
-**If you mount secrets as files** — Kubernetes secret volumes, systemd credentials, docker secrets — the container may no longer be able to read them, and the failure is at startup:
+**If you mount secrets as files** — Kubernetes secret volumes, systemd credentials, docker secrets — the container may no longer be able to read them, and it fails at startup:
 
 ```
 Caused by: java.nio.file.AccessDeniedException: /etc/aquarium-secrets/spring.flyway.password
@@ -244,9 +244,40 @@ Caused by: java.nio.file.AccessDeniedException: /etc/aquarium-secrets/spring.fly
 
 ⚠ **`AccessDenied`, not `NoSuchFile`: the file is there, the process may not read it.** Root could read a `0400` root-owned mount; uid 10001 cannot.
 
-### The fix, and the part that catches people
+### The simplest fix: pass them as environment variables instead
 
-**Both the group AND the mode have to move.** Setting `fsGroup` alone does not work: Kubernetes applies `fsGroup` as the volume's group owner but still honours `defaultMode`, so `0400` remains owner-only — and the owner is still root.
+**Usually the right answer, because it removes the permission surface rather than configuring around it** — and because this application already reads these values from the environment. `application.yaml` ships:
+
+```yaml
+spring:
+  flyway:
+    password: ${DB_PASSWORD:password}
+  datasource:
+    username: ${DB_USERNAME:fluidtokens}
+    password: ${DB_PASSWORD:password}
+```
+
+A config tree mounted at `/etc/aquarium-secrets/` is a deployment **overriding** that with a higher-precedence property source. Drop it and set the variables directly:
+
+```yaml
+env:
+  - name: DB_PASSWORD
+    valueFrom:
+      secretKeyRef: { name: aquarium-secrets, key: db-password }
+  - name: DB_USERNAME
+    valueFrom:
+      secretKeyRef: { name: aquarium-secrets, key: db-username }
+```
+
+Then remove the volume mount and any `spring.config.import=configtree:…`. **With no files to read, the non-root image needs no `fsGroup` and no `defaultMode`** — the hardening stays and costs nothing.
+
+For any other key in such a directory, the mapping is Spring's relaxed binding — uppercase, dots and dashes to underscores: `spring.flyway.password` → `SPRING_FLYWAY_PASSWORD`.
+
+⚠ **Judge this per secret rather than as a rule.** File mounts are generally stronger than environment variables, which leak into `/proc/<pid>/environ`, child processes and crash dumps. But this node already takes `WALLET_MNEMONIC` and `BLOCKFROST_KEY` from the environment, and the mnemonic is by a wide margin the most sensitive thing it holds — so putting a **local database password** beside it is consistency, not a downgrade. A credential that is worth file-mounting is worth file-mounting *everything* for, and that is a bigger decision than this section.
+
+### If you want to keep file mounts
+
+**Both the group AND the mode have to move.** `fsGroup` alone does not work: Kubernetes applies it as the volume's group owner but still honours `defaultMode`, so `0400` remains owner-only — and the owner is still root.
 
 ```yaml
 spec:
@@ -258,14 +289,14 @@ spec:
     - name: aquarium-secrets
       secret:
         secretName: aquarium-secrets
-        defaultMode: 0440    # ⛔ 0400 will still fail: group needs read
+        defaultMode: 0440    # ⛔ 0400 will still fail: the group needs read
 ```
 
-`0440` keeps the secret unreadable to everyone else. `0444` also works and is simpler, at the cost of being world-readable inside the container.
+`0440` keeps the secret unreadable to anything else in the container. `0444` also works and is simpler, at the cost of being world-readable there.
 
-### If you would rather not change your deployment
+### Or run as root
 
-Run as root explicitly. You give up the hardening, and it is a legitimate choice if the container is already isolated:
+You give up the hardening; a legitimate choice if the container is already isolated:
 
 ```yaml
 spec:
@@ -275,4 +306,4 @@ spec:
 
 ### Why the image changed at all
 
-The node holds a funded wallet mnemonic in its process environment and makes outbound network calls. Root inside the container is one bug away from being root on a mounted volume. The trade is a one-time deployment change against removing that class of escalation permanently.
+The node holds a funded wallet mnemonic in its process environment and makes outbound network calls. Root inside the container is one bug away from root on a mounted volume. The trade is a one-time deployment change against removing that class of escalation permanently.
