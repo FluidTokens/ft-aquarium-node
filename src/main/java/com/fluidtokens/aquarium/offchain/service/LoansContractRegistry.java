@@ -171,6 +171,25 @@ public class LoansContractRegistry {
     @Getter(AccessLevel.NONE)
     private final Map<String, PlutusScript> scriptCache = new ConcurrentHashMap<>();
 
+    /**
+     * How many parameters were applied to each validator, recorded as {@link #derive} runs.
+     *
+     * <p>⛔ This exists for ONE check, and it is the check that was missing on 2026-09-17:
+     * {@code pool_manager.poolManager} went from seven applied parameters to eight, and
+     * <b>both arities apply cleanly and both produce well-formed hashes</b>.
+     * {@code applyParamToScript} does not know how many parameters a validator wants; it wraps
+     * whatever it is handed. Seven yielded {@code 8536884e…}, eight yielded the deployed
+     * {@code 1e0bf58a…}, and nothing in the build, the type system or the evaluator could tell them
+     * apart — the wrong one is simply a hash nobody deployed. Finding it took a comparison against
+     * the chain, four steps from the cause.
+     *
+     * <p>The blueprint DECLARES each validator's parameter list. Holding this against that
+     * declaration turns the next arity change into a build failure naming the validator. See
+     * {@code BlueprintParameterContractTest}.
+     */
+    @Getter(AccessLevel.NONE)
+    private final Map<String, Integer> appliedParameterCount = new LinkedHashMap<>();
+
     @Autowired
     public LoansContractRegistry(AppConfig.LoansConfiguration cfg) {
         this(coordinate(cfg.getConfigPolicyId(), "loans.config.policy-id"),
@@ -711,9 +730,19 @@ public class LoansContractRegistry {
             list.add(p);
         }
         String applied = AikenScriptUtil.applyParamToScript(list, unapplied);
+        appliedParameterCount.put(validator, params.length);
         String hash = hashOf(applied);
         appliedCompiledCode.put(hash, applied);
         return hash;
+    }
+
+    /**
+     * Validator name to the number of parameters this registry applied to it. Only validators this
+     * node actually derives appear. Read by {@code BlueprintParameterContractTest} against the
+     * blueprint's own declarations — see {@link #appliedParameterCount}.
+     */
+    public Map<String, Integer> appliedParameterCounts() {
+        return Map.copyOf(appliedParameterCount);
     }
 
     private static String hashOf(String compiledCode) {

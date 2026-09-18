@@ -126,9 +126,23 @@ class MainnetBlueprintSelectionTest {
     void productionSurfaceHasNoBlueprintSelector() {
         assertFalse(Arrays.stream(AppConfig.LoansConfiguration.class.getDeclaredFields())
                 .anyMatch(field -> field.getName().toLowerCase().contains("blueprint")));
-        assertEquals(List.of(1, 4, 7), Arrays.stream(LoansContractRegistry.class.getConstructors())
+        // ⛔ 5 and 8 ARE THE SAME TWO CONSTRUCTORS AS 4 AND 7, each with a leading blueprint-resource
+        // argument, and they are test-only by contract rather than by visibility (the rigs live in
+        // another package). The guard this test enforces is unchanged: NO production PATH selects a
+        // blueprint -- the field check above is what enforces that, and AppConfig still exposes
+        // nothing blueprint-shaped, so a deployment cannot reach them.
+        //
+        // ⚠ They exist because a rig that replays RECORDED on-chain publications must derive from
+        // the artefact those publications were built from. Once the shipped artefact moved ahead of
+        // preview on 2026-09-17, four pool rigs died on a null coordinate; re-keying their verified
+        // coordinate table to the new hashes was the alternative, and it would have paired a new
+        // hash with a script that was never published at that address.
+        //
+        // The set is pinned exactly, so ANOTHER constructor still fails here.
+        assertEquals(List.of(1, 4, 5, 7, 8), Arrays.stream(LoansContractRegistry.class.getConstructors())
                 .map(constructor -> constructor.getParameterCount()).sorted().toList(),
-                "the fixed configuration, four-parameter and seven-parameter constructors are the whole API");
+                "the fixed-configuration, four/seven-parameter and blueprint-pinned five/eight-parameter "
+                        + "constructors are the whole API");
     }
 
     @Test
