@@ -29,6 +29,18 @@ import static org.junit.jupiter.api.Assertions.assertNull;
  */
 class LoansContractDerivationTest {
 
+    // ⚠ WHAT THESE PREVIEW PINS ARE, AND WHAT THEY ARE NOT.
+    //
+    // They pin what the SHIPPED artefact derives under preview's parameters. They moved on
+    // 2026-09-17 because the artefact moved -- FluidTokens' mainnet redeploy carried pool.ak,
+    // loan_recast_action.ak and locked_borrower_manager.ak with it.
+    //
+    // ⛔ They are NOT chain-verified and cannot be: PREVIEW HAS NOT BEEN REDEPLOYED, so nothing on
+    // that network publishes these hashes and there is nothing to compare them against. They guard
+    // against ACCIDENTAL drift in the derivation code -- a changed parameter order, a lost
+    // argument -- and not against being wrong. The chain-verified equivalents are the mainnet
+    // assertions in MainnetReferenceScriptsTest and MainnetRegistryMatchesConfigTest.
+
     // ---- Derivation inputs (preview) ----------------------------------------------------
 
     private static final String CONFIG_POLICY_ID = "d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e";
@@ -48,24 +60,24 @@ class LoansContractDerivationTest {
     // These are what the LIVE datum publishes. The vendored latest blueprint still derives all
     // except the explicitly labelled pool-sell value below.
 
-    private static final String POOL_POLICY_ID = "a33aee4034165f1772e57af5fb975f26c35f7e9080b7e44b4634f227";
+    private static final String POOL_POLICY_ID = "1c330cfbd58d994945d29c7c52ec001d054b93f733317ec59d9a0537";
     private static final String REQUEST_POLICY_ID = "39bef32eb5f696f6d0b1cc0446903311f04fe008797c0e349a672acb";
     private static final String LOAN_POLICY_ID = "2f1aa941f437e351e3870f7247d735b2bc2952f1c7977426e8960d17";
-    private static final String POOL_SPEND = "bf8c4378bab7de15baddbb5d8805255d89174c08bf36179c21cad685";
+    private static final String POOL_SPEND = "515009399bc0fd2bb204b0a50973a1285415159bed4213e315d739b7";
     private static final String REQUEST_SPEND = "978934c46206696e0d44e56a43ceeaf0a607b1232fcd5b4ec64b0f73";
     private static final String LOAN_SPEND = "31e0dc1d75076e4f7795b24c4cc4b5515791bb4eff4af7961e404f3e";
     private static final String LOAN_CLAIM_ACTION = "c6e0c4395cf22e08f918ca996d7db49faba793dbd6b647160168ff39";
     private static final String LOAN_REPAY_ACTION = "c0f7e513e81f7eb1abf8429c614cc0ab2acde02189bade0dd65c15be";
     private static final String LOAN_CHANGE_COLLATERAL_ACTION = "899f9bf3ff89d48537a283a38e5c8d868a97c22200f8c66695f38e7b";
-    private static final String LOAN_RECAST_ACTION = "1628910a5fbdba415c3b1bf7304672106659ac527442f10701472753";
+    private static final String LOAN_RECAST_ACTION = "21f4bde7524bbab159eb0293dac262f1193c6266385d983ee761e363";
     private static final String ASSET_MANAGER_SPEND = "de8f81868054fe87019230b9c33e1d18d668689ee201f3f57fbfa69c";
     private static final String POOL_CANCEL_ACTION = "a4f2d030b2348582335038135cb7b59bbe7145d44d2dab9a409dde50";
     private static final String POOL_BORROW_ACTION = "344755c30db0617ff43cb41e5212379b729985352a213371b15c90cd";
     /** Latest blueprint value; captured fourth-deployment preview publishes db9a5bf0…d9c56. */
     private static final String POOL_SELL_LENDER_POSITION_ACTION = "cdfa58c27aee3458983247dcde6419e6e8ca13b30e5ba34f95feccb0";
     private static final String POOL_COMPOUND_ACTION = "33128ca352b5472f593104d5884ced5cba5e980b3177353eb2116c62";
-    private static final String POOL_MANAGER_SPEND = "b4ad9a6f2710d68067177e0de5a4378ebe4fcdfdc929c7488479c313";
-    private static final String POOL_MANAGER_POLICY_ID = "45ce890c9bcf70f6eed629b5db7c0622e44ca1003e001a2cf951518f";
+    private static final String POOL_MANAGER_SPEND = "1322b6d1e7e46ac543769a8fcfb43840606f040d2e9efa2e59389d86";
+    private static final String POOL_MANAGER_POLICY_ID = "c2023c909f66d50886e82ba86a03382313bbb8e994789e0aba588b3d";
     /**
      * <b>Not ground truth from the datum</b> — the {@code ConfigDatum} does not publish the pool-manager
      * <em>action</em> hashes, they are baked into {@code pool_manager.ak}'s parameters instead. It is
@@ -74,8 +86,8 @@ class LoansContractDerivationTest {
      * and {@link #POOL_MANAGER_POLICY_ID} above <em>is</em> ground truth off the live datum. A wrong value
      * here cannot produce the right value there.
      */
-    private static final String PM_CANCEL_POOL_MANAGER = "72bdf30225529881c6e6de5f6576b0ec5f55a8e515019b3412d7bce1";
-    private static final String LOCKED_BORROWER_MANAGER_SPEND = "d815766d61c1241742ff78164cdf8edaef1746a99a242a7fb7938aa6";
+    private static final String PM_CANCEL_POOL_MANAGER = "2f670dfbfb6a72e68510ea56404931e3b754bf972c7c51b5ee415501";
+    private static final String LOCKED_BORROWER_MANAGER_SPEND = "f74b887491c86b1a1b7785c01f15cb7551f4520174589e22efb0df02";
 
     /**
      * Bond policy ids, read from the {@code ConfigDatum} (output 0 of {@code 8dd38e97…091c}): the
@@ -92,9 +104,9 @@ class LoansContractDerivationTest {
     private static final String LM_WITHDRAW_BONDS_ACTION = "42c4a0d6f33f21ccc694c6620d6485331df6528da8b8d16acf1589fe";
     private static final String LM_LIQUIDATE_ACTION = "e0a13838d176cea9de466afe2075f38f682603013604021a3959700f";
     /** Latest blueprint value; captured fourth-deployment preview publishes dd47090…00457. */
-    private static final String LM_COMPOUND_ACTION = "7dbcad0e76f5c639c96dd7ffc52f730d1ac0290c46c04fe343edc49b";
+    private static final String LM_COMPOUND_ACTION = "7e7563dd1753d0a933922a8da698154eead46f662ccb7c65f748f2c3";
     private static final String LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION = "00b8a30bd2f18962e527d7c03712e86077a688bfce7e2934ef70034d";
-    private static final String LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION = "70b149e7c84a4cf47fb273d87ed2fe97562f0148bfce0b4681afa480";
+    private static final String LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION = "190a6c685dd2cb61fc2e542b5c43382b649ce98d7a7c97d746d7aa12";
     /** Unchanged across the third redeploy: the parameterless stub takes no config policy id. */
     private static final String LM_LIQUIDATE_CONVERT_AND_COMPOUND_ACTION = "435b42cc200719c3868dfe01689ee07e2eeff5f5809f25408cbe4e7d";
 
