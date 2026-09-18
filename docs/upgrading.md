@@ -227,3 +227,52 @@ seems to have no effect, confirm it reached the process and that the name still 
 ```bash
 docker compose exec aquarium-node env | grep AQUARIUM_
 ```
+
+---
+
+## 8. ⛔ The image runs as a non-root user — if you mount secrets as FILES, read this first
+
+Since 2026-09-18 the image runs as **uid 10001** (`aquarium`) instead of root.
+
+**If you pass configuration by environment variable — Docker Compose, `--env-file`, plain env — nothing changes.** This section does not apply to you.
+
+**If you mount secrets as files** — Kubernetes secret volumes, systemd credentials, docker secrets — the container may no longer be able to read them, and the failure is at startup:
+
+```
+Caused by: java.nio.file.AccessDeniedException: /etc/aquarium-secrets/spring.flyway.password
+```
+
+⚠ **`AccessDenied`, not `NoSuchFile`: the file is there, the process may not read it.** Root could read a `0400` root-owned mount; uid 10001 cannot.
+
+### The fix, and the part that catches people
+
+**Both the group AND the mode have to move.** Setting `fsGroup` alone does not work: Kubernetes applies `fsGroup` as the volume's group owner but still honours `defaultMode`, so `0400` remains owner-only — and the owner is still root.
+
+```yaml
+spec:
+  securityContext:
+    runAsUser:  10001
+    runAsGroup: 10001
+    fsGroup:    10001        # group-owns the mounted volume
+  volumes:
+    - name: aquarium-secrets
+      secret:
+        secretName: aquarium-secrets
+        defaultMode: 0440    # ⛔ 0400 will still fail: group needs read
+```
+
+`0440` keeps the secret unreadable to everyone else. `0444` also works and is simpler, at the cost of being world-readable inside the container.
+
+### If you would rather not change your deployment
+
+Run as root explicitly. You give up the hardening, and it is a legitimate choice if the container is already isolated:
+
+```yaml
+spec:
+  securityContext:
+    runAsUser: 0
+```
+
+### Why the image changed at all
+
+The node holds a funded wallet mnemonic in its process environment and makes outbound network calls. Root inside the container is one bug away from being root on a mounted volume. The trade is a one-time deployment change against removing that class of escalation permanently.

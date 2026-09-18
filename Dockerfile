@@ -25,6 +25,17 @@ RUN apt-get update && \
 # ⛔ NOT ROOT. A process that reads WALLET_MNEMONIC from its environment and talks to the internet
 # should not also be uid 0 inside its container. 8080 is above 1024, so no privileged bind is needed
 # and nothing here requires escalation.
+#
+# ⚠ THIS IS A BREAKING CHANGE FOR ANY DEPLOYMENT THAT MOUNTS SECRETS AS FILES, and it broke a real
+# one on 2026-09-18. The image used to run as root, which can read anything; uid 10001 cannot read a
+# root-owned 0400 mount, and Spring's config-tree support fails with
+#   java.nio.file.AccessDeniedException: /etc/aquarium-secrets/spring.flyway.password
+# -- the file EXISTS, the process simply may not read it. Docker `--env-file` and Compose are
+# unaffected; this only bites file-mounted secrets (Kubernetes, systemd credentials, docker secrets).
+#
+# ⚠ AND fsGroup ALONE IS NOT ENOUGH. Kubernetes applies fsGroup as the volume's GROUP owner but still
+# honours defaultMode, so `defaultMode: 0400` stays owner-only (owner is root) and the group cannot
+# read it. Both have to move together -- see docs/upgrading.md.
 RUN groupadd --system --gid 10001 aquarium && \
     useradd --system --uid 10001 --gid aquarium --home-dir /app --shell /usr/sbin/nologin aquarium
 
