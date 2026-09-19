@@ -103,7 +103,8 @@ class LiquidationReadinessControllerTest {
                 new LoanAge("1d", "2026-09-13T00:00:00Z"),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
-                PoolUsability.noPool());
+                PoolUsability.noPool(),
+                null, null, null, null, null);
     }
 
     /**
@@ -139,7 +140,8 @@ class LiquidationReadinessControllerTest {
                 new LoanAge("unknown", null),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
-                PoolUsability.noPool());
+                PoolUsability.noPool(),
+                null, null, null, null, null);
 
         assertNull(r.healthFactor());
         assertNull(r.feeValueLovelace());
@@ -311,17 +313,20 @@ class LiquidationReadinessControllerTest {
             this.poolExists = poolExists;
         }
 
+        // ⛔ resolveAllEitherOrder is what the page calls now — it needs EVERY pool for the pair,
+        // because depth only orders candidates and the fill test decides between them. Counting the
+        // single-pool method instead would count zero and the dedupe assertions would pass vacuously.
         @Override
-        public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
+        public java.util.List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
             calls++;
             // A real datum: PoolFetch now carries it through the memo, which is what lets the
             // per-loan verdict be computed without a second lookup.
             return poolExists
-                    ? Optional.of(new ResolvedPool(null, new MinswapPoolDatum(AssetType.ada(),
+                    ? java.util.List.of(new ResolvedPool(null, new MinswapPoolDatum(AssetType.ada(),
                             new AssetType("11".repeat(28), "464c4454"), BigInteger.TEN,
                             BigInteger.valueOf(1_000_000L), BigInteger.valueOf(2_000_000L),
                             BigInteger.valueOf(30), BigInteger.valueOf(30), false), "lp"))
-                    : Optional.empty();
+                    : java.util.List.of();
         }
     }
 
@@ -382,7 +387,7 @@ class LiquidationReadinessControllerTest {
 
             assertEquals(direct, first, "the memoised answer must equal an unmemoised one (pool=" + poolExists + ")");
             assertEquals(first, second, "the second read must equal the first (pool=" + poolExists + ")");
-            assertEquals(poolExists, first.datum() != null, "the fetched pool must survive the memo");
+            assertEquals(poolExists, !first.datums().isEmpty(), "the fetched pool must survive the memo");
         }
     }
 

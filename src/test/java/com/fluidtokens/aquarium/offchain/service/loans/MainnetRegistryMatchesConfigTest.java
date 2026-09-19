@@ -33,8 +33,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class MainnetRegistryMatchesConfigTest {
 
     /** Quoted first-hand from FluidTokens' own tooling, 2026-09-02. */
-    private static final String CONFIG_POLICY_ID = "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416";
-    private static final String LM_CONFIG_POLICY_ID = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
+    private static final String CONFIG_POLICY_ID = "235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200";
+    private static final String LM_CONFIG_POLICY_ID = "fb6ae2027358b4a0b62710eb95102d87fa13f66ecf55d8943699c492";
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
     /** Published by the mainnet ConfigDatum itself (field 0); not derivable from the blueprint. */
     private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";

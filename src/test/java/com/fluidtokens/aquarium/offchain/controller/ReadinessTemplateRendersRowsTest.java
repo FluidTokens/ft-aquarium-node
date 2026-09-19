@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -81,7 +82,16 @@ class ReadinessTemplateRendersRowsTest {
                         new TokenMetadata(FLDT_UNIT, "FLDT", "FluidTokens", 6, TokenMetadata.Source.REGISTRY)),
                 new PoolUsability(PoolUsability.Verdict.TOO_THIN,
                         "the pool would return about 4 but the debt to clear is 9, short by 5 — the "
-                                + "order would be refunded at the operator's expense"));
+                                + "order would be refunded at the operator's expense"),
+                // ⚠ POPULATED ON PURPOSE. This row exists to render every branch; nulls here would
+                // skip the scaled fee, the ada valuation, the scaled capital and both explorer links,
+                // and the test would pass without touching any of them.
+                AssetDisplay.of(BigInteger.valueOf(5_000_000L),
+                        new TokenMetadata(FLDT_UNIT, "FLDT", "FluidTokens", 6, TokenMetadata.Source.REGISTRY)),
+                AssetDisplay.of(BigInteger.valueOf(1_113_385L), TokenMetadata.ada()),
+                AssetDisplay.of(BigInteger.valueOf(20_887_781L), TokenMetadata.ada()),
+                "https://cexplorer.io/asset/aabbccdd1b6fda505ea9b739e42b5871d274344af37c196ddb70619541a7d06d",
+                "https://cexplorer.io/tx/d832b78e");
     }
 
     /** And one with every optional field null — the other half of the row branch. */
@@ -95,7 +105,8 @@ class ReadinessTemplateRendersRowsTest {
                 new LoanAge("unknown", null),
                 AssetDisplay.of(BigInteger.ONE, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)),
-                PoolUsability.checkFailed("SocketTimeoutException"));
+                PoolUsability.checkFailed("SocketTimeoutException"),
+                null, null, null, null, null);
     }
 
     private static String render(List<LiquidationReadinessController.Row> rows) {
@@ -119,13 +130,41 @@ class ReadinessTemplateRendersRowsTest {
         String html = render(List.of(fullRow()));
 
         assertTrue(html.contains("CAPITAL IN ADVANCE"), "the route pill must render");
-        assertTrue(html.contains("20887781"), "the capital-needed figure must render");
-        assertTrue(html.contains("1113385"), "the fee value must render — this is the broken cell");
+        // ⛔ SCALED, not raw. This asserted the raw base-unit figure "20887781", which is exactly the
+        // number an operator would have misread by a factor of a million. The column now renders the
+        // asset's own scale and ticker like every other amount on the page.
+        assertTrue(html.contains("20.887781"), "the capital-needed figure must render, scaled");
+        assertFalse(html.contains("20887781"),
+                "the raw base-unit figure must NOT appear once a scale is known — that is the defect");
+
+        // The fee slice is TWO assets: the collateral amount and its ada valuation. Rendering both as
+        // bare integers read as one number restated, which is how it was read.
+        assertTrue(html.contains("5") && html.contains("FLDT"),
+                "the fee slice must carry the collateral ticker");
+        // ⚠ Asserted without the apostrophe: Thymeleaf escapes it to &#39; in the output, so matching
+        // the literal sentence would fail on the ENCODING rather than on the content.
+        assertTrue(html.contains("1.113385"), "the fee's ada valuation must render scaled");
+        assertTrue(html.contains("oracle price"),
+                "and be labelled as a valuation, not as a second quantity of the same asset");
+
+        // Both explorer links, and both hashes still reachable in full via the title attribute.
+        assertTrue(html.contains("https://cexplorer.io/asset/"), "the loan asset link must render");
+        assertTrue(html.contains("https://cexplorer.io/tx/"), "the loan UTxO link must render");
+        assertTrue(html.contains("loan NFT asset name") && html.contains("loan UTxO"),
+                "each hash must say WHICH hash it is, and carry the full value on hover");
+        // ⛔ This asserted the RAW lovelace figure "1113385". That cell is the one the |...| literal
+        // fix made render at all, and it is now also scaled — so the raw form must be GONE, for the
+        // same reason as the capital column: a bare base-unit integer beside a scaled one is the
+        // misreading this page exists to prevent. The scaled assertion above covers the rendering.
+        assertFalse(html.contains("1113385"),
+                "the raw lovelace figure must not survive once ada's scale is known");
         // ⚠ Thymeleaf HTML-ESCAPES th:text output, so the apostrophe arrives as &#39; — asserting the
         // raw character failed here and it was the assertion that was wrong, not the fix. Accept
         // either: the point is that the apostrophe reached the OUTPUT at all, which is what proves it
         // was only ever illegal inside a quoted EXPRESSION and is perfectly legal as text.
-        assertTrue(html.contains("today&#39;s price") || html.contains("today's price"),
+        // ⚠ Matches the APOSTROPHE, not the sentence. This pinned "today's price" and broke when the
+        // caption gained the word "oracle" -- failing on copy rather than on the thing it guards.
+        assertTrue(html.contains("today&#39;s") || html.contains("today's"),
                 "the apostrophe must survive to the output, escaped or not — that is the whole point: "
                         + "it is legal TEXT and was only ever illegal inside a quoted Thymeleaf "
                         + "literal. Rendered fragment absent entirely means the cell did not render.");
@@ -260,6 +299,7 @@ class ReadinessTemplateRendersRowsTest {
                 new LoanAge("2d", "2026-09-12T00:00:00Z"),
                 AssetDisplay.of(BigInteger.ONE, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)),
-                usability);
+                usability,
+                null, null, null, null, null);
     }
 }

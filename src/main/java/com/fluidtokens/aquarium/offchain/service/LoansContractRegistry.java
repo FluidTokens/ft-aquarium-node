@@ -95,6 +95,12 @@ public class LoansContractRegistry {
     private final String poolBorrowActionScriptHash;
     private final String poolSellLenderPositionActionScriptHash;
     private final String poolCompoundActionScriptHash;
+    /**
+     * {@code pool/pool_edit_action} — added by FluidTokens' 2026-09-17 redeploy. Derived only so
+     * that the set this class publishes matches the set the deployment published; no path here
+     * invokes it yet.
+     */
+    private final String poolEditActionScriptHash;
 
     // Tier 5 — LenderManager. Neither hash is published on chain; both must be derived.
     private final String lenderManagerWithdrawScriptHash;
@@ -135,10 +141,24 @@ public class LoansContractRegistry {
      * {@code LoansConfigVerifier} must not grow an expectation for it either.
      */
     private final String pmCompoundLiquidityScriptHash;
+    /**
+     * {@code pool_manager/pm_edit_pool} — added by FluidTokens' 2026-09-17 redeploy, and the
+     * reason {@code pool_manager.poolManager} now takes <b>eight</b> parameters rather than seven.
+     *
+     * <p>⛔ Omitting it does not fail loudly: the seven-parameter application still produces a
+     * well-formed hash ({@code 8536884e…}) that simply is not the deployed one ({@code 1e0bf58a…}).
+     * Same standing as the other pm_* hashes — baked into {@code pool_manager.ak}'s parameters
+     * rather than published in the {@code ConfigDatum}.
+     */
+    private final String pmEditPoolScriptHash;
     private final String lmCompoundActionScriptHash;
     private final String lmLiquidatePayInAdvanceAndCompoundActionScriptHash;
 
     private final Map<String, String> code;
+
+    /** The blueprint resource {@link #code} was loaded from — named in errors so they are actionable. */
+    @Getter(AccessLevel.NONE)
+    private final String blueprintResource;
 
     /**
      * The <em>applied</em> compiled code of every validator this registry derives, keyed by its
@@ -150,6 +170,25 @@ public class LoansContractRegistry {
 
     @Getter(AccessLevel.NONE)
     private final Map<String, PlutusScript> scriptCache = new ConcurrentHashMap<>();
+
+    /**
+     * How many parameters were applied to each validator, recorded as {@link #derive} runs.
+     *
+     * <p>⛔ This exists for ONE check, and it is the check that was missing on 2026-09-17:
+     * {@code pool_manager.poolManager} went from seven applied parameters to eight, and
+     * <b>both arities apply cleanly and both produce well-formed hashes</b>.
+     * {@code applyParamToScript} does not know how many parameters a validator wants; it wraps
+     * whatever it is handed. Seven yielded {@code 8536884e…}, eight yielded the deployed
+     * {@code 1e0bf58a…}, and nothing in the build, the type system or the evaluator could tell them
+     * apart — the wrong one is simply a hash nobody deployed. Finding it took a comparison against
+     * the chain, four steps from the cause.
+     *
+     * <p>The blueprint DECLARES each validator's parameter list. Holding this against that
+     * declaration turns the next arity change into a build failure naming the validator. See
+     * {@code BlueprintParameterContractTest}.
+     */
+    @Getter(AccessLevel.NONE)
+    private final Map<String, Integer> appliedParameterCount = new LinkedHashMap<>();
 
     @Autowired
     public LoansContractRegistry(AppConfig.LoansConfiguration cfg) {
@@ -167,11 +206,44 @@ public class LoansContractRegistry {
                 null, null, null);
     }
 
+    /**
+     * Derive from a NAMED blueprint rather than the shipped one.
+     *
+     * <p>⛔ <b>Production must never call this — the running node derives from
+     * {@link #BLUEPRINT_RESOURCE} and nothing else.</b> It exists for one situation, and it is a real
+     * one: a rig that replays <b>recorded on-chain publications</b> has to derive from the artefact
+     * those publications were built from. Otherwise the shipped artefact moving ahead of a deployment
+     * silently re-keys the rig's coordinate table onto hashes FluidTokens never published there, and
+     * the rig either crashes or — worse — pairs a new hash with an old script.
+     *
+     * <p>That is not hypothetical: FluidTokens' 2026-09-17 mainnet redeploy changed
+     * {@code pool.pool}, {@code pool_manager.poolManager} and
+     * {@code pool_manager/pm_compound_liquidity} while leaving every liquidation-path validator
+     * byte-identical, which broke exactly the four preview pool rigs and nothing else.
+     */
+    public LoansContractRegistry(String blueprintResource, String configPolicyId,
+                                 String lmConfigPolicyId, String configAssetName,
+                                 String smartTokensSpendScriptHash) {
+        this(blueprintResource, configPolicyId, lmConfigPolicyId, configAssetName,
+                smartTokensSpendScriptHash, null, null, null);
+    }
+
     public LoansContractRegistry(String configPolicyId, String lmConfigPolicyId,
                                  String configAssetName, String smartTokensSpendScriptHash,
                                  String minswapPoolPolicyId, String minswapPoolSpendScriptHash,
                                  String minswapOrderSpendScriptHash) {
-        this.code = loadUnappliedCompiledCodes();
+        this(BLUEPRINT_RESOURCE, configPolicyId, lmConfigPolicyId, configAssetName,
+                smartTokensSpendScriptHash, minswapPoolPolicyId, minswapPoolSpendScriptHash,
+                minswapOrderSpendScriptHash);
+    }
+
+    public LoansContractRegistry(String blueprintResource, String configPolicyId,
+                                 String lmConfigPolicyId, String configAssetName,
+                                 String smartTokensSpendScriptHash,
+                                 String minswapPoolPolicyId, String minswapPoolSpendScriptHash,
+                                 String minswapOrderSpendScriptHash) {
+        this.code = loadUnappliedCompiledCodes(blueprintResource);
+        this.blueprintResource = blueprintResource;
         this.configPolicyId = configPolicyId;
         this.lmConfigPolicyId = lmConfigPolicyId;
         this.configAssetName = configAssetName;
@@ -213,6 +285,8 @@ public class LoansContractRegistry {
         this.poolSellLenderPositionActionScriptHash =
                 derive("pool/pool_sell_lender_position.pool_sell_lender_position_action", mainCfg, name);
         this.poolCompoundActionScriptHash = derive("pool/pool_compound_action.pool_compound_action", mainCfg, name);
+        this.poolEditActionScriptHash = has("pool/pool_edit_action.pool_edit_action")
+                ? derive("pool/pool_edit_action.pool_edit_action", mainCfg, name) : null;
 
         // Rule 2: the LenderManager wraps with the LM config policy, not the main one.
         this.lenderManagerWithdrawScriptHash = derive("lender_manager.lenderManager", b(lmConfigPolicyId), name);
@@ -255,6 +329,7 @@ public class LoansContractRegistry {
             this.poolManagerSpendScriptHash = null;
             this.pmCancelPoolManagerScriptHash = null;
             this.pmCompoundLiquidityScriptHash = null;
+            this.pmEditPoolScriptHash = null;
             this.lmCompoundActionScriptHash = null;
             this.lmLiquidatePayInAdvanceAndCompoundActionScriptHash = null;
         } else {
@@ -267,10 +342,26 @@ public class LoansContractRegistry {
                     mainCfg, name, poolSpend, poolPolicy, smartTokensSpend);
             String pmCompound = derive("pool_manager/pm_compound_liquidity.poolManager",
                     b(lenderManagerWithdrawScriptHash), b(poolPolicyId));
+            // ⛔ THE PARAMETER COUNT FOLLOWS THE ARTEFACT, and it must.
+            // FluidTokens' 2026-09-17 redeploy added pool_manager/pm_edit_pool and made
+            // pool_manager.poolManager take EIGHT parameters instead of seven. Both arities apply
+            // cleanly and both produce well-formed hashes -- seven yields 8536884e..., eight yields
+            // the deployed 1e0bf58a... -- so NOTHING about the application catches a wrong count.
+            // The blueprint's own validator list is the only honest source of the answer, which is
+            // why this branches on presence rather than on a version flag or a config key.
+            String pmEdit = has("pool_manager/pm_edit_pool.poolManager")
+                    ? derive("pool_manager/pm_edit_pool.poolManager",
+                            mainCfg, name, poolSpend, poolPolicy, smartTokensSpend)
+                    : null;
             this.pmCancelPoolManagerScriptHash = pmCancel;
             this.pmCompoundLiquidityScriptHash = pmCompound;
-            this.poolManagerPolicyId = derive("pool_manager.poolManager",
-                    mainCfg, name, poolSpend, poolPolicy, b(pmCancel), b(pmUpdate), b(pmCompound));
+            this.pmEditPoolScriptHash = pmEdit;
+            this.poolManagerPolicyId = pmEdit == null
+                    ? derive("pool_manager.poolManager",
+                            mainCfg, name, poolSpend, poolPolicy, b(pmCancel), b(pmUpdate), b(pmCompound))
+                    : derive("pool_manager.poolManager",
+                            mainCfg, name, poolSpend, poolPolicy, b(pmCancel), b(pmUpdate), b(pmCompound),
+                            b(pmEdit));
             this.poolManagerSpendScriptHash = generalSpend(poolManagerPolicyId, configPolicyId);
             this.lmCompoundActionScriptHash = derive("lender_manager/lm_compound_action.actionValidator",
                     mainCfg, name, lmSpend, b(lenderManagerWithdrawScriptHash), amSpend, amWithdraw,
@@ -316,6 +407,7 @@ public class LoansContractRegistry {
         m.put("poolBorrowActionScriptHash", poolBorrowActionScriptHash);
         m.put("poolSellLenderPositionActionScriptHash", poolSellLenderPositionActionScriptHash);
         m.put("poolCompoundActionScriptHash", poolCompoundActionScriptHash);
+        m.put("poolEditActionScriptHash", poolEditActionScriptHash);
         m.put("lenderManagerWithdrawScriptHash", lenderManagerWithdrawScriptHash);
         m.put("lenderManagerSpendScriptHash", lenderManagerSpendScriptHash);
         m.put("borrowerBondPolicyId", borrowerBondPolicyId);
@@ -331,6 +423,7 @@ public class LoansContractRegistry {
         // the ConfigDatum does not publish it (see the field's own javadoc).
         m.put("pmCancelPoolManagerScriptHash", pmCancelPoolManagerScriptHash);
         m.put("pmCompoundLiquidityScriptHash", pmCompoundLiquidityScriptHash);
+        m.put("pmEditPoolScriptHash", pmEditPoolScriptHash);
         m.put("lmCompoundActionScriptHash", lmCompoundActionScriptHash);
         m.put("lmLiquidatePayInAdvanceAndCompoundActionScriptHash", lmLiquidatePayInAdvanceAndCompoundActionScriptHash);
         return m;
@@ -622,19 +715,34 @@ public class LoansContractRegistry {
                 b(withdrawScriptHash), b(configNftPolicyId), b(configAssetName));
     }
 
+    /** Whether this blueprint carries a validator at all — artefacts differ across deployments. */
+    private boolean has(String validator) {
+        return code.containsKey(validator);
+    }
+
     private String derive(String validator, PlutusData... params) {
         String unapplied = code.get(validator);
         if (unapplied == null) {
-            throw new IllegalStateException("no such validator in " + BLUEPRINT_RESOURCE + ": " + validator);
+            throw new IllegalStateException("no such validator in " + blueprintResource + ": " + validator);
         }
         ListPlutusData list = ListPlutusData.builder().build();
         for (PlutusData p : params) {
             list.add(p);
         }
         String applied = AikenScriptUtil.applyParamToScript(list, unapplied);
+        appliedParameterCount.put(validator, params.length);
         String hash = hashOf(applied);
         appliedCompiledCode.put(hash, applied);
         return hash;
+    }
+
+    /**
+     * Validator name to the number of parameters this registry applied to it. Only validators this
+     * node actually derives appear. Read by {@code BlueprintParameterContractTest} against the
+     * blueprint's own declarations — see {@link #appliedParameterCount}.
+     */
+    public Map<String, Integer> appliedParameterCounts() {
+        return Map.copyOf(appliedParameterCount);
     }
 
     private static String hashOf(String compiledCode) {
@@ -701,13 +809,13 @@ public class LoansContractRegistry {
         return trimmed;
     }
 
-    private static Map<String, String> loadUnappliedCompiledCodes() {
+    private static Map<String, String> loadUnappliedCompiledCodes(String resource) {
         Map<String, String> m = new HashMap<>();
-        try (InputStream is = new ClassPathResource(BLUEPRINT_RESOURCE).getInputStream()) {
+        try (InputStream is = new ClassPathResource(resource).getInputStream()) {
             JsonNode root = new ObjectMapper().readTree(is);
             JsonNode validators = root.get("validators");
             if (validators == null || !validators.isArray()) {
-                throw new IllegalStateException("loans blueprint classpath resource '" + BLUEPRINT_RESOURCE
+                throw new IllegalStateException("loans blueprint classpath resource '" + resource
                         + "' has no validators array");
             }
             for (JsonNode v : validators) {
@@ -718,7 +826,7 @@ public class LoansContractRegistry {
             throw e;
         } catch (Exception e) {
             throw new IllegalStateException("cannot read loans blueprint classpath resource '"
-                    + BLUEPRINT_RESOURCE + "'", e);
+                    + resource + "'", e);
         }
         return m;
     }

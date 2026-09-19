@@ -44,7 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Slf4j
 class CompoundDryEvalTest {
 
-    private static final LoansContractRegistry REGISTRY = LoanFixtures.shippedPreviewRegistry();
+    private static final LoansContractRegistry REGISTRY = LoanFixtures.previewDeploymentRegistry();
     private static final String POOL_ID = "00d3513725536642b6fe985ce9ec87d1ebb880497d92e0a8495bc6d0bf";
     private static final String LOAN_ID = "e833a769ea3a480343175e253eab799ec0b058c99de30cc17160dc37";
     private static final BigInteger ESCROW = BigInteger.valueOf(29_109_268L);
@@ -91,17 +91,41 @@ class CompoundDryEvalTest {
 
     private static List<Utxo> universe() {
         return List.of(utxo("escrow"), utxo("bond"), utxo("pool"), utxo("poolManager"),
-                syntheticConfig(), syntheticLmConfig(), wallet());
+                recordedConfig(), recordedLmConfig(), wallet());
     }
 
-    private static Utxo syntheticConfig() {
+    /**
+     * ⛔ The config reference input, synthesised from THE SAME REGISTRY THIS RIG BUILDS WITH.
+     *
+     * <p>Two things have to line up here and on 2026-09-17 they stopped doing so on their own.
+     *
+     * <p><b>The artefact.</b> The fixture is a recorded preview snapshot: its pool sits at
+     * {@code bf8c4378…} and its pool manager at {@code b4ad9a6f…}. Those are what
+     * {@code loans-v4-third-deployment.plutus.json} derives — the artefact preview was deployed
+     * from. Once FluidTokens' mainnet redeploy moved the SHIPPED artefact's pool family, building
+     * with it produced {@code 51500939…} / {@code 1322b6d1…} and the evaluator said so:
+     * {@code RequiredRedeemersMismatch}, recorded pair <b>missing</b>, derived pair <b>extra</b>.
+     * Hence {@link LoanFixtures#previewDeploymentRegistry()}.
+     *
+     * <p><b>The datum.</b> The recording carries its own ConfigDatum, and using it directly does NOT
+     * work — the captured preview deployment differs from any vendored artefact at ConfigDatum[24]
+     * and LMConfigDatum[3], which is the divergence {@code OLD_PREVIEW_MISMATCHES} pins. Feeding the
+     * recorded datum in makes a validator RUN AND REJECT
+     * ({@code RedeemerError{tag:"Withdraw", index:4}}) rather than fail to resolve. So the datum is
+     * still synthesised — but now from the same registry the builder uses, which is the part that
+     * was previously implicit and is now explicit.
+     */
+    private static Utxo recordedConfig() {
         Utxo captured = utxo("config");
-        return LoanFixtures.syntheticLatestConfigUtxo(captured.getTxHash(), captured.getOutputIndex());
+        return LoanFixtures.syntheticConfigUtxoFor(REGISTRY, captured.getTxHash(),
+                captured.getOutputIndex());
     }
 
-    private static Utxo syntheticLmConfig() {
+    /** Its pair, synthesised from the same registry. See {@link #recordedConfig()}. */
+    private static Utxo recordedLmConfig() {
         Utxo captured = utxo("lmConfig");
-        return LoanFixtures.syntheticLatestLmConfigUtxo(captured.getTxHash(), captured.getOutputIndex());
+        return LoanFixtures.syntheticLmConfigUtxoFor(REGISTRY, captured.getTxHash(),
+                captured.getOutputIndex());
     }
 
     private static CompoundCandidate candidate() {
@@ -122,7 +146,7 @@ class CompoundDryEvalTest {
 
     private static CompoundTransactionBuilder.Request request(BigInteger fee) {
         return new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
-                syntheticConfig(), syntheticLmConfig(), wallet(), BOT, fee,
+                recordedConfig(), recordedLmConfig(), wallet(), BOT, fee,
                 VALID_FROM_SLOT, VALID_TO_SLOT);
     }
 
@@ -217,7 +241,7 @@ class CompoundDryEvalTest {
                 com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion.POOL_NOT_LIVE, "burned");
 
         var request = new CompoundTransactionBuilder.Request(excluded, java.util.Map.of(), utxo("bond"),
-                syntheticConfig(), syntheticLmConfig(), wallet(), BOT, FEE,
+                recordedConfig(), recordedLmConfig(), wallet(), BOT, FEE,
                 VALID_FROM_SLOT, VALID_TO_SLOT);
 
         var e = assertThrows(CompoundTransactionBuilder.RefusedException.class,

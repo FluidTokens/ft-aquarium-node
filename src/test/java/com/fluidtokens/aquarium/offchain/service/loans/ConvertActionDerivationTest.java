@@ -26,8 +26,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class ConvertActionDerivationTest {
 
-    private static final String MAINNET_CONFIG = "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416";
-    private static final String MAINNET_LM_CONFIG = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
+    private static final String MAINNET_CONFIG = "235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200";
+    private static final String MAINNET_LM_CONFIG = "fb6ae2027358b4a0b62710eb95102d87fa13f66ecf55d8943699c492";
     private static final String PREVIEW_CONFIG = "d46f626fc11750409cf44f3d202f48d1b5df41ad35d62a7364b8e22e";
     private static final String PREVIEW_LM_CONFIG = "a7d4b762c5a6197ab3b169c2ff1945fdcd4c21cc5f4c180e75441a13";
     private static final String ASSET_NAME = "706172616d6574657273";
@@ -54,7 +54,7 @@ class ConvertActionDerivationTest {
      * ever something other than what FluidTokens built, which is the whole §51/§53 failure class.
      */
     private static final String MAINNET_CONVERT_ACTION =
-            "c3f51e55dd156a4c29a41df0d630b0d8f1c96f396f5a317788a94b70";
+            "2432ab45c54570998ad5379c46fec2276ea72a94c7ffb6510bcd3aa8";
     /** Field 5 of the live preview LMConfigDatum — a DIFFERENT Minswap deployment's. */
     private static final String PREVIEW_CONVERT_ACTION =
             "aa3628d86e3f16b7d797d0633087859c11e3d200a5defc8ff0fc920e";

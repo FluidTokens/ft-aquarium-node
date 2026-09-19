@@ -43,11 +43,11 @@ class ShippedDefaultsTest {
 
     private static final String RESOURCE = "application.yaml";
     private static final String MAINNET_CONFIG_TX =
-            "ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b";
+            "bad663cca0de6682d963d80e4a421f891e922edd04a68a0dd9722ec3a68f9803";
     private static final String OLD_COMPOUND_REFERENCE =
             "954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0";
     private static final String NEW_COMPOUND_REFERENCE =
-            "8d92115bb26dece0f197b110b0cf2c9bfa5f542cb1fd4dc53e595f1a1b73341a#0";
+            "ec592cc9e0dffdc1fdefa197cb353c4f60a07910c257cd4236293b844ceeabb7#0";
 
     /** The base document and the {@code preview}-profile document, in file order. */
     private static List<Map<String, Object>> documents() throws IOException {
@@ -125,9 +125,9 @@ class ShippedDefaultsTest {
         assertEquals("${LOANS_CONFIG_REF_UTXO_TX_HASH:" + MAINNET_CONFIG_TX + "}",
                 at(mainnet, "loans.config.ref-utxo-tx-hash"),
                 "the shipped mainnet config transaction is stale");
-        assertEquals("${LOANS_CONFIG_POLICY_ID:db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416}",
+        assertEquals("${LOANS_CONFIG_POLICY_ID:235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200}",
                 at(mainnet, "loans.config.policy-id"));
-        assertEquals("${LOANS_LM_CONFIG_POLICY_ID:a56b0ac2654663f395601601a7825649e5488905648747e912d870e4}",
+        assertEquals("${LOANS_LM_CONFIG_POLICY_ID:fb6ae2027358b4a0b62710eb95102d87fa13f66ecf55d8943699c492}",
                 at(mainnet, "loans.lm-config.policy-id"));
         assertEquals("${LOANS_CONFIG_ASSET_NAME:706172616d6574657273}",
                 at(mainnet, "loans.config.asset-name"));

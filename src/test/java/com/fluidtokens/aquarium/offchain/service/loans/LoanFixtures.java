@@ -162,6 +162,45 @@ public final class LoanFixtures {
                 yamlValue(section, "smart-tokens-spend-script-hash", 1));
     }
 
+    /**
+     * The shipped PREVIEW configuration, derived from the artefact <b>preview was deployed from</b>
+     * rather than the one the image now ships.
+     *
+     * <p>⛔ Use this, not {@link #shippedPreviewRegistry()}, for any rig that replays <b>recorded
+     * preview UTxOs</b>. Since FluidTokens' 2026-09-17 mainnet redeploy the shipped artefact is ahead
+     * of preview, so {@code shippedPreviewRegistry()} derives pool-family credentials that exist
+     * nowhere on preview — a rig whose fixture universe sits at the recorded credentials then fails
+     * with {@code RequiredRedeemersMismatch}, naming the new hashes as "extra" and the recorded ones
+     * as "missing". That failure is real and it is about the ARTEFACT, not the builder.
+     *
+     * <p>⚠ Accepted residue, stated so it is a decision and not an oversight: <b>nothing offline
+     * exercises the NEW artefact's compound path.</b> It cannot, until either FluidTokens migrates
+     * preview or a mainnet compound candidate under the new deployment is recorded. Tracked with the
+     * other single-sourced compound coverage in FAB-94.
+     */
+    public static LoansContractRegistry previewDeploymentRegistry() {
+        String yaml;
+        try (InputStream is = LoanFixtures.class.getResourceAsStream("/application.yaml")) {
+            if (is == null) {
+                throw new IllegalStateException("application.yaml is not on the test classpath");
+            }
+            yaml = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("could not read application.yaml", e);
+        }
+        int preview = yaml.indexOf("on-profile: preview");
+        if (preview < 0) {
+            throw new IllegalStateException("no preview profile in application.yaml");
+        }
+        String section = yaml.substring(preview);
+        return new LoansContractRegistry(
+                THIRD_DEPLOYMENT_BLUEPRINT,
+                yamlValue(section, "policy-id", 1),
+                yamlValue(section, "policy-id", 2),
+                "706172616d6574657273",
+                yamlValue(section, "smart-tokens-spend-script-hash", 1));
+    }
+
     /** The {@code n}-th occurrence of {@code key:} in {@code section}, hex value only. */
     private static String yamlValue(String section, String key, int occurrence) {
         java.util.regex.Matcher m = java.util.regex.Pattern
@@ -187,7 +226,32 @@ public final class LoanFixtures {
     private static final String THIRD_LM_CONFIG_POLICY_ID =
             "de1b8b40536f96c1084d73f838ebac6b228d891902d6234afc731484";
 
+    /**
+     * ⛔ The blueprint the THIRD DEPLOYMENT was built from, pinned as a test resource — <b>not</b> the
+     * shipped {@code loans-v4.plutus.json}.
+     *
+     * <p>This is the fix for a failure that arrived for real on 2026-09-17. FluidTokens redeployed
+     * mainnet from a newer upstream commit; the shipped artefact moved with it, and
+     * {@code pool.pool} / {@code pool_manager.poolManager} /
+     * {@code pool_manager/pm_compound_liquidity} changed while <b>every liquidation-path validator
+     * stayed byte-identical</b>. The pool family's derived hashes therefore moved, and
+     * {@link PoolFixtures#PUBLISHED_REFERENCE_SCRIPTS} — keyed by derived hash, holding real preview
+     * coordinates — stopped resolving. Four rigs died with a null coordinate.
+     *
+     * <p>The javadoc below used to say every registry derives from the single latest artefact, and
+     * warned that re-keying the coordinate table onto newer hashes "would erase its provenance". Both
+     * remain true; this is the other way out. <b>A rig that replays recorded publications must derive
+     * from the artefact those publications were built from</b>, or the coordinate table silently
+     * describes scripts that were never published at those addresses.
+     *
+     * <p>sha256 {@code 63f5fcf395c5a3e76c211e71e8a327aeb1009205e0773b2bdb732ab8020904a5} — byte-for-byte
+     * the artefact shipped until 2026-09-17. When FluidTokens migrates preview, re-record the
+     * coordinates and re-pin this.
+     */
+    private static final String THIRD_DEPLOYMENT_BLUEPRINT = "loans-v4-third-deployment.plutus.json";
+
     private static final LoansContractRegistry THIRD_DEPLOYMENT_REGISTRY = new LoansContractRegistry(
+            THIRD_DEPLOYMENT_BLUEPRINT,
             THIRD_CONFIG_POLICY_ID, THIRD_LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
 
     /**
@@ -644,11 +708,126 @@ public final class LoanFixtures {
      * that changed in FluidTokens revision 4c4d143. Never use this as chain evidence or in a live rig.
      */
     public static Utxo syntheticLatestConfigUtxo(String txHash, int outputIndex) {
+        return syntheticConfigUtxoFor(REGISTRY, txHash, outputIndex);
+    }
+
+    /**
+     * The same synthesis, but derived from a REGISTRY YOU CHOOSE rather than {@link #REGISTRY}.
+     *
+     * <p>⛔ The two have to be the same registry the transaction is built with, and that stopped
+     * being automatic on 2026-09-17. A rig building with one artefact while its config datum names
+     * another produces {@code RequiredRedeemersMismatch} if the credentials differ, or — worse —
+     * a validator that runs and REJECTS, which is what {@code RedeemerError{tag:"Withdraw"}} is.
+     */
+    public static Utxo syntheticConfigUtxoFor(LoansContractRegistry registry, String txHash,
+                                              int outputIndex) {
+        return configUtxo(txHash, outputIndex, registry.getConfigPolicyId(),
+                syntheticConfigDatumFor(registry));
+    }
+
+    /** {@link #syntheticConfigUtxoFor} for the LenderManager config. */
+    public static Utxo syntheticLmConfigUtxoFor(LoansContractRegistry registry, String txHash,
+                                                int outputIndex) {
         String datum = replaceCapturedCredential(
-                fixture("fourth-deployment-config-datum.hex"),
-                "db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56",
-                REGISTRY.getPoolSellLenderPositionActionScriptHash(), "ConfigDatum[24]");
-        return configUtxo(txHash, outputIndex, CONFIG_POLICY_ID, datum);
+                fixture("fourth-deployment-lm-config-datum.hex"),
+                "dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457",
+                registry.getLmCompoundActionScriptHash(), "LMConfigDatum[3]");
+        return configUtxo(txHash, outputIndex, registry.getLmConfigPolicyId(), datum);
+    }
+
+    /**
+     * ⛔ <b>REBUILT STRUCTURALLY on 2026-09-17, because a hex substitution can no longer express what
+     * this fixture means.</b>
+     *
+     * <p>It used to take the captured fourth-deployment bytes and swap one credential in place. That
+     * worked while the latest artefact differed from preview by a <em>substitution</em>. FluidTokens'
+     * redeploy <b>INSERTED</b> {@code poolEditActionScriptHash} at ConfigDatum index 26, taking the
+     * record from 29 fields to 30 — and <b>no amount of string replacement adds a field.</b>
+     *
+     * <p>⚠ The symptom was not a decode error, which is what makes it worth recording. The rig fed a
+     * 29-field datum to validators compiled against the 30-field type; they read
+     * {@code poolManagerSpendScriptHash} where {@code poolEditActionScriptHash} now lives, and
+     * rejected with {@code RedeemerError{tag:"Withdraw", index:4, EvaluationFailure}} — a validator
+     * that resolved, ran, and said no. <b>A shape change one field wide surfaced as a semantic
+     * rejection four layers away from the datum.</b>
+     *
+     * <p>So the datum is now assembled from the field list rather than patched: positions the artefact
+     * derives are taken from {@link #REGISTRY}, positions it cannot derive (the admin credential, the
+     * Dutch-auction parameters, {@code repaymentPolicyId}, {@code smartTokensSpendScriptHash}) are
+     * carried over from the captured bytes, and the new field is inserted only when the loaded
+     * artefact actually has it. Preview has NOT been redeployed — confirmed by Giovanni 2026-09-17 —
+     * so the captured bytes stay the only real evidence and this remains synthetic.
+     *
+     * <p><b>Never use this as chain evidence or in a live rig.</b>
+     */
+    static String syntheticLatestConfigDatum() {
+        return syntheticConfigDatumFor(REGISTRY);
+    }
+
+    static String syntheticConfigDatumFor(LoansContractRegistry REGISTRY) {
+        PlutusData raw;
+        try {
+            raw = PlutusData.deserialize(
+                    HexUtil.decodeHexString(fixture("fourth-deployment-config-datum.hex")));
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot decode the captured fourth-deployment ConfigDatum", e);
+        }
+        if (!(raw instanceof ConstrPlutusData captured)) {
+            throw new IllegalStateException("captured ConfigDatum is not a constructor record");
+        }
+        List<PlutusData> in = captured.getData().getPlutusDataList();
+        if (in.size() != 29) {
+            throw new IllegalStateException("captured ConfigDatum has " + in.size()
+                    + " fields, expected the 29-field fourth-deployment shape");
+        }
+
+        // 0..25 keep their positions in every shape; the tail is what moved.
+        List<PlutusData> out = new ArrayList<>(in.subList(0, 26));
+        String poolEdit = REGISTRY.getPoolEditActionScriptHash();
+        if (poolEdit != null) {
+            out.add(BytesPlutusData.of(HexUtil.decodeHexString(poolEdit)));
+        }
+        out.add(in.get(26));   // poolManagerSpendScriptHash
+        out.add(in.get(27));   // poolManagerPolicyId
+        out.add(in.get(28));   // lockedBorrowerManagerSpendScriptHash
+
+        int shift = poolEdit == null ? 0 : 1;
+        LinkedHashMap<Integer, String> derived = new LinkedHashMap<>();
+        derived.put(2, REGISTRY.getPoolPolicyId());
+        derived.put(3, REGISTRY.getRequestPolicyId());
+        derived.put(4, REGISTRY.getBorrowerBondPolicyId());
+        derived.put(5, REGISTRY.getLenderBondPolicyId());
+        derived.put(6, REGISTRY.getLoanPolicyId());
+        derived.put(8, REGISTRY.getPoolSpendScriptHash());
+        derived.put(9, REGISTRY.getRequestSpendScriptHash());
+        derived.put(10, REGISTRY.getLoanSpendScriptHash());
+        derived.put(11, REGISTRY.getLoanClaimActionScriptHash());
+        derived.put(12, REGISTRY.getLoanRepayActionScriptHash());
+        derived.put(13, REGISTRY.getLoanChangeCollateralActionScriptHash());
+        derived.put(14, REGISTRY.getLoanRecastActionScriptHash());
+        derived.put(15, REGISTRY.getAssetManagerSpendScriptHash());
+        derived.put(22, REGISTRY.getPoolCancelActionScriptHash());
+        derived.put(23, REGISTRY.getPoolBorrowActionScriptHash());
+        derived.put(24, REGISTRY.getPoolSellLenderPositionActionScriptHash());
+        derived.put(25, REGISTRY.getPoolCompoundActionScriptHash());
+        derived.put(26 + shift, REGISTRY.getPoolManagerSpendScriptHash());
+        derived.put(27 + shift, REGISTRY.getPoolManagerPolicyId());
+        derived.put(28 + shift, REGISTRY.getLockedBorrowerManagerSpendScriptHash());
+        for (var e : derived.entrySet()) {
+            if (e.getValue() != null) {
+                out.set(e.getKey(), BytesPlutusData.of(HexUtil.decodeHexString(e.getValue())));
+            }
+        }
+
+        ListPlutusData list = ListPlutusData.builder().build();
+        out.forEach(list::add);
+        ConstrPlutusData rebuilt = ConstrPlutusData.builder()
+                .alternative(captured.getAlternative()).data(list).build();
+        try {
+            return HexUtil.encodeHexString(rebuilt.serializeToBytes());
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot re-serialise the synthetic ConfigDatum", e);
+        }
     }
 
     /**
