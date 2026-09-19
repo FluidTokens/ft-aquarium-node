@@ -197,9 +197,23 @@ otherwise have to. Add this under `aquarium-node`, and bind it to the interface 
 just moves the open door. If you want browser access from outside, terminate TLS *and* require auth
 (mTLS, an identity proxy, basic auth over TLS at minimum).
 
-**If you leave `LOANS_UI_ENABLED=false`, none of this applies** — the endpoints and the template
-engine do not exist in that configuration. The same information is available from the logs and from
-`GET /api/v1/loans/liquidations`.
+### ⛔ `LOANS_UI_ENABLED=false` does NOT close port 8080
+
+It is easy to read the flag as an on/off switch for the whole surface. It is not. Only
+`LiquidationReadinessController` and the Thymeleaf engine are conditional on it; **every JSON
+endpoint is unconditional and stays up.** What an unauthenticated caller reaches either way:
+
+| path | up when UI is off? | what it discloses |
+|---|---|---|
+| `GET /api/v1/loans` | **yes** | every indexed loan: amounts, assets, remaining debt, equity, current LTV, liquidatability |
+| `GET /api/v1/loans/liquidations` | **yes** | every decision the bot made and why |
+| `GET /api/v1/loans/oracle` | **yes** | the oracle feeds it is using |
+| `GET /healthcheck` | **yes** | five booleans |
+| `GET /actuator/health`, `/actuator/info`, `/actuator/prometheus` | **yes** | build commit, dirty flag, and runtime metrics |
+| `GET /api/v1/loans/readiness` | no — this is the only thing the flag removes | the HTML operator page |
+
+**⇒ Turning the UI off narrows the disclosure; it does not end it.** The exposure decision above is
+about the *port*, not about the flag. Tunnel it or keep it on a private network either way.
 
 ---
 
@@ -333,6 +347,8 @@ liquidations in it.
 - [ ] `docker/.env` is `chmod 600` and not in any repository
 - [ ] The 30,000 FLDT is delegated **from a separate wallet**, ideally cold
 - [ ] No `ports:` mapping on `aquarium-node` — UI reached by tunnel or private network (§7)
+- [ ] You have not published 8080 on the strength of `LOANS_UI_ENABLED=false` — that flag
+      removes the HTML page only, and `/api/v1/loans` still serves your positions (§7)
 - [ ] Postgres is on `127.0.0.1` (the shipped file does this; check if you edited it)
 - [ ] A real `DB_PASSWORD`
 - [ ] The image version is **pinned**, not `latest`
@@ -360,9 +376,17 @@ docker build -t ft-aquarium-node:local .
 
 Then point `AQUARIUM_DOCKER_IMAGE_NAME`/`_VERSION` at it and set `pull_policy: never`.
 
-**The image records the commit it was built from**, and `/healthcheck` reports it. Build from a
-dirty tree and it says so. Build with no `.git` and it reports `unknown` rather than guessing — which
-is why the Dockerfile is deliberately not multi-stage.
+**The image records the commit it was built from**, and reports it on **`/actuator/info`** — not on
+`/healthcheck`, which carries five booleans and nothing else:
+
+```bash
+curl -s http://localhost:8080/actuator/info | jq .build
+# { "commit": "2776163…", "commitShort": "2776163…", "dirty": "false", "time": "…" }
+```
+
+It is also the first line of the startup banner, so `docker compose logs` has it without curl. Build
+from a dirty tree and it says `dirty: true`. Build with no `.git` and it reports `unknown` rather
+than guessing — which is why the Dockerfile is deliberately not multi-stage.
 
 ### Overriding a contract coordinate
 

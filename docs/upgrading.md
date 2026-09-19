@@ -40,9 +40,15 @@ Check afterwards:
 curl -s http://localhost:8080/healthcheck | jq .
 ```
 
-**Confirm you are running what you think you are.** The image records the commit it was built from
-and reports it — if the version you pinned and the commit reported disagree, stop and find out why
-before arming anything.
+**Confirm you are running what you think you are.** `/healthcheck` answers "is it working", not
+"what is it" — the commit is on `/actuator/info`:
+
+```bash
+curl -s http://localhost:8080/actuator/info | jq .build
+```
+
+If the version you pinned and the commit reported disagree — or `dirty` is `true` on an image you
+expected CI to have built — stop and find out why before arming anything.
 
 **⚠ Pin versions.** With `latest`, a restart months from now silently changes what you run, and
 there is no record of what it used to be.

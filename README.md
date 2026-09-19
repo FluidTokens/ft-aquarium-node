@@ -1,13 +1,18 @@
-# FluidTokens Aquarium Node 
+# FluidTokens Aquarium Node
 
-Welcome to the FluidTokens Aquarium Node Repo
+A Java service that operators run against the Cardano chain. It does **two** jobs:
 
-The Aquarium Node is a java app which indexes FluidTokens users' _Tanks_ utxos and processes _Scheduled Transactions_
-when conditions are met.
+1. **Scheduled Transactions** — indexes FluidTokens users' _Tank_ UTxOs and executes their scheduled
+   transactions when the conditions are met.
+2. **Lending v4 auto-liquidation** — watches lending-v4 loans and, when one becomes liquidatable,
+   either sells the collateral through Minswap (`CONVERT`) or repays the lender from your own wallet
+   and keeps the collateral (`ANTICIPATE`).
 
-Node operators will be required to stake a certain amount of FLDT tokens in order to be allowed to process _Scheduled Transactions_.
+Both reuse the same indexer, scheduler and wallet. **Both ship switched off** — see
+[docs/deploying.md](docs/deploying.md) §8.
 
-Operators will periodically receive compensation for the work executed.
+Operators stake 30,000 FLDT to be allowed to process scheduled transactions, and are compensated
+monthly from the fees generated.
 
 ## What you need
 
@@ -44,7 +49,7 @@ docker compose logs -f aquarium
 
 Then get 30k FLDT (for example on [Minswap](https://minswap.org/tokens/fldt)) into a **separate**
 wallet — it can be cold — and delegate it to your node's address
-[here](https://aquarium-qa.fluidtokens.com/validator). The node's own hot wallet only needs about
+[here](https://aquarium.fluidtokens.com/validator). The node's own hot wallet only needs about
 10 ADA to operate.
 
 The first sync takes a while; after that it tracks the tip. Every month 50% of generated fees are
@@ -54,29 +59,49 @@ split across the nodes that performed transactions.
 and compound all have to be turned on deliberately. Read
 [docs/deploying.md](docs/deploying.md) §8 before arming anything, and rehearse in `shadow` first.
 
-**⛔ Do not publish port 8080.** The operator UI has no authentication in front of it. Reach it
-through an SSH tunnel or a private network — [docs/deploying.md](docs/deploying.md) §7.
+**⛔ Do not publish port 8080.** Nothing served there is authenticated, and
+`LOANS_UI_ENABLED=false` does **not** close it: that flag removes the HTML readiness page only.
+`/api/v1/loans`, `/api/v1/loans/liquidations`, `/api/v1/loans/oracle`, `/healthcheck` and
+`/actuator/*` stay up and still disclose your positions. Reach the port through an SSH tunnel or a
+private network — [docs/deploying.md](docs/deploying.md) §7.
 
 ## How it works
 
-The Aquarium Node requires two additional components to work:
+The node needs two things beside itself: a **Cardano relay** for the chain feed, and a **Postgres**
+database it owns. Transactions are submitted through **Blockfrost**.
 
-1. A Cardano Node (which can either be local or remote)
-2. A local Postgres Database
+```mermaid
+flowchart TB
+    relay["Cardano relay<br/><i>yours or any reachable</i>"]
+    oracle["FluidTokens<br/>oracle API"]
+    bf["Blockfrost<br/><i>submission</i>"]
+    minswap["Minswap V2"]
 
-The Aquarium Node leverages [BloxBean Yaci Store](https://github.com/bloxbean/yaci-store) to index the Cardano blockchain and 
-saves to a local database relevant data such as:
+    subgraph aq["your deployment — docker compose"]
+        yaci["Yaci Store<br/>indexer"]
+        db[("PostgreSQL")]
+        sched["Scheduled<br/>Transaction Service"]
+        liq["Liquidation bot<br/><i>scan · price · build</i>"]
+        ui["Operator UI<br/><i>off by default</i>"]
+        wallet(["Wallet<br/>WALLET_MNEMONIC"])
+    end
 
-* the UTxOs of Aquarium Scheduled transactions
-* Aquarium Parameters UTxO 
-* Aquarium Staker UTxOs
+    relay -- "blocks" --> yaci
+    yaci -- "only UTxOs at known<br/>credentials — see below" --> db
+    db --> sched & liq & ui
+    oracle -- "collateral prices" --> liq
+    sched & liq -- "sign" --> wallet
+    wallet -- "submit" --> bf
+    liq -. "CONVERT order" .-> minswap
+```
 
-Periodically, the node loads all the UTxOs of the `Scheduled Transaction` contract, deserialise the attached data (if any),
-checks if any of the _Scheduled Transaction_ can be executed and eventually prepares, signs and submits the transaction to a Node via [Blockfrost](https://blockfrost.io/).
+**What gets indexed:** Aquarium Scheduled Transaction UTxOs, the Aquarium Parameters UTxO, Aquarium
+Staker UTxOs, and the lending-v4 contract UTxOs.
 
-Here below a high level design of the Acquarium Node:
-
-![Aquarium Node High Level Design](AQUARIUM_DESIGN.jpg)
+**⛔ Only UTxOs at credentials the node knew about when the block went past are kept.** The filter is
+applied at write time, so adding a contract address later does not backfill — and after a contract
+redeploy a restart is not enough. [docs/upgrading.md](docs/upgrading.md) §3 is the one section to
+read before you meet that.
 
 ### Alternative solutions
 
@@ -105,9 +130,15 @@ If you would rather verify what you run, you need JDK 21:
 docker build -t ft-aquarium-node:local .
 ```
 
-The image records the commit it was built from and reports it on `/healthcheck` — including whether
-the tree was dirty, and `unknown` when it could not tell. See
-[docs/deploying.md](docs/deploying.md) §11.
+The image records the commit it was built from and reports it on **`/actuator/info`** — including
+whether the tree was dirty, and `unknown` when it could not tell. It is also the first line of the
+startup banner.
+
+```bash
+curl -s http://localhost:8080/actuator/info | jq .build
+```
+
+See [docs/deploying.md](docs/deploying.md) §11.
 
 ## Development Notes
 
