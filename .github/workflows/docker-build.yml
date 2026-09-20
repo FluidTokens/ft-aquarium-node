@@ -225,7 +225,7 @@ jobs:
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '151'
+          RESULT_FILE_FLOOR: '152'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
