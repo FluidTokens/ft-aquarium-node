@@ -8,6 +8,32 @@ left to you, and everything here about ordering, secrets and exposure applies un
 
 ---
 
+## 0. The short version
+
+If you just want a node running, this is the whole of it:
+
+```bash
+git clone https://github.com/FluidTokens/ft-aquarium-node.git
+cd ft-aquarium-node/docker
+cp .env.example .env && chmod 600 .env     # it will hold a seed phrase
+# fill in six values, then:
+docker compose up -d
+docker compose logs -f aquarium
+```
+
+**Six values**: your relay host and port, a Blockfrost key, a dedicated wallet mnemonic, a database
+password, and the image version to pin. Everything else has a working default.
+
+**You never set a contract address, a script hash or a sync start point.** Those ship inside the
+image, verified against the chain before release. When FluidTokens redeploy, you bump
+`AQUARIUM_DOCKER_IMAGE_VERSION` — that is the entire upgrade.
+
+Then wait for the tip (§6). The rest of this guide is for when you want more than that: arming the
+bot (§8), market policy (§9), the UI (§7). **A node that never reads those sections is a correct
+node** — it indexes, serves `/healthcheck`, and touches no funds.
+
+---
+
 ## 1. Before you start
 
 | you need | notes |
@@ -71,49 +97,65 @@ you would rather build it yourself, see §11.
 
 ## 4. Configure
 
-Open `docker/.env`. It is long and heavily commented; that is deliberate. What matters is that the
-settings fall into three groups, and **they are not equally yours to change.**
+Two files, and the split is the point.
 
-### 4a. You must set these — the node cannot work without them
+### `docker/.env` — the six things that are yours
+
+Copied from `.env.example`, which contains **only** what you must set:
 
 | variable | what it is |
 |---|---|
-| `BLOCKFROST_KEY` | your Blockfrost project key |
+| `STORE_CARDANO_HOST`, `STORE_CARDANO_PORT` | your Cardano relay — the chain feed |
+| `BLOCKFROST_KEY` | your Blockfrost project key — how transactions are submitted |
 | `WALLET_MNEMONIC` | the dedicated wallet from §2 |
 | `DB_USERNAME`, `DB_PASSWORD` | credentials for the bundled Postgres. Pick a real password |
-| `STORE_CARDANO_HOST`, `STORE_CARDANO_PORT` | your Cardano relay |
-| `SPRING_PROFILES_ACTIVE` | leave empty for **mainnet**; `preview` for preview |
-| `AQUARIUM_DOCKER_IMAGE_NAME`, `..._VERSION` | which image to run — pin a version rather than tracking `latest`, so a restart never silently changes what you run |
+| `AQUARIUM_DOCKER_IMAGE_VERSION` | ⚠ **pin it**, so a restart months from now cannot silently change what you run |
 
-### 4b. You should decide these deliberately — they ship OFF or SAFE
+Everything else the stack needs — image name, database host, port, name, schema — has a default in
+`docker-compose.yaml` and works unset.
 
-Nothing here turns on by itself. Read §8 before changing any of them.
+**If `DB_PASSWORD` is missing, Compose refuses to start and says so.** It is not defaulted on
+purpose: a database that comes up with an empty password because a variable was misspelled is
+exactly the failure that should be loud.
 
-| variable | ships | what it does |
-|---|---|---|
-| `SCHEDULING_TRANSACTION_PROCESSOR_ENABLED` | `false` | the Aquarium scheduled-transaction processor |
-| `AQUARIUM_LIQUIDATION_MODE` | `disabled` | `shadow` rehearses, `live` submits |
-| `AQUARIUM_COMPOUND_ENABLED` | `false` | the compound loop |
-| `AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE` | `5000000` | the single profit floor for **every** mode |
-| `LOANS_LIQUIDATION_MARKETS_<n>_*` | empty | per-market policy — see §9 |
-| `LOANS_UI_ENABLED` | `false` | the operator web UI — see §7 before enabling |
+### `docker/.env.advanced.example` — a menu, not a second file
 
-### 4c. ⛔ Do not set these — they ship maintained, and a stale override is worse than none
+Optional settings: arming the processor and the bot, the profit margin, market policy, the UI, the
+memory limit, the network profile. **Compose does not read this file.** Copy the lines you want into
+your `.env` and restart.
 
-Contract coordinates: `LOANS_CONFIG_POLICY_ID`, `LOANS_LM_CONFIG_POLICY_ID`,
-`LOANS_CONFIG_REF_UTXO_TX_HASH`, every `AQUARIUM_LIQUIDATION_REF_*`, and
-`AQUARIUM_COMPOUND_REFERENCE_SCRIPTS`. Also the sync start point.
+Everything in it ships in a safe position, so an operator who never opens it gets a node that
+indexes the chain, serves `/healthcheck`, and touches no funds. Read §8 before changing any of the
+arming values.
 
-These describe **where FluidTokens' contracts live on chain**. They ship in the image, verified
-against the chain before release, and they change when FluidTokens redeploys.
+### ⛔ 4c. Contract coordinates are not configuration
 
-**A stale override is strictly worse than no override: it silently replaces a maintained value with
-a frozen one.** Set one today and it is correct; the next redeploy makes it wrong, your override
+`LOANS_CONFIG_POLICY_ID`, `LOANS_LM_CONFIG_POLICY_ID`, every `AQUARIUM_LIQUIDATION_REF_*`,
+`AQUARIUM_COMPOUND_REFERENCE_SCRIPTS`, and the sync start point are **deliberately absent from both
+files.** They describe where FluidTokens' contracts live on chain, they ship in the image verified
+against the chain before release, and they change when FluidTokens redeploy.
+
+**A stale override is strictly worse than no override.** It silently replaces a maintained value
+with a frozen one. Set one today and it is correct; the next redeploy makes it wrong, your override
 wins over the corrected default, and the failure is not a crash — it is a node that starts cleanly,
-verifies cleanly, and quietly sees an empty world.
+verifies cleanly, and quietly watches a dead deployment.
 
-If you have a genuine reason to override, §11 explains how to verify a coordinate yourself. **Once
-you override, keeping it current is yours.**
+**⇒ When FluidTokens redeploy, you bump the image tag. Nothing else.** If you have a genuine reason
+to override one, §11 explains how to verify a coordinate yourself, and **keeping it current becomes
+yours**.
+
+### What happens when only part of the deployment moves
+
+FluidTokens sometimes change one side of the contract set. If that touches a validator this node
+**never invokes**, the node starts, and logs a warning naming each field:
+
+```
+⚠ Lending v4: 3 config field(s) do not match the chain, in validators THIS NODE NEVER INVOKES.
+```
+
+That is not an error you need to act on, and it does not need a config change. It means a new image
+is coming. If a field the node **does** use has moved, startup fails instead, naming the field —
+because then the node genuinely cannot work against that deployment.
 
 ---
 

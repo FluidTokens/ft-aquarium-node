@@ -34,6 +34,11 @@ monthly from the fees generated.
 Both cover **Docker Compose**. Systemd, Kubernetes and Nomad all work; the ordering, secrets and
 exposure guidance applies unchanged.
 
+**You never configure a contract address, a script hash or a sync start point.** They ship in the
+image, verified against the chain before release. When FluidTokens redeploy, you bump the image
+tag — that is the whole upgrade. Optional settings (arming, markets, margin, UI) live in
+`docker/.env.advanced.example`, and a node that never touches them is a correct node.
+
 ## Quick start (mainnet)
 
 ```bash
@@ -41,8 +46,7 @@ git clone https://github.com/FluidTokens/ft-aquarium-node.git
 cd ft-aquarium-node/docker
 cp .env.example .env
 chmod 600 .env                  # it will hold a seed phrase
-# set BLOCKFROST_KEY, WALLET_MNEMONIC, DB_USERNAME, DB_PASSWORD,
-#     STORE_CARDANO_HOST, STORE_CARDANO_PORT and the image name/version
+# fill in the six values it contains, then:
 docker compose up -d
 docker compose logs -f aquarium
 ```
