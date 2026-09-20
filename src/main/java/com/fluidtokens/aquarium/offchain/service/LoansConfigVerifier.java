@@ -17,6 +17,8 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.Set;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -114,6 +116,37 @@ public class LoansConfigVerifier {
     private final String configuredSmartTokensSpendScriptHash;
     private final AppConfig.Network network;
     private final BFBackendService bfBackendService;
+    /**
+     * ⛔ <b>A mismatch in a field this node never touches must not ground the node.</b>
+     *
+     * <p>Measured 2026-09-19: FluidTokens updated the mainnet ConfigDatum in place, changing three
+     * pool-side hashes — {@code pool_borrow_action}, {@code pool_sell_lender_position_action},
+     * {@code pool_edit_action}. Every operator's node then refused to boot, taking the
+     * scheduled-transaction half down with it, over three validators <b>this node does not have a
+     * single call site for</b>. Their own deployment was mid-flight at the time: the config named a
+     * script that did not yet exist on chain in any form.
+     *
+     * <p>So the check is split by what a wrong value actually costs us:
+     * <ul>
+     *   <li><b>ENFORCED</b> — the node INVOKES the script or INDEXES at its credential. A wrong
+     *       value here builds invalid transactions or indexes a dead world, which is the redeploy
+     *       pathology of findings §12. Still fatal, and deliberately so.</li>
+     *   <li><b>ADVISORY</b> — the node only derives the hash to compare it. Nothing reads it
+     *       afterwards. A mismatch is real news about the deployment and is reported at WARN,
+     *       field by field, but it is not this node's emergency.</li>
+     * </ul>
+     *
+     * <p>⚠ <b>ADVISORY MEANS "NOT USED", AND THAT IS A FACT ABOUT THE CODE, NOT A PREFERENCE.</b>
+     * {@code AdvisoryFieldsAreTrulyUnusedTest} greps the main sources for every accessor named
+     * below and fails if any of them gains a caller. Wire one of these up and the test tells you to
+     * promote it, rather than letting a newly load-bearing field degrade to a warning in silence.
+     */
+    public record Findings(List<String> enforced, List<String> advisory, List<String> all) {
+        public boolean isEmpty() {
+            return enforced.isEmpty() && advisory.isEmpty();
+        }
+    }
+
     private final boolean failOnUnreachable;
 
     // Plain constructor params rather than injected config objects, so the verifier can be
@@ -160,9 +193,9 @@ public class LoansConfigVerifier {
             return;
         }
 
-        List<String> mismatches;
+        Findings findings;
         try {
-            mismatches = verifyAgainst(
+            findings = verifyAgainstBySeverity(
                     fetchConfigDatumHex(registry.getConfigPolicyId(), "ConfigDatum"),
                     fetchConfigDatumHex(registry.getLmConfigPolicyId(), "LMConfigDatum"));
         } catch (ConfigUnreachableException e) {
@@ -174,15 +207,32 @@ public class LoansConfigVerifier {
             return;
         }
 
-        if (!mismatches.isEmpty()) {
+        // ⚠ REPORTED BEFORE THE THROW, ON PURPOSE. When both buckets are non-empty the advisory
+        // fields are usually the clue to what actually happened upstream, and an exception thrown
+        // first would take them with it.
+        if (!findings.advisory().isEmpty()) {
+            log.warn("""
+                    ⚠ Lending v4: {} config field(s) do not match the chain, in validators THIS NODE \
+                    NEVER INVOKES. Not fatal, and the node is starting normally. This almost always \
+                    means FluidTokens redeployed part of the contract set — worth reporting to them, \
+                    and worth a new image when they finish. Fields: {}""",
+                    findings.advisory().size(), String.join("; ", findings.advisory()));
+        }
+
+        if (!findings.enforced().isEmpty()) {
             throw new IllegalStateException("""
                     Lending v4 config mismatch — the derived script hashes do not match the live \
-                    config UTxOs. The contracts were almost certainly redeployed; update \
+                    config UTxOs, in fields this node DOES use to build transactions or to decide \
+                    what to index. The contracts were almost certainly redeployed; update \
                     loans.config.policy-id / loans.lm-config.policy-id (and \
                     loans.smart-tokens-spend-script-hash) in application.yaml. Mismatches: """
-                    + String.join("; ", mismatches));
+                    + String.join("; ", findings.enforced()));
         }
-        log.info("Lending v4 config verified against chain: derived hashes match both config datums");
+        if (findings.advisory().isEmpty()) {
+            log.info("Lending v4 config verified against chain: derived hashes match both config datums");
+        } else {
+            log.info("Lending v4 config verified against chain for every field this node uses");
+        }
     }
 
     /**
@@ -193,16 +243,29 @@ public class LoansConfigVerifier {
      * @return one entry per mismatching field; empty means verified
      */
     public List<String> verifyAgainst(String configDatumHex, String lmConfigDatumHex) {
-        List<String> mismatches = new ArrayList<>();
-        mismatches.addAll(verifyMainConfig(parseFields(configDatumHex, "ConfigDatum",
-                CONFIG_DATUM_FIELDS_LEGACY, CONFIG_DATUM_FIELDS)));
-        mismatches.addAll(verifyLmConfig(parseFields(lmConfigDatumHex, "LMConfigDatum", LM_CONFIG_DATUM_FIELDS)));
-        return mismatches;
+        return verifyAgainstBySeverity(configDatumHex, lmConfigDatumHex).all();
+    }
+
+    /**
+     * The same comparison, split by whether a wrong value can actually hurt this node.
+     * See {@link Findings}.
+     */
+    public Findings verifyAgainstBySeverity(String configDatumHex, String lmConfigDatumHex) {
+        Findings main = verifyMainConfig(parseFields(configDatumHex, "ConfigDatum",
+                CONFIG_DATUM_FIELDS_LEGACY, CONFIG_DATUM_FIELDS));
+        Findings lm = verifyLmConfig(parseFields(lmConfigDatumHex, "LMConfigDatum", LM_CONFIG_DATUM_FIELDS));
+        List<String> enforced = new ArrayList<>(main.enforced());
+        enforced.addAll(lm.enforced());
+        List<String> advisory = new ArrayList<>(main.advisory());
+        advisory.addAll(lm.advisory());
+        List<String> all = new ArrayList<>(main.all());
+        all.addAll(lm.all());
+        return new Findings(enforced, advisory, all);
     }
 
     // ---- Main ConfigDatum ---------------------------------------------------------------
 
-    private List<String> verifyMainConfig(List<PlutusData> fields) {
+    private Findings verifyMainConfig(List<PlutusData> fields) {
         onChainSmartTokensSpendScriptHash = bytesAt(fields, CFG_SMART_TOKENS_SPEND);
         String configured = configuredSmartTokensSpendScriptHash;
         if (configured == null || configured.isBlank()) {
@@ -215,7 +278,12 @@ public class LoansConfigVerifier {
         // a 30-field record is the post-2026-09-17 shape, a 29-field one a captured legacy datum.
         int tailShift = fields.size() == CONFIG_DATUM_FIELDS ? 1 : 0;
 
+        // ⚠ INSERTION ORDER IS THE DATUM'S ORDER and several tests pin the resulting message
+        // sequence. `advisoryIndices` marks which of these a mismatch may only WARN about; it never
+        // changes what is compared, only what a difference costs. See Findings.
         Map<Integer, String> expected = new LinkedHashMap<>();
+        Set<Integer> advisoryIndices = new LinkedHashSet<>();
+
         expected.put(CFG_POOL_POLICY_ID, registry.getPoolPolicyId());
         expected.put(CFG_REQUEST_POLICY_ID, registry.getRequestPolicyId());
         expected.put(CFG_LOAN_POLICY_ID, registry.getLoanPolicyId());
@@ -243,19 +311,33 @@ public class LoansConfigVerifier {
         expected.put(CFG_LOCKED_BORROWER_MANAGER_SPEND + tailShift,
                 registry.getLockedBorrowerManagerSpendScriptHash());
 
+        // ⛔ ADVISORY: derived and compared, never read afterwards. Zero call sites outside this
+        // class and the registry -- enforced by AdvisoryConfigFieldsTest, which re-derives that from
+        // the sources rather than trusting this list.
+        advisoryIndices.add(CFG_REQUEST_POLICY_ID);
+        advisoryIndices.add(CFG_LOAN_REPAY_ACTION);
+        advisoryIndices.add(CFG_LOAN_CHANGE_COLLATERAL_ACTION);
+        advisoryIndices.add(CFG_LOAN_RECAST_ACTION);
+        advisoryIndices.add(CFG_POOL_CANCEL_ACTION);
+        advisoryIndices.add(CFG_POOL_BORROW_ACTION);
+        advisoryIndices.add(CFG_POOL_SELL_LENDER_POSITION_ACTION);
+        advisoryIndices.add(CFG_POOL_EDIT_ACTION);
+
         // smartTokensSpendScriptHash is not derived but is configured, so it is worth checking:
         // a stale value here silently corrupts the whole pool-manager branch.
         if (configured != null && !configured.isBlank()) {
             expected.put(CFG_SMART_TOKENS_SPEND, configured);
         }
 
-        return compare("ConfigDatum", fields, expected);
+        return split(compare("ConfigDatum", fields, expected), advisoryIndices);
     }
 
     // ---- LMConfigDatum ------------------------------------------------------------------
 
-    private List<String> verifyLmConfig(List<PlutusData> fields) {
+    private Findings verifyLmConfig(List<PlutusData> fields) {
         Map<Integer, String> expected = new LinkedHashMap<>();
+        Set<Integer> advisoryIndices = new LinkedHashSet<>();
+
         expected.put(LM_WITHDRAW_BONDS_ACTION, registry.getLmWithdrawBondsActionScriptHash());
         expected.put(LM_LIQUIDATE_ACTION, registry.getLmLiquidateActionScriptHash());
         expected.put(LM_COMPOUND_ACTION, registry.getLmCompoundActionScriptHash());
@@ -265,9 +347,15 @@ public class LoansConfigVerifier {
         expected.put(LM_LIQUIDATE_CONVERT_AND_COMPOUND_ACTION,
                 registry.getLmLiquidateConvertAndCompoundActionScriptHash());
 
-        List<String> mismatches = compare("LMConfigDatum", fields, expected);
+        // ⛔ ADVISORY -- no call sites. The three LIQUIDATE actions above are NOT advisory: the
+        // builders invoke them, and lm_liquidate_and_convert_action has its own report below.
+        advisoryIndices.add(LM_WITHDRAW_BONDS_ACTION);
+        advisoryIndices.add(LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION);
+        advisoryIndices.add(LM_LIQUIDATE_CONVERT_AND_COMPOUND_ACTION);
+
+        Findings findings = split(compare("LMConfigDatum", fields, expected), advisoryIndices);
         reportConvertAvailability(fields);
-        return mismatches;
+        return findings;
     }
 
     /**
@@ -304,8 +392,14 @@ public class LoansConfigVerifier {
      * branch without smartTokensSpendScriptHash); those are reported as unchecked, not as
      * mismatches, so a partial derivation still starts.
      */
-    private List<String> compare(String datum, List<PlutusData> fields, Map<Integer, String> expected) {
-        List<String> mismatches = new ArrayList<>();
+    /**
+     * ⚠ Returns index → message, in the datum's own field order, rather than a bare list. The
+     * severity split ({@link Findings}) is then a partition of THIS map by field index — so a
+     * caller that wants every mismatch still gets them in the order the datum declares them, and
+     * the split cannot silently reorder anything.
+     */
+    private Map<Integer, String> compare(String datum, List<PlutusData> fields, Map<Integer, String> expected) {
+        Map<Integer, String> mismatches = new LinkedHashMap<>();
         int unchecked = 0;
         for (Map.Entry<Integer, String> e : expected.entrySet()) {
             if (e.getValue() == null) {
@@ -314,12 +408,25 @@ public class LoansConfigVerifier {
             }
             String actual = bytesAt(fields, e.getKey());
             if (!e.getValue().equals(actual)) {
-                mismatches.add("%s[%d]: derived %s, chain %s".formatted(datum, e.getKey(), e.getValue(), actual));
+                mismatches.put(e.getKey(),
+                        "%s[%d]: derived %s, chain %s".formatted(datum, e.getKey(), e.getValue(), actual));
             }
         }
         log.info("{}: {} fields checked, {} skipped (not derivable), {} mismatched",
                 datum, expected.size() - unchecked, unchecked, mismatches.size());
         return mismatches;
+    }
+
+    /** Partitions one datum's mismatches into {@link Findings}, preserving field order in both. */
+    private static Findings split(Map<Integer, String> mismatches, Set<Integer> advisoryIndices) {
+        List<String> enforced = new ArrayList<>();
+        List<String> advisory = new ArrayList<>();
+        List<String> all = new ArrayList<>();
+        mismatches.forEach((index, message) -> {
+            (advisoryIndices.contains(index) ? advisory : enforced).add(message);
+            all.add(message);
+        });
+        return new Findings(enforced, advisory, all);
     }
 
     /**
