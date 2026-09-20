@@ -90,7 +90,19 @@ market.**
 ## 4. Contract redeploy — the full sequence
 
 FluidTokens redeploys when contracts change. New config policy, new script addresses, new reference
-scripts. The image ships the new coordinates; **your database still describes the old world.**
+scripts. **The image ships the new coordinates — you never type one** — but **your database still
+describes the old world**, and that part no image can fix for you.
+
+⚠ **Not every redeploy needs this.** FluidTokens sometimes move only part of the contract set. If
+the part that moved is a validator this node never invokes, the node starts and logs:
+
+```
+⚠ Lending v4: N config field(s) do not match the chain, in validators THIS NODE NEVER INVOKES.
+```
+
+**That is not this section.** Nothing is wrong with your deployment, no re-sync is needed, and the
+fix is a future image. Only a startup **failure** — which names the offending field — means the
+deployment genuinely moved under you and the sequence below applies.
 
 Order matters here. Do not improvise it.
 

@@ -2,6 +2,11 @@
 #
 # Read docs/deploying.md before first use and docs/upgrading.md before changing versions.
 #
+# ⚠ EVERY VALUE THAT NEVER CHANGES HAS A DEFAULT HERE, so `.env` holds only what is yours: the
+# relay, the Blockfrost key, the mnemonic, the database credentials and the image version. The
+# contract coordinates are not configuration at all — they ship in the image, verified against
+# the chain before release. When FluidTokens redeploy, you bump the image tag.
+#
 # ⛔ TWO THINGS IN HERE ARE SECURITY DECISIONS, NOT STYLE:
 #   1. Postgres is bound to 127.0.0.1. It used to be published on every interface.
 #   2. The node publishes NO port at all. The operator UI is reached through an SSH tunnel or a
@@ -14,9 +19,9 @@ services:
     image: postgres:15
     environment:
       - POSTGRES_LOGGING=true
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
-      - POSTGRES_USER=${DB_USERNAME}
+      - POSTGRES_DB=${POSTGRES_DB:-aquarium}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env — see .env.example}
+      - POSTGRES_USER=${DB_USERNAME:-aquarium}
     ports:
       # ⛔ 127.0.0.1 ON PURPOSE. This was `5432:5432`, which publishes the database on EVERY
       # interface -- on a cloud host that is a Postgres server open to the internet, protected
@@ -28,7 +33,7 @@ services:
       - ./postgres:/var/lib/postgresql/data
     restart: on-failure
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${POSTGRES_DB}" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${DB_USERNAME:-aquarium} -d ${POSTGRES_DB:-aquarium}" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -40,7 +45,7 @@ services:
 
   aquarium-node:
     container_name: aquarium
-    image: "${AQUARIUM_DOCKER_IMAGE_NAME}:${AQUARIUM_DOCKER_IMAGE_VERSION}"
+    image: "${AQUARIUM_DOCKER_IMAGE_NAME:-fluidtokens/ft-aquarium-node}:${AQUARIUM_DOCKER_IMAGE_VERSION:-latest}"
     pull_policy: always
     restart: on-failure
 
@@ -65,7 +70,7 @@ services:
       # container limit instead of contradicting it.
       - JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75
       # Composed from the parts above; not a knob of its own.
-      - DB_URL=jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?currentSchema=${DB_SCHEMA}
+      - DB_URL=jdbc:postgresql://${POSTGRES_HOST:-aquarium-pg}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-aquarium}?currentSchema=${DB_SCHEMA:-public}
 
     # ⚠ MaxRAMPercentage is a percentage OF THIS LIMIT. Without a limit it is a percentage of the
     # whole host, so the JVM will happily size its heap against RAM other things are using.
