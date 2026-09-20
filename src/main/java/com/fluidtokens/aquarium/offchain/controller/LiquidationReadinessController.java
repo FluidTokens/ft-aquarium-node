@@ -15,6 +15,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
+import com.fluidtokens.aquarium.offchain.service.loans.AnticipateAndSell;
 import com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner;
@@ -91,6 +92,11 @@ public class LiquidationReadinessController {
                       String utxoRef,
                       String principalUnit,
                       BigInteger principalAmount,
+                      // ⛔ THE DEBT, NOT THE PRINCIPAL, is what every decision turns on -- interest
+                      // accrues and the original borrowed amount stops being the number anyone acts
+                      // on. Taken from LoanHealth, which computes it with or without prices, so this
+                      // column renders even when the oracle cannot value the collateral.
+                      BigInteger remainingDebt,
                       String collateralUnit,
                       BigInteger collateralAmount,
                       Double healthFactor,
@@ -125,6 +131,14 @@ public class LiquidationReadinessController {
                       // The same fee priced in ada, so the two figures are never two bare integers.
                       AssetDisplay feeValueDisplay,
                       AssetDisplay advanceDisplay,
+                      AssetDisplay debtDisplay,
+                      // ⛔ What the operator would net by fronting the principal and selling the
+                      // collateral themselves -- a DIFFERENT question from poolUsability, not a
+                      // softer one. See AnticipateAndSell.
+                      AnticipateAndSell anticipateAndSell,
+                      // ⚠ SCALED AND TICKERED like every other amount on this page. A net shown in raw
+                      // base units is the same defect as the fee slice and the capital figure were.
+                      AssetDisplay anticipateDisplay,
                       // cexplorer links. Null when the network or the loan policy is unknown — a dead
                       // link is worse than none, so the template renders plain text instead.
                       String loanExplorerUrl,
@@ -272,16 +286,25 @@ public class LiquidationReadinessController {
         String route;
         String routeDetail;
         BigInteger advance = null;
+        // Same defaulting as `usability` below and for the same reason: the branches that never reach
+        // a pool must still say WHY, rather than leave a cell that reads as zero.
+        AnticipateAndSell anticipate = AnticipateAndSell.unknown(
+                "no lender bond indexed, so it is not known whether this loan may be converted at all");
         // Defaults for the branches that never reach a pool: the bond settles it before the chain does.
         PoolUsability usability = new PoolUsability(PoolUsability.Verdict.UNKNOWN,
                 "the lender bond decides this loan's route before a pool is consulted");
         if (bond == null) {
             route = "UNKNOWN";
             routeDetail = "no lender bond indexed — the bond decides whether conversion is permitted";
+            // ⚠ PAY-IN-ADVANCE REQUIRES THE BOND TO ALLOW CONVERSION (PayInAdvanceLiquidationRouter),
+            // so on a bond that forbids it the hybrid is not a worse option -- it is not an option.
+            // A profit figure against a route that cannot be taken is worse than no figure.
         } else if (!bond.datum().shouldLiquidationConvertToPrincipal()) {
             route = "PLAIN LIQUIDATE";
             routeDetail = "the lender bond forbids conversion, so the bot takes its fee in collateral "
                     + "and fronts nothing";
+            anticipate = AnticipateAndSell.unknown("the lender bond forbids conversion, so "
+                    + "pay-in-advance is not available for this loan");
         } else {
             var action = gate.actionFor(datum.principalAsset());
             // The FETCH is per pair and memoised; the VERDICT is per loan. Both come from the same
@@ -304,10 +327,23 @@ public class LiquidationReadinessController {
                         : "conversion is unavailable for this loan, so the principal must be fronted";
                 advance = advanceAmount(loan, bond, now);
             }
+
+            // ⛔ SHOWN ON EVERY CONVERTIBLE ROW, not only where CONVERT was refused. The operator's
+            // question is "which route pays better here", and that cannot be answered by a number
+            // that only appears once the other route has already failed.
+            var numbers = numbersFor(loan, bond, now);
+            anticipate = numbers == null
+                    ? AnticipateAndSell.unknown("this loan's figures could not be priced, so the "
+                            + "estimate is not known")
+                    : AnticipateAndSell.estimate(collateralAsset, datum.principalAsset(),
+                            numbers.collateralLenderShouldReceive(), numbers.liquidationFee(),
+                            numbers.convertedLoanCollateralToPrincipalAmount(),
+                            null, fetched.datums());
         }
 
         return new Row(loan.loanId(), loan.utxoRef(),
                 datum.principalAsset().toUnit(), datum.principalAmount(),
+                health.remainingDebt(),
                 collateralAsset.toUnit(), loan.collateralAmount(),
                 healthFactor, health.currentLtvPercent(), health.liquidatable(),
                 healthFactor == null ? healthUnknown : null,
@@ -320,6 +356,11 @@ public class LiquidationReadinessController {
                 feeTokens == null ? null : display(collateralAsset.toUnit(), feeTokens, metadataMemo),
                 feeValue == null ? null : display("lovelace", feeValue, metadataMemo),
                 advance == null ? null : display(datum.principalAsset().toUnit(), advance, metadataMemo),
+                health.remainingDebt() == null ? null
+                        : display(datum.principalAsset().toUnit(), health.remainingDebt(), metadataMemo),
+                anticipate,
+                anticipate.netInPrincipal() == null ? null
+                        : display(datum.principalAsset().toUnit(), anticipate.netInPrincipal(), metadataMemo),
                 loanAssetUrl(loan.loanId()), txUrl(loan.utxoRef()));
     }
 

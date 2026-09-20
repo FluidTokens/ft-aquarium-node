@@ -18,6 +18,7 @@ import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
+import com.fluidtokens.aquarium.offchain.service.loans.AnticipateAndSell;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
@@ -98,13 +99,14 @@ class LiquidationReadinessControllerTest {
 
     private static LiquidationReadinessController.Row row(String id, Double healthFactor) {
         return new LiquidationReadinessController.Row(id, id + "#0", "lovelace", BigInteger.TEN,
-                "tok", BigInteger.TEN, healthFactor, null, null, null,
+                BigInteger.TEN, "tok", BigInteger.TEN, healthFactor, null, null, null,
                 null, null, null, "PLAIN LIQUIDATE", "", null,
                 new LoanAge("1d", "2026-09-13T00:00:00Z"),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
                 PoolUsability.noPool(),
-                null, null, null, null, null);
+                null, null, null, null,
+                AnticipateAndSell.unknown("no pool"), null, null, null);
     }
 
     /**
@@ -134,14 +136,15 @@ class LiquidationReadinessControllerTest {
      */
     @Test
     void anUncomputableRowCarriesNullsAndAReasonRatherThanZeros() {
-        var r = new LiquidationReadinessController.Row("id", "id#0", "lovelace", BigInteger.TEN,
+        var r = new LiquidationReadinessController.Row("id", "id#0", "lovelace", BigInteger.TEN, null,
                 "tok", BigInteger.TEN, null, null, null, "no usable oracle feed",
                 null, null, "no usable oracle feed", "UNKNOWN", "no bond indexed", null,
                 new LoanAge("unknown", null),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
                 PoolUsability.noPool(),
-                null, null, null, null, null);
+                null, null, null, null,
+                AnticipateAndSell.unknown("no pool"), null, null, null);
 
         assertNull(r.healthFactor());
         assertNull(r.feeValueLovelace());

@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.controller;
 import com.fluidtokens.aquarium.offchain.model.AssetDisplay;
 import com.fluidtokens.aquarium.offchain.model.LoanAge;
 import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
+import com.fluidtokens.aquarium.offchain.service.loans.AnticipateAndSell;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 
 import org.junit.jupiter.api.Test;
@@ -70,7 +71,7 @@ class ReadinessTemplateRendersRowsTest {
     private static LiquidationReadinessController.Row fullRow() {
         return new LiquidationReadinessController.Row(
                 "1b6fda505ea9b739e42b5871d274344af37c196ddb70619541a7d06d", "d832b78e…#1",
-                "lovelace", BigInteger.valueOf(20_000_000L),
+                "lovelace", BigInteger.valueOf(20_000_000L), BigInteger.valueOf(20_003_778L),
                 "577f0b13…0014df10464c4454", BigInteger.valueOf(100_000_000L),
                 0.87, 89.82, true, null,
                 BigInteger.valueOf(5_000_000L), BigInteger.valueOf(1_113_385L), null,
@@ -90,6 +91,11 @@ class ReadinessTemplateRendersRowsTest {
                         new TokenMetadata(FLDT_UNIT, "FLDT", "FluidTokens", 6, TokenMetadata.Source.REGISTRY)),
                 AssetDisplay.of(BigInteger.valueOf(1_113_385L), TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.valueOf(20_887_781L), TokenMetadata.ada()),
+                AssetDisplay.of(BigInteger.valueOf(20_003_778L), TokenMetadata.ada()),
+                // ⚠ A POSITIVE estimate on purpose: `profitable()` drives a class on the cell, so a
+                // negative-only fixture would never render the branch an operator acts on.
+                new AnticipateAndSell(BigInteger.valueOf(1_250_000L), "net positive"),
+                AssetDisplay.of(BigInteger.valueOf(1_250_000L), TokenMetadata.ada()),
                 "https://cexplorer.io/asset/aabbccdd1b6fda505ea9b739e42b5871d274344af37c196ddb70619541a7d06d",
                 "https://cexplorer.io/tx/d832b78e");
     }
@@ -97,7 +103,7 @@ class ReadinessTemplateRendersRowsTest {
     /** And one with every optional field null — the other half of the row branch. */
     private static LiquidationReadinessController.Row sparseRow() {
         return new LiquidationReadinessController.Row(
-                "abc", "aa#0", "lovelace", BigInteger.ONE, "tok", BigInteger.TEN,
+                "abc", "aa#0", "lovelace", BigInteger.ONE, null, "tok", BigInteger.TEN,
                 null, null, null, "no usable oracle feed",
                 null, null, "no usable oracle feed", "UNKNOWN", "no bond indexed", null,
                 // ⚠ The UNKNOWN-metadata path deliberately: the marker branch is its own render path
@@ -106,7 +112,8 @@ class ReadinessTemplateRendersRowsTest {
                 AssetDisplay.of(BigInteger.ONE, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)),
                 PoolUsability.checkFailed("SocketTimeoutException"),
-                null, null, null, null, null);
+                null, null, null, null,
+                AnticipateAndSell.unknown("no lender bond indexed"), null, null, null);
     }
 
     private static String render(List<LiquidationReadinessController.Row> rows) {
@@ -293,13 +300,14 @@ class ReadinessTemplateRendersRowsTest {
 
     private static LiquidationReadinessController.Row rowWithPool(PoolUsability usability) {
         return new LiquidationReadinessController.Row(
-                "abc", "aa#0", "lovelace", BigInteger.ONE, FLDT_UNIT, BigInteger.TEN,
+                "abc", "aa#0", "lovelace", BigInteger.ONE, BigInteger.TWO, FLDT_UNIT, BigInteger.TEN,
                 1.4, 70.0, false, null, BigInteger.ONE, BigInteger.ONE, null,
                 "CAPITAL IN ADVANCE", "this market is configured action: ANTICIPATE", BigInteger.TEN,
                 new LoanAge("2d", "2026-09-12T00:00:00Z"),
                 AssetDisplay.of(BigInteger.ONE, TokenMetadata.ada()),
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)),
                 usability,
-                null, null, null, null, null);
+                null, null, null, null,
+                AnticipateAndSell.unknown("no pool"), null, null, null);
     }
 }

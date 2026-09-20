@@ -134,8 +134,8 @@
     <table>
       <thead>
       <tr>
-        <th>Loan</th><th>UTxO</th><th>Age</th><th class="num">Principal</th><th class="num">Collateral</th><th>Health</th>
-        <th class="num">Fee slice at liquidation</th><th>Route</th><th class="num">Capital needed</th>
+        <th>Loan</th><th>UTxO</th><th>Age</th><th class="num">Debt</th><th class="num">Collateral</th><th>Health</th>
+        <th class="num">Fee slice at liquidation</th><th>Route</th><th class="num">Advance cost</th><th class="num">Anticipate &amp; sell</th>
       </tr>
       </thead>
       <tbody>
@@ -162,9 +162,14 @@
         <!-- The readable form wins the visible slot; the exact instant stays on hover, because anyone
              reconciling against the chain needs it and rounding it away makes this useless to them. -->
         <td class="mono age" th:title="${r.age.iso}" th:text="${r.age.text}">age</td>
-        <td class="mono num" th:with="d=${r.principalDisplay}">
+        <!-- ⛔ THE DEBT, NOT THE PRINCIPAL. Interest accrues, so the amount originally borrowed stops
+             being the number anyone acts on; it stays on hover for reconciliation. When the debt could
+             not be computed the ORIGINAL principal is shown, marked, rather than an empty cell. -->
+        <td class="mono num" th:with="d=${r.debtDisplay != null ? r.debtDisplay : r.principalDisplay}"
+            th:title="|originally borrowed: ${r.principalDisplay.amountText} ${r.principalDisplay.label}|">
           <span th:text="${d.amountText}">0</span>
           <span class="ticker" th:text="${d.label}" th:title="${d.policyId}">TKR</span>
+          <span th:if="${r.debtDisplay == null}" class="reason">principal &mdash; debt unavailable</span>
           <!-- ⛔ No registry knew this asset, so the figure above is RAW base units. The marker is the
                difference between a number an operator can act on and one that is wrong by a factor of
                a million, so it is never omitted. -->
@@ -237,9 +242,28 @@
                 class="reason">&mdash;</span>
           <span class="reason" th:if="${r.advancePrincipalAmount != null}">repayment to the lender &mdash; capital you must have ready</span>
         </td>
+        <!-- ⛔ A DIFFERENT QUESTION FROM THE ROUTE, shown on every row on purpose. "Which route pays
+             better here" cannot be answered by a figure that only appears once the other route has
+             already failed. See AnticipateAndSell. -->
+        <td class="mono num">
+          <span th:if="${r.anticipateDisplay != null}"
+                th:classappend="${r.anticipateAndSell.profitable()} ? 'ok' : 'bad'"
+                th:text="${r.anticipateDisplay.amountText}">0</span>
+          <span th:if="${r.anticipateDisplay != null}" class="ticker"
+                th:text="${r.anticipateDisplay.label}" th:title="${r.anticipateDisplay.policyId}">TKR</span>
+          <span th:if="${r.anticipateDisplay != null and r.anticipateDisplay.metadataUnknown}" class="nometa"
+                th:title="|no metadata for ${r.anticipateDisplay.unit} — raw, unscaled base units|">&#10071;</span>
+          <span th:unless="${r.anticipateAndSell.known()}" class="unknown">unknown</span>
+          <!-- ⚠ The three honesties travel WITH the number, not in a legend someone has to find:
+               it is two transactions rather than one, the quote prices the whole slice at once so
+               selling gradually does better, and the capital is tied up in between. -->
+          <span class="reason" th:text="${r.anticipateAndSell.detail}">why</span>
+          <span class="reason" th:if="${r.anticipateAndSell.known()}">estimate, not a quote &mdash; two
+            transactions, and the price may move between them</span>
+        </td>
       </tr>
       <tr th:if="${#lists.isEmpty(rows)}">
-        <td colspan="9" class="empty">No loans indexed. On a healthy node that means a quiet market
+        <td colspan="10" class="empty">No loans indexed. On a healthy node that means a quiet market
           &mdash; but it looks identical to a node pinned to a superseded deployment, or to one whose
           decoder has gone blind. <strong>Check the scan summary at
           <span class="mono">/api/v1/loans/liquidations</span></strong>, and read three numbers
