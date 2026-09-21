@@ -106,7 +106,71 @@ class LiquidationReadinessControllerTest {
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
                 PoolUsability.noPool(),
                 null, null, null, null,
-                AnticipateAndSell.unknown("no pool"), null, null, null);
+                AnticipateAndSell.unknown("no pool"), null,
+                ActionNow.of(false, null, null, null, true, false, null), null, null);
+    }
+
+    // ---- sorting and filtering, which are query parameters rather than JavaScript ----------------
+
+    private static LiquidationReadinessController.Row aged(String id, Double health, String iso) {
+        var base = row(id, health);
+        return new LiquidationReadinessController.Row(base.loanId(), base.utxoRef(), base.principalUnit(),
+                base.principalAmount(), base.remainingDebt(), base.collateralUnit(), base.collateralAmount(),
+                base.healthFactor(), base.currentLtvPercent(), base.liquidatable(), base.healthUnknownReason(),
+                base.feeInCollateral(), base.feeValueLovelace(), base.feeUnknownReason(), base.route(),
+                base.routeDetail(), base.advancePrincipalAmount(),
+                new com.fluidtokens.aquarium.offchain.model.LoanAge("x", iso),
+                base.principalDisplay(), base.collateralDisplay(), base.poolUsability(), base.feeDisplay(),
+                base.feeValueDisplay(), base.advanceDisplay(), base.debtDisplay(), base.anticipateAndSell(),
+                base.anticipateDisplay(), base.actionNow(), base.loanExplorerUrl(), base.utxoExplorerUrl());
+    }
+
+    /**
+     * ⛔ <b>UNKNOWN STAYS LAST WHEN THE DIRECTION FLIPS.</b> A naive {@code reversed()} promotes the
+     * uncomputable rows straight to the top, which looks exactly like a correct descending sort and
+     * pushes the genuinely urgent loans off the fold. This is the assertion that catches it.
+     */
+    @Test
+    void reversingTheSortDoesNotPromoteRowsWhoseHealthIsUnknown() {
+        var rows = List.of(row("healthy", 2.4), row("unknown", null), row("critical", 0.87));
+
+        var asc = LiquidationReadinessController.arrange(rows, "health", "asc", null, null);
+        var desc = LiquidationReadinessController.arrange(rows, "health", "desc", null, null);
+
+        assertEquals(List.of("critical", "healthy", "unknown"),
+                asc.stream().map(LiquidationReadinessController.Row::loanId).toList());
+        assertEquals(List.of("healthy", "critical", "unknown"),
+                desc.stream().map(LiquidationReadinessController.Row::loanId).toList(),
+                "descending reverses the measurable rows and leaves unknown last");
+    }
+
+    /**
+     * ⚠ A LATER lend date is a YOUNGER loan, so ascending AGE is descending DATE. Inverted once,
+     * inside arrange(), because an off-by-one-direction here is invisible on a four-row page.
+     */
+    @Test
+    void sortingByAgePutsTheYoungestFirstAscending() {
+        var rows = List.of(aged("old", 1.0, "2026-01-01T00:00:00Z"),
+                aged("new", 1.0, "2026-09-01T00:00:00Z"));
+
+        assertEquals(List.of("new", "old"),
+                LiquidationReadinessController.arrange(rows, "age", "asc", null, null)
+                        .stream().map(LiquidationReadinessController.Row::loanId).toList());
+        assertEquals(List.of("old", "new"),
+                LiquidationReadinessController.arrange(rows, "age", "desc", null, null)
+                        .stream().map(LiquidationReadinessController.Row::loanId).toList());
+    }
+
+    @Test
+    void filteringNarrowsByPrincipalAndCollateralAndBlankMeansNoFilter() {
+        var rows = List.of(row("a", 1.0), row("b", 2.0));
+
+        assertEquals(2, LiquidationReadinessController.arrange(rows, "health", "asc", "", "").size(),
+                "a blank filter is not a filter — an empty select must not hide every row");
+        assertEquals(2, LiquidationReadinessController.arrange(rows, "health", "asc", "lovelace", null).size());
+        assertEquals(0, LiquidationReadinessController.arrange(rows, "health", "asc", "nosuchunit", null).size(),
+                "a principal no loan carries must match nothing rather than everything");
+        assertEquals(2, LiquidationReadinessController.arrange(rows, "health", "asc", null, "tok").size());
     }
 
     /**
@@ -144,7 +208,8 @@ class LiquidationReadinessControllerTest {
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown("tok")),
                 PoolUsability.noPool(),
                 null, null, null, null,
-                AnticipateAndSell.unknown("no pool"), null, null, null);
+                AnticipateAndSell.unknown("no pool"), null,
+                ActionNow.of(false, null, null, null, true, false, null), null, null);
 
         assertNull(r.healthFactor());
         assertNull(r.feeValueLovelace());

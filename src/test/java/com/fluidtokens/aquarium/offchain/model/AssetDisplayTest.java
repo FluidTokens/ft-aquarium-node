@@ -25,7 +25,11 @@ class AssetDisplayTest {
     void adaScalesBySixWithoutAskingAnyone() {
         AssetDisplay d = AssetDisplay.of(BigInteger.valueOf(20_887_781L), TokenMetadata.ada());
 
-        assertEquals("20.887781", d.amountText());
+        // ⛔ ROUNDED FOR READING, EXACT FOR RECONCILING. 20.887781 is in the 1..10,000 band, so it
+        // shows two decimals — and exactText keeps every digit, which is the only reason rounding
+        // here is admissible at all.
+        assertEquals("20.89", d.amountText());
+        assertEquals("20.887781", d.exactText(), "the unrounded figure must always be available");
         assertEquals("ADA", d.label());
         assertFalse(d.metadataUnknown(), "ada can never be unknown");
     }
@@ -36,7 +40,8 @@ class AssetDisplayTest {
 
         AssetDisplay d = AssetDisplay.of(new BigInteger("100000000"), fldt);
 
-        assertEquals("100", d.amountText(), "100,000,000 base units at 6 decimals is 100 FLDT");
+        assertEquals("100.00", d.amountText(), "100,000,000 base units at 6 decimals is 100 FLDT");
+        assertEquals("100", d.exactText());
         assertEquals("FLDT", d.label());
         assertFalse(d.metadataUnknown());
     }
@@ -56,8 +61,11 @@ class AssetDisplayTest {
         AssetDisplay zero = AssetDisplay.of(amount, declaredZero);
         AssetDisplay none = AssetDisplay.of(amount, unknown);
 
-        assertEquals("100000000", zero.amountText(), "a declared 0 renders base units");
-        assertEquals("100000000", none.amountText(), "an unknown scale renders base units too");
+        // ⚠ A DECLARED zero is a scale, so the figure is genuinely 100,000,000 units and is grouped
+        // like any other number that size. An UNKNOWN scale is not rounded or grouped at all: the
+        // amount is raw base units, and dressing it up would make an unscaled figure look scaled.
+        assertEquals("100,000,000", zero.amountText(), "a declared 0 renders base units");
+        assertEquals("100000000", none.amountText(), "an unknown scale renders raw base units");
 
         assertFalse(zero.metadataUnknown(), "a declared zero is known and must not be marked");
         assertTrue(none.metadataUnknown(), "an unknown scale MUST be marked");

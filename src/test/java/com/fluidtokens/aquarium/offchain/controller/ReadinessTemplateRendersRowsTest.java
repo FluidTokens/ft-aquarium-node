@@ -96,6 +96,9 @@ class ReadinessTemplateRendersRowsTest {
                 // negative-only fixture would never render the branch an operator acts on.
                 new AnticipateAndSell(BigInteger.valueOf(1_250_000L), "net positive"),
                 AssetDisplay.of(BigInteger.valueOf(1_250_000L), TokenMetadata.ada()),
+                // ⚠ A LIVE, would-act row: `wouldAct` drives a distinct class, so a fixture that only
+                // ever renders the idle branch would never exercise the cell an operator reacts to.
+                new ActionNow("CONVERT", "live: this loan would be liquidated on the next scan", true),
                 "https://cexplorer.io/asset/aabbccdd1b6fda505ea9b739e42b5871d274344af37c196ddb70619541a7d06d",
                 "https://cexplorer.io/tx/d832b78e");
     }
@@ -113,14 +116,95 @@ class ReadinessTemplateRendersRowsTest {
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)),
                 PoolUsability.checkFailed("SocketTimeoutException"),
                 null, null, null, null,
-                AnticipateAndSell.unknown("no lender bond indexed"), null, null, null);
+                AnticipateAndSell.unknown("no lender bond indexed"), null,
+                ActionNow.of(null, null, null, null, true, false, null), null, null);
+    }
+
+    /**
+     * ⛔ <b>The banner is the reason this page can be trusted at a glance.</b> Without it the table
+     * rendered a route and a positive margin on a node that would do none of it.
+     */
+    @Test
+    void theBannerSaysWhatTheNodeWillActuallyDo() {
+        String html = render(List.of(fullRow()));
+
+        assertTrue(html.contains("MONITORING ONLY"), "the headline must be on the page");
+        assertTrue(html.contains("simulation"), "and it must name the figures below as a simulation");
+        assertTrue(html.contains("liquidation: DISABLED"), "the mode itself must be visible, not implied");
+    }
+
+    /** A live node must look different, or the banner is decoration. */
+    @Test
+    void aLiveNodeRendersADistinctBanner() {
+        String html = render(List.of(fullRow()),
+                new OperationalStatus("LIVE — this node can submit", "LIVE", true, true, true, 0,
+                        List.of()));
+
+        assertTrue(html.contains("LIVE — this node can submit"));
+        assertTrue(html.contains("status live"), "the live banner must carry its own class: " + html.contains("status"));
+    }
+
+    /**
+     * ⛔ <b>TOOLTIPS ARE INVISIBLE ON TOUCH AND ABSENT FROM SCREENSHOTS</b>, so the one thing that may
+     * never move into a `title` is the reason an UNKNOWN is unknown — which is the failure this page
+     * exists to prevent. Everything else may hide; this may not.
+     */
+    @Test
+    void anUnknownPoolVerdictKeepsItsReasonOnScreenRatherThanInATooltip() {
+        String html = render(List.of(sparseRow()));
+
+        // sparseRow carries PoolUsability.checkFailed(...), which is CHECK_FAILED rather than UNKNOWN —
+        // so assert the shape that matters: the detail text is present as TEXT for an unknown-ish cell.
+        assertTrue(html.contains("SocketTimeoutException"),
+                "a failed lookup must say so where it can be read without hovering");
+    }
+
+    /** The breakdown answers "why is the capital required more than the debt", permanently. */
+    @Test
+    void theBreakdownExplainsWhyCapitalRequiredIsNotTheDebt() {
+        String html = render(List.of(fullRow()));
+
+        assertTrue(html.contains("Capital required"), "the breakdown must name the figure");
+        assertTrue(html.contains("liquidation penalty"),
+                "and it must say WHY it differs from the debt, rather than leaving the reader to guess");
+        assertTrue(html.contains("Estimated gross margin"), "the realistic profit lives here");
+    }
+
+    /** ⛔ A phone is for knowing whether to find a laptop, not for operating a bot that holds funds. */
+    @Test
+    void theSmallScreenViewIsAGlanceAndNotTheTable() {
+        String html = render(List.of(fullRow()));
+
+        assertTrue(html.contains("class=\"glance\""), "the phone view must exist");
+        assertTrue(html.contains("Open this on a laptop") || html.contains("Nothing needs you right now"),
+                "and it must end in a verdict about whether to go and act");
+        assertTrue(html.contains("max-width: 700px"), "the table must be hidden below the breakpoint");
     }
 
     private static String render(List<LiquidationReadinessController.Row> rows) {
+        return render(rows, monitoringOnly());
+    }
+
+    /** The common case, and the one the banner exists for: nothing on this node can submit. */
+    private static OperationalStatus monitoringOnly() {
+        return new OperationalStatus("MONITORING ONLY", "DISABLED", true, false, false, 0,
+                List.of("liquidation is DISABLED — the figures below are a simulation, not an intention"));
+    }
+
+    private static String render(List<LiquidationReadinessController.Row> rows,
+                                 OperationalStatus status) {
         var context = new Context();
         context.setVariable("network", "preview");
         context.setVariable("generatedAt", "2026-09-04T13:00:00Z");
         context.setVariable("disabledReason", null);
+        context.setVariable("status", status);
+        context.setVariable("sort", "health");
+        context.setVariable("dir", "asc");
+        context.setVariable("principalFilter", null);
+        context.setVariable("collateralFilter", null);
+        context.setVariable("filterQuery", "");
+        context.setVariable("principals", List.of("lovelace"));
+        context.setVariable("collaterals", List.of(FLDT_UNIT));
         context.setVariable("rows", rows);
         return engine().process("readiness", context);
     }
@@ -140,7 +224,10 @@ class ReadinessTemplateRendersRowsTest {
         // ⛔ SCALED, not raw. This asserted the raw base-unit figure "20887781", which is exactly the
         // number an operator would have misread by a factor of a million. The column now renders the
         // asset's own scale and ticker like every other amount on the page.
-        assertTrue(html.contains("20.887781"), "the capital-needed figure must render, scaled");
+        // ⚠ Rounded in the cell, exact on hover. Asserting BOTH is the point: a display rule must
+        // never be the reason someone cannot reconcile a figure against the chain.
+        assertTrue(html.contains("20.89"), "the capital-required figure must render, scaled and rounded");
+        assertTrue(html.contains("20.887781"), "and the exact figure must survive, for reconciliation");
         assertFalse(html.contains("20887781"),
                 "the raw base-unit figure must NOT appear once a scale is known — that is the defect");
 
@@ -191,8 +278,12 @@ class ReadinessTemplateRendersRowsTest {
     void severalRowsRenderTogether() {
         String html = render(List.of(fullRow(), sparseRow()));
 
-        assertEquals(2, html.split("<tr", -1).length - 1 - 1,
-                "two body rows plus the header row");
+        // ⛔ TWO ROWS PER LOAN NOW: the data row and its breakdown row. Counting only the total would
+        // pass if the breakdown silently stopped rendering, so both are asserted.
+        assertEquals(4, html.split("<tr", -1).length - 1 - 1,
+                "two loans, each a data row plus a breakdown row, on top of the header row");
+        assertEquals(2, html.split("<tr class=\"detail\"", -1).length - 1,
+                "every loan must get exactly one breakdown row");
     }
 
     /**
@@ -308,6 +399,7 @@ class ReadinessTemplateRendersRowsTest {
                 AssetDisplay.of(BigInteger.TEN, TokenMetadata.unknown(FLDT_UNIT)),
                 usability,
                 null, null, null, null,
-                AnticipateAndSell.unknown("no pool"), null, null, null);
+                AnticipateAndSell.unknown("no pool"), null,
+                ActionNow.of(false, null, null, null, true, false, null), null, null);
     }
 }
