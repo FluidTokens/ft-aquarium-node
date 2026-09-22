@@ -266,28 +266,57 @@ jobs:
         run: |
           ./gradlew bootJar  # Assuming you're using bootJar to build the JAR
 
-      # Step 5: Generate version using year.month.day format
-      - name: Generate version
-        id: version  # This step has an ID to be referenced in the next step
+      # Step 5: Compute the image tag
+      #
+      # ⛔ ONE TAG MUST MEAN EXACTLY ONE IMAGE, FOREVER. The old scheme was the build DATE alone, so
+      # two merges on one day produced two different images under one tag and the second silently
+      # overwrote the first. That happened for real: 2026.09.19 was published twice, and anyone who
+      # pulled between the two got different bytes under a name they had pinned precisely to avoid
+      # that. A tag an operator cannot trust is worse than no tag, because they pinned it deliberately.
+      #
+      # ⇒ `YYYY.MM.DD-<12-char commit sha>`. The date keeps the tags human-readable and sortable --
+      # "which of these is newer" is the question operators actually ask -- and the sha makes a clash
+      # STRUCTURALLY IMPOSSIBLE rather than merely detected.
+      #
+      # ⚠ TWELVE characters, not the customary seven, ON PURPOSE: `build.commitShort` in the jar is
+      # `git rev-parse --short=12`, so the tag suffix is STRING-EQUAL to what /actuator/info reports.
+      # An operator can compare the tag they deployed against the commit the running node claims with
+      # their eyes, and the assertion below does the same thing at build time.
+      #
+      # ⚠ Not semver: nothing in this repo maintains a version (build.gradle is 0.0.1-SNAPSHOT), so a
+      # semver would be a number someone increments rather than a fact about the artefact. Not a bare
+      # sha either: unique, but it cannot be ordered, and ordering is what the date is for.
+      - name: Compute the image tag
+        id: version
         run: |
-          
-          ## Append -pv for preview images
-          
-          echo "GITHUB_REF_NAME: $GITHUB_REF_NAME"
-          
-          if [ $GITHUB_REF_NAME == "preview" ]
-          then
-            VERSION=$(date +'%Y.%m.%d')-pv
+          SHA_SHORT="${GITHUB_SHA:0:12}"
+          DATE="$(date +'%Y.%m.%d')"
+
+          if [ "$GITHUB_REF_NAME" = "preview" ]; then
+            VERSION="${DATE}-${SHA_SHORT}-pv"
           else
-            VERSION=$(date +'%Y.%m.%d')  # Format: year.month.day
+            VERSION="${DATE}-${SHA_SHORT}"
           fi
 
-          echo "Generated version: ${VERSION}"
-          if [ -z "$VERSION" ]; then
-            echo "Error: VERSION is empty"
+          # ⛔ THE TAG MUST NAME THE COMMIT THE IMAGE WAS ACTUALLY BUILT FROM. The jar carries its own
+          # provenance, derived independently by build.gradle from git, so comparing the two turns the
+          # sha in the tag from a label into a checked claim. Without this the tag is decoration: it
+          # would still be unique, and could still be wrong.
+          BUILD_INFO="build/resources/main/META-INF/build-info.properties"
+          if [ ! -f "$BUILD_INFO" ]; then
+            echo "::error::$BUILD_INFO is absent — the jar did not record its provenance, so the tag cannot be verified"
             exit 1
           fi
-          echo "::set-output name=version::${VERSION}"  # Set VERSION as output for the next step
+          JAR_COMMIT="$(grep '^build.commitShort=' "$BUILD_INFO" | cut -d= -f2)"
+          if [ "$JAR_COMMIT" != "$SHA_SHORT" ]; then
+            echo "::error::tag says ${SHA_SHORT} but the jar was built from ${JAR_COMMIT}"
+            exit 1
+          fi
+          echo "tag ${VERSION} verified against the jar's own provenance (${JAR_COMMIT})"
+
+          # ⚠ $GITHUB_OUTPUT, not ::set-output — the latter is deprecated and already warns on every run.
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
 
       # Step 6: Log in to Docker Hub
       - name: Log in to Docker Hub
@@ -305,6 +334,11 @@ jobs:
           DOCKER_IMAGE="${DOCKER_IMAGE_NAME}:${VERSION}"
           echo "Building Docker image with tag: ${DOCKER_IMAGE}"
 
+          ## ⇒ TWO TAGS OF DIFFERENT KINDS, and the difference is the point:
+          ##    ${VERSION}  IMMUTABLE. Carries the commit sha, is never reused, and is what an
+          ##                operator pins. Any one of these will always be the same bytes.
+          ##    latest      MOVING. A pointer to the newest build, and it changes under anyone who
+          ##                tracks it. Fine for trying the node; wrong for running one.
           ## Don't push latest for preview
           if [ $GITHUB_REF_NAME == "preview" ]
           then
