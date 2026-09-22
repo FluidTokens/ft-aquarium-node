@@ -403,14 +403,19 @@ loans:
       lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0}
       lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0}
       loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:6338f0b7ab80d8bfa5de479d8cdba1b40fe4d8cee58ff1d0fe4c403e4560c4d4#0}
-      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
+      # ⭐ PUBLISHED 2026-09-22, block 13973022 — blank since the redeploy. VERIFIED, not pasted:
+      # this UTxO carries reference_script df30096d…, 4,227 bytes, unspent, and df30096d… is exactly
+      # what this node derives and what the live LMConfigDatum names at field 2.
+      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:fee70b786b9575430aa20edffbec42128803311633336ab590a4f73948cb4fad#0}
       # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
       # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
       # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
       # at all, so it could not be referenced however much else was published -- which is why a convert
       # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
       # referenced and working. Referencing this one alone sheds ~7,051 bytes.
-      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:}
+      # ⭐ PUBLISHED 2026-09-22, block 13973034. Carries bec0ed6f…, 7,051 bytes, unspent — the
+      # largest script this path carried inline, so referencing it is the bigger of the two savings.
+      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:cac8029b51af2b7bd08c3bf0d046d64c1cfc4c0d7de3706f66b50a8e106a6294#0}
       asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0}
       # ⚑ The CONVERT action. It has NO AQUARIUM_LIQUIDATION_REF_* alias -- the only route in is
       # the relaxed name LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION.
