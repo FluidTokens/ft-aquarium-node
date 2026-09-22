@@ -202,7 +202,25 @@ public class ScheduledTransactionService {
 
         var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
                 .getProtocolParams();
-        var required = LedgerCeilings.maxPossibleFee(protocolParams);
+
+        // ⛔ THE COLLATERAL CEILING, NOT THE FEE CEILING — and the difference is a transaction NO NODE
+        // CAN PARSE, not a transaction that fails.
+        //
+        // This asked for maxPossibleFee. The ledger requires collateral of fee × collateral_percent
+        // (150%), so a utxo between the two passed this filter, was nominated as both the input and
+        // the collateral, and cardano-client-lib emitted a NEGATIVE collateral return. A negative
+        // MaryValue is unrepresentable, so the provider rejects the CBOR at offset 0 before any
+        // validation runs — "DeserialiseFailure ... expected tag" — and nothing reaches the chain.
+        //
+        // ⚠ MEASURED ON MAINNET 2026-09-22: floor 2,549,327 against a collateral requirement of
+        // ~3,823,991. Every wallet utxo in that 1.27 ada window failed, every cycle.
+        //
+        // ⚑ THIS IS THE 2026-08-25 INCIDENT ON A SECOND PATH. LiquidateTransactionBuilder carries
+        // INSUFFICIENT_COLLATERAL and sizes from maxPossibleCollateral; LiquidationExecutor does the
+        // same. This service shares their wallet, their library and their failure mode, and had
+        // neither -- the "every guarantee lives on the preview paths, this one had none" shape, twice
+        // noted in this file and now the cause of a third outage.
+        var required = LedgerCeilings.maxPossibleCollateral(protocolParams);
 
         // ⚠ SMALLEST-FIRST, still: largest-first would spend the biggest utxo to pay a fee and
         // fragment the wallet against the case where a large one is genuinely needed. Ordering the
@@ -214,7 +232,7 @@ public class ScheduledTransactionService {
                     .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
                     .map(LedgerCeilings::lovelaceOf)
                     .max(java.math.BigInteger::compareTo);
-            log.warn("no ada-only wallet utxo covers the {} lovelace this ledger could charge; "
+            log.warn("no ada-only wallet utxo covers the {} lovelace of COLLATERAL this ledger could demand; "
                             + "largest available is {}. Fund the wallet with a single ada-only "
                             + "utxo of at least that amount.",
                     required, largest.map(Object::toString).orElse("none at all"));
@@ -308,7 +326,23 @@ public class ScheduledTransactionService {
                         .validFrom(slot - 30)
                         .validTo(slot + 180)
                         .feePayer(account.baseAddress())
+                        // ⛔ COLLATERAL PINNED TO THIS TANK'S OWN WALLET UTXO, which the pool above
+                        // has already proven covers maxPossibleCollateral.
+                        //
+                        // collateralPayer alone lets cardano-client-lib choose ANY utxo at the
+                        // address -- including dust, and including a utxo ANOTHER tank in this same
+                        // cycle is about to spend as its input. The fan-out makes that second hazard
+                        // real: unpinned collateral could name an input that no longer exists by the
+                        // time this transaction lands.
+                        //
+                        // ⚠ Input and collateral being the SAME utxo is deliberate and is what the
+                        // liquidation path already falls back to ("the nominated wallet utxo"). It
+                        // keeps each tank self-contained, which is the property the fan-out needs.
                         .collateralPayer(account.baseAddress())
+                        .withCollateralInputs(TransactionInput.builder()
+                                .transactionId(walletUtxo.getTxHash())
+                                .index(walletUtxo.getOutputIndex())
+                                .build())
                         .mergeOutputs(false)
                         .ignoreScriptCostEvaluationError(false)
                         // T-059 — THE ONLY MAINNET PATH NOW ASSERTS ITS OWN STRUCTURE.

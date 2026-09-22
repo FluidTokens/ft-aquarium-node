@@ -122,6 +122,43 @@ class ScheduledTransactionWalletPoolTest {
         assertEquals("plain", pool.poll().getTxHash());
     }
 
+    /**
+     * ⛔ <b>THE CEILING MUST BE THE COLLATERAL ONE, NOT THE FEE ONE — and the gap between them is a
+     * transaction no node can parse.</b>
+     *
+     * <p>Measured on mainnet 2026-09-22: the pool asked for {@code maxPossibleFee} (2,549,327) while
+     * the ledger demands collateral of fee x collateral_percent (~3,823,991). Every wallet utxo in
+     * that 1.27 ada window passed the filter, was nominated as input AND collateral, and
+     * cardano-client-lib emitted a NEGATIVE collateral return. A negative {@code MaryValue} is
+     * unrepresentable, so the provider rejected the CBOR at offset 0 — {@code DeserialiseFailure 0
+     * "expected tag"} — before any validation ran.
+     *
+     * <p>⚑ The same incident, on a different path, is recorded as
+     * {@code LiquidateTransactionBuilder.Refusal.INSUFFICIENT_COLLATERAL} (2026-08-25). This test
+     * exists so the third occurrence is a failing build rather than a fourth outage.
+     */
+    @Test
+    void aUtxoBetweenTheFeeCeilingAndTheCollateralCeilingIsNotUsable() {
+        BigInteger feeCeiling = BigInteger.valueOf(2_549_327L);
+        BigInteger collateralCeiling = BigInteger.valueOf(3_823_991L);
+
+        // The exact shape that failed on mainnet: comfortably over the fee, short of the collateral.
+        Utxo inTheGap = ada("gap", 0, 3_000_000L);
+
+        assertEquals(1, ScheduledTransactionService.walletPool(List.of(inTheGap), feeCeiling).size(),
+                "the OLD floor accepted it — this is the bug, pinned so the difference is visible");
+        assertTrue(ScheduledTransactionService.walletPool(List.of(inTheGap), collateralCeiling).isEmpty(),
+                "the collateral ceiling must REJECT it; accepting it produces a transaction whose "
+                        + "CBOR no node can decode, which is worse than one that merely fails");
+    }
+
+    /** And a utxo that clears the collateral ceiling is usable, so the guard is not simply "refuse". */
+    @Test
+    void aUtxoAboveTheCollateralCeilingRemainsUsable() {
+        assertEquals(1, ScheduledTransactionService.walletPool(
+                List.of(ada("big", 0, 5_000_000L)), BigInteger.valueOf(3_823_991L)).size());
+    }
+
     /** An empty pool is the signal to stop the cycle, not to fall through and build with nothing. */
     @Test
     void anEmptyWalletProducesAnEmptyPoolRatherThanThrowing() {

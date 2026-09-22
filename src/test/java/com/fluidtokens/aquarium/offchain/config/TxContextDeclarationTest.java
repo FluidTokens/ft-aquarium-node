@@ -92,9 +92,16 @@ class TxContextDeclarationTest {
         // ---- collateral: nominated by us on the liquidation paths (T-050) --------------------
         d.put("withCollateralInputs", new LinkedHashMap<>(Map.of(
                 LIQ, Entry.set(), CONVERT, Entry.set(),
-                TANK, Entry.omitted("relies on cardano-client-lib's automatic collateral, which at "
-                        + "0.7.2 builds its own selection strategy invisible to withUtxoSelectionStrategy "
-                        + "and hardcodes 5 ADA. Structurally unguardable, not an oversight"))));
+                // ⛔ WAS "structurally unguardable". IT WAS NOT — it was unguarded by the wrong lever.
+                // withUtxoSelectionStrategy genuinely cannot reach cardano-client-lib's collateral
+                // selector, which is what that note recorded; withCollateralInputs can, and is the
+                // lever ReferenceScriptSafeUtxoSelection already named as "a separate fix".
+                //
+                // ⚠ Left unnominated, CCL's own selection produced a NEGATIVE collateral return on
+                // mainnet 2026-09-22 and the provider rejected the CBOR at offset 0, before any
+                // validation ran. The tank now nominates the same wallet utxo it spends, which the
+                // cycle has already proven covers maxPossibleCollateral.
+                TANK, Entry.set())));
 
         // ---- evaluation ----------------------------------------------------------------------
         d.put("withTxEvaluator", new LinkedHashMap<>(Map.of(
