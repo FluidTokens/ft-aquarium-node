@@ -168,6 +168,18 @@ class UnprocessableTankBlacklistTest {
 
         assertTrue(source.contains("unprocessableScheduledTransactions.add("),
                 "a failing tank must be recorded, or the same bad datum is rebuilt every cycle");
+
+        // ⛔ A UTXO WHOSE DATUM CANNOT BE READ MUST BE BLACKLISTED TOO, and for weeks it was not.
+        //
+        // The decode failure was caught, logged, and the utxo dropped from the stream — so it was
+        // re-read and re-logged every cycle, forever, with the whole AddressUtxoEntity dumped into
+        // the line. 35 of those at once, once a minute. A UTxO is immutable: one carrying no inline
+        // datum will never carry one, which makes it exactly as permanent as a malformed credential.
+        int decodeSite = source.indexOf("could not deserialise");
+        int decodeSiteNew = source.indexOf("it carries no inline datum at all");
+        assertTrue(decodeSite < 0 && decodeSiteNew > 0,
+                "the datum-decode failure path must blacklist and say why in one line, not log the "
+                        + "entire entity and drop the utxo back into next cycle's work");
         assertTrue(source.contains("filterUnprocessableScheduledTransactions("),
                 "and the record must be consulted, or recording it achieves nothing");
 

@@ -960,6 +960,20 @@ public class ScheduledTransactionService {
      * transform a AddressUtxoEntity into an "optional" DatumTankUtxo stream.
      * @return an utxo object and the Tank Datum if it can be deserialized, otherwise an empty stream.
      */
+    /**
+     * ⛔ <b>A UTXO WHOSE DATUM WE CANNOT READ IS BLACKLISTED, because it will never become
+     * readable.</b>
+     *
+     * <p>A UTxO is immutable. One carrying no inline datum, or bytes that are not a
+     * {@code DatumTank}, is in that state permanently — so re-decoding it every cycle can only
+     * produce the same failure forever. Measured on mainnet 2026-09-22: <b>35</b> such UTxOs sit at
+     * the tank credential, and each was re-read and re-logged once a minute, indefinitely.
+     *
+     * <p>⚠ <b>And the old log line dumped the entire {@code AddressUtxoEntity}</b> — every field,
+     * including the full address, both credentials, the amount list and a row of nulls. Thirty-five
+     * of those per cycle is not a diagnostic, it is a wall. One line, naming the utxo and the
+     * reason, is what an operator can act on.
+     */
     private Function<AddressUtxoEntity, Stream<DatumTankUtxo>> getAddressUtxoEntityStreamFunction() {
         return addressUtxoEntity -> {
             try {
@@ -967,7 +981,15 @@ public class ScheduledTransactionService {
                 var tankDatum = datumConverter.deserialize(inlineDatum);
                 return Stream.of(new DatumTankUtxo(tankDatum, toUtxo(addressUtxoEntity)));
             } catch (Exception e) {
-                log.warn("could not deserialise datum for: {}", addressUtxoEntity);
+                unprocessableScheduledTransactions.add(TransactionInput.builder()
+                        .transactionId(addressUtxoEntity.getTxHash())
+                        .index(addressUtxoEntity.getOutputIndex())
+                        .build());
+                log.warn("Could not process Tank utxo {}:{} — {} Blacklisted until restart.",
+                        addressUtxoEntity.getTxHash(), addressUtxoEntity.getOutputIndex(),
+                        addressUtxoEntity.getInlineDatum() == null
+                                ? "it carries no inline datum at all, so it is not a tank."
+                                : "its inline datum is not a readable DatumTank.");
                 return Stream.empty();
             }
         };
