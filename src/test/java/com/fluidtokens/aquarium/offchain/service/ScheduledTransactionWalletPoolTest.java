@@ -1,9 +1,12 @@
 package com.fluidtokens.aquarium.offchain.service;
 
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.HashSet;
 import java.util.List;
@@ -123,40 +126,85 @@ class ScheduledTransactionWalletPoolTest {
     }
 
     /**
-     * ⛔ <b>THE CEILING MUST BE THE COLLATERAL ONE, NOT THE FEE ONE — and the gap between them is a
-     * transaction no node can parse.</b>
+     * ⛔ <b>THREE CANDIDATE CEILINGS, AND ONLY THE THIRD IS SAFE.</b>
      *
-     * <p>Measured on mainnet 2026-09-22: the pool asked for {@code maxPossibleFee} (2,549,327) while
-     * the ledger demands collateral of fee x collateral_percent (~3,823,991). Every wallet utxo in
-     * that 1.27 ada window passed the filter, was nominated as input AND collateral, and
-     * cardano-client-lib emitted a NEGATIVE collateral return. A negative {@code MaryValue} is
-     * unrepresentable, so the provider rejected the CBOR at offset 0 — {@code DeserialiseFailure 0
-     * "expected tag"} — before any validation ran.
+     * <pre>
+     *   maxPossibleFee           2,549,327   what PR #22 shipped     -- UNDECODABLE
+     *   maxPossibleCollateral    3,823,991   the first attempted fix -- STILL UNDECODABLE
+     *   CCL's DEFAULT_COLLATERAL 5,000,000   what the library asks   -- correct
+     * </pre>
      *
-     * <p>⚑ The same incident, on a different path, is recorded as
-     * {@code LiquidateTransactionBuilder.Refusal.INSUFFICIENT_COLLATERAL} (2026-08-25). This test
-     * exists so the third occurrence is a failing build rather than a fourth outage.
+     * <p>Mainnet figures, 2026-09-22. The ledger wants collateral of fee x {@code collateral_percent}
+     * (~3.82 ada), so the middle row looks like the answer and is what a careful reading of the
+     * ledger rules produces. It is wrong, because <b>cardano-client-lib never consults the ledger</b>:
+     * {@code QuickTxBuilder:65} hardcodes {@code Amount.ada(5.0)}. Any utxo under that makes CCL emit
+     * a negative collateral return; a negative {@code MaryValue} is unrepresentable, so the provider
+     * rejects the CBOR at offset 0 — {@code DeserialiseFailure 0 "expected tag"} — before any
+     * validation runs.
+     *
+     * <p>⚠ <b>The middle row is why this test exists in this shape.</b> A two-band test would have
+     * gone green on the fix that did not work: 3,823,991 rejects the 3 ada utxo that 2,549,327
+     * accepted, so the bug looks fixed while the symptom is unchanged in production. <b>The band that
+     * catches it is the one between the two ceilings that are both too low</b> — a 4 ada utxo, which
+     * satisfies the ledger and not the library.
+     *
+     * <p>⚑ The same incident on a different path is
+     * {@code LiquidateTransactionBuilder.Refusal.INSUFFICIENT_COLLATERAL} (2026-08-25).
      */
     @Test
-    void aUtxoBetweenTheFeeCeilingAndTheCollateralCeilingIsNotUsable() {
+    void aUtxoBelowCardanoClientLibsOwnCollateralFigureIsNotUsable() {
         BigInteger feeCeiling = BigInteger.valueOf(2_549_327L);
-        BigInteger collateralCeiling = BigInteger.valueOf(3_823_991L);
+        BigInteger ledgerCollateralCeiling = BigInteger.valueOf(3_823_991L);
+        BigInteger cclCeiling = BigInteger.valueOf(5_000_000L);
 
-        // The exact shape that failed on mainnet: comfortably over the fee, short of the collateral.
-        Utxo inTheGap = ada("gap", 0, 3_000_000L);
+        // 4 ada: over the LEDGER's collateral requirement, under the LIBRARY's. The band that the
+        // first fix left open, and the reason the symptom did not move when the floor was raised.
+        Utxo satisfiesLedgerNotLibrary = ada("gap", 0, 4_000_000L);
 
-        assertEquals(1, ScheduledTransactionService.walletPool(List.of(inTheGap), feeCeiling).size(),
-                "the OLD floor accepted it — this is the bug, pinned so the difference is visible");
-        assertTrue(ScheduledTransactionService.walletPool(List.of(inTheGap), collateralCeiling).isEmpty(),
-                "the collateral ceiling must REJECT it; accepting it produces a transaction whose "
+        assertEquals(1, ScheduledTransactionService.walletPool(
+                        List.of(satisfiesLedgerNotLibrary), feeCeiling).size(),
+                "PR #22's floor accepted it");
+        assertEquals(1, ScheduledTransactionService.walletPool(
+                        List.of(satisfiesLedgerNotLibrary), ledgerCollateralCeiling).size(),
+                "and so did the first attempted fix -- which is why the bug survived it");
+        assertTrue(ScheduledTransactionService.walletPool(
+                        List.of(satisfiesLedgerNotLibrary), cclCeiling).isEmpty(),
+                "only the library's own figure rejects it; accepting it produces a transaction whose "
                         + "CBOR no node can decode, which is worse than one that merely fails");
     }
 
-    /** And a utxo that clears the collateral ceiling is usable, so the guard is not simply "refuse". */
+    /**
+     * ⛔ <b>AND THE CEILING THE PROCESSOR ACTUALLY ASKS FOR IS THE THING UNDER TEST.</b>
+     *
+     * <p>⚠ The test above exercises {@code walletPool}, which takes the ceiling as a <b>parameter</b>
+     * — so it can pin every band and still say nothing about which one production passes. That is
+     * exactly the gap the first fix fell through: the filter was correct at every value it was
+     * handed, and the caller handed it the wrong one. <b>A test that cannot fail when the caller
+     * chooses wrongly is not a regression test for this bug.</b>
+     */
     @Test
-    void aUtxoAboveTheCollateralCeilingRemainsUsable() {
-        assertEquals(1, ScheduledTransactionService.walletPool(
-                List.of(ada("big", 0, 5_000_000L)), BigInteger.valueOf(3_823_991L)).size());
+    void theProcessorAsksForAtLeastWhatCardanoClientLibWillDemand() {
+        ProtocolParams params = new ProtocolParams();
+        params.setMinFeeA(44);
+        params.setMinFeeB(155381);
+        params.setMaxTxSize(16384);
+        params.setCollateralPercent(BigDecimal.valueOf(150));
+        params.setPriceMem(BigDecimal.valueOf(0.0577));
+        params.setPriceStep(BigDecimal.valueOf(0.0000721));
+        params.setMaxTxExMem("14000000");
+        params.setMaxTxExSteps("10000000000");
+        params.setMinFeeRefScriptCostPerByte(BigDecimal.valueOf(15));
+
+        BigInteger required = ScheduledTransactionService.requiredWalletLovelace(params);
+
+        assertTrue(required.compareTo(BigInteger.valueOf(5_000_000L)) >= 0,
+                "cardano-client-lib hardcodes DEFAULT_COLLATERAL_AMT = Amount.ada(5.0) at "
+                        + "QuickTxBuilder:65 and builds its own selector to find it -- asking for "
+                        + "less means a negative collateral return and undecodable CBOR. Got "
+                        + required);
+        assertTrue(required.compareTo(LedgerCeilings.maxPossibleCollateral(params)) >= 0,
+                "and it must still satisfy the LEDGER's figure, so this stays correct if "
+                        + "collateral_percent ever rises past the library's constant");
     }
 
     /** An empty pool is the signal to stop the cycle, not to fall through and build with nothing. */

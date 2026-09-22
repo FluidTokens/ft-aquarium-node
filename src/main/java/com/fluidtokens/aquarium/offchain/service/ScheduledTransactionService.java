@@ -83,6 +83,16 @@ public class ScheduledTransactionService {
 
     private final Account account;
 
+    /**
+     * cardano-client-lib 0.7.2's own collateral figure: {@code DEFAULT_COLLATERAL_AMT =
+     * Amount.ada(5.0)}, hardcoded at {@code QuickTxBuilder:65}. It does not consult protocol
+     * parameters, and {@code buildCollateralOutput} constructs its own selection strategy rather
+     * than reading the one on the builder context — so this number, not the ledger's, is what a
+     * wallet utxo must actually clear.
+     */
+    private static final java.math.BigInteger CCL_DEFAULT_COLLATERAL_LOVELACE =
+            java.math.BigInteger.valueOf(5_000_000L);
+
     private final QuickTxBuilder quickTxBuilder;
 
     /**
@@ -271,7 +281,7 @@ public class ScheduledTransactionService {
         // same. This service shares their wallet, their library and their failure mode, and had
         // neither -- the "every guarantee lives on the preview paths, this one had none" shape, twice
         // noted in this file and now the cause of a third outage.
-        var required = LedgerCeilings.maxPossibleCollateral(protocolParams);
+        var required = requiredWalletLovelace(protocolParams);
 
         // ⚠ SMALLEST-FIRST, still: largest-first would spend the biggest utxo to pay a fee and
         // fragment the wallet against the case where a large one is genuinely needed. Ordering the
@@ -390,23 +400,18 @@ public class ScheduledTransactionService {
                         .validFrom(slot - 30)
                         .validTo(slot + 180)
                         .feePayer(account.baseAddress())
-                        // ⛔ COLLATERAL PINNED TO THIS TANK'S OWN WALLET UTXO, which the pool above
-                        // has already proven covers maxPossibleCollateral.
+                        // ⛔ COLLATERAL IS **NOT** PINNED HERE, AND THAT IS DELIBERATE.
                         //
-                        // collateralPayer alone lets cardano-client-lib choose ANY utxo at the
-                        // address -- including dust, and including a utxo ANOTHER tank in this same
-                        // cycle is about to spend as its input. The fan-out makes that second hazard
-                        // real: unpinned collateral could name an input that no longer exists by the
-                        // time this transaction lands.
+                        // A previous attempt at this bug nominated withCollateralInputs(walletUtxo)
+                        // -- the same utxo this transaction spends. ReferenceScriptSafeUtxoSelection's
+                        // javadoc already warned why that cannot work: "the pinned collateral input
+                        // is then excluded from ordinary coin selection, so it cannot also be the
+                        // UTxO fronting the principal". Pinning the input to itself starves balancing.
                         //
-                        // ⚠ Input and collateral being the SAME utxo is deliberate and is what the
-                        // liquidation path already falls back to ("the nominated wallet utxo"). It
-                        // keeps each tank self-contained, which is the property the fan-out needs.
+                        // ⇒ The requirement is met by SIZE instead: the pool above admits no utxo
+                        // below CCL's own collateral figure, so whatever its selector picks is large
+                        // enough. See `required`.
                         .collateralPayer(account.baseAddress())
-                        .withCollateralInputs(TransactionInput.builder()
-                                .transactionId(walletUtxo.getTxHash())
-                                .index(walletUtxo.getOutputIndex())
-                                .build())
                         .mergeOutputs(false)
                         .ignoreScriptCostEvaluationError(dumpCbor)
                         // T-059 — THE ONLY MAINNET PATH NOW ASSERTS ITS OWN STRUCTURE.
@@ -485,6 +490,41 @@ public class ScheduledTransactionService {
      * distinctness can be tested without a Spring context, a provider or a signer — the whole reason
      * the previous coupling went unnoticed is that nothing could exercise it.
      */
+    /**
+     * ⛔ <b>HOW BIG A WALLET UTXO HAS TO BE — TWO CEILINGS, AND THE BINDING ONE IS THE LIBRARY'S.</b>
+     *
+     * <p>The ledger's requirement is {@link LedgerCeilings#maxPossibleCollateral} — fee ×
+     * {@code collateral_percent}, ~3.82 ada on mainnet today. But cardano-client-lib does not ask
+     * the ledger: {@code QuickTxBuilder:65} hardcodes {@code DEFAULT_COLLATERAL_AMT = Amount.ada(5.0)},
+     * and {@code buildCollateralOutput} constructs its <b>own</b> selection strategy to go and find
+     * that much — a strategy {@code withUtxoSelectionStrategy} cannot reach. So a utxo that satisfies
+     * the ledger and not the library still yields a <b>negative collateral return</b>, and a negative
+     * {@code MaryValue} is unrepresentable: the provider rejects the CBOR <i>before any validation
+     * runs</i>, as {@code DeserialiseFailure 0 "expected tag"}.
+     *
+     * <p>⚑ <b>This is the regression PR #22 introduced, and the archaeology is exact.</b> Before it,
+     * selection was {@code .findFirst()} over ada-only utxos — in practice a large one, which cleared
+     * the 5 ada by luck rather than by rule. #22 changed it to the <b>smallest</b> utxo covering
+     * {@code maxPossibleFee} (2.55 ada), deliberately choosing small, and every tank transaction has
+     * been undecodable since. The bot's last successful tank spend is block 13774170 (~2026-08-07);
+     * #22 merged 2026-09-09; {@code git log --follow} shows no other change to this file between
+     * 2025-08-29 and that merge.
+     *
+     * <p>⚠ <b>A first attempt at this fix raised the floor to {@code maxPossibleCollateral} and
+     * stopped.</b> 3.82 &lt; 5.00, so the symptom did not move. <b>Taking the max of the two is the
+     * whole point</b> — and taking the max, rather than hardcoding 5 ada, is what keeps this correct
+     * if the ledger's figure ever rises above the library's.
+     *
+     * <p>⚠ Deliberately <b>not</b> fixed by {@code withCollateralInputs}: as
+     * {@code ReferenceScriptSafeUtxoSelection} records, a pinned collateral input is excluded from
+     * ordinary coin selection, so it cannot also be the utxo fronting the principal. Size is the
+     * only lever that works here.
+     */
+    static java.math.BigInteger requiredWalletLovelace(
+            com.bloxbean.cardano.client.api.model.ProtocolParams protocolParams) {
+        return LedgerCeilings.maxPossibleCollateral(protocolParams).max(CCL_DEFAULT_COLLATERAL_LOVELACE);
+    }
+
     static java.util.Deque<Utxo> walletPool(List<Utxo> walletUtxos, java.math.BigInteger required) {
         return new java.util.ArrayDeque<>(walletUtxos.stream()
                 .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
