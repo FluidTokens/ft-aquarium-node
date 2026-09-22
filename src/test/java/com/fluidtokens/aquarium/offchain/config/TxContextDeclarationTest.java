@@ -92,26 +92,29 @@ class TxContextDeclarationTest {
         // ---- collateral: nominated by us on the liquidation paths (T-050) --------------------
         d.put("withCollateralInputs", new LinkedHashMap<>(Map.of(
                 LIQ, Entry.set(), CONVERT, Entry.set(),
-                // ⛔ THIS ENTRY HAS NOW BEEN WRONG IN BOTH DIRECTIONS, and both wrong versions are
-                // kept because the pair is the lesson.
+                // ⛔ THIS ENTRY HAS BEEN WRONG IN BOTH DIRECTIONS, and both wrong versions are
+                // recorded because the pair is the lesson.
                 //
-                // (1) "structurally unguardable" -- false. withUtxoSelectionStrategy genuinely cannot
-                //     reach cardano-client-lib's collateral selector, which is what that note
-                //     observed; it concluded no lever existed, when withCollateralInputs is one.
-                // (2) "the tank nominates the same wallet utxo it spends" -- ALSO false, and worse,
-                //     because it acted on (1)'s correction without reading the rest of the sentence
-                //     that offered it. ReferenceScriptSafeUtxoSelection says a pinned collateral
-                //     input is EXCLUDED from ordinary coin selection -- so it cannot also be the
-                //     utxo fronting the principal. Pinning the input to itself starves balancing.
+                // (1) "structurally unguardable" -- false. withUtxoSelectionStrategy genuinely
+                //     cannot reach CCL's collateral selector, which is what that note observed; it
+                //     concluded no lever existed, when withCollateralInputs is one.
+                // (2) "the tank nominates the same wallet utxo it spends" -- false, and worse,
+                //     because it acted on (1)'s correction without reading the rest of the sentence:
+                //     ReferenceScriptSafeUtxoSelection says a pinned collateral input is EXCLUDED
+                //     from ordinary coin selection, so it cannot also front the principal.
                 //
-                // ⚠ The real cause was never the lever: it was SIZE. CCL hardcodes 5 ada of
-                // collateral (QuickTxBuilder:65) and PR #22 had narrowed wallet selection to the
-                // smallest utxo covering the FEE (2.55 ada). The tank omits this knob and meets the
-                // requirement through requiredWalletLovelace() instead.
-                TANK, Entry.omitted("size, not nomination: requiredWalletLovelace() admits no utxo "
-                        + "below CCL's hardcoded 5 ada, so its own selector always finds enough. "
-                        + "Pinning here would EXCLUDE that utxo from coin selection -- see "
-                        + "ReferenceScriptSafeUtxoSelection"))));
+                // ⚑ Both objections dissolved once the tank stopped taking a wallet input at all.
+                // It now spends ONLY ITS OWN TANK, so the collateral utxo is not wanted as an input
+                // and being excluded from selection is exactly the behaviour required. Pinning is
+                // also necessary rather than optional: buildCollateralOutput (QuickTxBuilder:499)
+                // calls select(payingAddress, DEFAULT_COLLATERAL_AMT, null) -- that third argument
+                // is utxosToExclude, it is null, and an unpinned CCL is therefore free to nominate a
+                // utxo the transaction already spends.
+                //
+                // ⚠ One utxo backs EVERY tank in the cycle, because collateral is consumed only on
+                // a phase-2 failure. That is what uncapped the processor: the number of tanks per
+                // cycle no longer depends on the wallet's utxo count.
+                TANK, Entry.set())));
 
         // ---- evaluation ----------------------------------------------------------------------
         d.put("withTxEvaluator", new LinkedHashMap<>(Map.of(

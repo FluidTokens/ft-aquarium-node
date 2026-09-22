@@ -4,6 +4,7 @@ import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.blueprint.cardano.address.model.impl.AddressData;
 import com.fluidtokens.aquarium.offchain.blueprint.model.impl.InlineData;
+import com.fluidtokens.aquarium.offchain.util.UnusableTankDatumException;
 import org.junit.jupiter.api.Test;
 
 import java.util.Optional;
@@ -93,7 +94,7 @@ class AddressUtilCredentialTest {
     void anEmptyPaymentCredentialIsRefusedRatherThanTurnedIntoATwentyNineByteAddress() {
         var broken = address(paymentKey(new byte[0]), stakeKey(REAL_HASH));
 
-        var thrown = assertThrows(IllegalArgumentException.class,
+        var thrown = assertThrows(UnusableTankDatumException.class,
                 () -> AddressUtil.toAddress(broken, Networks.mainnet()),
                 "an empty payment credential must be refused here -- unchecked it produces "
                         + "01dea1c9..., a 29-byte address with a 57-byte header, and a transaction "
@@ -112,7 +113,7 @@ class AddressUtilCredentialTest {
     void anEmptyStakeCredentialIsRefusedToo() {
         var broken = address(paymentKey(REAL_HASH), stakeKey(new byte[0]));
 
-        var thrown = assertThrows(IllegalArgumentException.class,
+        var thrown = assertThrows(UnusableTankDatumException.class,
                 () -> AddressUtil.toAddress(broken, Networks.mainnet()));
         assertTrue(thrown.getMessage().contains("stake"), thrown.getMessage());
     }

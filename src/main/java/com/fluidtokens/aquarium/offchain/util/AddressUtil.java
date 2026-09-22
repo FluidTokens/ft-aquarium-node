@@ -94,9 +94,9 @@ public class AddressUtil {
             // it pays an address nobody can spend from. Length validation cannot catch that one.
             case Script script ->
                     Credential.fromScript(checkedHash(script.getScriptHash(), role, "script"));
-            case null -> throw new IllegalArgumentException(
+            case null -> throw new UnusableTankDatumException(
                     "datum carries no " + role + " credential at all");
-            default -> throw new IllegalArgumentException(
+            default -> throw new UnusableTankDatumException(
                     "Unexpected " + role + " credential type: " + credential);
         };
     }
@@ -104,7 +104,7 @@ public class AddressUtil {
     /** ⚠ Length is the whole check: 28 bytes or the address is not an address. */
     private static byte[] checkedHash(byte[] hash, String role, String kind) {
         if (hash == null || hash.length != CREDENTIAL_HASH_BYTES) {
-            throw new IllegalArgumentException(
+            throw new UnusableTankDatumException(
                     "datum carries an unusable " + role + " " + kind + " credential: expected a "
                             + CREDENTIAL_HASH_BYTES + "-byte blake2b-224 hash but got "
                             + (hash == null ? "null" : hash.length + " bytes")

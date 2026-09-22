@@ -2,6 +2,7 @@ package com.fluidtokens.aquarium.offchain.service;
 
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.common.model.Network;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
@@ -177,6 +178,19 @@ public class ScheduledTransactionService {
 
     private final Vector<TransactionInput> unprocessableScheduledTransactions = new Vector<>();
 
+    /**
+     * ⚠ How many consecutive non-tank-specific failures before the cycle is abandoned as systemic.
+     * Small on purpose: tanks are independent, so three in a row is already strong evidence that the
+     * fault is shared, and the cost of being wrong is one delay period rather than the backlog.
+     */
+    private static final int SYSTEMIC_FAILURE_LIMIT = 3;
+
+    private static final String LOVELACE = "lovelace";
+
+    /** @see #processPayments() — held for the duration of a cycle so ticks cannot overlap. */
+    private final java.util.concurrent.atomic.AtomicBoolean cycleInProgress =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private final DatumTankConverter datumConverter = new DatumTankConverter();
 
     private RefInputIndexes resolveRefIndexes(TransactionInput parametersRefInput, TransactionInput stakingRefInput) {
@@ -194,8 +208,40 @@ public class ScheduledTransactionService {
         return new DefaultUtxoSupplier(bfBackendService.getUtxoService());
     }
 
+    /**
+     * ⛔ <b>ONE CYCLE AT A TIME. A tick that arrives while the previous one is still working is
+     * SKIPPED, not queued and not run alongside.</b>
+     *
+     * <p>A cycle now processes <b>every</b> eligible tank rather than a fixed few, so its duration is
+     * set by the size of the backlog and can easily exceed the tick interval. Two cycles running
+     * together would read the same tank set and build two transactions spending the same tank — one
+     * wins, the other is rejected for an input that no longer exists, and the loser's tank gets
+     * counted as a failure it never had.
+     *
+     * <p>⚠ Spring's {@code fixedDelay} already serialises this method today, so on paper the guard is
+     * redundant. It is here because that property is <b>invisible at the call site and easy to lose</b>:
+     * switching to {@code fixedRate}, adding an admin endpoint that triggers a run, or a second
+     * scheduler bean all break the assumption silently, and the symptom would be sporadic phantom
+     * failures rather than anything pointing back at concurrency. <b>An invariant worth relying on is
+     * worth stating in the code that relies on it.</b>
+     */
     @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelayString = "${scheduling.transaction-processor.delay-minutes}")
     public void processPayments() {
+        if (!cycleInProgress.compareAndSet(false, true)) {
+            log.info("previous Process Payments run is still going — SKIPPING this tick rather than "
+                    + "running two cycles over the same tanks");
+            return;
+        }
+        try {
+            runPaymentCycle();
+        } finally {
+            // ⚠ finally, not at the end of the happy path: a cycle that throws must still release
+            // the guard, or the processor is dead until restart and says nothing about why.
+            cycleInProgress.set(false);
+        }
+    }
+
+    private void runPaymentCycle() {
 
         log.info("Starting Process Payments RUN");
 
@@ -233,14 +279,47 @@ public class ScheduledTransactionService {
                 .filter(isScheduledTankTransaction())
                 .toList();
 
-        var processableScheduledTransactions = scheduledTank.stream()
+        var dueScheduledTransactions = scheduledTank.stream()
                 .filter(isScheduledTxTimeValid())
                 .toList();
 
-        log.info("Found {} Tank Utxos of which {} Scheduled Transactions and {} Processable Scheduled Transactions",
-                tankUtxos.size(),
-                scheduledTank.size(),
-                processableScheduledTransactions.size());
+        // ⛔ DECIDE WHAT IS HOPELESS BEFORE THE LOOP, NOT INSIDE IT.
+        //
+        // Everything needed to know a tank can never work is in its datum, which is already in hand:
+        // an address that cannot be built, or payouts larger than the tank holds. Both are fixed
+        // properties of bytes written on chain.
+        //
+        // ⚑ Discovering them INSIDE the loop is what throttled the bot to 1-2 tanks a minute. Each
+        // one consumed a wallet utxo from the cycle's pool -- for an exception thrown while building
+        // an address, before any transaction existed and with nothing spent -- so a cluster of broken
+        // tanks could exhaust the cycle's whole budget at full speed and the bot looked stopped.
+        // Measured on mainnet 2026-09-22: 21 tanks with an unbuildable address (14 with an empty
+        // payment credential, 9 with an empty stake credential) and 42 that cannot cover their own
+        // payouts, against 551 sound ones.
+        var processableScheduledTransactions = new java.util.ArrayList<DatumTankUtxo>();
+        int refusedBeforeStarting = 0;
+        for (var candidate : dueScheduledTransactions) {
+            var refusal = permanentRefusal(candidate, network.getCardanoNetwork());
+            if (refusal == null) {
+                processableScheduledTransactions.add(candidate);
+                continue;
+            }
+            refusedBeforeStarting++;
+            unprocessableScheduledTransactions.add(TransactionInput.builder()
+                    .transactionId(candidate.utxo().getTxHash())
+                    .index(candidate.utxo().getOutputIndex())
+                    .build());
+            // ⚠ ONE LINE, NO STACK TRACE. The reason is known, complete and permanent; a 20-frame
+            // trace through Optional.map adds nothing actionable and, at this volume, buries the
+            // failures that DO need reading.
+            log.warn("Could not process Tank utxo {}:{} — {} Blacklisted until restart.",
+                    candidate.utxo().getTxHash(), candidate.utxo().getOutputIndex(), refusal);
+        }
+
+        log.info("Found {} Tank Utxos of which {} Scheduled Transactions, {} due, {} refused up "
+                        + "front as permanently unprocessable, {} to process this cycle",
+                tankUtxos.size(), scheduledTank.size(), dueScheduledTransactions.size(),
+                refusedBeforeStarting, processableScheduledTransactions.size());
 
         // ⛔ ONE WALLET READ AND ONE PROTOCOL-PARAMS READ PER CYCLE, NOT PER TANK.
         //
@@ -248,16 +327,8 @@ public class ScheduledTransactionService {
         // tanks that is 1,070 Blockfrost calls per cycle, every five minutes — and AppUtxoService's
         // own javadoc promises "one provider call per cycle", which had quietly stopped being true.
         //
-        // ⚠ AND THE PER-TANK READ WAS LOAD-BEARING BEFORE THIS CHANGE, which is why hoisting it
-        // alone would have BROKEN the bot rather than sped it up. Selection took the SMALLEST
-        // qualifying utxo, so every tank in a cycle chose the SAME one; the loop only worked because
-        // completeAndWait() waited for confirmation and the next iteration re-read a wallet that now
-        // held the change. The read WAS the chaining.
-        //
-        // ⇒ So the read is hoisted AND the coupling is removed together: each tank is assigned its
-        // OWN wallet utxo from a pool built once. The transactions then share no input and cannot
-        // conflict, which is why no chaining is needed — not because the waiting was unnecessary,
-        // but because the dependency it existed to satisfy is gone.
+        // ⇒ And the read is hoisted because the dependency it served is gone: a tank transaction
+        // now spends ONLY ITS OWN TANK, so two of them share no input and cannot conflict.
         List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
         if (walletUtxos.isEmpty()) {
             log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
@@ -267,72 +338,53 @@ public class ScheduledTransactionService {
         var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
                 .getProtocolParams();
 
-        // ⛔ THE COLLATERAL CEILING, NOT THE FEE CEILING — and the difference is a transaction NO NODE
-        // CAN PARSE, not a transaction that fails.
-        //
-        // This asked for maxPossibleFee. The ledger requires collateral of fee × collateral_percent
-        // (150%), so a utxo between the two passed this filter, was nominated as both the input and
-        // the collateral, and cardano-client-lib emitted a NEGATIVE collateral return. A negative
-        // MaryValue is unrepresentable, so the provider rejects the CBOR at offset 0 before any
-        // validation runs — "DeserialiseFailure ... expected tag" — and nothing reaches the chain.
-        //
-        // ⚠ MEASURED ON MAINNET 2026-09-22: floor 2,549,327 against a collateral requirement of
-        // ~3,823,991. Every wallet utxo in that 1.27 ada window failed, every cycle.
-        //
-        // ⚑ THIS IS THE 2026-08-25 INCIDENT ON A SECOND PATH. LiquidateTransactionBuilder carries
-        // INSUFFICIENT_COLLATERAL and sizes from maxPossibleCollateral; LiquidationExecutor does the
-        // same. This service shares their wallet, their library and their failure mode, and had
-        // neither -- the "every guarantee lives on the preview paths, this one had none" shape, twice
-        // noted in this file and now the cause of a third outage.
         var required = requiredWalletLovelace(protocolParams);
 
-        // ⚠ SMALLEST-FIRST, still: largest-first would spend the biggest utxo to pay a fee and
-        // fragment the wallet against the case where a large one is genuinely needed. Ordering the
-        // POOL this way means the cheapest suitable utxos are consumed first, tank by tank.
-        var walletPool = walletPool(walletUtxos, required);
+        // ⛔ ONE COLLATERAL UTXO FOR THE WHOLE CYCLE, AND IT IS NEVER SPENT.
+        //
+        // Collateral is forfeited only on a PHASE-2 failure. On every successful transaction it is
+        // named and left alone — so one utxo can back every transaction in the cycle, and the
+        // cycle's size stops depending on the shape of the wallet.
+        //
+        // ⚑ THIS IS WHAT UNCAPPED THE BOT. Previously each tank was assigned its own wallet utxo
+        // from a pool, so the wallet's utxo COUNT was the number of tanks per cycle: a wallet of two
+        // qualifying utxos processed two tanks a minute against a backlog of 551, and a fragmented
+        // wallet (16 utxos of ~1 ada, all unusable) could not be fixed by adding ada.
+        //
+        // ⚠ The shared-fate this creates is real and worth knowing: if one transaction DOES fail
+        // phase 2, this utxo is consumed and every other transaction naming it becomes invalid.
+        // That is an argument for the evaluator being wired correctly (CCL trap 8), not against
+        // sharing -- a phase-2 failure is already a bug, and one that costs a cycle rather than one
+        // transaction is still the same bug.
+        var collateralUtxoOpt = walletUtxos.stream()
+                .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
+                .filter(utxo -> LedgerCeilings.lovelaceOf(utxo).compareTo(required) >= 0)
+                .min(Comparator.comparing(LedgerCeilings::lovelaceOf));
 
-        if (walletPool.isEmpty()) {
+        if (collateralUtxoOpt.isEmpty()) {
             var largest = walletUtxos.stream()
                     .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
                     .map(LedgerCeilings::lovelaceOf)
                     .max(java.math.BigInteger::compareTo);
-            log.warn("no ada-only wallet utxo covers the {} lovelace of COLLATERAL this ledger could demand; "
-                            + "largest available is {}. Fund the wallet with a single ada-only "
-                            + "utxo of at least that amount.",
+            log.warn("no ada-only wallet utxo covers the {} lovelace of collateral this ledger could "
+                            + "demand; largest available is {}. ONE such utxo is enough for the "
+                            + "whole cycle — collateral is only consumed if a script fails.",
                     required, largest.map(Object::toString).orElse("none at all"));
             return;
         }
+        final var collateralUtxo = collateralUtxoOpt.get();
 
-        // ⚠ How many tanks this cycle can do is now bounded by the wallet's SHAPE, not its balance:
-        // one ada-only utxo per tank. Said once, here, because an operator watching a backlog drain
-        // slowly needs to know the lever is "split the wallet into more utxos", not "add more ada".
-        if (walletPool.size() < processableScheduledTransactions.size()) {
-            log.info("{} processable tanks but only {} usable wallet utxos — processing {} this "
-                            + "cycle and the rest next. Each tank needs its own ada-only utxo of at "
-                            + "least {} lovelace; split the wallet to raise this ceiling.",
-                    processableScheduledTransactions.size(), walletPool.size(), walletPool.size(),
-                    required);
-        }
+        // ⚠ Counts failures that are NOT the tank's own fault, and resets on any success.
+        int consecutiveFailures = 0;
+        int submitted = 0;
 
+        // ⛔ EVERY DUE TANK, EVERY CYCLE. No pool, no budget, no break.
         for (var datumTankUtxo : processableScheduledTransactions) {
 
-            if (walletPool.isEmpty()) {
-                break;
-            }
             var tankPaymentUtxo = datumTankUtxo.utxo();
             var tankDatum = datumTankUtxo.datumTank();
 
             try {
-
-                // ⛔ ONE UTXO PER TANK, TAKEN FROM THE POOL — the reason these transactions need no
-                // chaining. Each carries a different wallet input, so none conflicts with another
-                // and none has to wait for the previous one's change to exist and be indexed.
-                //
-                // The selection RULE is unchanged and its reasoning still holds (T-053): ada-only,
-                // no reference script, and PROVABLY covering what the ledger could charge, smallest
-                // first. What changed is only that the pool is built once and drained here, instead
-                // of every tank re-reading the wallet and picking the same utxo.
-                var walletUtxo = walletPool.poll();
 
                 var batcher = AddressUtil.toOnchainAddress(account.getBaseAddress());
 
@@ -356,8 +408,17 @@ public class ScheduledTransactionService {
 
                 var rewardsAddress = AddressUtil.toAddress(parameters.getAddressRewards(), network.getCardanoNetwork());
 
+                // ⛔ THE TANK IS THE ONLY INPUT. No wallet utxo is spent.
+                //
+                // The tank funds its own payouts and its own fee, and whatever is left becomes change
+                // at the operator's address -- which is how the operator is paid. Adding a wallet
+                // input put ~15 ada in and took ~15 ada straight back out, and in exchange coupled
+                // every transaction in the cycle to the wallet's utxo count.
+                //
+                // ⚠ A tank too thin to cover payouts is refused before the loop; one too thin to
+                // cover payouts PLUS fee fails here and is retried, because separating those needs a
+                // fee estimate and an estimate would blacklist tanks that would have worked.
                 var tx = new ScriptTx()
-                        .collectFrom(walletUtxo)
                         .collectFrom(tankPaymentUtxo, redeemer)
                         .payToAddress(payeeAddress.getAddress(), ValueUtil.toAmountList(amountToSend))
                         .payToAddress(rewardsAddress.getAddress(), ValueUtil.toAmountList(reward))
@@ -427,25 +488,23 @@ public class ScheduledTransactionService {
                         .validFrom(slot - 30)
                         .validTo(slot + 180)
                         .feePayer(account.baseAddress())
-                        // ⛔ COLLATERAL IS NOT PINNED, AND THE REASON IS NARROWER THAN IT WAS.
+                        // ⛔ COLLATERAL IS PINNED, AND TO THE SAME UTXO FOR EVERY TANK THIS CYCLE.
                         //
-                        // An earlier commit pinned withCollateralInputs to the utxo this transaction
-                        // SPENDS. That is wrong for a reason ReferenceScriptSafeUtxoSelection had
-                        // already written down: a pinned collateral input is excluded from ordinary
-                        // coin selection, so it cannot also front the principal.
+                        // Left unpinned, CCL picks its own: buildCollateralOutput (QuickTxBuilder:499)
+                        // calls select(payingAddress, DEFAULT_COLLATERAL_AMT, null) -- that third
+                        // argument is utxosToExclude, and it is NULL. Nothing is excluded, so the
+                        // library is free to nominate a utxo the transaction already spends.
                         //
-                        // ⚠ But read in CCL 0.7.2's own source (QuickTxBuilder:499-514), the
-                        // unpinned path has a real defect of its own:
-                        //
-                        //     utxoSelectionStrategy.select(payingAddress, DEFAULT_COLLATERAL_AMT, null)
-                        //                                                                        ^^^^
-                        //                                                            utxosToExclude
-                        //
-                        // Nothing is excluded -- so CCL's collateral selector scans the SAME address
-                        // and may nominate as collateral a utxo the transaction is already spending
-                        // as an input. Pinning a DIFFERENT wallet utxo is the only way to stop that.
-                        // Not done here yet: it costs a second utxo per tank, and it should not be
-                        // bought on a theory before the CBOR says this is what is happening.
+                        // ⚠ An earlier commit pinned collateral to the utxo being SPENT, which
+                        // ReferenceScriptSafeUtxoSelection had already warned against: a pinned
+                        // collateral input is excluded from ordinary coin selection, so it cannot
+                        // also front the principal. That objection dissolves here -- this
+                        // transaction spends only the tank, so the collateral utxo is not wanted as
+                        // an input and being excluded from selection is exactly right.
+                        .withCollateralInputs(TransactionInput.builder()
+                                .transactionId(collateralUtxo.getTxHash())
+                                .index(collateralUtxo.getOutputIndex())
+                                .build())
                         .collateralPayer(account.baseAddress())
                         .mergeOutputs(false)
                         .ignoreScriptCostEvaluationError(dumpCbor)
@@ -485,18 +544,77 @@ public class ScheduledTransactionService {
                     continue;
                 }
 
-                context.completeAndWait();
+                // ⛔ complete(), NOT completeAndWait(). Fire and forget.
+                //
+                // Waiting for confirmation existed to serialise a chain of transactions that shared a
+                // wallet input. Nothing is shared now -- each spends only its own tank, and the
+                // collateral they have in common is not consumed on success -- so there is nothing
+                // to wait FOR, and waiting ~60s per tank is what made a 551-tank backlog take days.
+                //
+                // ⚠ The cost is that a tank submitted late in a cycle may still look unspent to the
+                // indexer when the next cycle reads. Resubmitting it is harmless: the input is gone,
+                // so the ledger rejects it at phase 1, free of charge, and it is counted transient
+                // rather than blacklisted.
+                context.complete();
+                submitted++;
+                consecutiveFailures = 0;
 
-            } catch (Exception e) {
+            } catch (com.fluidtokens.aquarium.offchain.util.UnusableTankDatumException e) {
+                // ⛔ PERMANENT, AND THE ONLY KIND THAT EARNS A BLACKLIST. The datum is written on
+                // chain and cannot change, so every future attempt fails identically.
                 unprocessableScheduledTransactions.add(TransactionInput.builder()
                         .transactionId(tankPaymentUtxo.getTxHash())
                         .index(tankPaymentUtxo.getOutputIndex())
                         .build());
-                log.warn("Could not process Tank utxo: {}:{}", tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex());
-                log.warn("Error", e);
+                // ⚠ ONE LINE, NO STACK TRACE. Expected, fully explained and permanent — the message
+                // already names the field and what was wrong with it. A 20-frame trace through
+                // Optional.map adds nothing actionable and, at this volume, buries what does.
+                //
+                // ⚠ Reaching HERE rather than being caught by permanentRefusal() above means the two
+                // disagree about what is permanent; the tank is still refused, but the up-front
+                // classifier should have seen it.
+                log.warn("Could not process Tank utxo {}:{} — {} Blacklisted until restart.",
+                        tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex(), e.getMessage());
+                consecutiveFailures = 0;
+
+            } catch (Exception e) {
+                // ⛔ TRANSIENT BY DEFAULT — AND THIS IS THE CORRECTION, NOT A REFINEMENT.
+                //
+                // Until 2026-09-22 this branch did not exist: every exception blacklisted its tank
+                // until restart. A provider 500, a 429, an evaluator outage, a node catching up —
+                // all of them permanently discarded a perfectly good scheduled payment, and the
+                // discard is invisible afterwards because a blacklist produces SILENCE, which reads
+                // exactly like an empty queue.
+                //
+                // ⚑ THAT IS WHY THE BOT WENT QUIET SO FAST. On `main` this loop is a forEach over
+                // EVERY processable tank with no bound: one systemic fault — such as the address
+                // bug that made the evaluator reject every transaction — rips through the whole
+                // backlog in a single cycle, blacklists all of it, and never tries again. 558 live
+                // tanks can be written off in minutes by one broken thing, and nothing reports it.
+                consecutiveFailures++;
+                log.warn("Could not process Tank utxo {}:{} (attempt will be REPEATED next cycle; "
+                                + "not blacklisted)",
+                        tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex(), e);
+
+                // ⚠ A RUN OF FAILURES IS EVIDENCE ABOUT THE WORLD, NOT ABOUT THE TANKS. Tanks are
+                // independent, so consecutive failures across different ones means the fault is
+                // shared — the provider, the wallet, the parameters datum. Stopping the cycle costs
+                // one delay period; continuing costs the remaining backlog, one tank at a time.
+                if (consecutiveFailures >= SYSTEMIC_FAILURE_LIMIT) {
+                    log.error("{} consecutive tank failures — treating this as a SYSTEMIC fault and "
+                                    + "abandoning the cycle rather than working through {} more "
+                                    + "tanks. Nothing has been blacklisted; the next cycle retries "
+                                    + "from the start.",
+                            consecutiveFailures, processableScheduledTransactions.size());
+                    break;
+                }
             }
 
         }
+
+        log.info("Process Payments RUN finished: {} submitted, {} refused up front, {} blacklisted "
+                        + "in total so far",
+                submitted, refusedBeforeStarting, unprocessableScheduledTransactions.size());
     }
 
     /**
@@ -560,6 +678,66 @@ public class ScheduledTransactionService {
      * ordinary coin selection, so it cannot also be the utxo fronting the principal. Size is the
      * only lever that works here.
      */
+    /**
+     * ⛔ <b>Is this tank hopeless, and why? {@code null} means "no reason found", never "fine".</b>
+     *
+     * <p>Only <b>permanent</b> conditions belong here — properties of the datum and the tank's own
+     * value, both immutable once on chain, so a refusal issued now is still correct in a week. It
+     * must not reach for the provider, the wallet, or the clock: a refusal that depends on the world
+     * would blacklist a healthy tank the moment the world twitched.
+     *
+     * <p>Two conditions qualify today:
+     * <ol>
+     *   <li><b>the destination address cannot be built</b> — a credential that is not a 28-byte
+     *       hash. Unchecked, this produced a 29-byte address under a 57-byte header and a
+     *       transaction no node could decode ({@code DeserialiseFailure 0 "expected tag"});</li>
+     *   <li><b>the tank cannot cover its own payouts</b> — scheduled amount plus operator reward
+     *       exceed what it holds, in any unit. Nothing can add value to a UTxO, so this is final.</li>
+     * </ol>
+     *
+     * <p>⚠ Deliberately <b>not</b> included: whether the tank can also cover the FEE. That needs a
+     * fee estimate, an estimate is a guess, and a guess in this function silently blacklists tanks
+     * that would have worked. Those fail once in the loop and are retried — the honest cost of not
+     * knowing.
+     */
+    private static String permanentRefusal(DatumTankUtxo candidate, Network network) {
+        try {
+            AddressUtil.toAddress(candidate.datumTank().getDestionationaaddress(), network);
+        } catch (com.fluidtokens.aquarium.offchain.util.UnusableTankDatumException e) {
+            return e.getMessage();
+        }
+
+        var owed = AssetAmountUtil.toValue(List.of(candidate.datumTank().getScheduledamount()))
+                .plus(AssetAmountUtil.toValue(List.of(candidate.datumTank().getReward())));
+
+        // ⚠ Compared unit by unit, because a tank can be rich in ada and still owe a token it does
+        // not hold — and the reverse. A single "is it big enough" number cannot express that.
+        var held = new java.util.HashMap<String, java.math.BigInteger>();
+        for (var amount : candidate.utxo().getAmount()) {
+            held.merge(amount.getUnit(), amount.getQuantity(), java.math.BigInteger::add);
+        }
+
+        var needed = new java.util.LinkedHashMap<String, java.math.BigInteger>();
+        if (owed.getCoin().signum() > 0) {
+            needed.put(LOVELACE, owed.getCoin());
+        }
+        for (var multiAsset : owed.getMultiAssets()) {
+            for (var asset : multiAsset.getAssets()) {
+                needed.merge(multiAsset.getPolicyId() + asset.getNameAsHex().replaceFirst("^0x", ""),
+                        asset.getValue(), java.math.BigInteger::add);
+            }
+        }
+
+        for (var entry : needed.entrySet()) {
+            var have = held.getOrDefault(entry.getKey(), java.math.BigInteger.ZERO);
+            if (have.compareTo(entry.getValue()) < 0) {
+                return "tank is scheduled to pay out " + entry.getValue() + " of " + entry.getKey()
+                        + " but holds only " + have + ", so the transaction can never balance.";
+            }
+        }
+        return null;
+    }
+
     static java.math.BigInteger requiredWalletLovelace(
             com.bloxbean.cardano.client.api.model.ProtocolParams protocolParams) {
         return LedgerCeilings.maxPossibleCollateral(protocolParams).max(CCL_DEFAULT_COLLATERAL_LOVELACE);
