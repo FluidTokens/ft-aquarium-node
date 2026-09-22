@@ -142,8 +142,18 @@ public class ScheduledTransactionService {
      * result carry PLACEHOLDER ex-units, and submitting one is CCL trap 8 — accepted by the mempool,
      * failed in phase 2, collateral forfeit. Hence {@code build()} and an immediate {@code continue}:
      * in this mode the code path that submits is not reachable.
+     *
+     * <p>⛔⛔ <b>THE DEFAULT IS {@code true} ON THIS BRANCH ONLY, AND IT MUST NOT REACH {@code main}.</b>
+     * Giovanni runs this on Kubernetes, where adding an environment variable means editing the Helm
+     * chart — so a flag that must be switched on to be useful would not have been switched on. His
+     * instruction was to hack it here and roll it back once the cause is found.
+     *
+     * <p>⚠ <b>While this default stands, the processor SUBMITS NOTHING.</b> That is the intended
+     * trade, not a side effect: every tank transaction is currently rejected at decode anyway, so
+     * the cost is zero and the return is the bytes. <b>Restore {@code :false} in the commit that
+     * fixes the decode failure</b> — {@code ScheduledTransactionDumpDefaultTest} fails until it is.
      */
-    @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.dump-cbor:false}")
+    @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.dump-cbor:true}")
     private boolean dumpCbor;
 
 
@@ -400,17 +410,25 @@ public class ScheduledTransactionService {
                         .validFrom(slot - 30)
                         .validTo(slot + 180)
                         .feePayer(account.baseAddress())
-                        // ⛔ COLLATERAL IS **NOT** PINNED HERE, AND THAT IS DELIBERATE.
+                        // ⛔ COLLATERAL IS NOT PINNED, AND THE REASON IS NARROWER THAN IT WAS.
                         //
-                        // A previous attempt at this bug nominated withCollateralInputs(walletUtxo)
-                        // -- the same utxo this transaction spends. ReferenceScriptSafeUtxoSelection's
-                        // javadoc already warned why that cannot work: "the pinned collateral input
-                        // is then excluded from ordinary coin selection, so it cannot also be the
-                        // UTxO fronting the principal". Pinning the input to itself starves balancing.
+                        // An earlier commit pinned withCollateralInputs to the utxo this transaction
+                        // SPENDS. That is wrong for a reason ReferenceScriptSafeUtxoSelection had
+                        // already written down: a pinned collateral input is excluded from ordinary
+                        // coin selection, so it cannot also front the principal.
                         //
-                        // ⇒ The requirement is met by SIZE instead: the pool above admits no utxo
-                        // below CCL's own collateral figure, so whatever its selector picks is large
-                        // enough. See `required`.
+                        // ⚠ But read in CCL 0.7.2's own source (QuickTxBuilder:499-514), the
+                        // unpinned path has a real defect of its own:
+                        //
+                        //     utxoSelectionStrategy.select(payingAddress, DEFAULT_COLLATERAL_AMT, null)
+                        //                                                                        ^^^^
+                        //                                                            utxosToExclude
+                        //
+                        // Nothing is excluded -- so CCL's collateral selector scans the SAME address
+                        // and may nominate as collateral a utxo the transaction is already spending
+                        // as an input. Pinning a DIFFERENT wallet utxo is the only way to stop that.
+                        // Not done here yet: it costs a second utxo per tank, and it should not be
+                        // bought on a theory before the CBOR says this is what is happening.
                         .collateralPayer(account.baseAddress())
                         .mergeOutputs(false)
                         .ignoreScriptCostEvaluationError(dumpCbor)
@@ -493,27 +511,32 @@ public class ScheduledTransactionService {
     /**
      * ⛔ <b>HOW BIG A WALLET UTXO HAS TO BE — TWO CEILINGS, AND THE BINDING ONE IS THE LIBRARY'S.</b>
      *
-     * <p>The ledger's requirement is {@link LedgerCeilings#maxPossibleCollateral} — fee ×
-     * {@code collateral_percent}, ~3.82 ada on mainnet today. But cardano-client-lib does not ask
-     * the ledger: {@code QuickTxBuilder:65} hardcodes {@code DEFAULT_COLLATERAL_AMT = Amount.ada(5.0)},
-     * and {@code buildCollateralOutput} constructs its <b>own</b> selection strategy to go and find
-     * that much — a strategy {@code withUtxoSelectionStrategy} cannot reach. So a utxo that satisfies
-     * the ledger and not the library still yields a <b>negative collateral return</b>, and a negative
-     * {@code MaryValue} is unrepresentable: the provider rejects the CBOR <i>before any validation
-     * runs</i>, as {@code DeserialiseFailure 0 "expected tag"}.
+     * <p>{@link LedgerCeilings#maxPossibleCollateral} is the <i>ledger's</i> figure — fee ×
+     * {@code collateral_percent}, ~3.82 ada on mainnet. cardano-client-lib does not use it:
+     * {@code QuickTxBuilder:65} hardcodes {@code DEFAULT_COLLATERAL_AMT = Amount.ada(5.0)} and
+     * {@code buildCollateralOutput} builds its <b>own</b> {@code DefaultUtxoSelectionStrategyImpl}
+     * to find that much — a strategy {@code withUtxoSelectionStrategy} cannot reach. Asking for the
+     * max of the two means the utxo we put in is never smaller than what the library may ask of it.
      *
-     * <p>⚑ <b>This is the regression PR #22 introduced, and the archaeology is exact.</b> Before it,
-     * selection was {@code .findFirst()} over ada-only utxos — in practice a large one, which cleared
-     * the 5 ada by luck rather than by rule. #22 changed it to the <b>smallest</b> utxo covering
-     * {@code maxPossibleFee} (2.55 ada), deliberately choosing small, and every tank transaction has
-     * been undecodable since. The bot's last successful tank spend is block 13774170 (~2026-08-07);
-     * #22 merged 2026-09-09; {@code git log --follow} shows no other change to this file between
-     * 2025-08-29 and that merge.
+     * <p>⚠ <b>THIS IS A CHEAP INVARIANT, NOT A DIAGNOSIS — and an earlier version of this javadoc
+     * claimed otherwise.</b> It asserted that a sub-5-ada utxo makes CCL emit a negative collateral
+     * return, which is what produced the undecodable mainnet CBOR. <b>Reading CCL 0.7.2's sources
+     * refutes that:</b>
+     * <ul>
+     *   <li>{@code DefaultUtxoSelectionStrategyImpl.select} <b>accumulates across several utxos</b>
+     *       to reach its target and <b>throws</b> {@code InsufficientBalanceException} if it cannot.
+     *       It never returns a short set — so it cannot under-fund the return this way. A per-utxo
+     *       floor is not what the library requires; it requires 5 ada <i>at the address</i>, and the
+     *       wallet holds ~140.</li>
+     *   <li>{@code CollateralBuilders.balanceCollateralOutputs} computes
+     *       {@code remainingCoin = coin - totalCollateral} with <b>no non-negativity check</b> — a
+     *       genuine landmine, but one the throw above keeps out of reach.</li>
+     * </ul>
      *
-     * <p>⚠ <b>A first attempt at this fix raised the floor to {@code maxPossibleCollateral} and
-     * stopped.</b> 3.82 &lt; 5.00, so the symptom did not move. <b>Taking the max of the two is the
-     * whole point</b> — and taking the max, rather than hardcoding 5 ada, is what keeps this correct
-     * if the ledger's figure ever rises above the library's.
+     * <p>⇒ So the cause of {@code DeserialiseFailure 0 "expected tag"} is <b>still open</b>, and the
+     * CBOR dump on this branch is how it gets settled. Keeping this floor is defensible on its own
+     * terms — it removes one variable for about one wallet utxo of throughput — but it must not be
+     * described as the fix until the bytes say so.
      *
      * <p>⚠ Deliberately <b>not</b> fixed by {@code withCollateralInputs}: as
      * {@code ReferenceScriptSafeUtxoSelection} records, a pinned collateral input is excluded from
