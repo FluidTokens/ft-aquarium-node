@@ -178,13 +178,6 @@ public class ScheduledTransactionService {
 
     private final Vector<TransactionInput> unprocessableScheduledTransactions = new Vector<>();
 
-    /**
-     * ⚠ How many consecutive non-tank-specific failures before the cycle is abandoned as systemic.
-     * Small on purpose: tanks are independent, so three in a row is already strong evidence that the
-     * fault is shared, and the cost of being wrong is one delay period rather than the backlog.
-     */
-    private static final int SYSTEMIC_FAILURE_LIMIT = 3;
-
     private static final String LOVELACE = "lovelace";
 
     /** @see #processPayments() — held for the duration of a cycle so ticks cannot overlap. */
@@ -296,10 +289,15 @@ public class ScheduledTransactionService {
         // Measured on mainnet 2026-09-22: 21 tanks with an unbuildable address (14 with an empty
         // payment credential, 9 with an empty stake credential) and 42 that cannot cover their own
         // payouts, against 551 sound ones.
+        // ⚠ Fetched BEFORE classification, because the min-UTxO floor is derived from
+        // coinsPerUtxoByte and must never be a hardcoded guess -- it has changed before.
+        var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
+                .getProtocolParams();
+
         var processableScheduledTransactions = new java.util.ArrayList<DatumTankUtxo>();
         int refusedBeforeStarting = 0;
         for (var candidate : dueScheduledTransactions) {
-            var refusal = permanentRefusal(candidate, network.getCardanoNetwork());
+            var refusal = permanentRefusal(candidate, network.getCardanoNetwork(), protocolParams);
             if (refusal == null) {
                 processableScheduledTransactions.add(candidate);
                 continue;
@@ -334,9 +332,6 @@ public class ScheduledTransactionService {
             log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
             return;
         }
-
-        var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
-                .getProtocolParams();
 
         var required = requiredWalletLovelace(protocolParams);
 
@@ -398,8 +393,8 @@ public class ScheduledTransactionService {
         }
 
         // ⚠ Counts failures that are NOT the tank's own fault, and resets on any success.
-        int consecutiveFailures = 0;
         int submitted = 0;
+        int failed = 0;
 
         for (var datumTankUtxo : processableScheduledTransactions) {
 
@@ -569,7 +564,6 @@ public class ScheduledTransactionService {
                 // rather than blacklisted.
                 context.complete();
                 submitted++;
-                consecutiveFailures = 0;
 
             } catch (com.fluidtokens.aquarium.offchain.util.UnusableTankDatumException e) {
                 // ⛔ PERMANENT, AND THE ONLY KIND THAT EARNS A BLACKLIST. The datum is written on
@@ -591,7 +585,6 @@ public class ScheduledTransactionService {
                 // before a transaction exists. Keeping it would let one dead tank cost a live one
                 // its turn -- which is what throttled the bot to 1-2 tanks a minute.
                 walletPool.addFirst(walletUtxo);
-                consecutiveFailures = 0;
 
             } catch (Exception e) {
                 // ⛔ TRANSIENT BY DEFAULT — AND THIS IS THE CORRECTION, NOT A REFINEMENT.
@@ -607,30 +600,30 @@ public class ScheduledTransactionService {
                 // bug that made the evaluator reject every transaction — rips through the whole
                 // backlog in a single cycle, blacklists all of it, and never tries again. 558 live
                 // tanks can be written off in minutes by one broken thing, and nothing reports it.
-                consecutiveFailures++;
+                failed++;
                 log.warn("Could not process Tank utxo {}:{} (attempt will be REPEATED next cycle; "
                                 + "not blacklisted)",
                         tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex(), e);
 
-                // ⚠ A RUN OF FAILURES IS EVIDENCE ABOUT THE WORLD, NOT ABOUT THE TANKS. Tanks are
-                // independent, so consecutive failures across different ones means the fault is
-                // shared — the provider, the wallet, the parameters datum. Stopping the cycle costs
-                // one delay period; continuing costs the remaining backlog, one tank at a time.
-                if (consecutiveFailures >= SYSTEMIC_FAILURE_LIMIT) {
-                    log.error("{} consecutive tank failures — treating this as a SYSTEMIC fault and "
-                                    + "abandoning the cycle rather than working through {} more "
-                                    + "tanks. Nothing has been blacklisted; the next cycle retries "
-                                    + "from the start.",
-                            consecutiveFailures, processableScheduledTransactions.size());
-                    break;
-                }
+                // ⛔ NEVER BREAK THE LOOP. SWALLOW, AND GO ON TO THE NEXT TANK.
+                //
+                // An earlier version abandoned the cycle after three consecutive failures, on the
+                // theory that a run of them means the fault is shared. The theory was wrong in the
+                // one case that mattered: 329 of 403 due tanks fail for a reason that is entirely
+                // their OWN (a payout below the min-UTxO floor), so three in a row proves nothing
+                // about the world and the abort simply stopped the bot from ever reaching the 74
+                // tanks that work.
+                //
+                // ⚠ Tanks are independent. A failure carries no information about the next tank, so
+                // there is nothing a bound can protect -- it can only hide the backlog behind the
+                // first few bad entries. Giovanni's rule: catch, swallow, continue, attempt them all.
             }
 
         }
 
-        log.info("Process Payments RUN finished: {} submitted, {} refused up front, {} blacklisted "
-                        + "in total so far",
-                submitted, refusedBeforeStarting, unprocessableScheduledTransactions.size());
+        log.info("Process Payments RUN finished: {} submitted, {} failed and will be retried, {} "
+                        + "refused up front, {} blacklisted in total so far",
+                submitted, failed, refusedBeforeStarting, unprocessableScheduledTransactions.size());
     }
 
     /**
@@ -716,11 +709,33 @@ public class ScheduledTransactionService {
      * that would have worked. Those fail once in the loop and are retried — the honest cost of not
      * knowing.
      */
-    private static String permanentRefusal(DatumTankUtxo candidate, Network network) {
+    private static String permanentRefusal(DatumTankUtxo candidate, Network network,
+                                          com.bloxbean.cardano.client.api.model.ProtocolParams params) {
+        String payee;
         try {
-            AddressUtil.toAddress(candidate.datumTank().getDestionationaaddress(), network);
+            payee = AddressUtil.toAddress(candidate.datumTank().getDestionationaaddress(), network)
+                    .getAddress();
         } catch (com.fluidtokens.aquarium.offchain.util.UnusableTankDatumException e) {
             return e.getMessage();
+        }
+
+        // ⛔ A PAYOUT BELOW THE MIN-UTXO FLOOR CANNOT BE PAID, BY ANYONE, EVER.
+        //
+        // Every Cardano output must hold at least (160 + its size) x coinsPerUtxoByte -- about
+        // 0.857 ada for a plain ada-only output. A tank whose scheduled amount is under that is
+        // asking for an output the ledger will not accept.
+        //
+        // ⚑ THIS IS THE BULK OF THE BACKLOG. Measured on mainnet 2026-09-22: of 403 due tanks,
+        // **329** declare a payout below the floor -- the failing example asked for 700,000 lovelace
+        // against a floor of ~857,690. Only 74 are actually payable.
+        //
+        // ⚠ And it was invisible from the error, because cardano-client-lib does not refuse it: it
+        // TOPS THE OUTPUT UP out of change (CCL trap 6), so the transaction builds, reaches the
+        // validator, and the validator rejects it for paying an amount the datum did not name. The
+        // remote evaluator then reports {"ScriptFailures":{}} -- an empty map, naming nothing.
+        var minAda = minAdaFor(payee, candidate.datumTank().getScheduledamount(), params);
+        if (minAda != null) {
+            return minAda;
         }
 
         var owed = AssetAmountUtil.toValue(List.of(candidate.datumTank().getScheduledamount()))
@@ -804,6 +819,27 @@ public class ScheduledTransactionService {
                 .readFrom(parametersRefInput)
                 .readFrom(stakerRefInput)
                 .readFrom(tankContractRefInput);
+    }
+
+    /**
+     * @return a refusal message when this payout cannot legally become an output, else {@code null}.
+     */
+    private static String minAdaFor(String address,
+                                    com.fluidtokens.aquarium.offchain.blueprint.types.general.model.CardanoToken token,
+                                    com.bloxbean.cardano.client.api.model.ProtocolParams params) {
+        var value = AssetAmountUtil.toValue(List.of(token));
+        var output = com.bloxbean.cardano.client.transaction.spec.TransactionOutput.builder()
+                .address(address)
+                .value(value)
+                .build();
+        var floor = new com.bloxbean.cardano.client.common.MinAdaCalculator(params)
+                .calculateMinAda(output);
+        if (value.getCoin().compareTo(floor) < 0) {
+            return "scheduled payout of " + value.getCoin() + " lovelace is below the min-UTxO floor "
+                    + "of " + floor + " for an output at " + address + ", so no valid transaction "
+                    + "can pay it.";
+        }
+        return null;
     }
 
     static java.math.BigInteger requiredWalletLovelace(

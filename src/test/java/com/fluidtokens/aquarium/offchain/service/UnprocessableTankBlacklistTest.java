@@ -77,6 +77,50 @@ class UnprocessableTankBlacklistTest {
     }
 
     /**
+     * ⛔ <b>A PAYOUT THE LEDGER CANNOT HOLD IS REFUSED, AND IT IS MOST OF THE BACKLOG.</b>
+     *
+     * <p>Every Cardano output must carry at least {@code (160 + size) x coinsPerUtxoByte} — about
+     * 0.857 ada for a plain ada-only output. Tank
+     * {@code a5fb7d8b69d5610785e7a452c8753280affbcb4c89334e40b384b38901595d5f#0} schedules a payout
+     * of <b>700,000 lovelace</b>, which no valid transaction can pay to anyone.
+     *
+     * <p>⚑ Measured on mainnet 2026-09-22: of <b>403</b> due tanks, <b>329</b> are in this state.
+     * Only 74 are payable at all. The backlog was never mostly healthy.
+     *
+     * <p>⚠ <b>It was invisible from the error.</b> cardano-client-lib does not refuse a short output
+     * — it tops it up out of change (CCL trap 6). So the transaction builds, reaches the validator,
+     * and is rejected for paying an amount the datum never named; the remote evaluator then reports
+     * {@code {"ScriptFailures":{}}}, an empty map naming nothing. <b>A library being helpful is why
+     * this took a day to find.</b>
+     */
+    @Test
+    void aPayoutBelowTheMinUtxoFloorIsRefusedRatherThanBuilt() {
+        var params = new com.bloxbean.cardano.client.api.model.ProtocolParams();
+        params.setCoinsPerUtxoSize("4310");
+
+        var payee = com.bloxbean.cardano.client.address.AddressProvider.getBaseAddress(
+                com.bloxbean.cardano.client.address.Credential.fromKey(HexUtil.decodeHexString(
+                        "1db7e8e3c128c1a3711c7326b232231c98441149041349ee8e0282ec")),
+                com.bloxbean.cardano.client.address.Credential.fromKey(HexUtil.decodeHexString(
+                        "e4ff47a36e9602fdee192181be146d445591a051d56b5615fe3e7d42")),
+                Networks.mainnet());
+
+        var output = com.bloxbean.cardano.client.transaction.spec.TransactionOutput.builder()
+                .address(payee.getAddress())
+                .value(com.bloxbean.cardano.client.transaction.spec.Value.builder()
+                        .coin(java.math.BigInteger.valueOf(700_000L)).build())
+                .build();
+
+        var floor = new com.bloxbean.cardano.client.common.MinAdaCalculator(params)
+                .calculateMinAda(output);
+
+        assertTrue(floor.compareTo(java.math.BigInteger.valueOf(700_000L)) > 0,
+                "the real tank's 700,000 lovelace payout must sit BELOW the floor — if this ever "
+                        + "stops being true the refusal is over-eager and 329 tanks are being "
+                        + "blacklisted for nothing. Floor was " + floor);
+    }
+
+    /**
      * ⛔ The blacklist is <b>write-only by design</b>: added to on failure, read on every cycle,
      * never emptied. Restarting the node is the deliberate way to retry.
      */
