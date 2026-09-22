@@ -27,7 +27,9 @@ RUN apt-get update && \
 # and nothing here requires escalation.
 #
 # ⚠ THIS IS A BREAKING CHANGE FOR ANY DEPLOYMENT THAT MOUNTS SECRETS AS FILES, and it broke a real
-# one on 2026-09-18. The image used to run as root, which can read anything; uid 10001 cannot read a
+# one on 2026-09-18 -- FIRST PUBLISHED IN TAG 2026.09.19, since no image was built on the 18th and
+# a date is not a tag anyone can pull. The image used to run as root, which can read anything; uid
+# 10001 cannot read a
 # root-owned 0400 mount, and Spring's config-tree support fails with
 #   java.nio.file.AccessDeniedException: /etc/aquarium-secrets/spring.flyway.password
 # -- the file EXISTS, the process simply may not read it. Docker `--env-file` and Compose are

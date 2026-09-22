@@ -250,7 +250,19 @@ docker compose exec aquarium-node env | grep AQUARIUM_
 
 ## 8. ⛔ The image runs as a non-root user — if you mount secrets as FILES, read this first
 
-Since 2026-09-18 the image runs as **uid 10001** (`aquarium`) instead of root.
+**The first published image that runs as uid 10001 is `2026.09.19`.** Everything up to and including
+`2026.09.17` runs as root.
+
+⚠ **Check your tag, not the date.** This used to say "since 2026-09-18", which is when the change was
+written — and there is **no `2026.09.18` image**, because none was published that day. Tags are dated
+by the CI run that built them, so a date you read in a changelog is not necessarily a tag you can pull:
+
+```
+… 2026.09.14   2026.09.17   ← root
+   2026.09.19   2026.09.20   ← uid 10001
+```
+
+So the question is not "have I upgraded since some date" but **"is the tag I run ≥ 2026.09.19"**.
 
 **If you pass configuration by environment variable — Docker Compose, `--env-file`, Kubernetes `env:` — nothing changes.** This section does not apply to you.
 
