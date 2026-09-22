@@ -85,6 +85,40 @@ public class ScheduledTransactionService {
 
     private final QuickTxBuilder quickTxBuilder;
 
+    /**
+     * ⛔ <b>A DIAGNOSTIC, NOT A DESIGN CHANGE — and it ships OFF.</b>
+     *
+     * <p>Left unset (the default) nothing changes: evaluation goes through the shared
+     * {@code QuickTxBuilder(bfBackendService)} bean, i.e. Blockfrost's
+     * {@code /utils/txs/evaluate}, exactly as before.
+     *
+     * <h2>What it is for</h2>
+     * On mainnet 2026-09-22 every tank transaction failed with Blockfrost answering
+     * {@code DeserialiseFailure 0 "expected tag"} — the provider could not DECODE the transaction,
+     * so nothing reached phase 1, let alone a validator. Two hypotheses were eliminated by
+     * measurement: cardano-client-lib 0.7.2 emits Conway set tags correctly (probed, body and
+     * witness set), and the collateral ceiling — a real bug, fixed — did not change the symptom.
+     *
+     * <p>⚑ The commented-out reference this builder was derived from
+     * ({@code MainnetTankTest.executePayment}) differs in exactly one line: it evaluated through
+     * <b>Ogmios</b>. Pointing this at an Ogmios endpoint answers the open question — is the
+     * TRANSACTION malformed, or is Blockfrost's evaluator simply the wrong tool for it — and that
+     * answer decides which fix is correct.
+     *
+     * <h2>⚠ Why this must NOT become the shipped answer</h2>
+     * This node's architecture is "connects straight to a relay — <b>no Kupo/Ogmios</b>", and the
+     * README sells that as the reason an operator's costs stay low. Requiring every operator to run
+     * Ogmios to process scheduled transactions would undo it. If Ogmios proves the transaction is
+     * sound, the fix belongs elsewhere — most likely the offline Aiken evaluator this repo already
+     * uses in its dry-eval rigs, which needs no external service at all.
+     *
+     * <p>⛔ {@code TransactionEvaluator} is a ONE-METHOD interface that cannot submit (CCL trap 8),
+     * so nominating one here grants costing without granting submission. The evaluator changes; the
+     * submit path does not.
+     */
+    @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.ogmios-url:}")
+    private String ogmiosUrl;
+
 
     /**
      * Only used to build the reference-script-safe coin selection; see the guard at compose().
@@ -302,7 +336,20 @@ public class ScheduledTransactionService {
                         .readFrom(stakerRefInput)
                         .readFrom(tankContractRefInput);
 
-                quickTxBuilder.compose(tx)
+                var composed = quickTxBuilder.compose(tx);
+                if (ogmiosUrl != null && !ogmiosUrl.isBlank()) {
+                    // ⚠ Named in the log the first time it is used, because a node evaluating
+                    // somewhere other than its configured backend must not do so silently.
+                    log.info("evaluating script cost through OGMIOS at {} instead of the backend "
+                            + "(scheduling.transaction-processor.ogmios-url is set)", ogmiosUrl);
+                    // ⚠ It lives in cardano-client-supplier-ogmios-supplier, NOT in
+                    // cardano-client-backend-ogmios — that artefact has only a BackendService, whose
+                    // TransactionService is not a TransactionEvaluator in 0.7.2. The supplier module
+                    // arrives transitively through the backend one, so no new dependency is declared.
+                    composed = composed.withTxEvaluator(
+                            new com.bloxbean.cardano.client.supplier.ogmios.OgmiosTransactionEvaluator(ogmiosUrl));
+                }
+                composed
                         // ⛔ NEVER SPEND A UTxO CARRYING A REFERENCE SCRIPT.
                         //
                         // This service reaches coin selection through the SHARED QuickTxBuilder bean

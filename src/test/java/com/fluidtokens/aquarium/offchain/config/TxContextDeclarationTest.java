@@ -106,9 +106,18 @@ class TxContextDeclarationTest {
         // ---- evaluation ----------------------------------------------------------------------
         d.put("withTxEvaluator", new LinkedHashMap<>(Map.of(
                 LIQ, Entry.set(), CONVERT, Entry.set(),
-                TANK, Entry.omitted("submits via completeAndWait(), so QuickTxBuilder wires the "
-                        + "TransactionProcessor as the evaluator itself; supplying one would be "
-                        + "redundant, not absent"))));
+                // ⛔ WAS "redundant, not absent". The redundancy was real and the CONCLUSION was
+                // wrong: QuickTxBuilder does wire the backend's TransactionProcessor as the
+                // evaluator, so one is always present -- but WHICH one is then decided by the
+                // backend, and on mainnet 2026-09-22 Blockfrost's could not DECODE the transaction
+                // at all ("DeserialiseFailure 0 expected tag"). An evaluator you did not choose is
+                // not the same as one you do not need.
+                //
+                // ⚠ CONDITIONAL, and it ships OFF: set only when
+                // scheduling.transaction-processor.ogmios-url is configured. Unset, the behaviour is
+                // exactly as declared before. This is a DIAGNOSTIC for that failure, not the fix --
+                // requiring operators to run Ogmios would undo this node's "no Kupo/Ogmios" design.
+                TANK, Entry.set())));
 
         // ---- signing: the liquidation builders must NOT be able to submit ---------------------
         for (String knob : List.of("withSigner", "withRequiredSigners")) {
