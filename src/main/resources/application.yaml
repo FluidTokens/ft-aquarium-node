@@ -459,6 +459,18 @@ scheduling:
     # operator to run Ogmios would undo it. If Ogmios proves the transaction sound, the shipped fix
     # belongs elsewhere -- most likely the offline Aiken evaluator already used in the dry-eval rigs.
     ogmios-url: ${SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL:}
+    # ⛔ DIAGNOSTIC. Builds each transaction, LOGS ITS CBOR, AND SUBMITS NOTHING.
+    #
+    # The provider rejects these transactions while DECODING them, and its message is not reliable
+    # about WHAT it choked on -- the same class of failure has previously reported "expected array or
+    # int, got TypeNInt" for a negative value. The message is a symptom; the bytes are the evidence.
+    #
+    # ⚠ This ALSO turns ignoreScriptCostEvaluationError ON, which is the only way to get past a
+    # failing evaluation and reach a serialisable transaction. The result therefore carries
+    # PLACEHOLDER ex-units, and submitting one is CCL trap 8 -- accepted by the mempool, failed in
+    # PHASE 2, collateral forfeit. So this mode calls build() and returns: the submit path is not
+    # reachable while it is on. Turn it off again before arming.
+    dump-cbor: ${SCHEDULING_TRANSACTION_PROCESSOR_DUMP_CBOR:false}
 
 blockfrost:
   url: https://cardano-mainnet.blockfrost.io/api/v0/

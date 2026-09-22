@@ -119,6 +119,23 @@ public class ScheduledTransactionService {
     @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.ogmios-url:}")
     private String ogmiosUrl;
 
+    /**
+     * ⛔ <b>DIAGNOSTIC. Builds the transaction, logs its CBOR, and SUBMITS NOTHING.</b>
+     *
+     * <p>The provider rejects these transactions while DECODING them, and its message — {@code
+     * DeserialiseFailure 0 "expected tag"} — is not reliable about <em>what</em> it choked on. The
+     * same class of failure has previously reported {@code "expected array or int, got TypeNInt"}
+     * for a negative value. So the message is a symptom, and the bytes are the evidence.
+     *
+     * <p>⚠ <b>This flag also turns {@code ignoreScriptCostEvaluationError} ON</b>, which is the only
+     * way to get past a failing evaluation and reach a serialisable transaction. That makes the
+     * result carry PLACEHOLDER ex-units, and submitting one is CCL trap 8 — accepted by the mempool,
+     * failed in phase 2, collateral forfeit. Hence {@code build()} and an immediate {@code continue}:
+     * in this mode the code path that submits is not reachable.
+     */
+    @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.dump-cbor:false}")
+    private boolean dumpCbor;
+
 
     /**
      * Only used to build the reference-script-safe coin selection; see the guard at compose().
@@ -349,7 +366,7 @@ public class ScheduledTransactionService {
                     composed = composed.withTxEvaluator(
                             new com.bloxbean.cardano.client.supplier.ogmios.OgmiosTransactionEvaluator(ogmiosUrl));
                 }
-                composed
+                var context = composed
                         // ⛔ NEVER SPEND A UTxO CARRYING A REFERENCE SCRIPT.
                         //
                         // This service reaches coin selection through the SHARED QuickTxBuilder bean
@@ -391,7 +408,7 @@ public class ScheduledTransactionService {
                                 .index(walletUtxo.getOutputIndex())
                                 .build())
                         .mergeOutputs(false)
-                        .ignoreScriptCostEvaluationError(false)
+                        .ignoreScriptCostEvaluationError(dumpCbor)
                         // T-059 — THE ONLY MAINNET PATH NOW ASSERTS ITS OWN STRUCTURE.
                         //
                         // Every guarantee the lending-v4 review added lives on the PREVIEW paths;
@@ -409,7 +426,26 @@ public class ScheduledTransactionService {
                                 ZERO,
                                 payeeAddress.getAddress(), amountToSend.getCoin(),
                                 rewardsAddress.getAddress(), reward.getCoin()))
-                        .completeAndWait();
+                        ;
+
+                // ⛔ DUMP MODE BUILDS AND STOPS. IT CANNOT SUBMIT, and that is the whole safety
+                // property: ignoreScriptCostEvaluationError is TRUE here, so the build survives a
+                // failed evaluation by shipping PLACEHOLDER ex-units (10000 mem / 1000 steps).
+                // Submitting that is CCL trap 8 -- accepted by the mempool, failed in PHASE 2,
+                // collateral forfeit. So this branch calls build(), never completeAndWait(), and
+                // returns before anything can be signed or sent.
+                if (dumpCbor) {
+                    var built = context.build();
+                    log.warn("CBOR DUMP for tank {}:{} — {} bytes. ⚠ NOT SUBMITTED: this build "
+                                    + "carries PLACEHOLDER ex-units and must never be sent. Decode it "
+                                    + "to find what the evaluator could not read.\n{}",
+                            tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex(),
+                            built.serialize().length,
+                            com.bloxbean.cardano.client.util.HexUtil.encodeHexString(built.serialize()));
+                    continue;
+                }
+
+                context.completeAndWait();
 
             } catch (Exception e) {
                 unprocessableScheduledTransactions.add(TransactionInput.builder()
