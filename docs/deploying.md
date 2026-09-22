@@ -109,7 +109,7 @@ Copied from `.env.example`, which contains **only** what you must set:
 | `BLOCKFROST_KEY` | your Blockfrost project key — how transactions are submitted |
 | `WALLET_MNEMONIC` | the dedicated wallet from §2 |
 | `DB_USERNAME`, `DB_PASSWORD` | credentials for the bundled Postgres. Pick a real password |
-| `AQUARIUM_DOCKER_IMAGE_VERSION` | ⚠ **pin it**, so a restart months from now cannot silently change what you run |
+| `AQUARIUM_DOCKER_IMAGE_VERSION` | ⚠ **pin it**, so a restart months from now cannot silently change what you run. Tags are `date-commit`, e.g. `2026.09.22-413f16cb32fb` — permanent, unlike `latest` |
 
 Everything else the stack needs — image name, database host, port, name, schema — has a default in
 `docker-compose.yaml` and works unset.

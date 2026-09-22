@@ -28,7 +28,7 @@ The first four are ordinary. The last two are the subject of this guide.
 
 ```bash
 cd docker
-# pin the new version in .env: AQUARIUM_DOCKER_IMAGE_VERSION=...
+# pin the new version in .env, e.g. AQUARIUM_DOCKER_IMAGE_VERSION=2026.09.22-413f16cb32fb
 docker compose pull
 docker compose up -d
 docker compose logs -f aquarium
@@ -49,6 +49,14 @@ curl -s http://localhost:8080/actuator/info | jq .build
 
 If the version you pinned and the commit reported disagree — or `dirty` is `true` on an image you
 expected CI to have built — stop and find out why before arming anything.
+
+**The comparison is direct.** A tag is `date-commit`, and the commit half is the same twelve
+characters `/actuator/info` reports as `commitShort`. So `2026.09.22-413f16cb32fb` running clean
+reports `413f16cb32fb`, and anything else is worth stopping for.
+
+⚠ **Tags before 2026-09-22 are the date alone**, with no commit. Those are still valid pins and
+still resolve — but two of them were published twice on their day, so an older date-only tag does
+not uniquely identify an image the way a current one does.
 
 **⚠ Pin versions.** With `latest`, a restart months from now silently changes what you run, and
 there is no record of what it used to be.
