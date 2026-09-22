@@ -443,7 +443,21 @@ scheduling:
     # and spends nothing. Set to true to arm it.
     # ⚠ Upgrading across this change: a processor that was running will STOP until this is set.
     enabled: ${SCHEDULING_TRANSACTION_PROCESSOR_ENABLED:false}
-    delay-minutes: ${SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES:5}
+    # ⛔ A CRON EXPRESSION, NOT AN INTERVAL — six fields, seconds first, evaluated in UTC.
+    #
+    #   2 * * * * *   =  two seconds past every minute
+    #   ^ second
+    #
+    # ⚠ Two seconds past, not on the minute: block production and the indexer both cluster on the
+    # minute boundary, and a processor that reads at exactly :00 reads a view that is still settling.
+    # The offset costs nothing and removes a class of "the tank was there a moment ago" failures.
+    #
+    # ⛔ CRON CAN OVERLAP AND fixedDelay COULD NOT. fixedDelay measured the gap between a run
+    # finishing and the next starting; cron fires on the clock regardless of whether the previous
+    # cycle is still going. A cycle now processes EVERY due tank, so it can outlast its own period.
+    # The AtomicBoolean in processPayments() is what makes that safe, and it stops being optional
+    # here -- see its javadoc.
+    cron: ${SCHEDULING_TRANSACTION_PROCESSOR_CRON:2 * * * * *}
     # ⛔ A DIAGNOSTIC, AND IT SHIPS EMPTY. Unset, script-cost evaluation goes through the configured
     # backend (Blockfrost) exactly as before; set, it goes to this Ogmios instead.
     #

@@ -36,7 +36,6 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Vector;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
@@ -211,14 +210,19 @@ public class ScheduledTransactionService {
      * wins, the other is rejected for an input that no longer exists, and the loser's tank gets
      * counted as a failure it never had.
      *
-     * <p>⚠ Spring's {@code fixedDelay} already serialises this method today, so on paper the guard is
-     * redundant. It is here because that property is <b>invisible at the call site and easy to lose</b>:
-     * switching to {@code fixedRate}, adding an admin endpoint that triggers a run, or a second
-     * scheduler bean all break the assumption silently, and the symptom would be sporadic phantom
-     * failures rather than anything pointing back at concurrency. <b>An invariant worth relying on is
-     * worth stating in the code that relies on it.</b>
+     * <p>⛔ <b>THIS GUARD IS NOW LOAD-BEARING, NOT BELT-AND-BRACES.</b> It was written while this
+     * method ran on {@code fixedDelay}, which measures the gap between a run FINISHING and the next
+     * STARTING and therefore cannot overlap. <b>A cron trigger has no such property</b>: it fires on
+     * the clock, so a cycle still working when the next minute arrives is exactly the case cron
+     * introduces — and the overlap would be invisible, showing up as tanks failing for inputs that
+     * another thread had just spent.
+     *
+     * <p>⚑ It was added on the argument that "an invariant worth relying on is worth stating in the
+     * code that relies on it", against the objection that {@code fixedDelay} made it redundant. One
+     * commit later the schedule changed and the redundancy was gone. <b>That is the usual lifetime
+     * of a guarantee nobody wrote down.</b>
      */
-    @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelayString = "${scheduling.transaction-processor.delay-minutes}")
+    @Scheduled(cron = "${scheduling.transaction-processor.cron}", zone = "UTC")
     public void processPayments() {
         if (!cycleInProgress.compareAndSet(false, true)) {
             log.info("previous Process Payments run is still going — SKIPPING this tick rather than "
