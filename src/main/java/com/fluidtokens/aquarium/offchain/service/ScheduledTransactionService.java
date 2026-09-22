@@ -386,6 +386,30 @@ public class ScheduledTransactionService {
                     composed = composed.withTxEvaluator(
                             new com.bloxbean.cardano.client.supplier.ogmios.OgmiosTransactionEvaluator(ogmiosUrl));
                 }
+
+                // ⛔ DUMP THE BYTES THE EVALUATOR IS ACTUALLY HANDED, NOT THE ONES build() RETURNS.
+                //
+                // The failure is Blockfrost's /utils/txs/evaluate refusing to DECODE the request.
+                // Dumping build()'s output would give a transaction that has since been through fee
+                // calculation and balancing -- close to, but NOT the same as, the bytes that were
+                // rejected. For a decode failure at offset 0, "close" is useless: the whole question
+                // is which byte is wrong.
+                //
+                // ⚠ This wraps the SAME backend evaluator the bean already uses, so it changes
+                // nothing about where evaluation happens -- it only copies the payload to the log on
+                // the way past, and returns the backend's own answer untouched.
+                if (dumpCbor) {
+                    var dumpTank = tankPaymentUtxo;
+                    composed = composed.withTxEvaluator((cbor, inputUtxos) -> {
+                        log.warn("EVALUATE CBOR for tank {}:{} — {} bytes, {} input utxos. These are "
+                                        + "the exact bytes posted to the evaluator.\n{}",
+                                dumpTank.getTxHash(), dumpTank.getOutputIndex(), cbor.length,
+                                inputUtxos == null ? 0 : inputUtxos.size(),
+                                com.bloxbean.cardano.client.util.HexUtil.encodeHexString(cbor));
+                        return bfBackendService.getTransactionService().evaluateTx(cbor);
+                    });
+                }
+
                 var context = composed
                         // ⛔ NEVER SPEND A UTxO CARRYING A REFERENCE SCRIPT.
                         //
