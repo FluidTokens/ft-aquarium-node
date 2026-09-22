@@ -429,7 +429,7 @@ public class ScheduledTransactionService {
 
                 var rewardsAddress = AddressUtil.toAddress(parameters.getAddressRewards(), network.getCardanoNetwork());
 
-                var tx = tankScriptTx(walletUtxo, tankPaymentUtxo, redeemer, payeeAddress.getAddress(),
+                var tx = tankScriptTx(tankPaymentUtxo, redeemer, payeeAddress.getAddress(),
                         amountToSend, rewardsAddress.getAddress(), reward,
                         account.baseAddress(), parametersRefInput, stakerRefInput,
                         tankContractRefInput);
@@ -525,6 +525,11 @@ public class ScheduledTransactionService {
                         // ⚠ It COMPOSES (QuickTxBuilder:863-868 uses andThen), unlike preBalanceTx
                         // above, which is a SETTER whose second call silently discards the first.
                         // Two hooks on one builder with opposite semantics.
+                        // ⛔ AFTER BALANCING, FOLD THE CHANGE INTO THE FEE. See foldChangeIntoFee:
+                        // the tank is funded to pay its own fee exactly, so the change CCL computes
+                        // IS that fee, and the transaction must not carry a third output.
+                        .postBalanceTx((ctx, txn) -> stripOperatorContribution(
+                                txn, tankPaymentUtxo, account.baseAddress()))
                         .withVerifier(TankStructureVerifier.of(
                                 tankPaymentUtxo,
                                 parametersRefInput, stakerRefInput,
@@ -783,8 +788,89 @@ public class ScheduledTransactionService {
      * with the caller, because those are exactly what an offline rig must be able to substitute.
      * What lives here is only what must be identical: inputs, outputs, redeemer, reference inputs.
      */
-    static ScriptTx tankScriptTx(Utxo walletUtxo,
-                                 Utxo tankPaymentUtxo,
+    /**
+     * ⛔ <b>PUT THE TRANSACTION BACK TO ONE INPUT AND TWO OUTPUTS, AND LET THE FEE TAKE THE REST.</b>
+     *
+     * <p>A tank is funded as {@code payout + reward + fee}, exactly. Measured on mainnet
+     * 2026-09-22: eleven of the fourteen payable tanks hold precisely <b>350,000 lovelace</b> more
+     * than they owe, and a fee for this shape prices at roughly
+     * {@code 155,381 (minFeeB) + ~66,000 (size) + 104,415 (6,961-byte reference script x 15) +
+     * ~26,045 (ex-units) = ~351,841}. Eleven tanks landing on one figure is a funding rule, not a
+     * coincidence: <b>there is no spare ada in a tank because none was ever meant to be spare.</b>
+     *
+     * <p>⚠ <b>cardano-client-lib will not build that transaction on its own, and the reason is
+     * worth knowing.</b> It balances to a change output; that output is smaller than min-UTxO; so
+     * {@code ChangeOutputAdjustments} reaches into the fee payer's wallet <i>unasked</i> and pulls
+     * in an input to top it up. The measured result was a transaction with the operator's utxo as a
+     * second input and the operator's change as a third output — which cost the operator a little
+     * ada on every single payment, since the tank's whole remainder went back out as fee.
+     *
+     * <p>⇒ So this runs in {@code postBalanceTx}, which QuickTxBuilder applies <b>after</b>
+     * balancing: it removes every input that is not the tank, removes the change output, and sets
+     * the fee to what the tank has left. The arithmetic closes exactly —
+     * {@code fee = tank − payout − reward} — and the fee can only go UP relative to what CCL
+     * computed for the larger body, never below the minimum for this smaller one.
+     *
+     * <p>⚠ <b>The redeemer index must move with it.</b> A spend redeemer names its input by position
+     * in the ledger-sorted input list; dropping an input can shift the tank. Left alone it points at
+     * an input that is no longer there.
+     *
+     * <p>⚠ <b>Ex-units are NOT recomputed, and that is safe in one direction only.</b> They were
+     * measured against a body with more inputs, so the script context this ships is strictly
+     * smaller and costs no more to evaluate — over-declared, never under. Under-declaring is the
+     * phase-2 direction (CCL trap 8); this cannot produce it.
+     *
+     * @return true when the transaction was reshaped, false when it was left exactly as CCL built it
+     */
+    static boolean stripOperatorContribution(
+            com.bloxbean.cardano.client.transaction.spec.Transaction txn,
+            Utxo tankPaymentUtxo, String operatorAddress) {
+
+        var body = txn.getBody();
+
+        var changeOutputs = body.getOutputs().stream()
+                .filter(o -> operatorAddress.equals(o.getAddress()))
+                .toList();
+        if (changeOutputs.size() != 1) {
+            // No change to reclaim, or a shape this was not written for. Leave it alone: an
+            // unexpected layout is a reason to stop touching the transaction, not to improvise.
+            return false;
+        }
+        var change = changeOutputs.getFirst();
+        if (change.getValue().getMultiAssets() != null
+                && !change.getValue().getMultiAssets().isEmpty()) {
+            // ⚠ Native assets cannot be folded into a fee -- they have to go somewhere. Dropping
+            // them would destroy them, which is far worse than an extra output.
+            return false;
+        }
+
+        var tankInput = com.bloxbean.cardano.client.transaction.spec.TransactionInput.builder()
+                .transactionId(tankPaymentUtxo.getTxHash())
+                .index(tankPaymentUtxo.getOutputIndex())
+                .build();
+        if (!body.getInputs().contains(tankInput)) {
+            return false;
+        }
+
+        body.getOutputs().remove(change);
+        body.getInputs().removeIf(in -> !in.equals(tankInput));
+
+        var tankLovelace = LedgerCeilings.lovelaceOf(tankPaymentUtxo);
+        var paidOut = body.getOutputs().stream()
+                .map(o -> o.getValue().getCoin())
+                .reduce(java.math.BigInteger.ZERO, java.math.BigInteger::add);
+        body.setFee(tankLovelace.subtract(paidOut));
+
+        // The tank is now the only input, so any spend redeemer points at index 0.
+        if (txn.getWitnessSet() != null && txn.getWitnessSet().getRedeemers() != null) {
+            txn.getWitnessSet().getRedeemers().stream()
+                    .filter(r -> r.getTag() == com.bloxbean.cardano.client.plutus.spec.RedeemerTag.Spend)
+                    .forEach(r -> r.setIndex(java.math.BigInteger.ZERO));
+        }
+        return true;
+    }
+
+    static ScriptTx tankScriptTx(Utxo tankPaymentUtxo,
                                  com.bloxbean.cardano.client.plutus.spec.PlutusData redeemer,
                                  String payeeAddress,
                                  com.bloxbean.cardano.client.transaction.spec.Value amountToSend,
@@ -794,24 +880,24 @@ public class ScheduledTransactionService {
                                  TransactionInput parametersRefInput,
                                  TransactionInput stakerRefInput,
                                  TransactionInput tankContractRefInput) {
-        // ⛔ THE WALLET INPUT IS REQUIRED. A TANK CANNOT FUND ITSELF — MEASURED, NOT ASSUMED.
+        // ⛔ THE TANK IS THE ONLY INPUT, AND ITS REMAINDER IS THE FEE.
         //
-        // It looked removable: the tank holds more than it pays out, so the remainder should cover
-        // the fee and become change at the operator's address. TankTransactionDryEvalTest disproved
-        // it on a real mainnet tank -- 101.34 ada holding, 101.00 owed, leaving 0.34, which is BELOW
-        // the min-UTxO floor for the change output before any fee is charged. CCL then reaches for
-        // the fee payer's wallet and, with nothing there it may spend, dies in
-        // ChangeOutputAdjustments with "Not enough funds for [{lovelace=2958283}]".
+        // A tank is funded as payout + reward + fee, EXACTLY. Measured on mainnet 2026-09-22:
+        // eleven of the fourteen payable tanks hold precisely 350,000 lovelace more than they owe,
+        // and a fee for this shape prices at roughly
         //
-        // ⚠ Removing it also would not have achieved what it was meant to. CCL pulls a wallet utxo
-        // in by itself during balancing, so the transaction acquires one either way -- the only
-        // thing the removal changed was WHICH utxo, chosen by the library rather than by us, and
-        // two concurrent tanks choosing the same one conflict.
+        //     155,381 (minFeeB) + ~66,000 (size) + 104,415 (6,961-byte ref script x 15)
+        //         + ~26,045 (317,812 mem / 106,896,000 steps)   =   ~351,841
         //
-        // ⇒ So each tank is given its OWN wallet utxo, explicitly. That is what lets the cycle
-        // submit without waiting: the transactions share no input and cannot conflict.
-        return new ScriptTx()
-                .collectFrom(walletUtxo)
+        // ⇒ Eleven tanks landing on the same figure is a funding rule, not a coincidence. There is
+        // no spare ada in a tank because none was ever meant to be spare.
+        //
+        // ⚠ So a wallet input and a change output are not merely unnecessary, they are WRONG: they
+        // add a third output to a transaction whose shape the validator checks. An earlier attempt
+        // kept them because removing the wallet input made CCL fail to reach min-UTxO on the change
+        // output -- the right reading of that failure was that THE CHANGE OUTPUT SHOULD NOT EXIST,
+        // not that the tank needed topping up.
+                return new ScriptTx()
                 .collectFrom(tankPaymentUtxo, redeemer)
                 .payToAddress(payeeAddress, ValueUtil.toAmountList(amountToSend))
                 .payToAddress(rewardsAddress, ValueUtil.toAmountList(reward))

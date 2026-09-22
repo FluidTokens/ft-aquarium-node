@@ -83,11 +83,24 @@ class TxContextDeclarationTest {
         // ---- V5: the structural assertion, installed INSIDE the build pipeline (T-054) --------
         d.put("postBalanceTx", new LinkedHashMap<>(Map.of(
                 LIQ, Entry.set(), CONVERT, Entry.set(),
-                // ⛔ THE MAINNET PATH HAS NO STRUCTURAL ASSERTIONS AT ALL. This is T-059, queued and
-                // NOT prioritised — Giovanni's scope call, because the CCL review's brief was the
-                // review and this is new work. Declared here so it is a decision, not an oversight.
-                TANK, Entry.omitted("T-059: the tank asserts nothing about the body it built. QUEUED, "
-                        + "not decided — and it is the only path that runs on MAINNET"))));
+                // ⛔ THE TANK NOW USES IT, AND NOT FOR ASSERTIONS — IT RESHAPES THE BODY.
+                //
+                // postBalanceTx is the only hook that runs AFTER balancing (QuickTxBuilder:478), and
+                // after balancing is the only moment this transaction can be put right. CCL balances
+                // to a change output below min-UTxO, so ChangeOutputAdjustments reaches into the
+                // operator's wallet unasked, adds an input and leaves a third output — costing the
+                // operator ada on every payment, because a tank is funded to pay its own fee exactly
+                // and has no spare to give back.
+                //
+                // stripOperatorContribution() removes that input and that output and lets the fee
+                // take the tank's remainder. Measured: 1 input, 2 outputs, fee 340,000 against a
+                // minimum of ~322,752.
+                //
+                // ⚠ IT IS A SETTER, like preBalanceTx (QuickTxBuilder:275 assigns rather than
+                // composes) — a second call here silently discards the first, so the structural
+                // assertions T-059 wants cannot simply be added as another postBalanceTx. They have
+                // to go inside this one, or through withVerifier, which DOES compose.
+                TANK, Entry.set())));
 
         // ---- collateral: nominated by us on the liquidation paths (T-050) --------------------
         d.put("withCollateralInputs", new LinkedHashMap<>(Map.of(
