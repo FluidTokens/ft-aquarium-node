@@ -107,7 +107,53 @@ class LiquidationReadinessControllerTest {
                 PoolUsability.noPool(),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), null, null);
+                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                null, null);
+    }
+
+    // ---- pagination ------------------------------------------------------------------------------
+
+    /**
+     * ⛔ <b>A PAGE NUMBER FROM OUTSIDE IS NOT TRUSTED.</b> A bookmark from when the list was longer,
+     * or a page left behind when a filter narrowed it, must land on a real page — an empty table
+     * reads as "the filter matched nothing", which is a different and wrong conclusion.
+     */
+    @Test
+    void anOutOfRangePageIsClampedRatherThanRenderingAnEmptyTable() {
+        List<LiquidationReadinessController.Row> rows = new ArrayList<>();
+        for (int i = 0; i < 30; i++) {
+            rows.add(row("loan" + i, 1.0 + i));
+        }
+        var arranged = LiquidationReadinessController.arrange(rows, "health", "asc", null, null);
+
+        int pages = Math.max(1, (arranged.size() + LiquidationReadinessController.PAGE_SIZE - 1)
+                / LiquidationReadinessController.PAGE_SIZE);
+        assertEquals(2, pages, "30 loans at 25 a page is two pages");
+
+        for (int requested : new int[] {-5, 0, 1}) {
+            assertEquals(1, Math.min(Math.max(requested, 1), pages), "page " + requested + " clamps to 1");
+        }
+        assertEquals(2, Math.min(Math.max(99, 1), pages), "page 99 clamps to the last page, not past it");
+    }
+
+    /**
+     * ⚠ <b>The phone view reads the COUNTS, and they must be totals.</b> "2 liquidatable" meaning
+     * "on this page" is the class of half-truth this page exists to avoid — and it is the number an
+     * operator uses to decide whether to go and find a laptop.
+     */
+    @Test
+    void theCountsAreOverTheWholeFilteredSetRatherThanThePage() {
+        List<LiquidationReadinessController.Row> rows = new ArrayList<>();
+        for (int i = 0; i < 30; i++) {
+            rows.add(row("loan" + i, i < 27 ? 0.5 : 2.0));
+        }
+        var arranged = LiquidationReadinessController.arrange(rows, "health", "asc", null, null);
+
+        long liquidatable = arranged.stream()
+                .filter(r -> r.healthFactor() != null && r.healthFactor() < 1.0).count();
+        assertEquals(27, liquidatable, "27 are under 1.0 across the whole set");
+        assertTrue(liquidatable > LiquidationReadinessController.PAGE_SIZE,
+                "the fixture must exceed one page, or it cannot catch a page-scoped count");
     }
 
     // ---- sorting and filtering, which are query parameters rather than JavaScript ----------------
@@ -122,7 +168,8 @@ class LiquidationReadinessControllerTest {
                 new com.fluidtokens.aquarium.offchain.model.LoanAge("x", iso),
                 base.principalDisplay(), base.collateralDisplay(), base.poolUsability(), base.feeDisplay(),
                 base.feeValueDisplay(), base.advanceDisplay(), base.debtDisplay(), base.anticipateAndSell(),
-                base.anticipateDisplay(), base.actionNow(), base.loanExplorerUrl(), base.utxoExplorerUrl());
+                base.anticipateDisplay(), base.actionNow(), base.blocker(), base.loanExplorerUrl(),
+                base.utxoExplorerUrl());
     }
 
     /**
@@ -209,7 +256,8 @@ class LiquidationReadinessControllerTest {
                 PoolUsability.noPool(),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), null, null);
+                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                null, null);
 
         assertNull(r.healthFactor());
         assertNull(r.feeValueLovelace());
@@ -287,7 +335,7 @@ class LiquidationReadinessControllerTest {
             }
         };
         return new LiquidationReadinessController(provide(null), provide(null), provide(null),
-                provide(client), provide(null), provide(null), provide(registry), null, network);
+                provide(client), provide(null), provide(null), provide(registry), provide(null), null, network);
     }
 
     /**
@@ -406,7 +454,7 @@ class LiquidationReadinessControllerTest {
             }
         };
         return new LiquidationReadinessController(provide(null), provide(null), provide(null),
-                provide(null), provide(resolver), provide(null), provide(null), null, network);
+                provide(null), provide(resolver), provide(null), provide(null), provide(null), null, network);
     }
 
     /**

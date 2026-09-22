@@ -138,12 +138,30 @@
        one-line count is all that remains. */
     .glance { display:none; }
     @media (max-width: 700px) {
-      .tw, .filters, thead { display:none; }
+      .tw, .filters, thead, .pager, .wallet-age { display:none; }
       .glance { display:block; font-size:.9rem; margin-top:.4rem; }
       .glance .big { font-size:1.6rem; font-weight:700; }
       .glance .go  { margin-top:.6rem; font-weight:600; color:var(--crit); }
       .status-head { font-size:1.2rem; }
     }
+
+    /* ---- the operator's own wallet ---------------------------------------------------------- */
+    .wallet { display:flex; flex-wrap:wrap; align-items:baseline; gap:.7rem; margin:0 0 .8rem;
+              padding:.5rem .7rem; border:1px solid var(--rule); border-radius:8px;
+              background:var(--surface); font-size:.82rem; }
+    .wallet-label { font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+    .wallet .bal { font-variant-numeric:tabular-nums; }
+    .wallet-age { margin-left:auto; font-size:.7rem; color:var(--muted); }
+
+    /* ---- the exception mark ------------------------------------------------------------------ */
+    /* ⚠ Deliberately the only warning colour in the table body, so it cannot be lost among chips. */
+    .warn-badge { display:inline-flex; align-items:center; gap:.2rem; margin-right:.35rem;
+                  color:var(--warn); font-size:.68rem; font-weight:700; cursor:help; }
+
+    /* ---- pagination -------------------------------------------------------------------------- */
+    .pager { display:flex; align-items:center; gap:1rem; justify-content:center; margin:.9rem 0;
+             font-size:.78rem; color:var(--muted); }
+    .pager a { color:var(--ink-2); }
 
     /* ---- auto-refresh control ------------------------------------------------------------ */
     .refresh { display:flex; align-items:center; gap:.45rem; font-size:.76rem; color:var(--muted);
@@ -194,18 +212,42 @@
 
   <div th:if="${disabledReason}" class="note" th:text="${disabledReason}">disabled</div>
 
+  <!-- ⛔ THE OPERATOR'S OWN WALLET. Amount and ticker; the policy id lives on hover, because a
+       56-character hex string beside every figure is how a balance strip becomes unreadable.
+       ⚠ The reading's AGE is shown because this is CACHED (a provider call behind a 60s TTL). A
+       cached number rendered as though it were live is the failure that replaces the one the cache
+       was avoiding. -->
+  <div class="wallet" th:unless="${disabledReason}">
+    <span class="wallet-label">node wallet</span>
+    <span th:unless="${wallet.known()}" class="unknown">unknown &mdash; the balance could not be read</span>
+    <span th:if="${wallet.known() and #lists.isEmpty(wallet.ordered())}" class="unknown">empty</span>
+    <span class="bal" th:each="b : ${wallet.ordered()}" th:with="d=${walletDisplay.get(b.key)}">
+      <span th:text="${d != null ? d.amountText : b.value}">0</span>
+      <span class="ticker" th:text="${d != null ? d.label : b.key}"
+            th:title="${d != null ? d.policyId : b.key}">TKR</span>
+      <span th:if="${d != null and d.metadataUnknown}" class="nometa"
+            th:title="|no metadata for ${d.unit} — raw, unscaled base units|">&#10071;</span>
+    </span>
+    <span class="wallet-age" th:if="${wallet.known()}"
+          th:text="|as of ${walletAgeSeconds}s ago|">as of</span>
+  </div>
+
   <!-- ⛔ THE PHONE VIEW. Visible only under 700px, where the table is hidden entirely. It answers one
        question — is anything happening that needs me — and then tells you where to go. Deliberately
        NOT a reflowed table: a dense economics grid on a phone is unreadable, and acting on it from a
        phone is not something this page should make easy. -->
   <div class="glance" th:unless="${disabledReason}">
-    <div><span class="big" th:text="${#lists.size(rows)}">0</span> loan(s) indexed</div>
-    <div th:with="urgent=${#lists.size(rows) == 0 ? 0 : #lists.size(rows.?[liquidatable != null and liquidatable])}">
-      <span class="big" th:text="${urgent}">0</span> liquidatable now
-      <div class="go" th:if="${urgent > 0}">Something is liquidatable. Open this on a laptop.</div>
-      <div class="go" th:if="${urgent == 0}" style="color:var(--muted);font-weight:400">
-        Nothing needs you right now.</div>
-    </div>
+    <!-- ⚠ TOTALS, not this page's rows. A phone count that silently meant "of 25" would be worse
+         than no count, because the whole purpose here is deciding whether to go and act. -->
+    <div><span class="big" th:text="${totalRows}">0</span> loan(s) indexed</div>
+    <div><span class="big" th:text="${liquidatableCount}">0</span> liquidatable now</div>
+    <div th:if="${blockedCount > 0}"><span class="big" th:text="${blockedCount}">0</span>
+      the bot could not process</div>
+    <div class="go" th:if="${liquidatableCount > 0}">Something is liquidatable. Open this on a laptop.</div>
+    <div class="go" th:if="${liquidatableCount == 0 and blockedCount > 0}" style="color:var(--warn)">
+      Nothing is liquidatable yet, but some loans could not be processed. Worth a look.</div>
+    <div class="go" th:if="${liquidatableCount == 0 and blockedCount == 0}"
+         style="color:var(--muted);font-weight:400">Nothing needs you right now.</div>
   </div>
 
   <!-- ⚠ Query parameters, not JavaScript: the page re-GETs its own URL every minute, so client-side
@@ -262,6 +304,12 @@
              nothing saying which was which. Full value on hover, because anyone reconciling against
              the chain needs it and an abbreviation is useless to them. -->
         <td class="mono id">
+          <!-- ⚠ MARK THE EXCEPTIONS, NOT THE PASSES. A clean row carries nothing; only a loan the bot
+               could not process is marked, so the eye goes to the few that need attention instead of
+               scanning a column of green. The reason is terse ON the badge and a sentence on hover. -->
+          <span class="warn-badge" th:if="${r.blocker != null and r.blocker.blocked()}"
+                th:title="${r.blocker.detail()}">&#9888;
+            <span th:text="${r.blocker.label()}">why</span></span>
           <a th:if="${r.loanExplorerUrl}" th:href="${r.loanExplorerUrl}" target="_blank"
              rel="noopener noreferrer" th:title="|loan NFT asset name — ${r.loanId}|"
              th:text="${#strings.abbreviate(r.loanId, 14)}">id</a>
