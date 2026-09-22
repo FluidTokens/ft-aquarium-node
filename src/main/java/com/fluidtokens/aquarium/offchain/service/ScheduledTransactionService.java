@@ -374,13 +374,39 @@ public class ScheduledTransactionService {
         }
         final var collateralUtxo = collateralUtxoOpt.get();
 
+        // ⛔ ONE SPENDABLE WALLET UTXO PER TANK, and the collateral utxo is NOT among them.
+        //
+        // The tank needs a wallet input (see tankScriptTx) and two tanks sharing one would conflict,
+        // so the cycle hands each its own. The pinned collateral is excluded because CCL excludes a
+        // pinned collateral input from ordinary coin selection anyway -- spending it here would
+        // leave the transaction with no collateral at all.
+        //
+        // ⚠ THIS IS THE CYCLE'S REAL CEILING, and it is the wallet's SHAPE, not its balance: N
+        // ada-only utxos means N tanks. Splitting the wallet raises it; adding ada does not.
+        var walletPool = walletPool(walletUtxos.stream()
+                .filter(u -> !(u.getTxHash().equals(collateralUtxo.getTxHash())
+                        && u.getOutputIndex() == collateralUtxo.getOutputIndex()))
+                .toList(), required);
+
+        if (walletPool.size() < processableScheduledTransactions.size()) {
+            log.info("{} tanks to process but only {} spendable wallet utxos (collateral excluded) — "
+                            + "doing {} this cycle. Each tank needs its own ada-only utxo of at "
+                            + "least {} lovelace; SPLIT the wallet to raise this, adding ada will "
+                            + "not.",
+                    processableScheduledTransactions.size(), walletPool.size(), walletPool.size(),
+                    required);
+        }
+
         // ⚠ Counts failures that are NOT the tank's own fault, and resets on any success.
         int consecutiveFailures = 0;
         int submitted = 0;
 
-        // ⛔ EVERY DUE TANK, EVERY CYCLE. No pool, no budget, no break.
         for (var datumTankUtxo : processableScheduledTransactions) {
 
+            if (walletPool.isEmpty()) {
+                break;
+            }
+            var walletUtxo = walletPool.poll();
             var tankPaymentUtxo = datumTankUtxo.utxo();
             var tankDatum = datumTankUtxo.datumTank();
 
@@ -408,24 +434,10 @@ public class ScheduledTransactionService {
 
                 var rewardsAddress = AddressUtil.toAddress(parameters.getAddressRewards(), network.getCardanoNetwork());
 
-                // ⛔ THE TANK IS THE ONLY INPUT. No wallet utxo is spent.
-                //
-                // The tank funds its own payouts and its own fee, and whatever is left becomes change
-                // at the operator's address -- which is how the operator is paid. Adding a wallet
-                // input put ~15 ada in and took ~15 ada straight back out, and in exchange coupled
-                // every transaction in the cycle to the wallet's utxo count.
-                //
-                // ⚠ A tank too thin to cover payouts is refused before the loop; one too thin to
-                // cover payouts PLUS fee fails here and is retried, because separating those needs a
-                // fee estimate and an estimate would blacklist tanks that would have worked.
-                var tx = new ScriptTx()
-                        .collectFrom(tankPaymentUtxo, redeemer)
-                        .payToAddress(payeeAddress.getAddress(), ValueUtil.toAmountList(amountToSend))
-                        .payToAddress(rewardsAddress.getAddress(), ValueUtil.toAmountList(reward))
-                        .withChangeAddress(account.baseAddress())
-                        .readFrom(parametersRefInput)
-                        .readFrom(stakerRefInput)
-                        .readFrom(tankContractRefInput);
+                var tx = tankScriptTx(walletUtxo, tankPaymentUtxo, redeemer, payeeAddress.getAddress(),
+                        amountToSend, rewardsAddress.getAddress(), reward,
+                        account.baseAddress(), parametersRefInput, stakerRefInput,
+                        tankContractRefInput);
 
                 var composed = quickTxBuilder.compose(tx);
                 if (ogmiosUrl != null && !ogmiosUrl.isBlank()) {
@@ -575,6 +587,10 @@ public class ScheduledTransactionService {
                 // classifier should have seen it.
                 log.warn("Could not process Tank utxo {}:{} — {} Blacklisted until restart.",
                         tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex(), e.getMessage());
+                // ⛔ NOTHING WAS SUBMITTED, SO THE UTXO GOES BACK. Thrown while building an address,
+                // before a transaction exists. Keeping it would let one dead tank cost a live one
+                // its turn -- which is what throttled the bot to 1-2 tanks a minute.
+                walletPool.addFirst(walletUtxo);
                 consecutiveFailures = 0;
 
             } catch (Exception e) {
@@ -736,6 +752,58 @@ public class ScheduledTransactionService {
             }
         }
         return null;
+    }
+
+    /**
+     * ⛔ <b>THE TANK TRANSACTION'S SHAPE, IN ONE PLACE, so a test can drive the SAME construction
+     * production does.</b>
+     *
+     * <p>This repo has already paid for the alternative. A builder was promoted to {@code src/main}
+     * byte-identically and its tests all used a rig that supplied what production had to earn — the
+     * null-evaluator incident of 2026-08-21, phase-2 failure, collateral forfeit. <b>A test that
+     * rebuilds the shape by hand proves the test's shape, not the service's</b>, and the two drift
+     * silently because nothing compares them.
+     *
+     * <p>⚠ Everything about <i>pricing</i> — evaluator, signers, collateral, selection guards — stays
+     * with the caller, because those are exactly what an offline rig must be able to substitute.
+     * What lives here is only what must be identical: inputs, outputs, redeemer, reference inputs.
+     */
+    static ScriptTx tankScriptTx(Utxo walletUtxo,
+                                 Utxo tankPaymentUtxo,
+                                 com.bloxbean.cardano.client.plutus.spec.PlutusData redeemer,
+                                 String payeeAddress,
+                                 com.bloxbean.cardano.client.transaction.spec.Value amountToSend,
+                                 String rewardsAddress,
+                                 com.bloxbean.cardano.client.transaction.spec.Value reward,
+                                 String changeAddress,
+                                 TransactionInput parametersRefInput,
+                                 TransactionInput stakerRefInput,
+                                 TransactionInput tankContractRefInput) {
+        // ⛔ THE WALLET INPUT IS REQUIRED. A TANK CANNOT FUND ITSELF — MEASURED, NOT ASSUMED.
+        //
+        // It looked removable: the tank holds more than it pays out, so the remainder should cover
+        // the fee and become change at the operator's address. TankTransactionDryEvalTest disproved
+        // it on a real mainnet tank -- 101.34 ada holding, 101.00 owed, leaving 0.34, which is BELOW
+        // the min-UTxO floor for the change output before any fee is charged. CCL then reaches for
+        // the fee payer's wallet and, with nothing there it may spend, dies in
+        // ChangeOutputAdjustments with "Not enough funds for [{lovelace=2958283}]".
+        //
+        // ⚠ Removing it also would not have achieved what it was meant to. CCL pulls a wallet utxo
+        // in by itself during balancing, so the transaction acquires one either way -- the only
+        // thing the removal changed was WHICH utxo, chosen by the library rather than by us, and
+        // two concurrent tanks choosing the same one conflict.
+        //
+        // ⇒ So each tank is given its OWN wallet utxo, explicitly. That is what lets the cycle
+        // submit without waiting: the transactions share no input and cannot conflict.
+        return new ScriptTx()
+                .collectFrom(walletUtxo)
+                .collectFrom(tankPaymentUtxo, redeemer)
+                .payToAddress(payeeAddress, ValueUtil.toAmountList(amountToSend))
+                .payToAddress(rewardsAddress, ValueUtil.toAmountList(reward))
+                .withChangeAddress(changeAddress)
+                .readFrom(parametersRefInput)
+                .readFrom(stakerRefInput)
+                .readFrom(tankContractRefInput);
     }
 
     static java.math.BigInteger requiredWalletLovelace(
