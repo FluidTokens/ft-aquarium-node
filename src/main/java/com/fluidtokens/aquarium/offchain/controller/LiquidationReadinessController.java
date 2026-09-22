@@ -33,6 +33,7 @@ import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -139,6 +140,10 @@ public class LiquidationReadinessController {
                       // ⚠ SCALED AND TICKERED like every other amount on this page. A net shown in raw
                       // base units is the same defect as the fee slice and the capital figure were.
                       AssetDisplay anticipateDisplay,
+                      // ⛔ THREE SEPARATE FACTS, not one. The route is what a liquidation WOULD build,
+                      // the pool status is the chain's answer, and actionNow is what this node would
+                      // actually do — which on a disabled node is "nothing", however good the rest looks.
+                      ActionNow actionNow,
                       // cexplorer links. Null when the network or the loan policy is unknown — a dead
                       // link is worse than none, so the template renders plain text instead.
                       String loanExplorerUrl,
@@ -160,6 +165,17 @@ public class LiquidationReadinessController {
     private final AppConfig.LiquidationConfiguration liquidationConfiguration;
     private final AppConfig.Network network;
 
+    // ⚠ @Value fields rather than constructor parameters: these three are read ONLY to describe the
+    // node's posture in the banner, nothing computes with them, and threading them through a
+    // constructor every test already calls would buy nothing. OperationalStatus is unit-tested
+    // directly, which is where the logic that matters actually lives.
+    @org.springframework.beans.factory.annotation.Value("${loans.liquidation.convert.enabled:true}")
+    private boolean convertEnabled = true;
+    @org.springframework.beans.factory.annotation.Value("${loans.compound.enabled:false}")
+    private boolean compoundEnabled;
+    @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.enabled:false}")
+    private boolean processorEnabled;
+
     public LiquidationReadinessController(ObjectProvider<LiquidationCandidateScanner> scanner,
                                           ObjectProvider<LoanService> loanService,
                                           ObjectProvider<LoanHealthService> loanHealthService,
@@ -180,10 +196,31 @@ public class LiquidationReadinessController {
         this.network = network;
     }
 
+    /**
+     * ⚠ SORT AND FILTER ARE QUERY PARAMETERS, NOT JAVASCRIPT, and the auto-refresh is why. The page
+     * re-GETs its own URL every minute, so client-side state would be silently undone on each tick —
+     * and it would be invisible to the template tests, which render server-side. Params survive the
+     * refresh, make the view shareable as a link, and stay testable.
+     */
     @GetMapping
-    public String readiness(Model model) {
+    public String readiness(Model model,
+                            @RequestParam(name = "sort", required = false) String sort,
+                            @RequestParam(name = "dir", required = false) String dir,
+                            @RequestParam(name = "principal", required = false) String principal,
+                            @RequestParam(name = "collateral", required = false) String collateral) {
         model.addAttribute("network", network == null ? "unknown" : network.getNetwork());
         model.addAttribute("generatedAt", java.time.Instant.now().toString());
+        model.addAttribute("status", OperationalStatus.of(liquidationConfiguration,
+                convertEnabled, compoundEnabled, processorEnabled));
+        model.addAttribute("sort", sort == null ? "health" : sort);
+        model.addAttribute("dir", dir == null ? "asc" : dir);
+        model.addAttribute("principalFilter", principal);
+        model.addAttribute("collateralFilter", collateral);
+        // ⚠ Built here rather than in the template so a sort link CARRIES the active filters. A sort
+        // that silently cleared the filter would look like the filter had failed.
+        model.addAttribute("filterQuery",
+                (principal == null || principal.isBlank() ? "" : "&principal=" + principal)
+                        + (collateral == null || collateral.isBlank() ? "" : "&collateral=" + collateral));
 
         LoanService loans = loanService.getIfAvailable();
         LiquidationCandidateScanner scan = scanner.getIfAvailable();
@@ -206,8 +243,45 @@ public class LiquidationReadinessController {
 
         long now = System.currentTimeMillis();
         model.addAttribute("disabledReason", null);
-        model.addAttribute("rows", rows(loans, scan, health, now));
+        List<Row> all = rows(loans, scan, health, now);
+        // ⚠ The SELECT options come from the loans actually present, never from a fixed list: an
+        // option that matches nothing is a filter an operator can set and then wonder about.
+        model.addAttribute("principals", all.stream().map(Row::principalUnit).distinct().sorted().toList());
+        model.addAttribute("collaterals", all.stream().map(Row::collateralUnit).distinct().sorted().toList());
+        model.addAttribute("rows", arrange(all, sort, dir, principal, collateral));
         return "readiness";
+    }
+
+    /**
+     * ⛔ Sorting and filtering, separated from rendering so it can be tested without Spring.
+     *
+     * <p>⚠ <b>UNKNOWN sorts LAST in both directions.</b> A loan whose health could not be computed is
+     * not "healthy" and must never outrank one measurably about to go — and flipping the direction
+     * must not quietly promote it to the top, which a naive reverse would do. That ordering is the
+     * whole product of this page.
+     */
+    static List<Row> arrange(List<Row> rows, String sort, String dir, String principal, String collateral) {
+        List<Row> out = new java.util.ArrayList<>(rows.stream()
+                .filter(r -> principal == null || principal.isBlank() || principal.equals(r.principalUnit()))
+                .filter(r -> collateral == null || collateral.isBlank() || collateral.equals(r.collateralUnit()))
+                .toList());
+        boolean descending = "desc".equalsIgnoreCase(dir);
+        // ⚠ Age is sorted on the loan's ISO lend-date, which orders lexicographically because every
+        // value is the same fixed-width UTC format. A LATER lend date is a YOUNGER loan, so ascending
+        // age is descending date — inverted here rather than at the call site, where it would be a
+        // silent off-by-one-direction nobody would notice on a four-row page.
+        Comparator<Row> known = "age".equalsIgnoreCase(sort)
+                ? Comparator.comparing(
+                        (Row r) -> r.age() == null || r.age().iso() == null ? "" : r.age().iso(),
+                        Comparator.reverseOrder())
+                : Comparator.comparingDouble(Row::sortKey);
+        if (descending) {
+            known = known.reversed();
+        }
+        // Unknown-health rows are pinned after everything measurable, whichever way the rest is sorted.
+        Comparator<Row> unknownLast = Comparator.comparing(r -> r.healthFactor() == null);
+        out.sort(unknownLast.thenComparing(known));
+        return out;
     }
 
     private List<Row> rows(LoanService loans, LiquidationCandidateScanner scan,
@@ -341,6 +415,12 @@ public class LiquidationReadinessController {
                             null, fetched.datums());
         }
 
+        // ⛔ COMPUTED FROM THE EFFECTIVE STATE, never the configured one: the node mode is a ceiling,
+        // the cap is per-loan, and convert can be off globally. See ActionNow.
+        ActionNow actionNow = ActionNow.of(health.liquidatable(),
+                gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
+                gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance);
+
         return new Row(loan.loanId(), loan.utxoRef(),
                 datum.principalAsset().toUnit(), datum.principalAmount(),
                 health.remainingDebt(),
@@ -361,6 +441,7 @@ public class LiquidationReadinessController {
                 anticipate,
                 anticipate.netInPrincipal() == null ? null
                         : display(datum.principalAsset().toUnit(), anticipate.netInPrincipal(), metadataMemo),
+                actionNow,
                 loanAssetUrl(loan.loanId()), txUrl(loan.utxoRef()));
     }
 

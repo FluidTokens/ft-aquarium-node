@@ -90,6 +90,61 @@
     .pool.unknown       { background:var(--surface-2); color:var(--muted); }
     .nometa-note { display:block; font-size:.72rem; color:var(--warn); margin-top:.15rem; }
 
+    /* ---- operational status banner --------------------------------------------------------- */
+    /* ⛔ Loud on purpose. This is the difference between "the bot is about to act" and "these are
+       numbers about a bot that will do nothing", and the page used to say neither. */
+    .status { border-radius:10px; padding:.7rem .9rem; margin:0 0 1rem; border:1px solid var(--rule); }
+    .status.idle  { background:var(--surface-2); border-color:var(--rule); }
+    .status.shadow{ background:var(--warn-soft); border-color:var(--warn); }
+    .status.live  { background:var(--crit-soft); border-color:var(--crit); }
+    .status-head  { font-weight:700; font-size:1rem; letter-spacing:.02em; }
+    .status-chips { display:flex; flex-wrap:wrap; gap:.35rem; margin-top:.45rem; }
+    .chip { font-size:.66rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+            padding:.12rem .4rem; border-radius:4px; background:var(--surface); border:1px solid var(--rule); }
+    .chip.off { color:var(--muted); }
+    .status-notes { margin:.5rem 0 0; padding-left:1.1rem; font-size:.76rem; color:var(--ink-2); }
+    .status-notes li { margin:.15rem 0; }
+
+    /* ---- filters and sorting ---------------------------------------------------------------- */
+    .filters { display:flex; flex-wrap:wrap; gap:.8rem; align-items:center; margin:0 0 .7rem;
+               font-size:.76rem; color:var(--muted); }
+    .filters select { font:inherit; padding:.15rem .3rem; }
+    .filters .clear { color:var(--muted); }
+    .sortlink { color:inherit; text-decoration:none; border-bottom:1px dotted var(--muted); }
+    .sortlink:hover { border-bottom-style:solid; }
+    /* ⚠ A tooltip marker has to LOOK like one, or nobody hovers it and the explanation is lost. */
+    .info { cursor:help; font-size:.72rem; color:var(--muted); margin-left:.25rem; }
+
+    /* ---- action now -------------------------------------------------------------------------- */
+    .action { display:inline-block; font-size:.66rem; font-weight:700; letter-spacing:.04em;
+              padding:.14rem .4rem; border-radius:4px; }
+    .action.act  { background:var(--crit-soft); color:var(--crit); }
+    .action.idle { background:var(--surface-2); color:var(--muted); }
+
+    /* ---- the per-loan breakdown -------------------------------------------------------------- */
+    tr.detail > td { padding-top:0; border-top:0; }
+    tr.detail summary { cursor:pointer; font-size:.72rem; color:var(--muted); }
+    tr.detail dl { display:grid; grid-template-columns:auto 1fr; gap:.25rem .9rem; margin:.5rem 0 .3rem;
+                   font-size:.78rem; }
+    tr.detail dt { color:var(--muted); }
+    tr.detail dd { margin:0; }
+    .ok  { color:var(--ok); font-weight:600; }
+    .bad { color:var(--crit); font-weight:600; }
+
+    /* ---- ⛔ SMALL SCREENS ARE A GLANCE, NOT A CONSOLE ---------------------------------------- */
+    /* Nobody operates a bot holding funds from a phone, and a phone that could reach those funds is
+       a mistake of its own. What a phone is for is knowing whether to go and find a laptop — so the
+       table is hidden outright rather than reflowed into something unreadable, and the status plus a
+       one-line count is all that remains. */
+    .glance { display:none; }
+    @media (max-width: 700px) {
+      .tw, .filters, thead { display:none; }
+      .glance { display:block; font-size:.9rem; margin-top:.4rem; }
+      .glance .big { font-size:1.6rem; font-weight:700; }
+      .glance .go  { margin-top:.6rem; font-weight:600; color:var(--crit); }
+      .status-head { font-size:1.2rem; }
+    }
+
     /* ---- auto-refresh control ------------------------------------------------------------ */
     .refresh { display:flex; align-items:center; gap:.45rem; font-size:.76rem; color:var(--muted);
                font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
@@ -116,30 +171,91 @@
 </header>
 
 <main>
-  <p class="lede">Sorted by <strong>health factor ascending</strong> &mdash; closest to liquidation
-    first. Loans that are only <strong>approaching</strong> the threshold are included on purpose:
-    where the route is <strong>capital in advance</strong>, the principal has to be found
-    <em>before</em> the loan goes sour, and a list of what is already liquidatable would arrive too
-    late to act on.</p>
-
-  <p class="note">A health factor below <strong>1.0</strong> is liquidatable now. Every figure comes
-    from the same code the bot acts through &mdash; the scanner, the health service, the economics
-    gate, the pool resolver and the pay-in-advance builder &mdash; so what is shown here is what the
-    bot would decide. Where a value cannot be computed it reads <em>unknown</em> with the reason;
-    it is never shown as zero.</p>
+  <!-- ⛔ WHAT THIS NODE WILL DO, before any number describing what it could do. Until 2026-09-21
+       this page rendered a route and a positive margin on a fully disabled node with nothing saying
+       so, which reads as "about to act". See OperationalStatus. -->
+  <div class="status" th:classappend="${status.monitoringOnly()} ? 'idle' : (${status.liquidationMode} == 'LIVE' ? 'live' : 'shadow')">
+    <div class="status-head" th:text="${status.headline}">MONITORING ONLY</div>
+    <div class="status-chips">
+      <span class="chip" th:text="'liquidation: ' + ${status.liquidationMode}">liquidation</span>
+      <span class="chip" th:classappend="${status.convertEnabled} ? '' : 'off'"
+            th:text="${status.convertEnabled} ? 'convert: on' : 'convert: OFF'">convert</span>
+      <span class="chip" th:classappend="${status.compoundEnabled} ? '' : 'off'"
+            th:text="${status.compoundEnabled} ? 'compound: on' : 'compound: off'">compound</span>
+      <span class="chip" th:classappend="${status.processorEnabled} ? '' : 'off'"
+            th:text="${status.processorEnabled} ? 'processor: on' : 'processor: off'">processor</span>
+      <span class="chip" th:if="${status.marketsOverridden > 0}"
+            th:text="${status.marketsOverridden} + ' market(s) overridden'">markets</span>
+    </div>
+    <ul class="status-notes" th:if="${not #lists.isEmpty(status.notes)}">
+      <li th:each="n : ${status.notes}" th:text="${n}">note</li>
+    </ul>
+  </div>
 
   <div th:if="${disabledReason}" class="note" th:text="${disabledReason}">disabled</div>
+
+  <!-- ⛔ THE PHONE VIEW. Visible only under 700px, where the table is hidden entirely. It answers one
+       question — is anything happening that needs me — and then tells you where to go. Deliberately
+       NOT a reflowed table: a dense economics grid on a phone is unreadable, and acting on it from a
+       phone is not something this page should make easy. -->
+  <div class="glance" th:unless="${disabledReason}">
+    <div><span class="big" th:text="${#lists.size(rows)}">0</span> loan(s) indexed</div>
+    <div th:with="urgent=${#lists.size(rows) == 0 ? 0 : #lists.size(rows.?[liquidatable != null and liquidatable])}">
+      <span class="big" th:text="${urgent}">0</span> liquidatable now
+      <div class="go" th:if="${urgent > 0}">Something is liquidatable. Open this on a laptop.</div>
+      <div class="go" th:if="${urgent == 0}" style="color:var(--muted);font-weight:400">
+        Nothing needs you right now.</div>
+    </div>
+  </div>
+
+  <!-- ⚠ Query parameters, not JavaScript: the page re-GETs its own URL every minute, so client-side
+       state would be undone on every tick — and would be invisible to the template tests. -->
+  <form class="filters" method="get" th:unless="${disabledReason}">
+    <input type="hidden" name="sort" th:value="${sort}">
+    <input type="hidden" name="dir" th:value="${dir}">
+    <label>principal
+      <select name="principal" onchange="this.form.submit()">
+        <option value="">any</option>
+        <option th:each="p : ${principals}" th:value="${p}" th:text="${p == 'lovelace' ? 'ADA' : #strings.abbreviate(p, 18)}"
+                th:selected="${p == principalFilter}">unit</option>
+      </select>
+    </label>
+    <label>collateral
+      <select name="collateral" onchange="this.form.submit()">
+        <option value="">any</option>
+        <option th:each="c : ${collaterals}" th:value="${c}" th:text="${c == 'lovelace' ? 'ADA' : #strings.abbreviate(c, 18)}"
+                th:selected="${c == collateralFilter}">unit</option>
+      </select>
+    </label>
+    <a class="clear" th:if="${principalFilter != null or collateralFilter != null}"
+       th:href="|?sort=${sort}&amp;dir=${dir}|">clear</a>
+  </form>
 
   <div class="tw" th:unless="${disabledReason}">
     <table>
       <thead>
       <tr>
-        <th>Loan</th><th>UTxO</th><th>Age</th><th class="num">Debt</th><th class="num">Collateral</th><th>Health</th>
-        <th class="num">Fee slice at liquidation</th><th>Route</th><th class="num">Advance cost</th><th class="num">Anticipate &amp; sell</th>
+        <th>Loan</th><th>UTxO</th>
+        <th><a class="sortlink" th:href="|?sort=age&amp;dir=${(sort == 'age' and dir == 'asc') ? 'desc' : 'asc'}${filterQuery}|">Age<span
+              th:if="${sort == 'age'}" th:text="${dir == 'asc'} ? ' ▲' : ' ▼'"></span></a></th>
+        <th class="num">Debt<span class="info" title="What the borrower still owes: principal plus accrued interest. The amount originally borrowed is on hover over each figure.">ⓘ</span></th>
+        <th class="num">Collateral</th>
+        <th><a class="sortlink" th:href="|?sort=health&amp;dir=${(sort == 'health' and dir == 'asc') ? 'desc' : 'asc'}${filterQuery}|">Health<span
+              th:if="${sort == 'health'}" th:text="${dir == 'asc'} ? ' ▲' : ' ▼'"></span></a><span
+              class="info" title="Health factor. Below 1.0 is liquidatable now. Loans approaching the threshold are listed on purpose: where the route is capital in advance, the principal has to be found BEFORE the loan goes sour. A loan whose health cannot be computed sorts last in both directions — it is not healthy, it is unknown.">ⓘ</span></th>
+        <th class="num">Expected reward<span class="info" title="The liquidator's fee slice, valued in the principal asset at oracle prices. This is the IDEAL profit: it ignores transaction and order costs, and assumes the collateral sells at the oracle price. The realistic figure is in the breakdown.">ⓘ</span></th>
+        <th>Route<span class="info" title="Configured route is which transaction a liquidation would build. Pool status is the chain's answer about Minswap. Action now is what this node would actually do — which on a disabled node is nothing, however good the rest looks.">ⓘ</span></th>
+        <th class="num">Capital required<span class="info" title="What you would pay the lender to anticipate: the debt PLUS the lender's liquidation penalty, MINUS your fee slice, valued at oracle prices. This is why it differs from the debt.">ⓘ</span></th>
+        <th>Action now<span class="info" title="What this node would actually do about this loan on the next scan, after the node mode ceiling, the market cap and the global convert switch are all applied. This is the only column that describes intent rather than possibility.">ⓘ</span></th>
       </tr>
       </thead>
       <tbody>
-      <tr th:each="r : ${rows}" th:classappend="${r.liquidatable != null and r.liquidatable} ? 'liquidatable'">
+      <!-- ⚠ A th:block wraps BOTH rows: th:each on a row element repeats that one row only, so the
+           breakdown row underneath has to iterate with it or `r` is out of scope there.
+           ⛔ And no literal row tag in this comment: comments reach the output, and a test that
+           counts rows would count it. -->
+      <th:block th:each="r : ${rows}">
+      <tr th:classappend="${r.liquidatable != null and r.liquidatable} ? 'liquidatable'">
         <!-- ⛔ TWO DIFFERENT THINGS, which is why they are now two columns. The loan id is the loan
              NFT's ASSET NAME (the lender bond carries the same name); the UTxO ref is txHash#index,
              where that loan currently sits. They were stacked in one cell as two bare hashes with
@@ -165,8 +281,11 @@
         <!-- ⛔ THE DEBT, NOT THE PRINCIPAL. Interest accrues, so the amount originally borrowed stops
              being the number anyone acts on; it stays on hover for reconciliation. When the debt could
              not be computed the ORIGINAL principal is shown, marked, rather than an empty cell. -->
+        <!-- ⛔ THE EXACT FIGURE ON HOVER, always. The cell rounds; this is the only reason it may.
+             Anyone reconciling against the chain needs every digit, and a display rule must never be
+             what stops them. -->
         <td class="mono num" th:with="d=${r.debtDisplay != null ? r.debtDisplay : r.principalDisplay}"
-            th:title="|originally borrowed: ${r.principalDisplay.amountText} ${r.principalDisplay.label}|">
+            th:title="|exact: ${d.exactText} ${d.label} — originally borrowed ${r.principalDisplay.exactText} ${r.principalDisplay.label}|">
           <span th:text="${d.amountText}">0</span>
           <span class="ticker" th:text="${d.label}" th:title="${d.policyId}">TKR</span>
           <span th:if="${r.debtDisplay == null}" class="reason">principal &mdash; debt unavailable</span>
@@ -177,7 +296,7 @@
                 th:title="|no metadata found for ${d.unit} — the amount above is raw, unscaled base units|">&#10071;</span>
           <span th:if="${d.metadataUnknown}" class="nometa-note">raw base units &mdash; no metadata</span>
         </td>
-        <td class="mono num" th:with="d=${r.collateralDisplay}">
+        <td class="mono num" th:with="d=${r.collateralDisplay}" th:title="|exact: ${d.exactText} ${d.label}|">
           <span th:text="${d.amountText}">0</span>
           <span class="ticker" th:text="${d.label}" th:title="${d.policyId}">TKR</span>
           <span th:if="${d.metadataUnknown}" class="nometa"
@@ -198,7 +317,8 @@
              integers side by side they read as the same quantity twice — which is exactly how they
              were read. Both now carry their scale and their ticker. -->
         <td class="mono num">
-          <span th:if="${r.feeDisplay != null}" th:text="${r.feeDisplay.amountText}">0</span>
+          <span th:if="${r.feeDisplay != null}" th:title="|exact: ${r.feeDisplay.exactText}|"
+                th:text="${r.feeDisplay.amountText}">0</span>
           <span th:if="${r.feeDisplay != null}" class="ticker"
                 th:text="${r.feeDisplay.label}" th:title="${r.feeDisplay.policyId}">TKR</span>
           <span th:if="${r.feeDisplay != null and r.feeDisplay.metadataUnknown}" class="nometa"
@@ -210,28 +330,32 @@
                throwing TemplateProcessingException. It only fired once a ROW rendered, so the page
                was 200 while preview was empty and 500 the moment two loans appeared. -->
           <span class="reason" th:if="${r.feeValueDisplay != null}"
-                th:text="|≈ ${r.feeValueDisplay.amountText} ADA at today's oracle price|">value</span>
+                th:title="|exact: ${r.feeValueDisplay.exactText} ADA|"
+                th:text="|≈ ${r.feeValueDisplay.amountText} ADA, today's oracle|">value</span>
           <span class="reason" th:if="${r.feeUnknownReason}" th:text="${r.feeUnknownReason}">why</span>
         </td>
+        <!-- ⚠ CHIPS, NOT PROSE. Both reasons move into `title`: an operator scanning ten rows reads
+             verdicts, and the sentence explaining each one is what made this table unreadable. -->
         <td>
-          <span class="pill"
+          <span class="route"
                 th:classappend="${r.route == 'CAPITAL IN ADVANCE'} ? 'advance' : (${r.route == 'CONVERT'} ? 'convert' : (${r.route == 'UNKNOWN'} ? 'unknown' : 'plain'))"
-                th:text="${r.route}">ROUTE</span>
-          <span class="reason" th:text="${r.routeDetail}">why</span>
-          <!-- ⛔ The pool's own verdict, for THIS loan. Reported whatever the route, because on an
-               ANTICIPATE market it is the configuration and not the chain that fronts the capital —
-               and an operator can change a setting but cannot change a pool's depth. -->
+                th:title="${r.routeDetail}" th:text="${r.route}">ROUTE</span>
           <span class="pool" th:if="${r.poolUsability != null}"
                 th:classappend="${#strings.toLowerCase(r.poolUsability.verdict)}"
+                th:title="${r.poolUsability.detail}"
                 th:text="${#strings.replace(r.poolUsability.verdict, '_', ' ')}">POOL</span>
-          <span class="reason" th:if="${r.poolUsability != null}"
-                th:text="${r.poolUsability.detail}">pool detail</span>
+          <!-- ⛔ AN UNKNOWN KEEPS ITS REASON ON SCREEN. Everything else may hide behind a tooltip;
+               this may not. A tooltip is invisible on touch and absent from a screenshot, and an
+               "unknown" with no reason is precisely the failure this page exists to prevent. -->
+          <span class="reason" th:if="${r.poolUsability != null and r.poolUsability.verdict.name() == 'UNKNOWN'}"
+                th:text="${r.poolUsability.detail}">why</span>
         </td>
         <td class="mono num">
           <!-- F5 (round 2) — name the UNIT beside the figure: r.principalUnit is the SAME asset this
                amount is denominated in, never lovelace, and a 4.63x-wrong number in the wrong unit is
                exactly the failure this caption exists to prevent. -->
-          <span th:if="${r.advanceDisplay != null}" th:text="${r.advanceDisplay.amountText}">0</span>
+          <span th:if="${r.advanceDisplay != null}" th:title="|exact: ${r.advanceDisplay.exactText}|"
+                th:text="${r.advanceDisplay.amountText}">0</span>
           <span th:if="${r.advanceDisplay != null}" class="ticker"
                 th:text="${r.advanceDisplay.label}" th:title="${r.advanceDisplay.policyId}">TKR</span>
           <span th:if="${r.advanceDisplay != null and r.advanceDisplay.metadataUnknown}" class="nometa"
@@ -240,28 +364,52 @@
                 class="unknown">unknown</span>
           <span th:if="${r.advancePrincipalAmount == null and r.route != 'CAPITAL IN ADVANCE'}"
                 class="reason">&mdash;</span>
-          <span class="reason" th:if="${r.advancePrincipalAmount != null}">repayment to the lender &mdash; capital you must have ready</span>
         </td>
-        <!-- ⛔ A DIFFERENT QUESTION FROM THE ROUTE, shown on every row on purpose. "Which route pays
-             better here" cannot be answered by a figure that only appears once the other route has
-             already failed. See AnticipateAndSell. -->
-        <td class="mono num">
-          <span th:if="${r.anticipateDisplay != null}"
-                th:classappend="${r.anticipateAndSell.profitable()} ? 'ok' : 'bad'"
-                th:text="${r.anticipateDisplay.amountText}">0</span>
-          <span th:if="${r.anticipateDisplay != null}" class="ticker"
-                th:text="${r.anticipateDisplay.label}" th:title="${r.anticipateDisplay.policyId}">TKR</span>
-          <span th:if="${r.anticipateDisplay != null and r.anticipateDisplay.metadataUnknown}" class="nometa"
-                th:title="|no metadata for ${r.anticipateDisplay.unit} — raw, unscaled base units|">&#10071;</span>
-          <span th:unless="${r.anticipateAndSell.known()}" class="unknown">unknown</span>
-          <!-- ⚠ The three honesties travel WITH the number, not in a legend someone has to find:
-               it is two transactions rather than one, the quote prices the whole slice at once so
-               selling gradually does better, and the capital is tied up in between. -->
-          <span class="reason" th:text="${r.anticipateAndSell.detail}">why</span>
-          <span class="reason" th:if="${r.anticipateAndSell.known()}">estimate, not a quote &mdash; two
-            transactions, and the price may move between them</span>
+        <!-- ⛔ THE ONLY COLUMN THAT DESCRIBES INTENT. Everything left of it is what COULD happen;
+             this is what this node would do on the next scan, after the mode ceiling, the market cap
+             and the global convert switch. See ActionNow. -->
+        <td>
+          <span class="action" th:classappend="${r.actionNow.wouldAct()} ? 'act' : 'idle'"
+                th:title="${r.actionNow.detail()}" th:text="${r.actionNow.text()}">NONE</span>
         </td>
       </tr>
+      <!-- ⛔ THE BREAKDOWN, one click down rather than in the table. It exists because "why is the
+           capital required MORE than the debt" is the question this page kept provoking, and the
+           three middle lines answer it permanently instead of in a tooltip nobody re-reads. -->
+      <tr class="detail">
+        <td colspan="10">
+          <details>
+            <summary>economics &mdash; estimate only, this node submits nothing by looking</summary>
+            <dl>
+              <dt>Debt</dt>
+              <dd><span th:if="${r.debtDisplay != null}" th:text="${r.debtDisplay.amountText} + ' ' + ${r.debtDisplay.label}">0</span>
+                  <span th:if="${r.debtDisplay == null}" class="unknown">unknown</span></dd>
+
+              <dt>Capital required</dt>
+              <dd><span th:if="${r.advanceDisplay != null}" th:text="${r.advanceDisplay.amountText} + ' ' + ${r.advanceDisplay.label}">0</span>
+                  <span th:if="${r.advanceDisplay == null}" class="unknown">unknown</span>
+                  <span class="reason">the debt, PLUS the lender&rsquo;s liquidation penalty, MINUS your
+                    fee slice &mdash; which is why it is not the debt</span></dd>
+
+              <dt>Expected reward</dt>
+              <dd><span th:if="${r.feeValueDisplay != null}" th:text="${r.feeValueDisplay.amountText} + ' ' + ${r.feeValueDisplay.label}">0</span>
+                  <span th:if="${r.feeValueDisplay == null}" class="unknown">unknown</span>
+                  <span class="reason">your fee slice at oracle prices &mdash; the ideal, before costs
+                    and before the pool&rsquo;s own price</span></dd>
+
+              <dt>Estimated gross margin</dt>
+              <dd><span th:if="${r.anticipateDisplay != null}"
+                        th:classappend="${r.anticipateAndSell.profitable()} ? 'ok' : 'bad'"
+                        th:text="${r.anticipateDisplay.amountText} + ' ' + ${r.anticipateDisplay.label}">0</span>
+                  <span th:unless="${r.anticipateAndSell.known()}" class="unknown">unknown</span>
+                  <!-- ⚠ The honesties stay VISIBLE here, where there is room for them: this is the
+                       figure someone would commit capital against. -->
+                  <span class="reason" th:text="${r.anticipateAndSell.detail()}">why</span></dd>
+            </dl>
+          </details>
+        </td>
+      </tr>
+      </th:block>
       <tr th:if="${#lists.isEmpty(rows)}">
         <td colspan="10" class="empty">No loans indexed. On a healthy node that means a quiet market
           &mdash; but it looks identical to a node pinned to a superseded deployment, or to one whose
