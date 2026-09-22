@@ -178,58 +178,79 @@ public class ScheduledTransactionService {
                 scheduledTank.size(),
                 processableScheduledTransactions.size());
 
-        processableScheduledTransactions.forEach(datumTankUtxo -> {
+        // ⛔ ONE WALLET READ AND ONE PROTOCOL-PARAMS READ PER CYCLE, NOT PER TANK.
+        //
+        // Both of these are PROVIDER CALLS and both were inside the loop below. With 535 processable
+        // tanks that is 1,070 Blockfrost calls per cycle, every five minutes — and AppUtxoService's
+        // own javadoc promises "one provider call per cycle", which had quietly stopped being true.
+        //
+        // ⚠ AND THE PER-TANK READ WAS LOAD-BEARING BEFORE THIS CHANGE, which is why hoisting it
+        // alone would have BROKEN the bot rather than sped it up. Selection took the SMALLEST
+        // qualifying utxo, so every tank in a cycle chose the SAME one; the loop only worked because
+        // completeAndWait() waited for confirmation and the next iteration re-read a wallet that now
+        // held the change. The read WAS the chaining.
+        //
+        // ⇒ So the read is hoisted AND the coupling is removed together: each tank is assigned its
+        // OWN wallet utxo from a pool built once. The transactions then share no input and cannot
+        // conflict, which is why no chaining is needed — not because the waiting was unnecessary,
+        // but because the dependency it existed to satisfy is gone.
+        List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
+        if (walletUtxos.isEmpty()) {
+            log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
+            return;
+        }
 
+        var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
+                .getProtocolParams();
+        var required = LedgerCeilings.maxPossibleFee(protocolParams);
+
+        // ⚠ SMALLEST-FIRST, still: largest-first would spend the biggest utxo to pay a fee and
+        // fragment the wallet against the case where a large one is genuinely needed. Ordering the
+        // POOL this way means the cheapest suitable utxos are consumed first, tank by tank.
+        var walletPool = walletPool(walletUtxos, required);
+
+        if (walletPool.isEmpty()) {
+            var largest = walletUtxos.stream()
+                    .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
+                    .map(LedgerCeilings::lovelaceOf)
+                    .max(java.math.BigInteger::compareTo);
+            log.warn("no ada-only wallet utxo covers the {} lovelace this ledger could charge; "
+                            + "largest available is {}. Fund the wallet with a single ada-only "
+                            + "utxo of at least that amount.",
+                    required, largest.map(Object::toString).orElse("none at all"));
+            return;
+        }
+
+        // ⚠ How many tanks this cycle can do is now bounded by the wallet's SHAPE, not its balance:
+        // one ada-only utxo per tank. Said once, here, because an operator watching a backlog drain
+        // slowly needs to know the lever is "split the wallet into more utxos", not "add more ada".
+        if (walletPool.size() < processableScheduledTransactions.size()) {
+            log.info("{} processable tanks but only {} usable wallet utxos — processing {} this "
+                            + "cycle and the rest next. Each tank needs its own ada-only utxo of at "
+                            + "least {} lovelace; split the wallet to raise this ceiling.",
+                    processableScheduledTransactions.size(), walletPool.size(), walletPool.size(),
+                    required);
+        }
+
+        for (var datumTankUtxo : processableScheduledTransactions) {
+
+            if (walletPool.isEmpty()) {
+                break;
+            }
             var tankPaymentUtxo = datumTankUtxo.utxo();
             var tankDatum = datumTankUtxo.datumTank();
 
             try {
 
-                List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
-                if (walletUtxos.isEmpty()) {
-                    log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
-                    return;
-                }
-
-                // The wallet input must be ada-only, must not carry a reference script, and must
-                // PROVABLY COVER what this transaction can cost (T-053).
+                // ⛔ ONE UTXO PER TANK, TAKEN FROM THE POOL — the reason these transactions need no
+                // chaining. Each carries a different wallet input, so none conflicts with another
+                // and none has to wait for the previous one's change to exist and be indexed.
                 //
-                // It used to be `findFirst()` with no size floor, which takes an ARBITRARY ada-only
-                // utxo — dust included. That is the shape that starved the liquidation path on a
-                // 1 ADA output on 2026-08-25.
-                //
-                // ⚠ SMALLEST THAT SUFFICES, not largest-first. Largest-first would spend the biggest
-                // utxo to pay a fee and fragment the wallet against the case where a large one is
-                // genuinely needed; Giovanni's own words are "a 5 ada utxo would be perfect". The
-                // requirement is DERIVED from the protocol parameters, never assumed — see
-                // LedgerCeilings, which exists because cardano-client-lib answers this same question
-                // with a hardcoded Amount.ada(5.0).
-                // ⚠ Derived from the BACKEND, not from a ProtocolParamsSupplier bean: that bean is
-                // @ConditionalOnProperty(loans.enabled) and lending is DISABLED ON MAINNET, so
-                // depending on it here would break the context on the one path operators run.
-                var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
-                        .getProtocolParams();
-                var required = LedgerCeilings.maxPossibleFee(protocolParams);
-
-                var walletUtxoOpt = walletUtxos
-                        .stream()
-                        .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
-                        .filter(utxo -> LedgerCeilings.lovelaceOf(utxo).compareTo(required) >= 0)
-                        .min(Comparator.comparing(LedgerCeilings::lovelaceOf));
-
-                if (walletUtxoOpt.isEmpty()) {
-                    var largest = walletUtxos.stream()
-                            .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
-                            .map(LedgerCeilings::lovelaceOf)
-                            .max(java.math.BigInteger::compareTo);
-                    log.warn("no ada-only wallet utxo covers the {} lovelace this ledger could charge; "
-                                    + "largest available is {}. Fund the wallet with a single ada-only "
-                                    + "utxo of at least that amount.",
-                            required, largest.map(Object::toString).orElse("none at all"));
-                    return;
-                }
-
-                var walletUtxo = walletUtxoOpt.get();
+                // The selection RULE is unchanged and its reasoning still holds (T-053): ada-only,
+                // no reference script, and PROVABLY covering what the ledger could charge, smallest
+                // first. What changed is only that the pool is built once and drained here, instead
+                // of every tank re-reading the wallet and picking the same utxo.
+                var walletUtxo = walletPool.poll();
 
                 var batcher = AddressUtil.toOnchainAddress(account.getBaseAddress());
 
@@ -318,7 +339,41 @@ public class ScheduledTransactionService {
                 log.warn("Error", e);
             }
 
-        });
+        }
+    }
+
+    /**
+     * ⛔ <b>The cycle's wallet inputs — one per tank, which is what removes the need to chain.</b>
+     *
+     * <p>Each tank transaction spends its own ada-only utxo, so no two share an input and none has
+     * to wait for the previous one's change to exist and be indexed. Before this existed, selection
+     * took the SMALLEST qualifying utxo on every iteration — the same one each time — and the loop
+     * only worked because {@code completeAndWait()} waited and the next iteration re-read a wallet
+     * that now held the change. The per-tank read WAS the chain.
+     *
+     * <p>The selection RULE is unchanged and its reasoning stands (T-053):
+     * <ul>
+     *   <li><b>ada-only</b> — a utxo carrying tokens drags them into a transaction that did not ask
+     *       for them;</li>
+     *   <li><b>no reference script</b> — spending one destroys it permanently, and this service
+     *       spends from the same wallet the liquidation bot publishes into;</li>
+     *   <li><b>provably covers</b> what the ledger could charge, derived from protocol parameters
+     *       rather than assumed;</li>
+     *   <li><b>smallest first</b> — largest-first would spend the biggest utxo to pay a fee and
+     *       fragment the wallet against the case where a large one is genuinely needed.</li>
+     * </ul>
+     *
+     * <p>⚠ The pool's SIZE is the cycle's ceiling, and it is a property of the wallet's SHAPE rather
+     * than its balance: ten tanks need ten utxos, not ten times the ada. Package-private so that
+     * distinctness can be tested without a Spring context, a provider or a signer — the whole reason
+     * the previous coupling went unnoticed is that nothing could exercise it.
+     */
+    static java.util.Deque<Utxo> walletPool(List<Utxo> walletUtxos, java.math.BigInteger required) {
+        return new java.util.ArrayDeque<>(walletUtxos.stream()
+                .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
+                .filter(utxo -> LedgerCeilings.lovelaceOf(utxo).compareTo(required) >= 0)
+                .sorted(Comparator.comparing(LedgerCeilings::lovelaceOf))
+                .toList());
     }
 
     /**
