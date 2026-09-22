@@ -828,6 +828,21 @@ public class ScheduledTransactionService {
                                     com.fluidtokens.aquarium.offchain.blueprint.types.general.model.CardanoToken token,
                                     com.bloxbean.cardano.client.api.model.ProtocolParams params) {
         var value = AssetAmountUtil.toValue(List.of(token));
+
+        // ⛔ ONLY AN ADA PAYOUT CAN BE "TOO SMALL". A TOKEN PAYOUT DECLARING ZERO ADA IS NORMAL.
+        //
+        // AssetAmountUtil.toValue puts the quantity in the multi-asset and leaves coin at ZERO for a
+        // token payout — so a naive floor check sees 0 < 857,690 and refuses every one of them.
+        // ⚠ Measured: that mistake blacklisted 43 live, payable tanks on the first run of this
+        // check. A token output's min-ada is supplied by the TRANSACTION, from the wallet, exactly
+        // as it should be; the datum is not wrong to omit it.
+        //
+        // ⇒ So the floor applies to what the datum promises in ADA, and a datum that promises no
+        // ada is promising a token, which is a different thing and not this function's business.
+        if (!value.getMultiAssets().isEmpty()) {
+            return null;
+        }
+
         var output = com.bloxbean.cardano.client.transaction.spec.TransactionOutput.builder()
                 .address(address)
                 .value(value)

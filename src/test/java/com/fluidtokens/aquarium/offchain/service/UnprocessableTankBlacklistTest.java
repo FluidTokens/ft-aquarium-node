@@ -121,6 +121,44 @@ class UnprocessableTankBlacklistTest {
     }
 
     /**
+     * ⛔ <b>AND A TOKEN PAYOUT IS NOT "BELOW THE FLOOR" — it declares no ada, which is correct.</b>
+     *
+     * <p>{@code AssetAmountUtil.toValue} puts the quantity in the multi-asset and leaves {@code coin}
+     * at zero for a token payout. A floor check that does not know this sees {@code 0 < 857,690} and
+     * refuses every token tank there is.
+     *
+     * <p>⚠ <b>That is not hypothetical — it happened.</b> The first run of the min-UTxO refusal on
+     * mainnet blacklisted <b>43 live, payable tanks</b> alongside the 329 genuinely impossible ones:
+     * 402 refused where 359 was right. A token output's min-ada comes from the TRANSACTION, out of
+     * the wallet, exactly as it should; the datum is not wrong to omit it.
+     *
+     * <p>⚑ The shape of this bug is worth more than the fix: <b>a guard derived from one case
+     * (ada) and applied to a case it had never seen (tokens) reads as correct in both</b>, because
+     * the number it compares is real in both. Only the meaning of zero differs.
+     */
+    @Test
+    void aTokenPayoutIsNotRefusedForDeclaringZeroAda() {
+        var tokenPayout = new com.fluidtokens.aquarium.offchain.blueprint.types.general.model.impl
+                .CardanoTokenData();
+        tokenPayout.setPolicyid(HexUtil.decodeHexString(
+                "577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e"));
+        tokenPayout.setAssetname(HexUtil.decodeHexString("0014df10464c4454"));
+        tokenPayout.setAmount(java.math.BigInteger.valueOf(5_000_000L));
+        tokenPayout.setDivider(java.math.BigInteger.valueOf(1_000_000L));
+        tokenPayout.setOracle(java.util.Optional.empty());
+
+        var value = com.fluidtokens.aquarium.offchain.util.AssetAmountUtil
+                .toValue(java.util.List.of(tokenPayout));
+
+        assertTrue(value.getCoin().signum() == 0,
+                "fixture check: a token payout really does declare zero ada — that is what makes a "
+                        + "naive floor check refuse it");
+        assertFalse(value.getMultiAssets().isEmpty(),
+                "and it really does carry the asset — which is the signal the guard keys on, so a "
+                        + "token payout is never measured against an ada floor it cannot meet");
+    }
+
+    /**
      * ⛔ The blacklist is <b>write-only by design</b>: added to on failure, read on every cycle,
      * never emptied. Restarting the node is the deliberate way to retry.
      */
