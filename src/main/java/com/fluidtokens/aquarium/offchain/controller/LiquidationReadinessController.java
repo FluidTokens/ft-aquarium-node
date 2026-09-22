@@ -13,6 +13,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.LoanHealth;
 import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
+import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
 import com.fluidtokens.aquarium.offchain.service.loans.AnticipateAndSell;
@@ -144,6 +145,9 @@ public class LiquidationReadinessController {
                       // the pool status is the chain's answer, and actionNow is what this node would
                       // actually do — which on a disabled node is "nothing", however good the rest looks.
                       ActionNow actionNow,
+                      // ⚠ Why the bot could not act on this loan IF IT HAD TO — forward-looking, and
+                      // independent of whether it is liquidatable today. See ProcessingBlocker.
+                      ProcessingBlocker blocker,
                       // cexplorer links. Null when the network or the loan policy is unknown — a dead
                       // link is worse than none, so the template renders plain text instead.
                       String loanExplorerUrl,
@@ -162,8 +166,25 @@ public class LiquidationReadinessController {
     private final ObjectProvider<MinswapPoolResolver> poolResolver;
     private final ObjectProvider<TokenMetadataService> tokenMetadata;
     private final ObjectProvider<LoansContractRegistry> registry;
+    private final ObjectProvider<AppUtxoService> walletUtxos;
     private final AppConfig.LiquidationConfiguration liquidationConfiguration;
     private final AppConfig.Network network;
+
+    /**
+     * ⛔ CACHED, because reading it is a PROVIDER CALL. {@code AppUtxoService.listWalletUtxo()} asks
+     * Blockfrost first by design — an index-backed balance cannot tell an empty wallet from one whose
+     * history starts below the sync point — and this page re-renders every sixty seconds in every
+     * open tab. Per-render reads would multiply provider traffic by the number of people looking.
+     *
+     * <p>⚠ And a cached number shown as live is the failure that replaces the one being avoided, so
+     * the reading's AGE is rendered beside it. Volatile rather than synchronized: a duplicate read
+     * under a race costs one provider call, and a lock on a render path costs a stall.
+     */
+    private static final long WALLET_TTL_MILLIS = 60_000L;
+
+    /** ⚠ Safe only because the default sort is health-ascending: page 1 is the urgent page. */
+    static final int PAGE_SIZE = 25;
+    private volatile WalletBalance cachedWallet = WalletBalance.unknown();
 
     // ⚠ @Value fields rather than constructor parameters: these three are read ONLY to describe the
     // node's posture in the banner, nothing computes with them, and threading them through a
@@ -183,6 +204,7 @@ public class LiquidationReadinessController {
                                           ObjectProvider<MinswapPoolResolver> poolResolver,
                                           ObjectProvider<TokenMetadataService> tokenMetadata,
                                           ObjectProvider<LoansContractRegistry> registry,
+                                          ObjectProvider<AppUtxoService> walletUtxos,
                                           AppConfig.LiquidationConfiguration liquidationConfiguration,
                                           AppConfig.Network network) {
         this.scanner = scanner;
@@ -192,6 +214,7 @@ public class LiquidationReadinessController {
         this.poolResolver = poolResolver;
         this.tokenMetadata = tokenMetadata;
         this.registry = registry;
+        this.walletUtxos = walletUtxos;
         this.liquidationConfiguration = liquidationConfiguration;
         this.network = network;
     }
@@ -207,7 +230,8 @@ public class LiquidationReadinessController {
                             @RequestParam(name = "sort", required = false) String sort,
                             @RequestParam(name = "dir", required = false) String dir,
                             @RequestParam(name = "principal", required = false) String principal,
-                            @RequestParam(name = "collateral", required = false) String collateral) {
+                            @RequestParam(name = "collateral", required = false) String collateral,
+                            @RequestParam(name = "page", required = false) Integer page) {
         model.addAttribute("network", network == null ? "unknown" : network.getNetwork());
         model.addAttribute("generatedAt", java.time.Instant.now().toString());
         model.addAttribute("status", OperationalStatus.of(liquidationConfiguration,
@@ -244,11 +268,39 @@ public class LiquidationReadinessController {
         long now = System.currentTimeMillis();
         model.addAttribute("disabledReason", null);
         List<Row> all = rows(loans, scan, health, now);
+        WalletBalance walletNow = wallet(now);
+        model.addAttribute("wallet", walletNow);
+        model.addAttribute("walletAgeSeconds", walletNow.ageSeconds(now));
+        // ⚠ Scaled and tickered through the SAME AssetDisplay the table uses, so the balance cannot
+        // render in different units from the loan figures it is meant to be compared against.
+        Map<String, TokenMetadata> walletMeta = new java.util.HashMap<>();
+        Map<String, AssetDisplay> walletDisplay = new java.util.LinkedHashMap<>();
+        walletNow.byUnit().forEach((unit, amount) ->
+                walletDisplay.put(unit, display(unit, amount, walletMeta)));
+        model.addAttribute("walletDisplay", walletDisplay);
         // ⚠ The SELECT options come from the loans actually present, never from a fixed list: an
         // option that matches nothing is a filter an operator can set and then wonder about.
         model.addAttribute("principals", all.stream().map(Row::principalUnit).distinct().sorted().toList());
         model.addAttribute("collaterals", all.stream().map(Row::collateralUnit).distinct().sorted().toList());
-        model.addAttribute("rows", arrange(all, sort, dir, principal, collateral));
+        List<Row> arranged = arrange(all, sort, dir, principal, collateral);
+
+        // ⛔ THE COUNTS ARE TOTALS, NEVER THE PAGE'S. "2 liquidatable" meaning "on this page" is the
+        // exact class of half-truth this page exists to avoid, and the phone view reads these.
+        model.addAttribute("totalRows", arranged.size());
+        model.addAttribute("liquidatableCount",
+                arranged.stream().filter(r -> Boolean.TRUE.equals(r.liquidatable())).count());
+        model.addAttribute("blockedCount",
+                arranged.stream().filter(r -> r.blocker() != null && r.blocker().blocked()).count());
+
+        int pages = Math.max(1, (arranged.size() + PAGE_SIZE - 1) / PAGE_SIZE);
+        // ⚠ CLAMPED, not trusted. A stale ?page= from a bookmark, or one left behind when a filter
+        // narrowed the list, must land on a real page rather than an empty one that reads as
+        // "the filter matched nothing".
+        int current = Math.min(Math.max(page == null ? 1 : page, 1), pages);
+        int from = (current - 1) * PAGE_SIZE;
+        model.addAttribute("page", current);
+        model.addAttribute("pages", pages);
+        model.addAttribute("rows", arranged.subList(from, Math.min(from + PAGE_SIZE, arranged.size())));
         return "readiness";
     }
 
@@ -284,6 +336,36 @@ public class LiquidationReadinessController {
         return out;
     }
 
+    /**
+     * The wallet, at most once per {@link #WALLET_TTL_MILLIS}. A failed read leaves the previous
+     * value standing rather than replacing a known balance with an unknown one — a transient
+     * provider blip should not make every affordability mark on the page go grey.
+     */
+    WalletBalance wallet(long now) {
+        WalletBalance cached = cachedWallet;
+        if (cached.known() && now - cached.asOfMillis() < WALLET_TTL_MILLIS) {
+            return cached;
+        }
+        AppUtxoService service = walletUtxos.getIfAvailable();
+        if (service == null) {
+            return cached;
+        }
+        try {
+            WalletBalance fresh = WalletBalance.of(service.listWalletUtxo(), now);
+            // ⚠ listWalletUtxo() logs and returns an EMPTY LIST when the provider cannot be reached,
+            // so an empty result is ambiguous. Keeping a previously known balance is the honest
+            // reading of "we learned nothing new", and it is also the safe one.
+            if (fresh.byUnit().isEmpty() && cached.known()) {
+                return cached;
+            }
+            cachedWallet = fresh;
+            return fresh;
+        } catch (RuntimeException e) {
+            log.warn("the wallet balance could not be read for the readiness page: {}", e.toString());
+            return cached;
+        }
+    }
+
     private List<Row> rows(LoanService loans, LiquidationCandidateScanner scan,
                            LoanHealthService healthService, long now) {
         LiquidationCandidateScanner.Scan result = scan.scan(now);
@@ -300,9 +382,13 @@ public class LiquidationReadinessController {
         // of the ASSET, not of the row, and a table is mostly two or three distinct assets.
         Map<String, TokenMetadata> metadataMemo = new HashMap<>();
         List<Row> rows = new ArrayList<>();
+        // ⚠ ONCE per render, not once per row: it is a provider call behind a TTL, and twenty loans
+        // asking the same question twenty times would defeat the cache on the first miss.
+        WalletBalance wallet = wallet(now);
         for (Loan loan : result.loanCensus().loans()) {
             LiquidationAssessment assessment = byLoanId.get(loan.loanId());
-            rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo, metadataMemo, now));
+            rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo,
+                    metadataMemo, wallet, now));
         }
         rows.sort(Comparator.comparingDouble(Row::sortKey));
         return rows;
@@ -310,7 +396,7 @@ public class LiquidationReadinessController {
 
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
                     MarketGate gate, Map<String, PoolFetch> poolMemo,
-                    Map<String, TokenMetadata> metadataMemo, long now) {
+                    Map<String, TokenMetadata> metadataMemo, WalletBalance wallet, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
 
@@ -417,6 +503,17 @@ public class LiquidationReadinessController {
 
         // ⛔ COMPUTED FROM THE EFFECTIVE STATE, never the configured one: the node mode is a ceiling,
         // the cap is per-loan, and convert can be off globally. See ActionNow.
+        // ⚠ The FORWARD question, asked whatever this loan's health is today: if it crossed the
+        // threshold in the next hour, could the bot handle it? A mark that only appeared once a loan
+        // was already liquidatable would arrive too late to move capital.
+        BigInteger principalBalance = wallet.of(datum.principalAsset().toUnit());
+        ProcessingBlocker blocker = ProcessingBlocker.of(
+                gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
+                gate.marketFor(datum.principalAsset()), convertEnabled,
+                bond != null && bond.datum().shouldLiquidationConvertToPrincipal(),
+                new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
+                advance, principalBalance, wallet.known());
+
         ActionNow actionNow = ActionNow.of(health.liquidatable(),
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                 gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance);
@@ -441,7 +538,7 @@ public class LiquidationReadinessController {
                 anticipate,
                 anticipate.netInPrincipal() == null ? null
                         : display(datum.principalAsset().toUnit(), anticipate.netInPrincipal(), metadataMemo),
-                actionNow,
+                actionNow, blocker,
                 loanAssetUrl(loan.loanId()), txUrl(loan.utxoRef()));
     }
 

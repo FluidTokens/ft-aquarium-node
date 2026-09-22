@@ -99,6 +99,9 @@ class ReadinessTemplateRendersRowsTest {
                 // ⚠ A LIVE, would-act row: `wouldAct` drives a distinct class, so a fixture that only
                 // ever renders the idle branch would never exercise the cell an operator reacts to.
                 new ActionNow("CONVERT", "live: this loan would be liquidated on the next scan", true),
+                // ⚠ A BLOCKED row on purpose: the badge is the branch this fixture exists to render.
+                new ProcessingBlocker("funds", "the wallet holds less of this loan's principal than "
+                        + "the advance would need"),
                 "https://cexplorer.io/asset/aabbccdd1b6fda505ea9b739e42b5871d274344af37c196ddb70619541a7d06d",
                 "https://cexplorer.io/tx/d832b78e");
     }
@@ -117,7 +120,8 @@ class ReadinessTemplateRendersRowsTest {
                 PoolUsability.checkFailed("SocketTimeoutException"),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no lender bond indexed"), null,
-                ActionNow.of(null, null, null, null, true, false, null), null, null);
+                ActionNow.of(null, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                null, null);
     }
 
     /**
@@ -203,6 +207,21 @@ class ReadinessTemplateRendersRowsTest {
         context.setVariable("principalFilter", null);
         context.setVariable("collateralFilter", null);
         context.setVariable("filterQuery", "");
+        // ⚠ A KNOWN, non-empty wallet: the strip's branches are amount/ticker rendering, and a fixture
+        // with an unknown balance would only ever exercise the "unknown" path.
+        context.setVariable("wallet", new WalletBalance(
+                java.util.Map.of("lovelace", BigInteger.valueOf(12_500_000L)),
+                System.currentTimeMillis(), true));
+        context.setVariable("walletDisplay", java.util.Map.of("lovelace",
+                AssetDisplay.of(BigInteger.valueOf(12_500_000L), TokenMetadata.ada())));
+        context.setVariable("walletAgeSeconds", 34L);
+        context.setVariable("totalRows", rows.size());
+        context.setVariable("liquidatableCount",
+                rows.stream().filter(r -> Boolean.TRUE.equals(r.liquidatable())).count());
+        context.setVariable("blockedCount",
+                rows.stream().filter(r -> r.blocker() != null && r.blocker().blocked()).count());
+        context.setVariable("page", 1);
+        context.setVariable("pages", 1);
         context.setVariable("principals", List.of("lovelace"));
         context.setVariable("collaterals", List.of(FLDT_UNIT));
         context.setVariable("rows", rows);
@@ -400,6 +419,7 @@ class ReadinessTemplateRendersRowsTest {
                 usability,
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), null, null);
+                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                null, null);
     }
 }
