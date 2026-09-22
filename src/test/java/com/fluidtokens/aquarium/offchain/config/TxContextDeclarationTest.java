@@ -83,25 +83,67 @@ class TxContextDeclarationTest {
         // ---- V5: the structural assertion, installed INSIDE the build pipeline (T-054) --------
         d.put("postBalanceTx", new LinkedHashMap<>(Map.of(
                 LIQ, Entry.set(), CONVERT, Entry.set(),
-                // ⛔ THE MAINNET PATH HAS NO STRUCTURAL ASSERTIONS AT ALL. This is T-059, queued and
-                // NOT prioritised — Giovanni's scope call, because the CCL review's brief was the
-                // review and this is new work. Declared here so it is a decision, not an oversight.
-                TANK, Entry.omitted("T-059: the tank asserts nothing about the body it built. QUEUED, "
-                        + "not decided — and it is the only path that runs on MAINNET"))));
+                // ⛔ THE TANK NOW USES IT, AND NOT FOR ASSERTIONS — IT RESHAPES THE BODY.
+                //
+                // postBalanceTx is the only hook that runs AFTER balancing (QuickTxBuilder:478), and
+                // after balancing is the only moment this transaction can be put right. CCL balances
+                // to a change output below min-UTxO, so ChangeOutputAdjustments reaches into the
+                // operator's wallet unasked, adds an input and leaves a third output — costing the
+                // operator ada on every payment, because a tank is funded to pay its own fee exactly
+                // and has no spare to give back.
+                //
+                // stripOperatorContribution() removes that input and that output and lets the fee
+                // take the tank's remainder. Measured: 1 input, 2 outputs, fee 340,000 against a
+                // minimum of ~322,752.
+                //
+                // ⚠ IT IS A SETTER, like preBalanceTx (QuickTxBuilder:275 assigns rather than
+                // composes) — a second call here silently discards the first, so the structural
+                // assertions T-059 wants cannot simply be added as another postBalanceTx. They have
+                // to go inside this one, or through withVerifier, which DOES compose.
+                TANK, Entry.set())));
 
         // ---- collateral: nominated by us on the liquidation paths (T-050) --------------------
         d.put("withCollateralInputs", new LinkedHashMap<>(Map.of(
                 LIQ, Entry.set(), CONVERT, Entry.set(),
-                TANK, Entry.omitted("relies on cardano-client-lib's automatic collateral, which at "
-                        + "0.7.2 builds its own selection strategy invisible to withUtxoSelectionStrategy "
-                        + "and hardcodes 5 ADA. Structurally unguardable, not an oversight"))));
+                // ⛔ THIS ENTRY HAS BEEN WRONG IN BOTH DIRECTIONS, and both wrong versions are
+                // recorded because the pair is the lesson.
+                //
+                // (1) "structurally unguardable" -- false. withUtxoSelectionStrategy genuinely
+                //     cannot reach CCL's collateral selector, which is what that note observed; it
+                //     concluded no lever existed, when withCollateralInputs is one.
+                // (2) "the tank nominates the same wallet utxo it spends" -- false, and worse,
+                //     because it acted on (1)'s correction without reading the rest of the sentence:
+                //     ReferenceScriptSafeUtxoSelection says a pinned collateral input is EXCLUDED
+                //     from ordinary coin selection, so it cannot also front the principal.
+                //
+                // ⚑ Both objections dissolved once the tank stopped taking a wallet input at all.
+                // It now spends ONLY ITS OWN TANK, so the collateral utxo is not wanted as an input
+                // and being excluded from selection is exactly the behaviour required. Pinning is
+                // also necessary rather than optional: buildCollateralOutput (QuickTxBuilder:499)
+                // calls select(payingAddress, DEFAULT_COLLATERAL_AMT, null) -- that third argument
+                // is utxosToExclude, it is null, and an unpinned CCL is therefore free to nominate a
+                // utxo the transaction already spends.
+                //
+                // ⚠ One utxo backs EVERY tank in the cycle, because collateral is consumed only on
+                // a phase-2 failure. That is what uncapped the processor: the number of tanks per
+                // cycle no longer depends on the wallet's utxo count.
+                TANK, Entry.set())));
 
         // ---- evaluation ----------------------------------------------------------------------
         d.put("withTxEvaluator", new LinkedHashMap<>(Map.of(
                 LIQ, Entry.set(), CONVERT, Entry.set(),
-                TANK, Entry.omitted("submits via completeAndWait(), so QuickTxBuilder wires the "
-                        + "TransactionProcessor as the evaluator itself; supplying one would be "
-                        + "redundant, not absent"))));
+                // ⛔ WAS "redundant, not absent". The redundancy was real and the CONCLUSION was
+                // wrong: QuickTxBuilder does wire the backend's TransactionProcessor as the
+                // evaluator, so one is always present -- but WHICH one is then decided by the
+                // backend, and on mainnet 2026-09-22 Blockfrost's could not DECODE the transaction
+                // at all ("DeserialiseFailure 0 expected tag"). An evaluator you did not choose is
+                // not the same as one you do not need.
+                //
+                // ⚠ CONDITIONAL, and it ships OFF: set only when
+                // scheduling.transaction-processor.ogmios-url is configured. Unset, the behaviour is
+                // exactly as declared before. This is a DIAGNOSTIC for that failure, not the fix --
+                // requiring operators to run Ogmios would undo this node's "no Kupo/Ogmios" design.
+                TANK, Entry.set())));
 
         // ---- signing: the liquidation builders must NOT be able to submit ---------------------
         for (String knob : List.of("withSigner", "withRequiredSigners")) {

@@ -444,6 +444,38 @@ scheduling:
     # ⚠ Upgrading across this change: a processor that was running will STOP until this is set.
     enabled: ${SCHEDULING_TRANSACTION_PROCESSOR_ENABLED:false}
     delay-minutes: ${SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES:5}
+    # ⛔ A DIAGNOSTIC, AND IT SHIPS EMPTY. Unset, script-cost evaluation goes through the configured
+    # backend (Blockfrost) exactly as before; set, it goes to this Ogmios instead.
+    #
+    # ⚠ It exists because on mainnet 2026-09-22 Blockfrost answered every tank transaction with
+    # `DeserialiseFailure 0 "expected tag"` -- it could not DECODE the transaction, so nothing reached
+    # phase 1 or a validator. The reference implementation this builder was derived from
+    # (MainnetTankTest.executePayment, commented out) differs in exactly one line: it evaluated
+    # through Ogmios. This answers whether the TRANSACTION is malformed or whether Blockfrost's
+    # evaluator is simply the wrong tool for it.
+    #
+    # ⛔ DO NOT TREAT THIS AS THE FIX. This node's whole architecture is "straight to a relay, no
+    # Kupo/Ogmios", and the README sells that as why an operator's costs stay low. Requiring every
+    # operator to run Ogmios would undo it. If Ogmios proves the transaction sound, the shipped fix
+    # belongs elsewhere -- most likely the offline Aiken evaluator already used in the dry-eval rigs.
+    ogmios-url: ${SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL:}
+    # ⛔ DIAGNOSTIC. Builds each transaction, LOGS ITS CBOR, AND SUBMITS NOTHING.
+    #
+    # The provider rejects these transactions while DECODING them, and its message is not reliable
+    # about WHAT it choked on -- the same class of failure has previously reported "expected array or
+    # int, got TypeNInt" for a negative value. The message is a symptom; the bytes are the evidence.
+    #
+    # ⚠ This ALSO turns ignoreScriptCostEvaluationError ON, which is the only way to get past a
+    # failing evaluation and reach a serialisable transaction. The result therefore carries
+    # PLACEHOLDER ex-units, and submitting one is CCL trap 8 -- accepted by the mempool, failed in
+    # PHASE 2, collateral forfeit. So this mode calls build() and returns: the submit path is not
+    # reachable while it is on. Turn it off again before arming.
+    #
+    # ⚑ It was defaulted TRUE on fix/tank-wallet-fanout for one deploy, and that deploy is
+    # what solved this: the dumped bytes showed output[0] carrying a 29-byte address under a
+    # 57-byte header, which is the whole of DeserialiseFailure 0 "expected tag". Back to false --
+    # AddressUtil now refuses the datum that produced it.
+    dump-cbor: ${SCHEDULING_TRANSACTION_PROCESSOR_DUMP_CBOR:false}
 
 blockfrost:
   url: https://cardano-mainnet.blockfrost.io/api/v0/
