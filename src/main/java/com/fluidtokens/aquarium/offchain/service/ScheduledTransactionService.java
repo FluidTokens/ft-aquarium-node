@@ -143,17 +143,10 @@ public class ScheduledTransactionService {
      * failed in phase 2, collateral forfeit. Hence {@code build()} and an immediate {@code continue}:
      * in this mode the code path that submits is not reachable.
      *
-     * <p>⛔⛔ <b>THE DEFAULT IS {@code true} ON THIS BRANCH ONLY, AND IT MUST NOT REACH {@code main}.</b>
-     * Giovanni runs this on Kubernetes, where adding an environment variable means editing the Helm
-     * chart — so a flag that must be switched on to be useful would not have been switched on. His
-     * instruction was to hack it here and roll it back once the cause is found.
-     *
-     * <p>⚠ <b>While this default stands, the processor SUBMITS NOTHING.</b> That is the intended
-     * trade, not a side effect: every tank transaction is currently rejected at decode anyway, so
-     * the cost is zero and the return is the bytes. <b>Restore {@code :false} in the commit that
-     * fixes the decode failure</b> — {@code ScheduledTransactionDumpDefaultTest} fails until it is.
+     * <p>⚑ This is what found the 2026-09-22 outage: the dumped bytes showed a 29-byte address
+     * under a 57-byte header in output[0]. Off by default again now that the cause is fixed.
      */
-    @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.dump-cbor:true}")
+    @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.dump-cbor:false}")
     private boolean dumpCbor;
 
 
