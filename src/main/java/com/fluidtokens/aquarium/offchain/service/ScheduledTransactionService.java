@@ -351,12 +351,12 @@ public class ScheduledTransactionService {
         // That is an argument for the evaluator being wired correctly (CCL trap 8), not against
         // sharing -- a phase-2 failure is already a bug, and one that costs a cycle rather than one
         // transaction is still the same bug.
-        var collateralUtxoOpt = walletUtxos.stream()
-                .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
-                .filter(utxo -> LedgerCeilings.lovelaceOf(utxo).compareTo(required) >= 0)
-                .min(Comparator.comparing(LedgerCeilings::lovelaceOf));
+        // ⚠ Same filter the pool has always used -- ada-only, no reference script, provably
+        // covering what the ledger could charge, smallest first -- so the selection rule stays under
+        // test rather than drifting into an inline stream nothing exercises.
+        var collateralCandidates = walletPool(walletUtxos, required);
 
-        if (collateralUtxoOpt.isEmpty()) {
+        if (collateralCandidates.isEmpty()) {
             var largest = walletUtxos.stream()
                     .filter(utxo -> utxo.getAmount().size() == 1 && utxo.getReferenceScriptHash() == null)
                     .map(LedgerCeilings::lovelaceOf)
@@ -367,41 +367,22 @@ public class ScheduledTransactionService {
                     required, largest.map(Object::toString).orElse("none at all"));
             return;
         }
-        final var collateralUtxo = collateralUtxoOpt.get();
+        final var collateralUtxo = collateralCandidates.poll();
 
-        // ⛔ ONE SPENDABLE WALLET UTXO PER TANK, and the collateral utxo is NOT among them.
-        //
-        // The tank needs a wallet input (see tankScriptTx) and two tanks sharing one would conflict,
-        // so the cycle hands each its own. The pinned collateral is excluded because CCL excludes a
-        // pinned collateral input from ordinary coin selection anyway -- spending it here would
-        // leave the transaction with no collateral at all.
-        //
-        // ⚠ THIS IS THE CYCLE'S REAL CEILING, and it is the wallet's SHAPE, not its balance: N
-        // ada-only utxos means N tanks. Splitting the wallet raises it; adding ada does not.
-        var walletPool = walletPool(walletUtxos.stream()
-                .filter(u -> !(u.getTxHash().equals(collateralUtxo.getTxHash())
-                        && u.getOutputIndex() == collateralUtxo.getOutputIndex()))
-                .toList(), required);
-
-        if (walletPool.size() < processableScheduledTransactions.size()) {
-            log.info("{} tanks to process but only {} spendable wallet utxos (collateral excluded) — "
-                            + "doing {} this cycle. Each tank needs its own ada-only utxo of at "
-                            + "least {} lovelace; SPLIT the wallet to raise this, adding ada will "
-                            + "not.",
-                    processableScheduledTransactions.size(), walletPool.size(), walletPool.size(),
-                    required);
-        }
-
-        // ⚠ Counts failures that are NOT the tank's own fault, and resets on any success.
         int submitted = 0;
         int failed = 0;
 
+        // ⛔ EVERY DUE TANK, EVERY CYCLE. No pool, no per-tank budget, no break.
+        //
+        // The cycle used to hand each tank its own spendable wallet utxo, which made the wallet's
+        // utxo COUNT the number of tanks per cycle -- two qualifying utxos meant two tanks a minute
+        // against a backlog of hundreds. Nothing needs one now: the transaction spends only the
+        // tank, and stripOperatorContribution removes whatever CCL adds while balancing.
+        //
+        // ⚠ The collateral utxo is NOT consumed and deliberately not drawn per tank. One backs every
+        // transaction in the cycle, because collateral is forfeited only on a phase-2 failure.
         for (var datumTankUtxo : processableScheduledTransactions) {
 
-            if (walletPool.isEmpty()) {
-                break;
-            }
-            var walletUtxo = walletPool.poll();
             var tankPaymentUtxo = datumTankUtxo.utxo();
             var tankDatum = datumTankUtxo.datumTank();
 
@@ -586,10 +567,6 @@ public class ScheduledTransactionService {
                 // classifier should have seen it.
                 log.warn("Could not process Tank utxo {}:{} — {} Blacklisted until restart.",
                         tankPaymentUtxo.getTxHash(), tankPaymentUtxo.getOutputIndex(), e.getMessage());
-                // ⛔ NOTHING WAS SUBMITTED, SO THE UTXO GOES BACK. Thrown while building an address,
-                // before a transaction exists. Keeping it would let one dead tank cost a live one
-                // its turn -- which is what throttled the bot to 1-2 tanks a minute.
-                walletPool.addFirst(walletUtxo);
 
             } catch (Exception e) {
                 // ⛔ TRANSIENT BY DEFAULT — AND THIS IS THE CORRECTION, NOT A REFINEMENT.
@@ -632,13 +609,12 @@ public class ScheduledTransactionService {
     }
 
     /**
-     * ⛔ <b>The cycle's wallet inputs — one per tank, which is what removes the need to chain.</b>
+     * ⛔ <b>Wallet utxos fit to back this cycle, smallest first — today that means COLLATERAL.</b>
      *
-     * <p>Each tank transaction spends its own ada-only utxo, so no two share an input and none has
-     * to wait for the previous one's change to exist and be indexed. Before this existed, selection
-     * took the SMALLEST qualifying utxo on every iteration — the same one each time — and the loop
-     * only worked because {@code completeAndWait()} waited and the next iteration re-read a wallet
-     * that now held the change. The per-tank read WAS the chain.
+     * <p>This used to hand one spendable utxo to each tank, which quietly made the wallet's utxo
+     * COUNT the number of tanks a cycle could do: two qualifying utxos meant two tanks a minute
+     * against a backlog of hundreds. That coupling is gone — the transaction spends only the tank —
+     * and what survives is the <b>selection rule</b>, which is still exactly right for collateral.
      *
      * <p>The selection RULE is unchanged and its reasoning stands (T-053):
      * <ul>
@@ -865,7 +841,7 @@ public class ScheduledTransactionService {
         if (txn.getWitnessSet() != null && txn.getWitnessSet().getRedeemers() != null) {
             txn.getWitnessSet().getRedeemers().stream()
                     .filter(r -> r.getTag() == com.bloxbean.cardano.client.plutus.spec.RedeemerTag.Spend)
-                    .forEach(r -> r.setIndex(java.math.BigInteger.ZERO));
+                    .forEach(r -> r.setIndex(0));
         }
         return true;
     }
