@@ -133,6 +133,67 @@ class ShippedDefaultsTest {
                 at(mainnet, "loans.config.asset-name"));
     }
 
+    /**
+     * ⛔ <b>THE LIQUIDATION REFERENCE SET IS COMPLETE AGAIN, AND THIS RUNS WITHOUT A KEY.</b>
+     *
+     * <p>{@code MainnetReferenceScriptsTest} asks the CHAIN whether each coordinate publishes the
+     * validator its name claims, and it is the better check — but it is gated on
+     * {@code BLOCKFROST_KEY} and skips without one. That gap is not hypothetical: after the
+     * 2026-09-17 redeploy its own pinned copy of these coordinates went stale in all eight slots and
+     * nothing said so for five days, because a skip is not a pass.
+     *
+     * <p>⇒ So the shape that can be checked with no credential is checked here, always: the same nine
+     * keys, all populated, each a well-formed {@code txHash#index}. It cannot tell you a coordinate is
+     * RIGHT. It can tell you someone blanked one, renamed one, or pasted something that is not a UTxO
+     * reference — which is what actually happens between deployments.
+     *
+     * <h2>Provenance of the two that were blank until 2026-09-22</h2>
+     * FluidTokens published them that day and Koios confirms both, unspent, publishing exactly what
+     * this node derives:
+     * <ul>
+     *   <li>{@code lm-liquidate-action} — {@code fee70b78…#0}, block 13973022, carries
+     *       {@code df30096d…}, 4,227 bytes</li>
+     *   <li>{@code lm-liquidate-and-pay-in-advance-action} — {@code cac8029b…#0}, block 13973034,
+     *       carries {@code bec0ed6f…}, 7,051 bytes</li>
+     * </ul>
+     * Both sizes match what the fourth deployment measured, which is the cross-check that the scripts
+     * are the ones this path was inlining rather than merely scripts with the right names.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void everyLiquidationReferenceCoordinateIsShippedAndWellFormed() throws IOException {
+        var block = (Map<String, Object>) at(base(documents()), "loans.liquidation.reference-scripts");
+
+        assertEquals(List.of("loan", "loan-spend", "lender-manager", "lender-manager-spend",
+                        "loan-claim-action", "lm-liquidate-action",
+                        "lm-liquidate-and-pay-in-advance-action", "asset-manager",
+                        "lm-liquidate-and-convert-action"),
+                List.copyOf(block.keySet()),
+                "the shipped key set changed — MainnetReferenceScriptsTest derives an expectation per "
+                        + "key, so a key added here and not there is a coordinate nothing verifies");
+
+        List<String> problems = new ArrayList<>();
+        block.forEach((key, value) -> {
+            String placeholder = String.valueOf(value);
+            int colon = placeholder.indexOf(':');
+            if (!placeholder.startsWith("${") || colon < 2 || !placeholder.endsWith("}")) {
+                problems.add(key + " is not an env-overridable shipped default: " + placeholder);
+                return;
+            }
+            String coordinate = placeholder.substring(colon + 1, placeholder.length() - 1);
+            // ⛔ BLANK IS NO LONGER ACCEPTABLE HERE. It was, while FluidTokens had not published these
+            // two -- the builders inline a missing one. Both are published now, so a blank means
+            // someone removed a coordinate, and the cost is silent: the transaction still BUILDS, it
+            // just carries thousands of bytes it need not and pays for them.
+            if (coordinate.isBlank()) {
+                problems.add(key + " is blank; every liquidation script is published as of 2026-09-22");
+            } else if (!coordinate.matches("[0-9a-f]{64}#\\d+")) {
+                problems.add(key + " is not a txHash#index: " + coordinate);
+            }
+        });
+        assertTrue(problems.isEmpty(), "shipped liquidation reference coordinates: " + problems);
+    }
+
     @Test
     void theBaseDocumentShipsExactlyTheCurrentCompoundReferences() throws IOException {
         String configured = (String) at(base(documents()), "loans.compound.reference-scripts");

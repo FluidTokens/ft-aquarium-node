@@ -75,23 +75,17 @@ class MainnetReferenceScriptsTest {
     private static final Map<String, JsonNode> GET_CACHE = new LinkedHashMap<>();
 
     /**
-     * ⛔ The EIGHT named liquidation coordinates, exactly as findings §24.4 publishes them and as
-     * {@code docker/.env.example} now ships them. Key → {@code txHash#index}.
+     * ⛔ <b>THERE IS NO PINNED COORDINATE LIST HERE ANY MORE, AND ITS ABSENCE IS THE POINT.</b>
+     *
+     * <p>This class used to keep its own {@code Map} of the eight liquidation coordinates, copied
+     * from what {@code application.yaml} shipped. On 2026-09-17 the deployment moved and the shipped
+     * values changed; <b>the copy did not</b>. All eight went stale and nothing said so, because this
+     * class is gated on {@code BLOCKFROST_KEY} and skips without one — so the staleness sat behind a
+     * skip for five days, which is exactly the "a skip is not a pass" failure this repo documents.
+     *
+     * <p>⇒ The coordinates are now READ FROM {@code application.yaml}, like the compound ones already
+     * were. A gate that keeps its own copy of the thing it guards is guarding the copy.
      */
-    private static final Map<String, String> LIQUIDATION = new LinkedHashMap<>();
-
-    static {
-        LIQUIDATION.put("loan", "f87ed9cc0fd53fd5d8d9c88bfac066fa741aa927e98e5c001496bfb4c82db84f#0");
-        LIQUIDATION.put("loan-spend", "46d7195856788885fd4a488dff7bde8bbaf46d5dc4a2fa3dbd12e9cb42129c96#0");
-        LIQUIDATION.put("lender-manager", "ebc11a0346719772709390b11156f6e3b46c5b39d305f80c1f842ceadc9a242b#0");
-        LIQUIDATION.put("lender-manager-spend", "55a67ecdf41df12275588f01a33cb4d0c88345e05bec7a52be4099dff9597d3d#0");
-        LIQUIDATION.put("loan-claim-action", "51eaf4994ee313bf4c95be65656e092d7366b0f397f7ecc1e0113c063fab5f98#0");
-        LIQUIDATION.put("lm-liquidate-action", "8ba0dfb30d40361b9bc775f032e2427c799a6cfefce0cbf13e8f1242c990249a#0");
-        LIQUIDATION.put("lm-liquidate-and-pay-in-advance-action",
-                "2ed58f66779acd64f9add3755dd0686d6841001c90683b369cae0f5f07287476#0");
-        LIQUIDATION.put("asset-manager", "e5e5bab0c7b39a929af8516f940811ca483dbc23ba647a664c1463c2a70b3fe0#0");
-    }
-
     private static JsonNode get(String path) throws IOException, InterruptedException {
         JsonNode cached = GET_CACHE.get(path);
         if (cached != null) return cached;
@@ -159,6 +153,37 @@ class MainnetReferenceScriptsTest {
         }
     }
 
+    /** The shipped liquidation coordinates, key → {@code txHash#index}, blanks omitted. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, String> shippedLiquidationReferences() throws IOException {
+        try (InputStream in = MainnetReferenceScriptsTest.class.getClassLoader()
+                .getResourceAsStream("application.yaml")) {
+            assertTrue(in != null, "application.yaml is absent from the test classpath");
+            Iterable<Object> documents = new Yaml().loadAll(
+                    new String(in.readAllBytes(), StandardCharsets.UTF_8));
+            // ⚠ The FIRST document only: later ones are profiles, and the preview profile blanks every
+            // one of these keys on purpose. Reading them all would test preview's blanks against mainnet.
+            Map<String, Object> root = (Map<String, Object>) documents.iterator().next();
+            Map<String, Object> liquidation = (Map<String, Object>)
+                    ((Map<String, Object>) ((Map<String, Object>) root.get("loans")).get("liquidation"))
+                            .get("reference-scripts");
+            Map<String, String> shipped = new LinkedHashMap<>();
+            for (var entry : liquidation.entrySet()) {
+                String placeholder = String.valueOf(entry.getValue());
+                int colon = placeholder.indexOf(':');
+                assertTrue(placeholder.startsWith("${") && colon > 1 && placeholder.endsWith("}"),
+                        entry.getKey() + " is not an env-overridable shipped default");
+                String coordinate = placeholder.substring(colon + 1, placeholder.length() - 1);
+                // A blank slot is a script FluidTokens have not published; the builder inlines it.
+                // Not a failure, and nothing to ask the chain about.
+                if (!coordinate.isBlank()) {
+                    shipped.put(entry.getKey(), coordinate);
+                }
+            }
+            return shipped;
+        }
+    }
+
     private static LoansContractRegistry mainnetRegistry() {
         return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID,
                 CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
@@ -200,13 +225,18 @@ class MainnetReferenceScriptsTest {
         expected.put("lm-liquidate-and-pay-in-advance-action",
                 registry.getLmLiquidateAndPayInAdvanceActionScriptHash());
         expected.put("asset-manager", registry.getAssetManagerWithdrawScriptHash());
+        // ⚑ The convert action is in the shipped block and was NOT in this map, so its coordinate was
+        // the one named key nothing here checked against the chain. It is derivable, so it is checked.
+        expected.put("lm-liquidate-and-convert-action",
+                registry.getLmLiquidateAndConvertActionScriptHash());
 
-        assertEquals(expected.keySet(), LIQUIDATION.keySet(),
+        Map<String, String> shipped = shippedLiquidationReferences();
+        assertEquals(expected.keySet(), shipped.keySet(),
                 "the shipped key set must be exactly the set LoansReferenceScriptVerifier checks — a "
                         + "key it does not verify is a coordinate nothing guards");
 
         List<String> mismatches = new ArrayList<>();
-        for (var entry : LIQUIDATION.entrySet()) {
+        for (var entry : shipped.entrySet()) {
             JsonNode output = publishedOutput(entry.getValue());
             assertUnspent(entry.getValue(), output);
             String published = output.hasNonNull("reference_script_hash")
