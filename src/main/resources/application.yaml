@@ -470,7 +470,20 @@ scheduling:
     # PLACEHOLDER ex-units, and submitting one is CCL trap 8 -- accepted by the mempool, failed in
     # PHASE 2, collateral forfeit. So this mode calls build() and returns: the submit path is not
     # reachable while it is on. Turn it off again before arming.
-    dump-cbor: ${SCHEDULING_TRANSACTION_PROCESSOR_DUMP_CBOR:false}
+    #
+    # ⛔⛔ DEFAULTED **true** ON BRANCH fix/tank-wallet-fanout ONLY. MUST BE :false BEFORE MERGE.
+    #
+    # ⚠ AND THIS LINE -- NOT THE @Value ANNOTATION -- IS THE ONE THAT DECIDES.
+    # The Java side reads @Value("${scheduling.transaction-processor.dump-cbor:true}"), and that
+    # `:true` is DEAD: Spring resolves the property here first, so the annotation's default is
+    # never consulted. A previous commit flipped only the annotation, shipped, and the node ran
+    # with the dump still OFF -- the change was invisible because both files looked right on
+    # their own. When a default exists in two places, the config file wins and the annotation is
+    # documentation.
+    #
+    # Giovanni runs this on Kubernetes, where setting the env var means editing the Helm chart --
+    # so a diagnostic gated on an env var would never be switched on. Hence the default moves.
+    dump-cbor: ${SCHEDULING_TRANSACTION_PROCESSOR_DUMP_CBOR:true}
 
 blockfrost:
   url: https://cardano-mainnet.blockfrost.io/api/v0/
