@@ -472,8 +472,36 @@ public class ScheduledTransactionService {
                         // it consumed by an unguarded builder on 2026-08-25.
                         .withUtxoSelectionStrategy(
                                 ReferenceScriptSafeUtxoSelection.strategy(referenceScriptSafeSupplier()))
-                        .preBalanceTx((ctx, txn) -> ctx.setUtxoSelector(
-                                ReferenceScriptSafeUtxoSelection.selector(referenceScriptSafeSupplier())))
+                        // ⛔ TWO JOBS, ONE LAMBDA — because preBalanceTx is a SETTER
+                        // (QuickTxBuilder:263 assigns), so a second call would silently discard the
+                        // first. Whatever this hook needs to do has to happen here or not at all.
+                        .preBalanceTx((ctx, txn) -> {
+                            ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(
+                                    referenceScriptSafeSupplier()));
+                            // ⛔ BALANCE THE BODY BEFORE IT IS EVALUATED, so the evaluator prices
+                            // the transaction we actually ship.
+                            //
+                            // QuickTxBuilder runs preBalanceTx at :401 and evaluateScriptCost at
+                            // :455 -- BEFORE balanceTx at :470. Left alone, the evaluator is handed
+                            // a body carrying fee 0 with the tank's whole remainder unaccounted for:
+                            // inputs 2,340,000 against outputs 2,000,000 and nothing to close it.
+                            // Setting the fee here makes inputs == outputs + fee at the moment of
+                            // evaluation, which is also exactly the shape stripOperatorContribution
+                            // restores afterwards.
+                            //
+                            // ⚠ Hypothesis, and stated as one: this has not been reproduced
+                            // locally, because the offline Aiken evaluator accepts the unbalanced
+                            // body and Blockfrost's does not (it answers {"ScriptFailures":{}} --
+                            // an empty map, naming nothing). What is NOT hypothetical is that
+                            // evaluating a body you do not ship is wrong on its own terms.
+                            var owed = txn.getBody().getOutputs().stream()
+                                    .map(o -> o.getValue().getCoin())
+                                    .reduce(java.math.BigInteger.ZERO, java.math.BigInteger::add);
+                            var remainder = LedgerCeilings.lovelaceOf(tankPaymentUtxo).subtract(owed);
+                            if (remainder.signum() > 0) {
+                                txn.getBody().setFee(remainder);
+                            }
+                        })
                         .withSigner(SignerProviders.signerFrom(account))
                         .withSigner(SignerProviders.stakeKeySignerFrom(account))
                         .withRequiredSigners(account.getBaseAddress().getDelegationCredentialHash().get())
