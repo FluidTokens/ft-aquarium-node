@@ -36,6 +36,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Vector;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
@@ -210,19 +211,14 @@ public class ScheduledTransactionService {
      * wins, the other is rejected for an input that no longer exists, and the loser's tank gets
      * counted as a failure it never had.
      *
-     * <p>⛔ <b>THIS GUARD IS NOW LOAD-BEARING, NOT BELT-AND-BRACES.</b> It was written while this
-     * method ran on {@code fixedDelay}, which measures the gap between a run FINISHING and the next
-     * STARTING and therefore cannot overlap. <b>A cron trigger has no such property</b>: it fires on
-     * the clock, so a cycle still working when the next minute arrives is exactly the case cron
-     * introduces — and the overlap would be invisible, showing up as tanks failing for inputs that
-     * another thread had just spent.
-     *
-     * <p>⚑ It was added on the argument that "an invariant worth relying on is worth stating in the
-     * code that relies on it", against the objection that {@code fixedDelay} made it redundant. One
-     * commit later the schedule changed and the redundancy was gone. <b>That is the usual lifetime
-     * of a guarantee nobody wrote down.</b>
+     * <p>⚠ Spring's {@code fixedDelay} already serialises this method today, so on paper the guard is
+     * redundant. It is here because that property is <b>invisible at the call site and easy to lose</b>:
+     * switching to {@code fixedRate} or a cron, adding an admin endpoint that triggers a run, or a
+     * second scheduler bean all break the assumption silently, and the symptom would be sporadic
+     * phantom failures rather than anything pointing back at concurrency. <b>An invariant worth
+     * relying on is worth stating in the code that relies on it.</b>
      */
-    @Scheduled(cron = "${scheduling.transaction-processor.cron}", zone = "UTC")
+    @Scheduled(timeUnit = TimeUnit.MINUTES, fixedDelayString = "${scheduling.transaction-processor.delay-minutes}")
     public void processPayments() {
         if (!cycleInProgress.compareAndSet(false, true)) {
             log.info("previous Process Payments run is still going — SKIPPING this tick rather than "
@@ -819,8 +815,9 @@ public class ScheduledTransactionService {
                 // ⛔ NEVER BEFORE THE TANK'S EXECUTION TIME. The tank validator requires the validity
                 // lower bound to be STRICTLY AFTER executiontime (measured with Scalus against the
                 // real validator: exec+0s fails, exec+1s passes). Back-dating by 30s unclamped made
-                // every tank fail on its first attempt — the cron fires ~2s after a tank falls due,
-                // so the bound landed ~28s early — and Blockfrost reported only {"ScriptFailures":{}}.
+                // any attempt within 30s of the due time fail — on 2026-09-23 the processor ran 2s
+                // after a tank fell due, so the bound landed 28s early — and Blockfrost reported only
+                // {"ScriptFailures":{}}.
                 // By the next cycle another operator had executed it (2026-09-23, tank 8f894e3b…#0,
                 // taken at 08:10:50 by tx 986504f8… with a lower bound of 08:10:03).
                 .validFrom(Math.max(slot - 30, firstValidSlot))
