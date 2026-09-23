@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -49,7 +50,7 @@ class ScheduledTransactionCronTest {
     }
 
     @Test
-    void theShippedCronIsValidAndFiresTwoSecondsPastEveryMinute() throws IOException {
+    void theShippedCronIsValidAndFiresEveryFifteenSecondsFromTwoPast() throws IOException {
         String cron = configuredCron();
         assertNotNull(cron, "no cron default found in application.yaml — the processor would fail "
                 + "to start, because @Scheduled(cron = ...) has no fallback of its own");
@@ -58,18 +59,19 @@ class ScheduledTransactionCronTest {
         // sees a context that will not load rather than a processor that will not run.
         CronExpression expression = CronExpression.parse(cron.trim());
 
-        ZonedDateTime from = LocalDateTime.of(2026, 9, 22, 14, 30, 30).atZone(ZoneOffset.UTC);
-        ZonedDateTime next = expression.next(from);
-        assertNotNull(next);
-        assertEquals(2, next.getSecond(),
-                "the processor must fire at 2 seconds past the minute, not on the boundary: block "
-                        + "production and the indexer both cluster at :00, so a read there sees a "
-                        + "view that is still settling");
-        assertEquals(31, next.getMinute(), "and it must fire every minute, not every hour");
-
-        ZonedDateTime after = expression.next(next);
-        assertEquals(60, java.time.Duration.between(next, after).toSeconds(),
-                "consecutive firings must be one minute apart");
+        // ⛔ A full minute of firings, from just before a boundary: :02 :17 :32 :47, then :02 again.
+        // :02 keeps the processor off the minute boundary, where block production and the indexer
+        // cluster; every 15s means a failed attempt is retried before a competing operator's
+        // one-minute cycle comes round.
+        ZonedDateTime t = LocalDateTime.of(2026, 9, 22, 14, 30, 59).atZone(ZoneOffset.UTC);
+        List<Integer> seconds = new java.util.ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            t = expression.next(t);
+            assertNotNull(t);
+            seconds.add(t.getSecond());
+        }
+        assertEquals(List.of(2, 17, 32, 47, 2), seconds,
+                "the processor must fire at :02 :17 :32 :47 — every 15s, never on the boundary");
     }
 
     /**
