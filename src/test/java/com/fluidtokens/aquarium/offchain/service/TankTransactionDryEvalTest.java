@@ -387,6 +387,28 @@ class TankTransactionDryEvalTest {
         // wallet input covers the fee, so "can the tank pay for itself" is no longer the question —
         // it was the question only while the tank was the sole input.
 
+        // ⛔ STRUCTURAL PARITY WITH PRODUCTION: reference script, no witness copy.
+        //
+        // ⚠ Added after a harder lesson about what this rig is worth. Both local evaluators accepted
+        // a transaction shape that mainnet refused four times out of four, so "Scalus and Aiken
+        // agree" is NOT evidence the transaction is correct — it means two evaluators share a blind
+        // spot. A rig that cannot reproduce a known production failure is not confirming the code;
+        // it is failing to reproduce.
+        //
+        // ⇒ What a rig CAN honestly assert is that the artefact it built has the same structure as
+        // the one production ships. If the script ever arrives as a witness copy instead of through
+        // a reference input, the rig is pricing a different transaction — bigger, differently
+        // witnessed, and differently costed (CCL trap 9).
+        assertEquals(0, built.getWitnessSet().getPlutusV3Scripts() == null ? 0
+                        : built.getWitnessSet().getPlutusV3Scripts().size(),
+                "the validator must come from a reference input, never a witness copy — production "
+                        + "spends through the published reference script");
+        assertEquals(3, built.getBody().getReferenceInputs().size(),
+                "parameters, staker and the tank validator, exactly as the service reads them");
+        assertNotNull(built.getBody().getScriptDataHash(),
+                "a transaction carrying redeemers must carry a script data hash, or the ledger "
+                        + "cannot check that what ran is what was declared");
+
         var redeemers = built.getWitnessSet().getRedeemers();
         assertFalse(redeemers.isEmpty(), "the tank spend must carry a redeemer");
 
