@@ -434,6 +434,14 @@ public class ScheduledTransactionService {
 
                 var now = LocalDateTime.now(ZoneOffset.UTC);
                 var slot = cardanoConverters.time().toSlot(now);
+                var firstValidSlot = firstValidSlot(tankDatum.getExecutiontime(),
+                        cardanoConverters.time()::toSlot);
+                if (firstValidSlot > slot) {
+                    // Due by the wall clock but not yet by the slot the validator will see — the
+                    // transaction could not be valid before its own lower bound. Next cycle.
+                    walletPool.addFirst(walletUtxo);
+                    continue;
+                }
 
                 var reward = AssetAmountUtil.toValue(List.of(tankDatum.getReward()));
 
@@ -488,7 +496,7 @@ public class ScheduledTransactionService {
                 // evaluation-error policy, and the structural verifier, which needs datum-derived
                 // arguments the caller already holds.
                 var context = balanceTankTx(composed, tankPaymentUtxo, collateralUtxo,
-                                account.baseAddress(), referenceScriptSafeSupplier(), slot)
+                                account.baseAddress(), referenceScriptSafeSupplier(), slot, firstValidSlot)
                         .withSigner(SignerProviders.signerFrom(account))
                         .withSigner(SignerProviders.stakeKeySignerFrom(account))
                         .ignoreScriptCostEvaluationError(dumpCbor)
@@ -790,7 +798,8 @@ public class ScheduledTransactionService {
                                                   Utxo collateralUtxo,
                                                   String operatorAddress,
                                                   UtxoSupplier referenceScriptSafeSupplier,
-                                                  long slot) {
+                                                  long slot,
+                                                  long firstValidSlot) {
         return context
                 .withUtxoSelectionStrategy(
                         ReferenceScriptSafeUtxoSelection.strategy(referenceScriptSafeSupplier))
@@ -807,7 +816,14 @@ public class ScheduledTransactionService {
                 .withRequiredSigners(
                         new com.bloxbean.cardano.client.address.Address(operatorAddress)
                                 .getDelegationCredentialHash().orElseThrow())
-                .validFrom(slot - 30)
+                // ⛔ NEVER BEFORE THE TANK'S EXECUTION TIME. The tank validator requires the validity
+                // lower bound to be STRICTLY AFTER executiontime (measured with Scalus against the
+                // real validator: exec+0s fails, exec+1s passes). Back-dating by 30s unclamped made
+                // every tank fail on its first attempt — the cron fires ~2s after a tank falls due,
+                // so the bound landed ~28s early — and Blockfrost reported only {"ScriptFailures":{}}.
+                // By the next cycle another operator had executed it (2026-09-23, tank 8f894e3b…#0,
+                // taken at 08:10:50 by tx 986504f8… with a lower bound of 08:10:03).
+                .validFrom(Math.max(slot - 30, firstValidSlot))
                 .validTo(slot + 180)
                 .feePayer(operatorAddress)
                 .withCollateralInputs(TransactionInput.builder()
@@ -816,6 +832,19 @@ public class ScheduledTransactionService {
                         .build())
                 .collateralPayer(operatorAddress)
                 .mergeOutputs(false);
+    }
+
+    /**
+     * The first slot whose start lies STRICTLY AFTER the tank's execution time — the earliest
+     * validity lower bound the tank validator accepts. Truncating to the second before adding one
+     * keeps it strict for execution times carrying milliseconds too.
+     */
+    static long firstValidSlot(java.math.BigInteger executionTimeMillis,
+                               java.util.function.ToLongFunction<LocalDateTime> toSlot) {
+        return toSlot.applyAsLong(LocalDateTime.ofInstant(
+                Instant.ofEpochMilli(executionTimeMillis.longValue())
+                        .truncatedTo(java.time.temporal.ChronoUnit.SECONDS),
+                ZoneOffset.UTC)) + 1;
     }
 
     static ScriptTx tankScriptTx(Utxo walletUtxo,

@@ -36,6 +36,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -128,11 +129,11 @@ class TankTransactionDryEvalTest {
         return ProtocolParams.builder()
                 .minFeeA(p.get("min_fee_a").asInt())
                 .minFeeB(p.get("min_fee_b").asInt())
-                // ⚠ The CHAIN's 16,384 would be the honest figure, but a reference-script build can
-                // exceed it here for reasons that are the rig's, not the transaction's. Raised on
-                // purpose so a size ceiling cannot masquerade as a script failure — the question this
-                // test answers is whether the VALIDATOR accepts, and nothing else.
-                .maxTxSize(1_000_000)
+                // ⛔ THE CHAIN'S OWN maxTxSize. This was once raised to 1,000,000 "so a size ceiling
+                // cannot masquerade as a script failure" — but the collateral ceiling production
+                // computes (requiredWalletLovelace) scales with it, so the inflated figure refused the
+                // real wallet's 15 ada collateral and the rig could not select what production selects.
+                .maxTxSize(p.get("max_tx_size").asInt())
                 .maxValSize(String.valueOf(p.get("max_val_size").asInt()))
                 .coinsPerUtxoSize(p.get("coins_per_utxo_size").asText())
                 .priceMem(new BigDecimal(p.get("price_mem").asText()))
@@ -187,31 +188,31 @@ class TankTransactionDryEvalTest {
         List<Utxo> refs = new ArrayList<>();
         fx.withArray("refs").forEach(r -> refs.add(utxo(r)));
 
-        // ⚠ Synthetic ONLY for collateral: it is never evaluated and never spent on a success, so
-        // inventing one changes nothing the validator can see. Everything the script reads is real.
+        // ⛔ THE REAL WALLET, NOT A SYNTHETIC ONE. Every utxo here existed on mainnet when the
+        // processor tried this tank: the operator's three utxos, recorded from chain.
         String operator = AddressProvider.getBaseAddress(
                 Credential.fromKey(HexUtil.decodeHexString(OPERATOR_PAYMENT)),
                 Credential.fromKey(HexUtil.decodeHexString(OPERATOR_STAKE)),
                 Networks.mainnet()).getAddress();
-        Utxo collateral = Utxo.builder()
-                .txHash("00".repeat(32)).outputIndex(0).address(operator)
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(10_000_000L)))).build();
-
-        // ⛔ A SPENDABLE WALLET UTXO, AND IT IS NOT OPTIONAL. This is the finding that corrected the
-        // design: the tank CANNOT fund itself. The fixture tank holds 101.34 ada and owes 101.00, so
-        // the remainder is 0.34 -- below the min-UTxO floor for the change output, before any fee.
-        // CCL then reaches for the fee payer's wallet, and without this it fails with
-        // "Not enough funds for [{lovelace=2958283}]" during ChangeOutputAdjustments.
-        Utxo walletInput = Utxo.builder()
-                .txHash("11".repeat(32)).outputIndex(0).address(operator)
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
+        List<Utxo> wallet = new ArrayList<>();
+        fx.withArray("wallet").forEach(w -> wallet.add(utxo(w)));
+        wallet.forEach(w -> assertEquals(operator, w.getAddress(),
+                "the fixture wallet must be the operator the node signs as"));
 
         List<Utxo> universe = new ArrayList<>(refs);
         universe.add(tank);
-        universe.add(collateral);
-        universe.add(walletInput);
-
+        universe.addAll(wallet);
         ProtocolParams params = protocolParams(fx.get("protocol_params"));
+
+        // ⛔ COLLATERAL AND WALLET INPUT CHOSEN BY PRODUCTION'S OWN CODE, as runPaymentCycle does.
+        var required = ScheduledTransactionService.requiredWalletLovelace(params);
+        Utxo collateral = ScheduledTransactionService.walletPool(wallet, required).poll();
+        assertNotNull(collateral, "the real wallet must yield a collateral utxo");
+        Utxo walletInput = ScheduledTransactionService.walletPool(wallet.stream()
+                .filter(u -> !(u.getTxHash().equals(collateral.getTxHash())
+                        && u.getOutputIndex() == collateral.getOutputIndex()))
+                .toList(), required).poll();
+        assertNotNull(walletInput, "the real wallet must yield a spendable input besides collateral");
         ProtocolParamsSupplier paramsSupplier = () -> params;
         UtxoSupplier utxoSupplier = supplier(universe);
 
@@ -267,8 +268,24 @@ class TankTransactionDryEvalTest {
                 (scalus.bloxbean.ScriptSupplier) scriptHash -> validator,
                 scalus.bloxbean.EvaluatorMode.EVALUATE_AND_COMPUTE_COST, false);
 
-        long slot = SlotConfigs.mainnet().getZeroSlot()
-                + (System.currentTimeMillis() - SlotConfigs.mainnet().getZeroTime()) / 1000;
+        // ⛔ THE MOMENT PRODUCTION ACTUALLY TRIED: the cron fired at 08:10:02, two seconds after
+        // this tank fell due at 08:10:00, and Blockfrost answered {"ScriptFailures":{}}. A rig that
+        // builds at "now" builds long after the execution time and cannot see a timing defect.
+        java.util.function.ToLongFunction<java.time.LocalDateTime> toSlot = t -> SlotConfigs.mainnet().getZeroSlot()
+                + (t.toInstant(java.time.ZoneOffset.UTC).toEpochMilli() - SlotConfigs.mainnet().getZeroTime()) / 1000;
+        long firstValidSlot = ScheduledTransactionService.firstValidSlot(tankDatum.getExecutiontime(), toSlot);
+        long slot = firstValidSlot + 1; // 08:10:02
+
+        // ⛔ NEGATIVE CONTROL — the pre-fix lower bound (slot - 30, unclamped) at the same moment.
+        // It must FAIL, or this rig cannot see the defect that cost every payable tank on mainnet.
+        var unclamped = assertThrows(Exception.class, () -> ScheduledTransactionService.balanceTankTx(
+                        new QuickTxBuilder(utxoSupplier, paramsSupplier,
+                                (com.bloxbean.cardano.client.api.ScriptSupplier) sh -> Optional.of(validator),
+                                (com.bloxbean.cardano.client.api.TransactionProcessor) null).compose(tx),
+                        tank, collateral, operator, utxoSupplier, slot, Long.MIN_VALUE)
+                .withTxEvaluator(evaluator).ignoreScriptCostEvaluationError(false).build(),
+                "a validity lower bound 28s BEFORE the execution time must be refused by the validator");
+        System.out.println("negative control refused as expected: " + unclamped.getMessage());
 
         // ⚠ FOUR-ARG, with a ScriptSupplier. The three-arg form NPEs at build() whenever the
         // transaction carries reference inputs: ReferenceScriptResolver walks them and calls
@@ -289,13 +306,23 @@ class TankTransactionDryEvalTest {
                                 (com.bloxbean.cardano.client.api.ScriptSupplier) sh -> Optional.of(validator),
                                 (com.bloxbean.cardano.client.api.TransactionProcessor) null)
                                 .compose(tx),
-                        tank, collateral, operator, utxoSupplier, slot)
+                        tank, collateral, operator, utxoSupplier, slot, firstValidSlot)
                 .withTxEvaluator(evaluator)
                 // ⛔ FALSE. Left true — its default — a failed evaluation is swallowed and the build
                 // ships PLACEHOLDER ex-units, so this test would go green on exactly the defect it
                 // exists to catch (CCL trap 8).
                 .ignoreScriptCostEvaluationError(false)
                 .build();
+
+        assertEquals(firstValidSlot, built.getBody().getValidityStartInterval(),
+                "the lower bound must be clamped to the first slot strictly after the execution time");
+        assertEquals("38f802f7a163e9777bb85ee814c99b2befd004ad30545bda911af22669262953#0",
+                collateral.getTxHash() + "#" + collateral.getOutputIndex(),
+                "production's selection must pick the real 15 ada utxo as collateral");
+        assertTrue(built.getBody().getInputs().stream().anyMatch(i ->
+                        i.getTransactionId().equals(walletInput.getTxHash())
+                                && i.getIndex() == walletInput.getOutputIndex()),
+                "the wallet utxo production selected must be the one spent");
 
         // ⛔ THE SPEND REDEEMER MUST NAME THE INPUT THE TANK ACTUALLY OCCUPIES.
         //
@@ -375,7 +402,7 @@ class TankTransactionDryEvalTest {
                         + built.getBody().getOutputs().size());
 
         var inputTotal = new BigInteger(fx.get("tank").get("value").asText())
-                .add(BigInteger.valueOf(20_000_000L));
+                .add(walletInput.getAmount().getFirst().getQuantity());
         var paidOut = built.getBody().getOutputs().stream()
                 .map(o -> o.getValue().getCoin()).reduce(BigInteger.ZERO, BigInteger::add);
         assertEquals(inputTotal, paidOut.add(built.getBody().getFee()),
