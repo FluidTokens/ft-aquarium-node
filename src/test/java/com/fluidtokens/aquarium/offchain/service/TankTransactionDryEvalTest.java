@@ -245,7 +245,7 @@ class TankTransactionDryEvalTest {
                         paramsDatumHex(fx));
 
         var tx = ScheduledTransactionService.tankScriptTx(
-                tank, redeemerData.toPlutusData(),
+                walletInput, tank, redeemerData.toPlutusData(),
                 AddressUtil.toAddress(tankDatum.getDestionationaaddress(), Networks.mainnet()).getAddress(),
                 AssetAmountUtil.toValue(List.of(tankDatum.getScheduledamount())),
                 AddressUtil.toAddress(parameters.getAddressRewards(), Networks.mainnet()).getAddress(),
@@ -253,10 +253,19 @@ class TankTransactionDryEvalTest {
                 operator, paramsRef, stakerRef, tankRef);
 
         final var validator = tankValidator();
-        var aiken = new com.bloxbean.cardano.aiken.AikenTransactionEvaluator(
-                utxoSupplier, paramsSupplier,
-                scriptHash -> Optional.of(validator),
-                SlotConfigs.mainnet());
+
+        // ⛔ SCALUS' PlutusVM, NOT aiken-java-binding.
+        //
+        // A second evaluator of INDEPENDENT PROVENANCE is the whole point (CCL trap 7): when two
+        // implementations disagree, the disagreement localises the fault, and when a remote one
+        // answers {"ScriptFailures":{}} — an empty map naming nothing — a local one that names the
+        // failure is the only way forward.
+        // ⚠ SlotConfig moved to scalus.cardano.ledger in 1.x — the scalus.bloxbean one the older
+        // rigs in this workspace use (0.8.5 / 0.10.4) no longer exists.
+        var evaluator = new scalus.bloxbean.ScalusTransactionEvaluator(
+                scalus.cardano.ledger.SlotConfig$.MODULE$.mainnet(), params, utxoSupplier,
+                (scalus.bloxbean.ScriptSupplier) scriptHash -> validator,
+                scalus.bloxbean.EvaluatorMode.EVALUATE_AND_COMPUTE_COST, false);
 
         long slot = SlotConfigs.mainnet().getZeroSlot()
                 + (System.currentTimeMillis() - SlotConfigs.mainnet().getZeroTime()) / 1000;
@@ -281,7 +290,7 @@ class TankTransactionDryEvalTest {
                                 (com.bloxbean.cardano.client.api.TransactionProcessor) null)
                                 .compose(tx),
                         tank, collateral, operator, utxoSupplier, slot)
-                .withTxEvaluator(aiken)
+                .withTxEvaluator(evaluator)
                 // ⛔ FALSE. Left true — its default — a failed evaluation is swallowed and the build
                 // ships PLACEHOLDER ex-units, so this test would go green on exactly the defect it
                 // exists to catch (CCL trap 8).
@@ -328,85 +337,55 @@ class TankTransactionDryEvalTest {
         // -- so the transaction the library priced is not the transaction it returns. Asserting on
         // the earlier one would prove nothing about what gets submitted; this re-runs the real
         // validator over the finished article.
-        var finalEval = aiken.evaluateTx(built.serialize(), java.util.Set.copyOf(universe));
+        // ⚠ Scalus' evaluateTx takes the bytes alone — it resolves inputs through the UtxoSupplier
+        // it was constructed with, which is the fixture universe.
+        var finalEval = evaluator.evaluateTx(built.serialize());
         assertTrue(finalEval.isSuccessful(),
                 "the RESHAPED transaction must still satisfy the validator: " + finalEval.getResponse());
         System.out.println("final shape evaluated: " + finalEval.getValue());
 
-        // ⛔⛔ THE DECLARED EX-UNITS MUST COVER WHAT THE RESHAPED BODY ACTUALLY COSTS.
+        // ⛔⛔ THE DECLARED EX-UNITS MUST COVER WHAT THE BUILT BODY ACTUALLY COSTS.
         //
-        // This is the one place the reshape could forfeit collateral. QuickTxBuilder evaluates
-        // BEFORE balancing; postBalanceTx then changes the body, and the script context changes with
-        // it. Under-declaring is not rejected at the mempool -- the transaction is accepted, the
-        // script exhausts its budget on chain, and it fails in PHASE 2 with the collateral gone
-        // (CCL trap 8).
-        //
-        // ⚠ The intuition that a smaller body must be cheaper is WRONG and was measured wrong here:
-        // dropping an input moved the cost from 317,812 mem to 428,890. The script context is not
-        // monotonic in the body's size, so "fewer inputs, less work" is not a safety argument.
+        // Under-declaring is not rejected at the mempool: the transaction is accepted, the script
+        // exhausts its budget on chain, and it fails in PHASE 2 with the collateral gone (CCL trap
+        // 8). So this compares what the transaction DECLARES against what a second, independent
+        // evaluator measures on the finished bytes.
         var measured = finalEval.getValue().stream()
                 .filter(r -> r.getRedeemerTag() == com.bloxbean.cardano.client.plutus.spec.RedeemerTag.Spend)
                 .findFirst().orElseThrow().getExUnits();
         assertTrue(spend.getExUnits().getMem().compareTo(measured.getMem()) >= 0
                         && spend.getExUnits().getSteps().compareTo(measured.getSteps()) >= 0,
                 "the transaction declares mem=" + spend.getExUnits().getMem() + " steps="
-                        + spend.getExUnits().getSteps() + " but the RESHAPED body costs mem="
+                        + spend.getExUnits().getSteps() + " but the built body costs mem="
                         + measured.getMem() + " steps=" + measured.getSteps()
-                        + ". Shipping that is a phase-2 failure and forfeited collateral: the "
-                        + "reshape must re-price the redeemer, not inherit the pre-reshape figures.");
+                        + ". Shipping that is a phase-2 failure and forfeited collateral.");
 
-        // ⛔ THE SHAPE, ASSERTED. One input, two outputs, no change.
+        // ⛔ THE VANILLA SHAPE: CCL's own, unaltered after balancing.
         //
-        // ⚠ The wallet utxo is deliberately still in the universe here, so this also proves CCL did
-        // not quietly pull one in during ChangeOutputAdjustments -- which it will do, unasked,
-        // whenever a change output falls short of min-UTxO. A passing evaluation alone would not
-        // have caught that: the transaction would work and simply not be the transaction we meant.
-        assertEquals(1, built.getBody().getInputs().size(),
-                "the tank must be the ONLY input -- a wallet input adds an unasked-for third output "
-                        + "and changes a shape the validator checks. Inputs were "
+        // ⚠ This asserted 1 input / 2 outputs until 2026-09-23, for a self-funding transaction that
+        // BOTH local evaluators accept and Blockfrost refuses with an empty ScriptFailures map. We
+        // reverted to the shape mainnet has actually executed (tank 64470b26...#0) rather than keep
+        // shipping one we can only validate offline. The change output is the operator's, and the
+        // operator funds the fee — a few thousand lovelace per payment, knowingly paid.
+        assertEquals(2, built.getBody().getInputs().size(),
+                "vanilla CCL spends the tank AND a wallet utxo. Inputs were "
                         + built.getBody().getInputs());
-        assertEquals(2, built.getBody().getOutputs().size(),
-                "exactly two outputs: the payee and the operator reward. A third is the change "
-                        + "output, and a tank is funded to pay its fee exactly, so there is nothing "
-                        + "for it to hold. Outputs were " + built.getBody().getOutputs().size());
+        assertEquals(3, built.getBody().getOutputs().size(),
+                "payee, operator reward, and the operator's change. Outputs were "
+                        + built.getBody().getOutputs().size());
 
-        var tankValue = new BigInteger(fx.get("tank").get("value").asText());
+        var inputTotal = new BigInteger(fx.get("tank").get("value").asText())
+                .add(BigInteger.valueOf(20_000_000L));
         var paidOut = built.getBody().getOutputs().stream()
                 .map(o -> o.getValue().getCoin()).reduce(BigInteger.ZERO, BigInteger::add);
-        assertEquals(tankValue, paidOut.add(built.getBody().getFee()),
-                "the tank's whole balance must be accounted for as outputs plus fee -- that is what "
-                        + "makes folding the change into the fee arithmetic rather than a fudge");
-        System.out.println("shape OK: 1 input, 2 outputs, fee " + built.getBody().getFee()
-                + " absorbed the remainder of a " + tankValue + " lovelace tank");
+        assertEquals(inputTotal, paidOut.add(built.getBody().getFee()),
+                "inputs must equal outputs plus fee — CCL balanced it and nothing touched it after");
+        System.out.println("vanilla shape OK: " + built.getBody().getInputs().size() + " inputs, "
+                + built.getBody().getOutputs().size() + " outputs, fee " + built.getBody().getFee());
 
-        // ⛔ CAN THE TANK ACTUALLY AFFORD THE FEE IT IS NOW SOLELY RESPONSIBLE FOR?
-        //
-        // Once the operator's input is gone, the fee is capped at whatever the tank had left. If the
-        // real minimum exceeds it the transaction is rejected in phase 1 -- free, but it never
-        // executes, which is indistinguishable from the bug we started with.
-        long bodyBytes = built.serialize().length;
-        var pp = protocolParams(fx.get("protocol_params"));
-        var declared = spend.getExUnits();
-        java.math.BigInteger sizeFee = java.math.BigInteger.valueOf(pp.getMinFeeA())
-                .multiply(java.math.BigInteger.valueOf(bodyBytes))
-                .add(java.math.BigInteger.valueOf(pp.getMinFeeB()));
-        // The tank validator ships as a 6,961-byte reference script; Conway charges for it by size.
-        java.math.BigInteger refFee = pp.getMinFeeRefScriptCostPerByte()
-                .multiply(new BigDecimal(6961)).setScale(0, java.math.RoundingMode.CEILING)
-                .toBigIntegerExact();
-        java.math.BigInteger exFee = pp.getPriceMem().multiply(new BigDecimal(declared.getMem()))
-                .add(pp.getPriceStep().multiply(new BigDecimal(declared.getSteps())))
-                .setScale(0, java.math.RoundingMode.CEILING).toBigIntegerExact();
-        var minFee = sizeFee.add(refFee).add(exFee);
-
-        System.out.println("fee budget: tank left " + built.getBody().getFee()
-                + " | minimum needed ~" + minFee + "  (size " + sizeFee + " + refScript " + refFee
-                + " + exUnits " + exFee + ")  body " + bodyBytes + " bytes");
-        assertTrue(built.getBody().getFee().compareTo(minFee) >= 0,
-                "the tank's remainder (" + built.getBody().getFee() + ") does not cover this "
-                        + "transaction's minimum fee (~" + minFee + "). With the operator's input "
-                        + "removed there is nothing else to draw on, so it would be rejected in "
-                        + "phase 1 and never execute.");
+        // ⚠ No tank-affordability assertion here any more. In the vanilla shape the operator's
+        // wallet input covers the fee, so "can the tank pay for itself" is no longer the question —
+        // it was the question only while the tank was the sole input.
 
         var redeemers = built.getWitnessSet().getRedeemers();
         assertFalse(redeemers.isEmpty(), "the tank spend must carry a redeemer");
