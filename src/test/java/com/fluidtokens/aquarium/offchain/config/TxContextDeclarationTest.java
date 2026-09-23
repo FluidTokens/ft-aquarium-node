@@ -10,6 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -47,6 +48,49 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class TxContextDeclarationTest {
 
+    /**
+     * ⛔ <b>THE TANK'S OFFLINE RIG MUST RUN PRODUCTION'S CONFIGURATION, NOT A COPY OF IT.</b>
+     *
+     * <p>This file's whole premise is that a builder's decisions are declared rather than guessed.
+     * The same applies one level out: {@code TankTransactionDryEvalTest} proves the tank transaction
+     * against the real validator, and it is worth exactly as much as the configuration it builds
+     * with.
+     *
+     * <p>⚑ <b>Measured 2026-09-23.</b> Diffing the knobs the rig set for itself against the ones the
+     * service sets showed it missing {@code withUtxoSelectionStrategy} and {@code preBalanceTx} —
+     * <b>so the reference-script guard and the pre-evaluation fee were both unexercised, the fee
+     * having shipped hours earlier.</b> Both are now inside {@code balanceTankTx}, which production
+     * and the rig share.
+     *
+     * <p>⚠ This repo already paid for that shape once: the 2026-08-21 incident, a builder promoted
+     * byte-identically while every test used a rig that supplied what production had to earn.
+     * A rig that rebuilds the configuration tests the rebuild.
+     */
+    @Test
+    void theTankRigBuildsThroughTheSharedConfigurationRatherThanItsOwn() throws IOException {
+        String rig = Files.readString(Path.of("src/test/java/com/fluidtokens/aquarium/offchain/"
+                + "service/TankTransactionDryEvalTest.java"));
+
+        assertTrue(rig.contains("ScheduledTransactionService.balanceTankTx("),
+                "the rig must build through balanceTankTx() — the shared source of the shape and "
+                        + "balancing knobs — or it proves only its own configuration");
+
+        for (String knob : List.of("withUtxoSelectionStrategy", "preBalanceTx", "withCollateralInputs",
+                "collateralPayer", "feePayer", "mergeOutputs", "postBalanceTx")) {
+            assertFalse(rig.contains("." + knob + "("),
+                    "the rig sets " + knob + " itself. That is how it silently stopped matching "
+                            + "production: every knob it re-declares is one production can change "
+                            + "underneath it. It belongs in balanceTankTx()");
+        }
+
+        // ⚠ And what the rig MUST still own: no signers (evaluation is not signing, and a rig that
+        // cannot sign cannot accidentally submit) and its own evaluator.
+        assertFalse(rig.contains(".withSigner("),
+                "an offline rig must not sign — that is the structural reason it cannot submit");
+        assertTrue(rig.contains(".withTxEvaluator("),
+                "and it must supply its own evaluator, which is the thing it exists to substitute");
+    }
+
     private enum Decision { SET, OMITTED }
 
     private record Entry(Decision decision, String reason) {
@@ -83,24 +127,26 @@ class TxContextDeclarationTest {
         // ---- V5: the structural assertion, installed INSIDE the build pipeline (T-054) --------
         d.put("postBalanceTx", new LinkedHashMap<>(Map.of(
                 LIQ, Entry.set(), CONVERT, Entry.set(),
-                // ⛔ THE TANK NOW USES IT, AND NOT FOR ASSERTIONS — IT RESHAPES THE BODY.
+                // ⛔ THE TANK USED IT TO RESHAPE THE BODY, AND NO LONGER DOES.
                 //
-                // postBalanceTx is the only hook that runs AFTER balancing (QuickTxBuilder:478), and
-                // after balancing is the only moment this transaction can be put right. CCL balances
-                // to a change output below min-UTxO, so ChangeOutputAdjustments reaches into the
-                // operator's wallet unasked, adds an input and leaves a third output — costing the
-                // operator ada on every payment, because a tank is funded to pay its own fee exactly
-                // and has no spare to give back.
+                // stripOperatorContribution() removed the wallet input and change output after
+                // balancing, so the tank paid its own fee. Two independent local evaluators
+                // accepted the result; Blockfrost refused it with an empty ScriptFailures map that
+                // cannot be reasoned from. Reverted to vanilla CCL on 2026-09-23 — the shape
+                // mainnet has actually executed.
                 //
-                // stripOperatorContribution() removes that input and that output and lets the fee
-                // take the tank's remainder. Measured: 1 input, 2 outputs, fee 340,000 against a
-                // minimum of ~322,752.
+                // ⚠ So this is an omission with TWO reasons now, and they are different: T-059's
+                // structural assertions are still queued and undone, and the reshaping that briefly
+                // occupied this hook was withdrawn. Do not read the empty hook as "nothing was ever
+                // wanted here".
                 //
-                // ⚠ IT IS A SETTER, like preBalanceTx (QuickTxBuilder:275 assigns rather than
-                // composes) — a second call here silently discards the first, so the structural
-                // assertions T-059 wants cannot simply be added as another postBalanceTx. They have
-                // to go inside this one, or through withVerifier, which DOES compose.
-                TANK, Entry.set())));
+                // ⚠ And when T-059 is finally done: postBalanceTx is a SETTER (QuickTxBuilder:275
+                // assigns), so the assertions cannot be added as a second call — they go inside one
+                // lambda, or through withVerifier, which composes.
+                TANK, Entry.omitted("T-059: the tank asserts nothing about the body it built, and it "
+                        + "is the only path that runs on MAINNET. Queued, not decided. The body "
+                        + "reshaping that briefly used this hook was reverted with the self-funding "
+                        + "transaction it belonged to"))));
 
         // ---- collateral: nominated by us on the liquidation paths (T-050) --------------------
         d.put("withCollateralInputs", new LinkedHashMap<>(Map.of(
