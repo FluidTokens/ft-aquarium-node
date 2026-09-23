@@ -265,28 +265,27 @@ class TankTransactionDryEvalTest {
         // transaction carries reference inputs: ReferenceScriptResolver walks them and calls
         // getScript() on a field that constructor never sets (CCL trap 2). This transaction reads
         // three reference inputs, so it hits that every time.
-        var built = new QuickTxBuilder(utxoSupplier, paramsSupplier,
-                (com.bloxbean.cardano.client.api.ScriptSupplier) scriptHash -> Optional.of(validator),
-                (com.bloxbean.cardano.client.api.TransactionProcessor) null)
-                .compose(tx)
+        // ⛔ THE PRODUCTION CONFIGURATION, NOT A REBUILD OF IT.
+        //
+        // An audit on 2026-09-23 diffed the knobs this test set for itself against the ones the
+        // service sets, and found it missing withUtxoSelectionStrategy and preBalanceTx — so the
+        // reference-script guard and the pre-evaluation fee were both unexercised, the fee having
+        // shipped hours earlier. balanceTankTx() is now the single source of both.
+        //
+        // ⚠ What this test still supplies for itself is exactly what a rig is allowed to supply:
+        // the evaluator, and NO SIGNERS AT ALL. Evaluation is not signing, so no mnemonic is
+        // needed — and a rig that cannot sign cannot accidentally submit.
+        var built = ScheduledTransactionService.balanceTankTx(
+                        new QuickTxBuilder(utxoSupplier, paramsSupplier,
+                                (com.bloxbean.cardano.client.api.ScriptSupplier) sh -> Optional.of(validator),
+                                (com.bloxbean.cardano.client.api.TransactionProcessor) null)
+                                .compose(tx),
+                        tank, collateral, operator, utxoSupplier, slot)
                 .withTxEvaluator(aiken)
                 // ⛔ FALSE. Left true — its default — a failed evaluation is swallowed and the build
                 // ships PLACEHOLDER ex-units, so this test would go green on exactly the defect it
                 // exists to catch (CCL trap 8).
                 .ignoreScriptCostEvaluationError(false)
-                .withRequiredSigners(HexUtil.decodeHexString(OPERATOR_STAKE))
-                .withCollateralInputs(TransactionInput.builder()
-                        .transactionId(collateral.getTxHash()).index(collateral.getOutputIndex()).build())
-                .collateralPayer(operator)
-                .feePayer(operator)
-                .validFrom(slot - 30)
-                .validTo(slot + 180)
-                .mergeOutputs(false)
-                // ⚠ postBalanceTx is a SETTER (QuickTxBuilder:275, `this.postBalanceTrasformer =`),
-                // exactly like preBalanceTx -- a second call silently discards the first. One call,
-                // and it must be the same reshaping production applies.
-                .postBalanceTx((ctx, txn) -> ScheduledTransactionService.stripOperatorContribution(
-                        txn, tank, operator))
                 .build();
 
         // ⛔ THE SPEND REDEEMER MUST NAME THE INPUT THE TANK ACTUALLY OCCUPIES.

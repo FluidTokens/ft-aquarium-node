@@ -10,6 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -46,6 +47,49 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * divergence impossible to introduce silently, not to prove any builder correct.
  */
 class TxContextDeclarationTest {
+
+    /**
+     * ⛔ <b>THE TANK'S OFFLINE RIG MUST RUN PRODUCTION'S CONFIGURATION, NOT A COPY OF IT.</b>
+     *
+     * <p>This file's whole premise is that a builder's decisions are declared rather than guessed.
+     * The same applies one level out: {@code TankTransactionDryEvalTest} proves the tank transaction
+     * against the real validator, and it is worth exactly as much as the configuration it builds
+     * with.
+     *
+     * <p>⚑ <b>Measured 2026-09-23.</b> Diffing the knobs the rig set for itself against the ones the
+     * service sets showed it missing {@code withUtxoSelectionStrategy} and {@code preBalanceTx} —
+     * <b>so the reference-script guard and the pre-evaluation fee were both unexercised, the fee
+     * having shipped hours earlier.</b> Both are now inside {@code balanceTankTx}, which production
+     * and the rig share.
+     *
+     * <p>⚠ This repo already paid for that shape once: the 2026-08-21 incident, a builder promoted
+     * byte-identically while every test used a rig that supplied what production had to earn.
+     * A rig that rebuilds the configuration tests the rebuild.
+     */
+    @Test
+    void theTankRigBuildsThroughTheSharedConfigurationRatherThanItsOwn() throws IOException {
+        String rig = Files.readString(Path.of("src/test/java/com/fluidtokens/aquarium/offchain/"
+                + "service/TankTransactionDryEvalTest.java"));
+
+        assertTrue(rig.contains("ScheduledTransactionService.balanceTankTx("),
+                "the rig must build through balanceTankTx() — the shared source of the shape and "
+                        + "balancing knobs — or it proves only its own configuration");
+
+        for (String knob : List.of("withUtxoSelectionStrategy", "preBalanceTx", "withCollateralInputs",
+                "collateralPayer", "feePayer", "mergeOutputs", "postBalanceTx")) {
+            assertFalse(rig.contains("." + knob + "("),
+                    "the rig sets " + knob + " itself. That is how it silently stopped matching "
+                            + "production: every knob it re-declares is one production can change "
+                            + "underneath it. It belongs in balanceTankTx()");
+        }
+
+        // ⚠ And what the rig MUST still own: no signers (evaluation is not signing, and a rig that
+        // cannot sign cannot accidentally submit) and its own evaluator.
+        assertFalse(rig.contains(".withSigner("),
+                "an offline rig must not sign — that is the structural reason it cannot submit");
+        assertTrue(rig.contains(".withTxEvaluator("),
+                "and it must supply its own evaluator, which is the thing it exists to substitute");
+    }
 
     private enum Decision { SET, OMITTED }
 

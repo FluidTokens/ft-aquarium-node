@@ -456,93 +456,17 @@ public class ScheduledTransactionService {
                     });
                 }
 
-                var context = composed
-                        // ⛔ NEVER SPEND A UTxO CARRYING A REFERENCE SCRIPT.
-                        //
-                        // This service reaches coin selection through the SHARED QuickTxBuilder bean
-                        // (YaciConfig), so there is no tx.from(...) here to grep for — the hazard
-                        // arrives by injection and is invisible to a search for the dangerous call.
-                        // That is how it was missed: the two liquidation builders construct their own
-                        // builders and were guarded, and this third site was not.
-                        //
-                        // It spends from the same wallet as the liquidation bot. Nothing with a
-                        // scriptRef is in that wallet today, but a guard whose absence depends on a
-                        // wallet staying empty of a particular UTxO shape is not a guard -- and this
-                        // repo published a reference script to its own address on 2026-08-17 and had
-                        // it consumed by an unguarded builder on 2026-08-25.
-                        .withUtxoSelectionStrategy(
-                                ReferenceScriptSafeUtxoSelection.strategy(referenceScriptSafeSupplier()))
-                        // ⛔ TWO JOBS, ONE LAMBDA — because preBalanceTx is a SETTER
-                        // (QuickTxBuilder:263 assigns), so a second call would silently discard the
-                        // first. Whatever this hook needs to do has to happen here or not at all.
-                        .preBalanceTx((ctx, txn) -> {
-                            ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(
-                                    referenceScriptSafeSupplier()));
-                            // ⛔ BALANCE THE BODY BEFORE IT IS EVALUATED, so the evaluator prices
-                            // the transaction we actually ship.
-                            //
-                            // QuickTxBuilder runs preBalanceTx at :401 and evaluateScriptCost at
-                            // :455 -- BEFORE balanceTx at :470. Left alone, the evaluator is handed
-                            // a body carrying fee 0 with the tank's whole remainder unaccounted for:
-                            // inputs 2,340,000 against outputs 2,000,000 and nothing to close it.
-                            // Setting the fee here makes inputs == outputs + fee at the moment of
-                            // evaluation, which is also exactly the shape stripOperatorContribution
-                            // restores afterwards.
-                            //
-                            // ⚠ Hypothesis, and stated as one: this has not been reproduced
-                            // locally, because the offline Aiken evaluator accepts the unbalanced
-                            // body and Blockfrost's does not (it answers {"ScriptFailures":{}} --
-                            // an empty map, naming nothing). What is NOT hypothetical is that
-                            // evaluating a body you do not ship is wrong on its own terms.
-                            var owed = txn.getBody().getOutputs().stream()
-                                    .map(o -> o.getValue().getCoin())
-                                    .reduce(java.math.BigInteger.ZERO, java.math.BigInteger::add);
-                            var remainder = LedgerCeilings.lovelaceOf(tankPaymentUtxo).subtract(owed);
-                            if (remainder.signum() > 0) {
-                                txn.getBody().setFee(remainder);
-                            }
-                        })
+                // ⛔ SHAPE AND BALANCING COME FROM balanceTankTx, SHARED WITH THE TEST.
+                //
+                // What remains here is exactly what an offline rig must be free to replace: the
+                // signers (evaluation is not signing, and the rig holds no mnemonic), the
+                // evaluation-error policy, and the structural verifier, which needs datum-derived
+                // arguments the caller already holds.
+                var context = balanceTankTx(composed, tankPaymentUtxo, collateralUtxo,
+                                account.baseAddress(), referenceScriptSafeSupplier(), slot)
                         .withSigner(SignerProviders.signerFrom(account))
                         .withSigner(SignerProviders.stakeKeySignerFrom(account))
-                        .withRequiredSigners(account.getBaseAddress().getDelegationCredentialHash().get())
-                        .validFrom(slot - 30)
-                        .validTo(slot + 180)
-                        .feePayer(account.baseAddress())
-                        // ⛔ COLLATERAL IS PINNED, AND TO THE SAME UTXO FOR EVERY TANK THIS CYCLE.
-                        //
-                        // Left unpinned, CCL picks its own: buildCollateralOutput (QuickTxBuilder:499)
-                        // calls select(payingAddress, DEFAULT_COLLATERAL_AMT, null) -- that third
-                        // argument is utxosToExclude, and it is NULL. Nothing is excluded, so the
-                        // library is free to nominate a utxo the transaction already spends.
-                        //
-                        // ⚠ An earlier commit pinned collateral to the utxo being SPENT, which
-                        // ReferenceScriptSafeUtxoSelection had already warned against: a pinned
-                        // collateral input is excluded from ordinary coin selection, so it cannot
-                        // also front the principal. That objection dissolves here -- this
-                        // transaction spends only the tank, so the collateral utxo is not wanted as
-                        // an input and being excluded from selection is exactly right.
-                        .withCollateralInputs(TransactionInput.builder()
-                                .transactionId(collateralUtxo.getTxHash())
-                                .index(collateralUtxo.getOutputIndex())
-                                .build())
-                        .collateralPayer(account.baseAddress())
-                        .mergeOutputs(false)
                         .ignoreScriptCostEvaluationError(dumpCbor)
-                        // T-059 — THE ONLY MAINNET PATH NOW ASSERTS ITS OWN STRUCTURE.
-                        //
-                        // Every guarantee the lending-v4 review added lives on the PREVIEW paths;
-                        // this one had none. And `withVerifier` is genuinely reached here because the
-                        // tank submits through completeAndWait() — the one place in that whole arc
-                        // where the obviously-named API is the right one, after three that were not.
-                        //
-                        // ⚠ It COMPOSES (QuickTxBuilder:863-868 uses andThen), unlike preBalanceTx
-                        // above, which is a SETTER whose second call silently discards the first.
-                        // Two hooks on one builder with opposite semantics.
-                        // ⛔ AFTER BALANCING, FOLD THE CHANGE INTO THE FEE. See foldChangeIntoFee:
-                        // the tank is funded to pay its own fee exactly, so the change CCL computes
-                        // IS that fee, and the transaction must not carry a third output.
-                        .postBalanceTx((ctx, txn) -> stripOperatorContribution(
-                                txn, tankPaymentUtxo, account.baseAddress()))
                         .withVerifier(TankStructureVerifier.of(
                                 tankPaymentUtxo,
                                 parametersRefInput, stakerRefInput,
@@ -876,6 +800,80 @@ public class ScheduledTransactionService {
                     .forEach(r -> r.setIndex(0));
         }
         return true;
+    }
+
+    /**
+     * ⛔ <b>EVERYTHING THAT DECIDES THE TRANSACTION'S SHAPE AND HOW IT BALANCES, in one place, so a
+     * test can exercise the configuration production actually runs.</b>
+     *
+     * <p>{@link #tankScriptTx} already shares the inputs, outputs and redeemer. That was not
+     * enough: an audit on 2026-09-23 compared the knobs set here against those
+     * {@code TankTransactionDryEvalTest} set for itself and found the test missing
+     * {@code withUtxoSelectionStrategy} and {@code preBalanceTx} — <b>so the reference-script guard
+     * and the pre-evaluation fee were both untested, the fee having shipped hours earlier.</b>
+     *
+     * <p>⚑ This repo has a name for that shape: the 2026-08-21 incident, where a builder was
+     * promoted byte-identically and every test used a rig that supplied what production had to
+     * earn. <b>A test that rebuilds the configuration by hand tests the rebuild.</b>
+     *
+     * <p>What deliberately stays with the caller is what an offline rig must be free to replace:
+     * the <b>signers</b> (evaluation is not signing, and the rig holds no mnemonic), the
+     * <b>evaluator</b>, and the <b>structural verifier</b>, which needs the datum-derived arguments
+     * the caller already has in hand.
+     */
+    static QuickTxBuilder.TxContext balanceTankTx(QuickTxBuilder.TxContext context,
+                                                  Utxo tankPaymentUtxo,
+                                                  Utxo collateralUtxo,
+                                                  String operatorAddress,
+                                                  UtxoSupplier referenceScriptSafeSupplier,
+                                                  long slot) {
+        return context
+                .withUtxoSelectionStrategy(
+                        ReferenceScriptSafeUtxoSelection.strategy(referenceScriptSafeSupplier))
+                // ⛔ TWO JOBS, ONE LAMBDA — because preBalanceTx is a SETTER
+                // (QuickTxBuilder:263 assigns), so a second call would silently discard the
+                // first. Whatever this hook needs to do has to happen here or not at all.
+                .preBalanceTx((ctx, txn) -> {
+                    ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(
+                            referenceScriptSafeSupplier));
+                    // ⛔ BALANCE THE BODY BEFORE IT IS EVALUATED, so the evaluator prices
+                    // the transaction we actually ship.
+                    //
+                    // QuickTxBuilder runs preBalanceTx at :401 and evaluateScriptCost at
+                    // :455 -- BEFORE balanceTx at :470. Left alone, the evaluator is handed
+                    // a body carrying fee 0 with the tank's whole remainder unaccounted for:
+                    // inputs 2,340,000 against outputs 2,000,000 and nothing to close it.
+                    // Setting the fee here makes inputs == outputs + fee at the moment of
+                    // evaluation, which is also exactly the shape stripOperatorContribution
+                    // restores afterwards.
+                    //
+                    // ⚠ Hypothesis, and stated as one: this has not been reproduced
+                    // locally, because the offline Aiken evaluator accepts the unbalanced
+                    // body and Blockfrost's does not (it answers {"ScriptFailures":{}} --
+                    // an empty map, naming nothing). What is NOT hypothetical is that
+                    // evaluating a body you do not ship is wrong on its own terms.
+                    var owed = txn.getBody().getOutputs().stream()
+                            .map(o -> o.getValue().getCoin())
+                            .reduce(java.math.BigInteger.ZERO, java.math.BigInteger::add);
+                    var remainder = LedgerCeilings.lovelaceOf(tankPaymentUtxo).subtract(owed);
+                    if (remainder.signum() > 0) {
+                        txn.getBody().setFee(remainder);
+                    }
+                })
+                .withRequiredSigners(
+                        new com.bloxbean.cardano.client.address.Address(operatorAddress)
+                                .getDelegationCredentialHash().orElseThrow())
+                .validFrom(slot - 30)
+                .validTo(slot + 180)
+                .feePayer(operatorAddress)
+                .withCollateralInputs(TransactionInput.builder()
+                        .transactionId(collateralUtxo.getTxHash())
+                        .index(collateralUtxo.getOutputIndex())
+                        .build())
+                .collateralPayer(operatorAddress)
+                .mergeOutputs(false)
+                .postBalanceTx((ctx, txn) -> stripOperatorContribution(
+                        txn, tankPaymentUtxo, operatorAddress));
     }
 
     static ScriptTx tankScriptTx(Utxo tankPaymentUtxo,
