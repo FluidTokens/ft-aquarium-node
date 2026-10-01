@@ -131,6 +131,39 @@ class ExecutorContextResolutionTest {
     }
 
     /**
+     * ⛔ FAB-115 round-2 finding 3. The reference-script verifier must close the SHARED gate in a real
+     * container — a verifier that kept a private gate would log the refusal while the executors carried
+     * on against stale coordinates (a phase-2 failure, collateral forfeit).
+     */
+    @Test
+    void aReferenceScriptMismatchClosesTheContainersSharedGate() {
+        var claimOnly = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30,
+                new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
+                        new com.bloxbean.cardano.client.transaction.spec.TransactionInput("ab".repeat(32), 0),
+                        null, null));
+        com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.TxOutputLookup foreign =
+                (tx, ix) -> com.bloxbean.cardano.client.api.model.Result
+                        .<com.bloxbean.cardano.client.api.model.Utxo>success("ok")
+                        .withValue(com.bloxbean.cardano.client.api.model.Utxo.builder().txHash(tx).outputIndex(ix)
+                                .referenceScriptHash("de".repeat(28)).build());
+
+        new ApplicationContextRunner()
+                .withBean(com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class)
+                .withBean(com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.class,
+                        () -> new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier(
+                                LoanFixtures.registry(), claimOnly, foreign, false))
+                .run(context -> {
+                    assertTrue(context.getStartupFailure() == null,
+                            "a reference-script mismatch must not fail the context: " + context.getStartupFailure());
+                    var gate = context.getBean(com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class);
+                    assertTrue(context.getBean(com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.class)
+                            .gate() == gate, "the verifier must write the container's gate, not a private one");
+                    assertTrue(gate.isBlocked(), "and that shared gate must be closed");
+                });
+    }
+
+    /**
      * ⛔ FAB-115 audit findings 1–2. The gate only works if EVERY reader and writer is handed the SAME
      * container bean. Injection is by setter and REQUIRED, so a missing gate bean fails the boot loudly
      * instead of leaving lending ungated (it used to be optional and failed open). This pins, for each

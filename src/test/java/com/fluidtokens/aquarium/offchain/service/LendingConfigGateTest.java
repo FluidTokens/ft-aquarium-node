@@ -139,6 +139,27 @@ class LendingConfigGateTest {
                 "a vanished config NFT is a lending fault, reported as one: " + verifier.gate().blockedReason());
     }
 
+    /**
+     * ⛔ Round-2 finding 6: any fault, not only IllegalStateException. A provider answering success with
+     * no value list NPEs in the lookup; that used to escape @PostConstruct and ground the node.
+     */
+    @Test
+    void anUnexpectedFaultClosesTheGateInsteadOfEscapingStartup() throws Exception {
+        UtxoService broken = mock(UtxoService.class);
+        when(broken.getUtxos(anyString(), anyInt(), anyInt())).thenReturn(
+                Result.<List<Utxo>>success("ok").withValue(null));
+        BFBackendService bf = mock(BFBackendService.class);
+        when(bf.getUtxoService()).thenReturn(broken);
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("mainnet");
+        LoansConfigVerifier verifier = new LoansConfigVerifier(
+                new LoansContractRegistry(CONFIG, LM_CONFIG, ASSET, SMART, null, null, null),
+                SMART, network, bf, false);
+
+        assertDoesNotThrow(verifier::verify, "a lending fault must not stop the node");
+        assertTrue(verifier.gate().isBlocked(), "it must close the lending gate instead");
+    }
+
     @Test
     void severalMismatchesOnOneHashReadAsAPauseAndDistinctOnesAsARedeploy() {
         assertTrue(LoansConfigVerifier.pausedReading(List.of(

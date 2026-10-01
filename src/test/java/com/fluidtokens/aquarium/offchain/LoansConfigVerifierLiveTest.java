@@ -19,8 +19,9 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -92,6 +93,10 @@ class LoansConfigVerifierLiveTest {
         // Exercises the whole @PostConstruct path — the same call the running node makes at boot.
         verifier.verify();
 
+        // ⛔ FAB-115: a mismatch no longer throws — it closes the lending gate. Without this line the
+        // test would pass on a WRONG pin, which is exactly what it exists to catch.
+        assertFalse(verifier.gate().isBlocked(),
+                "the shipped preview coordinates no longer match the chain: " + verifier.gate().blockedReason());
         assertEquals(shipped.smartTokensSpend(), verifier.getOnChainSmartTokensSpendScriptHash(),
                 "smartTokensSpendScriptHash read live from the ConfigDatum");
     }
@@ -101,9 +106,12 @@ class LoansConfigVerifierLiveTest {
      * verification on every boot, which is the exact failure this class exists to prevent. Runs with
      * fail-on-unreachable left at its default {@code false}, so the only way this passes is if a 4xx
      * is classified as an answer rather than an outage.
+     * <p>
+     * ⛔ FAB-115: an answer that rules out verification CLOSES THE LENDING GATE rather than stopping
+     * the node (scheduled payments must survive it). What must not happen is an OPEN gate.
      */
     @Test
-    void aRejectedKeyIsAHardFailureNotADegradedBoot() throws IOException {
+    void aRejectedKeyClosesTheLendingGateNotADegradedBoot() throws IOException {
         Coordinates shipped = shippedPreviewCoordinates();
 
         var network = new AppConfig.Network();
@@ -113,8 +121,9 @@ class LoansConfigVerifierLiveTest {
         var verifier = new LoansConfigVerifier(registry, shipped.smartTokensSpend(), network,
                 new BFBackendService(PREVIEW_URL, "not-a-real-project-id"), false);
 
-        var e = assertThrows(IllegalStateException.class, verifier::verify);
-        assertTrue(e.getMessage().contains("rejected"), "expected a rejection, got: " + e.getMessage());
+        assertDoesNotThrow(verifier::verify, "a lending config fault must not stop the node");
+        assertTrue(verifier.gate().blockedReason().orElse("").contains("rejected"),
+                "a rejected lookup must close the gate, naming the rejection: " + verifier.gate().blockedReason());
     }
 
     // ---- reading what we ship ------------------------------------------------------------------
