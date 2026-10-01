@@ -2452,7 +2452,7 @@ class LiquidationExecutorTest {
         // operator taking that advice re-routes EVERY loan in the market away from pay-in-advance on
         // the strength of one loan's equity sign. The builder-window sibling
         // aBuilderWindowNotModelledRefusalOnATokenPrincipalNeverAdvisesConvert pins the same rule for
-        // the remaining reachable refusal family.)
+        // the remaining reachable refusal family.
         assertFalse(message.contains("action to CONVERT"),
                 "a non-positive-equity refusal must NOT advise a market-wide routing change — the "
                         + "equity sign says nothing about the mechanism: " + message);

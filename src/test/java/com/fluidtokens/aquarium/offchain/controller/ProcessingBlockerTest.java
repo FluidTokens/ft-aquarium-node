@@ -139,23 +139,21 @@ class ProcessingBlockerTest {
     }
 
     @Test
-    void aLoanWithNoBondIsBlockedByTheMissingCandidate() {
+    void aLoanWithNoBondIsNotAProcessingFailure() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null),
                 true, BondRoute.NO_BOND, GOOD_POOL, null, BigInteger.ZERO, true);
 
-        assertTrue(blocker.blocked());
-        assertEquals("no bond", blocker.label());
-        assertTrue(blocker.detail().contains("no lender bond indexed"), blocker.detail());
+        assertFalse(blocker.blocked());
+        assertEquals(null, blocker.label());
     }
 
     @Test
-    void aNullRouteIsTheSameMissingBondBlocker() {
+    void aNullRouteIsTheSameNonProcessingCase() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null),
                 true, null, GOOD_POOL, null, BigInteger.ZERO, true);
 
-        assertTrue(blocker.blocked());
-        assertEquals("no bond", blocker.label());
-        assertTrue(blocker.detail().contains("no lender bond indexed"), blocker.detail());
+        assertFalse(blocker.blocked());
+        assertEquals(null, blocker.label());
     }
 
     @Test

@@ -17,7 +17,9 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfigurati
  *
  * <h2>⚠ The route decides which action question is asked</h2>
  * A plain bond ignores market routing and asks only whether plain liquidation would run. A missing
- * bond has no executor candidate. The three failure modes below therefore concern the convert route:
+ * bond has no executor candidate. The node-mode ceiling below applies to every route: the PLAIN
+ * answer reads the effective mode, not the market's configured mode. Items 2 and 3 concern the
+ * convert route only:
  * <ol>
  *   <li><b>The node mode is a CEILING.</b> A market configured {@code LIVE} on a {@code shadow} node
  *       runs as {@code SHADOW}. Reading the market's own mode here would report a submission that

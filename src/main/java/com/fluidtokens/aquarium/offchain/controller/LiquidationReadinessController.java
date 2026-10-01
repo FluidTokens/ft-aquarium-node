@@ -556,11 +556,15 @@ public class LiquidationReadinessController {
                 new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
                 advance, principalBalance, wallet.known());
 
-        ActionNow actionNow = gatedAction(lendingConfigGate, honestAction(health.liquidatable(),
-                datum.collateral().isAda(), bondRoute == BondRoute.CONVERT,
-                ActionNow.forRoute(bondRoute, health.liquidatable(),
-                        gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
-                        gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance)));
+        ActionNow actionNow = gatedAction(lendingConfigGate,
+                excludedAction(honestAction(health.liquidatable(), datum.collateral().isAda(),
+                                bondRoute == BondRoute.CONVERT,
+                                ActionNow.forRoute(bondRoute, health.liquidatable(),
+                                        gate.effectiveMode(datum.principalAsset()),
+                                        gate.actionFor(datum.principalAsset()),
+                                        gate.marketFor(datum.principalAsset()), convertEnabled,
+                                        usability.usable(), advance)),
+                        health.liquidatable(), assessment));
 
         return new Row(loan.loanId(), loan.utxoRef(),
                 datum.principalAsset().toUnit(), datum.principalAmount(),
@@ -597,6 +601,21 @@ public class LiquidationReadinessController {
                                   ActionNow computed) {
         return Boolean.TRUE.equals(liquidatable) && adaCollateral && convertBond
                 ? ActionNow.adaCollateralNotLiquidated() : computed;
+    }
+
+    /**
+     * The executor filters excluded assessments before {@code consider()}, so an excluded row can
+     * never truthfully say the bot would act, whatever route its bond selects.
+     */
+    static ActionNow excludedAction(ActionNow computed, Boolean liquidatable,
+                                    LiquidationAssessment assessment) {
+        if (assessment != null && !assessment.buildable() && Boolean.TRUE.equals(liquidatable)) {
+            return new ActionNow("NONE — excluded",
+                    assessment.exclusion().name() + ": " + assessment.detail()
+                            + " — the bot never considers an excluded assessment",
+                    false);
+        }
+        return computed;
     }
 
     /**

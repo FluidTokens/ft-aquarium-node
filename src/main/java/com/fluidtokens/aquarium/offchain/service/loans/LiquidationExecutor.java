@@ -1213,7 +1213,8 @@ public class LiquidationExecutor {
                 // POOLED or PRICE_DATA_ORCFAX variant; and :1264 is an entry not usable this cycle.
                 //
                 // Setting a market to CONVERT cures none of them. Window and margin are per-cycle feed
-                // timing and clear by themselves. Variant and usability are oracle-entry properties:
+                // timing and clear by themselves unless the configured oracle margin exceeds what any
+                // feed can leave after validTo. Variant and usability are oracle-entry properties:
                 // OracleEntry.usableForLiquidation() is false for POOLED/ORCFAX (OracleEntry.java:124),
                 // and ConvertTransactionBuilder.build refuses a collateral oracle that is not usable
                 // for liquidation (ConvertTransactionBuilder.java:237). Negative equity says nothing
