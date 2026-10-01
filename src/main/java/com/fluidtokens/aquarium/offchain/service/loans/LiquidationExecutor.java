@@ -173,7 +173,7 @@ public class LiquidationExecutor {
          * nothing — but "we submitted a transaction we knew had expired" is not a thing this loop
          * should do, and the contract's intent was staleness protection at submit time.
          * <p>
-         * Evaluated last on purpose. Where a feed exists, S7's firing region is contained in this
+         * Evaluated last on purpose. Where a feed exists, S6's firing region is contained in this
          * one (the builder demands {@code feed.validTo >= tx.validTo + margin}, so a feed can only
          * run short after the transaction has expired), and the more specific reason is the more
          * useful one to report.
@@ -500,11 +500,11 @@ public class LiquidationExecutor {
      * ⛔ {@code ignore-profit-check} disables BOTH profitability gates. On mainnet that is a hard
      * startup failure, never a warning.
      * <p>
-     * Same reasoning as {@link #guardMainnetNegativeMargin()} and deliberately the same shape: this
-     * bean only exists when {@code loans.enabled=true}, so refusing construction refuses to arm the
-     * liquidation path at all on a mainnet node configured to liquidate at a loss. A WARN on that path
-     * is a comment, not a guard, and "copy the working preview config to mainnet" is the foreseeable
-     * operator action.
+     * Same reasoning as {@link #guardMainnetNegativeMargin()} and deliberately the same shape:
+     * {@code LiquidationExecutor} is an unconditional {@code @Service} with no {@code loans.enabled}
+     * gate, so refusing construction refuses to arm the liquidation path at all on a mainnet node
+     * configured to liquidate at a loss. A WARN on that path is a comment, not a guard, and "copy the
+     * working preview config to mainnet" is the foreseeable operator action.
      * <p>
      * On preview it proceeds, and announces itself unconditionally at boot: a bot that will move
      * someone's collateral at a loss has to say so where the operator already looks.

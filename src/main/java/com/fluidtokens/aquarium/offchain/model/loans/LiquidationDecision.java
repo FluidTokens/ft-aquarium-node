@@ -31,7 +31,7 @@ import java.math.BigInteger;
  * @param reason                 the machine-readable half: a {@code Refusal} name, an exception
  *                               class name, or the outcome's own name
  * @param detail                 the human half
- * @param submitVeto             which of the seven submit vetoes stopped this candidate being
+ * @param submitVeto             which of the eight submit vetoes stopped this candidate being
  *                               submitted, or null — either because the candidate never reached the
  *                               veto chain, or because every veto passed and a submission was
  *                               attempted
@@ -161,7 +161,7 @@ public record LiquidationDecision(long decidedAt,
          * Skipped because an earlier failure quarantined this loan UTxO and the quarantine has not
          * yet lapsed. {@code detail} carries the remaining hold.
          *
-         * <p>⚠ <b>This is the one outcome that says nothing about the candidate.</b> The other seven
+         * <p>⚠ <b>This is the one outcome that says nothing about the candidate.</b> The other eight
          * are judgements about the loan; this is a statement about the bot's own recent history, and
          * an operator reading it as "not liquidatable" would be reading it wrong.
          *

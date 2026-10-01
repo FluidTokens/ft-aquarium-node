@@ -887,7 +887,7 @@ public class AppConfig {
 
         /**
          * {@code txHash#index}, or empty for "not published". Every rejection names the key, because
-         * the value alone does not tell an operator which of seven near-identical lines to fix.
+         * the value alone does not tell an operator which of nine near-identical lines to fix.
          */
         static TransactionInput referenceInput(String key, String value) {
             String coordinate = value == null ? "" : value.trim();
@@ -998,7 +998,7 @@ public class AppConfig {
         /**
          * Published reference scripts, as a comma-separated list of {@code txHash#index} coordinates.
          *
-         * <p>⚑ <b>Deliberately NOT one named key per validator.</b> The liquidation path has eight
+         * <p>⚑ <b>Deliberately NOT one named key per validator.</b> The liquidation path has nine
          * such keys, and its own Argo comment records the confusion they cause: a key named for a
          * validator holds a <em>coordinate</em>, not a contract, and nothing checks that the two
          * agree. Here the operator lists coordinates and <b>the chain says which script each one
@@ -1097,10 +1097,13 @@ public class AppConfig {
          * operator's stated cost of touching a DEX.
          *
          * <p>⚑ <b>Why a floor rather than adding the batcher fee to the measurement.</b> Read at
-         * {@code e0b818e}: for an <b>ada</b> collateral the validator requires the order's total
-         * lovelace to equal {@code swappableCollateralAmount} exactly — <b>no extra ada at all</b> —
-         * so Minswap's {@code max_batcher_fee} of 700,000 comes out of the <em>swap input</em>, which
-         * is the lender's proceeds, not the bot's wallet. Adding it to the bot's outlay would be a
+         * {@code e0b818e}: for an <b>ada</b> collateral the validator <b>used to require</b> the
+         * order's total lovelace to equal {@code swappableCollateralAmount} exactly — no extra ada
+         * at all — so Minswap's {@code max_batcher_fee} of 700,000 came out of the <em>swap
+         * input</em>, which is the lender's proceeds, not the bot's wallet. Since {@code db5069e}
+         * the ada branch also carries the Minswap overhead on top of the swappable amount (see
+         * {@code ConvertOrderPlan}), but that overhead pays for the order mechanics, not the bot's
+         * own batcher-fee outlay — adding the batcher fee itself to the bot's outlay would still be a
          * false attribution. A floor captures Giovanni's conservatism <b>without asserting who pays
          * what</b>, which is the honest instrument for a cost whose incidence is genuinely split.
          *

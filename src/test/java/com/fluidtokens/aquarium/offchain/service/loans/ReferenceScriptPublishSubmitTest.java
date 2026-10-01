@@ -38,10 +38,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <h2>Why one script and not the shipped minimum split</h2>
  * The plan here is {@code of(LOAN_CLAIM_ACTION)}, not {@code minimumSplit()}. Measured on the fourth
  * deployment, shedding this one 8,662-byte validator is sufficient on both liquidation paths — plain
- * Liquidate 20,342 → 11,713 bytes and the convert path 23,459 → 14,794, against a 16,384 limit. The
- * other validator the convert path references, the oracle at {@code 402c984d…}, is <b>already
- * published by FluidTokens</b> and appears as a reference input in their own borrow transactions, so
- * it is not ours to publish. Publishing more than this would lock ada for nothing.
+ * Liquidate 20,342 → 11,713 bytes and the pay-in-advance path 23,459 → 14,794, against a 16,384 limit.
+ * The other validator the pay-in-advance path references, the oracle at {@code 402c984d…}, is
+ * <b>already published by FluidTokens</b> and appears as a reference input in their own borrow
+ * transactions, so it is not ours to publish. Publishing more than this would lock ada for nothing.
  *
  * <h2>⚠ The change address is the FUNDER, deliberately, and this differs from the print-only runner</h2>
  * That runner sends change to wallet index 1 to keep it away from the destination. Here the funder is
@@ -93,7 +93,7 @@ class ReferenceScriptPublishSubmitTest {
             "c6e0c4395cf22e08f918ca996d7db49faba793dbd6b647160168ff39";
 
     /**
-     * The CONVERT path's action validator, 7,051 bytes — the target of the second publish
+     * The PAY-IN-ADVANCE path's action validator, 7,051 bytes — the target of the second publish
      * (2026-08-25). Derived from the shipped blueprint under the fourth deployment's coordinates.
      */
     private static final String EXPECTED_PAY_IN_ADVANCE_ACTION_HASH =

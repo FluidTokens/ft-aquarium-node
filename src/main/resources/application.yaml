@@ -99,7 +99,7 @@ loans:
   # really help." A redundant gate is not free: it made `disabled` and `live` + `enabled: false` two
   # spellings of "off", and gave an operator who HAD decided to arm one more silent way not to have.
   #
-  # This is not a drill: when mode is live and all seven submit-vetoes pass, the
+  # This is not a drill: when mode is live and all eight submit-vetoes pass, the
   # executor SIGNS AND SUBMITS the liquidation on preview (LiquidationExecutor wires the real
   # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
   # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely.
@@ -418,12 +418,13 @@ loans:
       # reference_script 8f469373…, 4,227 bytes, unspent, and 8f469373… is exactly what this node derives
       # and what the live LMConfigDatum names at field 2.
       lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:668605c0fba76ab5c4c6551c914f5ebe50d4afec3fc454f96e99064c764e8670#0}
-      # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
-      # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
-      # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
-      # at all, so it could not be referenced however much else was published -- which is why a convert
-      # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
-      # referenced and working. Referencing this one alone sheds ~7,051 bytes.
+      # The PAY-IN-ADVANCE path's action validator -- distinct from lm-liquidate-action, which is the
+      # PLAIN path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
+      # largest script left inline on a pay-in-advance liquidation. Until 2026-08-25 there was no key
+      # for it at all, so it could not be referenced however much else was published -- which is why a
+      # pay-in-advance transaction measured 20,548 bytes against a 16,384 maxTxSize with
+      # loan-claim-action already referenced and working. Referencing this one alone sheds ~7,051
+      # bytes. Minswap convert has its own lm-liquidate-and-convert-action key, below.
       # ⭐ RE-POINTED 2026-10-01 (was 2026-09-22's bec0ed6f…). Carries 0e000364…, 7,051 bytes, unspent —
       # the largest script this path carried inline, so referencing it is the bigger of the two savings.
       lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:7b52267a32d4855dfe6360a4c8c4a7d28cc006c2b22162590646af549cbebc52#0}
@@ -666,12 +667,13 @@ loans:
       # is republished under the fourth deployment. Scanning, health and pricing are unaffected.
       loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
       lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
-      # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
-      # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
-      # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
-      # at all, so it could not be referenced however much else was published -- which is why a convert
-      # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
-      # referenced and working. Referencing this one alone sheds ~7,051 bytes.
+      # The PAY-IN-ADVANCE path's action validator -- distinct from lm-liquidate-action, which is the
+      # PLAIN path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
+      # largest script left inline on a pay-in-advance liquidation. Until 2026-08-25 there was no key
+      # for it at all, so it could not be referenced however much else was published -- which is why a
+      # pay-in-advance transaction measured 20,548 bytes against a 16,384 maxTxSize with
+      # loan-claim-action already referenced and working. Referencing this one alone sheds ~7,051
+      # bytes. Minswap convert has its own lm-liquidate-and-convert-action key, below.
       lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:}
       # ⛔ BLANKED EXPLICITLY, not omitted. The base document now BAKES mainnet coordinates as its
       # defaults, and a preview node inherits every base key it does not override. A mainnet

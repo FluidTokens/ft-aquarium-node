@@ -90,7 +90,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * form of that: it takes the transaction the loop actually produced, parses it back out of the
  * recorded CBOR, and shows the witness set holds zero vkey witnesses.
  * <p>
- * The armed half — the seven submit vetoes and the submission itself — lives in
+ * The armed half — the eight submit vetoes and the submission itself — lives in
  * {@link LiquidationSubmitVetoTest}.
  */
 class LiquidationExecutorTest {
@@ -3520,6 +3520,12 @@ class LiquidationExecutorTest {
      * <p>The listing here puts a reference-script utxo FIRST on purpose; the captured input must be
      * the ada-only one. Mutant: hand the router {@code walletUtxos.get(0)} again — this test fails with
      * the reference-script hash in the message.
+     *
+     * <p>⚠ {@code convertScenario} is ada collateral, which {@link ConvertLiquidationRouter} (~line
+     * 332, FAB-117) refuses before any wallet selection in production. This test reaches the sized
+     * selection only because {@link CapturingConvertRouter} is a fake standing in for that router and
+     * never runs its own refusal; it proves the executor hands the fake the right utxo, not that
+     * production would ever get this far on ada collateral.
      */
     @Test
     void theConvertRouteIsHandedANominableWalletUtxoNeverTheFirstRawOne() {

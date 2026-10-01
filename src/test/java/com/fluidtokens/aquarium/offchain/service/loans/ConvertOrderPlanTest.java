@@ -297,7 +297,7 @@ class ConvertOrderPlanTest {
     /**
      * ⛔ THE ORDER'S ADA, which differs by collateral kind and is the term a model would omit. A token
      * collateral's order must carry exactly 2.8 ada <b>alongside</b> the tokens; an ADA collateral's
-     * order holds exactly the swappable amount and nothing extra.
+     * order holds the swappable amount <b>plus</b> that same overhead.
      */
     @Test
     void everyOrderCarriesTheMinswapOverhead_andTheAdaCaseAddsItToTheSwapAmount() throws IOException {

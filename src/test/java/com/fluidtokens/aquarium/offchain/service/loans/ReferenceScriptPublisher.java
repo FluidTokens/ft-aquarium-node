@@ -82,9 +82,10 @@ public final class ReferenceScriptPublisher {
         LOAN_CLAIM_ACTION("loan-claim-action"),
         LM_LIQUIDATE_ACTION("lm-liquidate-action"),
         /**
-         * The CONVERT path's action validator — 7,051 bytes against the plain path's 4,227, and the
-         * largest script left inline on a convert liquidation. Added 2026-08-25 with the
-         * {@code ReferenceScripts} slot that finally lets it be referenced at all.
+         * The PAY-IN-ADVANCE path's action validator — 7,051 bytes against the plain path's 4,227, and
+         * the largest script left inline on a pay-in-advance liquidation. Added 2026-08-25 with the
+         * {@code ReferenceScripts} slot that finally lets it be referenced at all. Minswap convert has
+         * its own {@code lm-liquidate-and-convert-action} key.
          */
         LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION("lm-liquidate-and-pay-in-advance-action"),
 

@@ -1154,7 +1154,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S3 — profitability
+    // S4 — profitability
     // ======================================================================================
 
     /**
@@ -1458,7 +1458,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S4 — the size, against the live protocol parameters
+    // S5 — the size, against the live protocol parameters
     // ======================================================================================
 
     /**
@@ -1515,7 +1515,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S5 — the oracle window at submit time
+    // S6 — the oracle window at submit time
     // ======================================================================================
 
     /**
@@ -1599,7 +1599,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S6 — the UTxOs, re-read immediately before the wire
+    // S7 — the UTxOs, re-read immediately before the wire
     // ======================================================================================
 
     /**
@@ -1755,7 +1755,7 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
-    // S7 — the transaction's own validity window
+    // S8 — the transaction's own validity window
     // ======================================================================================
 
     /**
@@ -2051,8 +2051,9 @@ class LiquidationSubmitVetoTest {
     // ======================================================================================
 
     /**
-     * {@code mode: disabled} and {@code enabled: false} — what an operator gets if they change
-     * nothing. Nothing is scanned, nothing is built, nothing is submitted.
+     * {@code mode: disabled} — the whole arming story now that {@code loans.liquidation.enabled} is
+     * gone — is what an operator gets if they change nothing. Nothing is scanned, nothing is built,
+     * nothing is submitted.
      */
     @Test
     void withTheShippedDefaultsNothingIsSubmitted() {
