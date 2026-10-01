@@ -1137,6 +1137,10 @@ class LiquidationReadinessControllerTest {
         assertEquals("CONVERT", row.route(), row.routeDetail());
         assertTrue(row.routeDetail().contains("this node cannot convert"), row.routeDetail());
         assertFalse(row.routeDetail().contains("no usable Minswap pool"), row.routeDetail());
+        // ⚠ "this node cannot convert" is also in the verdict's own detail, which every text appends --
+        // so the pool-verdict wording must be refused outright, and the node's own remedy required.
+        assertFalse(row.routeDetail().contains("the pool cannot fill"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("configure loans.minswap"), row.routeDetail());
         assertFalse(row.routeDetail().contains("must be fronted"), row.routeDetail());
         assertTrue(row.routeDetail().contains("fronts no capital"), row.routeDetail());
     }
