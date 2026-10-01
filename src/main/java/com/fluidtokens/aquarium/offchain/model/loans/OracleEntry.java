@@ -9,12 +9,17 @@ import java.util.List;
  * Everything the registry knows about one asset's oracle — the price, and the deployment a
  * liquidation transaction has to reference.
  * <p>
- * There is one of these per priced asset, not one per protocol: the registry publishes 19 entries
- * with 19 distinct reward addresses. That is forced by the validator, because
+ * There is one of these per ORACLE NFT. Since 2026-09-30 that is not one per priced asset: the
+ * registry lists most tokens twice — {@code oracleVersion} 1 (Lending v3) and 2 (Lending v4), under
+ * different NFT policies — 35 entries across 19 tokens on 2026-10-01. A loan names exactly one of them
+ * ({@link #oracleToken}), and the validator requires exactly that NFT.
+ * <p>
+ * Two versions may share one withdraw CREDENTIAL (FLDT's v1 and v2 run one script under two NFTs).
  * {@code retrieve_oracle_data} resolves its feed with
- * {@code pairs.get_first(redeemers, Withdraw(oraclePaymentCredential))} — one redeemer per
- * credential. A loan with a token principal <em>and</em> token collateral therefore needs two
- * separate oracle withdrawals, one per leg, each with its own reference input.
+ * {@code pairs.get_first(redeemers, Withdraw(oraclePaymentCredential))} — one redeemer per credential —
+ * so a transaction carries ONE withdrawal per credential but ONE reference input per NFT its legs name.
+ * A loan with a token principal and token collateral behind different credentials needs two
+ * withdrawals, one per leg.
  *
  * @param token           the asset being priced, as it appears inside the signed feed
  * @param oracleToken     the oracle's own NFT. This is what a loan datum points at
