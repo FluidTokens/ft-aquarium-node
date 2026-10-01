@@ -1482,8 +1482,9 @@ public class LiquidationExecutor {
         // floorProfit is therefore REPLACED (not added to) for this branch: acquired - outlay - txFee
         // - riders, exactly the plain path's shape (fee slice - txFee - riders) with "fee slice"
         // widened to the REAL trade this path actually makes. Both acquired and outlay are priced
-        // through PricingService, at the SAME instant (`now`) — never mixed with collateralFeed above,
-        // which is a DIFFERENT, validator-pinned source that can disagree with PricingService's own.
+        // through PricingService, at the SAME instant (`now`) — never mixed with collateralFeed above.
+        // Since FAB-111 both resolve the oracle the datum NAMES, but collateralFeed comes from this
+        // cycle's snapshot and PricingService reads the live client, so a refresh can still part them.
         //
         // Direction: PricingService.toLovelace ROUNDS FLOOR — correct for acquired (an EARNED amount)
         // and WRONG for the outlay, where floor would UNDERSTATE the cost and flatter the bot. So the
@@ -1509,8 +1510,12 @@ public class LiquidationExecutor {
                     return;
                 }
                 PricingService pricingService = new PricingService(client);
-                PricingService.Priced pricedAcquired = pricingService.toLovelace(collateralAsset,
-                        acquiredQuantity, now);
+                // ⛔ FAB-111: both legs off the oracles THIS loan's datum names — the ones its
+                // transaction is built from — not a token's preferred version, which since 2026-09-30
+                // can be a different oracle (v1 Lending v3 vs v2 Lending v4).
+                var payInAdvanceDatum = assessment.loan().datum();
+                PricingService.Priced pricedAcquired = pricingService.toLovelaceForLeg(collateralAsset,
+                        payInAdvanceDatum.collateral().oracleTokenAsset(), acquiredQuantity, now);
                 if (!pricedAcquired.isPriced()) {
                     PricingService.PriceRefusal refusal = pricedAcquired.refusal();
                     String priceDetail = ("PRICE_UNAVAILABLE: cannot price the acquired collateral of "
@@ -1523,8 +1528,8 @@ public class LiquidationExecutor {
                             assessment.loan().utxoRef(), priceDetail);
                     return;
                 }
-                PricingService.Priced pricedOutlay = pricingService.toLovelace(payInAdvancePrincipal,
-                        payout, now);
+                PricingService.Priced pricedOutlay = pricingService.toLovelaceForLeg(payInAdvancePrincipal,
+                        payInAdvanceDatum.principalOracleAsset(), payout, now);
                 if (!pricedOutlay.isPriced()) {
                     PricingService.PriceRefusal refusal = pricedOutlay.refusal();
                     String priceDetail = ("PRICE_UNAVAILABLE: cannot price the pay-in-advance outlay of "
@@ -1839,24 +1844,27 @@ public class LiquidationExecutor {
         }
         long marginMillis = configuration.getOracleWindowMarginSeconds() * 1000L;
         LoanDatum datum = assessment.loan().datum();
-        String principal = shortfall(datum.principalAsset().isAda(), datum.principalOracleAsset(),
+        String principal = shortfall(datum.principalAsset(), datum.principalOracleAsset(),
                 "principal", submitTime, marginMillis, oraclesByUnit);
         if (principal != null) {
             return principal;
         }
-        return shortfall(datum.collateral().isAda(), datum.collateral().oracleTokenAsset(),
+        return shortfall(datum.collateral().assetType(), datum.collateral().oracleTokenAsset(),
                 "collateral", submitTime, marginMillis, oraclesByUnit);
     }
 
-    private static String shortfall(boolean isAda, AssetType oracleToken, String which, long submitTime,
-                                    long marginMillis, Map<String, OracleEntry> oraclesByUnit) {
-        if (isAda) {
+    static String shortfall(AssetType asset, AssetType oracleToken, String which, long submitTime,
+                            long marginMillis, Map<String, OracleEntry> oraclesByUnit) {
+        if (asset.isAda()) {
             return null;
         }
-        OracleEntry entry = oraclesByUnit == null ? null : oraclesByUnit.get(oracleToken.toUnit());
+        // The named oracle, only if it prices this leg's token: another token's window says nothing
+        // about this leg's (oracle re-slice, cross-provider round 2 finding 1).
+        OracleEntry entry = OracleEntry.namedForLeg(oraclesByUnit, asset, oracleToken);
         if (entry == null) {
             // Unreachable through a successful build — the builder refuses ORACLE_ENTRY_MISSING for
-            // a non-ada leg with no entry in this very map, so by here it is present. Kept because
+            // a non-ada leg with no entry in this very map, or one pricing another token, so by here
+            // it is present. Kept because
             // the alternative on the submit path is a NullPointerException, and the rule for this
             // chain is that not being able to check is failing the check.
             return "the %s leg has no oracle entry to re-check".formatted(which);
@@ -2111,15 +2119,17 @@ public class LiquidationExecutor {
         return new Address(address).getPaymentCredentialHash().map(HexUtil::encodeHexString).orElse(null);
     }
 
-    private static OraclePriceFeed collateralFeed(LiquidationAssessment assessment,
-                                                  Map<String, OracleEntry> oraclesByUnit) {
+    static OraclePriceFeed collateralFeed(LiquidationAssessment assessment,
+                                          Map<String, OracleEntry> oraclesByUnit) {
         var collateral = assessment.loan().datum().collateral();
         if (collateral.isAda()) {
             return OraclePriceFeed.unit();
         }
-        OracleEntry entry = oraclesByUnit.get(collateral.oracleTokenAsset().toUnit());
+        OracleEntry entry = OracleEntry.namedForLeg(oraclesByUnit, collateral.assetType(),
+                collateral.oracleTokenAsset());
         // Unreachable through a successful build: the builder refuses ORACLE_ENTRY_MISSING for a
-        // non-ada leg with no entry in this very map, so by here it is present.
+        // non-ada leg with no entry in this very map — or one pricing another token — so by here it is
+        // present.
         if (entry == null) {
             throw new IllegalStateException("no oracle entry for the collateral leg of loan "
                     + assessment.loan().loanId() + " after the transaction built");
@@ -2472,7 +2482,9 @@ public class LiquidationExecutor {
      * NFT's unit, which is what a loan datum points at and what {@code retrieve_oracle_data} matches
      * a reference input against — not by the priced asset.
      */
-    private Map<String, OracleEntry> oracleSnapshot() {
+    // Package-private for FluidOracleTwoVersionsTest: the snapshot is what every builder consumes, so it
+    // is what a regression test must read — not a map the test assembles for itself.
+    Map<String, OracleEntry> oracleSnapshot() {
         FluidOracleClient client = oracleClient.getIfAvailable();
         if (client == null) {
             return Map.of();

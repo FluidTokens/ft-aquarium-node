@@ -24,6 +24,14 @@ public final class OracleClients {
         return client;
     }
 
+    /**
+     * The MAINNET registry of 2026-10-01: 35 oracles across 19 tokens, 16 tokens listed twice
+     * (oracleVersion 1 for Lending v3, 2 for Lending v4). See its PROVENANCE file.
+     */
+    public static FluidOracleClient mainnetTwoVersions() throws Exception {
+        return fromFixture("/loans-v4/mainnet-oracle-registry-2026-10-01.json");
+    }
+
     /** The preview registry, which is what the node actually polls. */
     public static FluidOracleClient preview() throws Exception {
         return fromFixture("/loans-v4/oracle-registry-preview.json");

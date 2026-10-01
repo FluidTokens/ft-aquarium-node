@@ -83,13 +83,22 @@ public class LoanController {
                                  boolean usableNow,
                                  int signatures,
                                  int threshold,
-                                 boolean usableForLiquidation) {
+                                 boolean usableForLiquidation,
+                                 Integer oracleVersion) {
     }
 
+    /**
+     * @param trackedAssets  priced TOKENS (19 on 2026-10-01)
+     * @param trackedOracles registry ORACLES (35 the same day): two per token where FluidTokens
+     *                       publishes both a v1 (Lending v3) and a v2 (Lending v4) oracle
+     * @param usableNow      ORACLES (not tokens) whose feed is usable now — so it can exceed
+     *                       {@code trackedAssets}; compare it with {@code trackedOracles}
+     */
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record OracleStatusView(String lastRefresh,
                                    long secondsSinceRefresh,
                                    int trackedAssets,
+                                   int trackedOracles,
                                    int usableNow,
                                    List<OracleFeedView> feeds) {
     }
@@ -105,17 +114,19 @@ public class LoanController {
     public OracleStatusView oracle() {
         var client = oracleClient.getIfAvailable();
         if (client == null) {
-            return new OracleStatusView(null, -1, 0, 0, List.of());
+            return new OracleStatusView(null, -1, 0, 0, 0, List.of());
         }
         long now = System.currentTimeMillis();
         var feeds = client.entries().stream()
                 .map(entry -> toView(entry, now))
-                .sorted(Comparator.comparing(OracleFeedView::token))
+                .sorted(Comparator.comparing(OracleFeedView::token)
+                        .thenComparing(OracleFeedView::oracleToken))
                 .toList();
         return new OracleStatusView(
                 client.lastRefresh().toString(),
                 Duration.between(client.lastRefresh(), Instant.now()).toSeconds(),
                 client.trackedAssets(),
+                client.trackedOracles(),
                 (int) feeds.stream().filter(OracleFeedView::usableNow).count(),
                 feeds);
     }
@@ -135,7 +146,8 @@ public class LoanController {
                 feed.usableAt(now),
                 entry.signatures().size(),
                 entry.threshold(),
-                entry.usableForLiquidation());
+                entry.usableForLiquidation(),
+                entry.oracleVersion());
     }
 
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)

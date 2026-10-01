@@ -151,7 +151,29 @@ public class LiquidationReadinessController {
                       // cexplorer links. Null when the network or the loan policy is unknown — a dead
                       // link is worse than none, so the template renders plain text instead.
                       String loanExplorerUrl,
-                      String utxoExplorerUrl) {
+                      String utxoExplorerUrl,
+                      // FAB-112: the oracleVersion of the collateral oracle THIS loan's datum names
+                      // (1 = Lending v3's, 2 = Lending v4's), null when unknown or no oracle.
+                      Integer collateralOracleVersion) {
+
+        /** Without an oracle version — every construction that predates FAB-112. */
+        public Row(String loanId, String utxoRef, String principalUnit, BigInteger principalAmount,
+                   BigInteger remainingDebt, String collateralUnit, BigInteger collateralAmount,
+                   Double healthFactor, Double currentLtvPercent, Boolean liquidatable,
+                   String healthUnknownReason, BigInteger feeInCollateral, BigInteger feeValueLovelace,
+                   String feeUnknownReason, String route, String routeDetail,
+                   BigInteger advancePrincipalAmount, LoanAge age, AssetDisplay principalDisplay,
+                   AssetDisplay collateralDisplay, PoolUsability poolUsability, AssetDisplay feeDisplay,
+                   AssetDisplay feeValueDisplay, AssetDisplay advanceDisplay, AssetDisplay debtDisplay,
+                   AnticipateAndSell anticipateAndSell, AssetDisplay anticipateDisplay, ActionNow actionNow,
+                   ProcessingBlocker blocker, String loanExplorerUrl, String utxoExplorerUrl) {
+            this(loanId, utxoRef, principalUnit, principalAmount, remainingDebt, collateralUnit,
+                    collateralAmount, healthFactor, currentLtvPercent, liquidatable, healthUnknownReason,
+                    feeInCollateral, feeValueLovelace, feeUnknownReason, route, routeDetail,
+                    advancePrincipalAmount, age, principalDisplay, collateralDisplay, poolUsability,
+                    feeDisplay, feeValueDisplay, advanceDisplay, debtDisplay, anticipateAndSell,
+                    anticipateDisplay, actionNow, blocker, loanExplorerUrl, utxoExplorerUrl, null);
+        }
 
         /** Sorting key: lower is closer to liquidation. Unknown health sorts last, never first. */
         public double sortKey() {
@@ -442,8 +464,10 @@ public class LiquidationReadinessController {
                     bond.datum().liquidationFeePerMille().longValueExact());
             feeUnknown = null;
             var client = oracleClient.getIfAvailable();
+            // ⛔ FAB-111: the collateral oracle THIS loan names, not the token's preferred version.
             var feed = client == null ? Optional.<com.fluidtokens.aquarium.offchain.model.loans
-                    .OraclePriceFeed>empty() : client.findFeed(collateralAsset, now);
+                    .OraclePriceFeed>empty()
+                    : client.findFeedForLeg(collateralAsset, datum.collateral().oracleTokenAsset(), now);
             if (feed.isEmpty()) {
                 feeUnknown = "no usable oracle feed for the collateral, so the slice cannot be valued";
             } else {
@@ -552,7 +576,8 @@ public class LiquidationReadinessController {
                 anticipate.netInPrincipal() == null ? null
                         : display(datum.principalAsset().toUnit(), anticipate.netInPrincipal(), metadataMemo),
                 actionNow, blocker,
-                loanAssetUrl(loan.loanId()), txUrl(loan.utxoRef()));
+                loanAssetUrl(loan.loanId()), txUrl(loan.utxoRef()),
+                collateralOracleVersion(datum));
     }
 
     /**
@@ -563,10 +588,19 @@ public class LiquidationReadinessController {
      * unavailable the reason survives unchanged; the page must never turn "could not ask" into
      * "no pool", because one says try again shortly and the other says hold capital from now on.
      */
-    private PoolUsability usabilityFor(PoolFetch fetched, Loan loan, LenderBond bond,
+    /** Why an ADA-collateral row has no pool verdict: this node builds no liquidation for one. */
+    static final String ADA_COLLATERAL_NOT_LIQUIDATED =
+            "ada collateral: this node builds no liquidation for it (no collateral oracle leg), so no "
+                    + "pool verdict is given";
+
+    PoolUsability usabilityFor(PoolFetch fetched, Loan loan, LenderBond bond,
                                        AssetType collateral, AssetType principal, long now) {
         if (fetched.unavailable() != null) {
             return fetched.unavailable();
+        }
+        if (loan.datum().collateral().isAda()) {
+            return new PoolUsability(PoolUsability.Verdict.UNKNOWN,
+                    ADA_COLLATERAL_NOT_LIQUIDATED);
         }
         var numbers = numbersFor(loan, bond, now);
         if (numbers == null) {
@@ -773,6 +807,17 @@ public class LiquidationReadinessController {
         return n == null ? null : n.convertedLoanCollateralToPrincipalAmount();
     }
 
+    /** FAB-112: the version of the collateral oracle this loan's datum names, if the registry says. */
+    Integer collateralOracleVersion(com.fluidtokens.aquarium.offchain.model.loans.LoanDatum datum) {
+        FluidOracleClient client = oracleClient.getIfAvailable();
+        if (client == null || datum.collateral().isAda()) {
+            return null;
+        }
+        return client.findEntryByOracleToken(datum.collateral().oracleTokenAsset())
+                .filter(e -> e.token().equals(datum.collateral().assetType()))
+                .map(OracleEntry::oracleVersion).orElse(null);
+    }
+
     /**
      * ⛔ FAB-115: a closed lending gate overrides whatever a loan's health and market say — the bot
      * refuses every lending transaction, so no row may claim it "would act".
@@ -795,19 +840,25 @@ public class LiquidationReadinessController {
         if (client == null || reg == null) {
             return null;
         }
-        Optional<OracleEntry> oracle = client.findEntry(loan.datum().collateral().assetType());
+        // ⛔ FAB-111: by the oracle NFT the datum names, exactly as the builder resolves it. This was a
+        // token lookup, tolerated as a "controller-only simplification" while every token had one
+        // oracle; since 2026-09-30 a token can have two (v1 Lending v3, v2 Lending v4), and these
+        // figures must be the ones the transaction for THIS loan would be built from.
+        // ⚠ ADA collateral gets NO figures, deliberately: its datum names the NONE sentinel, which has no
+        // registry entry, so this returns null. Do not synthesise a 1:1 entry here — neither liquidation
+        // path builds an ada-collateral loan (convert refuses COLLATERAL_ORACLE_MISSING, pay-in-advance
+        // has no collateral oracle to price with), and figures become a pool verdict and a "would act"
+        // the bot cannot honour. usabilityFor says why instead (oracle re-slice, round-2 audit finding 1).
+        Optional<OracleEntry> oracle = client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
+                .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
         if (oracle.isEmpty()) {
             return null;
         }
         AssetType principalAsset = loan.datum().principalAsset();
         OracleEntry principalOracle = null;
         if (!principalAsset.isAda()) {
-            // Same lookup style already used for the collateral leg above — findEntry is keyed by the
-            // PRICED asset (byToken), never the oracle NFT (that is findEntryByOracleToken's job, for
-            // building a real transaction where the exact reference-input coordinate matters). A
-            // controller-only simplification unchanged by this fix; see the class javadoc on where a
-            // re-derivation is and is not tolerated here.
-            Optional<OracleEntry> principalEntry = client.findEntry(principalAsset);
+            Optional<OracleEntry> principalEntry = client.findEntryByOracleToken(loan.datum().principalOracleAsset())
+                    .filter(e -> e.token().equals(principalAsset));
             if (principalEntry.isEmpty()) {
                 return null;
             }

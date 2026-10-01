@@ -156,6 +156,10 @@ public class LoansContractRegistry {
 
     private final Map<String, String> code;
 
+    /** Each validator's DECLARED parameter count, read from the blueprint itself (see {@link #arity}). */
+    @Getter(AccessLevel.NONE)
+    private final Map<String, Integer> declaredParameterCount;
+
     /** The blueprint resource {@link #code} was loaded from — named in errors so they are actionable. */
     @Getter(AccessLevel.NONE)
     private final String blueprintResource;
@@ -243,6 +247,7 @@ public class LoansContractRegistry {
                                  String minswapPoolPolicyId, String minswapPoolSpendScriptHash,
                                  String minswapOrderSpendScriptHash) {
         this.code = loadUnappliedCompiledCodes(blueprintResource);
+        this.declaredParameterCount = loadDeclaredParameterCounts(blueprintResource);
         this.blueprintResource = blueprintResource;
         this.configPolicyId = configPolicyId;
         this.lmConfigPolicyId = lmConfigPolicyId;
@@ -271,8 +276,26 @@ public class LoansContractRegistry {
         PlutusData amSpend = b(assetManagerSpendScriptHash);
         PlutusData amWithdraw = b(assetManagerWithdrawScriptHash);
 
-        this.loanClaimActionScriptHash =
-                derive("loan/loan_claim_action.loan_claim_action", mainCfg, name, amSpend, amWithdraw);
+        // Rule 2: the LenderManager wraps with the LM config policy, not the main one.
+        // ⚠ Derived BEFORE the loan actions since FluidTokens' 2026-10-01 redeploy (FTAI-001): the claim
+        // action and the pool sell action now take LenderManager hashes as parameters.
+        this.lenderManagerWithdrawScriptHash = derive("lender_manager.lenderManager", b(lmConfigPolicyId), name);
+        this.lenderManagerSpendScriptHash = generalSpend(lenderManagerWithdrawScriptHash, lmConfigPolicyId);
+
+        // ⛔ SIX parameters since 2026-10-01 (was four). The two new ones are the LenderManager spend hash
+        // (compared with the lender bond input's payment credential) and its payment CREDENTIAL, which the
+        // validator looks up as Withdraw(credential) and parses as a LenderManagerWithdrawRedeemer -- so it
+        // is Script(lenderManager WITHDRAW hash), never the spend hash. Both arities apply cleanly and both
+        // hash; only ConfigDatum[11] says which one FluidTokens deployed.
+        //
+        // ⚑ THE PARAMETER COUNT FOLLOWS THE ARTEFACT, as for pool_manager.poolManager below: a registry
+        // pinned to an older blueprint (a rig replaying an earlier deployment) must still derive what that
+        // artefact derives, and an arity this code does not know is refused rather than guessed.
+        this.loanClaimActionScriptHash = switch (arity("loan/loan_claim_action.loan_claim_action", 4, 6)) {
+            case 6 -> derive("loan/loan_claim_action.loan_claim_action", mainCfg, name, amSpend, amWithdraw,
+                    b(lenderManagerSpendScriptHash), scriptCredential(lenderManagerWithdrawScriptHash));
+            default -> derive("loan/loan_claim_action.loan_claim_action", mainCfg, name, amSpend, amWithdraw);
+        };
         this.loanRepayActionScriptHash =
                 derive("loan/loan_repay_action.loan_repay_action", mainCfg, name, amSpend, amWithdraw);
         this.loanRecastActionScriptHash =
@@ -282,15 +305,18 @@ public class LoansContractRegistry {
 
         this.poolCancelActionScriptHash = derive("pool/pool_cancel_action.pool_cancel_action", mainCfg, name);
         this.poolBorrowActionScriptHash = derive("pool/pool_borrow_action.pool_borrow_action", mainCfg, name);
+        // THREE parameters since 2026-10-01 (was two). The new LenderManager withdraw hash is never read in
+        // the validator body: FluidTokens disabled selling a lender position (Raul, 2026-10-01). It still
+        // moves the hash, which ConfigDatum[24] publishes.
         this.poolSellLenderPositionActionScriptHash =
-                derive("pool/pool_sell_lender_position.pool_sell_lender_position_action", mainCfg, name);
+                arity("pool/pool_sell_lender_position.pool_sell_lender_position_action", 2, 3) == 3
+                        ? derive("pool/pool_sell_lender_position.pool_sell_lender_position_action", mainCfg, name,
+                                b(lenderManagerWithdrawScriptHash))
+                        : derive("pool/pool_sell_lender_position.pool_sell_lender_position_action", mainCfg, name);
         this.poolCompoundActionScriptHash = derive("pool/pool_compound_action.pool_compound_action", mainCfg, name);
         this.poolEditActionScriptHash = has("pool/pool_edit_action.pool_edit_action")
                 ? derive("pool/pool_edit_action.pool_edit_action", mainCfg, name) : null;
 
-        // Rule 2: the LenderManager wraps with the LM config policy, not the main one.
-        this.lenderManagerWithdrawScriptHash = derive("lender_manager.lenderManager", b(lmConfigPolicyId), name);
-        this.lenderManagerSpendScriptHash = generalSpend(lenderManagerWithdrawScriptHash, lmConfigPolicyId);
         PlutusData lmSpend = b(lenderManagerSpendScriptHash);
 
         this.lmWithdrawBondsActionScriptHash =
@@ -716,6 +742,23 @@ public class LoansContractRegistry {
                 b(withdrawScriptHash), b(configNftPolicyId), b(configAssetName));
     }
 
+    /**
+     * The parameter count this blueprint DECLARES for {@code validator}, which must be one of
+     * {@code known}. ⛔ Anything else is refused: both arities of a validator apply cleanly and hash, so
+     * an unknown count derived anyway is a valid-looking hash nobody deployed.
+     */
+    private int arity(String validator, int... known) {
+        Integer declared = declaredParameterCount.get(validator);
+        for (int k : known) {
+            if (declared != null && declared == k) {
+                return k;
+            }
+        }
+        throw new IllegalStateException(validator + " declares " + declared + " parameters in "
+                + blueprintResource + "; this registry derives it only with " + java.util.Arrays.toString(known)
+                + ". FluidTokens changed its parameters: read the validator and extend the derivation");
+    }
+
     /** Whether this blueprint carries a validator at all — artefacts differ across deployments. */
     private boolean has(String validator) {
         return code.containsKey(validator);
@@ -808,6 +851,21 @@ public class LoansContractRegistry {
                     + "nothing while reporting a quiet market");
         }
         return trimmed;
+    }
+
+    private static Map<String, Integer> loadDeclaredParameterCounts(String resource) {
+        Map<String, Integer> m = new HashMap<>();
+        try (InputStream is = new ClassPathResource(resource).getInputStream()) {
+            for (JsonNode v : new ObjectMapper().readTree(is).get("validators")) {
+                JsonNode params = v.get("parameters");
+                m.putIfAbsent(v.get("title").asText().replaceAll("\\.[^.]+$", ""),
+                        params == null || !params.isArray() ? 0 : params.size());
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot read loans blueprint classpath resource '"
+                    + resource + "'", e);
+        }
+        return m;
     }
 
     private static Map<String, String> loadUnappliedCompiledCodes(String resource) {

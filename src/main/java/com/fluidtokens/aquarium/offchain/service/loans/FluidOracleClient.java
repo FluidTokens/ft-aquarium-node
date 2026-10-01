@@ -61,6 +61,9 @@ public class FluidOracleClient {
     /** Same entries, keyed by the oracle's own NFT — the way a loan datum names its oracle. */
     private final AtomicReference<Map<AssetType, OracleEntry>> byOracleToken = new AtomicReference<>(Map.of());
 
+    /** Every entry per priced token, for LOAN-FREE lookups that must choose among versions (A3). */
+    private final AtomicReference<Map<AssetType, List<OracleEntry>>> versionsByToken = new AtomicReference<>(Map.of());
+
     private final AtomicReference<Instant> lastRefresh = new AtomicReference<>(Instant.EPOCH);
 
     /** Last state warned about, per asset and warning kind — see {@link #warnOnce}. */
@@ -77,8 +80,15 @@ public class FluidOracleClient {
     }
 
     /**
-     * The price for an asset, or empty if there is none <em>or the one we hold is not usable at
-     * {@code atMillis}</em>.
+     * ⛔ <b>LOAN-FREE pricing only</b> — a wallet balance, a pool's principal, anything with no loan
+     * datum to say which oracle it means. For a LOAN, use {@link #findFeedForLeg}: since 2026-09-30 a
+     * token can have two oracles (v1 for Lending v3, v2 for Lending v4) and a loan's datum names one of
+     * them, so pricing a loan by its token can read the wrong one (FAB-111).
+     *
+     * <p>The price for an asset, or empty if there is none <em>or none we hold is usable at
+     * {@code atMillis}</em>. With several versions: one usable now, preferring the HIGHEST
+     * {@code oracleVersion} (ruling A3, 2026-10-01). They are one feed published twice, so this only
+     * decides anything when one version has lapsed and the other has not.
      * <p>
      * Fail-closed on purpose. A liquidation decision taken on an expired price is worse than no
      * decision: the validator would reject the transaction, and in the meantime we would have
@@ -89,7 +99,21 @@ public class FluidOracleClient {
      * that feed when the asset's policy id is empty.
      */
     public Optional<OraclePriceFeed> findFeed(AssetType asset, long atMillis) {
-        return findFeedIgnoringValidity(asset).filter(feed -> feed.usableAt(atMillis));
+        if (asset == null) {
+            return Optional.empty();
+        }
+        if (asset.isAda()) {
+            return Optional.of(OraclePriceFeed.unit());
+        }
+        List<OracleEntry> versions = versionsByToken.get().getOrDefault(asset, List.of());
+        if (versions.isEmpty()) {
+            // Nothing loaded for it here — and the path a subclass that overrides findEntry takes.
+            return findFeedIgnoringValidity(asset).filter(feed -> feed.usableAt(atMillis));
+        }
+        return versions.stream()
+                .filter(entry -> entry.feed().usableAt(atMillis))
+                .max(BY_VERSION)
+                .map(OracleEntry::feed);
     }
 
     /**
@@ -107,10 +131,51 @@ public class FluidOracleClient {
         return findEntry(asset).map(OracleEntry::feed);
     }
 
-    /** The full oracle deployment for a priced asset — reference input, keys, signatures. */
+    /**
+     * The oracle deployment for a priced asset, LOAN-FREE: the highest {@code oracleVersion} when there
+     * are several. A loan must use {@link #findEntryByOracleToken} with the NFT its datum names.
+     */
     public Optional<OracleEntry> findEntry(AssetType token) {
-        return token == null ? Optional.empty() : Optional.ofNullable(byToken.get().get(token));
+        if (token == null) {
+            return Optional.empty();
+        }
+        List<OracleEntry> versions = versionsByToken.get().getOrDefault(token, List.of());
+        return versions.isEmpty() ? Optional.ofNullable(byToken.get().get(token))
+                : versions.stream().max(BY_VERSION);
     }
+
+    /**
+     * ⛔ <b>The price of one LEG of a loan, from the oracle that loan's datum names</b> (FAB-111).
+     * {@code oracleToken} is {@code LoanDatum.principalOracleAsset} for the principal leg and
+     * {@code collateral.oracleTokenAsset} for the collateral leg. Ada needs no oracle and prices 1:1,
+     * whatever the datum carries — {@code retrieve_oracle_data} short-circuits on the empty policy id.
+     *
+     * <p>Exactly what the validator will check, which is the point: health, readiness and the
+     * economics of a loan must agree with the transaction that would liquidate it.
+     */
+    public Optional<OraclePriceFeed> findFeedForLeg(AssetType asset, AssetType oracleToken, long atMillis) {
+        return findFeedForLegIgnoringValidity(asset, oracleToken).filter(feed -> feed.usableAt(atMillis));
+    }
+
+    /** As {@link #findFeedForLeg}, whether or not still valid — only to explain an absence. */
+    public Optional<OraclePriceFeed> findFeedForLegIgnoringValidity(AssetType asset, AssetType oracleToken) {
+        if (asset == null) {
+            return Optional.empty();
+        }
+        if (asset.isAda()) {
+            return Optional.of(OraclePriceFeed.unit());
+        }
+        // ⚠ The named oracle must price THIS leg's token (oracle audit round 1, finding 6). A datum
+        // naming another token's oracle would otherwise be priced at that other token's price; the
+        // validator's is_feed_token_correct refuses such a transaction, so the figures must not claim it.
+        return findEntryByOracleToken(oracleToken)
+                .filter(entry -> asset.equals(entry.token()))
+                .map(OracleEntry::feed);
+    }
+
+    /** Higher {@code oracleVersion} wins; an entry without one ranks below any that has one. */
+    private static final java.util.Comparator<OracleEntry> BY_VERSION = java.util.Comparator.comparing(
+            OracleEntry::oracleVersion, java.util.Comparator.nullsFirst(java.util.Comparator.naturalOrder()));
 
     /**
      * The oracle a loan datum actually names. {@code retrieve_oracle_data} requires the reference
@@ -123,9 +188,21 @@ public class FluidOracleClient {
                 : Optional.ofNullable(byOracleToken.get().get(oracleToken));
     }
 
-    /** Every oracle currently known, for reporting and for tests. */
+    /**
+     * Every oracle currently known — <b>every registry entry</b>, one per oracle NFT.
+     *
+     * <p>⛔ FAB-110. This returned {@code byToken.values()} until 2026-10-01, which is ONE entry per
+     * priced token: harmless while the registry listed one oracle per token, and wrong since
+     * FluidTokens split them on 2026-09-30 (v1 for Lending v3, v2 for Lending v4, same asset names,
+     * both permanent). {@code byToken} keeps the last of two, so every v1 oracle vanished from here —
+     * and {@code LiquidationExecutor.oracleSnapshot()}, the NFT-keyed map every liquidation builder
+     * resolves a loan's oracle from, is built from THIS method. Every live v4 loan names a v1 oracle,
+     * so every one of them refused {@code ORACLE_ENTRY_MISSING} at build.
+     *
+     * <p>Keyed by oracle NFT, so two versions of one token are two entries, which is the truth.
+     */
     public Collection<OracleEntry> entries() {
-        return byToken.get().values();
+        return byOracleToken.get().values();
     }
 
     public Instant lastRefresh() {
@@ -134,6 +211,14 @@ public class FluidOracleClient {
 
     public int trackedAssets() {
         return byToken.get().size();
+    }
+
+    /**
+     * Oracles, not tokens: since 2026-09-30 most tokens have two (v1 for Lending v3, v2 for v4), so
+     * this is larger than {@link #trackedAssets()} and the two must never be read as one number.
+     */
+    public int trackedOracles() {
+        return byOracleToken.get().size();
     }
 
     /**
@@ -163,27 +248,84 @@ public class FluidOracleClient {
     int load(JsonNode array) {
         var tokens = new HashMap<AssetType, OracleEntry>();
         var oracleTokens = new HashMap<AssetType, OracleEntry>();
+        var versionsPerToken = new HashMap<AssetType, List<OracleEntry>>();
         array.forEach(node -> parse(node).ifPresent(entry -> {
-            // ⚠ put(), so a duplicate token silently takes the LAST entry — and the registry's
-            // contract is one feed per asset. If that contract ever breaks we would pick an
-            // arbitrary one and never know, so say so rather than resolving it quietly. Keeping
-            // last-wins is deliberate: changing it to first-wins would be an equally arbitrary
-            // choice made without knowing which the registry intends.
-            OracleEntry displaced = tokens.put(entry.token(), entry);
+            // ⛔ TWO ORACLES FOR ONE TOKEN IS NORMAL (FAB-113). Since 2026-09-30 FluidTokens publish
+            // v1 (Lending v3) and v2 (Lending v4) of most tokens, permanently. This used to WARN on
+            // every refresh — 16 tokens twice a minute, ~46,000 lines a day — about the registry's
+            // normal shape, which teaches whoever reads the log that WARN means nothing here.
+            // byToken keeps the last for TOKEN-keyed lookups; every entry stays reachable by its NFT.
+            tokens.put(entry.token(), entry);
+            versionsPerToken.computeIfAbsent(entry.token(), k -> new ArrayList<>()).add(entry);
+
+            // ⚠ What IS a conflict: two entries naming the SAME oracle NFT. A loan names its oracle by
+            // that NFT, so two of them make "the oracle this loan uses" ambiguous.
+            OracleEntry displaced = oracleTokens.put(entry.oracleToken(), entry);
             if (displaced != null) {
-                log.warn("oracle registry returned TWO feeds for {} — keeping the last "
-                                + "([{},{}]) and discarding ([{},{}]). One feed per asset is the "
-                                + "assumed contract; if it no longer holds, the choice below is "
-                                + "arbitrary and needs a rule.",
-                        entry.token().toUnit(), entry.feed().validFrom(), entry.feed().validTo(),
-                        displaced.feed().validFrom(), displaced.feed().validTo());
+                // Keep the per-token versions consistent with the NFT map (last wins): the displaced
+                // entry must not stay selectable, nor count as a second "version" (audit finding 9).
+                versionsPerToken.get(displaced.token()).remove(displaced);
+                warnOnce(entry.oracleToken(), "duplicate-oracle-nft", "duplicate",
+                        "oracle registry lists oracle NFT {} TWICE (token {}) — keeping the last. A loan "
+                                + "names its oracle by this NFT, so which entry it gets is now arbitrary.",
+                        entry.oracleToken().toUnit(), entry.token().toUnit());
             }
-            oracleTokens.put(entry.oracleToken(), entry);
         }));
+        warnOnVersionPriceDisagreement(versionsPerToken, System.currentTimeMillis());
         byToken.set(Map.copyOf(tokens));
         byOracleToken.set(Map.copyOf(oracleTokens));
+        var versions = new HashMap<AssetType, List<OracleEntry>>();
+        versionsPerToken.forEach((token, list) -> versions.put(token, List.copyOf(list)));
+        versionsByToken.set(Map.copyOf(versions));
         lastRefresh.set(Instant.now());
+        reportShapeOnChange(oracleTokens.size(), tokens.size(),
+                (int) versionsPerToken.values().stream().filter(v -> v.size() > 1).count());
         return tokens.size();
+    }
+
+    private volatile String lastShape;
+
+    /** One INFO line when the registry's shape moves — never one per refresh. */
+    private void reportShapeOnChange(int oracles, int tokens, int multiVersionTokens) {
+        String shape = "%d oracles across %d tokens, %d tokens with more than one oracle version"
+                .formatted(oracles, tokens, multiVersionTokens);
+        if (!shape.equals(lastShape)) {
+            lastShape = shape;
+            log.info("FluidTokens oracle registry: {}", shape);
+        }
+    }
+
+    /**
+     * ⚠ Two versions of one token are ONE feed published twice, so at the same instant they must
+     * agree. If both are valid and their prices differ, something upstream broke — the one condition
+     * about duplicates still worth a WARN (ruling A5, 2026-10-01). Latched on the first live entry's
+     * oracle NFT and the two prices, so it re-warns only when the disagreement itself changes (with
+     * three or more disagreeing versions it can re-warn per refresh — none exist today).
+     */
+    private void warnOnVersionPriceDisagreement(Map<AssetType, List<OracleEntry>> versionsPerToken, long now) {
+        versionsPerToken.forEach((token, entries) -> {
+            List<OracleEntry> live = entries.stream().filter(e -> e.feed().usableAt(now)).toList();
+            if (live.size() < 2) {
+                return;
+            }
+            OracleEntry first = live.getFirst();
+            for (OracleEntry other : live.subList(1, live.size())) {
+                // a/b == c/d  <=>  a*d == c*b — exact, no rounding
+                boolean equal = first.feed().priceInLovelaces().multiply(other.feed().priceDenominator())
+                        .equals(other.feed().priceInLovelaces().multiply(first.feed().priceDenominator()));
+                if (!equal) {
+                    warnOnce(first.oracleToken(), "version-price-disagreement",
+                            first.feed().priceInLovelaces() + "/" + first.feed().priceDenominator() + " vs "
+                                    + other.feed().priceInLovelaces() + "/" + other.feed().priceDenominator(),
+                            "oracle versions for {} DISAGREE while both are valid: {} (v{}) says {}/{}, {} (v{}) "
+                                    + "says {}/{}. They are meant to be one feed published twice.",
+                            token.toUnit(), first.oracleToken().toUnit(), first.oracleVersion(),
+                            first.feed().priceInLovelaces(), first.feed().priceDenominator(),
+                            other.oracleToken().toUnit(), other.oracleVersion(),
+                            other.feed().priceInLovelaces(), other.feed().priceDenominator());
+                }
+            }
+        });
     }
 
     private Optional<OracleEntry> parse(JsonNode entry) {
@@ -240,8 +382,12 @@ public class FluidOracleClient {
                     keys,
                     entry.path("multisigOracle").path("requiredSignatures").asInt(0),
                     feed,
-                    signatures(supported, keys, asset),
-                    charlieProviderReferenceInput));
+                    signatures(supported, keys, asset, oracleToken),
+                    charlieProviderReferenceInput,
+                    // ⚠ FAB-112: 1 (Lending v3) or 2 (Lending v4) since 2026-09-30. ABSENT means
+                    // unknown, never an error — a registry without the field is the one we parsed
+                    // for months, and refusing it would blind every price over a label.
+                    entry.path("oracleVersion").isInt() ? entry.path("oracleVersion").asInt() : null));
         } catch (Exception e) {
             log.warn("could not parse a FluidTokens oracle entry: {}", e.toString());
             return Optional.empty();
@@ -255,7 +401,7 @@ public class FluidOracleClient {
      * {@code expect}s every supplied signature to verify against the key at its position, so one
      * wrong position fails the entire transaction instead of merely being ignored.
      */
-    private List<OracleSignature> signatures(JsonNode supported, List<String> keys, AssetType asset) {
+    private List<OracleSignature> signatures(JsonNode supported, List<String> keys, AssetType asset, AssetType oracleToken) {
         JsonNode published = supported.path("multisigOracle").path("signatures");
         if (!published.isArray() || published.isEmpty()) {
             return List.of();
@@ -270,7 +416,7 @@ public class FluidOracleClient {
             // preview 2026-09-04: 109 identical WARNs in 56 minutes, one per 30-second refresh, for a
             // registry FluidTokens are not about to change. A log that repeats twice a minute forever
             // trains an operator to ignore WARN, and the next one may be the real one.
-            warnOnce(asset, "no-public-keys", String.valueOf(published.size()),
+            warnOnce(oracleToken, "no-public-keys", String.valueOf(published.size()),
                     "oracle {} publishes {} signature(s) but no publicKeys; cannot resolve key "
                             + "positions, so it stays priceable but not liquidatable",
                     asset.toUnit(), published.size());
@@ -290,7 +436,7 @@ public class FluidOracleClient {
         if (!unresolved.isEmpty()) {
             // Latched on the SET of offending keys — same reasoning as above, and the set is stable
             // across re-publications where the signatures themselves are not.
-            warnOnce(asset, "unresolved-keys", unresolved.toString(),
+            warnOnce(oracleToken, "unresolved-keys", unresolved.toString(),
                     "oracle {} published signatures from keys outside its publicKeys {}; dropping them",
                     asset.toUnit(), unresolved);
         }
@@ -318,8 +464,11 @@ public class FluidOracleClient {
      * condition is fixed upstream this branch simply stops being reached, so the latch needs no
      * clearing.
      */
-    private void warnOnce(AssetType asset, String kind, String state, String format, Object... args) {
-        String key = asset.toUnit() + "/" + kind;
+    private void warnOnce(AssetType oracleToken, String kind, String state, String format, Object... args) {
+        // ⚠ Keyed by ORACLE NFT, not priced token (FAB-113): since 2026-09-30 one token has two
+        // oracles, and a per-token latch lets their two states overwrite each other — re-warning on
+        // every refresh, the exact noise this method exists to stop.
+        String key = oracleToken.toUnit() + "/" + kind;
         String previous = warnedStates.put(key, state);
         if (state.equals(previous)) {
             log.debug(format, args);

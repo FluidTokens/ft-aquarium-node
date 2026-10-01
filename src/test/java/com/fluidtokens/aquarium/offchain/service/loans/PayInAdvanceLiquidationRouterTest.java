@@ -151,8 +151,8 @@ class PayInAdvanceLiquidationRouterTest {
     private static final String TX_LM_CONFIG = "f2".repeat(32);
     private static final String TX_WALLET = "e0".repeat(32);
 
-    private static final Utxo CONFIG_UTXO = LoanFixtures.configUtxo(TX_CONFIG, 0);
-    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.lmConfigUtxo(TX_LM_CONFIG, 0);
+    private static final Utxo CONFIG_UTXO = LoanFixtures.syntheticLatestConfigUtxo(TX_CONFIG, 0); // synthetic: the captured preview datum names the pre-2026-10-01 claim
+    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 60_000_000L);
 
@@ -294,6 +294,53 @@ class PayInAdvanceLiquidationRouterTest {
                         CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS));
         assertTrue(refusal.getMessage().contains("no oracle entry for principal oracle asset"),
                 refusal.getMessage());
+    }
+
+    /**
+     * ⛔ And the COLLATERAL's named oracle must price the collateral token: present under that NFT but
+     * pricing another, it is refused by name — before, numbers() priced the loan with it. Not a
+     * PayInAdvanceNotModelledException (round-2 audit finding 2): see the router.
+     */
+    @Test
+    void aCollateralOracleThatPricesAnotherTokenIsRefusedCleanly() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
+        OracleEntry named = oracle();
+        OracleEntry wrongToken = new OracleEntry(new AssetType("e".repeat(56), named.token().assetName()),
+                named.oracleToken(), named.rewardAddress(), named.withdrawCredentialHash(),
+                named.referenceInput(), named.referenceScript(), named.verificationKeys(), named.threshold(),
+                named.feed(), named.signatures(), named.charlieProviderReferenceInput());
+
+        // IllegalStateException, so the executor quarantines it rather than advising CONVERT (which
+        // refuses the same loan for the same reason).
+        IllegalStateException refusal = assertThrows(IllegalStateException.class,
+                () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(), CONFIG_UTXO,
+                        LM_CONFIG_UTXO, Map.of(named.oracleToken().toUnit(), wrongToken), AMPLE_BALANCE,
+                        anyWallet(), NOW, VALID_TO_MILLIS));
+        assertTrue(refusal.getMessage().contains("pricing " + named.token().toUnit()), refusal.getMessage());
+    }
+
+    /**
+     * ⛔ The oracle the datum names for the principal must price the PRINCIPAL token (oracle re-slice,
+     * cross-provider finding 2): here it is present under that NFT but prices another token — refused,
+     * never computed with.
+     */
+    @Test
+    void aPrincipalOracleThatPricesAnotherTokenIsRefusedCleanly() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY), tokenPrincipalLoanDatum());
+        OracleEntry named = tokenPrincipalOracle();
+        AssetType otherToken = new AssetType("e".repeat(56), TOKEN_PRINCIPAL.assetName());
+        OracleEntry wrongToken = new OracleEntry(otherToken, named.oracleToken(), named.rewardAddress(),
+                named.withdrawCredentialHash(), named.referenceInput(), named.referenceScript(),
+                named.verificationKeys(), named.threshold(), named.feed(), named.signatures(),
+                named.charlieProviderReferenceInput());
+        Map<String, OracleEntry> byUnit = new java.util.LinkedHashMap<>(oraclesByUnit());
+        byUnit.put(named.oracleToken().toUnit(), wrongToken);
+
+        PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
+                PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
+                () -> tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
+                        CONFIG_UTXO, LM_CONFIG_UTXO, byUnit, AMPLE_BALANCE, tokenWallet(), NOW, VALID_TO_MILLIS));
+        assertTrue(refusal.getMessage().contains("pricing " + TOKEN_PRINCIPAL.toUnit()), refusal.getMessage());
     }
 
     // ======================================================================================

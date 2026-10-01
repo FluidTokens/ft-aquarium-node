@@ -171,8 +171,8 @@ class LiquidationExecutorTest {
      * validators can be run against the result at all, which
      * {@link #honestExUnitsCostMoreThanPlaceholdersAndStillFitInsideHalfTheLiveBudget()} needs.
      */
-    private static final Utxo CONFIG_UTXO = LoanFixtures.configUtxo(TX_CONFIG, 0);
-    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.lmConfigUtxo(TX_LM_CONFIG, 0);
+    private static final Utxo CONFIG_UTXO = LoanFixtures.syntheticLatestConfigUtxo(TX_CONFIG, 0); // synthetic: the captured preview datum names the pre-2026-10-01 claim
+    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             ACCOUNT.baseAddress(), 200_000_000L);
 
@@ -316,6 +316,13 @@ class LiquidationExecutorTest {
         @Override
         public Optional<OracleEntry> findEntry(AssetType token) {
             return entries.stream().filter(e -> e.token().equals(token)).findFirst();
+        }
+
+        // FAB-111 — a LOAN's legs are priced off the oracle NFT its datum names
+        // (PricingService.toLovelaceForLeg → findEntryByOracleToken), exactly as the builder resolves it.
+        @Override
+        public Optional<OracleEntry> findEntryByOracleToken(AssetType oracleToken) {
+            return entries.stream().filter(e -> e.oracleToken().equals(oracleToken)).findFirst();
         }
     }
 
@@ -2144,6 +2151,19 @@ class LiquidationExecutorTest {
                 NOW - 60_000L, NOW + 600_000L);
     }
 
+    /**
+     * The same token's OTHER oracle version: a different NFT policy, its own reference input, and a
+     * different price — the 2026-09-30 v1/v2 shape. Never named by any datum in this class.
+     */
+    private static OracleEntry decoyVersion(OracleEntry named, long price) {
+        OraclePriceFeed feed = OraclePriceFeed.priceDataCharlie(named.token(), BigInteger.valueOf(price),
+                BigInteger.ONE, NOW - 60_000L, NOW + 600_000L);
+        return new OracleEntry(named.token(), new AssetType("dd".repeat(28), named.oracleToken().assetName()),
+                named.rewardAddress(), named.withdrawCredentialHash(), LoanFixtures.input("dd".repeat(32), 7),
+                named.referenceScript(), named.verificationKeys(), named.threshold(), feed, named.signatures(),
+                named.charlieProviderReferenceInput());
+    }
+
     private static OracleEntry principalOracle() {
         return LoanFixtures.charli3(PRINCIPAL_TOKEN_2, PRINCIPAL_TOKEN_2_ORACLE_NFT,
                 PRINCIPAL_TOKEN_2_CREDENTIAL, principalFeed(),
@@ -2192,9 +2212,15 @@ class LiquidationExecutorTest {
         FakeScanner scanner = new FakeScanner(List.of(convert.assessment()));
         FakeResolver resolver = new FakeResolver(allUnspent(List.of(convert)));
         LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        // ⛔ FAB-111 (oracle audit round 1, finding 2): a SECOND oracle version of each token, at a
+        // DIFFERENT price, under another NFT and listed FIRST — so a token lookup (this fake's findEntry
+        // takes the first match) lands on it. The pinned figures below are only reachable through the
+        // oracles the loan's datum names, as the transaction itself uses.
         CountingOracleProvider oracles = new CountingOracleProvider(
-                new FakeOracleClient(List.of(collateralOracle(), principalOracle())),
-                new FakeOracleClient(List.of(collateralOracle(), principalOracle())));
+                new FakeOracleClient(List.of(decoyVersion(collateralOracle(), 77),
+                        decoyVersion(principalOracle(), 9), collateralOracle(), principalOracle())),
+                new FakeOracleClient(List.of(decoyVersion(collateralOracle(), 77),
+                        decoyVersion(principalOracle(), 9), collateralOracle(), principalOracle())));
 
         PayInAdvanceLiquidationRouter router = new PayInAdvanceLiquidationRouter(
                 LoanFixtures.registry(), LoanFixtures.converters(), configuration,
@@ -2277,7 +2303,10 @@ class LiquidationExecutorTest {
         // SMALL_MARGIN, which is itself informative: the OLD bug (subtracting the outlay alone against
         // a puny fee slice) would have been far more negative still — this fixture does not need to
         // clear a margin to prove the fix, only to prove the CORRECT number is being computed.
-        assertTrue(detail.contains("= floor -951764"),
+        // ⚠ RE-MEASURED 2026-10-01: txFee 1,206,413 -> 1,233,561 (+27,148) against FluidTokens' FTAI-001
+        // claim action (larger script, one more check evaluated); every other term is unchanged, so the
+        // floor moves by exactly the fee: 10,500,000 - 8,000,001 - 1,233,561 - 2,245,350 = -978,912.
+        assertTrue(detail.contains("tx fee 1233561") && detail.contains("= floor -978912"),
                 "the exact pinned floorProfit — a mutant removing the acquired credit, weakening the "
                         + "outlay's ceil-bias, or counting the USDM change as a rider each move this "
                         + "number: " + detail);

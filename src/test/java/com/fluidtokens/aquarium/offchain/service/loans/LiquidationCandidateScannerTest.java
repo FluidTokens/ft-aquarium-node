@@ -506,6 +506,24 @@ class LiquidationCandidateScannerTest {
                 "detail should name which leg failed: " + assessment.detail());
     }
 
+    /**
+     * ⛔ The oracle the datum names must price THIS leg's token (oracle audit round 2, cross-provider
+     * finding 2). Here the collateral's named NFT resolves to an entry pricing ANOTHER token (same asset
+     * name, other policy); is_feed_token_correct would refuse it on chain, so the leg is unusable.
+     */
+    @Test
+    void aCollateralLegWhoseNamedOraclePricesAnotherTokenIsExcluded() throws Exception {
+        var datum = healthyDatum(liquidation(100, 125, 100, false), BigInteger.valueOf(1_000_000));
+        var loan = loan(datum, BigInteger.valueOf(1_000));
+        AssetType otherToken = new AssetType("e".repeat(56), COLLATERAL.assetName());
+        var client = oracleClientWith(entry(PRINCIPAL, 5), entry(otherToken, 2));
+
+        var assessment = scanOne(List.of(loan), List.of(permissiveBond()), client);
+
+        assertEquals(LiquidationExclusion.COLLATERAL_ORACLE_UNUSABLE, assessment.exclusion());
+        assertTrue(assessment.detail().contains("prices " + otherToken.toUnit()), assessment.detail());
+    }
+
     // ---- HEALTH_NOT_COMPUTABLE ---------------------------------------------------------------
 
     /**

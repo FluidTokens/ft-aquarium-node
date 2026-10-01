@@ -43,11 +43,13 @@ class ShippedDefaultsTest {
 
     private static final String RESOURCE = "application.yaml";
     private static final String MAINNET_CONFIG_TX =
-            "bad663cca0de6682d963d80e4a421f891e922edd04a68a0dd9722ec3a68f9803";
+            "3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c"; // 2026-10-01 in-place update
+    /** lm_compound before FluidTokens' 2026-10-01 redeploy (2a8faf65…, still unspent on chain). */
     private static final String OLD_COMPOUND_REFERENCE =
-            "954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0";
-    private static final String NEW_COMPOUND_REFERENCE =
             "ec592cc9e0dffdc1fdefa197cb353c4f60a07910c257cd4236293b844ceeabb7#0";
+    /** lm_compound since 2026-10-01: 71515a89…, the hash LMConfigDatum[3] names. */
+    private static final String NEW_COMPOUND_REFERENCE =
+            "29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0";
 
     /** The base document and the {@code preview}-profile document, in file order. */
     private static List<Map<String, Object>> documents() throws IOException {

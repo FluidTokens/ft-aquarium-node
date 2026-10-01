@@ -139,7 +139,7 @@ loans:
     profit-margin-lovelace: ${AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE:0}
     # Published reference scripts: a comma-separated list of txHash#index coordinates.
     #
-    # NOT one named key per validator. The `liquidation.reference-scripts` block above has eight of
+    # NOT one named key per validator. The `liquidation.reference-scripts` block above has nine of
     # those, and a key named for a validator holds a COORDINATE -- nothing checks the two agree. Here
     # the node reads referenceScriptHash off the chain, so a mislabelled coordinate is not expressible.
     #
@@ -149,8 +149,10 @@ loans:
     #
     # Deployment-specific and env-overridable. The verified mainnet set is the shipped default so
     # the public image is buildable; preview explicitly blanks it below.
-    # ⛔ RE-POINTED at FluidTokens' 2026-09-17 redeploy. All ELEVEN verified: for each one, the hash
-    # this node DERIVES equals the reference_script_hash the chain publishes at that coordinate.
+    # ⛔ RE-POINTED at FluidTokens' 2026-09-17 redeploy, and again on 2026-10-01 (FTAI-001/002/102):
+    # only lmCompoundAction moved (2a8faf65 -> 71515a89, 29f63a1e...#0); the other ten scripts are
+    # unchanged. All ELEVEN verified: for each one, the hash this node DERIVES equals the
+    # reference_script_hash the chain publishes at that coordinate (Koios utxo_info, 2026-10-01).
     #
     # ⚠ THE ELEVENTH WAS NEARLY MISREPORTED AS MISSING, and the near-miss is the lesson.
     # lm_compound_action takes poolManagerSpendScriptHash and poolManagerPolicyId among its eight
@@ -163,15 +165,17 @@ loans:
     # Order is presentation only -- the builder matches on the SET of published hashes, not position.
     #   assetManagerSpend b256da41  lenderManagerSpend 6743f4b6  poolSpend ecd0c0fc
     #   poolManagerSpend dfb1d21e   assetManagerWithdraw addd060d  lenderManagerWithdraw 247065fa
-    #   lmCompoundAction 2a8faf65   poolPolicy 20f765d2  poolCompoundAction fef12ea6
+    #   lmCompoundAction 71515a89   poolPolicy 20f765d2  poolCompoundAction fef12ea6
     #   poolManagerPolicy 1e0bf58a  pmCompoundLiquidity 96f1e889
-    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:af5bc4815ec1aefb86d51e25649ffd22abc2b0385eb0909512a96adccd4048ec#0,691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0,d39ada3381d91682fd063b5f4a2351c2bddff8ec3259916b328a428394eb14ed#0,ed3fa111c1529bb0b6a57dc7ffb255231db7fe390d21fc8bab181c7fd67e289c#0,bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0,b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0,ec592cc9e0dffdc1fdefa197cb353c4f60a07910c257cd4236293b844ceeabb7#0,b35ed92547f040c6733104a810d5611edf04fc2df6a9202f3fa78d38fe1bffc6#0,7d3ad6d0ad994c032aa1a99b49abff3ff2f79612a5407c5d96c957a3cd48708e#0,58b7b66d8adafc8b2e83d34c3980af24e70f6528995faa647cc66e6eaeba5ff5#0,8a2372acd140ef84fd3b62ff64874684aca683c18ae1c7fa3b8ec1fdc361c7ff#0}
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:af5bc4815ec1aefb86d51e25649ffd22abc2b0385eb0909512a96adccd4048ec#0,691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0,d39ada3381d91682fd063b5f4a2351c2bddff8ec3259916b328a428394eb14ed#0,ed3fa111c1529bb0b6a57dc7ffb255231db7fe390d21fc8bab181c7fd67e289c#0,bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0,b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0,29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0,b35ed92547f040c6733104a810d5611edf04fc2df6a9202f3fa78d38fe1bffc6#0,7d3ad6d0ad994c032aa1a99b49abff3ff2f79612a5407c5d96c957a3cd48708e#0,58b7b66d8adafc8b2e83d34c3980af24e70f6528995faa647cc66e6eaeba5ff5#0,8a2372acd140ef84fd3b62ff64874684aca683c18ae1c7fa3b8ec1fdc361c7ff#0}
 
   # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
   #
-  # Verified read-only against the chain on 2026-09-11: the current config NFTs are unspent at
-  # ffced74c…#0 and 1c4a9128…#0, asset name `parameters`, and the mainnet blueprint derives every
-  # credential their datums publish. See MainnetRegistryMatchesConfigTest.
+  # Verified read-only against the chain on 2026-10-01, after FluidTokens' FTAI-001 redeploy: the current
+  # config NFTs are unspent at 3d800e98…#0 (ConfigDatum) and ab3e3aaf…#0 (LMConfigDatum), asset name
+  # `parameters`, and the vendored blueprint derives every credential their datums publish except the
+  # recast pause at ConfigDatum[14] (advisory, by FluidTokens' design). See MainnetRegistryMatchesConfigTest
+  # and MainnetReferenceScriptsTest. (Earlier outputs: ffced74c…#0 / 1c4a9128…#0, verified 2026-09-11.)
   #
   # ⚠ CONFIGURED IS NOT ARMED. The liquidation mode is `disabled`, compound is disabled, and the
   # scheduled-transaction processor is disabled. These values derive and read mainnet only.
@@ -179,9 +183,10 @@ loans:
   # The preview profile overrides the deployment coordinates, while the image keeps the single
   # latest artifact; it remains incompatible with the captured old preview deployment until Fluid migrates it.
   config:
-    # Current Config NFT output. Runtime discovery uses policy id + asset name; this transaction is
-    # provenance and operator configuration, not a mint point or a sync-start instruction.
-    ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:bad663cca0de6682d963d80e4a421f891e922edd04a68a0dd9722ec3a68f9803}
+    # Current Config NFT output (FluidTokens' 2026-10-01 in-place update: 3d800e98…#0, block 14,012,337).
+    # Runtime discovery uses policy id + asset name -- NOTHING READS THIS KEY; it is provenance and
+    # operator configuration, not a mint point or a sync-start instruction.
+    ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c}
     policy-id: ${LOANS_CONFIG_POLICY_ID:235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200}
     # The config NFTs' asset name, "parameters" in hex. Identical on every network — stated
     # rather than inlined, because a key that exists nowhere can be neither overridden nor
@@ -404,20 +409,24 @@ loans:
       loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:fabb157baaf7645e359b1c00318954c3a14c725d535707477abaaa5ecd0b95de#0}
       lender-manager: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER:b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0}
       lender-manager-spend: ${AQUARIUM_LIQUIDATION_REF_LENDER_MANAGER_SPEND:691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0}
-      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:6338f0b7ab80d8bfa5de479d8cdba1b40fe4d8cee58ff1d0fe4c403e4560c4d4#0}
-      # ⭐ PUBLISHED 2026-09-22, block 13973022 — blank since the redeploy. VERIFIED, not pasted:
-      # this UTxO carries reference_script df30096d…, 4,227 bytes, unspent, and df30096d… is exactly
-      # what this node derives and what the live LMConfigDatum names at field 2.
-      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:fee70b786b9575430aa20edffbec42128803311633336ab590a4f73948cb4fad#0}
+      # ⭐ RE-POINTED 2026-10-01 (FluidTokens' FTAI-001 redeploy). Carries 6a6f2aec…, 9,279 bytes,
+      # unspent -- what this node derives (claim now takes SIX parameters) and what ConfigDatum[11] names.
+      # Referencing it is mandatory: with the new claim script, even the plain path measured 16,956
+      # bytes against a 16,384 maxTxSize when lm-liquidate-action travelled inline.
+      loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:1c949d64f9dec3478c3ea3aaa4b124b9389db5e2cff28d1bf90baf81812d7cad#0}
+      # ⭐ RE-POINTED 2026-10-01 (was 2026-09-22's df30096d…). VERIFIED, not pasted: this UTxO carries
+      # reference_script 8f469373…, 4,227 bytes, unspent, and 8f469373… is exactly what this node derives
+      # and what the live LMConfigDatum names at field 2.
+      lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:668605c0fba76ab5c4c6551c914f5ebe50d4afec3fc454f96e99064c764e8670#0}
       # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
       # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
       # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
       # at all, so it could not be referenced however much else was published -- which is why a convert
       # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
       # referenced and working. Referencing this one alone sheds ~7,051 bytes.
-      # ⭐ PUBLISHED 2026-09-22, block 13973034. Carries bec0ed6f…, 7,051 bytes, unspent — the
-      # largest script this path carried inline, so referencing it is the bigger of the two savings.
-      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:cac8029b51af2b7bd08c3bf0d046d64c1cfc4c0d7de3706f66b50a8e106a6294#0}
+      # ⭐ RE-POINTED 2026-10-01 (was 2026-09-22's bec0ed6f…). Carries 0e000364…, 7,051 bytes, unspent —
+      # the largest script this path carried inline, so referencing it is the bigger of the two savings.
+      lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:7b52267a32d4855dfe6360a4c8c4a7d28cc006c2b22162590646af549cbebc52#0}
       asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0}
       # ⚑ The CONVERT action. It has NO AQUARIUM_LIQUIDATION_REF_* alias -- the only route in is
       # the relaxed name LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION.
@@ -436,7 +445,10 @@ loans:
       #
       # ⇒ And LoansReferenceScriptVerifier now covers this slot too, so a future staleness here
       # closes the lending gate at boot naming the key, exactly like the other eight.
-      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:09c5d5c7582a0dcd4d4bc76901cb9991b28512324a5ea248dce32cd3981a1e4f#0}
+      #
+      # ⭐ RE-POINTED 2026-10-01 (FTAI-001 redeploy): 745089d1…#0 carries cbf3e8c5…, 5,524 bytes,
+      # unspent -- derived here and named by LMConfigDatum[5].
+      lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:745089d1220a0fa145be3ff521304b4eea9a503a94f20995824f98355a44e4ab#0}
 
 scheduling:
   transaction-processor:

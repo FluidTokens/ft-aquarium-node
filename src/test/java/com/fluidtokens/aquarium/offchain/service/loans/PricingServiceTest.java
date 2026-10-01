@@ -89,6 +89,152 @@ class PricingServiceTest {
         }
     }
 
+    // ---- FAB-111: two oracle versions of one token -----------------------------------------------
+
+    /**
+     * Mainnet NIGHT — a well-formed 56-hex policy. (The class's {@code TOKEN} constant carries a
+     * 55-character policy id, which {@code AssetType.fromUnit} splits in the wrong place, so a REAL
+     * client parsing a registry can never key it; the stubs above never parse, which is why it never
+     * mattered before.)
+     */
+    private static final AssetType NIGHT =
+            new AssetType("0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa", "4e49474854");
+
+    /** A real client holding v1 (price 2/1) and v2 (price 3/1) of one token, v2 listed LAST. */
+    private static FluidOracleClient twoVersionClient(long now) throws Exception {
+        String v1 = versionEntry("93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b", 1, 2, now);
+        String v2 = versionEntry("26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26", 2, 3, now);
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new com.fasterxml.jackson.databind.ObjectMapper().readTree("[" + v1 + "," + v2 + "]"));
+        return client;
+    }
+
+    private static String versionEntry(String oraclePolicy, int version, long price, long now) {
+        return versionEntry(oraclePolicy, version, price, now - 600_000L, now + 600_000L);
+    }
+
+    private static String versionEntry(String oraclePolicy, int version, long price, long validFrom, long validTo) {
+        return """
+                {"token":{"policyId":"%s","assetName":"%s"},
+                 "fluidOracle":{"policyId":"%s","assetName":"6f7261636c65"},
+                 "active":true,"oracleVersion":%d,"preferredOracle":"multisig",
+                 "supportedOracle":{"multisig":{"tokenPriceInLovelaces":%d,"tokenPriceDenominator":1,
+                     "validFrom":%d,"validTo":%d,
+                     "multisigOracle":{"publicKeys":["aa"],"signatures":[{"publicKey":"aa","signature":"s"}]}}}}
+                """.formatted(NIGHT.policyId(), NIGHT.assetName(), oraclePolicy, version, price,
+                validFrom, validTo);
+    }
+
+    private static PricingService loanFree(String... entries) throws Exception {
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new com.fasterxml.jackson.databind.ObjectMapper().readTree("[" + String.join(",", entries) + "]"));
+        return new PricingService(client);
+    }
+
+    private static final String V1 = "93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b";
+    private static final String V2 = "26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26";
+
+    /** A loan leg naming ANOTHER token's oracle is NO_FEED, never priced at that token (audit finding 6). */
+    @Test
+    void aLegNamingAnotherTokensOracleIsNotPricedByIt() throws Exception {
+        var service = loanFree(versionEntry(V1, 1, 2, AT_MILLIS));
+        var nightV1Nft = new AssetType(V1, "6f7261636c65");
+        var otherToken = new AssetType("ab".repeat(28), "4f54484552");
+
+        var leg = service.toLovelaceForLeg(otherToken, nightV1Nft, BigInteger.valueOf(1_000), AT_MILLIS);
+
+        assertTrue(!leg.isPriced() && leg.refusal().reason() == PricingService.RefusalReason.NO_FEED,
+                "the validator refuses a feed for the wrong token, so the figures must not use it");
+    }
+
+    /** A3 is "highest version", not "last listed": v2 FIRST must still win (oracle audit, finding 4). */
+    @Test
+    void loanFreePricingPrefersTheHighestVersionWhateverTheRegistryOrder() throws Exception {
+        var service = loanFree(versionEntry(V2, 2, 3, AT_MILLIS), versionEntry(V1, 1, 2, AT_MILLIS));
+
+        assertEquals(BigInteger.valueOf(3_000), service.toLovelace(NIGHT, BigInteger.valueOf(1_000), AT_MILLIS).lovelace(),
+                "v2 (price 3) wins even when listed before v1");
+    }
+
+    /** The loan-free ENTRY lookup follows A3 too: highest version, whatever the order (finding 4, M6b). */
+    @Test
+    void theLoanFreeEntryLookupIsTheHighestVersionWhateverTheRegistryOrder() throws Exception {
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new com.fasterxml.jackson.databind.ObjectMapper().readTree(
+                "[" + versionEntry(V2, 2, 3, AT_MILLIS) + "," + versionEntry(V1, 1, 2, AT_MILLIS) + "]"));
+
+        assertEquals(Integer.valueOf(2), client.findEntry(NIGHT).orElseThrow().oracleVersion(),
+                "v2 is listed FIRST here, so last-wins would answer v1");
+    }
+
+    /** The loan-free entry lookup with v2 listed LAST: still v2 (kills a first-listed rule). */
+    @Test
+    void theLoanFreeEntryLookupIsTheHighestVersionWhenListedLast() throws Exception {
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new com.fasterxml.jackson.databind.ObjectMapper().readTree(
+                "[" + versionEntry(V1, 1, 2, AT_MILLIS) + "," + versionEntry(V2, 2, 3, AT_MILLIS) + "]"));
+
+        assertEquals(Integer.valueOf(2), client.findEntry(NIGHT).orElseThrow().oracleVersion());
+    }
+
+    /**
+     * A duplicated oracle NFT keeps the LAST entry everywhere: loan-free pricing must not still select
+     * the displaced one while the NFT lookup answers the kept one (oracle audit r2, finding 2).
+     */
+    @Test
+    void aDuplicatedNftIsPricedFromTheKeptEntryLoanFreeAndByNft() throws Exception {
+        var service = loanFree(versionEntry(V1, 1, 2, AT_MILLIS), versionEntry(V1, 1, 7, AT_MILLIS));
+        var nft = new AssetType(V1, "6f7261636c65");
+
+        assertEquals(BigInteger.valueOf(7_000), service.toLovelace(NIGHT, BigInteger.valueOf(1_000), AT_MILLIS).lovelace(),
+                "loan-free pricing must use the kept (last) entry");
+        assertEquals(BigInteger.valueOf(7_000),
+                service.toLovelaceForLeg(NIGHT, nft, BigInteger.valueOf(1_000), AT_MILLIS).lovelace(),
+                "and agree with the NFT lookup");
+    }
+
+    /** A3 is "usable now FIRST": a lapsed v2 must not hide a valid v1 (oracle audit, finding 4). */
+    @Test
+    void loanFreePricingFallsBackToAValidLowerVersionWhenTheHigherHasLapsed() throws Exception {
+        var service = loanFree(versionEntry(V1, 1, 2, AT_MILLIS),
+                versionEntry(V2, 2, 3, AT_MILLIS - 1_200_000L, AT_MILLIS - 600_000L));
+
+        var priced = service.toLovelace(NIGHT, BigInteger.valueOf(1_000), AT_MILLIS);
+        assertTrue(priced.isPriced(), "a valid v1 must price while v2 has lapsed: " + priced.refusal());
+        assertEquals(BigInteger.valueOf(2_000), priced.lovelace());
+    }
+
+    /**
+     * ⛔ A LOAN's amount is priced off the oracle its datum names (v1 here) — the pay-in-advance outlay
+     * and acquisition go through this. The loan-free form, with no datum to say which, takes the
+     * highest version usable now (ruling A3). Prices differ on purpose, so the two cannot coincide.
+     */
+    @Test
+    void aLoanLegIsPricedOffItsNamedOracleAndLoanFreePricingPrefersTheHighestVersion() throws Exception {
+        var service = new PricingService(twoVersionClient(AT_MILLIS));
+        var v1Nft = new AssetType("93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b", "6f7261636c65");
+
+        var leg = service.toLovelaceForLeg(NIGHT, v1Nft, BigInteger.valueOf(1_000), AT_MILLIS);
+        assertEquals(BigInteger.valueOf(2_000), leg.lovelace(), "the loan names v1, priced 2 per unit");
+
+        var loanFree = service.toLovelace(NIGHT, BigInteger.valueOf(1_000), AT_MILLIS);
+        assertTrue(loanFree.isPriced(), "loan-free pricing refused: " + loanFree.refusal());
+        assertEquals(BigInteger.valueOf(3_000), loanFree.lovelace(),
+                "with no loan to say which, the highest version (v2, priced 3) wins");
+    }
+
+    /** A loan naming an oracle the node does not hold is NO_FEED — never priced off another version. */
+    @Test
+    void aLoanNamingAnUnknownOracleIsRefusedNotRepricedOffAnotherVersion() throws Exception {
+        var service = new PricingService(twoVersionClient(AT_MILLIS));
+        var unknownNft = new AssetType("ff".repeat(28), "6f7261636c65");
+
+        var leg = service.toLovelaceForLeg(NIGHT, unknownNft, BigInteger.valueOf(1_000), AT_MILLIS);
+
+        assertTrue(!leg.isPriced() && leg.refusal().reason() == PricingService.RefusalReason.NO_FEED,
+                "an unknown oracle is a refusal, not a silent fallback to the token's other oracle");
+    }
+
     // ---- ADA is the identity ------------------------------------------------------------------
 
     @Test

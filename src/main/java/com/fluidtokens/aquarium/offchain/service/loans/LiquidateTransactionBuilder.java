@@ -678,8 +678,13 @@ public final class LiquidateTransactionBuilder {
                 .toList();
 
         // Pass 3 — reference inputs, again canonically ordered before any index is read off them.
+        // ⛔ TWO DIFFERENT DEDUPLICATIONS (FAB-114). Withdrawals are one per oracle CREDENTIAL —
+        // pairs.get_first finds exactly one. Reference inputs are one per oracle NFT a leg NAMES —
+        // retrieve_oracle_data requires that exact NFT. Since 2026-09-30 they differ: FLDT's v1 and v2
+        // oracles share one script (one credential) under two NFTs, so deduplicating reference inputs
+        // by credential dropped one NFT and refused the transaction.
         List<OracleEntry> oracles = distinctOracles(loanOrder);
-        List<TransactionInput> refInputs = referenceInputs(request, oracles);
+        List<TransactionInput> refInputs = referenceInputs(request, oraclesNamedByLegs(loanOrder));
 
         int configRefIndex = refIndex(refInputs, inputOf(request.configUtxo()), "main config");
         int lmConfigRefIndex = refIndex(refInputs, inputOf(request.lmConfigUtxo()), "lm config");
@@ -1078,10 +1083,10 @@ public final class LiquidateTransactionBuilder {
                             .formatted(bond.loanId()));
         }
 
-        Leg principal = leg(datum.principalAsset().isAda(), datum.principalOracleAsset(), request,
-                loan.loanId(), "principal", validFrom, validTo);
-        Leg collateral = leg(datum.collateral().isAda(), datum.collateral().oracleTokenAsset(), request,
-                loan.loanId(), "collateral", validFrom, validTo);
+        Leg principal = leg(datum.principalAsset().isAda(), datum.principalAsset(), datum.principalOracleAsset(),
+                request, loan.loanId(), "principal", validFrom, validTo);
+        Leg collateral = leg(datum.collateral().isAda(), datum.collateral().assetType(),
+                datum.collateral().oracleTokenAsset(), request, loan.loanId(), "collateral", validFrom, validTo);
 
         // The two time-dependent figures the redeemer carries, computed HERE, at validFrom.
         //
@@ -1182,8 +1187,8 @@ public final class LiquidateTransactionBuilder {
      * synthesised 1:1 feed with no oracle consulted, and anything else is looked up by the oracle
      * NFT the datum names.
      */
-    private Leg leg(boolean isAda, AssetType oracleToken, Request request, String loanId, String which,
-                    long validFrom, long validTo) {
+    private Leg leg(boolean isAda, AssetType asset, AssetType oracleToken, Request request, String loanId,
+                    String which, long validFrom, long validTo) {
         if (isAda) {
             return new Leg(OraclePriceFeed.unit(), null);
         }
@@ -1192,6 +1197,13 @@ public final class LiquidateTransactionBuilder {
         if (entry == null) {
             throw refuse(Refusal.ORACLE_ENTRY_MISSING,
                     "loan %s %s leg: no oracle entry for %s".formatted(loanId, which, oracleToken.toUnit()));
+        }
+        // Defence in depth behind the scanner: an oracle for ANOTHER token is no oracle for this leg —
+        // the validator's is_feed_token_correct would refuse the transaction.
+        if (!entry.token().equals(asset)) {
+            throw refuse(Refusal.ORACLE_ENTRY_MISSING,
+                    "loan %s %s leg: oracle %s prices %s, not the leg's %s".formatted(loanId, which,
+                            oracleToken.toUnit(), entry.token().toUnit(), asset.toUnit()));
         }
 
         // V6 — variants whose redeemer this repo cannot build, and the c3 gap.
@@ -1466,6 +1478,28 @@ public final class LiquidateTransactionBuilder {
             }
         }
         return List.copyOf(byCredential.values());
+    }
+
+    /** Every oracle a leg NAMES, one per oracle NFT — what the reference inputs must carry (FAB-114). */
+    private static List<OracleEntry> oraclesNamedByLegs(List<VettedLoan> loans) {
+        List<OracleEntry> legEntries = new java.util.ArrayList<>();
+        for (VettedLoan loan : loans) {
+            for (Leg leg : List.of(loan.principal(), loan.collateral())) {
+                if (leg.isOracle()) {
+                    legEntries.add(leg.entry());
+                }
+            }
+        }
+        return distinctByOracleNft(legEntries);
+    }
+
+    /** One entry per oracle NFT, first wins — NOT per credential (see the build's FAB-114 note). */
+    static List<OracleEntry> distinctByOracleNft(List<OracleEntry> legEntries) {
+        Map<String, OracleEntry> byNft = new LinkedHashMap<>();
+        for (OracleEntry entry : legEntries) {
+            byNft.putIfAbsent(entry.oracleToken().toUnit(), entry);
+        }
+        return List.copyOf(byNft.values());
     }
 
     /** Every reference input the finished body will hold, deduplicated and canonically sorted. */

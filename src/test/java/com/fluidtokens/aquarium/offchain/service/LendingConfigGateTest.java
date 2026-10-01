@@ -65,7 +65,23 @@ class LendingConfigGateTest {
     }
 
     /** Blockfrost answering both config lookups with the given datums, as the live chain did. */
+    /**
+     * Judged by the artefact the node shipped BEFORE FluidTokens' 2026-10-01 redeploy -- for the
+     * incidents that happened against it (2026-09-19, 2026-09-30).
+     */
+    private static LoansConfigVerifier verifierServingBefore20261001(String configDatum, String lmConfigDatum)
+            throws Exception {
+        return verifierServing(configDatum, lmConfigDatum, new LoansContractRegistry(
+                "loans-v4-2026-09-17.plutus.json", CONFIG, LM_CONFIG, ASSET, SMART, null, null, null));
+    }
+
     private static LoansConfigVerifier verifierServing(String configDatum, String lmConfigDatum) throws Exception {
+        return verifierServing(configDatum, lmConfigDatum,
+                new LoansContractRegistry(CONFIG, LM_CONFIG, ASSET, SMART, null, null, null));
+    }
+
+    private static LoansConfigVerifier verifierServing(String configDatum, String lmConfigDatum,
+                                                        LoansContractRegistry registry) throws Exception {
         UtxoService utxos = mock(UtxoService.class);
         when(utxos.getUtxos(anyString(), anyInt(), anyInt())).thenReturn(
                 Result.<List<Utxo>>success("ok").withValue(List.of()));
@@ -78,13 +94,12 @@ class LendingConfigGateTest {
 
         var network = new AppConfig.Network();
         network.setNetworkForTest("mainnet");
-        return new LoansConfigVerifier(new LoansContractRegistry(CONFIG, LM_CONFIG, ASSET, SMART, null, null, null),
-                SMART, network, bf, false);
+        return new LoansConfigVerifier(registry, SMART, network, bf, false);
     }
 
     @Test
     void theDatumThatGroundedMainnetNoLongerStopsTheNodeButClosesTheLendingGate() throws Exception {
-        LoansConfigVerifier verifier = verifierServing(
+        LoansConfigVerifier verifier = verifierServingBefore20261001(
                 fixture("mainnet-config-datum-2026-09-30.hex"), fixture("mainnet-lm-config-datum.hex"));
 
         assertDoesNotThrow(verifier::verify,
@@ -100,8 +115,9 @@ class LendingConfigGateTest {
 
     @Test
     void aCleanDatumLeavesTheGateOpen() throws Exception {
+        // The live datums after FluidTokens' 2026-10-01 redeploy: only the advisory recast pause differs.
         LoansConfigVerifier verifier = verifierServing(
-                fixture("mainnet-config-datum.hex"), fixture("mainnet-lm-config-datum.hex"));
+                fixture("mainnet-config-datum-2026-10-01.hex"), fixture("mainnet-lm-config-datum-2026-10-01.hex"));
 
         verifier.verify();
 
@@ -112,7 +128,7 @@ class LendingConfigGateTest {
     @Test
     void theSeptember19DatumStillOnlyWarnsAndLeavesTheGateOpen() throws Exception {
         // 2026-09-19: three pool-side fields this node never invokes. ADVISORY — unchanged by FAB-115.
-        LoansConfigVerifier verifier = verifierServing(
+        LoansConfigVerifier verifier = verifierServingBefore20261001(
                 fixture("mainnet-config-datum-2026-09-19.hex"), fixture("mainnet-lm-config-datum.hex"));
 
         verifier.verify();

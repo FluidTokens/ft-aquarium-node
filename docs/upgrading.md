@@ -17,10 +17,11 @@ error.
 | A setting in `.env` | restart | untouched |
 | You added a **market**, margin, or mode | restart | untouched |
 | You enabled the **UI** | restart | untouched |
-| **FluidTokens redeployed the contracts** | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
+| **FluidTokens redeployed the contracts** (new config NFTs) | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
+| FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01) | §4.8 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 
-The first four are ordinary. The last two are the subject of this guide.
+The first four are ordinary. The last three are the subject of this guide (§4, §4.8, §3).
 
 ---
 
@@ -214,6 +215,61 @@ docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config ver
 
 **Then re-arm in stages** — `shadow` first, read the decisions, then `live`. Same sequence as a first
 deployment (deploying.md §8). A redeploy is a good moment to rehearse rather than assume.
+
+### 4.8 When FluidTokens replace action scripts IN PLACE — the 2026-10-01 update
+
+Not every redeploy is §4. On **2026-10-01** FluidTokens shipped security fixes (FTAI-001/002/102) by
+rewriting their two config datums **in place**: same config NFTs, new hashes for the claim action and
+for the LenderManager liquidate and compound actions.
+
+The node checks the deployment **at startup only**, so nothing changes in a node that is already running —
+it keeps the coordinates it booted with, and its liquidations fail at evaluation. What you see depends on
+the image you restart with:
+
+- an image **with the lending gate** (2026-10-01 onwards) starts, keeps scheduled payments running, and
+  closes the gate:
+  ```
+  LENDING_CONFIG_MISMATCH … ConfigDatum[11] … LMConfigDatum[2] … LMConfigDatum[3] … LMConfigDatum[4]
+  ```
+- an **older** image refuses to start at all — scheduled payments included.
+
+**What to do:** pull the image built from this release and restart.
+
+- **No wipe, no re-sync.** Only action hashes moved. Every payment credential the node indexes — the two
+  config NFT policies and the loan, pool, request, asset-manager, locked-borrower-manager, LenderManager
+  and pool-manager spend scripts — is unchanged, so the existing index is correct. Following §4 here
+  would cost a full re-sync for nothing.
+- **No `.env` change** if you use the shipped defaults (neither `.env.example` nor
+  `.env.advanced.example` sets the keys below).
+- ⚠ If you **override** reference-script coordinates, update them to the new defaults in
+  `application.yaml` or unset them:
+  - `AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION`, `AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION`,
+    `AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION`,
+    `LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION` — these are **verified at boot**:
+    a stale one closes the gate and the log names the key.
+  - `AQUARIUM_COMPOUND_REFERENCE_SCRIPTS` — **not verified at boot**. A stale entry is silently ignored as
+    a reference (the compound script then travels inline, and you still pay to reference the stale one).
+    Compare it with the shipped default by hand, or unset it.
+- **Verify exactly as §4.7.** Expect one WARN for `ConfigDatum[14]` (recast): FluidTokens point it at a
+  pause hash by design, and the node never recasts. It does not close the gate.
+
+⚠ **Gate open is not the same as ready.** Every liquidation withdraws through the new action scripts, so
+their **reward accounts must be registered** on chain, or each submit fails with
+`ConwayWithdrawalsMissingAccounts` — which no evaluation, dry-run or `shadow` decision can show you.
+FluidTokens registered them on 2026-10-01. To check, look up each stake address and confirm its most
+recent registration action is `registered` (e.g. Blockfrost
+`/accounts/{stake}/registrations?order=desc&count=1`):
+
+| action script | stake address |
+|---|---|
+| loan claim | `stake1794x72hvctkwz0xrthmzt3ztdpjaqlyz7rs8e56ppaxzeps7acgae` |
+| LenderManager liquidate | `stake17x85dymnutx0w2vdpwdnh9c6sthx4zwzem40j3rqjqexcyqe9uttz` |
+| LenderManager liquidate + pay in advance | `stake17y8qqqmyl7h8uemg7uvjfzzcel2rj4q6ulht9el5nv428qq6w773h` |
+| LenderManager liquidate + convert | `stake1789l86x95shx6r6s24qdt23pqjm79x5u8fadukqa7a96waqgtc0ql` |
+| LenderManager compound (only if you enable compound) | `stake179c4zk5fl5uezekc68n2v02fsghuy6ztweuzezal87qhnqsq0fld4` |
+
+For a future update: the node logs every hash it derives at startup (`Derived Lending v4 contract hashes`),
+and a script's stake address is its hash under the CIP-19 script-stake header (`stake17…` on mainnet).
 
 ---
 

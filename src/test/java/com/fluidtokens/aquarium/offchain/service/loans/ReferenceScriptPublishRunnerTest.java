@@ -114,8 +114,10 @@ public class ReferenceScriptPublishRunnerTest {
                 LoanFixtures.adaUtxo("bb".repeat(32), 0, funder, SYNTHETIC_UTXO_LOVELACE),
                 LoanFixtures.adaUtxo("cc".repeat(32), 0, funder, SYNTHETIC_UTXO_LOVELACE));
 
+        // ⚠ The artefact PREVIEW runs (not redeployed on 2026-10-01): publishing the current artefact's
+        // claim / lm-liquidate here would lock test-ada behind scripts no preview ConfigDatum names.
         ReferenceScriptPublisher publisher = new ReferenceScriptPublisher(
-                LoanFixtures.registry(), LoanFixtures.utxoSupplier(synthetic),
+                LoanFixtures.registryBefore20261001(), LoanFixtures.utxoSupplier(synthetic),
                 LoanFixtures.protocolParams());
 
         List<BuiltTransaction> built =

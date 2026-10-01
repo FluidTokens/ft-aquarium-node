@@ -49,6 +49,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code TransactionProcessor} and everything below reads transactions back out of their own
  * CBOR.
  *
+ * <p>⚠ Derived from {@link LoanFixtures#registryBefore20261001()}: preview was not redeployed on 2026-10-01,
+ * so the scripts it publishes are the pre-FTAI-001 ones (the new claim action is 9_279 bytes, not 8_662).
+ *
  * <h2>Measured, on preview protocol params (coinsPerUtxoSize 4310, maxTxSize 16_384)</h2>
  * Min-ada is per output, for a base address (57 bytes) carrying that one script and no datum.
  * <pre>
@@ -117,7 +120,7 @@ class ReferenceScriptPublisherTest {
                 LoanFixtures.adaUtxo("aa".repeat(32), 0, funderAddress, 60_000_000L),
                 LoanFixtures.adaUtxo("bb".repeat(32), 0, funderAddress, 60_000_000L),
                 LoanFixtures.adaUtxo("cc".repeat(32), 0, funderAddress, 60_000_000L));
-        return new ReferenceScriptPublisher(LoanFixtures.registry(),
+        return new ReferenceScriptPublisher(LoanFixtures.registryBefore20261001(),
                 LoanFixtures.utxoSupplier(wallet), LoanFixtures.protocolParams());
     }
 
@@ -471,7 +474,7 @@ class ReferenceScriptPublisherTest {
                 .build();
 
         EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(spendTx, List.of(atDestination),
-                LoanFixtures.registry(), List.of(dest.script()));
+                LoanFixtures.registryBefore20261001(), List.of(dest.script()));
         System.out.println("spend of the unspendable destination refused: "
                 + outcome.detail().replace("\n", " | "));
 

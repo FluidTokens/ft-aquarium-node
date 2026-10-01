@@ -69,21 +69,36 @@ class LoansConfigVerifierTest {
                     + "chain a33aee4034165f1772e57af5fb975f26c35f7e9080b7e44b4634f227",
             "ConfigDatum[8]: derived 515009399bc0fd2bb204b0a50973a1285415159bed4213e315d739b7, "
                     + "chain bf8c4378bab7de15baddbb5d8805255d89174c08bf36179c21cad685",
+            "ConfigDatum[11]: derived 66cdb92b631592ac08c32ff194c735c408b5b3776253f517b75c2024, "
+                    + "chain c6e0c4395cf22e08f918ca996d7db49faba793dbd6b647160168ff39",
             "ConfigDatum[14]: derived 21f4bde7524bbab159eb0293dac262f1193c6266385d983ee761e363, "
                     + "chain 1628910a5fbdba415c3b1bf7304672106659ac527442f10701472753",
-            "ConfigDatum[24]: derived cdfa58c27aee3458983247dcde6419e6e8ca13b30e5ba34f95feccb0, "
+            "ConfigDatum[23]: derived 2ecae5102d682a7bb8f622e357b2129112b5d50a39abf0f9a3fa1f08, "
+                    + "chain 344755c30db0617ff43cb41e5212379b729985352a213371b15c90cd",
+            "ConfigDatum[24]: derived 5dcebd73c56d86ab0c8049d09748dba14a6c19734aab121eb0613d25, "
                     + "chain db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56",
             "ConfigDatum[28]: derived f74b887491c86b1a1b7785c01f15cb7551f4520174589e22efb0df02, "
-                    + "chain d815766d61c1241742ff78164cdf8edaef1746a99a242a7fb7938aa6");
+                    + "chain d815766d61c1241742ff78164cdf8edaef1746a99a242a7fb7938aa6",
+            "LMConfigDatum[2]: derived f3c7a201440b39458111ab44c26863c4d089e66e71ae847fb87233bd, "
+                    + "chain e0a13838d176cea9de466afe2075f38f682603013604021a3959700f",
+            "LMConfigDatum[4]: derived 3a155105a91c371b74b96f480114ef1d4ec80389d27902426f553c99, "
+                    + "chain 00b8a30bd2f18962e527d7c03712e86077a688bfce7e2934ef70034d");
 
+    // Since FluidTokens' 2026-10-01 mainnet redeploy (FTAI-001) the shipped artefact also differs from the
+    // captured preview at [11] claim, [23] borrow, [24] sell and LM[2]/[3]/[4]/[6] -- preview was not
+    // redeployed, so each is the artefact moving, not the chain.
     private static final java.util.List<String> PREVIEW_DIVERGENCE = java.util.List.of(
             "ConfigDatum[2]: derived 1c330cfbd58d994945d29c7c52ec001d054b93f733317ec59d9a0537, "
                     + "chain a33aee4034165f1772e57af5fb975f26c35f7e9080b7e44b4634f227",
             "ConfigDatum[8]: derived 515009399bc0fd2bb204b0a50973a1285415159bed4213e315d739b7, "
                     + "chain bf8c4378bab7de15baddbb5d8805255d89174c08bf36179c21cad685",
+            "ConfigDatum[11]: derived 66cdb92b631592ac08c32ff194c735c408b5b3776253f517b75c2024, "
+                    + "chain c6e0c4395cf22e08f918ca996d7db49faba793dbd6b647160168ff39",
             "ConfigDatum[14]: derived 21f4bde7524bbab159eb0293dac262f1193c6266385d983ee761e363, "
                     + "chain 1628910a5fbdba415c3b1bf7304672106659ac527442f10701472753",
-            "ConfigDatum[24]: derived cdfa58c27aee3458983247dcde6419e6e8ca13b30e5ba34f95feccb0, "
+            "ConfigDatum[23]: derived 2ecae5102d682a7bb8f622e357b2129112b5d50a39abf0f9a3fa1f08, "
+                    + "chain 344755c30db0617ff43cb41e5212379b729985352a213371b15c90cd",
+            "ConfigDatum[24]: derived 5dcebd73c56d86ab0c8049d09748dba14a6c19734aab121eb0613d25, "
                     + "chain db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56",
             "ConfigDatum[26]: derived 1322b6d1e7e46ac543769a8fcfb43840606f040d2e9efa2e59389d86, "
                     + "chain b4ad9a6f2710d68067177e0de5a4378ebe4fcdfdc929c7488479c313",
@@ -91,9 +106,13 @@ class LoansConfigVerifierTest {
                     + "chain 45ce890c9bcf70f6eed629b5db7c0622e44ca1003e001a2cf951518f",
             "ConfigDatum[28]: derived f74b887491c86b1a1b7785c01f15cb7551f4520174589e22efb0df02, "
                     + "chain d815766d61c1241742ff78164cdf8edaef1746a99a242a7fb7938aa6",
-            "LMConfigDatum[3]: derived 7e7563dd1753d0a933922a8da698154eead46f662ccb7c65f748f2c3, "
+            "LMConfigDatum[2]: derived f3c7a201440b39458111ab44c26863c4d089e66e71ae847fb87233bd, "
+                    + "chain e0a13838d176cea9de466afe2075f38f682603013604021a3959700f",
+            "LMConfigDatum[3]: derived f9be2926201f9ed40da47cc77a40db0ad8b39d21842511116ddb644d, "
                     + "chain dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457",
-            "LMConfigDatum[6]: derived 190a6c685dd2cb61fc2e542b5c43382b649ce98d7a7c97d746d7aa12, "
+            "LMConfigDatum[4]: derived 3a155105a91c371b74b96f480114ef1d4ec80389d27902426f553c99, "
+                    + "chain 00b8a30bd2f18962e527d7c03712e86077a688bfce7e2934ef70034d",
+            "LMConfigDatum[6]: derived 1760b3c462d707870b904eca90145dc48619d0e770253728412f3bf3, "
                     + "chain 70b149e7c84a4cf47fb273d87ed2fe97562f0148bfce0b4681afa480");
 
     private static final String CONFIG_DATUM = fixture("fourth-deployment-config-datum.hex");

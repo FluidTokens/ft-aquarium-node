@@ -56,6 +56,39 @@ class OracleStatusEndpointTest {
     }
 
     /**
+     * ⛔ FAB-112. Since 2026-09-30 most tokens have TWO oracles (v1 for Lending v3, v2 for v4). The
+     * endpoint must list every oracle with its version, and say tokens and oracles as two numbers —
+     * one entry per token showed only v2, the version no live loan used.
+     */
+    @Test
+    void listsEveryOracleWithItsVersionAndCountsTokensAndOraclesSeparately() throws Exception {
+        var status = controllerWith(OracleClients.mainnetTwoVersions()).oracle();
+
+        assertEquals(19, status.trackedAssets(), "priced tokens");
+        assertEquals(35, status.trackedOracles(), "registry oracles");
+        assertEquals(35, status.feeds().size(), "every oracle is listed, not one per token");
+
+        var night = status.feeds().stream()
+                .filter(f -> f.token().equals("0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854"))
+                .toList();
+        assertEquals(2, night.size(), "NIGHT has a v1 and a v2 oracle");
+        assertEquals(java.util.Set.of(1, 2), night.stream()
+                .map(LoanController.OracleFeedView::oracleVersion).collect(java.util.stream.Collectors.toSet()));
+        assertTrue(night.stream().anyMatch(f -> f.oracleToken().startsWith("93794f9b"))
+                        && night.stream().anyMatch(f -> f.oracleToken().startsWith("26e60b20")),
+                "each version names its own oracle NFT");
+    }
+
+    /** A registry without {@code oracleVersion} (every payload before 2026-09-30) reads as unknown. */
+    @Test
+    void anEntryWithoutAVersionIsUnknownNotAnError() throws Exception {
+        var status = controllerWith(OracleClients.preview()).oracle();
+
+        assertEquals(5, status.feeds().size(), "nothing may be dropped for lacking a version");
+        assertTrue(status.feeds().stream().allMatch(f -> f.oracleVersion() == null));
+    }
+
+    /**
      * The captured payload is old, so every window in it has passed. That is the useful assertion:
      * a feed we hold is not the same as a feed we can use, and the endpoint must say so.
      */

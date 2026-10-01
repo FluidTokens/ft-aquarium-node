@@ -234,6 +234,30 @@ class ReadinessTemplateRendersRowsTest {
         return engine().process("readiness", context);
     }
 
+    /** {@code r} with its collateral oracle version set — the record has no wither. */
+    private static LiquidationReadinessController.Row withOracleVersion(LiquidationReadinessController.Row r,
+                                                                      Integer version) {
+        return new LiquidationReadinessController.Row(r.loanId(), r.utxoRef(), r.principalUnit(),
+                r.principalAmount(), r.remainingDebt(), r.collateralUnit(), r.collateralAmount(),
+                r.healthFactor(), r.currentLtvPercent(), r.liquidatable(), r.healthUnknownReason(),
+                r.feeInCollateral(), r.feeValueLovelace(), r.feeUnknownReason(), r.route(), r.routeDetail(),
+                r.advancePrincipalAmount(), r.age(), r.principalDisplay(), r.collateralDisplay(),
+                r.poolUsability(), r.feeDisplay(), r.feeValueDisplay(), r.advanceDisplay(), r.debtDisplay(),
+                r.anticipateAndSell(), r.anticipateDisplay(), r.actionNow(), r.blocker(), r.loanExplorerUrl(),
+                r.utxoExplorerUrl(), version);
+    }
+
+    /** FAB-112: the oracle version a loan's datum names is shown next to its health; absent, nothing. */
+    @Test
+    void theOracleVersionALoanUsesIsShownNextToItsHealth() {
+        assertTrue(render(List.of(withOracleVersion(fullRow(), 1))).contains("oracle v1"));
+        // ⚠ The label itself, not "oracle v": template comments reach the output, and the one beside this
+        // span says "oracle version".
+        String unknown = render(List.of(fullRow()));
+        assertTrue(!unknown.contains("oracle v1") && !unknown.contains("oracle v2"),
+                "no label when the version is unknown");
+    }
+
     /**
      * ⛔ FAB-115: a closed lending gate is shown above everything, while the rows still render — the
      * loan view keeps working, so a page of healthy-looking loans must not hide that the bot refuses
