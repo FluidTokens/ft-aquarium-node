@@ -176,7 +176,9 @@ class MainnetConvertActionDerivationTest {
                 MINSWAP_POOL_POLICY, MINSWAP_POOL_SPEND, MINSWAP_ORDER_SPEND);
 
         assertEquals(DEPLOYED_CONVERT_ACTION, registry.getLmLiquidateAndConvertActionScriptHash(),
-                "the SHIPPED loans-v4.plutus.json no longer derives the convert action mainnet runs. "
+                "the pre-2026-10-01 artefact (loans-v4-2026-09-17.plutus.json) no longer derives the convert action "
+                        + "deployed on 2026-09-04 -- this receipt is about that deployment; the SHIPPED artefact's "
+                        + "check is MainnetBlueprintSelectionTest / ConvertActionDerivationTest. "
                         + "Either the vendored file drifted from FluidTokens' bb4349c, or they moved "
                         + "the deployment again — and the node cannot build a convert liquidation "
                         + "either way, because lender_manager.withdraw only authorises the hash the "

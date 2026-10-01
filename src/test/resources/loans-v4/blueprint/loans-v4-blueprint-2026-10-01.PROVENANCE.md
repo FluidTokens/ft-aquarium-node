@@ -22,8 +22,9 @@ pool-manager code. FluidTokens (Raul Rosa, 2026-10-01 16:40, relayed by Giovanni
 **"should not have been merged"** — the deployed pool-manager is the intended one.
 
 ⛔ **A plain re-vendor of a later upstream `plutus.json` will silently re-introduce those two
-validators** and close the lending gate on [27]/[28]/LM[3]. `BlueprintProvenanceTest` pins the
-whole-file sha256 and these four entries' hashes so that cannot happen unnoticed.
+validators** and close the lending gate on [27]/[28]/LM[3]. `MainnetRedeploy20261001Test` (the exact set of validators
+that moved, and the whole-file sha256) and `MainnetBlueprintSelectionTest` (`BLUEPRINT_SHA256`) pin it so
+that cannot happen unnoticed.
 
 ## Evidence the assembly is the deployment
 

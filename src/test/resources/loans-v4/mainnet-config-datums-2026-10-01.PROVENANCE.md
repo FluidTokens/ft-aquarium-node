@@ -30,3 +30,10 @@ relayed by Giovanni 2026-10-01).
 ConfigDatum[13] (change collateral) is back to its pre-2026-09-30 value; every other field is unchanged.
 The undated `mainnet-config-datum.hex` / `mainnet-lm-config-datum.hex` are earlier captures and stay
 untouched as historical evidence.
+
+## `mainnet-compound-script-2026-10-01.hex`
+
+The reference script published at `29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0`
+(block 14,012,485): `lm_compound_action`, hash `71515a89…` (= LMConfigDatum[3]), PlutusV3, 5,197 bytes.
+Copied from Koios `utxo_info` (`reference_script.bytes`) on 2026-10-01; byte-identical to Blockfrost
+`/scripts/71515a89…/cbor` (checked independently by the slice-1 audit).

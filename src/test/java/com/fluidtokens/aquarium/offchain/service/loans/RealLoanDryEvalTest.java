@@ -989,7 +989,7 @@ class RealLoanDryEvalTest {
         assertFalse(none.fits(), "all six inline must not fit: " + none.signedBytes());
 
         // Giovanni's hypothesis, tested rather than adopted: one published script is enough — but not
-        // just any one. loanClaimAction sheds 8_662 bytes and clears the limit; lmLiquidateAction sheds
+        // just any one. loanClaimAction sheds 9_279 bytes (8_662 before FluidTokens' 2026-10-01 claim) and clears the limit; lmLiquidateAction sheds
         // 4_227 and does not.
         // THE SHIPPING CONFIGURATION. Five validators inline, loanClaimAction by reference.
         assertTrue(claimOnly.fits(),

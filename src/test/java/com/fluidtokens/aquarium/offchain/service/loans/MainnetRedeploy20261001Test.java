@@ -201,4 +201,30 @@ class MainnetRedeploy20261001Test {
             java.nio.file.Files.deleteIfExists(variant);
         }
     }
+
+    /** The pool-sell sibling: an arity outside {2, 3} is refused too (slice-1 audit finding 1). */
+    @Test
+    void anUnknownSellArityIsRefusedRatherThanGuessed() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode root = mapper.readTree(resource("loans-v4.plutus.json"));
+        for (JsonNode v : root.get("validators")) {
+            if (v.get("title").asText().startsWith("pool/pool_sell_lender_position.") && v.has("parameters")) {
+                ((com.fasterxml.jackson.databind.node.ArrayNode) v.get("parameters"))
+                        .add(v.get("parameters").get(2).deepCopy());
+            }
+        }
+        java.nio.file.Path dir = java.nio.file.Path.of(new ClassPathResource(BEFORE).getURL().toURI()).getParent();
+        java.nio.file.Path variant = dir.resolve("loans-v4-sell-four-parameters.plutus.json");
+        java.nio.file.Files.write(variant, mapper.writeValueAsBytes(root));
+        try {
+            IllegalStateException refused = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                    () -> new LoansContractRegistry(variant.getFileName().toString(),
+                            CONFIG, LM_CONFIG, ASSET, SMART, MS_POLICY, MS_POOL, MS_ORDER));
+            org.junit.jupiter.api.Assertions.assertTrue(
+                    refused.getMessage().contains("pool_sell_lender_position_action declares 4 parameters"),
+                    refused.getMessage());
+        } finally {
+            java.nio.file.Files.deleteIfExists(variant);
+        }
+    }
 }

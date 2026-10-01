@@ -38,7 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <h2>⚠ The hazard it exists for is specifically the NAMED keys</h2>
  * The compound path takes one comma-separated list and reads {@code referenceScriptHash} off the
  * chain, so <b>a mislabelled coordinate there is not expressible.</b> The liquidation path takes
- * <b>eight keys named for validators</b>, and — in {@code application.yaml}'s own words — <i>"a key
+ * <b>nine keys named for validators</b>, and — in {@code application.yaml}'s own words — <i>"a key
  * named for a validator holds a COORDINATE, nothing checks the two agree"</i>. This is that check:
  * every named key is asserted against the hash {@code LoansReferenceScriptVerifier} would demand for
  * that name, so a correct coordinate under the wrong key fails here rather than at an operator's boot.
@@ -371,6 +371,37 @@ class MainnetReferenceScriptsTest {
         credentials.put("asset-manager", registry.getAssetManagerWithdrawScriptHash());
         credentials.put("loan", registry.getLoanPolicyId());
 
+        List<String> unregistered = unregistered(credentials);
+        assertTrue(unregistered.isEmpty(), "withdraw credentials with no registered reward account -- every "
+                + "liquidation using them fails at submit: " + unregistered);
+    }
+
+    /**
+     * The compound path's own withdraw credentials, checked separately from the liquidation ones because
+     * compound is disabled on mainnet by default: a red here grounds compound, not liquidation.
+     * {@code lm_compound_action} moved on 2026-10-01 like the liquidate actions did.
+     */
+    @Test
+    void everyCompoundWithdrawCredentialIsRegistered() throws Exception {
+        LoansContractRegistry registry = mainnetRegistry();
+        Map<String, String> credentials = new LinkedHashMap<>();
+        credentials.put("asset-manager", registry.getAssetManagerWithdrawScriptHash());
+        credentials.put("lender-manager", registry.getLenderManagerWithdrawScriptHash());
+        credentials.put("lm-compound-action", registry.getLmCompoundActionScriptHash());
+        credentials.put("pool", registry.getPoolPolicyId());
+        credentials.put("pool-compound-action", registry.getPoolCompoundActionScriptHash());
+        credentials.put("pool-manager", registry.getPoolManagerPolicyId());
+        credentials.put("pm-compound-liquidity", registry.getPmCompoundLiquidityScriptHash());
+        List<String> unregistered = unregistered(credentials);
+        assertTrue(unregistered.isEmpty(), "compound withdraw credentials with no registered reward account -- "
+                + "every compound using them fails at submit: " + unregistered);
+    }
+
+    /**
+     * Each credential whose MOST RECENT registration action is not {@code registered}. Read newest-first,
+     * one event: an ascending page would judge a long history by its 100th event, not its last.
+     */
+    private static List<String> unregistered(Map<String, String> credentials) throws Exception {
         List<String> unregistered = new ArrayList<>();
         for (var e : credentials.entrySet()) {
             String stake = com.bloxbean.cardano.client.address.AddressProvider.getRewardAddress(
@@ -378,8 +409,9 @@ class MainnetReferenceScriptsTest {
                     com.bloxbean.cardano.client.common.model.Networks.mainnet()).toBech32();
             String last = null;
             try {
-                for (JsonNode event : get("/accounts/" + stake + "/registrations?order=asc&count=100")) {
-                    last = event.get("action").asText();
+                JsonNode events = get("/accounts/" + stake + "/registrations?order=desc&count=1");
+                if (events.size() > 0) {
+                    last = events.get(0).get("action").asText();
                 }
             } catch (IllegalStateException notFound) {
                 last = null;   // a 404: the account has never existed
@@ -388,7 +420,6 @@ class MainnetReferenceScriptsTest {
                 unregistered.add(e.getKey() + " " + e.getValue() + " (" + stake + ")");
             }
         }
-        assertTrue(unregistered.isEmpty(), "withdraw credentials with no registered reward account -- every "
-                + "liquidation using them fails at submit: " + unregistered);
+        return unregistered;
     }
 }
