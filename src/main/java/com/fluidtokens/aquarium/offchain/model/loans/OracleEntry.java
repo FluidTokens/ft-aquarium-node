@@ -71,6 +71,23 @@ public record OracleEntry(AssetType token,
                 verificationKeys, threshold, feed, signatures, charlieProviderReferenceInput, null);
     }
 
+    /**
+     * ⛔ <b>The oracle a loan names for one LEG — only if it prices that leg's token.</b> The ONE rule
+     * every NFT-keyed lookup on a loan's behalf goes through (oracle re-slice, cross-provider finding 2):
+     * {@code retrieve_oracle_data}'s {@code is_feed_token_correct} refuses an oracle for another token,
+     * so such an entry is no oracle for this leg — never a price to compute with.
+     *
+     * @return the entry, or null when the map has none for {@code oracleToken} or it prices another token
+     */
+    public static OracleEntry namedForLeg(java.util.Map<String, OracleEntry> byOracleNft, AssetType asset,
+                                          AssetType oracleToken) {
+        if (byOracleNft == null || asset == null || oracleToken == null) {
+            return null;
+        }
+        OracleEntry entry = byOracleNft.get(oracleToken.toUnit());
+        return entry != null && asset.equals(entry.token()) ? entry : null;
+    }
+
     public OracleEntry {
         verificationKeys = List.copyOf(verificationKeys);
         signatures = List.copyOf(signatures);

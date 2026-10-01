@@ -234,7 +234,9 @@ public class ConvertTransactionBuilder {
         // ⛔ THE LIMB THIS BUILDER SHIPPED WITHOUT. Checked first because its absence is invisible
         // downstream: every structural assertion in this class inspects what we EMIT, and none can
         // see a withdrawal that was never added.
-        if (request.collateralOracle() == null || !request.collateralOracle().usableForLiquidation()) {
+        if (request.collateralOracle() == null || !request.collateralOracle().usableForLiquidation()
+                // the collateral oracle must price the loan's collateral token (is_feed_token_correct)
+                || !request.collateralOracle().token().equals(request.collateral())) {
             throw refuse(Refusal.COLLATERAL_ORACLE_MISSING,
                     "the collateral leg has no usable oracle entry; loan_claim_action would refuse "
                             + "this transaction on chain and nothing here would have noticed");

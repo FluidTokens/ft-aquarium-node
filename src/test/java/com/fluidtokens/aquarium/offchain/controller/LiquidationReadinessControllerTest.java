@@ -663,6 +663,88 @@ class LiquidationReadinessControllerTest {
                 "an oracle pricing another token must not produce this loan's figures");
     }
 
+    /**
+     * ADA collateral has no registry oracle — retrieve_oracle_data synthesises the 1:1 feed. The figures
+     * must still come out (oracle re-slice, cross-provider finding 1; null here on main as well): the
+     * same arithmetic as the two-feed test above, whose collateral is also priced 1, gives 97,500,000.
+     */
+    @Test
+    void advanceAmountIsComputedForAnAdaCollateral() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO, LoanFixtures.adaCollateral(), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN));
+        OracleEntry principalOracle = LoanFixtures.charli3(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
+                        BigInteger.TWO, BigInteger.ONE, 0L, 10_000_000L),
+                input("66"), input("77"), input("88"));
+        LiquidationReadinessController controller = controllerWith(
+                new FakeOracleClient(principalOracle), LoanFixtures.registry());
+
+        assertEquals(BigInteger.valueOf(97_500_000L), controller.advanceAmount(loan, bond, 1_000L));
+    }
+
+    /** The version label is the named oracle's only if it prices the collateral token (finding 3). */
+    @Test
+    void theCollateralVersionLabelIsAbsentWhenTheNamedOraclePricesAnotherToken() {
+        AssetType otherToken = new AssetType("e".repeat(56), COLLATERAL_TOKEN.assetName());
+        OracleEntry base = LoanFixtures.charli3(otherToken, COLLATERAL_ORACLE_NFT, "11".repeat(28),
+                OraclePriceFeed.priceDataCharlie(otherToken, BigInteger.ONE, BigInteger.ONE, 0L, 10_000_000L),
+                input("22"), input("33"), input("44"));
+        OracleEntry versioned = new OracleEntry(base.token(), base.oracleToken(), base.rewardAddress(),
+                base.withdrawCredentialHash(), base.referenceInput(), base.referenceScript(),
+                base.verificationKeys(), base.threshold(), base.feed(), base.signatures(),
+                base.charlieProviderReferenceInput(), 2);
+        OracleEntry rightToken = new OracleEntry(COLLATERAL_TOKEN, base.oracleToken(), base.rewardAddress(),
+                base.withdrawCredentialHash(), base.referenceInput(), base.referenceScript(),
+                base.verificationKeys(), base.threshold(), base.feed(), base.signatures(),
+                base.charlieProviderReferenceInput(), 2);
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+
+        assertNull(controllerWith(new FakeOracleClient(versioned), LoanFixtures.registry())
+                .collateralOracleVersion(datum), "another token's oracle has no version to show here");
+        assertEquals(Integer.valueOf(2), controllerWith(new FakeOracleClient(rightToken), LoanFixtures.registry())
+                .collateralOracleVersion(datum), "the positive: the right token shows its version");
+    }
+
+    /**
+     * The collateral twin (oracle re-slice, Anthropic fresh audit finding 1): the collateral's named
+     * oracle prices ANOTHER token, so there are no figures — rather than 97,500,000 at that token's price.
+     */
+    @Test
+    void advanceAmountIsNullWhenTheCollateralsNamedOraclePricesAnotherToken() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN));
+        AssetType otherToken = new AssetType("e".repeat(56), COLLATERAL_TOKEN.assetName());
+        OracleEntry namedNftWrongToken = LoanFixtures.charli3(otherToken, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(otherToken,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 10_000_000L),
+                input("22"), input("33"), input("44"));
+        OracleEntry principalOracle = LoanFixtures.charli3(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
+                        BigInteger.TWO, BigInteger.ONE, 0L, 10_000_000L),
+                input("66"), input("77"), input("88"));
+        LiquidationReadinessController controller = controllerWith(
+                new FakeOracleClient(namedNftWrongToken, principalOracle), LoanFixtures.registry());
+
+        assertNull(controller.advanceAmount(loan, bond, 1_000L),
+                "an oracle pricing another token must not produce this loan's figures");
+    }
+
     /** advanceAmount refuses (null) rather than guess when the loan's OWN principal oracle is missing. */
     @Test
     void advanceAmountIsNullWhenNoPrincipalOracleEntryExists() {

@@ -2122,9 +2122,11 @@ public class LiquidationExecutor {
         if (collateral.isAda()) {
             return OraclePriceFeed.unit();
         }
-        OracleEntry entry = oraclesByUnit.get(collateral.oracleTokenAsset().toUnit());
+        OracleEntry entry = OracleEntry.namedForLeg(oraclesByUnit, collateral.assetType(),
+                collateral.oracleTokenAsset());
         // Unreachable through a successful build: the builder refuses ORACLE_ENTRY_MISSING for a
-        // non-ada leg with no entry in this very map, so by here it is present.
+        // non-ada leg with no entry in this very map — or one pricing another token — so by here it is
+        // present.
         if (entry == null) {
             throw new IllegalStateException("no oracle entry for the collateral leg of loan "
                     + assessment.loan().loanId() + " after the transaction built");

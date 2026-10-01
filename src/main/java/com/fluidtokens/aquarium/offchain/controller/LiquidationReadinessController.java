@@ -799,12 +799,13 @@ public class LiquidationReadinessController {
     }
 
     /** FAB-112: the version of the collateral oracle this loan's datum names, if the registry says. */
-    private Integer collateralOracleVersion(com.fluidtokens.aquarium.offchain.model.loans.LoanDatum datum) {
+    Integer collateralOracleVersion(com.fluidtokens.aquarium.offchain.model.loans.LoanDatum datum) {
         FluidOracleClient client = oracleClient.getIfAvailable();
         if (client == null || datum.collateral().isAda()) {
             return null;
         }
         return client.findEntryByOracleToken(datum.collateral().oracleTokenAsset())
+                .filter(e -> e.token().equals(datum.collateral().assetType()))
                 .map(OracleEntry::oracleVersion).orElse(null);
     }
 
@@ -834,8 +835,15 @@ public class LiquidationReadinessController {
         // token lookup, tolerated as a "controller-only simplification" while every token had one
         // oracle; since 2026-09-30 a token can have two (v1 Lending v3, v2 Lending v4), and these
         // figures must be the ones the transaction for THIS loan would be built from.
-        Optional<OracleEntry> oracle = client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
-                .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
+        // ⚠ ADA collateral has no oracle: retrieve_oracle_data synthesises the 1:1 feed, and numbers()
+        // reads only the feed — so a unit entry stands in. (Before, ADA collateral returned null here,
+        // on main as well: there is no registry entry to find.)
+        Optional<OracleEntry> oracle = loan.datum().collateral().isAda()
+                ? Optional.of(new OracleEntry(AssetType.ada(), AssetType.ada(), null, null, null, null,
+                        List.of(), 0, com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed.unit(),
+                        List.of(), null))
+                : client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
+                        .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
         if (oracle.isEmpty()) {
             return null;
         }

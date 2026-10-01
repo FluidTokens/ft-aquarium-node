@@ -296,6 +296,51 @@ class PayInAdvanceLiquidationRouterTest {
                 refusal.getMessage());
     }
 
+    /**
+     * ⛔ And the COLLATERAL's named oracle must price the collateral token: present under that NFT but
+     * pricing another, it is refused by name — before, numbers() priced the loan with it.
+     */
+    @Test
+    void aCollateralOracleThatPricesAnotherTokenIsRefusedCleanly() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
+        OracleEntry named = oracle();
+        OracleEntry wrongToken = new OracleEntry(new AssetType("e".repeat(56), named.token().assetName()),
+                named.oracleToken(), named.rewardAddress(), named.withdrawCredentialHash(),
+                named.referenceInput(), named.referenceScript(), named.verificationKeys(), named.threshold(),
+                named.feed(), named.signatures(), named.charlieProviderReferenceInput());
+
+        PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
+                PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
+                () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(), CONFIG_UTXO,
+                        LM_CONFIG_UTXO, Map.of(named.oracleToken().toUnit(), wrongToken), AMPLE_BALANCE,
+                        anyWallet(), NOW, VALID_TO_MILLIS));
+        assertTrue(refusal.getMessage().contains("pricing " + named.token().toUnit()), refusal.getMessage());
+    }
+
+    /**
+     * ⛔ The oracle the datum names for the principal must price the PRINCIPAL token (oracle re-slice,
+     * cross-provider finding 2): here it is present under that NFT but prices another token — refused,
+     * never computed with.
+     */
+    @Test
+    void aPrincipalOracleThatPricesAnotherTokenIsRefusedCleanly() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY), tokenPrincipalLoanDatum());
+        OracleEntry named = tokenPrincipalOracle();
+        AssetType otherToken = new AssetType("e".repeat(56), TOKEN_PRINCIPAL.assetName());
+        OracleEntry wrongToken = new OracleEntry(otherToken, named.oracleToken(), named.rewardAddress(),
+                named.withdrawCredentialHash(), named.referenceInput(), named.referenceScript(),
+                named.verificationKeys(), named.threshold(), named.feed(), named.signatures(),
+                named.charlieProviderReferenceInput());
+        Map<String, OracleEntry> byUnit = new java.util.LinkedHashMap<>(oraclesByUnit());
+        byUnit.put(named.oracleToken().toUnit(), wrongToken);
+
+        PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
+                PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
+                () -> tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
+                        CONFIG_UTXO, LM_CONFIG_UTXO, byUnit, AMPLE_BALANCE, tokenWallet(), NOW, VALID_TO_MILLIS));
+        assertTrue(refusal.getMessage().contains("pricing " + TOKEN_PRINCIPAL.toUnit()), refusal.getMessage());
+    }
+
     // ======================================================================================
     // (4) a TOKEN PRINCIPAL, routed and built end to end — WALLS 1-4 exercised off the built body
     // ======================================================================================

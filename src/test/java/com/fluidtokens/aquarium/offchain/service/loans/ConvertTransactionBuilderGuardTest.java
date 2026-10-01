@@ -425,6 +425,27 @@ class ConvertTransactionBuilderGuardTest {
     }
 
     /**
+     * ⛔ A usable oracle that prices ANOTHER token is no collateral oracle (is_feed_token_correct;
+     * oracle re-slice, cross-provider finding 2) — refused before anything is built.
+     */
+    @Test
+    void aCollateralOracleThatPricesAnotherTokenIsRefusedBeforeAnythingIsBuilt() {
+        ConvertOrderPlan p = plan();
+        OracleEntry good = oracle();
+        OracleEntry wrongToken = new OracleEntry(new AssetType("e".repeat(56), FLDT.assetName()),
+                good.oracleToken(), good.rewardAddress(), good.withdrawCredentialHash(), good.referenceInput(),
+                good.referenceScript(), good.verificationKeys(), good.threshold(), good.feed(),
+                good.signatures(), good.charlieProviderReferenceInput());
+        assertTrue(wrongToken.usableForLiquidation(), "usable, so only the token can be what refuses it");
+        var req = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
+                wrongToken, null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L);
+
+        var e = assertThrows(ConvertTransactionBuilder.RefusedException.class, () -> builder().build(req));
+        assertEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_ORACLE_MISSING, e.reason());
+    }
+
+    /**
      * ⛔ <b>AND NOT THE SIBLING'S CALL.</b> {@code LiquidatePayInAdvanceTransactionBuilder} passes
      * {@code List.of()} for the signatures — correct for a Charli3/Orcfax feed, whose price is proven
      * by a provider reference input instead. <b>Mainnet FLDT is multisig</b> (findings §40), so its
