@@ -60,6 +60,7 @@ class ExecutorContextResolutionTest {
         new ApplicationContextRunner()
                 .withPropertyValues("loans.enabled=true")
                 .withUserConfiguration(StubCollaborators.class)
+                .withBean(com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class)
                 .withBean(CompoundExecutor.class)
                 .run(context -> {
                     assertTrue(context.getStartupFailure() == null,
@@ -127,6 +128,37 @@ class ExecutorContextResolutionTest {
                                     context.getBean(CompoundExecutor.class), "lendingConfigGate") == gate,
                             "the executor must read the same gate the verifier closed");
                 });
+    }
+
+    /**
+     * ⛔ FAB-115 audit findings 1–2. The gate only works if EVERY reader and writer is handed the SAME
+     * container bean. Injection is by setter and REQUIRED, so a missing gate bean fails the boot loudly
+     * instead of leaving lending ungated (it used to be optional and failed open). This pins, for each
+     * class, the annotation a container test cannot cheaply reach — LiquidationExecutor and the readiness
+     * controller are too expensive to stand up — and that the gate is a scanned component at all.
+     */
+    @Test
+    void everyLendingGateReaderAndWriterHasTheGateInjectedAndTheGateIsAComponent() throws Exception {
+        var gateType = com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class;
+        assertTrue(gateType.isAnnotationPresent(Component.class),
+                "LendingConfigGate must be a @Component, or nothing in the container is handed it");
+        assertTrue(gateType.getPackageName().startsWith(
+                        com.fluidtokens.aquarium.offchain.AcquariumOffchainApp.class.getPackageName()),
+                "and it must live under the application's component-scan base");
+
+        for (Class<?> type : List.of(
+                com.fluidtokens.aquarium.offchain.service.LoansConfigVerifier.class,
+                com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.class,
+                LiquidationExecutor.class,
+                CompoundExecutor.class,
+                com.fluidtokens.aquarium.offchain.controller.LiquidationReadinessController.class)) {
+            var setter = type.getMethod("setLendingConfigGate", gateType);
+            Autowired autowired = setter.getAnnotation(Autowired.class);
+            assertNotNull(autowired, type.getSimpleName() + ".setLendingConfigGate is not @Autowired — the "
+                    + "container would leave it holding no gate, so a closed gate would not stop it");
+            assertTrue(autowired.required(), type.getSimpleName() + ".setLendingConfigGate must be "
+                    + "REQUIRED: optional injection fails open when the gate bean is missing");
+        }
     }
 
     /**

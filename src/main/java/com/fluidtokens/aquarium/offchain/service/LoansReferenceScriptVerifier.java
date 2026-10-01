@@ -82,8 +82,50 @@ public class LoansReferenceScriptVerifier {
         this.failOnUnreachable = failOnUnreachable;
     }
 
+    /**
+     * Where a mismatch is recorded instead of thrown (FAB-115). Required in the container; direct
+     * constructions in tests get a private gate of their own.
+     */
+    private LendingConfigGate gate = new LendingConfigGate();
+
+    @Autowired
+    public void setLendingConfigGate(LendingConfigGate gate) {
+        this.gate = gate;
+    }
+
+    public LendingConfigGate gate() {
+        return gate;
+    }
+
+    /** The one throw left, opt-in: an operator who set fail-on-unreachable asked for it. */
+    static final class OptInUnreachableFailure extends IllegalStateException {
+        OptInUnreachableFailure(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    /**
+     * ⛔ <b>A reference-script mismatch closes the lending gate; it no longer stops the node</b>
+     * (FAB-115). Every check below is unchanged and still lives in {@link #check()}; what changed is
+     * what a failure costs. A throw here failed the whole context, scheduled payments included — and
+     * after a re-pin of {@code loans.config.policy-id}, these coordinates are exactly what goes stale
+     * next, so the same verifier would have grounded the node again on the very restart meant to fix it.
+     */
     @PostConstruct
     public void verify() {
+        try {
+            check();
+        } catch (OptInUnreachableFailure e) {
+            throw e;
+        } catch (IllegalStateException e) {
+            gate.block(e.getMessage());
+            log.error("⛔ {} — {}. The node is starting normally: scheduled transactions are unaffected, "
+                    + "and only Lending v4 transactions are refused.", LendingConfigGate.REFUSAL, e.getMessage());
+        }
+    }
+
+    /** The checks, throwing on any mismatch. Package-visible so tests can assert each refusal. */
+    void check() {
         Map<String, Expectation> expected = expectations();
         if (expected.isEmpty()) {
             log.info("No liquidation reference scripts configured; every validator will travel in "
@@ -100,7 +142,7 @@ public class LoansReferenceScriptVerifier {
                 published = publishedScriptHash(key, expectation.input());
             } catch (ReferenceScriptUnreachableException e) {
                 if (failOnUnreachable) {
-                    throw new IllegalStateException(
+                    throw new OptInUnreachableFailure(
                             "Cannot verify liquidation reference scripts: " + e.getMessage(), e);
                 }
                 log.warn("Could not verify {} against chain ({}). Continuing unverified — the "

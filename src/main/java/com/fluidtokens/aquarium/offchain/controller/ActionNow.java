@@ -40,6 +40,15 @@ public record ActionNow(String text, String detail, boolean wouldAct) {
     }
 
     /**
+     * ⛔ FAB-115: the live Lending v4 config no longer matches this node, so the bot refuses EVERY
+     * lending transaction whatever the loan's health — a row must not say "would act" beside a banner
+     * saying nothing will.
+     */
+    public static ActionNow refusedByLendingConfig(String reason) {
+        return none("REFUSED", "LENDING_CONFIG_MISMATCH — " + reason);
+    }
+
+    /**
      * @param liquidatable  null when health could not be computed — which is NOT "no"
      * @param effectiveMode the market's mode after the node's ceiling is applied
      * @param advance       what an ANTICIPATE would have to front, null when unknown

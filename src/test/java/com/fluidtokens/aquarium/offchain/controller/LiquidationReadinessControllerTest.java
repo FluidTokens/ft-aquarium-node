@@ -336,6 +336,54 @@ class LiquidationReadinessControllerTest {
         };
     }
 
+    /**
+     * ⛔ FAB-115 audit finding 5: the banner attribute comes from the CONTROLLER reading the shared gate
+     * — the template test sets the variable itself and could not see a controller that never set it.
+     */
+    @Test
+    void theReadinessPageCarriesTheClosedLendingGateIntoItsModel() {
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var controller = new LiquidationReadinessController(provide(null), provide(null), provide(null),
+                provide(null), provide(null), provide(null), provide(null), provide(null),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        controller.setLendingConfigGate(gate);
+
+        var open = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(open, null, null, null, null, null);
+        assertNull(open.getAttribute("lendingConfigBlocked"), "no banner while the gate is open");
+
+        gate.block("ConfigDatum[11]: derived 63b26ff9, chain 64d9b13f");
+        var closed = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(closed, null, null, null, null, null);
+        assertEquals("ConfigDatum[11]: derived 63b26ff9, chain 64d9b13f", closed.getAttribute("lendingConfigBlocked"),
+                "the controller must hand the gate's reason to the page");
+    }
+
+    /**
+     * A closed gate overrides a row's action: never "would act", and it says why. An open gate leaves
+     * the row's own answer untouched.
+     */
+    @Test
+    void aClosedLendingGateOverridesARowsActionAndAnOpenOneDoesNot() {
+        var wouldLiquidate = new ActionNow("LIVE", "would liquidate on the next scan", true);
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+
+        assertEquals(wouldLiquidate, LiquidationReadinessController.gatedAction(gate, wouldLiquidate));
+
+        gate.block("ConfigDatum[11] mismatch");
+        var action = LiquidationReadinessController.gatedAction(gate, wouldLiquidate);
+        assertEquals("REFUSED", action.text());
+        assertTrue(!action.wouldAct() && action.detail().contains("LENDING_CONFIG_MISMATCH"),
+                "a closed gate must never leave a row saying the bot would act");
+    }
+
     private static LiquidationReadinessController controllerWith(FluidOracleClient client,
                                                                   LoansContractRegistry registry) {
         AppConfig.Network network = new AppConfig.Network() {

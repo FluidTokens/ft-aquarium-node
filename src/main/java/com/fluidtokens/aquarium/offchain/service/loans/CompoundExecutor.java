@@ -77,12 +77,13 @@ public class CompoundExecutor {
 
     /**
      * ⛔ Closed by {@code LoansConfigVerifier} when the live Lending v4 config does not match what this
-     * node derives (FAB-115). Setter-injected, optional: direct constructions in tests run ungated.
+     * node derives (FAB-115). Setter-injected and REQUIRED in the container: a missing gate bean must fail
+     * the boot loudly, never leave lending ungated. Direct constructions in tests run ungated.
      */
     private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
     private volatile boolean lendingGateRefusalLogged;
 
-    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
         this.lendingConfigGate = gate;
     }

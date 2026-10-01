@@ -1081,6 +1081,31 @@ class LiquidationExecutorTest {
         assertEquals(1, open.scanner().scans, "an open gate must not suppress the loop");
     }
 
+    /** FAB-115 audit finding 4: the refusal is logged ONCE at ERROR, naming the refusal, not per cycle. */
+    @Test
+    void aClosedLendingConfigGateIsLoggedOnceAtErrorNotEveryCycle() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        gate.block("ConfigDatum[11]: derived 63b26ff9…, chain 64d9b13f…");
+        wiring.executor().setLendingConfigGate(gate);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertEquals(1, appender.list.stream()
+                .filter(e -> e.getLevel() == Level.ERROR)
+                .filter(e -> e.getFormattedMessage().contains("LENDING_CONFIG_MISMATCH"))
+                .count(), "said once at ERROR naming LENDING_CONFIG_MISMATCH, not on every cycle");
+    }
+
     // ======================================================================================
     // the profit decision
     // ======================================================================================
