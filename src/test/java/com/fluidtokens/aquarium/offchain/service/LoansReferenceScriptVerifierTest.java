@@ -167,7 +167,8 @@ class LoansReferenceScriptVerifierTest {
 
     /**
      * The mismatch. The UTxO exists, is readable, and publishes a perfectly valid script — just not
-     * this one. That is what a redeploy looks like, and it must abort startup.
+     * this one. That is what a redeploy looks like, and check() must refuse it (at startup that refusal
+     * closes the lending gate — see aMismatchAtStartupClosesTheLendingGateInsteadOfThrowing).
      */
     @Test
     void aUtxoPublishingSomeoneElsesValidatorIsRefusedByTheCheck() {

@@ -160,6 +160,37 @@ class LendingConfigGateTest {
         assertTrue(verifier.gate().isBlocked(), "it must close the lending gate instead");
     }
 
+    private static LoansConfigVerifier verifierBehindA5xx(boolean failOnUnreachable) throws Exception {
+        UtxoService down = mock(UtxoService.class);
+        when(down.getUtxos(anyString(), anyInt(), anyInt())).thenReturn(
+                Result.<List<Utxo>>error("upstream 503").code(503));
+        BFBackendService bf = mock(BFBackendService.class);
+        when(bf.getUtxoService()).thenReturn(down);
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("mainnet");
+        return new LoansConfigVerifier(new LoansContractRegistry(CONFIG, LM_CONFIG, ASSET, SMART, null, null, null),
+                SMART, network, bf, failOnUnreachable);
+    }
+
+    /** V10 (documented residue, now pinned): an UNREACHABLE backend warns and leaves the gate OPEN. */
+    @Test
+    void anUnreachableBackendLeavesTheGateOpenAndDoesNotStopTheNode() throws Exception {
+        LoansConfigVerifier verifier = verifierBehindA5xx(false);
+
+        assertDoesNotThrow(verifier::verify);
+        assertFalse(verifier.gate().isBlocked(), "an outage is not a mismatch: the gate stays open, unverified");
+    }
+
+    /** V7: the operator's explicit opt-in still turns an unreachable backend into a startup failure. */
+    @Test
+    void failOnUnreachableStillStopsTheNodeWhenTheOperatorAskedForIt() throws Exception {
+        LoansConfigVerifier verifier = verifierBehindA5xx(true);
+
+        var thrown = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, verifier::verify,
+                "loans.verify-config.fail-on-unreachable=true must keep its throw");
+        assertTrue(thrown.getMessage().contains("Cannot verify Lending v4 config"), thrown.getMessage());
+    }
+
     @Test
     void severalMismatchesOnOneHashReadAsAPauseAndDistinctOnesAsARedeploy() {
         assertTrue(LoansConfigVerifier.pausedReading(List.of(

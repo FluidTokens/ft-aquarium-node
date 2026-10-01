@@ -45,9 +45,9 @@ public class LoansReferenceScriptVerifier {
     /**
      * Everything this class needs from a backend: read one transaction output. Narrowed to a single
      * method for the same reason {@code LiquidationExecutor.TransactionSubmitter} is — a concrete
-     * {@link BFBackendService} cannot be stubbed, and a hard-fail nobody can write a test for is a
-     * hard-fail that quietly becomes a log line. The three mutations that matter here (deleting the
-     * mismatch throw, softening a 4xx, accepting a UTxO with no reference script) are only
+     * {@link BFBackendService} cannot be stubbed, and a refusal nobody can write a test for is a
+     * refusal that quietly becomes a log line. The three mutations that matter here (deleting the
+     * mismatch refusal, softening a 4xx, accepting a UTxO with no reference script) are only
      * detectable because this seam exists.
      */
     @FunctionalInterface
@@ -209,8 +209,11 @@ public class LoansReferenceScriptVerifier {
         // convert action ed8d41e4… — passed startup and failed at build with
         // `withdraw:3 missingRequiredScripts`, four walls deep into a live mainnet debug.
         //
-        // ⚠ The derived hash is null when loans.minswap.* is not configured, and put() skips a null
-        // expectation, so a node that legitimately cannot convert is unaffected.
+        // ⚠ The derived hash is null when loans.minswap.* is not configured. put() skips only a null
+        // COORDINATE, not a null hash: a convert coordinate configured WITHOUT loans.minswap.* reaches
+        // the comparison with a null hash, which verify() turns into a CLOSED LENDING GATE (every
+        // Lending v4 transaction refused). Leave the convert coordinate blank on a node that cannot
+        // convert.
         put(expected, "loans.liquidation.reference-scripts.lm-liquidate-and-pay-in-advance-action",
                 scripts.lmLiquidateAndPayInAdvanceAction(),
                 registry.getLmLiquidateAndPayInAdvanceActionScriptHash());
