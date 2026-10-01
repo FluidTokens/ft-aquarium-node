@@ -167,6 +167,32 @@ class PricingServiceTest {
                 "v2 is listed FIRST here, so last-wins would answer v1");
     }
 
+    /** The loan-free entry lookup with v2 listed LAST: still v2 (kills a first-listed rule). */
+    @Test
+    void theLoanFreeEntryLookupIsTheHighestVersionWhenListedLast() throws Exception {
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new com.fasterxml.jackson.databind.ObjectMapper().readTree(
+                "[" + versionEntry(V1, 1, 2, AT_MILLIS) + "," + versionEntry(V2, 2, 3, AT_MILLIS) + "]"));
+
+        assertEquals(Integer.valueOf(2), client.findEntry(NIGHT).orElseThrow().oracleVersion());
+    }
+
+    /**
+     * A duplicated oracle NFT keeps the LAST entry everywhere: loan-free pricing must not still select
+     * the displaced one while the NFT lookup answers the kept one (oracle audit r2, finding 2).
+     */
+    @Test
+    void aDuplicatedNftIsPricedFromTheKeptEntryLoanFreeAndByNft() throws Exception {
+        var service = loanFree(versionEntry(V1, 1, 2, AT_MILLIS), versionEntry(V1, 1, 7, AT_MILLIS));
+        var nft = new AssetType(V1, "6f7261636c65");
+
+        assertEquals(BigInteger.valueOf(7_000), service.toLovelace(NIGHT, BigInteger.valueOf(1_000), AT_MILLIS).lovelace(),
+                "loan-free pricing must use the kept (last) entry");
+        assertEquals(BigInteger.valueOf(7_000),
+                service.toLovelaceForLeg(NIGHT, nft, BigInteger.valueOf(1_000), AT_MILLIS).lovelace(),
+                "and agree with the NFT lookup");
+    }
+
     /** A3 is "usable now FIRST": a lapsed v2 must not hide a valid v1 (oracle audit, finding 4). */
     @Test
     void loanFreePricingFallsBackToAValidLowerVersionWhenTheHigherHasLapsed() throws Exception {

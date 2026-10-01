@@ -298,8 +298,9 @@ public class FluidOracleClient {
     /**
      * ⚠ Two versions of one token are ONE feed published twice, so at the same instant they must
      * agree. If both are valid and their prices differ, something upstream broke — the one condition
-     * about duplicates still worth a WARN (ruling A5, 2026-10-01). Latched per token on the two
-     * prices, so it re-warns only when the disagreement itself changes.
+     * about duplicates still worth a WARN (ruling A5, 2026-10-01). Latched on the first live entry's
+     * oracle NFT and the two prices, so it re-warns only when the disagreement itself changes (with
+     * three or more disagreeing versions it can re-warn per refresh — none exist today).
      */
     private void warnOnVersionPriceDisagreement(Map<AssetType, List<OracleEntry>> versionsPerToken, long now) {
         versionsPerToken.forEach((token, entries) -> {

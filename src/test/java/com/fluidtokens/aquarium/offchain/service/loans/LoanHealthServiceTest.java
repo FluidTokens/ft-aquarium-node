@@ -295,6 +295,30 @@ class LoanHealthServiceTest {
                         + "not the tokens' other versions listed last (9 and 7)");
     }
 
+    /**
+     * ⛔ An ADA principal needs no oracle and prices 1:1, whatever the datum's oracle field holds
+     * (oracle audit r2, finding 1: deleting findFeedForLeg's ada branch left every test green while
+     * every ada-principal loan's health went blank).
+     */
+    @Test
+    void anAdaPrincipalLoanIsPricedWithOnlyACollateralOracle() throws Exception {
+        var adaDatum = new LoanDatum(BigInteger.ZERO, BigInteger.valueOf(1_000_000), BigInteger.valueOf(LEND_DATE),
+                BigInteger.ZERO, BigInteger.valueOf(1_000), BigInteger.ZERO,
+                AssetType.ada(), new AssetType("4e4f4e45", "4e4f4e45"),
+                BigInteger.ZERO, BigInteger.ZERO, liquidation(),
+                new RepaymentMode.PerpetualLoan(BigInteger.valueOf(28), BigInteger.valueOf(5)),
+                BigInteger.ZERO, BigInteger.ZERO, false, "00",
+                new CollateralAsset(COLLATERAL.policyId(), Optional.of(COLLATERAL.assetName()), COLLATERAL_ORACLE));
+        var adaLoan = new Loan("ab".repeat(32), 0, "addr_test1", "cafe", COLLATERAL_AMOUNT,
+                BigInteger.valueOf(3_000_000), adaDatum);
+
+        var health = serviceWith("[%s]".formatted(entry(COLLATERAL, COLLATERAL_PRICE, VALID_FROM, VALID_TO)))
+                .health(adaLoan, NOW);
+
+        assertNull(health.unavailableReason(), "ada needs no oracle: " + health.unavailableReason());
+        assertTrue(health.currentLtv() != null, "an ada-principal loan must still get an LTV");
+    }
+
     @Test
     void anExpiredFeedReportsExpiredRatherThanUnknown() throws Exception {
         var health = serviceWith(registry(PRINCIPAL_PRICE, COLLATERAL_PRICE, NOW - 2_000L, NOW - 1L))

@@ -42,6 +42,8 @@ import java.util.List;
  *                        omits it. c3 feeds carry no signature over their own bytes — the validator
  *                        checks them structurally against this reference input instead — so this,
  *                        not a signature count, is what decides whether one is liquidatable.
+ * @param oracleVersion   the registry's {@code oracleVersion}: 1 (Lending v3) or 2 (Lending v4) since
+ *                        2026-09-30; null when the registry omits it (unknown, never an error).
  */
 public record OracleEntry(AssetType token,
                           AssetType oracleToken,
