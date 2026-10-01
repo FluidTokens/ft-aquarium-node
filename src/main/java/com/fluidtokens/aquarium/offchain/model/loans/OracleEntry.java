@@ -48,7 +48,21 @@ public record OracleEntry(AssetType token,
                           int threshold,
                           OraclePriceFeed feed,
                           List<OracleSignature> signatures,
-                          TransactionInput charlieProviderReferenceInput) {
+                          TransactionInput charlieProviderReferenceInput,
+                          Integer oracleVersion) {
+
+    /**
+     * Without a version: what every entry was before FluidTokens added {@code oracleVersion} to the
+     * registry on 2026-09-30, and what most fixtures still build.
+     */
+    public OracleEntry(AssetType token, AssetType oracleToken, String rewardAddress,
+                       String withdrawCredentialHash, TransactionInput referenceInput,
+                       TransactionInput referenceScript, List<String> verificationKeys, int threshold,
+                       OraclePriceFeed feed, List<OracleSignature> signatures,
+                       TransactionInput charlieProviderReferenceInput) {
+        this(token, oracleToken, rewardAddress, withdrawCredentialHash, referenceInput, referenceScript,
+                verificationKeys, threshold, feed, signatures, charlieProviderReferenceInput, null);
+    }
 
     public OracleEntry {
         verificationKeys = List.copyOf(verificationKeys);
