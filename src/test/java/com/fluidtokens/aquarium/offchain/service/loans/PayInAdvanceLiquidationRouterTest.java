@@ -13,6 +13,7 @@ import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
+import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
@@ -288,12 +289,29 @@ class PayInAdvanceLiquidationRouterTest {
     void nonAdaPrincipalWithNoMatchingOracleIsRefusedCleanly() {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY),
                 nonAdaPrincipalLoanDatum());
-        PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
-                PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
+        // IllegalStateException (FAB-117): quarantined, never answered with CONVERT advice -- convert
+        // needs this same principal oracle.
+        IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
                         CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS));
         assertTrue(refusal.getMessage().contains("no oracle entry for principal oracle asset"),
                 refusal.getMessage());
+    }
+
+    /**
+     * FAB-117: ada collateral is refused BY NAME. numbers() prices the collateral through its oracle entry
+     * and ada has none, so this used to die as a NullPointerException there -- quarantined, but silent.
+     */
+    @Test
+    void anAdaCollateralIsRefusedByNameRatherThanCrashing() {
+        LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY),
+                LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(20_000_000L), BigInteger.valueOf(100L),
+                        LoanFixtures.adaCollateral(), 1_700_000_000_000L, LoanFixtures.liquidation(),
+                        new RepaymentMode.InterestOnRemainingPrincipal(BigInteger.ZERO), false));
+        IllegalStateException refusal = assertThrows(IllegalStateException.class,
+                () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(), CONFIG_UTXO,
+                        LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS));
+        assertTrue(refusal.getMessage().startsWith("ada collateral:"), refusal.getMessage());
     }
 
     /**
@@ -336,8 +354,9 @@ class PayInAdvanceLiquidationRouterTest {
         Map<String, OracleEntry> byUnit = new java.util.LinkedHashMap<>(oraclesByUnit());
         byUnit.put(named.oracleToken().toUnit(), wrongToken);
 
-        PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
-                PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
+        // IllegalStateException (FAB-117): quarantined, never answered with CONVERT advice -- convert
+        // needs this same principal oracle.
+        IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
                         CONFIG_UTXO, LM_CONFIG_UTXO, byUnit, AMPLE_BALANCE, tokenWallet(), NOW, VALID_TO_MILLIS));
         assertTrue(refusal.getMessage().contains("pricing " + TOKEN_PRINCIPAL.toUnit()), refusal.getMessage());

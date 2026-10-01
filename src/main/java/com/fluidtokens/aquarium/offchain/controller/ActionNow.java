@@ -49,6 +49,15 @@ public record ActionNow(String text, String detail, boolean wouldAct) {
     }
 
     /**
+     * FAB-117: a liquidatable loan with ADA collateral. No liquidation path builds one (convert refuses
+     * COLLATERAL_ORACLE_MISSING; pay-in-advance has no collateral oracle to price with), so whatever the
+     * market's action, the row must not say ADVANCE or CONVERT.
+     */
+    public static ActionNow adaCollateralNotLiquidated() {
+        return none("NONE", "ada collateral — this node builds no liquidation for it, whatever the market's action");
+    }
+
+    /**
      * @param liquidatable  null when health could not be computed — which is NOT "no"
      * @param effectiveMode the market's mode after the node's ceiling is applied
      * @param advance       what an ANTICIPATE would have to front, null when unknown

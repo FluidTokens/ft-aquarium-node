@@ -164,7 +164,12 @@ public class PayInAdvanceLiquidationRouter {
         // with "set this market's action to CONVERT", and convert refuses this loan for the same reason
         // (ConvertLiquidationRouter throws the same) — the advice would re-route a whole market for
         // nothing. Quarantined like the convert router's refusal and like the NPE it replaces.
-        if (collateralOracle == null && !datum.collateral().isAda()) {
+        // ⛔ Ada collateral is refused by name too (FAB-117): numbers() prices the collateral through this
+        // entry and ada has none, so it used to die as an NPE there. Same quarantine, now saying why.
+        if (datum.collateral().isAda()) {
+            throw new IllegalStateException("ada collateral: this node builds no pay-in-advance liquidation for it");
+        }
+        if (collateralOracle == null) {
             throw new IllegalStateException(
                     "no oracle entry for collateral oracle asset "
                             + datum.collateral().oracleTokenAsset().toUnit() + " pricing "
@@ -180,10 +185,14 @@ public class PayInAdvanceLiquidationRouter {
         if (!datum.principalAsset().isAda()) {
             principalOracle = OracleEntry.namedForLeg(oraclesByUnit, datum.principalAsset(),
                     datum.principalOracleAsset());
+            // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException (FAB-117), exactly as the
+            // collateral leg above: the executor answers a not-modelled refusal of a non-ada principal with
+            // "set this market's action to CONVERT", and the convert router needs this same oracle
+            // (ConvertLiquidationRouter.feedOf throws on it) -- the advice would re-route a whole market
+            // for nothing. Quarantined instead, like the convert router's identical refusal.
             if (principalOracle == null) {
-                throw new PayInAdvanceNotModelledException(
-                        "pay-in-advance not yet modelled: no oracle entry for principal oracle asset "
-                                + datum.principalOracleAsset().toUnit() + " pricing " + datum.principalAsset().toUnit());
+                throw new IllegalStateException("no oracle entry for principal oracle asset "
+                        + datum.principalOracleAsset().toUnit() + " pricing " + datum.principalAsset().toUnit());
             }
         }
 

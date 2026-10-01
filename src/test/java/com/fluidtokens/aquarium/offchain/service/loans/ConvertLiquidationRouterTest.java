@@ -251,4 +251,30 @@ class ConvertLiquidationRouterTest {
 
         assertTrue(e.getMessage().contains("pricing " + principal.toUnit()), e.getMessage());
     }
+
+    /**
+     * FAB-117: ada collateral is refused BY NAME. No liquidation path builds one (its datum names the NONE
+     * sentinel, and redeemerEquity needs a collateral feed), and it used to die as a NullPointerException
+     * there -- quarantined, but saying nothing. Same quarantine now, with the reason the readiness page shows.
+     */
+    @Test
+    void anAdaCollateralIsRefusedByNameRatherThanCrashing() {
+        LiquidationAssessment base = candidate();
+        LoanDatum datum = LoanFixtures.loanDatum(FLDT, LoanFixtures.NO_ORACLE, BigInteger.valueOf(20_000_000L),
+                BigInteger.valueOf(100L), LoanFixtures.adaCollateral(), 1_700_000_000_000L,
+                base.loan().datum().liquidationMode(), base.loan().datum().repaymentMode(), false);
+        Loan loan = new Loan("aa".repeat(32), 0, "addr_loan", "cafe",
+                BigInteger.valueOf(100_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("bb".repeat(32), 0, "addr_bond", "cafe", "d87980",
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50L),
+                        LoanFixtures.noStakeCredential(), FLDT));
+        LiquidationAssessment adaCollateral = LiquidationAssessment.buildable(bond, loan, "ada collateral",
+                BigInteger.valueOf(20_000_000L), BigInteger.ZERO, false, BigInteger.valueOf(5_000_000L));
+
+        var e = assertThrows(IllegalStateException.class,
+                () -> router().buildConvertLiquidation(adaCollateral, loanUtxo(), null, null, null,
+                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+        assertTrue(e.getMessage().startsWith("ada collateral:"), e.getMessage());
+    }
 }

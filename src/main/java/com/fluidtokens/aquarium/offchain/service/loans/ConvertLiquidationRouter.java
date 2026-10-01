@@ -371,9 +371,15 @@ public class ConvertLiquidationRouter {
 
         OracleEntry collateralOracle = OracleEntry.namedForLeg(oraclesByOracleTokenUnit,
                 loan.collateral().assetType(), loan.collateral().oracleTokenAsset());
+        // ⛔ Ada collateral is refused by name (FAB-117): no liquidation path builds one, and without this it
+        // died as an NPE inside redeemerEquity, which requires a collateral feed. Same quarantine, now
+        // saying why -- and the readiness page says the same thing.
+        if (loan.collateral().isAda()) {
+            throw new IllegalStateException("ada collateral: this node builds no convert liquidation for it");
+        }
         // A token collateral needs the oracle its datum names, pricing that token; refused by name here
         // rather than as an NPE inside redeemerEquity (which requires the collateral feed).
-        if (!loan.collateral().isAda() && collateralOracle == null) {
+        if (collateralOracle == null) {
             throw new IllegalStateException("no oracle feed for " + loan.collateral().oracleTokenAsset().toUnit()
                     + " pricing " + loan.collateral().assetType().toUnit()
                     + "; the loan's figures cannot be derived at the body's validFrom");

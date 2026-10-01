@@ -2190,6 +2190,12 @@ class LiquidationExecutorTest {
 
     /** As above, with the wallet contents made explicit — F7's own scenario overrides these. */
     private static Wiring tokenPrincipalConvertEconomicsWiring(List<Utxo> walletUtxos) {
+        return tokenPrincipalConvertEconomicsWiring(walletUtxos, List.of(decoyVersion(collateralOracle(), 77),
+                decoyVersion(principalOracle(), 9), collateralOracle(), principalOracle()));
+    }
+
+    /** As above, with the oracle registry made explicit too (FAB-117 withholds the principal's). */
+    private static Wiring tokenPrincipalConvertEconomicsWiring(List<Utxo> walletUtxos, List<OracleEntry> registry) {
         AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
         configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_500_000_000L)));
 
@@ -2217,10 +2223,7 @@ class LiquidationExecutorTest {
         // takes the first match) lands on it. The pinned figures below are only reachable through the
         // oracles the loan's datum names, as the transaction itself uses.
         CountingOracleProvider oracles = new CountingOracleProvider(
-                new FakeOracleClient(List.of(decoyVersion(collateralOracle(), 77),
-                        decoyVersion(principalOracle(), 9), collateralOracle(), principalOracle())),
-                new FakeOracleClient(List.of(decoyVersion(collateralOracle(), 77),
-                        decoyVersion(principalOracle(), 9), collateralOracle(), principalOracle())));
+                new FakeOracleClient(registry), new FakeOracleClient(registry));
 
         PayInAdvanceLiquidationRouter router = new PayInAdvanceLiquidationRouter(
                 LoanFixtures.registry(), LoanFixtures.converters(), configuration,
@@ -2400,23 +2403,20 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * ⛔ REPURPOSED, token-principals slice: {@code PayInAdvanceLiquidationRouter:143} — the outright
-     * "non-ada principal" refusal this test used to pin — is GONE (Part 1 of that slice; a non-ada
-     * principal is now modelled). The remaining {@code PayInAdvanceNotModelledException} trigger a
-     * non-ada principal can still hit is "no oracle entry for principal oracle asset X" (WALL 3): the
-     * executor's {@code oraclesByUnit} snapshot has nothing for the loan's own
-     * {@code principalOracleAsset}. The remedy logic this test exists to pin ({@code action: CONVERT}
-     * is sound advice for ANY non-ada-principal trigger, never for a non-positive-equity one) is
-     * unchanged and still keyed on the principal asset alone, so it still fires here.
+     * ⛔ REPURPOSED AGAIN, FAB-117. A non-ada principal whose own oracle (the NFT its datum names, pricing
+     * its token) is absent from the snapshot used to be a not-modelled refusal answered with "set this
+     * market's action to CONVERT". That advice was wrong for this trigger: the convert router needs the
+     * SAME principal oracle ({@code ConvertLiquidationRouter.feedOf} throws on it), so an operator taking it
+     * would re-route a whole market and get the same refusal. It is now a machinery refusal: quarantined,
+     * and the CONVERT advice must NOT appear.
      */
     @Test
-    void aNonAdaPrincipalNotModelledRefusalCarriesTheConvertRemedy() {
-        Scenario convert = tokenPrincipalConvertScenario();
-        AppConfig.LiquidationConfiguration configuration =
-                config(AppConfig.LiquidationConfiguration.Mode.SHADOW, SMALL_MARGIN, 200);
-        configuration.setMarkets(java.util.List.of(
-                anticipateMarket(COLLATERAL_TOKEN.toUnit(), 1_000_000_000_000L)));
-        Wiring wiring = wiring(configuration, convert, false);
+    void aMissingPrincipalOracleIsQuarantinedAndNeverAdvisesConvert() {
+        // Token collateral (its oracle present) and a USDM principal whose datum-named oracle is ABSENT --
+        // only the principal leg can be what refuses. (The ada-collateral scenario this test used before
+        // FAB-117 is now refused for its collateral first, by name.)
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, TOKEN_WALLET_UTXO),
+                List.of(decoyVersion(principalOracle(), 9), collateralOracle()));
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -2428,28 +2428,14 @@ class LiquidationExecutorTest {
             logger.detachAppender(appender);
         }
 
-        List<ILoggingEvent> infos = appender.list.stream()
-                .filter(event -> event.getLevel() == Level.INFO)
-                .filter(event -> event.getFormattedMessage().contains("not yet modelled"))
-                .toList();
-        assertEquals(1, infos.size(), "expected exactly one INFO line for the not-modelled refusal: "
-                + appender.list);
-        String message = infos.getFirst().getFormattedMessage();
-        assertTrue(message.contains("no oracle entry for principal oracle asset"),
-                "must carry the router's own message, which is what names this trigger: " + message);
-        assertTrue(message.contains(COLLATERAL_TOKEN.toUnit()),
-                "must name the principal unit that makes the remedy apply: " + message);
-        assertTrue(message.contains("action to CONVERT"),
-                "a non-ada-principal refusal MUST carry the remedy — it is the one trigger the advice "
-                        + "is correct for: " + message);
-        // REMEDY WORDING (Machine Owner ruling, 2026-09-09) — "routable" is not "profitable": for the
-        // live USDM loan the FLDT/USDM pool returns ~827M against a 980M minimum_receive, so CONVERT
-        // would build, submit and REFUND rather than fill the debt. The remedy must carry that caveat
-        // until PR3's POOL_TOO_THIN pre-check exists, or it reads as an unconditional fix it is not.
-        assertTrue(message.contains("only if a Minswap pool can fill the debt")
-                        && message.contains("thin pool refunds rather than fills"),
-                "the CONVERT remedy must carry the pool-depth caveat, not read as unconditional advice: "
-                        + message);
+        assertEquals(1, wiring.executor().quarantinedCount(),
+                "a missing principal oracle is a machinery refusal, quarantined: " + appender.list);
+        assertTrue(appender.list.stream().anyMatch(e -> e.getFormattedMessage()
+                        .contains("no oracle entry for principal oracle asset")),
+                "the refusal must name the trigger: " + appender.list);
+        assertFalse(appender.list.stream().anyMatch(e -> e.getFormattedMessage().contains("action to CONVERT")),
+                "CONVERT needs the same principal oracle; advising it re-routes a whole market for nothing: "
+                        + appender.list);
     }
 
     /**
@@ -2481,9 +2467,9 @@ class LiquidationExecutorTest {
      * (c) A convert assessment that clears the router's preconditions (ada principal, positive equity)
      * but whose {@code builder.build} then throws a <em>genuine</em> exception — the machinery failing,
      * not a verdict on the loan — is mapped to the QUARANTINE path, exactly like the plain path's
-     * machinery-failure branch. Here the positive-equity ada-collateral convert loan carries no oracle
-     * entry for its (nominal) collateral leg, so the promoted builder dereferences a null oracle
-     * ({@code NullPointerException}); in production the same branch would catch a Blockfrost timeout.
+     * machinery-failure branch. Here the positive-equity loan has ADA collateral, which the router refuses
+     * by name ({@code IllegalStateException}, FAB-117 -- before, it died as a {@code NullPointerException}
+     * dereferencing a null collateral oracle); in production the same branch would catch a Blockfrost timeout.
      */
     @Test
     void aConvertAssessmentWhoseBuildThrowsIsQuarantined() {
@@ -2507,15 +2493,18 @@ class LiquidationExecutorTest {
         // The refusal must SAY WHY. The old code recorded e.getMessage(), which is null for this
         // message-less NPE, leaving the operator debugging blind — the exact defect Giovanni hit. The
         // detail now carries the cause chain, so it is non-null and names the fault even with no message.
-        assertEquals("NullPointerException", decision.reason(),
+        // FAB-117: the ada-collateral loan used to die as a message-less NullPointerException here; it is
+        // now refused BY NAME, with the same quarantine. The message-less case stays defended by the
+        // wrapped-cause tests below.
+        assertEquals("IllegalStateException", decision.reason(),
                 "the refusal names the root-cause class");
         assertNotNull(decision.detail(),
                 "a build-failure refusal must carry a detail — the old e.getMessage() was null here");
-        assertTrue(decision.detail().contains("NullPointerException"),
+        assertTrue(decision.detail().contains("ada collateral"),
                 "the cause chain surfaces the real fault: " + decision.detail());
         // Cause-less fixture — see the plain path's twin: this assertion discriminates only on the
         // simple-vs-qualified name, and the wrapped-cause test below is what really defends this site.
-        assertTrue(decision.detail().startsWith("NullPointerException"),
+        assertTrue(decision.detail().startsWith("IllegalStateException"),
                 "causeChain uses the SIMPLE name; e.toString() qualifies it: " + decision.detail());
     }
 

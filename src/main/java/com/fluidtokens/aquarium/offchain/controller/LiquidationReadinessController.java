@@ -551,9 +551,11 @@ public class LiquidationReadinessController {
                 new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
                 advance, principalBalance, wallet.known());
 
-        ActionNow actionNow = gatedAction(lendingConfigGate, ActionNow.of(health.liquidatable(),
-                gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
-                gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance));
+        ActionNow actionNow = gatedAction(lendingConfigGate, honestAction(health.liquidatable(),
+                datum.collateral().isAda(),
+                ActionNow.of(health.liquidatable(),
+                        gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
+                        gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance)));
 
         return new Row(loan.loanId(), loan.utxoRef(),
                 datum.principalAsset().toUnit(), datum.principalAmount(),
@@ -581,6 +583,22 @@ public class LiquidationReadinessController {
     }
 
     /**
+     * FAB-117: a liquidatable ADA-collateral loan gets {@link ActionNow#adaCollateralNotLiquidated()}
+     * whatever the market's action -- {@code computed} would say ADVANCE (an unknown advance skips the cap
+     * check) or CONVERT, and no path builds one. Every other row keeps {@code computed}.
+     */
+    static ActionNow honestAction(Boolean liquidatable, boolean adaCollateral, ActionNow computed) {
+        return Boolean.TRUE.equals(liquidatable) && adaCollateral ? ActionNow.adaCollateralNotLiquidated() : computed;
+    }
+
+    /**
+     * Why an ADA-collateral row has no pool verdict: this node builds no liquidation for one.
+     */
+    static final String ADA_COLLATERAL_NOT_LIQUIDATED =
+            "ada collateral: this node builds no liquidation for it (no collateral oracle leg), so no "
+                    + "pool verdict is given";
+
+    /**
      * ⛔ Whether the fetched pool could fill THIS loan.
      *
      * <p>Everything here is arithmetic over values already in hand — the pool datum from the memoised
@@ -588,10 +606,6 @@ public class LiquidationReadinessController {
      * unavailable the reason survives unchanged; the page must never turn "could not ask" into
      * "no pool", because one says try again shortly and the other says hold capital from now on.
      */
-    /** Why an ADA-collateral row has no pool verdict: this node builds no liquidation for one. */
-    static final String ADA_COLLATERAL_NOT_LIQUIDATED =
-            "ada collateral: this node builds no liquidation for it (no collateral oracle leg), so no "
-                    + "pool verdict is given";
 
     PoolUsability usabilityFor(PoolFetch fetched, Loan loan, LenderBond bond,
                                        AssetType collateral, AssetType principal, long now) {

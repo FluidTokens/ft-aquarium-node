@@ -35,6 +35,8 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -688,8 +690,9 @@ class LiquidationReadinessControllerTest {
 
         assertNull(controller.advanceAmount(loan, bond, 1_000L),
                 "no figures for a loan neither liquidation path can build");
-        // A pool IS available, so the only thing withholding a verdict is the ada collateral — and the
-        // row says so, rather than claiming a pool could fill a liquidation the bot will not build.
+        // The verdict is withheld by the ada collateral itself, before any pool is consulted -- the row
+        // says so, rather than claiming a pool could fill a liquidation the bot will not build. (The
+        // positive path, a real pool that CAN fill, is aTokenCollateralLoanWithADeepPoolIsUsable.)
         var usability = controller.usabilityFor(
                 new LiquidationReadinessController.PoolFetch(List.of(), null), loan, bond,
                 AssetType.ada(), PRINCIPAL_TOKEN, 1_000L);
@@ -915,5 +918,54 @@ class LiquidationReadinessControllerTest {
         controller.resolvePool(ada, usdm, memo);
 
         assertEquals(2, resolver.calls, "distinct pairs are distinct questions");
+    }
+
+    /**
+     * FAB-117: the POSITIVE path of usabilityFor -- a token-collateral loan, its named oracle, and a real
+     * pool deep enough to fill the debt. Without it, widening the ada guard to every row (every row reading
+     * "no pool verdict") kept the suite green.
+     */
+    @Test
+    void aTokenCollateralLoanWithADeepPoolIsUsable() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(50_000_000L),
+                BigInteger.ZERO, LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.bondDatum(BigInteger.ZERO, LoanFixtures.noStakeCredential(), AssetType.ada()));
+        OracleEntry collateralOracle = LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 10_000_000L),
+                input("22"), input("33"), input("44"));
+        LiquidationReadinessController controller = controllerWith(
+                new FakeOracleClient(collateralOracle), LoanFixtures.registry());
+        // 1:1 and deep, no liquidation fee (this is about pool depth, not fees): the swappable collateral is
+        // the debt plus its partial-liquidation penalty, so a deep pool clears it.
+        var pool = new com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum(AssetType.ada(),
+                COLLATERAL_TOKEN, BigInteger.TEN, new BigInteger("10000000000000"),
+                new BigInteger("10000000000000"), BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+
+        var usability = controller.usabilityFor(new LiquidationReadinessController.PoolFetch(List.of(pool), null),
+                loan, bond, COLLATERAL_TOKEN, AssetType.ada(), 1_000L);
+
+        assertEquals(PoolUsability.Verdict.USABLE, usability.verdict(), usability.detail());
+    }
+
+    /** FAB-117: a liquidatable ADA-collateral row never claims an action; every other row keeps its own. */
+    @Test
+    void aLiquidatableAdaCollateralRowNeverClaimsAnAction() {
+        ActionNow advance = new ActionNow("ADVANCE", "would liquidate on the next scan", true);
+        ActionNow honest = LiquidationReadinessController.honestAction(true, true, advance);
+        assertEquals("NONE", honest.text());
+        assertFalse(honest.wouldAct(), "no path builds an ada-collateral liquidation");
+        assertTrue(honest.detail().contains("ada collateral"), honest.detail());
+
+        assertSame(advance, LiquidationReadinessController.honestAction(true, false, advance),
+                "a token collateral keeps its computed action");
+        assertSame(advance, LiquidationReadinessController.honestAction(false, true, advance),
+                "a healthy ada-collateral row keeps its computed (non-acting) answer");
+        assertSame(advance, LiquidationReadinessController.honestAction(null, true, advance),
+                "unknown health keeps its computed answer");
     }
 }
