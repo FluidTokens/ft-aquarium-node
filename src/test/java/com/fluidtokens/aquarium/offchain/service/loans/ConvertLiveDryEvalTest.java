@@ -80,16 +80,22 @@ class ConvertLiveDryEvalTest {
     // since been REPAID — its escrow is the 25 ada the compound collected in f2a598a9…. A rig aimed
     // at a settled loan reads a spent output, which Blockfrost answers happily (CCL trap 12:
     // getTxOutput is not an existence check), so it fails for a reason unrelated to the code.
-    private static final String LOAN_TX = "4a95a00f8d0ba2d0ab0dca1cbbad9f4dd5aa9600dbcc2174f21f33c1fd12f80a";
-    private static final int LOAN_IX = 1;
-    private static final int BOND_IX = 3;
+    // ⇑ REPOINTED AGAIN 2026-10-01 (FAB-124). 4a95a00f…#1 sat at the FIRST mainnet deployment's loan
+    // script, superseded by FluidTokens' 2026-09-17 redeploy -- the rig had been rehearsing a dead
+    // deployment. This is a live loan of the CURRENT one (Koios credential_utxos by the derived loan-spend
+    // credential, 2026-10-01): FLDT collateral, ada principal, its lender bond at #6 with convert = true.
+    // ⚠ It expires when the loan is repaid or liquidated; theCandidateIsStillLive says so by name.
+    private static final String LOAN_TX = "45f3f1db6b384d2bca09edcd14e9c4f095c42d4345e7e378f00d88c422ce968d";
+    private static final int LOAN_IX = 2;
+    private static final int BOND_IX = 6;
     /** The asset name shared by the loan NFT and both bonds. */
-    private static final String LOAN_ID = "cae82d7d6cbe064249c49c685267fbe8185ddcb869f35ce9dc13495d";
+    private static final String LOAN_ID = "03ab565dac6c827636091a4463a3ddcfb5041914140fbbe646833d60";
     private static final AssetType FLDT =
             new AssetType("577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e", "0014df10464c4454");
 
     /** Current Config NFT holder; its original mint and every superseded pin remain documented below. */
-    private static final String CONFIG_TX = "ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b";
+    // 2026-10-01: FluidTokens' FTAI-001 in-place update (was ffced74c…, then 3add9d68…).
+    private static final String CONFIG_TX = "3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c";
     private static final int CONFIG_IX = 0;
 
     /**
@@ -115,14 +121,25 @@ class ConvertLiveDryEvalTest {
      */
     // Repointed again 2026-09-11: the current datum publishes the new compound action while keeping
     // the convert action unchanged. The live-set assertion below is what prevents this pin rotting.
+    // Repointed again 2026-10-01 (FTAI-001: the LenderManager actions moved with the new claim action).
     private static final String LM_CONFIG_TX =
-            "1c4a91283f9fc2bffe13c0b10584b1d1492f770e910bd858da8586c395a8bdaa";
+            "ab3e3aafe7ea0e6fec24d9ac9249e01edb242dee55aeaa2399da097a21177620";
     private static final int LM_CONFIG_IX = 0;
 
     // ---- mainnet deployment coordinates -----------------------------------------------------------
 
-    private static final String CONFIG_POLICY = "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416";
-    private static final String LM_CONFIG_POLICY = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
+    // ⛔ READ FROM application.yaml (FAB-124). These were the FIRST deployment's ids (db2c498e… / a56b0ac2…)
+    // and never moved with the 2026-09-17 redeploy: a gate keeping its own copy of what it guards.
+    private static final String CONFIG_POLICY = shippedOrFail("loans.config.policy-id");
+    private static final String LM_CONFIG_POLICY = shippedOrFail("loans.lm-config.policy-id");
+
+    private static String shippedOrFail(String key) {
+        try {
+            return MainnetReferenceScriptsTest.shipped(key);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("cannot read " + key + " from application.yaml", e);
+        }
+    }
     private static final String ASSET_NAME = "706172616d6574657273";
     private static final String SMART_TOKENS = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
 
@@ -308,8 +325,12 @@ class ConvertLiveDryEvalTest {
         // ⛔ The feed, FETCHED. Its window is fifty minutes and the transaction must sit inside it.
         FluidOracleClient oracles = new FluidOracleClient("https://api.fluidtokens.com/get-oracle-tokens");
         oracles.refresh();
-        OracleEntry entry = oracles.findEntry(FLDT)
-                .orElseThrow(() -> new IllegalStateException("no mainnet oracle entry for FLDT"));
+        // The oracle the loan's DATUM names, and only if it prices FLDT (FAB-111/114: the registry lists
+        // most tokens twice, v1 and v2, and the validator requires exactly the named NFT).
+        OracleEntry entry = oracles.findEntryByOracleToken(loan.collateral().oracleTokenAsset())
+                .filter(e -> FLDT.equals(e.token()))
+                .orElseThrow(() -> new IllegalStateException("no oracle entry for the NFT this loan names: "
+                        + loan.collateral().oracleTokenAsset().toUnit()));
         assertTrue(entry.usableForLiquidation(),
                 "the live FLDT feed is not usable: signatures=" + entry.signatures().size()
                         + " threshold=" + entry.threshold());
@@ -471,6 +492,23 @@ class ConvertLiveDryEvalTest {
      * check could never do: the UTxO must still carry the LM config NFT, and its datum must still name
      * the convert action this node derives. Either failing is the drift, named.
      */
+    /**
+     * The pinned candidate is a LIVE loan of the current deployment: its loan NFT is in the current UTxO set
+     * at the pinned output. When this fails, the loan was repaid or liquidated -- re-select a live
+     * FLDT-collateral, ada-principal loan with a convert bond and repoint LOAN_TX / LOAN_IX / BOND_IX / LOAN_ID.
+     */
+    @Test
+    void theCandidateIsStillLive() throws Exception {
+        BFBackendService backend = backend();
+        Utxo loan = output(backend, LOAN_TX, LOAN_IX);
+        String nft = registry().getLoanPolicyId() + LOAN_ID;
+        Result<List<Utxo>> current = backend.getUtxoService().getUtxos(loan.getAddress(), nft, 10, 1);
+        assertTrue(current.isSuccessful() && current.getValue().stream().anyMatch(u ->
+                        LOAN_TX.equals(u.getTxHash()) && LOAN_IX == u.getOutputIndex()),
+                "the pinned convert candidate " + LOAN_TX + "#" + LOAN_IX + " is no longer live (repaid or "
+                        + "liquidated) -- re-select a live FLDT-collateral, ada-principal loan with a convert bond");
+    }
+
     @Test
     void thePinnedLmConfigIsStillTheLiveOne() throws Exception {
         BFBackendService backend = backend();
@@ -513,8 +551,46 @@ class ConvertLiveDryEvalTest {
                         + " is not current — getTxOutput also returns spent history (CCL trap 12)");
     }
 
+    /**
+     * ⛔ Null when the pinned candidate can be claimed NOW; otherwise the stated reason it cannot.
+     *
+     * <p>{@code loan_claim_action} requires {@code or { isRepaymentLate, can_liquidate(…) }}. A HEALTHY loan
+     * is refused by design, so a rehearsal against one fails at the claim whatever the transaction's shape
+     * -- and the adversarial case below would "pass" for the wrong reason. Measured 2026-10-01 with a traced
+     * claim (FAB-124): on the healthy pinned candidate, every OTHER claim check passed, FTAI-001's
+     * LenderManager-action rule included; only {@code can_liquidate} was false. Computed with the node's
+     * own mirrors ({@link LoanFinance#isRepaymentLate}, {@link LoanFinance#canLiquidate}) at the live feed.
+     */
+    private static String whyTheCandidateCannotBeClaimedNow() throws Exception {
+        BFBackendService backend = backend();
+        Utxo loanUtxo = output(backend, LOAN_TX, LOAN_IX);
+        LoanDatum loan = new LoanDatumConverter().deserialize(loanUtxo.getInlineDatum());
+        FluidOracleClient oracles = new FluidOracleClient("https://api.fluidtokens.com/get-oracle-tokens");
+        oracles.refresh();
+        OraclePriceFeed feed = oracles.findEntryByOracleToken(loan.collateral().oracleTokenAsset())
+                .filter(e -> FLDT.equals(e.token())).orElseThrow().feed();
+        long at = feed.validFrom() + 1_000L;
+        BigInteger collateralAmount = BigInteger.valueOf(loanUtxo.getAmount().stream()
+                .filter(a -> a.getUnit().equalsIgnoreCase(FLDT.toUnit()))
+                .findFirst().orElseThrow().getQuantity().longValueExact());
+        boolean late = LoanFinance.isRepaymentLate(loan, at);
+        boolean underwater = LoanFinance.canLiquidate(Rational.fromInt(LoanFinance.remainingDebt(loan, at)),
+                Rational.fromInt(collateralAmount),
+                LoanFinance.liquidationLtv((LiquidationMode.Liquidation) loan.liquidationMode()),
+                OraclePriceFeed.unit(), feed);
+        return late || underwater ? null
+                : "the pinned candidate " + LOAN_TX + "#" + LOAN_IX + " is HEALTHY at the live feed (not late, "
+                        + "LTV within its limit): loan_claim_action refuses it by design (or { isRepaymentLate, "
+                        + "can_liquidate }), so no rehearsal against it can evaluate. Re-pin a LIQUIDATABLE "
+                        + "FLDT-collateral, ada-principal loan with a convert bond when one exists.";
+    }
+
     @Test
     void theRealCandidateBuildsAndEveryScriptEvaluates() throws Exception {
+        String why = whyTheCandidateCannotBeClaimedNow();
+        // A FAILURE with the reason, not an abort: Gradle's XML drops abort messages, and an abort reads as
+        // nothing (docs/tests-pinned-to-chain-state.md -- "prefer failing loudly to aborting").
+        assertTrue(why == null, why);
         Built built;
         try {
             built = build(false);
@@ -565,7 +641,12 @@ class ConvertLiveDryEvalTest {
      * baseline's</b> — identical budgets are what exposed the defect and are the thing to assert on.
      */
     @Test
-    void aMinimumReceiveThatDisagreesWithTheValidatorIsREJECTED() {
+    void aMinimumReceiveThatDisagreesWithTheValidatorIsREJECTED() throws Exception {
+        // On a healthy candidate the claim refuses for HEALTH, so this rejection would be the wrong one.
+        String why = whyTheCandidateCannotBeClaimedNow();
+        // A FAILURE with the reason, not an abort: Gradle's XML drops abort messages, and an abort reads as
+        // nothing (docs/tests-pinned-to-chain-state.md -- "prefer failing loudly to aborting").
+        assertTrue(why == null, why);
         // ignoreScriptCostEvaluationError(false) means a failed evaluation ABORTS the build, so the
         // rejection surfaces as a build failure rather than an outcome to inspect.
         lastEvaluatorMessage = null;
@@ -613,10 +694,17 @@ class ConvertLiveDryEvalTest {
 
         // loan_claim_action first: the convert action takes its credential as a PARAMETER, so a
         // traced claim action changes the convert action's hash too.
+        // SIX parameters since FluidTokens' 2026-10-01 redeploy (FTAI-001): + the LenderManager spend hash and
+        // Script(LenderManager withdraw hash), exactly as LoansContractRegistry derives the claim.
         String claim = apply(unapplied.get("loan/loan_claim_action.loan_claim_action"),
                 bytes(CONFIG_POLICY), bytes(ASSET_NAME),
                 bytes(registry.getAssetManagerSpendScriptHash()),
-                bytes(registry.getAssetManagerWithdrawScriptHash()));
+                bytes(registry.getAssetManagerWithdrawScriptHash()),
+                bytes(registry.getLenderManagerSpendScriptHash()),
+                com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.builder().alternative(1)
+                        .data(com.bloxbean.cardano.client.plutus.spec.ListPlutusData.of(
+                                bytes(registry.getLenderManagerWithdrawScriptHash())))
+                        .build());
         String claimHash = hashOf(claim);
         record(registry, codes, "loanClaimActionScriptHash", claimHash, claim);
 
@@ -763,6 +851,9 @@ class ConvertLiveDryEvalTest {
         m.put(registry.getLoanClaimActionScriptHash(), shippedRef("loan-claim-action"));
         m.put(registry.getLmLiquidateAndConvertActionScriptHash(),
                 shippedRef("lm-liquidate-and-convert-action"));
+        // TRACE PROBE: a swapped (traced) script is NOT what the shipped coordinate publishes, so it must
+        // travel inline -- left in this map, the builder would believe it referenced and attach nothing.
+        m.keySet().removeAll(SWAPPED.values());
         return m;
     }
 

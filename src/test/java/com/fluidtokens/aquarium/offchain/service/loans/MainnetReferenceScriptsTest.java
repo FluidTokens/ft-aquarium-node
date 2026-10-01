@@ -196,7 +196,7 @@ class MainnetReferenceScriptsTest {
 
     /** A shipped mainnet default ({@code ${ENV:value}} in the FIRST yaml document), by dotted path. */
     @SuppressWarnings("unchecked")
-    private static String shipped(String dotted) throws IOException {
+    static String shipped(String dotted) throws IOException {
         try (InputStream in = MainnetReferenceScriptsTest.class.getClassLoader()
                 .getResourceAsStream("application.yaml")) {
             assertTrue(in != null, "application.yaml is absent from the test classpath");
