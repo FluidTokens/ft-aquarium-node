@@ -367,6 +367,67 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
+     * ⛔ FAB-115 round-2 finding 4: the gate must reach the ROW through the real path —
+     * readiness() → rows() → row() → gatedAction — not only the static helper. One loan, health
+     * unknown (so its own action reads UNKNOWN); with the gate closed the row must read REFUSED.
+     */
+    @Test
+    void aClosedLendingGateReachesEveryRowThroughTheRealRenderPath() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(loan), 1, 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(List.of(), census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null) {
+            @Override
+            public com.fluidtokens.aquarium.offchain.model.loans.LoanHealth health(Loan l, long at) {
+                return com.fluidtokens.aquarium.offchain.model.loans.LoanHealth.debtOnly(BigInteger.ZERO, false, "stub");
+            }
+        };
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(null), provide(null), provide(null), provide(LoanFixtures.registry()), provide(null),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        controller.setLendingConfigGate(gate);
+
+        var open = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(open, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var openRows = (List<LiquidationReadinessController.Row>) open.getAttribute("rows");
+        assertEquals(1, openRows.size(), "the fixture must render its one loan, or this test proves nothing");
+        assertTrue(!"REFUSED".equals(openRows.getFirst().actionNow().text()), "an open gate must not refuse");
+
+        gate.block("ConfigDatum[11] mismatch");
+        var closed = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(closed, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var closedRows = (List<LiquidationReadinessController.Row>) closed.getAttribute("rows");
+        assertEquals("REFUSED", closedRows.getFirst().actionNow().text(),
+                "with the lending gate closed, every row must say the bot refuses it");
+    }
+
+    /**
      * A closed gate overrides a row's action: never "would act", and it says why. An open gate leaves
      * the row's own answer untouched.
      */

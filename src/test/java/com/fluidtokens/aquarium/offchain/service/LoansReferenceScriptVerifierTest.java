@@ -170,7 +170,7 @@ class LoansReferenceScriptVerifierTest {
      * this one. That is what a redeploy looks like, and it must abort startup.
      */
     @Test
-    void aUtxoPublishingSomeoneElsesValidatorAbortsStartup() {
+    void aUtxoPublishingSomeoneElsesValidatorIsRefusedByTheCheck() {
         Lookup lookup = new Lookup((txHash, index) ->
                 found(utxoPublishing(txHash, index, FOREIGN_SCRIPT_HASH)));
 
@@ -221,7 +221,7 @@ class LoansReferenceScriptVerifierTest {
      * validator. A verifier that merely checked membership would pass this.
      */
     @Test
-    void coordinatesThatPublishTheDerivedHashesInTheWrongOrderAbortStartup() {
+    void coordinatesThatPublishTheDerivedHashesInTheWrongOrderAreRefusedByTheCheck() {
         Lookup lookup = new Lookup((txHash, index) ->
                 found(utxoPublishing(txHash, index, derivedAt((index + 1) % 6))));
 
@@ -237,7 +237,7 @@ class LoansReferenceScriptVerifierTest {
      * the hole this class exists to close.
      */
     @Test
-    void aFourHundredResponseAbortsStartupRatherThanWarning() {
+    void aFourHundredResponseIsRefusedRatherThanWarned() {
         for (int code : new int[]{400, 403, 404}) {
             Lookup lookup = new Lookup((txHash, index) ->
                     Result.<Utxo>error("not found").code(code));
@@ -255,7 +255,7 @@ class LoansReferenceScriptVerifierTest {
      * too, and the answer is no.
      */
     @Test
-    void aUtxoCarryingNoReferenceScriptAbortsStartup() {
+    void aUtxoCarryingNoReferenceScriptIsRefusedByTheCheck() {
         for (String published : new String[]{null, ""}) {
             Lookup lookup = new Lookup((txHash, index) ->
                     found(utxoPublishing(txHash, index, published)));
@@ -269,7 +269,7 @@ class LoansReferenceScriptVerifierTest {
 
     /** A successful call that carries no value at all is the same kind of answer. */
     @Test
-    void aSuccessfulLookupWithNoUtxoAbortsStartup() {
+    void aSuccessfulLookupWithNoUtxoIsRefusedByTheCheck() {
         Lookup lookup = new Lookup((txHash, index) -> Result.<Utxo>success("ok").code(200));
 
         assertThrows(IllegalStateException.class,
@@ -333,6 +333,32 @@ class LoansReferenceScriptVerifierTest {
                 "the convert action is not verified at startup, so a stale coordinate there boots "
                         + "clean and fails at build with missingRequiredScripts. Covered keys: "
                         + expectationKeys());
+    }
+
+    /**
+     * ⛔ FAB-115 round-2 finding 6. A convert coordinate configured WITHOUT {@code loans.minswap.*}
+     * derives a null hash, and the comparison NPEs. Only IllegalStateException used to be caught, so
+     * this lending misconfiguration still escaped @PostConstruct and grounded the node. Any fault now
+     * closes the gate.
+     */
+    @Test
+    void aNullDerivedHashClosesTheGateInsteadOfEscapingStartup() {
+        var noMinswap = new LoansContractRegistry(
+                "235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200",
+                "fb6ae2027358b4a0b62710eb95102d87fa13f66ecf55d8943699c492",
+                "706172616d6574657273", "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa",
+                null, null, null);
+        assertTrue(noMinswap.getLmLiquidateAndConvertActionScriptHash() == null,
+                "precondition: without loans.minswap.* the convert action derives nothing");
+        var convertOnly = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30,
+                new LiquidateTransactionBuilder.ReferenceScripts(
+                        null, null, null, null, null, null, null, null, in(9)));
+        var verifier = new LoansReferenceScriptVerifier(noMinswap, convertOnly,
+                (tx, ix) -> found(utxoPublishing(tx, ix, FOREIGN_SCRIPT_HASH)), false);
+
+        assertDoesNotThrow(verifier::verify, "a lending misconfiguration must not stop the node");
+        assertTrue(verifier.gate().isBlocked(), "it must close the lending gate instead");
     }
 
     /** Every named slot configured, so the covered-key set is the only variable. */

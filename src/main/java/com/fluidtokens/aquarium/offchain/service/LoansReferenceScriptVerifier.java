@@ -19,19 +19,21 @@ import java.util.Map;
 
 /**
  * Checks, at startup, that every configured {@code loans.liquidation.reference-scripts.*} UTxO
- * really publishes the script this repo derives for that validator — and refuses to start if it
- * does not.
+ * really publishes the script this repo derives for that validator — and, if it does not, closes
+ * the {@link LendingConfigGate} so every Lending v4 transaction is refused (FAB-115; it used to refuse
+ * to start, which took scheduled payments down with it).
  * <p>
  * A reference-script coordinate is a deployment coordinate like the config NFT policy ids
  * {@link LoansConfigVerifier} checks, and it fails the same way: FluidTokens redeploys v4, the
  * coordinates in {@code application.yaml} go stale, and the bot builds transactions that point at
  * reference inputs carrying <em>somebody else's</em> validator. That transaction does not merely
- * fail — it fails in phase-2 evaluation, with the collateral already forfeit. Turning it into a
- * startup failure is the whole point of this class, and that failure is an answer, not an outage.
+ * fail — it fails in phase-2 evaluation, with the collateral already forfeit. Refusing every lending
+ * transaction before one is built is the whole point of this class, and that refusal is an answer, not
+ * an outage.
  *
  * <h2>A sibling of {@link LoansConfigVerifier} rather than part of it</h2>
- * Same failure taxonomy, deliberately the same shape — hard fail on a mismatch, soft warn on a
- * transient backend error, a 4xx treated as an answer. It is separate because it needs
+ * Same failure taxonomy, deliberately the same shape — a mismatch closes the lending gate, a transient
+ * backend error is a soft warn, a 4xx is treated as an answer. It is separate because it needs
  * {@link AppConfig.LiquidationConfiguration}, which only exists on a node that runs the bot, and
  * because bolting a fourth constructor parameter onto {@code LoansConfigVerifier} would change the
  * shape its own tests pin.
@@ -117,8 +119,11 @@ public class LoansReferenceScriptVerifier {
             check();
         } catch (OptInUnreachableFailure e) {
             throw e;
-        } catch (IllegalStateException e) {
-            gate.block(e.getMessage());
+        } catch (RuntimeException e) {
+            // ⚠ Any fault, not only IllegalStateException (round-2 finding 6): a convert coordinate set
+            // without loans.minswap.* derives a null hash and NPEs in the comparison, which used to
+            // escape @PostConstruct and ground the node over a lending misconfiguration.
+            gate.block(e.getClass().getSimpleName() + ": " + e.getMessage());
             log.error("⛔ {} — {}. The node is starting normally: scheduled transactions are unaffected, "
                     + "and only Lending v4 transactions are refused.", LendingConfigGate.REFUSAL, e.getMessage());
         }
