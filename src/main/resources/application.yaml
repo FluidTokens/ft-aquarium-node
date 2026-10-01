@@ -70,9 +70,11 @@ aquarium:
 # ⇒ WHAT DECIDES WHETHER ANYTHING IS INDEXED IS NOW THE COORDINATES BELOW. Absent or malformed
 # config policy ids mean "not configured yet": the node starts CLEAN, indexes nothing for v4, says so
 # at WARN, and contacts nothing. Supply both and it indexes from the sync-start slot.
-# ⚠ ABSENT is not MISMATCHED. A stale policy id still HARD-FAILS at startup (LoansConfigVerifier) —
-# that check is what catches a redeploy, which otherwise verifies cleanly forever against a dead
-# deployment while the node reports an empty world (findings section 12). Do not soften it.
+# ⚠ ABSENT is not MISMATCHED. A stale policy id CLOSES THE LENDING GATE at startup (LoansConfigVerifier):
+# every Lending v4 transaction is refused, logged as LENDING_CONFIG_MISMATCH, while scheduled payments
+# keep running (FAB-115 — it used to stop the whole node, which grounded mainnet on 2026-09-19 and
+# 2026-10-01). That check is still what catches a redeploy, which otherwise verifies cleanly forever
+# against a dead deployment (findings section 12). Do not soften it into a warning that leaves the gate open.
 #
 # ⚠ AND INDEXING IS NOT ARMING. Reading v4 arms nothing; the switch is `liquidation.mode: live`
 # on that path and `compound.enabled` on the other. Both off below.
@@ -355,7 +357,7 @@ loans:
     # profit-margin-lovelace has to cover.
     #
     # No coordinates on mainnet: lending is disabled there, and a stale coordinate is worse than an
-    # absent one — LoansReferenceScriptVerifier hard-fails on a hash that does not match.
+    # absent one — LoansReferenceScriptVerifier closes the lending gate on a hash that does not match.
     convert:
       # ⚑ NO MARGIN KEY HERE since 2026-09-09. `profit-margin-lovelace` is GONE -- Giovanni's ruling:
       # "for me convert is a liquidation and profitMarginLovelace is literally the same as
@@ -433,7 +435,7 @@ loans:
       # *a* script. Verified now: e4e47ab1...#0 publishes dc715410..., 5,516 bytes, unspent.
       #
       # ⇒ And LoansReferenceScriptVerifier now covers this slot too, so a future staleness here
-      # hard-fails at boot naming the key, exactly like the other eight.
+      # closes the lending gate at boot naming the key, exactly like the other eight.
       lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:09c5d5c7582a0dcd4d4bc76901cb9991b28512324a5ea248dce32cd3981a1e4f#0}
 
 scheduling:
@@ -607,8 +609,8 @@ loans:
     # script addresses, which means the old reference UTxOs hold scripts this deployment never uses.
     #
     # Left empty rather than wrong on purpose. LoansReferenceScriptVerifier compares each published
-    # coordinate's on-chain reference_script_hash against the freshly derived hash and hard-fails at
-    # boot on a mismatch -- so leaving the old values here would block startup entirely, whereas the
+    # coordinate's on-chain reference_script_hash against the freshly derived hash and closes the lending
+    # gate at boot on a mismatch -- so leaving the old values here would refuse every liquidation, whereas the
     # empty case is a supported path that skips the check. The consequence is bounded and specific:
     # indexing, health, the scanner and shadow mode all work; SUBMISSION does not, because six
     # validators total ~18.6 KB against a 16,384-byte maxTxSize and cannot travel in the witness set.
@@ -645,7 +647,7 @@ loans:
       # predicted: the script hash is derived by applying the config NFT policy ids as parameters,
       # so new policy ids move this hash, and the published UTxO at 48c102c0...#0 holds a script
       # THIS deployment never uses. LoansReferenceScriptVerifier compares published against derived
-      # and hard-fails at boot on a mismatch, so leaving it here would block startup entirely.
+      # and closes the lending gate at boot on a mismatch, so leaving it here would refuse every liquidation.
       # CONSEQUENCE, and it is not cosmetic: with every coordinate blank all six validators travel
       # inline, which does not fit under maxTxSize -- so liquidations cannot BUILD until this script
       # is republished under the fourth deployment. Scanning, health and pricing are unaffected.
@@ -661,7 +663,7 @@ loans:
       # ⛔ BLANKED EXPLICITLY, not omitted. The base document now BAKES mainnet coordinates as its
       # defaults, and a preview node inherits every base key it does not override. A mainnet
       # coordinate reaching a preview node is not inert: LoansReferenceScriptVerifier resolves it,
-      # finds a hash that is not what preview derives, and HARD-FAILS AT BOOT. These two were
+      # finds a hash that is not what preview derives, and CLOSES THE LENDING GATE AT BOOT. These two were
       # previously absent here and harmless only because the base default was empty too.
       asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:}
       lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:}
