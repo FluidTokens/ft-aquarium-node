@@ -126,10 +126,14 @@ public class PayInAdvanceLiquidationRouter {
      *                        path passes
      * @throws WalletInputTooSmallException      when no nominable wallet utxo covers the lender
      *                                          payout this liquidation must fund
-     * @throws PayInAdvanceNotModelledException when the loan's own principal-oracle asset has no
-     *                                          matching oracle entry — a clean refusal, no transaction
-     *                                          built. (F0, round 2: equity 0 is no longer a trigger —
-     *                                          it is the validator's normal, buildable case.)
+     * @throws IllegalStateException            when the loan has ada collateral, or a leg's own oracle
+     *                                          (the NFT its datum names, pricing that leg's token) is
+     *                                          missing -- a machinery refusal the executor QUARANTINES
+     *                                          with no CONVERT advice, since convert needs the same
+     *                                          oracle (FAB-117). No transaction built.
+     * @throws PayInAdvanceNotModelledException for a trigger this path does not model (not the oracle
+     *                                          ones above, since FAB-117). (F0, round 2: equity 0 is
+     *                                          not a trigger -- it is the validator's normal case.)
      */
     Transaction buildConvertLiquidation(LiquidationAssessment assessment,
                                         Utxo loanUtxo,

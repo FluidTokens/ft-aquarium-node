@@ -349,7 +349,21 @@ class ConvertLiveDryEvalTest {
         BigInteger collateralAmount = BigInteger.valueOf(loanUtxo.getAmount().stream()
                 .filter(a -> a.getUnit().equalsIgnoreCase(FLDT.toUnit()))
                 .findFirst().orElseThrow().getQuantity().longValueExact());
+        // The instant the validator sees: the start of validFromSlot (whole seconds on mainnet).
+        long claimValidFromMillis = (validFromMillis / 1000L) * 1000L;
         BigInteger remainingDebt = LoanFinance.remainingDebt(loan, validFromMillis);
+        boolean late = LoanFinance.isRepaymentLate(loan, claimValidFromMillis);
+        boolean underwater = LoanFinance.canLiquidate(
+                Rational.fromInt(LoanFinance.remainingDebt(loan, claimValidFromMillis)),
+                Rational.fromInt(collateralAmount),
+                LoanFinance.liquidationLtv((LiquidationMode.Liquidation) loan.liquidationMode()),
+                OraclePriceFeed.unit(), feed);
+        if (!late && !underwater) {
+            throw new CandidateNotClaimable("the pinned candidate " + LOAN_TX + "#" + LOAN_IX + " is HEALTHY at "
+                    + "this build's own feed and validFrom (not late, LTV within its limit): loan_claim_action "
+                    + "refuses it by design (or { isRepaymentLate, can_liquidate }), so no rehearsal against it can "
+                    + "evaluate. Re-pin a LIQUIDATABLE FLDT-collateral, ada-principal loan with a convert bond.");
+        }
         LiquidationMode.Liquidation liquidation = (LiquidationMode.Liquidation) loan.liquidationMode();
         BigInteger equity = LoanFinance.redeemerEquity(liquidation,
                 Rational.fromInt(collateralAmount), Rational.fromInt(remainingDebt),
@@ -552,48 +566,31 @@ class ConvertLiveDryEvalTest {
     }
 
     /**
-     * ⛔ Null when the pinned candidate can be claimed NOW; otherwise the stated reason it cannot.
+     * ⛔ The pinned candidate cannot be claimed at the build's own instant, so no rehearsal can evaluate.
      *
-     * <p>{@code loan_claim_action} requires {@code or { isRepaymentLate, can_liquidate(…) }}. A HEALTHY loan
-     * is refused by design, so a rehearsal against one fails at the claim whatever the transaction's shape
-     * -- and the adversarial case below would "pass" for the wrong reason. Measured 2026-10-01 with a traced
-     * claim (FAB-124): on the healthy pinned candidate, every OTHER claim check passed, FTAI-001's
-     * LenderManager-action rule included; only {@code can_liquidate} was false. Computed with the node's
-     * own mirrors ({@link LoanFinance#isRepaymentLate}, {@link LoanFinance#canLiquidate}) at the live feed.
+     * <p>{@code loan_claim_action} requires {@code or { isRepaymentLate, can_liquidate(…) }}: a HEALTHY loan is
+     * refused by design, whatever the transaction's shape -- and the adversarial case would "pass" for the
+     * wrong reason. Thrown from INSIDE {@link #build} (FAB-124, cross-provider audit round 1), on exactly the
+     * loan, feed, collateral amount and slot-aligned validFrom the transaction is built with: a separate
+     * pre-check fetched its own oracle snapshot and could disagree with the build. Measured 2026-10-01 with
+     * a traced claim: on the healthy pinned candidate every OTHER claim check passed, FTAI-001's
+     * LenderManager-action rule included; only {@code can_liquidate} was false.
      */
-    private static String whyTheCandidateCannotBeClaimedNow() throws Exception {
-        BFBackendService backend = backend();
-        Utxo loanUtxo = output(backend, LOAN_TX, LOAN_IX);
-        LoanDatum loan = new LoanDatumConverter().deserialize(loanUtxo.getInlineDatum());
-        FluidOracleClient oracles = new FluidOracleClient("https://api.fluidtokens.com/get-oracle-tokens");
-        oracles.refresh();
-        OraclePriceFeed feed = oracles.findEntryByOracleToken(loan.collateral().oracleTokenAsset())
-                .filter(e -> FLDT.equals(e.token())).orElseThrow().feed();
-        long at = feed.validFrom() + 1_000L;
-        BigInteger collateralAmount = BigInteger.valueOf(loanUtxo.getAmount().stream()
-                .filter(a -> a.getUnit().equalsIgnoreCase(FLDT.toUnit()))
-                .findFirst().orElseThrow().getQuantity().longValueExact());
-        boolean late = LoanFinance.isRepaymentLate(loan, at);
-        boolean underwater = LoanFinance.canLiquidate(Rational.fromInt(LoanFinance.remainingDebt(loan, at)),
-                Rational.fromInt(collateralAmount),
-                LoanFinance.liquidationLtv((LiquidationMode.Liquidation) loan.liquidationMode()),
-                OraclePriceFeed.unit(), feed);
-        return late || underwater ? null
-                : "the pinned candidate " + LOAN_TX + "#" + LOAN_IX + " is HEALTHY at the live feed (not late, "
-                        + "LTV within its limit): loan_claim_action refuses it by design (or { isRepaymentLate, "
-                        + "can_liquidate }), so no rehearsal against it can evaluate. Re-pin a LIQUIDATABLE "
-                        + "FLDT-collateral, ada-principal loan with a convert bond when one exists.";
+    static final class CandidateNotClaimable extends RuntimeException {
+        CandidateNotClaimable(String reason) {
+            super(reason);
+        }
     }
 
     @Test
     void theRealCandidateBuildsAndEveryScriptEvaluates() throws Exception {
-        String why = whyTheCandidateCannotBeClaimedNow();
-        // A FAILURE with the reason, not an abort: Gradle's XML drops abort messages, and an abort reads as
-        // nothing (docs/tests-pinned-to-chain-state.md -- "prefer failing loudly to aborting").
-        assertTrue(why == null, why);
         Built built;
         try {
             built = build(false);
+        } catch (CandidateNotClaimable notNow) {
+            // A FAILURE with the reason, not an abort: Gradle's XML drops abort messages, and an abort reads
+            // as nothing (docs/tests-pinned-to-chain-state.md -- "prefer failing loudly to aborting").
+            throw new AssertionError(notNow.getMessage(), notNow);
         } catch (Exception e) {
             throw new AssertionError("the convert build failed. What the evaluator said: "
                     + lastEvaluatorMessage, e);
@@ -642,11 +639,6 @@ class ConvertLiveDryEvalTest {
      */
     @Test
     void aMinimumReceiveThatDisagreesWithTheValidatorIsREJECTED() throws Exception {
-        // On a healthy candidate the claim refuses for HEALTH, so this rejection would be the wrong one.
-        String why = whyTheCandidateCannotBeClaimedNow();
-        // A FAILURE with the reason, not an abort: Gradle's XML drops abort messages, and an abort reads as
-        // nothing (docs/tests-pinned-to-chain-state.md -- "prefer failing loudly to aborting").
-        assertTrue(why == null, why);
         // ignoreScriptCostEvaluationError(false) means a failed evaluation ABORTS the build, so the
         // rejection surfaces as a build failure rather than an outcome to inspect.
         lastEvaluatorMessage = null;
@@ -659,6 +651,10 @@ class ConvertLiveDryEvalTest {
         // vacuous for as long as the unperturbed case was also red: both threw, at the identical
         // budget, and this test was observing the baseline's own failure rather than its own
         // perturbation. A negative test must reject for the RIGHT reason.
+        // On a healthy candidate the claim refuses for HEALTH, so a rejection here would be the wrong one.
+        if (e instanceof CandidateNotClaimable) {
+            throw new AssertionError(e.getMessage(), e);
+        }
         assertNotNull(lastEvaluatorMessage,
                 "the build failed before the evaluator ever ran, so this proves nothing about the "
                         + "validator; the rejection must come from EVALUATION, not from assembly");
@@ -669,10 +665,13 @@ class ConvertLiveDryEvalTest {
     }
 
     /**
-     * TEMPORARY DIAGNOSTIC PROBE — swaps the convert action's bytes for a trace-enabled rebuild of
-     * the SAME source sha (bb4349c), applied to the SAME eleven parameters, injected under the REAL
-     * hash so every address and index in the body stays correct. Diagnostic only: these bytes are
-     * not the deployed script and must never be vendored or submitted.
+     * DIAGNOSTIC PROBE — swaps the CLAIM action and the CONVERT action for trace-enabled rebuilds of
+     * the DEPLOYED source, applied to the same parameters the registry applies (claim: six since
+     * 2026-10-01; convert: eleven). Build TRACED_BLUEPRINT from upstream fec809e with its declared
+     * compiler (aiken v1.1.21: {@code aiken build -f all -t verbose -o traced.json}); confirm an untraced
+     * rebuild reproduces upstream's committed plutus.json byte for byte first. The traced hashes differ,
+     * so the config datums are repointed and the traced scripts travel inline. Diagnostic only: these
+     * bytes are not the deployed scripts and must never be vendored or submitted.
      */
     @SuppressWarnings("unchecked")
     private static void injectTracedConvertScript(LoansContractRegistry registry) throws Exception {
