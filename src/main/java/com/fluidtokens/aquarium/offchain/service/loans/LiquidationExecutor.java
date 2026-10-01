@@ -1212,9 +1212,10 @@ public class LiquidationExecutor {
                 //
                 // Task 3: this used to record REFUSED and log NOTHING. The router's own message is
                 // generic ("… for a negative equity") and does not say WHICH asset, so the line below
-                // names the principal unit. Today negative equity is the ONLY trigger: the router's
-                // non-ada-principal refusal is gone (see the ⚠ below), and missing oracles and ada
-                // collateral are quarantined, not refused here (FAB-117).
+                // names the principal unit. Triggers today: the router's negative equity, and the
+                // builder's oracle-feed refusals (window, margin, variant, usability). The router's
+                // non-ada-principal refusal is gone, and missing oracles and ada collateral are
+                // quarantined, not refused here (FAB-117).
                 //
                 // ⛔ AND THE REMEDY IS CONDITIONAL, because historically only ONE of two triggers had one.
                 // "Set this market to CONVERT" is routable advice for a non-ada principal — the convert

@@ -2347,10 +2347,11 @@ class LiquidationExecutorTest {
 
     /**
      * Slice 1, task 3. Exit 7 recorded REFUSED and logged NOTHING. The router's own message is
-     * generic ("… for a negative equity" / "… no oracle entry for principal oracle asset") and never
-     * says which asset — the log line must, because the operator's next question is always "which
-     * loan, which token". The message itself is what lets a reader tell the two triggers apart, so it
-     * must be carried verbatim. (F0, round 2: the equity trigger is now a genuinely negative equity,
+     * generic ("… for a negative equity") and never says which asset — the log line must, because the
+     * operator's next question is always "which loan, which token". The message is carried verbatim
+     * because it is what tells the triggers apart: the router's negative equity, or one of the builder's
+     * oracle-feed refusals. (Since FAB-117 a missing principal oracle is NOT one of them -- it is an
+     * IllegalStateException and quarantined.) (F0, round 2: the equity trigger is now a genuinely negative equity,
      * not "non-positive" — equity 0 is buildable.)
      */
     @Test
@@ -2396,8 +2397,8 @@ class LiquidationExecutorTest {
         // is not merely unhelpful — `action` is a MARKET-level setting keyed by principal asset, so an
         // operator taking that advice re-routes EVERY loan in the market away from pay-in-advance on
         // the strength of one loan's equity sign. (The sibling that proved the remedy DOES appear rode the
-        // principal-oracle trigger, which FAB-117 moved to quarantine; negative equity is now the only
-        // NotModelled trigger, so the remedy's surviving non-ada case is tracked as a follow-up.)
+        // principal-oracle trigger, which FAB-117 moved to quarantine. What the remedy should say for the
+        // triggers that remain -- negative equity and the builder's oracle-feed refusals -- is FAB-126.)
         assertFalse(message.contains("action to CONVERT"),
                 "a non-positive-equity refusal must NOT advise a market-wide routing change — the "
                         + "equity sign says nothing about the mechanism: " + message);

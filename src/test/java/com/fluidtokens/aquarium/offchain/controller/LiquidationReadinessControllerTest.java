@@ -666,13 +666,14 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
-     * ADA collateral gets no figures (round-2 audit finding 1): neither liquidation path builds one, and
-     * figures here would become a pool verdict and a "would CONVERT" the bot cannot honour. The row
+     * ADA collateral gets no figures (round-2 audit finding 1): neither the convert nor the pay-in-advance
+     * route builds one -- only the PLAIN route does, and it needs no pool and no advance -- and figures here
+     * would become a pool verdict and a "would CONVERT" the bot cannot honour. The row
      * carries {@link LiquidationReadinessController#ADA_COLLATERAL_NOT_LIQUIDATED} instead — even with
      * the principal's oracle present, so it is the collateral, not a missing feed, that withholds them.
      */
     @Test
-    void anAdaCollateralGetsNoFiguresBecauseNoPathLiquidatesIt() {
+    void anAdaCollateralGetsNoFiguresBecauseNeitherPoolRouteBuildsIt() {
         LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
                 BigInteger.valueOf(100_000_000L), BigInteger.ZERO, LoanFixtures.adaCollateral(), 0L,
                 LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
@@ -689,7 +690,7 @@ class LiquidationReadinessControllerTest {
                 new FakeOracleClient(principalOracle), LoanFixtures.registry());
 
         assertNull(controller.advanceAmount(loan, bond, 1_000L),
-                "no figures for a loan neither liquidation path can build");
+                "no figures for a loan neither the convert nor the pay-in-advance route can build");
         // The verdict is withheld by the ada collateral itself, before any pool is consulted -- the row
         // says so, rather than claiming a pool could fill a liquidation the bot will not build. (The
         // positive path, a real pool that CAN fill, is aTokenCollateralLoanWithADeepPoolIsUsable.)

@@ -44,8 +44,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <h2>Reviewer's orientation — what this class proves, and what it does not</h2>
  * <b>Proves:</b> the ROUTING decision only — that a bond whose datum says
  * {@code shouldLiquidationConvertToPrincipal == True} reaches the pay-in-advance builder rather than
- * the plain one, and that the two shapes the seam cannot model are refused cleanly instead of
- * throwing. <b>Does NOT prove:</b> that the routed transaction is valid, buildable against live data,
+ * the plain one, that the shape this router cannot model (a negative equity) is refused cleanly, and
+ * that loans it cannot price (ada collateral, a missing or wrong-token principal oracle) are refused by
+ * name as {@code IllegalStateException}, so the executor quarantines them (FAB-117). <b>Does NOT prove:</b> that the routed transaction is valid, buildable against live data,
  * or acceptable to the chain — the builder's own tests and the live check answer that.
  * <b>Evaluator:</b> none; this class does not evaluate scripts at all.
  *

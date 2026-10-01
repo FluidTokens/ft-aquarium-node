@@ -51,7 +51,10 @@ import java.util.Map;
 public class PayInAdvanceLiquidationRouter {
 
     /**
-     * A convert loan the promoted pay-in-advance builder cannot model — a negative equity. Deliberately declared <em>here</em>, not as a
+     * A convert loan this path cannot build right now — this router raises it for a negative equity, and
+     * {@link LiquidatePayInAdvanceTransactionBuilder} raises it for an oracle feed it cannot use this cycle
+     * (window not covering the transaction, too little margin left, an unmodelled variant, or an entry not
+     * usable now). Deliberately declared <em>here</em>, not as a
      * {@link LiquidateTransactionBuilder.Refusal} constant: this is the routing seam's own clean
      * refusal, it never reaches the plain builder, and {@link LiquidationExecutor} turns it into a
      * {@code REFUSED} row whose reason is this exception's message.
