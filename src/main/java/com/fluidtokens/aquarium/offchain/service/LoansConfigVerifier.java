@@ -202,7 +202,8 @@ public class LoansConfigVerifier {
         // correctly treats a 4xx as an ANSWER rather than an outage — so it throws, out of a
         // @PostConstruct, and the pod CRASH-LOOPS with no way to turn it off.
         //
-        // ⚠ The hard fail below is NOT weakened by this and must not be. A MISMATCH means the
+        // ⚠ The mismatch check below is NOT weakened by this and must not be — it closes the lending
+        // gate (FAB-115) rather than stopping the node, but it closes it. A MISMATCH means the
         // configured policy ids no longer describe the deployment, which is precisely the redeploy
         // that verifies cleanly forever while the node indexes a dead world (§12). Absent means the
         // operator has not said which deployment to watch yet. One is a fault; the other is a Tuesday.
@@ -228,8 +229,9 @@ public class LoansConfigVerifier {
             log.warn("Could not verify Lending v4 config against chain ({}). Continuing unverified — " +
                     "the derived hashes may describe a superseded deployment.", e.getMessage());
             return;
-        } catch (IllegalStateException e) {
-            // ⛔ Config NFT gone, a lookup the provider rejected, a datum of the wrong shape: each
+        } catch (RuntimeException e) {
+            // ⛔ Config NFT gone, a lookup the provider rejected, a datum of the wrong shape — or any
+            // other fault (round-2 finding 6: only IllegalStateException used to be caught): each
             // means the configured coordinates no longer describe a usable deployment. That is a
             // LENDING fault, so it closes the lending gate — it no longer stops the node, whose
             // scheduled-transaction half does not depend on Lending v4 at all.
