@@ -217,6 +217,10 @@
     re-pinned and restarted. Scheduled payments are unaffected.
     <div style="font-weight:400" th:text="${lendingConfigBlocked}">why</div>
   </div>
+  <div th:if="${withdrawAccountsUnconfirmed}" class="note" style="color:var(--warn);font-weight:600">
+    &#9888; WITHDRAW_ACCOUNT_NOT_REGISTERED: liquidations on the affected routes are refused before submit.
+    <div style="font-weight:400" th:each="line : ${withdrawAccountsUnconfirmed}" th:text="${line}">why</div>
+  </div>
   <div th:if="${disabledReason}" class="note" th:text="${disabledReason}">disabled</div>
 
   <!-- ⛔ THE OPERATOR'S OWN WALLET. Amount and ticker; the policy id lives on hover, because a

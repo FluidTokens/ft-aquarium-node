@@ -594,6 +594,7 @@ class LiquidationSubmitVetoTest {
         private RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         private Account account = ACCOUNT;
         private CardanoConverters executorConverters = LoanFixtures.converters();
+        private WithdrawAccountRegistration registration;
 
         Rig configuration(AppConfig.LiquidationConfiguration configuration) {
             this.configuration = configuration;
@@ -664,6 +665,11 @@ class LiquidationSubmitVetoTest {
             return this;
         }
 
+        Rig registration(WithdrawAccountRegistration registration) {
+            this.registration = registration;
+            return this;
+        }
+
         /**
          * How many cycles to drive against the same executor. Each subsequent cycle advances both
          * the cycle clock and the submit clock by one minute, which is what a real scheduler does
@@ -704,6 +710,9 @@ class LiquidationSubmitVetoTest {
                     networkNamed(networkName), params, executorConverters, submitter);
             long[] elapsed = {0};
             executor.setSubmitClock(() -> submitTime + elapsed[0]);
+            if (registration != null) {
+                executor.setWithdrawAccountRegistration(registration);
+            }
 
             for (int cycle = 0; cycle < cycles; cycle++) {
                 elapsed[0] = cycle * 60_000L;
@@ -757,6 +766,95 @@ class LiquidationSubmitVetoTest {
         assertEquals(veto.name(), decision.submitVeto(), decision.detail());
         assertEquals(outcome, decision.outcome(), decision.detail());
         return decision;
+    }
+
+    // ======================================================================================
+    // S3 — every withdrawal reward account must be confirmed registered
+    // ======================================================================================
+
+    @Test
+    void allWithdrawAccountsRegisteredStillSubmitsExactlyOnce() {
+        Run run = new Rig().registration(registration(path -> registered())).run();
+
+        assertEquals(1, run.submitter().submitted.size(),
+                "all built-transaction withdrawals were confirmed, so the new guard must pass");
+        assertNull(run.onlyDecision().submitVeto(), run.onlyDecision().detail());
+    }
+
+    @Test
+    void oneUnregisteredPlainCredentialVetoesAndNamesOnlyThatCredential() {
+        String refused = LoanFixtures.registry().getLmLiquidateActionScriptHash();
+        String refusedStake = LoanFixtures.rewardAddress(refused);
+        Run run = new Rig().registration(registration(path -> path.contains(refusedStake)
+                ? new WithdrawAccountRegistration.Fetched(404, "[]") : registered())).run();
+
+        LiquidationDecision decision = vetoed(run,
+                LiquidationExecutor.SubmitVeto.WITHDRAW_ACCOUNT_NOT_REGISTERED,
+                LiquidationDecision.Outcome.SUBMIT_VETOED);
+        assertTrue(decision.detail().contains(refused), decision.detail());
+        for (String confirmed : List.of(LoanFixtures.registry().getLoanPolicyId(),
+                LoanFixtures.registry().getLoanClaimActionScriptHash(),
+                LoanFixtures.registry().getLenderManagerWithdrawScriptHash())) {
+            assertFalse(decision.detail().contains(confirmed),
+                    "confirmed credential leaked into the veto detail: " + decision.detail());
+        }
+    }
+
+    @Test
+    void aThrowingRegistrationLookupFailsClosedBeforeSubmit() {
+        Run run = new Rig().registration(registration(path -> {
+            throw new IllegalStateException("lookup wrapper",
+                    new java.net.SocketTimeoutException("registration timed out"));
+        })).run();
+
+        LiquidationDecision decision = vetoed(run,
+                LiquidationExecutor.SubmitVeto.WITHDRAW_ACCOUNT_NOT_REGISTERED,
+                LiquidationDecision.Outcome.SUBMIT_VETOED);
+        assertTrue(decision.detail().contains("not read as registered"), decision.detail());
+        assertTrue(decision.detail().contains("registration timed out"), decision.detail());
+    }
+
+    @Test
+    void anUnregisteredOracleWithdrawalProvesTheBuiltTransactionIsChecked() {
+        String oracleStake = LoanFixtures.rewardAddress(ORACLE_CREDENTIAL);
+        Run run = new Rig().scenario(tokenScenario())
+                .oracle(new FakeOracleClient(List.of(collateralOracle())))
+                .registration(registration(path -> path.contains(oracleStake)
+                        ? new WithdrawAccountRegistration.Fetched(404, "[]") : registered()))
+                .run();
+
+        LiquidationDecision decision = vetoed(run,
+                LiquidationExecutor.SubmitVeto.WITHDRAW_ACCOUNT_NOT_REGISTERED,
+                LiquidationDecision.Outcome.SUBMIT_VETOED);
+        assertTrue(decision.detail().contains(ORACLE_CREDENTIAL), decision.detail());
+        assertTrue(decision.detail().contains("oracle or other"), decision.detail());
+    }
+
+    @Test
+    void shadowKeepsItsModeVetoAndAddsTheRegistrationNote() {
+        String refused = LoanFixtures.registry().getLmLiquidateActionScriptHash();
+        Run run = new Rig()
+                .configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        SMALL_MARGIN, PUBLISHED))
+                .registration(registration(path -> path.contains(LoanFixtures.rewardAddress(refused))
+                        ? new WithdrawAccountRegistration.Fetched(404, "[]") : registered()))
+                .run();
+
+        LiquidationDecision decision = vetoed(run, LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE,
+                LiquidationDecision.Outcome.WOULD_SUBMIT);
+        assertTrue(decision.detail().contains("NOTE: withdraw accounts not confirmed registered"),
+                decision.detail());
+        assertTrue(decision.detail().contains(refused), decision.detail());
+    }
+
+    private static WithdrawAccountRegistration registration(
+            WithdrawAccountRegistration.RegistrationsFetcher fetcher) {
+        return new WithdrawAccountRegistration(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                fetcher, () -> NOW);
+    }
+
+    private static WithdrawAccountRegistration.Fetched registered() {
+        return new WithdrawAccountRegistration.Fetched(200, "[{\"action\":\"registered\"}]");
     }
 
     // ======================================================================================

@@ -22,6 +22,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.AnticipateAndSell;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
+import com.fluidtokens.aquarium.offchain.service.loans.WithdrawAccountRegistration;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -43,6 +44,8 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * ⛔ <b>The two properties an operator is promised about the readiness UI.</b>
@@ -1186,6 +1189,161 @@ class LiquidationReadinessControllerTest {
                 rendered.row().actionNow().toString());
     }
 
+    @Test
+    void registrationBannerIsNullWhenConfirmedAndNamesNegativeAndUnknownAnswers() {
+        var plainBond = LoanFixtures.bondDatum(BigInteger.valueOf(50),
+                LoanFixtures.noStakeCredential(), AssetType.ada());
+        Rendered confirmed = renderLiquidatable(plainBond, LoanFixtures.adaCollateral(),
+                liveConfiguration(), null, new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                registration(path -> registered()));
+        assertNull(confirmed.model().getAttribute("withdrawAccountsUnconfirmed"));
+        assertFalse(confirmed.row().blocker().blocked(), confirmed.row().blocker().toString());
+
+        String refused = LoanFixtures.registry().getLmLiquidateActionScriptHash();
+        Rendered negative = renderLiquidatable(plainBond, LoanFixtures.adaCollateral(),
+                liveConfiguration(), null, new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                registration(path -> path.contains(testnetStake(refused))
+                        ? new WithdrawAccountRegistration.Fetched(404, "[]") : registered()));
+        assertTrue(String.valueOf(negative.model().getAttribute("withdrawAccountsUnconfirmed"))
+                .contains(refused));
+
+        Rendered unknown = renderLiquidatable(plainBond, LoanFixtures.adaCollateral(),
+                liveConfiguration(), null, new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                registration(path -> {
+                    throw new IllegalStateException("lookup unavailable");
+                }));
+        assertTrue(String.valueOf(unknown.model().getAttribute("withdrawAccountsUnconfirmed"))
+                .contains("could not be confirmed"));
+    }
+
+    @Test
+    void plainRowUsesOnlyThePlainRegistrationRoute() {
+        var bond = LoanFixtures.bondDatum(BigInteger.valueOf(50),
+                LoanFixtures.noStakeCredential(), AssetType.ada());
+        String liquidate = LoanFixtures.registry().getLmLiquidateActionScriptHash();
+        var blocked = renderLiquidatable(bond, LoanFixtures.adaCollateral(), liveConfiguration(), null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                unregisteredOnly(liquidate)).row();
+        assertEquals("unregistered", blocked.blocker().label(), blocked.blocker().detail());
+        assertEquals("REFUSED", blocked.actionNow().text(), blocked.actionNow().detail());
+
+        String payInAdvance = LoanFixtures.registry().getLmLiquidateAndPayInAdvanceActionScriptHash();
+        var unchanged = renderLiquidatable(bond, LoanFixtures.adaCollateral(), liveConfiguration(), null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                unregisteredOnly(payInAdvance)).row();
+        assertFalse(unchanged.blocker().blocked(), unchanged.blocker().detail());
+        assertEquals("LIQUIDATE", unchanged.actionNow().text(), unchanged.actionNow().detail());
+    }
+
+    @Test
+    void convertBondUsesMarketActionRatherThanItsDisplayedRouteLabel() {
+        var bond = LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                LoanFixtures.noStakeCredential(), AssetType.ada());
+        var collateral = LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT);
+        String payInAdvance = LoanFixtures.registry().getLmLiquidateAndPayInAdvanceActionScriptHash();
+        AppConfig.LiquidationConfiguration anticipate = liveConfiguration();
+        anticipate.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
+        var anticipated = renderLiquidatable(bond, collateral, anticipate, null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                unregisteredOnly(payInAdvance)).row();
+        assertEquals("unregistered", anticipated.blocker().label(), anticipated.blocker().detail());
+        assertEquals("REFUSED", anticipated.actionNow().text(), anticipated.actionNow().detail());
+
+        var convertWithPiaMissing = renderLiquidatable(bond, collateral, liveConfiguration(), null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                unregisteredOnly(payInAdvance)).row();
+        assertNotEquals("unregistered", convertWithPiaMissing.blocker().label(),
+                convertWithPiaMissing.blocker().detail());
+
+        String convert = "ee".repeat(28);
+        var convertMissing = renderLiquidatable(bond, collateral, liveConfiguration(), null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                unregisteredConvertOnly(convert)).row();
+        assertEquals("unregistered", convertMissing.blocker().label(), convertMissing.blocker().detail());
+        assertEquals("REFUSED", convertMissing.actionNow().text(), convertMissing.actionNow().detail());
+    }
+
+    @Test
+    void rowsWithNoExecutorRouteIgnoreEveryRegistrationFailure() {
+        WithdrawAccountRegistration noneRegistered = registration(
+                path -> new WithdrawAccountRegistration.Fetched(404, "[]"));
+        var noBond = renderLiquidatable(null, LoanFixtures.adaCollateral(), liveConfiguration(), null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), noneRegistered).row();
+        assertFalse(noBond.blocker().blocked(), noBond.blocker().toString());
+        assertEquals("NONE — no bond", noBond.actionNow().text());
+
+        var convertBond = LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                LoanFixtures.noStakeCredential(), AssetType.ada());
+        var noRoute = renderLiquidatable(convertBond, LoanFixtures.adaCollateral(), liveConfiguration(), null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), noneRegistered).row();
+        assertNotEquals("unregistered", noRoute.blocker().label(), noRoute.blocker().detail());
+        assertEquals("NONE", noRoute.actionNow().text(), noRoute.actionNow().detail());
+    }
+
+    @Test
+    void registrationActionStaysInsideTheLendingGateAndOutsideExclusion() {
+        String missing = LoanFixtures.registry().getLmLiquidateActionScriptHash();
+        var bond = LoanFixtures.bondDatum(BigInteger.valueOf(50),
+                LoanFixtures.noStakeCredential(), AssetType.ada());
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        gate.block("ConfigDatum mismatch");
+        var closed = renderLiquidatable(bond, LoanFixtures.adaCollateral(), liveConfiguration(), null,
+                gate, unregisteredOnly(missing)).row();
+        assertEquals("REFUSED", closed.actionNow().text());
+        assertTrue(closed.actionNow().detail().startsWith("LENDING_CONFIG_MISMATCH"),
+                closed.actionNow().detail());
+        assertFalse(closed.actionNow().detail().contains("WITHDRAW_ACCOUNT_NOT_REGISTERED"),
+                "the lending gate must remain outermost: " + closed.actionNow().detail());
+
+        var excluded = renderLiquidatable(bond, LoanFixtures.adaCollateral(), liveConfiguration(),
+                (b, loan, now) -> LiquidationAssessment.excluded(b, loan,
+                        LiquidationExclusion.EQUITY_IN_PRINCIPAL_CURRENCY, "fixture exclusion"),
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(),
+                unregisteredOnly(missing)).row();
+        assertEquals("NONE — excluded", excluded.actionNow().text(), excluded.actionNow().detail());
+    }
+
+    @Test
+    void executorRouteMirrorsTheExecutorBranches() {
+        var convert = AppConfig.LiquidationConfiguration.Action.CONVERT;
+        var anticipate = AppConfig.LiquidationConfiguration.Action.ANTICIPATE;
+        assertEquals(Optional.empty(), LiquidationReadinessController.executorRoute(
+                BondRoute.NO_BOND, false, convert));
+        assertEquals(Optional.of(WithdrawAccountRegistration.Route.PLAIN),
+                LiquidationReadinessController.executorRoute(BondRoute.PLAIN, true, anticipate));
+        assertEquals(Optional.empty(), LiquidationReadinessController.executorRoute(
+                BondRoute.CONVERT, true, convert));
+        assertEquals(Optional.of(WithdrawAccountRegistration.Route.CONVERT),
+                LiquidationReadinessController.executorRoute(BondRoute.CONVERT, false, convert));
+        assertEquals(Optional.of(WithdrawAccountRegistration.Route.PAY_IN_ADVANCE),
+                LiquidationReadinessController.executorRoute(BondRoute.CONVERT, false, anticipate));
+    }
+
+    @Test
+    void registrationHelpersPreservePrecedenceAndAppendComputedReasons() {
+        var unknown = new WithdrawAccountRegistration.Check("claim", "ab".repeat(28),
+                "stake_test1claim", WithdrawAccountRegistration.Status.UNKNOWN, "timeout");
+        var absent = new WithdrawAccountRegistration.Check("loan", "cd".repeat(28),
+                "stake_test1loan", WithdrawAccountRegistration.Status.NOT_REGISTERED, "no history");
+        var computed = new ProcessingBlocker("no pool", "pool too thin");
+        var blocker = LiquidationReadinessController.registrationBlocker(computed,
+                AppConfig.LiquidationConfiguration.Mode.LIVE,
+                Optional.of(WithdrawAccountRegistration.Route.CONVERT), List.of(unknown, absent));
+        assertEquals("unregistered", blocker.label());
+        assertTrue(blocker.detail().contains("claim") && blocker.detail().contains("loan"), blocker.detail());
+        assertTrue(blocker.detail().contains("otherwise: no pool — pool too thin"), blocker.detail());
+
+        ActionNow action = LiquidationReadinessController.registrationAction(
+                new ActionNow("CONVERT", "live", true), true,
+                AppConfig.LiquidationConfiguration.Mode.LIVE,
+                Optional.of(WithdrawAccountRegistration.Route.CONVERT), List.of(unknown));
+        assertEquals("REFUSED", action.text());
+        assertTrue(action.detail().contains("otherwise: CONVERT — live"), action.detail());
+        assertSame(computed, LiquidationReadinessController.registrationBlocker(computed,
+                AppConfig.LiquidationConfiguration.Mode.DISABLED,
+                Optional.of(WithdrawAccountRegistration.Route.CONVERT), List.of(absent)));
+    }
+
     private static LiquidationReadinessController.Row renderLiquidatableAdaRow(
             com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatum) {
         return renderLiquidatableRow(bondDatum, LoanFixtures.adaCollateral());
@@ -1228,6 +1386,17 @@ class LiquidationReadinessControllerTest {
             AppConfig.LiquidationConfiguration configuration,
             AssessmentFactory assessmentFactory,
             com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate) {
+        return renderLiquidatable(bondDatumOrNull, collateral, configuration, assessmentFactory,
+                lendingConfigGate, null);
+    }
+
+    private static Rendered renderLiquidatable(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatumOrNull,
+            com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral,
+            AppConfig.LiquidationConfiguration configuration,
+            AssessmentFactory assessmentFactory,
+            com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate,
+            WithdrawAccountRegistration registration) {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
                 collateral, 0L, LoanFixtures.liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
@@ -1270,6 +1439,9 @@ class LiquidationReadinessControllerTest {
                 provide(new FakeOracleClient()), provide(null), provide(null), provide(LoanFixtures.registry()),
                 provide(null), configuration, network);
         controller.setLendingConfigGate(lendingConfigGate);
+        if (registration != null) {
+            controller.setWithdrawAccountRegistration(registration);
+        }
         var model = new org.springframework.ui.ConcurrentModel();
         controller.readiness(model, null, null, null, null, null);
         @SuppressWarnings("unchecked")
@@ -1292,5 +1464,42 @@ class LiquidationReadinessControllerTest {
         market.setAction(AppConfig.LiquidationConfiguration.Action.ANTICIPATE);
         market.setCap(BigInteger.valueOf(cap));
         return market;
+    }
+
+    private static WithdrawAccountRegistration registration(
+            WithdrawAccountRegistration.RegistrationsFetcher fetcher) {
+        return new WithdrawAccountRegistration(LoanFixtures.registry(), Networks.testnet(), fetcher,
+                System::currentTimeMillis);
+    }
+
+    private static WithdrawAccountRegistration unregisteredOnly(String scriptHash) {
+        String stake = testnetStake(scriptHash);
+        return registration(path -> path.contains(stake)
+                ? new WithdrawAccountRegistration.Fetched(404, "[]") : registered());
+    }
+
+    private static WithdrawAccountRegistration unregisteredConvertOnly(String convertHash) {
+        LoansContractRegistry real = LoanFixtures.registry();
+        LoansContractRegistry registry = mock(LoansContractRegistry.class);
+        when(registry.getLoanPolicyId()).thenReturn(real.getLoanPolicyId());
+        when(registry.getLoanClaimActionScriptHash()).thenReturn(real.getLoanClaimActionScriptHash());
+        when(registry.getLenderManagerWithdrawScriptHash())
+                .thenReturn(real.getLenderManagerWithdrawScriptHash());
+        when(registry.getLmLiquidateActionScriptHash()).thenReturn(real.getLmLiquidateActionScriptHash());
+        when(registry.getLmLiquidateAndPayInAdvanceActionScriptHash())
+                .thenReturn(real.getLmLiquidateAndPayInAdvanceActionScriptHash());
+        when(registry.getLmLiquidateAndConvertActionScriptHash()).thenReturn(convertHash);
+        String stake = testnetStake(convertHash);
+        return new WithdrawAccountRegistration(registry, Networks.testnet(), path -> path.contains(stake)
+                ? new WithdrawAccountRegistration.Fetched(404, "[]") : registered(),
+                System::currentTimeMillis);
+    }
+
+    private static WithdrawAccountRegistration.Fetched registered() {
+        return new WithdrawAccountRegistration.Fetched(200, "[{\"action\":\"registered\"}]");
+    }
+
+    private static String testnetStake(String scriptHash) {
+        return WithdrawAccountRegistration.stakeAddress(scriptHash, Networks.testnet());
     }
 }

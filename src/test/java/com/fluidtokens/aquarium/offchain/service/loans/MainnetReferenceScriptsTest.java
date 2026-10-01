@@ -423,11 +423,11 @@ class MainnetReferenceScriptsTest {
 
     /** Newest event first, one event: the account's CURRENT state (tested keyless in RegistrationQueryTest). */
     static String registrationsPath(String stakeAddress) {
-        return "/accounts/" + stakeAddress + "/registrations?order=desc&count=1";
+        return WithdrawAccountRegistration.registrationsPath(stakeAddress);
     }
 
     /** The action of the first (newest, given {@link #registrationsPath}) event, or null for none. */
     static String mostRecentAction(JsonNode events) {
-        return events != null && events.size() > 0 ? events.get(0).get("action").asText() : null;
+        return WithdrawAccountRegistration.mostRecentAction(events);
     }
 }
