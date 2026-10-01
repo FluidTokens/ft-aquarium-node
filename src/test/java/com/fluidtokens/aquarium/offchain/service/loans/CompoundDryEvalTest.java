@@ -248,4 +248,20 @@ class CompoundDryEvalTest {
                 () -> builder().build(request));
         assertEquals(CompoundTransactionBuilder.Refusal.CANDIDATE_NOT_READY, e.getReason());
     }
+
+    /**
+     * FAB-125: the built transaction withdraws through EXACTLY {@link CompoundTransactionBuilder#withdrawCredentials},
+     * the list the live registration check reads -- so that check cannot drift into guarding its own copy.
+     */
+    @Test
+    void theBuiltTransactionWithdrawsExactlyTheDeclaredCredentials() {
+        Transaction tx = builder().build(request(FEE));
+        java.util.Set<String> withdrawn = new java.util.TreeSet<>();
+        for (var w : tx.getBody().getWithdrawals()) {
+            withdrawn.add(com.bloxbean.cardano.client.util.HexUtil.encodeHexString(
+                    new com.bloxbean.cardano.client.address.Address(w.getRewardAddress())
+                            .getDelegationCredentialHash().orElseThrow()));
+        }
+        assertEquals(new java.util.TreeSet<>(CompoundTransactionBuilder.withdrawCredentials(REGISTRY)), withdrawn);
+    }
 }

@@ -155,6 +155,19 @@ public class CompoundTransactionBuilder {
     private final TransactionEvaluator scriptCostEvaluator;
 
     /** Offline: rigs supply every script and evaluate for themselves. */
+    /**
+     * The script credentials a compound transaction withdraws through, in the order {@code build} adds
+     * them. Each needs a REGISTERED reward account or the transaction fails at submit
+     * ({@code ConwayWithdrawalsMissingAccounts}); {@code MainnetReferenceScriptsTest} checks that against
+     * this list, and {@code CompoundDryEvalTest} pins it to the built transaction's withdrawals.
+     */
+    public static List<String> withdrawCredentials(LoansContractRegistry registry) {
+        return List.of(registry.getAssetManagerWithdrawScriptHash(), registry.getLenderManagerWithdrawScriptHash(),
+                registry.getLmCompoundActionScriptHash(), registry.getPoolPolicyId(),
+                registry.getPoolCompoundActionScriptHash(), registry.getPoolManagerPolicyId(),
+                registry.getPmCompoundLiquidityScriptHash());
+    }
+
     public CompoundTransactionBuilder(LoansContractRegistry registry, Network network,
                                       UtxoSupplier utxoSupplier,
                                       ProtocolParamsSupplier protocolParamsSupplier,
@@ -253,7 +266,8 @@ public class CompoundTransactionBuilder {
                 echo(c.poolManager().getInlineDatum(), Refusal.POOL_MANAGER_DATUM_NOT_BYTE_IDENTICAL,
                         "pool manager"));
 
-        // The seven withdrawals (§22.2). Order of addition is irrelevant — the ledger sorts them.
+        // The seven withdrawals (§22.2) -- exactly withdrawCredentials(registry), which the compound
+        // registration check reads. Order of addition is irrelevant — the ledger sorts them.
         tx.withdraw(rewardAddress(registry.getAssetManagerWithdrawScriptHash()), BigInteger.ZERO,
                 CompoundTxEncoder.assetManagerWithdraw(configRefIndex));
         // ⛔ THE LM CONFIG, not the main one — see build().

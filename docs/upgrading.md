@@ -234,8 +234,8 @@ The node checks the deployment **at startup only**, so nothing changes in a node
 it keeps the coordinates it booted with, and its liquidations fail at evaluation. What you see depends on
 the image you restart with:
 
-- an image **with the lending gate** (2026-10-01 onwards) starts, keeps scheduled payments running, and
-  closes the gate:
+- an image with the lending gate but **from before this release** starts, keeps scheduled payments
+  running, and closes the gate:
   ```
   LENDING_CONFIG_MISMATCH … ConfigDatum[11] … LMConfigDatum[2] … LMConfigDatum[3] … LMConfigDatum[4]
   ```

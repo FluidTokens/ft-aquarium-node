@@ -123,6 +123,11 @@ public class ReferenceScriptPublishRunnerTest {
         List<BuiltTransaction> built =
                 publisher.build(Plan.minimumSplit(), destination, funder, change);
         assertEquals(2, built.size(), "the minimum split is two transactions");
+        // ⛔ The claim it would publish is the one PREVIEW's ConfigDatum[11] names (c6e0c439…), not the
+        // shipped 2026-10-01 claim -- a reference script nothing on preview would ever use.
+        assertEquals("c6e0c4395cf22e08f918ca996d7db49faba793dbd6b647160168ff39",
+                LoanFixtures.registryBefore20261001().getLoanClaimActionScriptHash(),
+                "the publisher must derive preview's own claim action");
 
         log.info("destination address (unspendable always-fails script, preview): {}", destination);
         log.info("destination script hash (always-fails; the locked ada is NOT recoverable): {}",

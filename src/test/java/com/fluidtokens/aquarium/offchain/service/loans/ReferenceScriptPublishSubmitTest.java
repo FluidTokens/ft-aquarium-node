@@ -118,7 +118,9 @@ class ReferenceScriptPublishSubmitTest {
         UtxoSupplier utxoSupplier = new DefaultUtxoSupplier(backend.getUtxoService());
         ProtocolParamsSupplier paramsSupplier = new DefaultProtocolParamsSupplier(backend.getEpochService());
 
-        LoansContractRegistry registry = new LoansContractRegistry(
+        // ⚠ The artefact PREVIEW runs (not redeployed on 2026-10-01). The shipped artefact derives the
+        // post-FTAI-001 claim, which no preview ConfigDatum names -- the pin below would (rightly) refuse.
+        LoansContractRegistry registry = new LoansContractRegistry("loans-v4-2026-09-17.plutus.json",
                 CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
 
         // Publishing the wrong script is the one mistake that cannot be undone here, so prove which
