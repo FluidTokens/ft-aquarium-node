@@ -171,9 +171,11 @@ loans:
 
   # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
   #
-  # Verified read-only against the chain on 2026-09-11: the current config NFTs are unspent at
-  # ffced74c…#0 and 1c4a9128…#0, asset name `parameters`, and the mainnet blueprint derives every
-  # credential their datums publish. See MainnetRegistryMatchesConfigTest.
+  # Verified read-only against the chain on 2026-10-01, after FluidTokens' FTAI-001 redeploy: the current
+  # config NFTs are unspent at 3d800e98…#0 (ConfigDatum) and ab3e3aaf…#0 (LMConfigDatum), asset name
+  # `parameters`, and the vendored blueprint derives every credential their datums publish except the
+  # recast pause at ConfigDatum[14] (advisory, by FluidTokens' design). See MainnetRegistryMatchesConfigTest
+  # and MainnetReferenceScriptsTest. (Earlier outputs: ffced74c…#0 / 1c4a9128…#0, verified 2026-09-11.)
   #
   # ⚠ CONFIGURED IS NOT ARMED. The liquidation mode is `disabled`, compound is disabled, and the
   # scheduled-transaction processor is disabled. These values derive and read mainnet only.

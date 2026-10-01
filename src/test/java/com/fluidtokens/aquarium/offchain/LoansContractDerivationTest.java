@@ -58,8 +58,10 @@ class LoansContractDerivationTest {
     // ---- Ground truth: ConfigDatum, output 0 of 8dd38e97…091c (FOURTH deployment) ----------
     //
     // ⛔ Moved from the THIRD deployment (7374a985…e781) on 2026-09-04, with LoanFixtures.
-    // These are what the LIVE datum publishes. The vendored latest blueprint still derives all
-    // except the explicitly labelled pool-sell value below.
+    // These are what the LIVE preview datum publishes. The vendored latest blueprint derives all of them
+    // EXCEPT the explicitly labelled "Latest blueprint value" constants below: pool-sell and LM-compound
+    // since 2026-09-11, and since FluidTokens' 2026-10-01 mainnet redeploy also the claim, pool borrow and
+    // the LenderManager liquidate actions parameterised by the claim. Preview was not redeployed.
 
     private static final String POOL_POLICY_ID = "1c330cfbd58d994945d29c7c52ec001d054b93f733317ec59d9a0537";
     private static final String REQUEST_POLICY_ID = "39bef32eb5f696f6d0b1cc0446903311f04fe008797c0e349a672acb";

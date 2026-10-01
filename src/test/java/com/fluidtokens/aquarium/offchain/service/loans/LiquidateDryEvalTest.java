@@ -631,6 +631,79 @@ class LiquidateDryEvalTest {
     }
 
     /**
+     * ⛔ <b>FluidTokens' 2026-10-01 claim rule (FTAI-001), proved live.</b> {@code loan_claim_action} now
+     * requires that a lender bond held by the LenderManager is spent under a LenderManager LIQUIDATE-type
+     * action -- {@code Liquidate}, {@code LiquidateAndPayInAdvance}, {@code LiquidateAndConvert} or the two
+     * compound variants -- and nothing else (before it, a compound or bond withdrawal could ride a claim).
+     *
+     * <p>The honest build evaluates clean. The mutation changes ONE thing: the LenderManager withdrawal's
+     * action, {@code Liquidate} → {@code WithdrawBonds}. The pre-redeploy claim never read that redeemer,
+     * and withdrawals evaluate in index order with the claim (index 1) before the LenderManager (index 2),
+     * so a rejection reported at the CLAIM's index can only be the new rule. A claim that let it through
+     * would leave the error at the LenderManager's own index instead.
+     */
+    @Test
+    void aClaimUnderANonLiquidateLenderManagerActionIsRejectedByLoanClaimAction() {
+        Scenario scenario = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+        List<Utxo> universe = universe(List.of(scenario));
+        EvalFixtures.evaluate(build(List.of(scenario)), universe, REGISTRY);
+
+        Transaction mutated = buildWithLenderManagerAction(scenario, LiquidationTxEncoder.LenderManagerAction.WITHDRAW_BONDS);
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated, universe, REGISTRY);
+        assertFalse(outcome.successful(), "a claim under WithdrawBonds must be refused");
+        assertTrue(outcome.detail().contains(redeemerError(mutated,
+                        LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))),
+                "expected loan_claim_action to be the rejecting script, got: " + outcome.detail());
+    }
+
+    /**
+     * The control that makes the test above about the RULE and not about any changed redeemer: a
+     * PERMITTED liquidate-type action ({@code LiquidateAndPayInAdvance}) passes the claim. The transaction
+     * still fails -- the LenderManager now demands the pay-in-advance action's withdrawal, which this plain
+     * build does not carry -- but at the LenderManager's index, AFTER the claim's: the claim accepted it.
+     */
+    @Test
+    void aClaimUnderAPermittedLiquidateActionPassesTheClaimAndFailsOnlyAtTheLenderManager() {
+        Scenario scenario = scenario(LOAN_ID_A, TX_LOAN_A, TX_BOND_A, 100_000_000L, 100_000_000L);
+        List<Utxo> universe = universe(List.of(scenario));
+
+        Transaction mutated = buildWithLenderManagerAction(scenario,
+                LiquidationTxEncoder.LenderManagerAction.LIQUIDATE_AND_PAY_IN_ADVANCE);
+        EvalFixtures.Outcome outcome = EvalFixtures.evaluateRaw(mutated, universe, REGISTRY);
+        assertFalse(outcome.successful(), "the plain build cannot satisfy the pay-in-advance action");
+        assertTrue(outcome.detail().contains(redeemerError(mutated,
+                        LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash()))),
+                "the claim must accept a permitted action; the refusal belongs to the LenderManager: "
+                        + outcome.detail());
+    }
+
+    /**
+     * The honest plain build with ONE change: the LenderManager withdrawal's action. Asserts the build
+     * really sent {@code Liquidate}, and that the claim evaluates before the LenderManager -- the order the
+     * attribution in the two tests above relies on (withdrawals evaluate in index order and the first
+     * failure is the one reported).
+     */
+    private static Transaction buildWithLenderManagerAction(Scenario scenario,
+                                                            LiquidationTxEncoder.LenderManagerAction action) {
+        Transaction tx = build(List.of(scenario));
+        int lmIndex = withdrawalIndexOf(tx, LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash()));
+        int claimIndex = withdrawalIndexOf(tx, LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()));
+        assertTrue(claimIndex < lmIndex, "the attribution relies on the claim evaluating first");
+        for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
+            if (redeemer.getTag() == RedeemerTag.Reward && redeemer.getIndex().intValue() == lmIndex) {
+                long lmConfigIndex = ((BigIntPlutusData) ((ConstrPlutusData) redeemer.getData())
+                        .getData().getPlutusDataList().get(0)).getValue().longValueExact();
+                assertEquals(LiquidationTxEncoder.lenderManagerWithdrawRedeemer(lmConfigIndex,
+                                LiquidationTxEncoder.LenderManagerAction.LIQUIDATE).serializeToHex(),
+                        redeemer.getData().serializeToHex(), "the honest build sends Liquidate");
+                redeemer.setData(LiquidationTxEncoder.lenderManagerWithdrawRedeemer(lmConfigIndex, action));
+                return tx;
+            }
+        }
+        throw new AssertionError("no LenderManager withdrawal redeemer to mutate");
+    }
+
+    /**
      * {@code list.unique(redeemer.assetOutputIndexes) == redeemer.assetOutputIndexes} is a top-level
      * conjunct of {@code lm_liquidate_action}, and it is there for a reason: a repeated index lets two
      * loans be settled against <em>one</em> asset-manager output, which is a double-satisfaction

@@ -31,8 +31,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * that makes shipping them to an operator safe.</b>
  *
  * <h2>What this converts from a one-off into a repeatable answer</h2>
- * Findings §24 verified 27 relayed coordinates by hand, once. This asserts the eight the liquidation
- * path uses and the eleven the compound path uses, live, so a redeploy or a spend turns into a red
+ * Findings §24 verified 27 relayed coordinates by hand, once. This asserts the nine the liquidation
+ * path uses (convert included) and the eleven the compound path uses, live, so a redeploy or a spend turns into a red
  * test rather than a stale line in {@code docker/.env.example}.
  *
  * <h2>⚠ The hazard it exists for is specifically the NAMED keys</h2>
