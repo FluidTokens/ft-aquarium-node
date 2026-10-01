@@ -170,16 +170,16 @@ public class LoansConfigVerifier {
     }
 
     /**
-     * Where a config problem is recorded instead of thrown. Setter-injected so the many direct
-     * constructions of this class in tests keep working; those get a private gate of their own.
+     * Where a config problem is recorded instead of thrown. Setter-injected (required in the container)
+     * so the many direct constructions of this class in tests keep working; those get a private gate.
      */
     private LendingConfigGate gate = new LendingConfigGate();
 
-    @Autowired(required = false)
+    // ⛔ REQUIRED (audit finding 2): optional injection let a missing gate bean fail OPEN — the
+    // verifier closing a private gate nobody reads, the executors holding null and running normally.
+    @Autowired
     public void setLendingConfigGate(LendingConfigGate gate) {
-        if (gate != null) {
-            this.gate = gate;
-        }
+        this.gate = gate;
     }
 
     public LendingConfigGate gate() {
@@ -261,7 +261,8 @@ public class LoansConfigVerifier {
                     config UTxOs, in fields this node DOES use to build transactions or to decide \
                     what to index. %s Every Lending v4 transaction is refused until the coordinates \
                     are updated (loans.config.policy-id / loans.lm-config.policy-id / \
-                    loans.smart-tokens-spend-script-hash) and the node restarted. Mismatches: %s"""
+                    loans.smart-tokens-spend-script-hash, AND loans.liquidation.reference-scripts.* \
+                    to the new deployment's published scripts) and the node restarted. Mismatches: %s"""
                     .formatted(paused, String.join("; ", findings.enforced())));
             return;
         }
