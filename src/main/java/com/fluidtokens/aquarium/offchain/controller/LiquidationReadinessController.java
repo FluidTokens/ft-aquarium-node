@@ -863,10 +863,10 @@ public class LiquidationReadinessController {
         // oracle; since 2026-09-30 a token can have two (v1 Lending v3, v2 Lending v4), and these
         // figures must be the ones the transaction for THIS loan would be built from.
         // ⚠ ADA collateral gets NO figures, deliberately: its datum names the NONE sentinel, which has no
-        // registry entry, so this returns null. Do not synthesise a 1:1 entry here — neither liquidation
-        // path builds an ada-collateral loan (convert refuses COLLATERAL_ORACLE_MISSING, pay-in-advance
-        // has no collateral oracle to price with), and figures become a pool verdict and a "would act"
-        // the bot cannot honour. usabilityFor says why instead (oracle re-slice, round-2 audit finding 1).
+        // registry entry, so this returns null. Do not synthesise a 1:1 entry here — these figures feed
+        // only the convert and pay-in-advance routes, and neither builds an ada-collateral loan (both
+        // refuse it by name, FAB-117), so figures would become a pool verdict and a "would act" the bot
+        // cannot honour. (The PLAIN route does liquidate ada collateral, and needs none of these figures.) usabilityFor says why instead (oracle re-slice, round-2 audit finding 1).
         Optional<OracleEntry> oracle = client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
                 .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
         if (oracle.isEmpty()) {

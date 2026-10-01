@@ -2391,8 +2391,8 @@ class LiquidationExecutorTest {
         String message = infos.getFirst().getFormattedMessage();
         assertTrue(message.contains("lovelace"), "must name the principal asset (the unit): " + message);
         assertTrue(message.contains("negative equity"),
-                "must carry the router's own message verbatim — it is what distinguishes the two "
-                        + "triggers: " + message);
+                "must carry the router's own message verbatim — it is what distinguishes negative equity "
+                        + "from the builder's oracle-feed triggers: " + message);
         // ⛔ AND THE REMEDY MUST BE ABSENT HERE. The principal IS ada, so "set this market to CONVERT"
         // is not merely unhelpful — `action` is a MARKET-level setting keyed by principal asset, so an
         // operator taking that advice re-routes EVERY loan in the market away from pay-in-advance on

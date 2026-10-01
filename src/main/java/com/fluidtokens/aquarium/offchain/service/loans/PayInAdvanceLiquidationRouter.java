@@ -43,8 +43,10 @@ import java.util.Map;
  * <em>before</em> the builder is called and refused with {@code IllegalStateException}, which the
  * executor QUARANTINES with no CONVERT advice: the convert route needs the same oracle, so advising it
  * would re-route a whole market for nothing. {@link PayInAdvanceNotModelledException} stays for
- * triggers this seam genuinely does not model. The builder is never handed a shape it would throw on,
- * and no {@link Transaction} is produced for one.
+ * triggers this path cannot build right now: the router's negative-equity precondition, and the
+ * builder's own oracle-feed refusals (feed window not covering the transaction, too little margin left,
+ * an unmodelled variant, an entry not usable this cycle), which only the builder can see. Either way no
+ * {@link Transaction} is produced.
  */
 @Service
 @Slf4j
@@ -134,9 +136,11 @@ public class PayInAdvanceLiquidationRouter {
      *                                          missing -- a machinery refusal the executor QUARANTINES
      *                                          with no CONVERT advice, since convert needs the same
      *                                          oracle (FAB-117). No transaction built.
-     * @throws PayInAdvanceNotModelledException for a trigger this path does not model (not the oracle
-     *                                          ones above, since FAB-117). (F0, round 2: equity 0 is
-     *                                          not a trigger -- it is the validator's normal case.)
+     * @throws PayInAdvanceNotModelledException for a negative equity (this router), or an oracle feed the
+     *                                          builder cannot use this cycle -- window, margin, variant,
+     *                                          usability. Not the missing-oracle cases above (FAB-117).
+     *                                          (F0, round 2: equity 0 is not a trigger -- it is the
+     *                                          validator's normal case.)
      */
     Transaction buildConvertLiquidation(LiquidationAssessment assessment,
                                         Utxo loanUtxo,
