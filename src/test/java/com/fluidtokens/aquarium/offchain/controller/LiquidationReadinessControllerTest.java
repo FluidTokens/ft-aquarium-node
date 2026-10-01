@@ -1130,11 +1130,138 @@ class LiquidationReadinessControllerTest {
                         LoanFixtures.noStakeCredential(), AssetType.ada()),
                 LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT));
 
-        assertFalse(row.poolUsability().usable(), "fixture premise: no usable pool — " + row.poolUsability());
+        // FAB-126 slice 2 r2 (V2): the render harness's null resolver is NOT_CONFIGURED -- the node
+        // cannot convert at all, which is a fact about this node, not about any pool.
+        assertEquals(PoolUsability.Verdict.NOT_CONFIGURED, row.poolUsability().verdict(),
+                "fixture premise: " + row.poolUsability());
         assertEquals("CONVERT", row.route(), row.routeDetail());
-        assertTrue(row.routeDetail().contains("no usable"), row.routeDetail());
-        assertTrue(row.routeDetail().contains("ANTICIPATE"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("this node cannot convert"), row.routeDetail());
+        assertFalse(row.routeDetail().contains("no usable Minswap pool"), row.routeDetail());
         assertFalse(row.routeDetail().contains("must be fronted"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("fronts no capital"), row.routeDetail());
+    }
+
+    /** A resolver whose lookup fails, as a Blockfrost blip would. */
+    private static final class ThrowingPoolResolver extends MinswapPoolResolver {
+        private ThrowingPoolResolver() {
+            super(null, "addr_pool", "00".repeat(28));
+        }
+
+        @Override
+        public java.util.List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
+            throw new IllegalStateException("fixture: provider unavailable");
+        }
+    }
+
+    /** A resolver that answers with fixed pools for every pair. */
+    private static final class FixedPoolResolver extends MinswapPoolResolver {
+        private final java.util.List<MinswapPoolDatum> pools;
+
+        private FixedPoolResolver(MinswapPoolDatum... pools) {
+            super(null, "addr_pool", "00".repeat(28));
+            this.pools = List.of(pools);
+        }
+
+        @Override
+        public java.util.List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
+            return pools.stream().map(p -> new ResolvedPool(null, p, "lp")).toList();
+        }
+    }
+
+    private static LiquidationReadinessController.Row renderTokenConvertRow(
+            AppConfig.LiquidationConfiguration configuration, FluidOracleClient oracleClient,
+            MinswapPoolResolver resolver) {
+        return renderLiquidatable(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                        LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), configuration, null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), null, true,
+                oracleClient, resolver).row();
+    }
+
+    /** The render loan's collateral oracle, 1:1 with ada, so the render can price the loan. */
+    private static FakeOracleClient pricedCollateralOracle() {
+        return new FakeOracleClient(LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("22"), input("33"), input("44")));
+    }
+
+    /**
+     * FAB-126 slice 2 r2 (V1): a pool lookup that FAILED is not evidence that no pool exists. The detail
+     * must not tell the operator there is no usable pool, nor advise switching the market to
+     * capital-fronting for a loan the executor would convert on the next cycle.
+     */
+    @Test
+    void aFailedPoolLookupOnAConvertMarketNeverAdvisesAnticipate() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
+                new FakeOracleClient(), new ThrowingPoolResolver());
+
+        assertEquals(PoolUsability.Verdict.CHECK_FAILED, row.poolUsability().verdict(),
+                "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertFalse(row.routeDetail().contains("no usable"), row.routeDetail());
+        assertFalse(row.routeDetail().contains("ANTICIPATE"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("could not"), row.routeDetail());
+    }
+
+    /**
+     * FAB-126 slice 2 r2 (V3): a pair with NO pool is a pool verdict, and fronting the principal is the
+     * operator's switch to flip -- so this, and only the pool verdicts, carry the ANTICIPATE remedy.
+     */
+    @Test
+    void aConvertMarketWithNoPoolForThePairAdvisesAnticipateWithACap() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
+                new FakeOracleClient(), new CountingPoolResolver(false));
+
+        assertEquals(PoolUsability.Verdict.NO_POOL, row.poolUsability().verdict(),
+                "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("convert route will refuse"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("action: ANTICIPATE with a cap"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("fronts no capital"), row.routeDetail());
+        assertFalse(row.routeDetail().contains("must be fronted"), row.routeDetail());
+    }
+
+    /**
+     * FAB-126 slice 2 r2 (F3): a priced loan with a deep pool keeps the usable-pool CONVERT route and
+     * its detail, unchanged. (The CONVERT-no-pool branch must not swallow it.)
+     */
+    @Test
+    void aConvertMarketWithAUsablePoolKeepsItsConvertDetail() {
+        // Deep, and two ada per collateral unit: the render's convert bond takes a liquidation fee, so
+        // what reaches the pool is less than the debt and a 1:1 pool would be TOO_THIN.
+        var deep = new MinswapPoolDatum(AssetType.ada(), COLLATERAL_TOKEN, BigInteger.TEN,
+                new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+        LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
+                pricedCollateralOracle(), new FixedPoolResolver(deep));
+
+        assertEquals(PoolUsability.Verdict.USABLE, row.poolUsability().verdict(),
+                "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertEquals("a Minswap pool is deep enough to clear this loan's debt, so the bot creates a swap "
+                + "order and fronts no capital", row.routeDetail());
+        assertNull(row.advancePrincipalAmount(), "the usable-pool route computes no advance");
+    }
+
+    /**
+     * FAB-126 slice 2 r2 (F2): relabelling a CONVERT-no-pool row did not change its advance -- it is the
+     * same figure the ANTICIPATE version of the same loan shows, and it is a real figure.
+     */
+    @Test
+    void theConvertNoPoolAdvanceEqualsTheAnticipateAdvanceForTheSameLoan() {
+        LiquidationReadinessController.Row convert = renderTokenConvertRow(liveConfiguration(),
+                pricedCollateralOracle(), new CountingPoolResolver(false));
+        var anticipateConfiguration = liveConfiguration();
+        anticipateConfiguration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
+        LiquidationReadinessController.Row anticipate = renderTokenConvertRow(anticipateConfiguration,
+                pricedCollateralOracle(), new CountingPoolResolver(false));
+
+        assertEquals("CONVERT", convert.route(), convert.routeDetail());
+        assertEquals("CAPITAL IN ADVANCE", anticipate.route(), anticipate.routeDetail());
+        assertNotNull(convert.advancePrincipalAmount(), "fixture premise: the loan must be priced");
+        assertEquals(anticipate.advancePrincipalAmount(), convert.advancePrincipalAmount());
     }
 
     /** FAB-126 slice 2 (L2): the same row on an ANTICIPATE market keeps its capital-in-advance label. */
@@ -1527,6 +1654,25 @@ class LiquidationReadinessControllerTest {
             com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate,
             WithdrawAccountRegistration registration,
             Boolean liquidatable) {
+        return renderLiquidatable(bondDatumOrNull, collateral, configuration, assessmentFactory,
+                lendingConfigGate, registration, liquidatable, new FakeOracleClient(), null);
+    }
+
+    /**
+     * FAB-126 slice 2 r2: the pool resolver and the oracle client are injectable, so a render can reach
+     * every pool verdict (a null resolver is NOT_CONFIGURED; a throwing one is CHECK_FAILED; an empty
+     * one is NO_POOL) and, with the loan's oracle entry, price it.
+     */
+    private static Rendered renderLiquidatable(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatumOrNull,
+            com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral,
+            AppConfig.LiquidationConfiguration configuration,
+            AssessmentFactory assessmentFactory,
+            com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate,
+            WithdrawAccountRegistration registration,
+            Boolean liquidatable,
+            FluidOracleClient oracleClient,
+            MinswapPoolResolver poolResolverOrNull) {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
                 collateral, 0L, LoanFixtures.liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
@@ -1567,7 +1713,7 @@ class LiquidationReadinessControllerTest {
             }
         };
         var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
-                provide(new FakeOracleClient()), provide(null), provide(null), provide(LoanFixtures.registry()),
+                provide(oracleClient), provide(poolResolverOrNull), provide(null), provide(LoanFixtures.registry()),
                 provide(null), configuration, network);
         controller.setLendingConfigGate(lendingConfigGate);
         if (registration != null) {
