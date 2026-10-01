@@ -26,21 +26,29 @@ public class LendingConfigGate {
     /** The refusal name lending paths log, so a closed gate is greppable. */
     public static final String REFUSAL = "LENDING_CONFIG_MISMATCH";
 
+    /** Said when a caller closes the gate without a reason: closed is what matters, not the text. */
+    static final String NO_REASON_GIVEN = "Lending v4 config could not be verified (no reason was given)";
+
+    // ⛔ "Closed" is its own flag, not "a reason is present". It used to be the latter, which made
+    // block(null) a silent no-op that left the gate OPEN -- fail-open on exactly the path meant to fail
+    // closed. No caller passed null, but a caller passing a bare e.getMessage() one day would have.
+    private volatile boolean blocked;
     private volatile String blockedReason;
 
     /** Closes the gate. The first reason wins: it is the one the startup log explains. */
     public synchronized void block(String reason) {
-        if (blockedReason == null) {
-            blockedReason = reason;
+        if (!blocked) {
+            blockedReason = reason == null || reason.isBlank() ? NO_REASON_GIVEN : reason;
+            blocked = true;
         }
     }
 
     /** Why Lending v4 transactions are refused, or empty when they may be built. */
     public Optional<String> blockedReason() {
-        return Optional.ofNullable(blockedReason);
+        return blocked ? Optional.of(blockedReason) : Optional.empty();
     }
 
     public boolean isBlocked() {
-        return blockedReason != null;
+        return blocked;
     }
 }

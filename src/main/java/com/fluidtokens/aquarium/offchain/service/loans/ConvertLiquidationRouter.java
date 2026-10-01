@@ -329,6 +329,13 @@ public class ConvertLiquidationRouter {
                                                long validFromMillis,
                                                long validToMillis) {
         LoanDatum loan = assessment.loan().datum();
+        // ⛔ Ada collateral is refused by name FIRST (FAB-117): convert needs a collateral oracle leg and ada
+        // has none (it used to die as an NPE inside redeemerEquity). First, so it is never answered with the
+        // no-pool branches' "set this market to action: ANTICIPATE" -- pay-in-advance refuses it too.
+        // Quarantined; the PLAIN route (a bond that forbids conversion) is unaffected and does liquidate it.
+        if (loan.collateral().isAda()) {
+            throw new IllegalStateException("ada collateral: this node builds no convert liquidation for it");
+        }
         AssetType collateral = loan.collateral().assetType();
 
         // ⛔ NO POOL ADDRESS CONFIGURED = NO MINSWAP ON THIS NETWORK. Checked BEFORE the provider is
@@ -373,7 +380,7 @@ public class ConvertLiquidationRouter {
                 loan.collateral().assetType(), loan.collateral().oracleTokenAsset());
         // A token collateral needs the oracle its datum names, pricing that token; refused by name here
         // rather than as an NPE inside redeemerEquity (which requires the collateral feed).
-        if (!loan.collateral().isAda() && collateralOracle == null) {
+        if (collateralOracle == null) {
             throw new IllegalStateException("no oracle feed for " + loan.collateral().oracleTokenAsset().toUnit()
                     + " pricing " + loan.collateral().assetType().toUnit()
                     + "; the loan's figures cannot be derived at the body's validFrom");

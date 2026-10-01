@@ -551,9 +551,11 @@ public class LiquidationReadinessController {
                 new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
                 advance, principalBalance, wallet.known());
 
-        ActionNow actionNow = gatedAction(lendingConfigGate, ActionNow.of(health.liquidatable(),
-                gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
-                gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance));
+        ActionNow actionNow = gatedAction(lendingConfigGate, honestAction(health.liquidatable(),
+                datum.collateral().isAda(), bond != null && bond.datum().shouldLiquidationConvertToPrincipal(),
+                ActionNow.of(health.liquidatable(),
+                        gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
+                        gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance)));
 
         return new Row(loan.loanId(), loan.utxoRef(),
                 datum.principalAsset().toUnit(), datum.principalAmount(),
@@ -581,6 +583,26 @@ public class LiquidationReadinessController {
     }
 
     /**
+     * FAB-117: a liquidatable ADA-collateral loan whose bond asks for CONVERSION gets
+     * {@link ActionNow#adaCollateralNotLiquidated()} whatever the market's action -- {@code computed} would
+     * say ADVANCE (an unknown advance skips the cap check) or CONVERT, and both of those routes refuse it.
+     * A PLAIN bond keeps {@code computed}: the plain route does liquidate ada collateral.
+     */
+    static ActionNow honestAction(Boolean liquidatable, boolean adaCollateral, boolean convertBond,
+                                  ActionNow computed) {
+        return Boolean.TRUE.equals(liquidatable) && adaCollateral && convertBond
+                ? ActionNow.adaCollateralNotLiquidated() : computed;
+    }
+
+    /**
+     * Why an ADA-collateral row has no pool verdict: neither the convert nor the pay-in-advance route builds
+     * a liquidation for one. (The PLAIN route does -- this is about the pool, which only convert uses.)
+     */
+    static final String ADA_COLLATERAL_NOT_LIQUIDATED =
+            "ada collateral: neither the convert nor the pay-in-advance route builds a liquidation for it (no "
+                    + "collateral oracle leg), so no pool verdict is given";
+
+    /**
      * ⛔ Whether the fetched pool could fill THIS loan.
      *
      * <p>Everything here is arithmetic over values already in hand — the pool datum from the memoised
@@ -588,10 +610,6 @@ public class LiquidationReadinessController {
      * unavailable the reason survives unchanged; the page must never turn "could not ask" into
      * "no pool", because one says try again shortly and the other says hold capital from now on.
      */
-    /** Why an ADA-collateral row has no pool verdict: this node builds no liquidation for one. */
-    static final String ADA_COLLATERAL_NOT_LIQUIDATED =
-            "ada collateral: this node builds no liquidation for it (no collateral oracle leg), so no "
-                    + "pool verdict is given";
 
     PoolUsability usabilityFor(PoolFetch fetched, Loan loan, LenderBond bond,
                                        AssetType collateral, AssetType principal, long now) {
@@ -845,10 +863,10 @@ public class LiquidationReadinessController {
         // oracle; since 2026-09-30 a token can have two (v1 Lending v3, v2 Lending v4), and these
         // figures must be the ones the transaction for THIS loan would be built from.
         // ⚠ ADA collateral gets NO figures, deliberately: its datum names the NONE sentinel, which has no
-        // registry entry, so this returns null. Do not synthesise a 1:1 entry here — neither liquidation
-        // path builds an ada-collateral loan (convert refuses COLLATERAL_ORACLE_MISSING, pay-in-advance
-        // has no collateral oracle to price with), and figures become a pool verdict and a "would act"
-        // the bot cannot honour. usabilityFor says why instead (oracle re-slice, round-2 audit finding 1).
+        // registry entry, so this returns null. Do not synthesise a 1:1 entry here — these figures feed
+        // only the convert and pay-in-advance routes, and neither builds an ada-collateral loan (both
+        // refuse it by name, FAB-117), so figures would become a pool verdict and a "would act" the bot
+        // cannot honour. (The PLAIN route does liquidate ada collateral, and needs none of these figures.) usabilityFor says why instead (oracle re-slice, round-2 audit finding 1).
         Optional<OracleEntry> oracle = client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
                 .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
         if (oracle.isEmpty()) {

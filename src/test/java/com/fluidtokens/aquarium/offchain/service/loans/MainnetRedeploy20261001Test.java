@@ -227,4 +227,19 @@ class MainnetRedeploy20261001Test {
             java.nio.file.Files.deleteIfExists(variant);
         }
     }
+
+    /**
+     * FAB-125: the CONTENT of what the node indexes, pinned. {@link #theIndexedPaymentCredentialsDidNotMove}
+     * compares the same method under two artefacts, so a credential dropped from the method itself passed it --
+     * and docs/upgrading.md §4.8 names exactly these nine as the reason no re-sync is needed.
+     */
+    @Test
+    void theNodeIndexesExactlyTheNineCredentialsTheUpgradeGuideNames() {
+        LoansContractRegistry r = shipped();
+        assertEquals(List.of(CONFIG, LM_CONFIG, r.getLoanSpendScriptHash(), r.getPoolSpendScriptHash(),
+                        r.getRequestSpendScriptHash(), r.getAssetManagerSpendScriptHash(),
+                        r.getLockedBorrowerManagerSpendScriptHash(), r.getLenderManagerSpendScriptHash(),
+                        r.getPoolManagerSpendScriptHash()),
+                r.indexedPaymentCredentials());
+    }
 }

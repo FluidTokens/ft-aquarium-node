@@ -153,21 +153,18 @@ class MainnetConvertActionDerivationTest {
     /**
      * ⛔ <b>INVERTED 2026-09-04, and the inversion is the receipt.</b>
      *
-     * <p>This assertion was written the other way round: <i>our vendored blueprint still derives the
-     * SUPERSEDED hash</i> — the gap the re-vendor existed to close, measured rather than assumed, so
-     * that closing it would produce a visible red. <b>It did, and this is what it turned into.</b>
+     * <p>Written the other way round at first -- <i>our vendored blueprint still derives the SUPERSEDED
+     * hash</i> -- so that closing the gap would produce a visible red. It did. It now asserts that the
+     * artefact the node shipped for that deployment ({@code loans-v4-2026-09-17.plutus.json}) derives the
+     * convert action FluidTokens deployed on 2026-09-04, independently of
+     * {@link #fluidTokensCommittedFixDerivesTheHashMainnetNowPublishes()}'s path through their committed source.
      *
-     * <p>⇒ Now it asserts the thing that has to stay true from here: <b>the artefact we SHIP derives
-     * the action mainnet actually runs.</b> Together with
-     * {@link #fluidTokensCommittedFixDerivesTheHashMainnetNowPublishes()} that is two independent
-     * paths to one hash — FluidTokens' committed source, and the file in {@code src/main/resources} —
-     * and <b>they are checked separately on purpose</b>. A single test covering both would go green if
-     * the vendored file were quietly replaced by anything that happened to derive the same value, and
-     * "a compiled artefact meeting data from a different build" is precisely the failure class
-     * findings §51 and §53 are both instances of.
+     * <p>⚠ Since FluidTokens' 2026-10-01 redeploy this is a RECEIPT about that deployment, not a check on
+     * what ships today: the current artefact derives {@code cbf3e8c5…}, asserted against the live 2026-10-01
+     * capture in {@code MainnetBlueprintSelectionTest} and {@code ConvertActionDerivationTest}.
      */
     @Test
-    void ourVendoredBlueprintNowDerivesTheDeployedAction() {
+    void thePreRedeployArtefactDerivesTheConvertActionDeployedOn20260904() {
         // ⚠ The artefact of the time (see mainnetRegistry). That the SHIPPED artefact derives what mainnet
         // runs TODAY is asserted against the live 2026-10-01 capture in MainnetBlueprintSelectionTest
         // (CONVERT) and ConvertActionDerivationTest.

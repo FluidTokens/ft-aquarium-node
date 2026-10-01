@@ -196,7 +196,7 @@ class MainnetReferenceScriptsTest {
 
     /** A shipped mainnet default ({@code ${ENV:value}} in the FIRST yaml document), by dotted path. */
     @SuppressWarnings("unchecked")
-    private static String shipped(String dotted) throws IOException {
+    static String shipped(String dotted) throws IOException {
         try (InputStream in = MainnetReferenceScriptsTest.class.getClassLoader()
                 .getResourceAsStream("application.yaml")) {
             assertTrue(in != null, "application.yaml is absent from the test classpath");
@@ -384,14 +384,15 @@ class MainnetReferenceScriptsTest {
     @Test
     void everyCompoundWithdrawCredentialIsRegistered() throws Exception {
         LoansContractRegistry registry = mainnetRegistry();
+        // The builder's own list, pinned to a built transaction in CompoundDryEvalTest -- never a copy here.
         Map<String, String> credentials = new LinkedHashMap<>();
-        credentials.put("asset-manager", registry.getAssetManagerWithdrawScriptHash());
-        credentials.put("lender-manager", registry.getLenderManagerWithdrawScriptHash());
-        credentials.put("lm-compound-action", registry.getLmCompoundActionScriptHash());
-        credentials.put("pool", registry.getPoolPolicyId());
-        credentials.put("pool-compound-action", registry.getPoolCompoundActionScriptHash());
-        credentials.put("pool-manager", registry.getPoolManagerPolicyId());
-        credentials.put("pm-compound-liquidity", registry.getPmCompoundLiquidityScriptHash());
+        List<String> names = List.of("asset-manager", "lender-manager", "lm-compound-action", "pool",
+                "pool-compound-action", "pool-manager", "pm-compound-liquidity");
+        List<String> hashes = CompoundTransactionBuilder.withdrawCredentials(registry);
+        assertEquals(names.size(), hashes.size(), "a compound withdrawal was added or removed: name it here");
+        for (int i = 0; i < hashes.size(); i++) {
+            credentials.put(names.get(i), hashes.get(i));
+        }
         List<String> unregistered = unregistered(credentials);
         assertTrue(unregistered.isEmpty(), "compound withdraw credentials with no registered reward account -- "
                 + "every compound using them fails at submit: " + unregistered);
@@ -407,12 +408,9 @@ class MainnetReferenceScriptsTest {
             String stake = com.bloxbean.cardano.client.address.AddressProvider.getRewardAddress(
                     com.bloxbean.cardano.client.address.Credential.fromScript(e.getValue()),
                     com.bloxbean.cardano.client.common.model.Networks.mainnet()).toBech32();
-            String last = null;
+            String last;
             try {
-                JsonNode events = get("/accounts/" + stake + "/registrations?order=desc&count=1");
-                if (events.size() > 0) {
-                    last = events.get(0).get("action").asText();
-                }
+                last = mostRecentAction(get(registrationsPath(stake)));
             } catch (IllegalStateException notFound) {
                 last = null;   // a 404: the account has never existed
             }
@@ -421,5 +419,15 @@ class MainnetReferenceScriptsTest {
             }
         }
         return unregistered;
+    }
+
+    /** Newest event first, one event: the account's CURRENT state (tested keyless in RegistrationQueryTest). */
+    static String registrationsPath(String stakeAddress) {
+        return "/accounts/" + stakeAddress + "/registrations?order=desc&count=1";
+    }
+
+    /** The action of the first (newest, given {@link #registrationsPath}) event, or null for none. */
+    static String mostRecentAction(JsonNode events) {
+        return events != null && events.size() > 0 ? events.get(0).get("action").asText() : null;
     }
 }

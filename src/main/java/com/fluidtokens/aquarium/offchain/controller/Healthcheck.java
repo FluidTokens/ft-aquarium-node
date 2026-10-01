@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.annotation.JsonNaming;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.LendingConfigGate;
 import com.fluidtokens.aquarium.offchain.service.ParametersService;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
 import lombok.RequiredArgsConstructor;
@@ -21,12 +22,20 @@ import java.util.stream.Stream;
 @RequiredArgsConstructor
 public class Healthcheck {
 
+    /**
+     * @param lendingGate       {@code "open"} or {@code "closed"} -- whether Lending v4 transactions may be
+     *                          built. ⚠ Reported, never part of the health verdict: a closed gate refuses
+     *                          lending only, and the scheduled-payment half this check guards keeps running.
+     * @param lendingGateReason why it is closed (the startup verifier's reason), null while open
+     */
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record HealthCheck(Boolean dbOk,
                               Boolean parametersOk,
                               Boolean parametersRefInputOk,
                               Boolean walletOk,
-                              Boolean stakingOk) {
+                              Boolean stakingOk,
+                              String lendingGate,
+                              String lendingGateReason) {
 
     }
 
@@ -37,6 +46,8 @@ public class Healthcheck {
     private final BlockEventListener blockEventListener;
 
     private final AppUtxoService utxoService;
+
+    private final LendingConfigGate lendingConfigGate;
 
     @GetMapping
     public ResponseEntity<?> healthCheck() {
@@ -90,7 +101,9 @@ public class Healthcheck {
                 parametersOk,
                 parametersRefInputOk,
                 walletOk,
-                stakingFound);
+                stakingFound,
+                lendingConfigGate.isBlocked() ? "closed" : "open",
+                lendingConfigGate.blockedReason().orElse(null));
 
         if (!walletOk) {
             log.warn("[HEALTH] No utxo found for wallet. Ensure you have at least one UTXO with only ada in it.");

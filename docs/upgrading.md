@@ -201,7 +201,17 @@ node. If the config policy ids or the reference-script coordinates do not match 
 it **closes the lending gate**: every Lending v4 transaction (liquidation in every mode, convert,
 compound) is refused for the life of the process, while scheduled payments keep running.
 
-⚠ **So a clean `/healthcheck` does NOT mean the lending check passed.** Before re-arming, confirm it:
+⚠ **A healthy `/healthcheck` does not mean lending may build** — the gate is reported, not part of the
+verdict, because the scheduled payments it guards keep running. Read the gate before re-arming:
+
+```bash
+curl -s http://localhost:8080/healthcheck | jq '{lending_gate, lending_gate_reason}'
+# Prometheus: aquarium_lending_gate_closed  (1 = closed, 0 = open) — worth an alert
+# ⚠ While the node is still syncing, /healthcheck answers the plain text "...syncing..." and the jq
+#   line fails — read the gauge, or wait for the sync to finish.
+```
+
+The startup log says the same, with every mismatched field:
 
 ```bash
 docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified"
@@ -226,8 +236,8 @@ The node checks the deployment **at startup only**, so nothing changes in a node
 it keeps the coordinates it booted with, and its liquidations fail at evaluation. What you see depends on
 the image you restart with:
 
-- an image **with the lending gate** (2026-10-01 onwards) starts, keeps scheduled payments running, and
-  closes the gate:
+- an image with the lending gate but **from before this release** starts, keeps scheduled payments
+  running, and closes the gate:
   ```
   LENDING_CONFIG_MISMATCH … ConfigDatum[11] … LMConfigDatum[2] … LMConfigDatum[3] … LMConfigDatum[4]
   ```

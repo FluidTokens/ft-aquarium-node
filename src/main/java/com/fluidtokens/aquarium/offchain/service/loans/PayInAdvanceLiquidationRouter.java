@@ -38,20 +38,25 @@ import java.util.Map;
  * outright) and the common liquidation, not an edge case. It still throws
  * {@code IllegalStateException} on a genuinely negative equity, which
  * {@code LoanFinance.redeemerEquity}'s own floor makes unreachable — defence in depth, never the
- * expected path. A convert loan outside what the seam can model (a non-ada principal with no
- * matching oracle entry) is not an error to quarantine — it is a candidate this seam cannot yet
- * model — so that precondition is checked <em>before</em> the builder is ever called and signalled
- * with {@link PayInAdvanceNotModelledException}, which the executor maps to a {@code REFUSED}
- * decision. The builder is never handed a shape it would throw on, and no {@link Transaction} is
- * produced for one.
+ * expected path. Since FAB-117 the oracle preconditions -- ada collateral (no collateral oracle leg),
+ * or a leg whose own oracle (the NFT its datum names, pricing its token) is missing -- are checked
+ * <em>before</em> the builder is called and refused with {@code IllegalStateException}, which the
+ * executor QUARANTINES with no CONVERT advice: the convert route needs the same oracle, so advising it
+ * would re-route a whole market for nothing. {@link PayInAdvanceNotModelledException} stays for
+ * triggers this path cannot build right now: the router's negative-equity precondition, and the
+ * builder's own oracle-feed refusals (feed window not covering the transaction, too little margin left,
+ * an unmodelled variant, an entry not usable this cycle), which only the builder can see. Either way no
+ * {@link Transaction} is produced.
  */
 @Service
 @Slf4j
 public class PayInAdvanceLiquidationRouter {
 
     /**
-     * A convert loan the promoted pay-in-advance builder cannot yet model — a non-ada principal, or a
-     * non-positive equity. Deliberately declared <em>here</em>, not as a
+     * A convert loan this path cannot build right now — this router raises it for a negative equity, and
+     * {@link LiquidatePayInAdvanceTransactionBuilder} raises it for an oracle feed it cannot use this cycle
+     * (window not covering the transaction, too little margin left, an unmodelled variant, or an entry not
+     * usable now). Deliberately declared <em>here</em>, not as a
      * {@link LiquidateTransactionBuilder.Refusal} constant: this is the routing seam's own clean
      * refusal, it never reaches the plain builder, and {@link LiquidationExecutor} turns it into a
      * {@code REFUSED} row whose reason is this exception's message.
@@ -126,10 +131,16 @@ public class PayInAdvanceLiquidationRouter {
      *                        path passes
      * @throws WalletInputTooSmallException      when no nominable wallet utxo covers the lender
      *                                          payout this liquidation must fund
-     * @throws PayInAdvanceNotModelledException when the loan's own principal-oracle asset has no
-     *                                          matching oracle entry — a clean refusal, no transaction
-     *                                          built. (F0, round 2: equity 0 is no longer a trigger —
-     *                                          it is the validator's normal, buildable case.)
+     * @throws IllegalStateException            when the loan has ada collateral, or a leg's own oracle
+     *                                          (the NFT its datum names, pricing that leg's token) is
+     *                                          missing -- a machinery refusal the executor QUARANTINES
+     *                                          with no CONVERT advice, since convert needs the same
+     *                                          oracle (FAB-117). No transaction built.
+     * @throws PayInAdvanceNotModelledException for a negative equity (this router), or an oracle feed the
+     *                                          builder cannot use this cycle -- window, margin, variant,
+     *                                          usability. Not the missing-oracle cases above (FAB-117).
+     *                                          (F0, round 2: equity 0 is not a trigger -- it is the
+     *                                          validator's normal case.)
      */
     Transaction buildConvertLiquidation(LiquidationAssessment assessment,
                                         Utxo loanUtxo,
@@ -159,12 +170,17 @@ public class PayInAdvanceLiquidationRouter {
         OracleEntry collateralOracle = OracleEntry.namedForLeg(oraclesByUnit,
                 datum.collateral().assetType(), datum.collateral().oracleTokenAsset());
         // A token collateral is refused by name, never an NPE in numbers(), which prices it through this
-        // entry. (Ada collateral keeps its existing path: no registry entry exists for it.)
+        // entry. Ada collateral is refused first, below: it has no oracle leg at all.
         // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException: the executor answers that one
         // with "set this market's action to CONVERT", and convert refuses this loan for the same reason
         // (ConvertLiquidationRouter throws the same) — the advice would re-route a whole market for
         // nothing. Quarantined like the convert router's refusal and like the NPE it replaces.
-        if (collateralOracle == null && !datum.collateral().isAda()) {
+        // ⛔ Ada collateral is refused by name too (FAB-117): numbers() prices the collateral through this
+        // entry and ada has none, so it used to die as an NPE there. Same quarantine, now saying why.
+        if (datum.collateral().isAda()) {
+            throw new IllegalStateException("ada collateral: this node builds no pay-in-advance liquidation for it");
+        }
+        if (collateralOracle == null) {
             throw new IllegalStateException(
                     "no oracle entry for collateral oracle asset "
                             + datum.collateral().oracleTokenAsset().toUnit() + " pricing "
@@ -180,10 +196,14 @@ public class PayInAdvanceLiquidationRouter {
         if (!datum.principalAsset().isAda()) {
             principalOracle = OracleEntry.namedForLeg(oraclesByUnit, datum.principalAsset(),
                     datum.principalOracleAsset());
+            // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException (FAB-117), exactly as the
+            // collateral leg above: the executor answers a not-modelled refusal of a non-ada principal with
+            // "set this market's action to CONVERT", and the convert router needs this same oracle
+            // (ConvertLiquidationRouter.feedOf throws on it) -- the advice would re-route a whole market
+            // for nothing. Quarantined instead, like the convert router's identical refusal.
             if (principalOracle == null) {
-                throw new PayInAdvanceNotModelledException(
-                        "pay-in-advance not yet modelled: no oracle entry for principal oracle asset "
-                                + datum.principalOracleAsset().toUnit() + " pricing " + datum.principalAsset().toUnit());
+                throw new IllegalStateException("no oracle entry for principal oracle asset "
+                        + datum.principalOracleAsset().toUnit() + " pricing " + datum.principalAsset().toUnit());
             }
         }
 

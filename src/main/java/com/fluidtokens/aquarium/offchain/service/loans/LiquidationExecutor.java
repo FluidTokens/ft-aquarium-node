@@ -1205,16 +1205,19 @@ public class LiquidationExecutor {
                         loanUtxoRef, e.getMessage());
                 return;
             } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
-                // A convert shape the seam cannot yet model (non-ada principal / non-positive equity):
+                // A convert shape the seam cannot yet model (a negative equity; a missing principal oracle
+                // is NOT one since FAB-117 -- it is quarantined below, as convert needs that oracle too):
                 // a clean statement about this candidate, reproducible next cycle. Not quarantined, and
                 // no transaction was built — exactly the plain path's RefusedException treatment.
                 //
                 // Task 3: this used to record REFUSED and log NOTHING. The router's own message is
-                // generic ("… for non-ada principal" / "… for non-positive equity") and does not say
-                // WHICH asset, so the line below names the principal unit; the message itself is what
-                // lets a reader tell the two triggers apart.
+                // generic ("… for a negative equity") and does not say WHICH asset, so the line below
+                // names the principal unit. Triggers today: the router's negative equity, and the
+                // builder's oracle-feed refusals (window, margin, variant, usability). The router's
+                // non-ada-principal refusal is gone, and missing oracles and ada collateral are
+                // quarantined, not refused here (FAB-117).
                 //
-                // ⛔ AND THE REMEDY IS CONDITIONAL, because only ONE of the two triggers has one.
+                // ⛔ AND THE REMEDY IS CONDITIONAL, because historically only ONE of two triggers had one.
                 // "Set this market to CONVERT" is routable advice for a non-ada principal — the convert
                 // router genuinely supports one (it resolves a collateral/principal pool and prices the
                 // principal leg through its own feed). It is WRONG advice for a negative equity, which

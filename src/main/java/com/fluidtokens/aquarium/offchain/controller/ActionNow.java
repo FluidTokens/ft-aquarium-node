@@ -49,6 +49,19 @@ public record ActionNow(String text, String detail, boolean wouldAct) {
     }
 
     /**
+     * FAB-117: a liquidatable loan with ADA collateral whose bond ASKS FOR CONVERSION. Both routes such a
+     * bond can take refuse it (convert and pay-in-advance each need a collateral oracle, and ada has
+     * none), so whatever the market's action the row must not say ADVANCE or CONVERT.
+     *
+     * <p>⚠ NOT for a plain bond: the PLAIN route does liquidate ada-collateral loans (the claim's oracle
+     * check short-circuits for ada), and a row saying "nothing will happen" there is false.
+     */
+    public static ActionNow adaCollateralNotLiquidated() {
+        return none("NONE", "ada collateral on a convert bond — neither the convert nor the pay-in-advance route "
+                + "builds a liquidation for it, whatever the market's action");
+    }
+
+    /**
      * @param liquidatable  null when health could not be computed — which is NOT "no"
      * @param effectiveMode the market's mode after the node's ceiling is applied
      * @param advance       what an ANTICIPATE would have to front, null when unknown
