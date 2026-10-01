@@ -595,7 +595,8 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * Why an ADA-collateral row has no pool verdict: this node builds no liquidation for one.
+     * Why an ADA-collateral row has no pool verdict: neither the convert nor the pay-in-advance route builds
+     * a liquidation for one. (The PLAIN route does -- this is about the pool, which only convert uses.)
      */
     static final String ADA_COLLATERAL_NOT_LIQUIDATED =
             "ada collateral: neither the convert nor the pay-in-advance route builds a liquidation for it (no "

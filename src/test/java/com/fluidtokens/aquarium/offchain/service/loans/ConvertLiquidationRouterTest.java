@@ -253,8 +253,9 @@ class ConvertLiquidationRouterTest {
     }
 
     /**
-     * FAB-117: ada collateral is refused BY NAME. No liquidation path builds one (its datum names the NONE
-     * sentinel, and redeemerEquity needs a collateral feed), and it used to die as a NullPointerException
+     * FAB-117: ada collateral is refused BY NAME. The convert route builds none (its datum names the NONE
+     * sentinel, and redeemerEquity needs a collateral feed) -- only the PLAIN route liquidates ada collateral --
+     * and it used to die as a NullPointerException
      * there -- quarantined, but saying nothing. Same quarantine now, with the reason the readiness page shows.
      */
     @Test

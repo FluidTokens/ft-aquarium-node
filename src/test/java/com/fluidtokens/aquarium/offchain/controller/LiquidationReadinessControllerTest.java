@@ -972,8 +972,10 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
-     * The CALL SITE, through readiness(): a liquidatable ada/ada loan in LIVE mode. On a PLAIN bond the row
-     * keeps the action the bot will take (the plain route liquidates it); on a CONVERT bond it says NONE.
+     * The CALL SITE, through readiness(): a liquidatable ada/ada loan in LIVE mode. On a PLAIN bond the row is
+     * not given the ada-collateral override (the plain route liquidates it); on a CONVERT bond it says NONE.
+     * ⚠ What a plain-bond row IS told is the market's convert/advance answer, which does not model the plain
+     * route at all -- a defect older than this override, tracked on its own ticket and deliberately not pinned here.
      * (FAB-117 round-1 audit: the override had been applied whatever the route, telling an operator
      * "nothing will happen" for a loan the bot submits -- and nothing pinned the call site.)
      */
@@ -990,12 +992,36 @@ class LiquidationReadinessControllerTest {
                         AssetType.ada()));
         assertEquals("NONE", convert.actionNow().text(), convert.actionNow().toString());
         assertFalse(convert.actionNow().wouldAct());
+        assertTrue(convert.actionNow().detail().contains("ada collateral"),
+                "the convert row's NONE must be the ada override, not some other non-acting verdict: "
+                        + convert.actionNow());
+    }
+
+    /**
+     * The collateral predicate at the call site, through readiness(): a liquidatable TOKEN-collateral loan on a
+     * CONVERT bond must never be told "ada collateral". (Round-2 audit: both render rows above are ada, so the
+     * call site's {@code isAda()} could be replaced by {@code true} and survive.)
+     */
+    @Test
+    void aTokenCollateralConvertRowIsNeverToldItIsAda() {
+        AssetType token = new AssetType("ab".repeat(28), "544f4b");
+        LiquidationReadinessController.Row row = renderLiquidatableRow(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        AssetType.ada()),
+                LoanFixtures.tokenCollateral(token, token));
+        assertFalse(row.actionNow().detail().contains("ada collateral"), row.actionNow().toString());
     }
 
     private static LiquidationReadinessController.Row renderLiquidatableAdaRow(
             com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatum) {
+        return renderLiquidatableRow(bondDatum, LoanFixtures.adaCollateral());
+    }
+
+    private static LiquidationReadinessController.Row renderLiquidatableRow(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatum,
+            com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral) {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
-                LoanFixtures.adaCollateral(), 0L, LoanFixtures.liquidation(),
+                collateral, 0L, LoanFixtures.liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
         Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
                 BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);

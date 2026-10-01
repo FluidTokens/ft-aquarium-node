@@ -51,8 +51,7 @@ import java.util.Map;
 public class PayInAdvanceLiquidationRouter {
 
     /**
-     * A convert loan the promoted pay-in-advance builder cannot yet model — a non-ada principal, or a
-     * non-positive equity. Deliberately declared <em>here</em>, not as a
+     * A convert loan the promoted pay-in-advance builder cannot model — a negative equity. Deliberately declared <em>here</em>, not as a
      * {@link LiquidateTransactionBuilder.Refusal} constant: this is the routing seam's own clean
      * refusal, it never reaches the plain builder, and {@link LiquidationExecutor} turns it into a
      * {@code REFUSED} row whose reason is this exception's message.

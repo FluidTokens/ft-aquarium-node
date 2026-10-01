@@ -2395,8 +2395,9 @@ class LiquidationExecutorTest {
         // ⛔ AND THE REMEDY MUST BE ABSENT HERE. The principal IS ada, so "set this market to CONVERT"
         // is not merely unhelpful — `action` is a MARKET-level setting keyed by principal asset, so an
         // operator taking that advice re-routes EVERY loan in the market away from pay-in-advance on
-        // the strength of one loan's equity sign. This assertion is the whole point of the pair: the
-        // sibling test below proves the remedy DOES appear when it is the right advice.
+        // the strength of one loan's equity sign. (The sibling that proved the remedy DOES appear rode the
+        // principal-oracle trigger, which FAB-117 moved to quarantine; negative equity is now the only
+        // NotModelled trigger, so the remedy's surviving non-ada case is tracked as a follow-up.)
         assertFalse(message.contains("action to CONVERT"),
                 "a non-positive-equity refusal must NOT advise a market-wide routing change — the "
                         + "equity sign says nothing about the mechanism: " + message);
