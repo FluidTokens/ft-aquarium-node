@@ -1844,24 +1844,27 @@ public class LiquidationExecutor {
         }
         long marginMillis = configuration.getOracleWindowMarginSeconds() * 1000L;
         LoanDatum datum = assessment.loan().datum();
-        String principal = shortfall(datum.principalAsset().isAda(), datum.principalOracleAsset(),
+        String principal = shortfall(datum.principalAsset(), datum.principalOracleAsset(),
                 "principal", submitTime, marginMillis, oraclesByUnit);
         if (principal != null) {
             return principal;
         }
-        return shortfall(datum.collateral().isAda(), datum.collateral().oracleTokenAsset(),
+        return shortfall(datum.collateral().assetType(), datum.collateral().oracleTokenAsset(),
                 "collateral", submitTime, marginMillis, oraclesByUnit);
     }
 
-    private static String shortfall(boolean isAda, AssetType oracleToken, String which, long submitTime,
-                                    long marginMillis, Map<String, OracleEntry> oraclesByUnit) {
-        if (isAda) {
+    static String shortfall(AssetType asset, AssetType oracleToken, String which, long submitTime,
+                            long marginMillis, Map<String, OracleEntry> oraclesByUnit) {
+        if (asset.isAda()) {
             return null;
         }
-        OracleEntry entry = oraclesByUnit == null ? null : oraclesByUnit.get(oracleToken.toUnit());
+        // The named oracle, only if it prices this leg's token: another token's window says nothing
+        // about this leg's (oracle re-slice, cross-provider round 2 finding 1).
+        OracleEntry entry = OracleEntry.namedForLeg(oraclesByUnit, asset, oracleToken);
         if (entry == null) {
             // Unreachable through a successful build — the builder refuses ORACLE_ENTRY_MISSING for
-            // a non-ada leg with no entry in this very map, so by here it is present. Kept because
+            // a non-ada leg with no entry in this very map, or one pricing another token, so by here
+            // it is present. Kept because
             // the alternative on the submit path is a NullPointerException, and the rule for this
             // chain is that not being able to check is failing the check.
             return "the %s leg has no oracle entry to re-check".formatted(which);
@@ -2116,8 +2119,8 @@ public class LiquidationExecutor {
         return new Address(address).getPaymentCredentialHash().map(HexUtil::encodeHexString).orElse(null);
     }
 
-    private static OraclePriceFeed collateralFeed(LiquidationAssessment assessment,
-                                                  Map<String, OracleEntry> oraclesByUnit) {
+    static OraclePriceFeed collateralFeed(LiquidationAssessment assessment,
+                                          Map<String, OracleEntry> oraclesByUnit) {
         var collateral = assessment.loan().datum().collateral();
         if (collateral.isAda()) {
             return OraclePriceFeed.unit();
