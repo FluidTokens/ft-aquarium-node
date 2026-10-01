@@ -2471,7 +2471,9 @@ public class LiquidationExecutor {
      * NFT's unit, which is what a loan datum points at and what {@code retrieve_oracle_data} matches
      * a reference input against — not by the priced asset.
      */
-    private Map<String, OracleEntry> oracleSnapshot() {
+    // Package-private for FluidOracleTwoVersionsTest: the snapshot is what every builder consumes, so it
+    // is what a regression test must read — not a map the test assembles for itself.
+    Map<String, OracleEntry> oracleSnapshot() {
         FluidOracleClient client = oracleClient.getIfAvailable();
         if (client == null) {
             return Map.of();

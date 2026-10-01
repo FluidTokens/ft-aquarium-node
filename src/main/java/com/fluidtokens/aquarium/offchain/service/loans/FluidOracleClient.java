@@ -123,9 +123,21 @@ public class FluidOracleClient {
                 : Optional.ofNullable(byOracleToken.get().get(oracleToken));
     }
 
-    /** Every oracle currently known, for reporting and for tests. */
+    /**
+     * Every oracle currently known — <b>every registry entry</b>, one per oracle NFT.
+     *
+     * <p>⛔ FAB-110. This returned {@code byToken.values()} until 2026-10-01, which is ONE entry per
+     * priced token: harmless while the registry listed one oracle per token, and wrong since
+     * FluidTokens split them on 2026-09-30 (v1 for Lending v3, v2 for Lending v4, same asset names,
+     * both permanent). {@code byToken} keeps the last of two, so every v1 oracle vanished from here —
+     * and {@code LiquidationExecutor.oracleSnapshot()}, the NFT-keyed map every liquidation builder
+     * resolves a loan's oracle from, is built from THIS method. Every live v4 loan names a v1 oracle,
+     * so every one of them refused {@code ORACLE_ENTRY_MISSING} at build.
+     *
+     * <p>Keyed by oracle NFT, so two versions of one token are two entries, which is the truth.
+     */
     public Collection<OracleEntry> entries() {
-        return byToken.get().values();
+        return byOracleToken.get().values();
     }
 
     public Instant lastRefresh() {
