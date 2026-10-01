@@ -201,7 +201,15 @@ node. If the config policy ids or the reference-script coordinates do not match 
 it **closes the lending gate**: every Lending v4 transaction (liquidation in every mode, convert,
 compound) is refused for the life of the process, while scheduled payments keep running.
 
-⚠ **So a clean `/healthcheck` does NOT mean the lending check passed.** Before re-arming, confirm it:
+⚠ **A healthy `/healthcheck` does not mean lending may build** — the gate is reported, not part of the
+verdict, because the scheduled payments it guards keep running. Read the gate before re-arming:
+
+```bash
+curl -s http://localhost:8080/healthcheck | jq '{lending_gate, lending_gate_reason}'
+# Prometheus: aquarium_lending_gate_closed  (1 = closed, 0 = open) — worth an alert
+```
+
+The startup log says the same, with every mismatched field:
 
 ```bash
 docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified"

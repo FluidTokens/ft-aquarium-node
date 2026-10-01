@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -217,5 +218,23 @@ class LendingConfigGateTest {
                         "ConfigDatum[11]: derived aa, chain " + "ab".repeat(28),
                         "ConfigDatum[13]: derived bb, chain " + "cd".repeat(28)))
                 .contains("redeployed"));
+    }
+
+    /**
+     * ⛔ FAB-116: closing the gate without a reason still CLOSES it. "Closed" used to mean "a reason is
+     * present", so block(null) was a silent no-op that left the gate open -- fail-open on the one path
+     * that must fail closed.
+     */
+    @Test
+    void blockingWithNoReasonStillClosesTheGate() {
+        LendingConfigGate gate = new LendingConfigGate();
+        gate.block(null);
+        assertTrue(gate.isBlocked(), "block(null) must close the gate");
+        assertEquals(LendingConfigGate.NO_REASON_GIVEN, gate.blockedReason().orElseThrow());
+
+        LendingConfigGate blank = new LendingConfigGate();
+        blank.block("  ");
+        assertTrue(blank.isBlocked());
+        assertEquals(LendingConfigGate.NO_REASON_GIVEN, blank.blockedReason().orElseThrow());
     }
 }
