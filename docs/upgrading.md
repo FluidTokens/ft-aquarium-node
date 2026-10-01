@@ -207,6 +207,8 @@ verdict, because the scheduled payments it guards keep running. Read the gate be
 ```bash
 curl -s http://localhost:8080/healthcheck | jq '{lending_gate, lending_gate_reason}'
 # Prometheus: aquarium_lending_gate_closed  (1 = closed, 0 = open) — worth an alert
+# ⚠ While the node is still syncing, /healthcheck answers the plain text "...syncing..." and the jq
+#   line fails — read the gauge, or wait for the sync to finish.
 ```
 
 The startup log says the same, with every mismatched field:

@@ -276,5 +276,21 @@ class ConvertLiquidationRouterTest {
                         requirement -> Optional.empty(), collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertTrue(e.getMessage().startsWith("ada collateral:"), e.getMessage());
+
+        // ⛔ And BEFORE the no-pool branches: with no pool address configured it must still be the ada
+        // refusal, never "set this market to action: ANTICIPATE" (pay-in-advance refuses ada too).
+        AppConfig.LoansConfiguration noPool = new AppConfig.LoansConfiguration() {
+            @Override
+            public String getMinswapPoolAddress() {
+                return "";
+            }
+        };
+        ConvertLiquidationRouter unconfigured = new ConvertLiquidationRouter(LoanFixtures.registry(), noPool, null,
+                new FixedPoolResolver(), null, null, LoanFixtures.converters(), LoanFixtures.NETWORK);
+        var first = assertThrows(IllegalStateException.class,
+                () -> unconfigured.buildConvertLiquidation(adaCollateral, loanUtxo(), null, null, null,
+                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+        assertTrue(first.getMessage().startsWith("ada collateral:"), first.getMessage());
     }
 }

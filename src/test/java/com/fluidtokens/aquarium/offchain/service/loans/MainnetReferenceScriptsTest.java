@@ -386,8 +386,12 @@ class MainnetReferenceScriptsTest {
         LoansContractRegistry registry = mainnetRegistry();
         // The builder's own list, pinned to a built transaction in CompoundDryEvalTest -- never a copy here.
         Map<String, String> credentials = new LinkedHashMap<>();
-        for (String hash : CompoundTransactionBuilder.withdrawCredentials(registry)) {
-            credentials.put(hash, hash);
+        List<String> names = List.of("asset-manager", "lender-manager", "lm-compound-action", "pool",
+                "pool-compound-action", "pool-manager", "pm-compound-liquidity");
+        List<String> hashes = CompoundTransactionBuilder.withdrawCredentials(registry);
+        assertEquals(names.size(), hashes.size(), "a compound withdrawal was added or removed: name it here");
+        for (int i = 0; i < hashes.size(); i++) {
+            credentials.put(names.get(i), hashes.get(i));
         }
         List<String> unregistered = unregistered(credentials);
         assertTrue(unregistered.isEmpty(), "compound withdraw credentials with no registered reward account -- "

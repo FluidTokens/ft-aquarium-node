@@ -1205,7 +1205,8 @@ public class LiquidationExecutor {
                         loanUtxoRef, e.getMessage());
                 return;
             } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
-                // A convert shape the seam cannot yet model (non-ada principal / non-positive equity):
+                // A convert shape the seam cannot yet model (non-positive equity; a missing principal oracle
+                // is NOT one since FAB-117 -- it is quarantined below, as convert needs that oracle too):
                 // a clean statement about this candidate, reproducible next cycle. Not quarantined, and
                 // no transaction was built — exactly the plain path's RefusedException treatment.
                 //

@@ -552,7 +552,7 @@ public class LiquidationReadinessController {
                 advance, principalBalance, wallet.known());
 
         ActionNow actionNow = gatedAction(lendingConfigGate, honestAction(health.liquidatable(),
-                datum.collateral().isAda(),
+                datum.collateral().isAda(), bond != null && bond.datum().shouldLiquidationConvertToPrincipal(),
                 ActionNow.of(health.liquidatable(),
                         gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                         gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance)));
@@ -583,20 +583,23 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * FAB-117: a liquidatable ADA-collateral loan gets {@link ActionNow#adaCollateralNotLiquidated()}
-     * whatever the market's action -- {@code computed} would say ADVANCE (an unknown advance skips the cap
-     * check) or CONVERT, and no path builds one. Every other row keeps {@code computed}.
+     * FAB-117: a liquidatable ADA-collateral loan whose bond asks for CONVERSION gets
+     * {@link ActionNow#adaCollateralNotLiquidated()} whatever the market's action -- {@code computed} would
+     * say ADVANCE (an unknown advance skips the cap check) or CONVERT, and both of those routes refuse it.
+     * A PLAIN bond keeps {@code computed}: the plain route does liquidate ada collateral.
      */
-    static ActionNow honestAction(Boolean liquidatable, boolean adaCollateral, ActionNow computed) {
-        return Boolean.TRUE.equals(liquidatable) && adaCollateral ? ActionNow.adaCollateralNotLiquidated() : computed;
+    static ActionNow honestAction(Boolean liquidatable, boolean adaCollateral, boolean convertBond,
+                                  ActionNow computed) {
+        return Boolean.TRUE.equals(liquidatable) && adaCollateral && convertBond
+                ? ActionNow.adaCollateralNotLiquidated() : computed;
     }
 
     /**
      * Why an ADA-collateral row has no pool verdict: this node builds no liquidation for one.
      */
     static final String ADA_COLLATERAL_NOT_LIQUIDATED =
-            "ada collateral: this node builds no liquidation for it (no collateral oracle leg), so no "
-                    + "pool verdict is given";
+            "ada collateral: neither the convert nor the pay-in-advance route builds a liquidation for it (no "
+                    + "collateral oracle leg), so no pool verdict is given";
 
     /**
      * ⛔ Whether the fetched pool could fill THIS loan.

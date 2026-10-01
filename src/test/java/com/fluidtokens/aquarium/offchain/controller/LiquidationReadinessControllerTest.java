@@ -952,20 +952,91 @@ class LiquidationReadinessControllerTest {
         assertEquals(PoolUsability.Verdict.USABLE, usability.verdict(), usability.detail());
     }
 
-    /** FAB-117: a liquidatable ADA-collateral row never claims an action; every other row keeps its own. */
+    /** FAB-117: a liquidatable ADA-collateral row on a CONVERT bond never claims an action. */
     @Test
-    void aLiquidatableAdaCollateralRowNeverClaimsAnAction() {
+    void aLiquidatableAdaCollateralRowOnAConvertBondNeverClaimsAnAction() {
         ActionNow advance = new ActionNow("ADVANCE", "would liquidate on the next scan", true);
-        ActionNow honest = LiquidationReadinessController.honestAction(true, true, advance);
+        ActionNow honest = LiquidationReadinessController.honestAction(true, true, true, advance);
         assertEquals("NONE", honest.text());
-        assertFalse(honest.wouldAct(), "no path builds an ada-collateral liquidation");
+        assertFalse(honest.wouldAct(), "neither the convert nor the pay-in-advance route builds it");
         assertTrue(honest.detail().contains("ada collateral"), honest.detail());
 
-        assertSame(advance, LiquidationReadinessController.honestAction(true, false, advance),
+        assertSame(advance, LiquidationReadinessController.honestAction(true, true, false, advance),
+                "⛔ a PLAIN bond keeps its computed action: the plain route DOES liquidate ada collateral");
+        assertSame(advance, LiquidationReadinessController.honestAction(true, false, true, advance),
                 "a token collateral keeps its computed action");
-        assertSame(advance, LiquidationReadinessController.honestAction(false, true, advance),
-                "a healthy ada-collateral row keeps its computed (non-acting) answer");
-        assertSame(advance, LiquidationReadinessController.honestAction(null, true, advance),
+        assertSame(advance, LiquidationReadinessController.honestAction(false, true, true, advance),
+                "a healthy row keeps its computed (non-acting) answer");
+        assertSame(advance, LiquidationReadinessController.honestAction(null, true, true, advance),
                 "unknown health keeps its computed answer");
+    }
+
+    /**
+     * The CALL SITE, through readiness(): a liquidatable ada/ada loan in LIVE mode. On a PLAIN bond the row
+     * keeps the action the bot will take (the plain route liquidates it); on a CONVERT bond it says NONE.
+     * (FAB-117 round-1 audit: the override had been applied whatever the route, telling an operator
+     * "nothing will happen" for a loan the bot submits -- and nothing pinned the call site.)
+     */
+    @Test
+    void theAdaCollateralOverrideFollowsTheBondsRouteOnTheRenderedPage() {
+        LiquidationReadinessController.Row plain = renderLiquidatableAdaRow(
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()));
+        assertEquals("PLAIN LIQUIDATE", plain.route(), plain.routeDetail());
+        assertFalse(plain.actionNow().detail().contains("ada collateral"),
+                "a plain-bond ada row must keep the route's own answer: " + plain.actionNow());
+
+        LiquidationReadinessController.Row convert = renderLiquidatableAdaRow(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        AssetType.ada()));
+        assertEquals("NONE", convert.actionNow().text(), convert.actionNow().toString());
+        assertFalse(convert.actionNow().wouldAct());
+    }
+
+    private static LiquidationReadinessController.Row renderLiquidatableAdaRow(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatum) {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.adaCollateral(), 0L, LoanFixtures.liquidation(),
+                new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "", bondDatum);
+        long now = System.currentTimeMillis();
+        var assessment = LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(), OraclePriceFeed.unit(), now);
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(loan), 1, 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(List.of(assessment), census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null) {
+            @Override
+            public com.fluidtokens.aquarium.offchain.model.loans.LoanHealth health(Loan l, long at) {
+                return new com.fluidtokens.aquarium.offchain.model.loans.LoanHealth(
+                        BigInteger.valueOf(100_000_000L), true, null, BigInteger.ZERO, true, null);
+            }
+        };
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(new FakeOracleClient()), provide(null), provide(null), provide(LoanFixtures.registry()),
+                provide(null), new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.LIVE,
+                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+        controller.setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        return rows.getFirst();
     }
 }

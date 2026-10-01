@@ -22,13 +22,13 @@ import java.util.stream.Stream;
 @RequiredArgsConstructor
 public class Healthcheck {
 
-    @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     /**
      * @param lendingGate       {@code "open"} or {@code "closed"} -- whether Lending v4 transactions may be
      *                          built. ⚠ Reported, never part of the health verdict: a closed gate refuses
      *                          lending only, and the scheduled-payment half this check guards keeps running.
      * @param lendingGateReason why it is closed (the startup verifier's reason), null while open
      */
+    @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record HealthCheck(Boolean dbOk,
                               Boolean parametersOk,
                               Boolean parametersRefInputOk,

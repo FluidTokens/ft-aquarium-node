@@ -1,5 +1,7 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptPublisher.BuiltTransaction;
@@ -116,8 +118,9 @@ public class ReferenceScriptPublishRunnerTest {
 
         // ⚠ The artefact PREVIEW runs (not redeployed on 2026-10-01): publishing the current artefact's
         // claim / lm-liquidate here would lock test-ada behind scripts no preview ConfigDatum names.
+        LoansContractRegistry registry = LoanFixtures.registryBefore20261001();
         ReferenceScriptPublisher publisher = new ReferenceScriptPublisher(
-                LoanFixtures.registryBefore20261001(), LoanFixtures.utxoSupplier(synthetic),
+                registry, LoanFixtures.utxoSupplier(synthetic),
                 LoanFixtures.protocolParams());
 
         List<BuiltTransaction> built =
@@ -126,7 +129,7 @@ public class ReferenceScriptPublishRunnerTest {
         // ⛔ The claim it would publish is the one PREVIEW's ConfigDatum[11] names (c6e0c439…), not the
         // shipped 2026-10-01 claim -- a reference script nothing on preview would ever use.
         assertEquals("c6e0c4395cf22e08f918ca996d7db49faba793dbd6b647160168ff39",
-                LoanFixtures.registryBefore20261001().getLoanClaimActionScriptHash(),
+                registry.getLoanClaimActionScriptHash(),
                 "the publisher must derive preview's own claim action");
 
         log.info("destination address (unspendable always-fails script, preview): {}", destination);

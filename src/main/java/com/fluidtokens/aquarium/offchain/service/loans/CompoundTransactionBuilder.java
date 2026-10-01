@@ -154,7 +154,6 @@ public class CompoundTransactionBuilder {
     private final BackendService backendService;
     private final TransactionEvaluator scriptCostEvaluator;
 
-    /** Offline: rigs supply every script and evaluate for themselves. */
     /**
      * The script credentials a compound transaction withdraws through, in the order {@code build} adds
      * them. Each needs a REGISTERED reward account or the transaction fails at submit
@@ -168,6 +167,7 @@ public class CompoundTransactionBuilder {
                 registry.getPmCompoundLiquidityScriptHash());
     }
 
+    /** Offline: rigs supply every script and evaluate for themselves. */
     public CompoundTransactionBuilder(LoansContractRegistry registry, Network network,
                                       UtxoSupplier utxoSupplier,
                                       ProtocolParamsSupplier protocolParamsSupplier,

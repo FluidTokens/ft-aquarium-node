@@ -2438,38 +2438,14 @@ class LiquidationExecutorTest {
                         + appender.list);
     }
 
-    /**
-     * A convert-flagged loan whose PRINCIPAL is a token, with equity forced strictly positive so the
-     * router's equity precondition clears and the NEXT gate — WALL 3's missing-principal-oracle
-     * refusal — is what actually fires (no oracle entry is wired for {@code COLLATERAL_TOKEN} as a
-     * PRINCIPAL in this fixture's {@code oraclesByUnit}, only, where applicable, as a collateral).
-     */
-    private static Scenario tokenPrincipalConvertScenario() {
-        LoanDatum datum = LoanFixtures.loanDatum(COLLATERAL_TOKEN, BigInteger.valueOf(100_000_000),
-                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
-                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
-
-        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum,
-                COLLATERAL_LOVELACE, List.of());
-        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
-                LoanFixtures.convertToPrincipalBondDatum(FAT_FEE_PER_MILLE,
-                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), COLLATERAL_TOKEN),
-                2_000_000L);
-
-        LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(),
-                OraclePriceFeed.unit(), OraclePriceFeed.unit(), VALID_FROM);
-        LiquidationAssessment positiveEquity = LoanFixtures.withNumbers(assessment,
-                assessment.remainingDebt(), BigInteger.ONE, assessment.liquidationFee());
-        return new Scenario(loan, bond, positiveEquity);
-    }
 
     /**
-     * (c) A convert assessment that clears the router's preconditions (ada principal, positive equity)
-     * but whose {@code builder.build} then throws a <em>genuine</em> exception — the machinery failing,
-     * not a verdict on the loan — is mapped to the QUARANTINE path, exactly like the plain path's
-     * machinery-failure branch. Here the positive-equity loan has ADA collateral, which the router refuses
-     * by name ({@code IllegalStateException}, FAB-117 -- before, it died as a {@code NullPointerException}
-     * dereferencing a null collateral oracle); in production the same branch would catch a Blockfrost timeout.
+     * (c) A pay-in-advance assessment the router refuses as a MACHINERY failure is mapped to the QUARANTINE
+     * path, exactly like the plain path's machinery-failure branch. Here the positive-equity loan has ADA
+     * collateral, which the router refuses by name ({@code IllegalStateException}, FAB-117 -- before, it died
+     * as a message-less {@code NullPointerException} dereferencing a null collateral oracle). A failure
+     * thrown by the BUILDER itself is pinned by {@code aConvertBuildFailureSurfacesTheRootCauseBehindTheProductionWrapper},
+     * and the message-less cause chain by {@code causeChainIsNeverNullForAMessagelessException}.
      */
     @Test
     void aConvertAssessmentWhoseBuildThrowsIsQuarantined() {
@@ -2494,8 +2470,8 @@ class LiquidationExecutorTest {
         // message-less NPE, leaving the operator debugging blind — the exact defect Giovanni hit. The
         // detail now carries the cause chain, so it is non-null and names the fault even with no message.
         // FAB-117: the ada-collateral loan used to die as a message-less NullPointerException here; it is
-        // now refused BY NAME, with the same quarantine. The message-less case stays defended by the
-        // wrapped-cause tests below.
+        // now refused BY NAME, with the same quarantine. The message-less case is defended by
+        // causeChainIsNeverNullForAMessagelessException.
         assertEquals("IllegalStateException", decision.reason(),
                 "the refusal names the root-cause class");
         assertNotNull(decision.detail(),

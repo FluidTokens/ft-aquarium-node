@@ -38,12 +38,13 @@ import java.util.Map;
  * outright) and the common liquidation, not an edge case. It still throws
  * {@code IllegalStateException} on a genuinely negative equity, which
  * {@code LoanFinance.redeemerEquity}'s own floor makes unreachable — defence in depth, never the
- * expected path. A convert loan outside what the seam can model (a non-ada principal with no
- * matching oracle entry) is not an error to quarantine — it is a candidate this seam cannot yet
- * model — so that precondition is checked <em>before</em> the builder is ever called and signalled
- * with {@link PayInAdvanceNotModelledException}, which the executor maps to a {@code REFUSED}
- * decision. The builder is never handed a shape it would throw on, and no {@link Transaction} is
- * produced for one.
+ * expected path. Since FAB-117 the oracle preconditions -- ada collateral (no collateral oracle leg),
+ * or a leg whose own oracle (the NFT its datum names, pricing its token) is missing -- are checked
+ * <em>before</em> the builder is called and refused with {@code IllegalStateException}, which the
+ * executor QUARANTINES with no CONVERT advice: the convert route needs the same oracle, so advising it
+ * would re-route a whole market for nothing. {@link PayInAdvanceNotModelledException} stays for
+ * triggers this seam genuinely does not model. The builder is never handed a shape it would throw on,
+ * and no {@link Transaction} is produced for one.
  */
 @Service
 @Slf4j
@@ -163,7 +164,7 @@ public class PayInAdvanceLiquidationRouter {
         OracleEntry collateralOracle = OracleEntry.namedForLeg(oraclesByUnit,
                 datum.collateral().assetType(), datum.collateral().oracleTokenAsset());
         // A token collateral is refused by name, never an NPE in numbers(), which prices it through this
-        // entry. (Ada collateral keeps its existing path: no registry entry exists for it.)
+        // entry. Ada collateral is refused first, below: it has no oracle leg at all.
         // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException: the executor answers that one
         // with "set this market's action to CONVERT", and convert refuses this loan for the same reason
         // (ConvertLiquidationRouter throws the same) — the advice would re-route a whole market for

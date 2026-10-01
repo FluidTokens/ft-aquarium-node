@@ -237,4 +237,14 @@ class LendingConfigGateTest {
         assertTrue(blank.isBlocked());
         assertEquals(LendingConfigGate.NO_REASON_GIVEN, blank.blockedReason().orElseThrow());
     }
+
+    /** The FIRST reason wins: it is the one the startup log explains, and a later block must not overwrite it. */
+    @Test
+    void theFirstReasonWins() {
+        LendingConfigGate gate = new LendingConfigGate();
+        gate.block("first: ConfigDatum[11]");
+        gate.block("second: reference scripts");
+        gate.block(null);
+        assertEquals("first: ConfigDatum[11]", gate.blockedReason().orElseThrow());
+    }
 }
