@@ -171,10 +171,11 @@ public class PayInAdvanceLiquidationRouter {
                 datum.collateral().assetType(), datum.collateral().oracleTokenAsset());
         // A token collateral is refused by name, never an NPE in numbers(), which prices it through this
         // entry. Ada collateral is refused first, below: it has no oracle leg at all.
-        // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException: the executor answers that one
-        // with "set this market's action to CONVERT", and convert refuses this loan for the same reason
-        // (ConvertLiquidationRouter throws the same) — the advice would re-route a whole market for
-        // nothing. Quarantined like the convert router's refusal and like the NPE it replaces.
+        // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException: the executor used to answer
+        // that one with "set this market's action to CONVERT" (removed, FAB-126), and convert refuses
+        // this loan for the same reason (ConvertLiquidationRouter throws the same) — the advice would
+        // re-route a whole market for nothing. Quarantined like the convert router's refusal and like
+        // the NPE it replaces.
         // ⛔ Ada collateral is refused by name too (FAB-117): numbers() prices the collateral through this
         // entry and ada has none, so it used to die as an NPE there. Same quarantine, now saying why.
         if (datum.collateral().isAda()) {
@@ -197,10 +198,11 @@ public class PayInAdvanceLiquidationRouter {
             principalOracle = OracleEntry.namedForLeg(oraclesByUnit, datum.principalAsset(),
                     datum.principalOracleAsset());
             // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException (FAB-117), exactly as the
-            // collateral leg above: the executor answers a not-modelled refusal of a non-ada principal with
-            // "set this market's action to CONVERT", and the convert router needs this same oracle
-            // (ConvertLiquidationRouter.feedOf throws on it) -- the advice would re-route a whole market
-            // for nothing. Quarantined instead, like the convert router's identical refusal.
+            // collateral leg above: the executor used to answer a not-modelled refusal of a non-ada
+            // principal with "set this market's action to CONVERT" (removed, FAB-126), and the convert
+            // router needs this same oracle (ConvertLiquidationRouter.feedOf throws on it) -- the advice
+            // would re-route a whole market for nothing. Quarantined instead, like the convert router's
+            // identical refusal.
             if (principalOracle == null) {
                 throw new IllegalStateException("no oracle entry for principal oracle asset "
                         + datum.principalOracleAsset().toUnit() + " pricing " + datum.principalAsset().toUnit());

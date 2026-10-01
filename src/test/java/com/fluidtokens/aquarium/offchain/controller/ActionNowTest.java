@@ -138,4 +138,85 @@ class ActionNowTest {
         assertEquals("NONE — disabled", disabled.text());
         assertTrue(disabled.detail().contains("market"), disabled.detail());
     }
+
+    @Test
+    void aPlainRouteIgnoresEveryConvertAndAdvanceGate() {
+        ActionNow plain = ActionNow.forRoute(BondRoute.PLAIN, true, Mode.LIVE, Action.CONVERT,
+                market(null, BigInteger.valueOf(100L)), false, false, BigInteger.valueOf(500L));
+
+        assertEquals("LIQUIDATE", plain.text());
+        assertTrue(plain.wouldAct());
+    }
+
+    @Test
+    void aPlainRouteInShadowBuildsButDoesNotSubmit() {
+        ActionNow plain = ActionNow.forRoute(BondRoute.PLAIN, true, Mode.SHADOW, Action.ANTICIPATE,
+                market(null, BigInteger.ONE), false, false, BigInteger.TEN);
+
+        assertEquals("WOULD LIQUIDATE", plain.text());
+        assertFalse(plain.wouldAct());
+    }
+
+    @Test
+    void aPlainRouteOnADisabledNodeIsDisabled() {
+        ActionNow plain = ActionNow.forRoute(BondRoute.PLAIN, true, Mode.DISABLED, Action.CONVERT,
+                market(Mode.DISABLED, null), true, true, null);
+
+        assertEquals("NONE — disabled", plain.text());
+    }
+
+    @Test
+    void aMissingBondNeverActsAcrossModesAndMarketActions() {
+        Market capped = market(null, BigInteger.valueOf(1_000L));
+        for (Mode mode : new Mode[] {Mode.LIVE, Mode.SHADOW}) {
+            for (Action action : new Action[] {Action.CONVERT, Action.ANTICIPATE}) {
+                ActionNow missing = ActionNow.forRoute(BondRoute.NO_BOND, true, mode, action,
+                        capped, true, true, null);
+
+                assertFalse(missing.wouldAct(), mode + " / " + action + ": " + missing);
+                assertEquals("NONE — no bond", missing.text());
+                assertEquals(BondRoute.NO_BOND_DETAIL, missing.detail());
+            }
+        }
+    }
+
+    @Test
+    void aNullRouteIsTheSameAsAMissingBond() {
+        ActionNow missing = ActionNow.forRoute(null, true, Mode.LIVE, Action.CONVERT,
+                market(null, BigInteger.TEN), true, true, null);
+
+        assertFalse(missing.wouldAct());
+        assertEquals("NONE — no bond", missing.text());
+        assertEquals(BondRoute.NO_BOND_DETAIL, missing.detail());
+    }
+
+    @Test
+    void aConvertRouteIsExactlyTheExistingConvertAnswer() {
+        Market capped = market(null, BigInteger.valueOf(100L));
+        assertRouteEqualsOf(Mode.LIVE, Action.ANTICIPATE, capped, true, true, BigInteger.valueOf(500L));
+        assertRouteEqualsOf(Mode.LIVE, Action.CONVERT, market(null, null), true, false, null);
+        assertRouteEqualsOf(Mode.LIVE, Action.CONVERT, market(null, null), false, true, null);
+        assertRouteEqualsOf(Mode.LIVE, Action.CONVERT, market(null, null), true, true, null);
+    }
+
+    @Test
+    void healthPrecedesThePlainAndMissingBondRoutes() {
+        for (BondRoute route : new BondRoute[] {BondRoute.PLAIN, BondRoute.NO_BOND}) {
+            ActionNow unknown = ActionNow.forRoute(route, null, Mode.LIVE, Action.CONVERT,
+                    market(null, null), true, true, null);
+            ActionNow healthy = ActionNow.forRoute(route, false, Mode.LIVE, Action.CONVERT,
+                    market(null, null), true, true, null);
+
+            assertEquals("UNKNOWN", unknown.text(), route.toString());
+            assertEquals("NONE", healthy.text(), route.toString());
+        }
+    }
+
+    private static void assertRouteEqualsOf(Mode mode, Action action, Market market,
+                                            boolean convertEnabled, boolean poolUsable,
+                                            BigInteger advance) {
+        assertEquals(ActionNow.of(true, mode, action, market, convertEnabled, poolUsable, advance),
+                ActionNow.forRoute(BondRoute.CONVERT, true, mode, action, market,
+                        convertEnabled, poolUsable, advance));
+    }
 }

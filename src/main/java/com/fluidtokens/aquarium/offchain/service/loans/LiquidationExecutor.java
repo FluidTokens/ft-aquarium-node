@@ -1205,49 +1205,27 @@ public class LiquidationExecutor {
                         loanUtxoRef, e.getMessage());
                 return;
             } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
-                // A convert shape the seam cannot yet model (a negative equity; a missing principal oracle
-                // is NOT one since FAB-117 -- it is quarantined below, as convert needs that oracle too):
-                // a clean statement about this candidate, reproducible next cycle. Not quarantined, and
-                // no transaction was built — exactly the plain path's RefusedException treatment.
+                // All seven construction sites describe a candidate or oracle state this route cannot
+                // build this cycle: PayInAdvanceLiquidationRouter:164 is negative equity (unreachable
+                // through a real assessment because LoanFinance.redeemerEquity floors at zero);
+                // LiquidatePayInAdvanceTransactionBuilder:522 and :528 are the collateral feed window
+                // and margin; :539 and :545 are the principal feed window and margin; :1243-1244 is a
+                // POOLED or PRICE_DATA_ORCFAX variant; and :1264 is an entry not usable this cycle.
                 //
-                // Task 3: this used to record REFUSED and log NOTHING. The router's own message is
-                // generic ("… for a negative equity") and does not say WHICH asset, so the line below
-                // names the principal unit. Triggers today: the router's negative equity, and the
-                // builder's oracle-feed refusals (window, margin, variant, usability). The router's
-                // non-ada-principal refusal is gone, and missing oracles and ada collateral are
-                // quarantined, not refused here (FAB-117).
+                // Setting a market to CONVERT cures none of them. Window and margin are per-cycle feed
+                // timing and clear by themselves. Variant and usability are oracle-entry properties:
+                // OracleEntry.usableForLiquidation() is false for POOLED/ORCFAX (OracleEntry.java:124),
+                // and ConvertTransactionBuilder.build refuses a collateral oracle that is not usable
+                // for liquidation (ConvertTransactionBuilder.java:237). Negative equity says nothing
+                // about the mechanism. Since `action` is market-wide, that advice would re-route every
+                // loan in the market on the strength of a refusal conversion cannot repair.
                 //
-                // ⛔ AND THE REMEDY IS CONDITIONAL, because historically only ONE of two triggers had one.
-                // "Set this market to CONVERT" is routable advice for a non-ada principal — the convert
-                // router genuinely supports one (it resolves a collateral/principal pool and prices the
-                // principal leg through its own feed). It is WRONG advice for a negative equity, which
-                // says nothing about the mechanism and everything about this loan right now.
-                // ⚠ And the cost of the wrong advice is not a wasted cycle: `action` is a MARKET-level
-                // setting keyed by principal asset, so taking it re-routes EVERY loan in that market
-                // away from pay-in-advance. The substitution between these two mechanisms is the one
-                // this file already calls "the one substitution that spends money nobody authorised".
-                // An equity-sign refusal must never be the reason an operator makes it.
-                //
-                // ⛔ REMEDY WORDING (Machine Owner ruling, 2026-09-09) — "routable" is not "profitable".
-                // For the live USDM loan the FLDT/USDM Minswap pool returns ~827M against a 980M
-                // minimum_receive: a convert order there would build, submit, and REFUND — it does not
-                // fill the debt. Until PR3's POOL_TOO_THIN pre-check exists, the remedy must carry that
-                // caveat rather than read as an unconditional fix.
-                // ⚠ On feat/token-principals the router's outright non-ada-principal refusal no longer
-                // exists (6d8427f), and F0 (round 2) means the negative-equity trigger this fires from
-                // is unreachable in practice (LoanFinance.redeemerEquity floors it to zero) — so this
-                // branch is a rare, defence-in-depth line here. `main` still carries the outright
-                // non-ada refusal, and this wording lands there via PR2's merge — so the conditional
-                // shape (and its pair test) stays intact rather than being simplified away.
+                // The 2026-09-09 remedy-wording ruling distinguished routability from profitability;
+                // FAB-126 removes the remedy because no remaining construction site is cured by it.
                 String principalUnit = assessment.loan().datum().principalAsset().toUnit();
-                String remedy = assessment.loan().datum().principalAsset().isAda()
-                        ? ""
-                        : "; this market's principal is not ada — if it should still be liquidated, set "
-                                + "its action to CONVERT — only if a Minswap pool can fill the debt; a "
-                                + "thin pool refunds rather than fills";
                 log.info("the pay-in-advance liquidation of {} (principal {}) was refused: {} — not "
-                                + "quarantined, reconsidered every cycle{}",
-                        loanUtxoRef, principalUnit, e.getMessage(), remedy);
+                                + "quarantined, reconsidered every cycle",
+                        loanUtxoRef, principalUnit, e.getMessage());
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         e.getMessage(), e.getMessage()));
                 return;

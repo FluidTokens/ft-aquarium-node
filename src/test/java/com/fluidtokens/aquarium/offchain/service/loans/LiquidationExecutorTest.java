@@ -2198,6 +2198,20 @@ class LiquidationExecutorTest {
     private static Wiring tokenPrincipalConvertEconomicsWiring(List<Utxo> walletUtxos, List<OracleEntry> registry) {
         AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
         configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_500_000_000L)));
+        return tokenPrincipalConvertEconomicsWiring(walletUtxos, registry, configuration);
+    }
+
+    /** As above, with the node timing configuration made explicit too (FAB-126's builder-window refusal). */
+    private static Wiring tokenPrincipalConvertEconomicsWiring(
+            AppConfig.LiquidationConfiguration configuration) {
+        return tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, TOKEN_WALLET_UTXO),
+                List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
+                        collateralOracle(), principalOracle()), configuration);
+    }
+
+    private static Wiring tokenPrincipalConvertEconomicsWiring(List<Utxo> walletUtxos,
+                                                                 List<OracleEntry> registry,
+                                                                 AppConfig.LiquidationConfiguration configuration) {
 
         // No evaluator is wired (offline, non-evaluating build — the same shape
         // theBuildPricesWithTheOracleSnapshotTheScanWasTakenWith uses), so reference inputs are
@@ -2235,6 +2249,46 @@ class LiquidationExecutorTest {
                 plainBuilder, router, LoanFixtures.registry(), log, metrics(), oracles, previewNetwork(),
                 LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
+    }
+
+    @Test
+    void aBuilderWindowNotModelledRefusalOnATokenPrincipalNeverAdvisesConvert() {
+        var configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 600,
+                SMALL_MARGIN, 200, 30);
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_500_000_000L)));
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(configuration);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertTrue(decision.reason().contains("oracle feed window"), decision.reason());
+        assertNull(decision.txHash(), "a not-modelled refusal must not build a transaction");
+        assertEquals(0, wiring.executor().quarantinedCount(),
+                "a per-cycle feed-window refusal is reconsidered immediately");
+
+        List<String> refusalInfos = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(message -> message.contains("was refused"))
+                .toList();
+        assertEquals(1, refusalInfos.size(), "expected exactly one refusal INFO line: " + appender.list);
+        String message = refusalInfos.getFirst();
+        assertTrue(message.contains(PRINCIPAL_TOKEN_2.toUnit()), message);
+        assertTrue(message.contains(decision.reason()),
+                "the INFO line must carry the exception message verbatim: " + message);
+        assertFalse(appender.list.stream()
+                        .anyMatch(event -> event.getFormattedMessage().contains("action to CONVERT")),
+                "a builder-window refusal must never advise a market-wide routing change: " + appender.list);
     }
 
     /**
@@ -2396,9 +2450,9 @@ class LiquidationExecutorTest {
         // ⛔ AND THE REMEDY MUST BE ABSENT HERE. The principal IS ada, so "set this market to CONVERT"
         // is not merely unhelpful — `action` is a MARKET-level setting keyed by principal asset, so an
         // operator taking that advice re-routes EVERY loan in the market away from pay-in-advance on
-        // the strength of one loan's equity sign. (The sibling that proved the remedy DOES appear rode the
-        // principal-oracle trigger, which FAB-117 moved to quarantine. What the remedy should say for the
-        // triggers that remain -- negative equity and the builder's oracle-feed refusals -- is FAB-126.)
+        // the strength of one loan's equity sign. The builder-window sibling
+        // aBuilderWindowNotModelledRefusalOnATokenPrincipalNeverAdvisesConvert pins the same rule for
+        // the remaining reachable refusal family.)
         assertFalse(message.contains("action to CONVERT"),
                 "a non-positive-equity refusal must NOT advise a market-wide routing change — the "
                         + "equity sign says nothing about the mechanism: " + message);

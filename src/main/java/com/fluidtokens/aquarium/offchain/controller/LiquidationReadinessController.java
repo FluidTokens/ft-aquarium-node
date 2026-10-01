@@ -457,6 +457,7 @@ public class LiquidationReadinessController {
         BigInteger feeValue = null;
         String feeUnknown;
         LenderBond bond = assessment == null ? null : assessment.bond();
+        BondRoute bondRoute = BondRoute.of(bond);
         if (bond == null) {
             feeUnknown = "no lender bond is indexed for this loan, so its fee rate is unknown";
         } else {
@@ -490,13 +491,13 @@ public class LiquidationReadinessController {
         // Defaults for the branches that never reach a pool: the bond settles it before the chain does.
         PoolUsability usability = new PoolUsability(PoolUsability.Verdict.UNKNOWN,
                 "the lender bond decides this loan's route before a pool is consulted");
-        if (bond == null) {
+        if (bondRoute == BondRoute.NO_BOND) {
             route = "UNKNOWN";
             routeDetail = "no lender bond indexed — the bond decides whether conversion is permitted";
             // ⚠ PAY-IN-ADVANCE REQUIRES THE BOND TO ALLOW CONVERSION (PayInAdvanceLiquidationRouter),
             // so on a bond that forbids it the hybrid is not a worse option -- it is not an option.
             // A profit figure against a route that cannot be taken is worse than no figure.
-        } else if (!bond.datum().shouldLiquidationConvertToPrincipal()) {
+        } else if (bondRoute == BondRoute.PLAIN) {
             route = "PLAIN LIQUIDATE";
             routeDetail = "the lender bond forbids conversion, so the bot takes its fee in collateral "
                     + "and fronts nothing";
@@ -509,7 +510,12 @@ public class LiquidationReadinessController {
             PoolFetch fetched = resolvePool(collateralAsset, datum.principalAsset(), poolMemo);
             usability = usabilityFor(fetched, loan, bond, collateralAsset, datum.principalAsset(), now);
 
-            if (action == AppConfig.LiquidationConfiguration.Action.CONVERT && usability.usable()) {
+            if (datum.collateral().isAda()) {
+                route = "NO ROUTE";
+                routeDetail = "ada collateral on a convert bond — neither the convert nor the "
+                        + "pay-in-advance route builds a liquidation for it, and the bond rules out "
+                        + "the plain route";
+            } else if (action == AppConfig.LiquidationConfiguration.Action.CONVERT && usability.usable()) {
                 route = "CONVERT";
                 routeDetail = "a Minswap pool is deep enough to clear this loan's debt, so the bot "
                         + "creates a swap order and fronts no capital";
@@ -546,14 +552,13 @@ public class LiquidationReadinessController {
         BigInteger principalBalance = wallet.of(datum.principalAsset().toUnit());
         ProcessingBlocker blocker = ProcessingBlocker.of(
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
-                gate.marketFor(datum.principalAsset()), convertEnabled,
-                bond != null && bond.datum().shouldLiquidationConvertToPrincipal(),
+                gate.marketFor(datum.principalAsset()), convertEnabled, bondRoute,
                 new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
                 advance, principalBalance, wallet.known());
 
         ActionNow actionNow = gatedAction(lendingConfigGate, honestAction(health.liquidatable(),
-                datum.collateral().isAda(), bond != null && bond.datum().shouldLiquidationConvertToPrincipal(),
-                ActionNow.of(health.liquidatable(),
+                datum.collateral().isAda(), bondRoute == BondRoute.CONVERT,
+                ActionNow.forRoute(bondRoute, health.liquidatable(),
                         gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                         gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance)));
 

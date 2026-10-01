@@ -25,6 +25,7 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfigurati
  *
  * <h2>⛔ "Processable" is not one test — it depends on the route</h2>
  * <ul>
+ *   <li><b>NO BOND</b> means there is no executor candidate to process.</li>
  *   <li><b>ANTICIPATE</b> needs the PRINCIPAL: {@code min(balance, cap) >= advance}. This is
  *       {@code MarketGate.decide}'s arithmetic and is not restated here.</li>
  *   <li><b>CONVERT</b> needs NO principal — the collateral pays the lender. It needs a pool that can
@@ -54,7 +55,7 @@ public record ProcessingBlocker(String label, String detail) {
      * @param balance       the operator's holding of the PRINCIPAL asset, already zero when unknown
      */
     public static ProcessingBlocker of(Mode effectiveMode, Action action, Market market,
-                                       boolean convertEnabled, boolean bondAllowsConversion,
+                                       boolean convertEnabled, BondRoute route,
                                        PoolUsabilityView pool, BigInteger advance,
                                        BigInteger balance, boolean balanceKnown) {
         if (effectiveMode == Mode.DISABLED) {
@@ -63,9 +64,13 @@ public record ProcessingBlocker(String label, String detail) {
                     : "liquidation is disabled on this node");
         }
 
+        if (route != BondRoute.PLAIN && route != BondRoute.CONVERT) {
+            return of("no bond", BondRoute.NO_BOND_DETAIL);
+        }
+
         // ⛔ A bond that forbids conversion is PLAIN LIQUIDATE, which needs no capital and no pool.
         // Nothing can block it that is not already covered above, so it is clean by construction.
-        if (!bondAllowsConversion) {
+        if (route == BondRoute.PLAIN) {
             return NONE;
         }
 

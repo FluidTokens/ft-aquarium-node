@@ -15,9 +15,9 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfigurati
  * disabled node that reading is wrong — which is the whole reason {@link OperationalStatus} exists.
  * This answers the other question, and it is the one an operator actually acts on.
  *
- * <h2>⚠ The three ways a loan looks actionable and is not</h2>
- * Each of these renders a route and a positive margin while the bot does nothing, and each sends an
- * operator somewhere different, so none may stand in for another:
+ * <h2>⚠ The route decides which action question is asked</h2>
+ * A plain bond ignores market routing and asks only whether plain liquidation would run. A missing
+ * bond has no executor candidate. The three failure modes below therefore concern the convert route:
  * <ol>
  *   <li><b>The node mode is a CEILING.</b> A market configured {@code LIVE} on a {@code shadow} node
  *       runs as {@code SHADOW}. Reading the market's own mode here would report a submission that
@@ -69,18 +69,9 @@ public record ActionNow(String text, String detail, boolean wouldAct) {
     public static ActionNow of(Boolean liquidatable, Mode effectiveMode, Action action,
                                Market market, boolean convertEnabled, boolean poolUsable,
                                BigInteger advance) {
-        if (liquidatable == null) {
-            return none("UNKNOWN", "this loan's health could not be computed, so whether the bot "
-                    + "would act on it is not known either — this is not the same as 'no'");
-        }
-        if (!liquidatable) {
-            return none("NONE", "this loan is not liquidatable yet; nothing would be attempted "
-                    + "whatever the bot's configuration says");
-        }
-        if (effectiveMode == Mode.DISABLED) {
-            return none("NONE — disabled", market != null && market.getMode() != null
-                    ? "this market is configured mode: DISABLED"
-                    : "liquidation is disabled on this node");
+        ActionNow head = sharedHead(liquidatable, effectiveMode, market);
+        if (head != null) {
+            return head;
         }
 
         Action effectiveAction = action == null ? Action.CONVERT : action;
@@ -107,5 +98,44 @@ public record ActionNow(String text, String detail, boolean wouldAct) {
                     + "size-checked, and NOT submitted");
         }
         return new ActionNow(verb, "live: this loan would be liquidated on the next scan", true);
+    }
+
+    public static ActionNow forRoute(BondRoute route, Boolean liquidatable, Mode effectiveMode,
+                                     Action action, Market market, boolean convertEnabled,
+                                     boolean poolUsable, BigInteger advance) {
+        if (route == BondRoute.CONVERT) {
+            return of(liquidatable, effectiveMode, action, market, convertEnabled, poolUsable, advance);
+        }
+
+        ActionNow head = sharedHead(liquidatable, effectiveMode, market);
+        if (head != null) {
+            return head;
+        }
+        if (route == BondRoute.PLAIN) {
+            return effectiveMode == Mode.SHADOW
+                    ? none("WOULD LIQUIDATE", "shadow mode: the plain liquidation would be built and "
+                            + "size-checked, and NOT submitted")
+                    : new ActionNow("LIQUIDATE", "live: the bond forbids conversion, so the plain route "
+                            + "takes its fee in collateral and fronts nothing; market action, convert "
+                            + "switch, pool and cap do not apply to this route", true);
+        }
+        return none("NONE — no bond", BondRoute.NO_BOND_DETAIL);
+    }
+
+    private static ActionNow sharedHead(Boolean liquidatable, Mode effectiveMode, Market market) {
+        if (liquidatable == null) {
+            return none("UNKNOWN", "this loan's health could not be computed, so whether the bot "
+                    + "would act on it is not known either — this is not the same as 'no'");
+        }
+        if (!liquidatable) {
+            return none("NONE", "this loan is not liquidatable yet; nothing would be attempted "
+                    + "whatever the bot's configuration says");
+        }
+        if (effectiveMode == Mode.DISABLED) {
+            return none("NONE — disabled", market != null && market.getMode() != null
+                    ? "this market is configured mode: DISABLED"
+                    : "liquidation is disabled on this node");
+        }
+        return null;
     }
 }

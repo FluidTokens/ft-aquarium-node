@@ -975,8 +975,8 @@ class LiquidationReadinessControllerTest {
     /**
      * The CALL SITE, through readiness(): a liquidatable ada/ada loan in LIVE mode. On a PLAIN bond the row is
      * not given the ada-collateral override (the plain route liquidates it); on a CONVERT bond it says NONE.
-     * ⚠ What a plain-bond row IS told is the market's convert/advance answer, which does not model the plain
-     * route at all -- a defect older than this override, tracked on its own ticket and deliberately not pinned here.
+     * The plain-route action answer is pinned by
+     * {@link #aPlainBondOnAnUnlistedMarketLiquidatesWithoutAConvertPool()}.
      * (FAB-117 round-1 audit: the override had been applied whatever the route, telling an operator
      * "nothing will happen" for a loan the bot submits -- and nothing pinned the call site.)
      */
@@ -996,6 +996,92 @@ class LiquidationReadinessControllerTest {
         assertTrue(convert.actionNow().detail().contains("ada collateral"),
                 "the convert row's NONE must be the ada override, not some other non-acting verdict: "
                         + convert.actionNow());
+        assertEquals("NO ROUTE", convert.route(), convert.routeDetail());
+    }
+
+    @Test
+    void aPlainBondOnAnUnlistedMarketLiquidatesWithoutAConvertPool() {
+        LiquidationReadinessController.Row row = renderLiquidatableAdaRow(
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()));
+
+        assertEquals("PLAIN LIQUIDATE", row.route(), row.routeDetail());
+        assertEquals("LIQUIDATE", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertTrue(row.actionNow().detail().contains("plain"), row.actionNow().detail());
+        assertFalse(row.blocker().blocked(), row.blocker().toString());
+    }
+
+    @Test
+    void aPlainBondIgnoresAnAnticipateMarketAndItsCap() {
+        var configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+        configuration.setMarkets(List.of(anticipateMarket("lovelace", 1)));
+
+        LiquidationReadinessController.Row row = renderLiquidatableRow(
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.adaCollateral(), configuration);
+
+        assertEquals("LIQUIDATE", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().wouldAct(), row.actionNow().toString());
+    }
+
+    @Test
+    void aPlainBondInShadowWouldLiquidateWithoutActing() {
+        var configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30);
+
+        LiquidationReadinessController.Row row = renderLiquidatableRow(
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.adaCollateral(), configuration);
+
+        assertEquals("WOULD LIQUIDATE", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+    }
+
+    @Test
+    void aLoanWithNoBondNeverActsOnAnAnticipateMarket() {
+        var configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+        configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
+
+        LiquidationReadinessController.Row row = renderLiquidatableRow(
+                null, LoanFixtures.adaCollateral(), configuration);
+
+        assertEquals("UNKNOWN", row.route(), row.routeDetail());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertEquals("NONE — no bond", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().detail().contains("no lender bond indexed"), row.actionNow().detail());
+        assertFalse(row.actionNow().detail().contains("ada collateral"), row.actionNow().detail());
+        assertTrue(row.blocker().blocked(), row.blocker().toString());
+        assertEquals("no bond", row.blocker().label(), row.blocker().toString());
+    }
+
+    @Test
+    void aLoanWithNoBondNeverActsOnAnUnlistedMarket() {
+        LiquidationReadinessController.Row row = renderLiquidatableRow(
+                null, LoanFixtures.adaCollateral());
+
+        assertEquals("NONE — no bond", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().detail().contains("no lender bond indexed"), row.actionNow().detail());
+    }
+
+    @Test
+    void anAdaCollateralConvertBondHasNoExecutableRoute() {
+        var configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+        configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
+
+        LiquidationReadinessController.Row row = renderLiquidatableRow(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                        LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.adaCollateral(), configuration);
+
+        assertEquals("NONE", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertTrue(row.actionNow().detail().contains("ada collateral"), row.actionNow().detail());
+        assertEquals("NO ROUTE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("ada collateral"), row.routeDetail());
+        assertNull(row.advancePrincipalAmount());
     }
 
     /**
@@ -1021,19 +1107,30 @@ class LiquidationReadinessControllerTest {
     private static LiquidationReadinessController.Row renderLiquidatableRow(
             com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatum,
             com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral) {
+        return renderLiquidatableRow(bondDatum, collateral, new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30));
+    }
+
+    private static LiquidationReadinessController.Row renderLiquidatableRow(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatumOrNull,
+            com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral,
+            AppConfig.LiquidationConfiguration configuration) {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
                 collateral, 0L, LoanFixtures.liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
         Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
                 BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
-        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "", bondDatum);
+        LenderBond bond = bondDatumOrNull == null ? null
+                : new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "", bondDatumOrNull);
         long now = System.currentTimeMillis();
-        var assessment = LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(), OraclePriceFeed.unit(), now);
+        var assessments = bond == null ? List.<com.fluidtokens.aquarium.offchain.model.loans
+                        .LiquidationAssessment>of()
+                : List.of(LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(), OraclePriceFeed.unit(), now));
         var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(loan), 1, 0, 0);
         var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
             @Override
             public Scan scan(long atTimeMillis) {
-                return new Scan(List.of(assessment), census);
+                return new Scan(assessments, census);
             }
         };
         var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
@@ -1057,13 +1154,21 @@ class LiquidationReadinessControllerTest {
         };
         var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
                 provide(new FakeOracleClient()), provide(null), provide(null), provide(LoanFixtures.registry()),
-                provide(null), new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.LIVE,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+                provide(null), configuration, network);
         controller.setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
         var model = new org.springframework.ui.ConcurrentModel();
         controller.readiness(model, null, null, null, null, null);
         @SuppressWarnings("unchecked")
         var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
         return rows.getFirst();
+    }
+
+    private static AppConfig.LiquidationConfiguration.Market anticipateMarket(String unit, long cap) {
+        var market = new AppConfig.LiquidationConfiguration.Market();
+        market.setUnit(unit);
+        market.setMode(AppConfig.LiquidationConfiguration.Mode.LIVE);
+        market.setAction(AppConfig.LiquidationConfiguration.Action.ANTICIPATE);
+        market.setCap(BigInteger.valueOf(cap));
+        return market;
     }
 }
