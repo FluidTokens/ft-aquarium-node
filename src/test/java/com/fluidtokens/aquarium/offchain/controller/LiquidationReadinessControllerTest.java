@@ -1111,10 +1111,112 @@ class LiquidationReadinessControllerTest {
                         LoanFixtures.noStakeCredential(), AssetType.ada()),
                 LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT));
 
-        assertTrue("CAPITAL IN ADVANCE".equals(row.route()) || "CONVERT".equals(row.route()),
-                "the token-collateral route must be executable: " + row.routeDetail());
+        // FAB-126 slice 2: an unlisted market is action: CONVERT, and the executor never fronts capital
+        // there — so the route is CONVERT whatever the pool says, never CAPITAL IN ADVANCE.
+        assertEquals("CONVERT", row.route(), row.routeDetail());
         assertNotEquals("NO ROUTE", row.route(), row.routeDetail());
         assertFalse(row.actionNow().detail().contains("ada collateral"), row.actionNow().toString());
+    }
+
+    /**
+     * FAB-126 slice 2 (L1): a CONVERT market whose pool cannot fill the swap. The executor goes to the
+     * convert router and refuses on the pool — it never falls back to fronting the operator's capital
+     * ({@code LiquidationExecutor}'s action split). The route column must say so, not "CAPITAL IN ADVANCE".
+     */
+    @Test
+    void aConvertMarketWithNoUsablePoolIsLabelledConvertAndNeverClaimsTheBotFrontsCapital() {
+        LiquidationReadinessController.Row row = renderLiquidatableRow(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                        LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT));
+
+        assertFalse(row.poolUsability().usable(), "fixture premise: no usable pool — " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("no usable"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("ANTICIPATE"), row.routeDetail());
+        assertFalse(row.routeDetail().contains("must be fronted"), row.routeDetail());
+    }
+
+    /** FAB-126 slice 2 (L2): the same row on an ANTICIPATE market keeps its capital-in-advance label. */
+    @Test
+    void anAnticipateMarketWithNoUsablePoolStillReadsCapitalInAdvance() {
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
+
+        LiquidationReadinessController.Row row = renderLiquidatableRow(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                        LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), configuration);
+
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("action: ANTICIPATE"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("fronts the principal"), row.routeDetail());
+    }
+
+    /**
+     * FAB-126 slice 2 (E1, X7): an excluded assessment on a loan that is NOT liquidatable keeps the
+     * health verdict. Only a liquidatable row can be misread as "the bot would act", so only it is
+     * rewritten to "NONE — excluded".
+     */
+    @Test
+    void anExcludedRowThatIsNotLiquidatableKeepsItsHealthVerdict() {
+        LiquidationReadinessController.Row row = renderLiquidatable(
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.adaCollateral(), liveConfiguration(),
+                (bond, loan, now) -> LiquidationAssessment.excluded(bond, loan,
+                        LiquidationExclusion.NOT_LIQUIDATABLE, "fixture: healthy"),
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), null, false).row();
+
+        assertEquals("NONE", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+    }
+
+    /** FAB-126 slice 2 (E2): the same, with health that could not be computed — UNKNOWN, not "excluded". */
+    @Test
+    void anExcludedRowWithUnknownHealthStaysUnknown() {
+        LiquidationReadinessController.Row row = renderLiquidatable(
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.adaCollateral(), liveConfiguration(),
+                (bond, loan, now) -> LiquidationAssessment.excluded(bond, loan,
+                        LiquidationExclusion.HEALTH_NOT_COMPUTABLE, "fixture: no price"),
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), null, null).row();
+
+        assertEquals("UNKNOWN", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+    }
+
+    /**
+     * FAB-126 slice 2 (G1, X3b): the closed lending gate stays outermost over an excluded, liquidatable
+     * row. If the gate sat inside the exclusion, the row would read "NONE — excluded" and hide the
+     * node-wide refusal.
+     */
+    @Test
+    void aClosedLendingGateLeadsOverAnExcludedLiquidatableRow() {
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        gate.block("ConfigDatum mismatch");
+
+        LiquidationReadinessController.Row row = renderLiquidatable(
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.adaCollateral(), liveConfiguration(),
+                (bond, loan, now) -> LiquidationAssessment.excluded(bond, loan,
+                        LiquidationExclusion.EQUITY_IN_PRINCIPAL_CURRENCY, "fixture exclusion"),
+                gate).row();
+
+        assertEquals("REFUSED", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().detail().startsWith("LENDING_CONFIG_MISMATCH"), row.actionNow().detail());
+        assertFalse(row.actionNow().detail().contains("excluded"), row.actionNow().detail());
+    }
+
+    /** FAB-126 slice 2 (N1): an exclusion with no detail never prints the word "null". */
+    @Test
+    void anExclusionWithANullDetailNeverPrintsNull() {
+        ActionNow action = LiquidationReadinessController.excludedAction(
+                new ActionNow("LIQUIDATE", "live", true), true,
+                LiquidationAssessment.excluded(null, null, LiquidationExclusion.EQUITY_IN_PRINCIPAL_CURRENCY, null));
+
+        assertEquals("NONE — excluded", action.text(), action.toString());
+        assertFalse(action.detail().contains(": null"), action.detail());
+        assertTrue(action.detail().contains("EQUITY_IN_PRINCIPAL_CURRENCY"), action.detail());
     }
 
     @Test
@@ -1412,6 +1514,19 @@ class LiquidationReadinessControllerTest {
             AssessmentFactory assessmentFactory,
             com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate,
             WithdrawAccountRegistration registration) {
+        return renderLiquidatable(bondDatumOrNull, collateral, configuration, assessmentFactory,
+                lendingConfigGate, registration, true);
+    }
+
+    /** @param liquidatable the health service's verdict for the loan: true, false, or null (not computable) */
+    private static Rendered renderLiquidatable(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatumOrNull,
+            com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral,
+            AppConfig.LiquidationConfiguration configuration,
+            AssessmentFactory assessmentFactory,
+            com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate,
+            WithdrawAccountRegistration registration,
+            Boolean liquidatable) {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
                 collateral, 0L, LoanFixtures.liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
@@ -1441,7 +1556,8 @@ class LiquidationReadinessControllerTest {
             @Override
             public com.fluidtokens.aquarium.offchain.model.loans.LoanHealth health(Loan l, long at) {
                 return new com.fluidtokens.aquarium.offchain.model.loans.LoanHealth(
-                        BigInteger.valueOf(100_000_000L), true, null, BigInteger.ZERO, true, null);
+                        BigInteger.valueOf(100_000_000L), true, null, BigInteger.ZERO, liquidatable,
+                        liquidatable == null ? "fixture: health not computable" : null);
             }
         };
         AppConfig.Network network = new AppConfig.Network() {

@@ -26,7 +26,9 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfigurati
  * <h2>⛔ "Processable" is not one test — it depends on the route</h2>
  * <ul>
  *   <li><b>NO BOND</b> is not a processing failure: there is no executor candidate, so the action
- *       column alone says {@code NONE — no bond} and there is nothing for this blocker to count.</li>
+ *       column alone says {@code NONE — no bond} and there is nothing for this blocker to count. The
+ *       one exception is a DISABLED market or node: there EVERY row, bond-less or not, reads
+ *       "bot off", because that is reported first, before the route is consulted.</li>
  *   <li><b>ANTICIPATE</b> needs the PRINCIPAL: {@code min(balance, cap) >= advance}. This is
  *       {@code MarketGate.decide}'s arithmetic and is not restated here.</li>
  *   <li><b>CONVERT</b> needs NO principal — the collateral pays the lender. It needs a pool that can

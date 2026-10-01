@@ -541,15 +541,24 @@ public class LiquidationReadinessController {
                 route = "CONVERT";
                 routeDetail = "a Minswap pool is deep enough to clear this loan's debt, so the bot "
                         + "creates a swap order and fronts no capital";
+            } else if (action == AppConfig.LiquidationConfiguration.Action.CONVERT) {
+                // ⛔ FAB-126: a CONVERT market whose pool cannot fill. The executor goes to the convert
+                // router and refuses on the pool; it NEVER falls back to pay-in-advance, which would
+                // front capital nobody authorised (LiquidationExecutor's action split). So the label
+                // is CONVERT, and fronting the principal is the operator's switch to flip, not ours.
+                // The advance is still computed: it is what ANTICIPATE would need, if they flip it.
+                route = "CONVERT";
+                routeDetail = "no usable Minswap pool can fill this loan's swap, so the convert route "
+                        + "will refuse it; the bot fronts no capital on a CONVERT market — to front the "
+                        + "principal, set this market to action: ANTICIPATE with a cap";
+                advance = advanceAmount(loan, bond, now);
             } else {
                 route = "CAPITAL IN ADVANCE";
                 // ⛔ The market's configuration and the pool's state are DIFFERENT reasons, and an
                 // operator acts on them differently: a setting will not change by itself, a thin pool
                 // may. So both are reported, never one standing in for the other.
-                routeDetail = action == AppConfig.LiquidationConfiguration.Action.ANTICIPATE
-                        ? "this market is configured action: ANTICIPATE, so the bot fronts the principal "
-                                + "whatever the pool says"
-                        : "conversion is unavailable for this loan, so the principal must be fronted";
+                routeDetail = "this market is configured action: ANTICIPATE, so the bot fronts the principal "
+                        + "whatever the pool says";
                 advance = advanceAmount(loan, bond, now);
             }
 
@@ -641,7 +650,8 @@ public class LiquidationReadinessController {
                                     LiquidationAssessment assessment) {
         if (assessment != null && !assessment.buildable() && Boolean.TRUE.equals(liquidatable)) {
             return new ActionNow("NONE — excluded",
-                    assessment.exclusion().name() + ": " + assessment.detail()
+                    assessment.exclusion().name() + ": "
+                            + (assessment.detail() == null ? "(no detail)" : assessment.detail())
                             + " — the bot never considers an excluded assessment",
                     false);
         }
