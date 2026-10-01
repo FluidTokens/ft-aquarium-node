@@ -70,6 +70,66 @@ class ExecutorContextResolutionTest {
     }
 
     /**
+     * ⛔ FAB-115, IN A REAL CONTAINER. 2026-10-01: the live ConfigDatum stopped matching and
+     * {@code LoansConfigVerifier} threw out of {@code @PostConstruct}, which failed the CONTEXT — the
+     * scheduled-payment half down with the lending half. Here the real verifier is handed that exact
+     * datum through Blockfrost, and the container must still start, with the one shared gate closed
+     * and the executor holding that same gate (setter injection is the wiring a unit test cannot see).
+     */
+    @Test
+    void aLendingConfigMismatchStartsTheContainerAndClosesTheSharedGate() throws Exception {
+        String config = "235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200";
+        String lmConfig = "fb6ae2027358b4a0b62710eb95102d87fa13f66ecf55d8943699c492";
+        String asset = "706172616d6574657273";
+        String smart = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
+
+        var utxos = org.mockito.Mockito.mock(com.bloxbean.cardano.client.backend.api.UtxoService.class);
+        for (String[] served : new String[][]{
+                {config, "mainnet-config-datum-2026-09-30.hex"}, {lmConfig, "mainnet-lm-config-datum.hex"}}) {
+            String datum;
+            try (var in = getClass().getResourceAsStream("/loans-v4/" + served[1])) {
+                datum = new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
+            }
+            String address = com.bloxbean.cardano.client.address.AddressProvider.getEntAddress(
+                    com.bloxbean.cardano.client.address.Credential.fromScript(
+                            com.bloxbean.cardano.client.util.HexUtil.decodeHexString(served[0])),
+                    Networks.mainnet()).getAddress();
+            var utxo = com.bloxbean.cardano.client.api.model.Utxo.builder()
+                    .txHash("00".repeat(32)).outputIndex(0)
+                    .amount(List.of(com.bloxbean.cardano.client.api.model.Amount.lovelace(BigInteger.TWO),
+                            com.bloxbean.cardano.client.api.model.Amount.asset(served[0] + asset, BigInteger.ONE)))
+                    .inlineDatum(datum).build();
+            org.mockito.Mockito.when(utxos.getUtxos(address, 100, 1)).thenReturn(
+                    com.bloxbean.cardano.client.api.model.Result.<List<com.bloxbean.cardano.client.api.model.Utxo>>success("ok")
+                            .withValue(List.of(utxo)));
+        }
+        var bf = org.mockito.Mockito.mock(BFBackendService.class);
+        org.mockito.Mockito.when(bf.getUtxoService()).thenReturn(utxos);
+        var mainnet = new AppConfig.Network();
+        mainnet.setNetworkForTest("mainnet");
+
+        new ApplicationContextRunner()
+                .withUserConfiguration(StubCollaborators.class)
+                .withBean(com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class)
+                .withBean(com.fluidtokens.aquarium.offchain.service.LoansConfigVerifier.class,
+                        () -> new com.fluidtokens.aquarium.offchain.service.LoansConfigVerifier(
+                                new LoansContractRegistry(config, lmConfig, asset, smart, null, null, null),
+                                smart, mainnet, bf, false))
+                .withBean(CompoundExecutor.class)
+                .run(context -> {
+                    assertTrue(context.getStartupFailure() == null,
+                            "a Lending v4 config mismatch must not fail the context: " + context.getStartupFailure());
+                    var gate = context.getBean(com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class);
+                    assertTrue(gate.isBlocked(), "the verifier must close the SHARED gate");
+                    assertTrue(context.getBean(com.fluidtokens.aquarium.offchain.service.LoansConfigVerifier.class)
+                            .gate() == gate, "the verifier must write the container's gate, not a private one");
+                    assertTrue(org.springframework.test.util.ReflectionTestUtils.getField(
+                                    context.getBean(CompoundExecutor.class), "lendingConfigGate") == gate,
+                            "the executor must read the same gate the verifier closed");
+                });
+    }
+
+    /**
      * The generalisation, so the next executor cannot repeat it. Spring's rule is simple and
      * unforgiving: with more than one constructor it will not guess. This encodes the rule itself
      * rather than one instance of it, and it needs no container, so it also covers classes whose

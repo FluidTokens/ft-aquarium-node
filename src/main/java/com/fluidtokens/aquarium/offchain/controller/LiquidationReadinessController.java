@@ -225,6 +225,14 @@ public class LiquidationReadinessController {
      * and it would be invisible to the template tests, which render server-side. Params survive the
      * refresh, make the view shareable as a link, and stay testable.
      */
+    /** Closed when the live Lending v4 config does not match this node (FAB-115). Optional. */
+    private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
+        this.lendingConfigGate = gate;
+    }
+
     @GetMapping
     public String readiness(Model model,
                             @RequestParam(name = "sort", required = false) String sort,
@@ -234,6 +242,11 @@ public class LiquidationReadinessController {
                             @RequestParam(name = "page", required = false) Integer page) {
         model.addAttribute("network", network == null ? "unknown" : network.getNetwork());
         model.addAttribute("generatedAt", java.time.Instant.now().toString());
+        // ⛔ Shown ABOVE everything and independent of the rows: the loan view still works while the
+        // gate is closed, and a page full of healthy-looking loans must not hide that the bot will
+        // refuse every one of them.
+        model.addAttribute("lendingConfigBlocked", lendingConfigGate == null ? null
+                : lendingConfigGate.blockedReason().orElse(null));
         model.addAttribute("status", OperationalStatus.of(liquidationConfiguration,
                 convertEnabled, compoundEnabled, processorEnabled));
         model.addAttribute("sort", sort == null ? "health" : sort);

@@ -197,7 +197,13 @@ class ReadinessTemplateRendersRowsTest {
 
     private static String render(List<LiquidationReadinessController.Row> rows,
                                  OperationalStatus status) {
+        return render(rows, status, null);
+    }
+
+    private static String render(List<LiquidationReadinessController.Row> rows,
+                                 OperationalStatus status, String lendingConfigBlocked) {
         var context = new Context();
+        context.setVariable("lendingConfigBlocked", lendingConfigBlocked);
         context.setVariable("network", "preview");
         context.setVariable("generatedAt", "2026-09-04T13:00:00Z");
         context.setVariable("disabledReason", null);
@@ -226,6 +232,24 @@ class ReadinessTemplateRendersRowsTest {
         context.setVariable("collaterals", List.of(FLDT_UNIT));
         context.setVariable("rows", rows);
         return engine().process("readiness", context);
+    }
+
+    /**
+     * ⛔ FAB-115: a closed lending gate is shown above everything, while the rows still render — the
+     * loan view keeps working, so a page of healthy-looking loans must not hide that the bot refuses
+     * every one of them. Absent, nothing is shown.
+     */
+    @Test
+    void aClosedLendingGateIsBanneredAboveTheRowsAndAbsentOtherwise() {
+        String reason = "ConfigDatum[11]: derived 63b26ff9, chain 64d9b13f";
+        String blocked = render(List.of(fullRow()), monitoringOnly(), reason);
+        assertTrue(blocked.contains("LENDING_CONFIG_MISMATCH") && blocked.contains(reason),
+                "the banner must name the refusal and its reason");
+        assertTrue(blocked.indexOf("LENDING_CONFIG_MISMATCH") < blocked.indexOf("<table"),
+                "the banner must come before the table");
+
+        String open = render(List.of(fullRow()), monitoringOnly(), null);
+        assertTrue(!open.contains("LENDING_CONFIG_MISMATCH"), "no banner while the gate is open");
     }
 
     /**

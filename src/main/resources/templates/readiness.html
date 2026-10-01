@@ -210,6 +210,13 @@
     </ul>
   </div>
 
+  <!-- ⛔ FAB-115: a Lending v4 config mismatch no longer stops the node; it closes the lending gate.
+       Said first and loudly, because every row below will still render. -->
+  <div th:if="${lendingConfigBlocked}" class="note" style="color:var(--warn);font-weight:600">
+    &#9888; LENDING_CONFIG_MISMATCH: the bot refuses every Lending v4 transaction on this node until it is
+    re-pinned and restarted. Scheduled payments are unaffected.
+    <div style="font-weight:400" th:text="${lendingConfigBlocked}">why</div>
+  </div>
   <div th:if="${disabledReason}" class="note" th:text="${disabledReason}">disabled</div>
 
   <!-- ⛔ THE OPERATOR'S OWN WALLET. Amount and ticker; the policy id lives on hover, because a

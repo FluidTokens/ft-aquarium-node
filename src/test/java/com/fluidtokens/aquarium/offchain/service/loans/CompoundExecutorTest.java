@@ -216,6 +216,39 @@ class CompoundExecutorTest {
         assertEquals(0, scans.get(), "a syncing node must not even scan");
     }
 
+    /** ⛔ FAB-115: compound is a Lending v4 transaction path, so a closed gate stops it too. */
+    @Test
+    void aClosedLendingConfigGateStopsCompoundBeforeTheScan() {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+
+        AtomicInteger scans = new AtomicInteger();
+        var scanner = new FakeScanner(List.of(ready(0L))) {
+            @Override
+            public Scan scan() {
+                scans.incrementAndGet();
+                return super.scan();
+            }
+        };
+        var executor = new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet())), ACCOUNT, scanner,
+                new CompoundEconomics(configuration, network, pricingService()),
+                new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                        LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                bytes -> { throw new AssertionError("a closed lending gate must not submit"); });
+
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        gate.block("ConfigDatum[11]: derived 63b26ff9…, chain 64d9b13f…");
+        executor.setLendingConfigGate(gate);
+
+        executor.cycle();
+        assertEquals(0, scans.get(), "FAB-115: a closed lending gate must stop compound before the scan");
+    }
+
     /**
      * ⛔ THE PRODUCTION SHAPE, 2026-09-02. The wallet held 9,898 ada and could build nothing, because
      * its ONE utxo also carried a native token — CCL trap 17: a successful transaction's change

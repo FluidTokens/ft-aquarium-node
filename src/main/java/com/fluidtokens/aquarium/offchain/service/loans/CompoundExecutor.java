@@ -76,6 +76,32 @@ public class CompoundExecutor {
     private final TransactionSubmitter submitter;
 
     /**
+     * ⛔ Closed by {@code LoansConfigVerifier} when the live Lending v4 config does not match what this
+     * node derives (FAB-115). Setter-injected, optional: direct constructions in tests run ungated.
+     */
+    private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
+    private volatile boolean lendingGateRefusalLogged;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
+        this.lendingConfigGate = gate;
+    }
+
+    /** True, and logged once, when the Lending v4 config gate is closed. */
+    private boolean refusedByLendingConfigGate(String what) {
+        if (lendingConfigGate == null || !lendingConfigGate.isBlocked()) {
+            return false;
+        }
+        if (!lendingGateRefusalLogged) {
+            lendingGateRefusalLogged = true;
+            log.error("{} REFUSED for the life of this process: {} — {}", what,
+                    com.fluidtokens.aquarium.offchain.service.LendingConfigGate.REFUSAL,
+                    lendingConfigGate.blockedReason().orElse(""));
+        }
+        return true;
+    }
+
+    /**
      * ⛔ {@code @Autowired} IS LOAD-BEARING. This class has two constructors, and with neither marked
      * Spring does not pick one — it looks for a no-arg constructor, finds none, and the context fails
      * to start with {@code NoSuchMethodException: CompoundExecutor.<init>()}. Nothing about that
@@ -144,6 +170,9 @@ public class CompoundExecutor {
     }
 
     void cycle() {
+        if (refusedByLendingConfigGate("compound")) {
+            return;
+        }
         if (blockEventListener.getIsSyncing().get()) {
             log.debug("compound: still syncing, skipping the cycle");
             return;

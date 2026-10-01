@@ -1049,6 +1049,31 @@ class LiquidationExecutorTest {
         assertNull(wiring.log().lastRun().at());
     }
 
+    /**
+     * ⛔ FAB-115. A Lending v4 config mismatch no longer stops the node; it closes the lending gate,
+     * and the loop must honour it in SHADOW too — a shadow build against a claim script the chain no
+     * longer names reports figures for a transaction that cannot exist. The control is the SAME
+     * wiring with the gate open, which scans (aProfitableCandidate… below asserts 1).
+     */
+    @Test
+    void aClosedLendingConfigGateStopsTheLoopBeforeTheScanEvenInShadow() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        gate.block("ConfigDatum[11]: derived 63b26ff9…, chain 64d9b13f…");
+        wiring.executor().setLendingConfigGate(gate);
+
+        wiring.executor().cycle(NOW);
+
+        assertEquals(0, wiring.scanner().scans, "a closed gate must return before the scanner is touched");
+        assertEquals(0, wiring.log().size());
+
+        // and an OPEN gate on the same wiring changes nothing
+        Wiring open = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+        open.executor().setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
+        open.executor().cycle(NOW);
+        assertEquals(1, open.scanner().scans, "an open gate must not suppress the loop");
+    }
+
     // ======================================================================================
     // the profit decision
     // ======================================================================================
