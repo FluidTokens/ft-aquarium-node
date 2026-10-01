@@ -1339,7 +1339,22 @@ class LiquidationReadinessControllerTest {
                 Optional.of(WithdrawAccountRegistration.Route.CONVERT), List.of(unknown));
         assertEquals("REFUSED", action.text());
         assertTrue(action.detail().contains("otherwise: CONVERT — live"), action.detail());
-        assertSame(computed, LiquidationReadinessController.registrationBlocker(computed,
+
+        // The ActionNow override is for liquidatable-TRUE rows on a mode that is not DISABLED only.
+        // Each case below has a route AND an unconfirmed check, so only the named guard keeps it out.
+        ActionNow acting = new ActionNow("CONVERT", "live", true);
+        for (Boolean notLiquidatable : java.util.Arrays.asList(Boolean.FALSE, null)) {
+            assertSame(acting, LiquidationReadinessController.registrationAction(acting, notLiquidatable,
+                            AppConfig.LiquidationConfiguration.Mode.LIVE,
+                            Optional.of(WithdrawAccountRegistration.Route.CONVERT), List.of(unknown, absent)),
+                    "liquidatable=" + notLiquidatable + " must leave the computed action unchanged");
+        }
+        assertSame(acting, LiquidationReadinessController.registrationAction(acting, true,
+                        AppConfig.LiquidationConfiguration.Mode.DISABLED,
+                        Optional.of(WithdrawAccountRegistration.Route.CONVERT), List.of(unknown, absent)),
+                "a DISABLED mode must leave the computed action unchanged");
+
+        assertSame(computed,LiquidationReadinessController.registrationBlocker(computed,
                 AppConfig.LiquidationConfiguration.Mode.DISABLED,
                 Optional.of(WithdrawAccountRegistration.Route.CONVERT), List.of(absent)));
     }

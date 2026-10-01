@@ -847,6 +847,48 @@ class LiquidationSubmitVetoTest {
         assertTrue(decision.detail().contains(refused), decision.detail());
     }
 
+    /**
+     * The EXECUTOR's own catch, not the service's: here {@code transactionChecks} itself throws, so
+     * no per-account fetch is ever reached. A catch that swallowed this and returned "no problem"
+     * would submit on a registration answer nobody ever read.
+     */
+    @Test
+    void aThrowingTransactionCheckFailsClosedThroughTheExecutorsCatch() {
+        WithdrawAccountRegistration throwing = new WithdrawAccountRegistration(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, path -> registered(), () -> NOW) {
+            @Override
+            public List<Check> transactionChecks(Transaction transaction) {
+                throw new IllegalStateException("transaction checks exploded");
+            }
+        };
+        Run run = new Rig().registration(throwing).run();
+
+        run.assertNothingWasSubmitted();
+        LiquidationDecision decision = vetoed(run,
+                LiquidationExecutor.SubmitVeto.WITHDRAW_ACCOUNT_NOT_REGISTERED,
+                LiquidationDecision.Outcome.SUBMIT_VETOED);
+        assertTrue(decision.detail().contains("registration check threw"), decision.detail());
+        assertTrue(decision.detail().contains("transaction checks exploded"), decision.detail());
+        assertTrue(decision.detail().contains("not read as registered"), decision.detail());
+    }
+
+    /** The S2 branch carries the same shadow NOTE as S1: a held market still says what arming would hit. */
+    @Test
+    void aShadowMarketKeepsItsMarketVetoAndAddsTheRegistrationNote() {
+        String refused = LoanFixtures.registry().getLmLiquidateActionScriptHash();
+        Run run = new Rig()
+                .configuration(armedWithMarket(AppConfig.LiquidationConfiguration.Mode.SHADOW))
+                .registration(registration(path -> path.contains(LoanFixtures.rewardAddress(refused))
+                        ? new WithdrawAccountRegistration.Fetched(404, "[]") : registered()))
+                .run();
+
+        LiquidationDecision decision = vetoed(run, LiquidationExecutor.SubmitVeto.MARKET_NOT_LIVE,
+                LiquidationDecision.Outcome.WOULD_SUBMIT);
+        assertTrue(decision.detail().contains("NOTE: withdraw accounts not confirmed registered"),
+                decision.detail());
+        assertTrue(decision.detail().contains(refused), decision.detail());
+    }
+
     private static WithdrawAccountRegistration registration(
             WithdrawAccountRegistration.RegistrationsFetcher fetcher) {
         return new WithdrawAccountRegistration(LoanFixtures.registry(), LoanFixtures.NETWORK,

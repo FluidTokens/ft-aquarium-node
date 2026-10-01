@@ -121,10 +121,17 @@ class WithdrawAccountRegistrationTest {
             }, now::get);
             String stake = reward(REGISTRY.getLoanClaimActionScriptHash());
 
-            service.check("claim", stake);
+            var fresh = service.check("claim", stake);
             now.addAndGet(WithdrawAccountRegistration.UNCONFIRMED_TTL_MILLIS - 1);
-            service.check("claim", stake);
+            var cached = service.check("claim", stake);
             assertEquals(1, calls.get(), "status " + status + " was re-fetched before its TTL");
+            // The cache hit must hand back the answer it stored — never promote it to REGISTERED.
+            var expected = status == 404 ? WithdrawAccountRegistration.Status.NOT_REGISTERED
+                    : WithdrawAccountRegistration.Status.UNKNOWN;
+            assertEquals(expected, fresh.status(), "fresh answer for status " + status);
+            assertEquals(fresh.status(), cached.status(), "cached answer for status " + status);
+            assertFalse(cached.confirmed(), "a cached " + status + " was read as registered");
+            assertEquals(fresh.detail(), cached.detail(), "cached detail for status " + status);
             now.incrementAndGet();
             service.check("claim", stake);
             assertEquals(2, calls.get(), "status " + status + " was not re-fetched at its TTL");
@@ -238,6 +245,51 @@ class WithdrawAccountRegistrationTest {
         } finally {
             logger.detachAppender(appender);
             server.stop(0);
+        }
+    }
+
+    /**
+     * The production fetcher's EXCEPTION path, not its status path: a real {@code BFBackendService}
+     * pointed at a port nothing listens on, so the HTTP client itself throws. That message is built
+     * by our catch, which is exactly where a project id could be concatenated in by accident.
+     */
+    @Test
+    void productionWiringConnectionFailureIsUnknownAndKeepsTheKeySecret() throws Exception {
+        int closedPort;
+        try (java.net.ServerSocket socket = new java.net.ServerSocket(0, 0,
+                java.net.InetAddress.getByName("127.0.0.1"))) {
+            closedPort = socket.getLocalPort();
+        }
+
+        Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        root.addAppender(appender);
+        try {
+            BFBackendService backend = new BFBackendService(
+                    "http://127.0.0.1:" + closedPort + "/api/v0/", "SECRET-KEY-MARKER");
+            new ApplicationContextRunner()
+                    .withUserConfiguration(RegistrationContext.class)
+                    .withBean(LoansContractRegistry.class, () -> REGISTRY)
+                    .withBean(AppConfig.Network.class, () -> network("preview"))
+                    .withBean(BFBackendService.class, () -> backend)
+                    .run(context -> {
+                        assertNull(context.getStartupFailure(), String.valueOf(context.getStartupFailure()));
+                        WithdrawAccountRegistration service =
+                                context.getBean(WithdrawAccountRegistration.class);
+                        var unknown = service.check("loan", reward(REGISTRY.getLoanPolicyId()));
+                        assertEquals(WithdrawAccountRegistration.Status.UNKNOWN, unknown.status());
+                        assertFalse(unknown.confirmed());
+                        assertTrue(unknown.detail().contains("not read as registered"), unknown.detail());
+                        assertFalse(unknown.detail().contains("SECRET-KEY-MARKER"), unknown.detail());
+                    });
+            assertTrue(appender.list.stream()
+                    .noneMatch(event -> event.getFormattedMessage().contains("SECRET-KEY-MARKER")
+                            || (event.getThrowableProxy() != null
+                                    && String.valueOf(event.getThrowableProxy().getMessage())
+                                            .contains("SECRET-KEY-MARKER"))));
+        } finally {
+            root.detachAppender(appender);
         }
     }
 

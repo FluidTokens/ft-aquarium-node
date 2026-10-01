@@ -269,7 +269,7 @@ public class LiquidationExecutor {
     /**
      * The clock the submit-time checks read, as opposed to the cycle's own {@code now}.
      * <p>
-     * The two are genuinely different instants and the difference is the whole point of S8. A cycle
+     * The two are genuinely different instants and the difference is the whole point of S6. A cycle
      * scans, resolves UTxOs, fetches protocol parameters and evaluates scripts before it gets
      * anywhere near submitting, and every one of those is a Blockfrost round trip; re-checking the
      * oracle windows against the instant the cycle <em>started</em> would be re-checking nothing.
@@ -560,8 +560,8 @@ public class LiquidationExecutor {
      * <h2>It fires for a POLICY hold, never for a rejection</h2>
      * A candidate the gates refused is not a transaction that would have gone, and dumping it would
      * bury the ones that would. So this prints exactly when the verdict is {@code WOULD_SUBMIT} and a
-     * policy veto (S1–S4) held it — mode, arming, network, or the market. An {@code UNPROFITABLE} row
-     * or a candidate stopped by S5–S9 gets its ordinary line and no payload.
+     * policy veto (S1–S2) held it — the mode or the market. An {@code UNPROFITABLE} row
+     * or a candidate stopped by S3–S8 gets its ordinary line and no payload.
      *
      * <h2>⚠ What it proves, and what it does NOT</h2>
      * The ex-units come off the <b>built, deserialised transaction</b> — never off an evaluator's
@@ -1141,7 +1141,7 @@ public class LiquidationExecutor {
                     return;
                 }
                 // Falls through to the shared record-and-maybe-submit path below, deliberately: the
-                // nine submit vetoes, the shadow dump and the decision record are the SAME for every
+                // eight submit vetoes, the shadow dump and the decision record are the SAME for every
                 // variant, and a convert that bypassed them would be the one path an operator cannot
                 // watch through the endpoint they already use.
             } else {
@@ -1641,9 +1641,9 @@ public class LiquidationExecutor {
     private Verdict verdict(LiquidationAssessment assessment, long now, Transaction transaction,
                             Map<String, OracleEntry> oraclesByUnit, BigInteger floorProfit,
                             BigInteger expectedProfit, int size, String detail) {
-        // What the row says on an unarmed node: WOULD_SUBMIT only if it would actually clear S3 (the
-        // profitability gate, twice renumbered: it was S5 before the network veto and the
-        // separate arming flag were removed) on an
+        // What the row says on an unarmed node: WOULD_SUBMIT only if it would actually clear S4 (the
+        // profitability gate, renumbered three times: it was S5 before the network veto and the
+        // separate arming flag were removed, then S3, and S4 since the registration veto) on an
         // armed one — i.e. it passes both the profitability floor and the margin lever.
         LiquidationDecision.Outcome shadowOutcome = wouldSubmit(floorProfit, expectedProfit)
                 ? LiquidationDecision.Outcome.WOULD_SUBMIT
@@ -1966,7 +1966,7 @@ public class LiquidationExecutor {
         try {
             signed = account.sign(transaction).serialize();
         } catch (Exception e) {
-            // Not one of the seven — those are all about whether submitting is *allowed*, and this
+            // Not one of the eight — those are all about whether submitting is *allowed*, and this
             // is the machinery failing after they all said yes. It carries no veto name for exactly
             // that reason, and it still transmits nothing.
             log.error("could not sign the liquidation of {}: {}", loanUtxoRef, causeChain(e), e);
