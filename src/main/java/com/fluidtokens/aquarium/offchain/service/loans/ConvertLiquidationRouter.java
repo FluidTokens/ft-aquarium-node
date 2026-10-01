@@ -146,7 +146,8 @@ public class ConvertLiquidationRouter {
      *
      * <p>⚠ <b>Keyed by the REGISTRY's hash for each named slot, not by a hash read off the chain.</b>
      * That is sound only because {@code LoansReferenceScriptVerifier} resolves every configured
-     * coordinate at startup and <b>hard-fails on a mismatch</b> — so by the time this runs, the claim
+     * coordinate at startup and <b>closes the lending gate on a mismatch</b> — and this router runs only
+     * inside {@code LiquidationExecutor.cycle}, after the gate check — so by the time this runs, the claim
      * "the key named {@code loan-spend} publishes the loan-spend script" is already proven. The
      * compound path reads the hash off chain instead because its coordinates are an unnamed list,
      * where a mislabelled entry would otherwise be inexpressible.

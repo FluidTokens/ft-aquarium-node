@@ -586,8 +586,9 @@ loans:
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
     # Six of the seven, verified on chain: each of these UTxOs publishes a reference_script_hash
     # equal to the hash this repo derives for that validator, and LoansReferenceScriptVerifier
-    # re-checks that at every startup — a redeploy turns these into a hard startup failure, which is
-    # an answer and not an outage. asset-manager is deliberately left empty: a plain Liquidate only
+    # re-checks that at every startup — a redeploy turns these into a CLOSED LENDING GATE
+    # (LENDING_CONFIG_MISMATCH: every Lending v4 transaction refused, scheduled payments untouched),
+    # which is an answer and not an outage. asset-manager is deliberately left empty: a plain Liquidate only
     # *creates* asset-manager outputs and never spends one, so its script is neither attached nor
     # needed; publishing a coordinate for it would only add a reference input and its fee.
     #
@@ -636,7 +637,7 @@ loans:
     # It sits at an ordinary key address we control and holds 38.359 ADA of min-ada, recoverable by
     # spending it back when the bot no longer needs it. LoansReferenceScriptVerifier checks its
     # on-chain reference_script_hash against the freshly derived hash at every boot, so the next
-    # redeploy turns it into a startup failure rather than a silent wrong-script.
+    # redeploy closes the lending gate rather than building against a silent wrong script.
     #   lm-liquidate-action  549b438c...49a47fe0#0
     reference-scripts:
       loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}

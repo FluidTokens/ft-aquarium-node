@@ -1081,6 +1081,37 @@ class LiquidationExecutorTest {
         assertEquals(1, open.scanner().scans, "an open gate must not suppress the loop");
     }
 
+    /**
+     * ⛔ FAB-115 (fresh-slice audit, finding 3): the gate in LIVE — the only mode that SUBMITS. A gate
+     * that held in shadow but not in live would submit against a script the chain no longer names (a
+     * phase-2 failure, collateral forfeit) with the shadow tests still green. Control: an open gate in
+     * LIVE reaches the scan.
+     */
+    @Test
+    void aClosedLendingConfigGateStopsTheLoopInLiveModeToo() {
+        Wiring closed = wiring(config(AppConfig.LiquidationConfiguration.Mode.LIVE, SMALL_MARGIN, 200),
+                scenario(FAT_FEE_PER_MILLE), false);
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        gate.block("ConfigDatum[11]: derived 63b26ff9…, chain 64d9b13f…");
+        closed.executor().setLendingConfigGate(gate);
+
+        closed.executor().cycle(NOW);
+
+        assertEquals(0, closed.scanner().scans, "LIVE with a closed gate must return before the scanner");
+        assertEquals(0, closed.log().size(), "and must decide, build and submit nothing");
+
+        Wiring open = wiring(config(AppConfig.LiquidationConfiguration.Mode.LIVE, SMALL_MARGIN, 200),
+                scenario(FAT_FEE_PER_MILLE), false);
+        open.executor().setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
+        try {
+            open.executor().cycle(NOW);
+        } catch (Throwable ignored) {
+            // the control asserts only that the gate let the cycle reach the scan; what LIVE does
+            // after that (this fixture's submitter refuses to submit) is not under test here
+        }
+        assertEquals(1, open.scanner().scans, "an open gate in LIVE must not suppress the loop");
+    }
+
     /** FAB-115 audit finding 4: the refusal is logged ONCE at ERROR, naming the refusal, not per cycle. */
     @Test
     void aClosedLendingConfigGateIsLoggedOnceAtErrorNotEveryCycle() {

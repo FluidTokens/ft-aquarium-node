@@ -32,8 +32,8 @@ import java.util.Map;
  * Without this the node fails <em>silently</em>: FluidTokens redeploys the v4 config NFTs
  * (which already happened once between 2026-07-14 and 2026-08-05), the policy ids in
  * {@code application.yaml} go stale, derivation still succeeds, and the node indexes a
- * dead deployment while looking perfectly healthy. Turning that into a startup failure is
- * the whole point of this class.
+ * dead deployment while looking perfectly healthy. Turning that into a refusal of every Lending
+ * v4 transaction — loud, named, and before anything is built — is the whole point of this class.
  *
  * <h2>Failure modes, deliberately kept distinct</h2>
  * <ul>

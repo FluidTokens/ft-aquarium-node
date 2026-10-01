@@ -456,7 +456,8 @@ mode has cost real debugging time.
 not as a quiet market — see [upgrading.md](upgrading.md).
 
 **Armed but never acts.** The three silent-idle causes in §8. The liquidations endpoint names the
-veto for every candidate.
+veto for every candidate. And check the **lending gate**: a contract-coordinate mismatch no longer
+stops the node, it refuses every Lending v4 transaction — see the next entry.
 
 **A setting seems to do nothing.** Confirm it actually reached the process:
 
@@ -464,6 +465,16 @@ veto for every candidate.
 docker compose exec aquarium-node env | grep AQUARIUM_
 ```
 
-**Node will not start.** Startup verification is strict on purpose: it refuses to run against
-contract coordinates that do not match what it derives, rather than running against the wrong ones.
-The message names the key at fault.
+**Lending refused, everything else running (`LENDING_CONFIG_MISMATCH`).** Startup verification is
+strict on purpose: it will not build against contract coordinates that do not match what it derives.
+Since FAB-115 a mismatch (config policy ids, `smart-tokens-spend-script-hash`, or
+`loans.liquidation.reference-scripts.*`) no longer stops the node — scheduled payments keep running —
+but every Lending v4 transaction (liquidation in every mode, convert, compound) is refused for the
+life of the process. A clean `/healthcheck` does not rule it out; check the log:
+
+```bash
+docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified"
+```
+
+The line names each field at fault (derived vs chain). Fix the coordinates and restart; see
+[upgrading.md §4.7](upgrading.md).
