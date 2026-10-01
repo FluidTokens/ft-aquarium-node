@@ -282,8 +282,8 @@ class RealLoanDryEvalTest {
     private static final String TX_LM_CONFIG = "f2".repeat(32);
     private static final String TX_WALLET = "e0".repeat(32);
 
-    private static final Utxo CONFIG_UTXO = LoanFixtures.configUtxo(TX_CONFIG, 0);
-    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.lmConfigUtxo(TX_LM_CONFIG, 0);
+    private static final Utxo CONFIG_UTXO = LoanFixtures.syntheticLatestConfigUtxo(TX_CONFIG, 0); // synthetic: the captured preview datum names the pre-2026-10-01 claim
+    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 50_000_000L);
 
@@ -997,11 +997,11 @@ class RealLoanDryEvalTest {
         assertTrue(claimOnly.lockedLovelace() < all.lockedLovelace(),
                 "the point of publishing fewer is locking less");
 
-        // lmLiquidateAction alone also fits — but by 130 bytes, which is not a margin. Asserted in the
-        // direction the measurement found rather than the direction it was predicted in: the brief
-        // reasoned it would clear the limit by ~76 bytes and it clears by 130, so "it fits" was the
-        // right call and the exact figure was not. Both are why this was measured.
-        assertTrue(lmOnly.fits(), "lmLiquidateAction alone fits, barely: " + lmOnly.signedBytes());
+        // lmLiquidateAction alone USED TO fit — by 130 bytes, which was never a margin. ⛔ RE-MEASURED
+        // 2026-10-01: FluidTokens' FTAI-001 claim action is 617 bytes larger (9_279 vs 8_662), and with
+        // it inline this configuration is 16_956 bytes against a 16_384 maxTxSize. It does NOT fit any
+        // more -- which is the measured reason loan-claim-action's published reference is mandatory.
+        assertFalse(lmOnly.fits(), "lmLiquidateAction alone no longer fits: " + lmOnly.signedBytes());
         assertFalse(sensible(lmOnly),
                 "lmLiquidateAction alone must not clear the margin rule: headroom " + lmOnly.headroom());
 

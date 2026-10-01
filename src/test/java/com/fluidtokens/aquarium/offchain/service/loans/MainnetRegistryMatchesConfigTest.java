@@ -67,9 +67,14 @@ class MainnetRegistryMatchesConfigTest {
         ReflectionTestUtils.setField(network, "network", "mainnet");
         LoansContractRegistry registry = mainnetRegistry();
 
-        List<String> mismatches = new LoansConfigVerifier(registry, SMART_TOKENS_SPEND, network, null, true)
-                .verifyAgainst(fixture("/loans-v4/mainnet-config-datum.hex"),
-                        fixture("/loans-v4/mainnet-lm-config-datum.hex"));
+        // The live datums after FluidTokens' 2026-10-01 redeploy. Their one advisory difference, the
+        // recast pause at [14], is by FluidTokens' design; nothing the node USES may differ.
+        var findings = new LoansConfigVerifier(registry, SMART_TOKENS_SPEND, network, null, true)
+                .verifyAgainstBySeverity(fixture("/loans-v4/mainnet-config-datum-2026-10-01.hex"),
+                        fixture("/loans-v4/mainnet-lm-config-datum-2026-10-01.hex"));
+        List<String> mismatches = findings.enforced();
+        assertEquals(1, findings.advisory().size(), "advisory: " + findings.advisory());
+        assertTrue(findings.advisory().getFirst().startsWith("ConfigDatum[14]:"), "advisory: " + findings.advisory());
 
         assertTrue(mismatches.isEmpty(),
                 "the selected mainnet blueprint does NOT derive FluidTokens' mainnet credentials. "

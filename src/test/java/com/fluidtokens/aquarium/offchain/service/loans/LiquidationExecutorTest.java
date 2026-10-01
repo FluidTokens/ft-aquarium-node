@@ -171,8 +171,8 @@ class LiquidationExecutorTest {
      * validators can be run against the result at all, which
      * {@link #honestExUnitsCostMoreThanPlaceholdersAndStillFitInsideHalfTheLiveBudget()} needs.
      */
-    private static final Utxo CONFIG_UTXO = LoanFixtures.configUtxo(TX_CONFIG, 0);
-    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.lmConfigUtxo(TX_LM_CONFIG, 0);
+    private static final Utxo CONFIG_UTXO = LoanFixtures.syntheticLatestConfigUtxo(TX_CONFIG, 0); // synthetic: the captured preview datum names the pre-2026-10-01 claim
+    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             ACCOUNT.baseAddress(), 200_000_000L);
 
@@ -2303,7 +2303,10 @@ class LiquidationExecutorTest {
         // SMALL_MARGIN, which is itself informative: the OLD bug (subtracting the outlay alone against
         // a puny fee slice) would have been far more negative still — this fixture does not need to
         // clear a margin to prove the fix, only to prove the CORRECT number is being computed.
-        assertTrue(detail.contains("= floor -951764"),
+        // ⚠ RE-MEASURED 2026-10-01: txFee 1,206,413 -> 1,233,561 (+27,148) against FluidTokens' FTAI-001
+        // claim action (larger script, one more check evaluated); every other term is unchanged, so the
+        // floor moves by exactly the fee: 10,500,000 - 8,000,001 - 1,233,561 - 2,245,350 = -978,912.
+        assertTrue(detail.contains("tx fee 1233561") && detail.contains("= floor -978912"),
                 "the exact pinned floorProfit — a mutant removing the acquired credit, weakening the "
                         + "outlay's ceil-bias, or counting the USDM change as a rider each move this "
                         + "number: " + detail);

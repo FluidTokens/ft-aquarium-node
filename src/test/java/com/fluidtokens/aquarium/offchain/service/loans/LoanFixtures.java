@@ -219,6 +219,22 @@ public final class LoanFixtures {
         return REGISTRY;
     }
 
+    /**
+     * The same preview coordinates, derived from the artefact the node shipped BEFORE FluidTokens'
+     * 2026-10-01 mainnet redeploy ({@code loans-v4-2026-09-17.plutus.json}, upstream {@code aad6c59}).
+     *
+     * <p>⛔ For rigs that measure or replay something built from that artefact -- the preview reference-script
+     * publish plan above all. Preview was not redeployed on 2026-10-01, so the scripts it runs are these;
+     * deriving them from today's artefact measures a claim action preview does not have.
+     */
+    public static LoansContractRegistry registryBefore20261001() {
+        return REGISTRY_BEFORE_2026_10_01;
+    }
+
+    private static final LoansContractRegistry REGISTRY_BEFORE_2026_10_01 = new LoansContractRegistry(
+            "loans-v4-2026-09-17.plutus.json",
+            CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
+
     // ---- the THIRD deployment, kept on purpose ------------------------------------------------
 
     private static final String THIRD_CONFIG_POLICY_ID =
@@ -728,11 +744,56 @@ public final class LoanFixtures {
     /** {@link #syntheticConfigUtxoFor} for the LenderManager config. */
     public static Utxo syntheticLmConfigUtxoFor(LoansContractRegistry registry, String txHash,
                                                 int outputIndex) {
-        String datum = replaceCapturedCredential(
-                fixture("fourth-deployment-lm-config-datum.hex"),
-                "dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457",
-                registry.getLmCompoundActionScriptHash(), "LMConfigDatum[3]");
-        return configUtxo(txHash, outputIndex, registry.getLmConfigPolicyId(), datum);
+        return configUtxo(txHash, outputIndex, registry.getLmConfigPolicyId(), syntheticLmConfigDatumFor(registry));
+    }
+
+    /**
+     * ⛔ <b>REBUILT STRUCTURALLY on 2026-10-01</b>, for the same reason {@link #syntheticConfigDatumFor} was on
+     * 2026-09-17: a one-credential hex swap stopped describing the deployment. FluidTokens' FTAI-001 redeploy
+     * moved FIVE LenderManager action hashes at once (fields 2-6: four are parameterised by the new claim
+     * action, compound changed code). A rig fed the captured preview bytes with only [3] swapped hands the
+     * LenderManager the OLD liquidate action, and the build fails at {@code RedeemerError{Withdraw}}.
+     *
+     * <p>Every field the registry derives (1-7) comes from the registry; field 0 (the admin credential, which
+     * nothing derives) is carried over from the captured fourth-deployment bytes. A null derivation
+     * ({@code lm_liquidate_and_convert} without Minswap coordinates) keeps the captured value.
+     *
+     * <p><b>Synthetic. Never use this as chain evidence or in a live rig.</b>
+     */
+    static String syntheticLmConfigDatumFor(LoansContractRegistry registry) {
+        PlutusData raw;
+        try {
+            raw = PlutusData.deserialize(
+                    HexUtil.decodeHexString(fixture("fourth-deployment-lm-config-datum.hex")));
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot decode the captured fourth-deployment LMConfigDatum", e);
+        }
+        if (!(raw instanceof ConstrPlutusData captured) || captured.getData().getPlutusDataList().size() != 8) {
+            throw new IllegalStateException("captured LMConfigDatum is not the 8-field record");
+        }
+        List<PlutusData> out = new ArrayList<>(captured.getData().getPlutusDataList());
+        String[] derived = {null,
+                registry.getLmWithdrawBondsActionScriptHash(),
+                registry.getLmLiquidateActionScriptHash(),
+                registry.getLmCompoundActionScriptHash(),
+                registry.getLmLiquidateAndPayInAdvanceActionScriptHash(),
+                registry.getLmLiquidateAndConvertActionScriptHash(),
+                registry.getLmLiquidatePayInAdvanceAndCompoundActionScriptHash(),
+                registry.getLmLiquidateConvertAndCompoundActionScriptHash()};
+        for (int k = 1; k < derived.length; k++) {
+            if (derived[k] != null) {
+                out.set(k, BytesPlutusData.of(HexUtil.decodeHexString(derived[k])));
+            }
+        }
+        ListPlutusData list = ListPlutusData.builder().build();
+        out.forEach(list::add);
+        ConstrPlutusData rebuilt = ConstrPlutusData.builder()
+                .alternative(captured.getAlternative()).data(list).build();
+        try {
+            return HexUtil.encodeHexString(rebuilt.serializeToBytes());
+        } catch (Exception e) {
+            throw new IllegalStateException("cannot re-serialise the synthetic LMConfigDatum", e);
+        }
     }
 
     /**
@@ -832,23 +893,11 @@ public final class LoanFixtures {
 
     /**
      * Synthetic LMConfigDatum paired with {@link #syntheticLatestConfigUtxo(String, int)}.
-     * Replaces only the old preview LM compound credential; captured getters remain untouched.
+     * Every derived LenderManager field rebuilt from the latest registry ({@link #syntheticLmConfigDatumFor});
+     * captured getters remain untouched.
      */
     public static Utxo syntheticLatestLmConfigUtxo(String txHash, int outputIndex) {
-        String datum = replaceCapturedCredential(
-                fixture("fourth-deployment-lm-config-datum.hex"),
-                "dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457",
-                REGISTRY.getLmCompoundActionScriptHash(), "LMConfigDatum[3]");
-        return configUtxo(txHash, outputIndex, LM_CONFIG_POLICY_ID, datum);
-    }
-
-    private static String replaceCapturedCredential(String captured, String oldValue,
-                                                     String latestValue, String field) {
-        int first = captured.indexOf(oldValue);
-        if (first < 0 || first != captured.lastIndexOf(oldValue)) {
-            throw new IllegalStateException(field + " is not uniquely present in the captured datum");
-        }
-        return captured.substring(0, first) + latestValue + captured.substring(first + oldValue.length());
+        return configUtxo(txHash, outputIndex, LM_CONFIG_POLICY_ID, syntheticLmConfigDatumFor(REGISTRY));
     }
 
     private static Utxo configUtxo(String txHash, int outputIndex, String policyId, String datumHex) {

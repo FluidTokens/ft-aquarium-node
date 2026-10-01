@@ -87,8 +87,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       floor <em>out of the bot's own inputs</em>. It is the borrower's money on arrival and the
  *       bot's on departure.</li>
  * </ul>
- * <b>That is ~2.19 ADA out of pocket, not ~1.4</b> — {@code COMPENSATION_MIN_ADA} 1,655,040 plus
- * {@code TX_FEE} 539,546.
+ * <b>That is ~2.20 ADA out of pocket, not ~1.4</b> — {@code COMPENSATION_MIN_ADA} 1,655,040 plus
+ * {@code TX_FEE} 548,801 (539,546 before FluidTokens' 2026-10-01 claim action; see {@code TX_FEE}).
  *
  * <p>⛔ <b>AND THE VERDICT FLIPPED ON 2026-09-04, which is worth more than the number.</b> The outlay
  * used to be ~3.02 ADA and the note here said so: against the preview
@@ -100,7 +100,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p><b>Re-measured after the fixtures moved to the FOURTH deployment, the fee is 824,692 lovelace
  * lower</b> (evaluation cost against a different ConfigDatum; the body layout and the synthetic
  * reference-script coordinates did not change). The same arithmetic is now
- * {@code 0 − 2,194,586 − (−3,000,000) = +805,414} — <b>a loan the node would ACCEPT.</b>
+ * {@code 0 − 2,194,586 − (−3,000,000) = +805,414} — <b>a loan the node would ACCEPT.</b> (Against the
+ * 2026-10-01 claim action: {@code 0 − 2,203,841 − (−3,000,000) = +796,159}; the verdict holds.)
  *
  * <p>⚠ <b>Read that as what it is.</b> Nothing about the loan changed and nothing about the operator's
  * policy changed; a fee moved and a decision inverted, because the scenario was sitting nineteen
@@ -253,7 +254,10 @@ class RealEquityLoanDryEvalTest {
      * {@link #COMPENSATION_MIN_ADA} it is the operator's whole outlay on this loan, and the operator
      * warning in this class's javadoc quotes both.
      */
-    private static final long TX_FEE = 539_546L;
+    private static final long TX_FEE = 548_801L;
+    // ⚠ RE-MEASURED 2026-10-01, from 539,546 (+9,255): the rig now builds against FluidTokens' FTAI-001
+    // claim action, which is larger and evaluates the new LenderManager-action check. Same body layout,
+    // same fixtures; the difference is script size and evaluation cost.
     // ⚠ RE-MEASURED 2026-09-04, from 1,364,238 — a 824,692 lovelace DROP, and it is not a relaxation.
     // The fixtures moved from the THIRD preview deployment to the FOURTH (Giovanni's ruling), which
     // changes the ConfigDatum this transaction reads as a reference input. The fee is size + ex-units,
@@ -261,7 +265,7 @@ class RealEquityLoanDryEvalTest {
     // unchanged — so the difference is EVALUATION COST against a different config datum. The figure is
     // an OUTPUT of the build, pinned so the operator note below quotes a measured number rather than a
     // remembered one; re-pinning it is what keeps that promise. The operator's outlay on this loan is
-    // now COMPENSATION_MIN_ADA + TX_FEE ≈ 2.19 ADA, not the ~3.02 the note used to quote.
+    // now COMPENSATION_MIN_ADA + TX_FEE ≈ 2.20 ADA, not the ~3.02 the note used to quote.
 
     // ---- the synthetic remainder -----------------------------------------------------------------
 
@@ -269,8 +273,8 @@ class RealEquityLoanDryEvalTest {
     private static final String TX_LM_CONFIG = "f2".repeat(32);
     private static final String TX_WALLET = "e0".repeat(32);
 
-    private static final Utxo CONFIG_UTXO = LoanFixtures.configUtxo(TX_CONFIG, 0);
-    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.lmConfigUtxo(TX_LM_CONFIG, 0);
+    private static final Utxo CONFIG_UTXO = LoanFixtures.syntheticLatestConfigUtxo(TX_CONFIG, 0); // synthetic: the captured preview datum names the pre-2026-10-01 claim
+    private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 50_000_000L);
 
@@ -418,7 +422,7 @@ class RealEquityLoanDryEvalTest {
         assertEquals(BigInteger.valueOf(COMPENSATION_MIN_ADA), compensation.getValue().getCoin(),
                 "the min-ada rider the bot funds on the borrower's compensation output");
         assertEquals(BigInteger.valueOf(TX_FEE), body.getBody().getFee(),
-                "the other half of the operator's outlay — the two together are the ~2.19 ADA the "
+                "the other half of the operator's outlay — the two together are the ~2.20 ADA the "
                         + "class javadoc quotes, against a fee slice of zero");
 
         TransactionOutput claimedCollateral = assetManager.get(1);

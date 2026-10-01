@@ -55,18 +55,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         disabledReason = "reads mainnet: run with `set -a; . ./.env.mainnet; set +a`")
 class MainnetReferenceScriptsTest {
 
-    private static final String CONFIG_POLICY_ID = "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416";
-    private static final String LM_CONFIG_POLICY_ID = "a56b0ac2654663f395601601a7825649e5488905648747e912d870e4";
+    // ⛔ RE-GROUNDED 2026-10-01. Until then this class derived from the FIRST mainnet deployment's policy
+    // ids (db2c498e… / a56b0ac2…), pinned config UTxOs that had been spent, and a compound coordinate the
+    // shipped set no longer carried -- red by inspection, and invisible, because it skips without a key.
+    // The derivation coordinates are now read from application.yaml like the reference coordinates are:
+    // a gate that keeps its own copy of the thing it guards is guarding the copy.
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
-    private static final String SMART_TOKENS_SPEND = "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa";
-    private static final String MS_POOL_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
-    private static final String MS_POOL_SPEND = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
-    private static final String MS_ORDER_SPEND = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
-    private static final String CONFIG = "ffced74c7936e803d9f3aedd5abe7e5261e14515dc1a0b045cdb2f03c8b0d36b#0";
-    private static final String LM_CONFIG = "1c4a91283f9fc2bffe13c0b10584b1d1492f770e910bd858da8586c395a8bdaa#0";
-    private static final String COMPOUND = "8d92115bb26dece0f197b110b0cf2c9bfa5f542cb1fd4dc53e595f1a1b73341a#0";
-    private static final String OLD_COMPOUND = "954f8be5773c3ebce3377ecb7a420f407ef18500638bb6d7db0022ed9e9b7c50#0";
-    private static final String COMPOUND_HASH = "ad34c3db53d20c1e368d7fea64724a0b0249b603a57c8f2a1670bda6";
+    /** The config NFT outputs after FluidTokens' 2026-10-01 in-place update (their CONFIG_REF_UTXO / LM_CONFIG_REF_UTXO). */
+    private static final String CONFIG = "3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c#0";
+    private static final String LM_CONFIG = "ab3e3aafe7ea0e6fec24d9ac9249e01edb242dee55aeaa2399da097a21177620#0";
+    /** lm_compound_action since 2026-10-01 (LMConfigDatum[3]). */
+    private static final String COMPOUND = "29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0";
+    /** lm_compound_action before 2026-10-01 -- still unspent, which is what makes it a fair negative. */
+    private static final String OLD_COMPOUND = "ec592cc9e0dffdc1fdefa197cb353c4f60a07910c257cd4236293b844ceeabb7#0";
+    private static final String COMPOUND_HASH = "71515a89fd399166d8d1e6a63d49822fc2684b76782c8bbf3f817982";
 
     private static final String BF = "https://cardano-mainnet.blockfrost.io/api/v0";
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -120,19 +122,27 @@ class MainnetReferenceScriptsTest {
                 ? output.get("reference_script_hash").asText() : null;
     }
 
-    private static void assertUnspent(String coordinate, JsonNode output) throws Exception {
+    /**
+     * ⛔ Read off the creating transaction's own output ({@code consumed_by_tx}), NOT by paging the
+     * address's UTxO set. FluidTokens' reference-script address holds 13,074 UTxOs (2026-10-01) and the
+     * paging this replaced stopped at 2,000 -- so it reported two live coordinates as spent. A check that
+     * fails on the size of someone else's address is measuring the address, not the coordinate.
+     */
+    private static void assertUnspent(String coordinate, JsonNode output) {
         assertTrue(output != null, coordinate + " is absent from its creating transaction");
-        String[] parts = coordinate.split("#");
-        for (int page = 1; page <= 20; page++) {
-            JsonNode current = get("/addresses/" + output.get("address").asText()
-                    + "/utxos?count=100&page=" + page + "&order=asc");
-            for (JsonNode utxo : current) {
-                if (parts[0].equals(utxo.get("tx_hash").asText())
-                        && Integer.parseInt(parts[1]) == utxo.get("output_index").asInt()) return;
-            }
-            if (current.size() < 100) break;
-        }
-        throw new AssertionError(coordinate + " is not in the current UTxO set at its address");
+        assertTrue(output.has("consumed_by_tx"),
+                "blockfrost no longer reports consumed_by_tx -- this check cannot tell spent from unspent");
+        assertTrue(output.get("consumed_by_tx").isNull(),
+                coordinate + " was spent by " + output.get("consumed_by_tx").asText());
+    }
+
+    /** The control: an output known to be spent must read as spent, or the check above proves nothing. */
+    @Test
+    void aSpentOutputReadsAsSpent() throws Exception {
+        // The ConfigDatum UTxO of 2026-09-30, consumed by FluidTokens' 2026-10-01 in-place update.
+        String spent = "3add9d6809c408fc627e93c60065e96857ba5c726d405a5808ee33a7f937c450#0";
+        assertThrows(AssertionError.class, () -> assertUnspent(spent, publishedOutput(spent)),
+                "a known-spent output passed the unspent check");
     }
 
     @SuppressWarnings("unchecked")
@@ -184,10 +194,37 @@ class MainnetReferenceScriptsTest {
         }
     }
 
-    private static LoansContractRegistry mainnetRegistry() {
-        return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID,
-                CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
-                MS_POOL_POLICY, MS_POOL_SPEND, MS_ORDER_SPEND);
+    /** A shipped mainnet default ({@code ${ENV:value}} in the FIRST yaml document), by dotted path. */
+    @SuppressWarnings("unchecked")
+    private static String shipped(String dotted) throws IOException {
+        try (InputStream in = MainnetReferenceScriptsTest.class.getClassLoader()
+                .getResourceAsStream("application.yaml")) {
+            assertTrue(in != null, "application.yaml is absent from the test classpath");
+            Object node = new Yaml().loadAll(new String(in.readAllBytes(), StandardCharsets.UTF_8)).iterator().next();
+            for (String key : dotted.split("\\.")) {
+                node = ((Map<String, Object>) node).get(key);
+            }
+            String placeholder = String.valueOf(node);
+            int colon = placeholder.indexOf(':');
+            assertTrue(placeholder.startsWith("${") && colon > 1 && placeholder.endsWith("}"),
+                    dotted + " is not an env-overridable shipped default");
+            return placeholder.substring(colon + 1, placeholder.length() - 1);
+        }
+    }
+
+    private static String configPolicyId() throws IOException {
+        return shipped("loans.config.policy-id");
+    }
+
+    private static String lmConfigPolicyId() throws IOException {
+        return shipped("loans.lm-config.policy-id");
+    }
+
+    private static LoansContractRegistry mainnetRegistry() throws IOException {
+        return new LoansContractRegistry(configPolicyId(), lmConfigPolicyId(),
+                CONFIG_ASSET_NAME, shipped("loans.smart-tokens-spend-script-hash"),
+                shipped("loans.minswap.pool-policy-id"), shipped("loans.minswap.pool-spend-script-hash"),
+                shipped("loans.minswap.order-spend-script-hash"));
     }
 
     private static Set<String> liveCompoundHashes(List<String> coordinates) throws Exception {
@@ -292,9 +329,9 @@ class MainnetReferenceScriptsTest {
 
     @Test
     void currentConfigOutputsAreUnspentExactNftsWithCapturedDatums() throws Exception {
-        assertCurrentConfig(CONFIG, CONFIG_POLICY_ID + CONFIG_ASSET_NAME, "mainnet-config-datum.hex");
-        assertCurrentConfig(LM_CONFIG, LM_CONFIG_POLICY_ID + CONFIG_ASSET_NAME,
-                "mainnet-lm-config-datum.hex");
+        assertCurrentConfig(CONFIG, configPolicyId() + CONFIG_ASSET_NAME, "mainnet-config-datum-2026-10-01.hex");
+        assertCurrentConfig(LM_CONFIG, lmConfigPolicyId() + CONFIG_ASSET_NAME,
+                "mainnet-lm-config-datum-2026-10-01.hex");
     }
 
     private static void assertCurrentConfig(String coordinate, String nft, String fixture) throws Exception {
@@ -310,5 +347,48 @@ class MainnetReferenceScriptsTest {
             assertEquals(new String(in.readAllBytes(), StandardCharsets.UTF_8).trim(),
                     output.get("inline_datum").asText(), coordinate + " inline datum differs from capture");
         }
+    }
+
+    /**
+     * ⛔ <b>Every withdraw credential a liquidation path uses has a REGISTERED reward account.</b> An
+     * unregistered one passes evaluation and fails only at submit ({@code ConwayWithdrawalsMissingAccounts},
+     * findings §57.8), so nothing offline can see it.
+     *
+     * <p>Measured RED on 2026-10-01 (FluidTokens published the redeployed withdraw scripts unregistered:
+     * claim, lm-liquidate, lm-pay-in-advance, lm-convert), then GREEN the same day once they were registered.
+     * Registration is read from the account's registration HISTORY, not {@code active} -- §60:
+     * active=false did not mean unregistered.
+     */
+    @Test
+    void everyLiquidationWithdrawCredentialIsRegistered() throws Exception {
+        LoansContractRegistry registry = mainnetRegistry();
+        Map<String, String> credentials = new LinkedHashMap<>();
+        credentials.put("loan-claim-action", registry.getLoanClaimActionScriptHash());
+        credentials.put("lm-liquidate-action", registry.getLmLiquidateActionScriptHash());
+        credentials.put("lm-liquidate-and-pay-in-advance-action", registry.getLmLiquidateAndPayInAdvanceActionScriptHash());
+        credentials.put("lm-liquidate-and-convert-action", registry.getLmLiquidateAndConvertActionScriptHash());
+        credentials.put("lender-manager", registry.getLenderManagerWithdrawScriptHash());
+        credentials.put("asset-manager", registry.getAssetManagerWithdrawScriptHash());
+        credentials.put("loan", registry.getLoanPolicyId());
+
+        List<String> unregistered = new ArrayList<>();
+        for (var e : credentials.entrySet()) {
+            String stake = com.bloxbean.cardano.client.address.AddressProvider.getRewardAddress(
+                    com.bloxbean.cardano.client.address.Credential.fromScript(e.getValue()),
+                    com.bloxbean.cardano.client.common.model.Networks.mainnet()).toBech32();
+            String last = null;
+            try {
+                for (JsonNode event : get("/accounts/" + stake + "/registrations?order=asc&count=100")) {
+                    last = event.get("action").asText();
+                }
+            } catch (IllegalStateException notFound) {
+                last = null;   // a 404: the account has never existed
+            }
+            if (!"registered".equals(last)) {
+                unregistered.add(e.getKey() + " " + e.getValue() + " (" + stake + ")");
+            }
+        }
+        assertTrue(unregistered.isEmpty(), "withdraw credentials with no registered reward account -- every "
+                + "liquidation using them fails at submit: " + unregistered);
     }
 }

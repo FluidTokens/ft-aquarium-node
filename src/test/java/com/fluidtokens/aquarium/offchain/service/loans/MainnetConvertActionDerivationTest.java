@@ -83,9 +83,15 @@ class MainnetConvertActionDerivationTest {
         return BytesPlutusData.of(HexUtil.decodeHexString(hex));
     }
 
+    /**
+     * ⚠ Pinned to the artefact the node shipped before FluidTokens' 2026-10-01 redeploy. This class is
+     * the receipt for the 2026-09-04 convert fix: its parameters include the CLAIM credential, which the
+     * 2026-10-01 artefact derives differently (two new parameters). Judging the 2026-09-04 deployment by
+     * today's claim would measure the redeploy, not the fix.
+     */
     private static LoansContractRegistry mainnetRegistry() {
-        return new LoansContractRegistry(CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME,
-                SMART_TOKENS_SPEND);
+        return new LoansContractRegistry("loans-v4-2026-09-17.plutus.json", CONFIG_POLICY_ID,
+                LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND);
     }
 
     /** The eleven, in the registry's order. The two empty ones are the absent CIP-113 counterparts. */
@@ -162,7 +168,10 @@ class MainnetConvertActionDerivationTest {
      */
     @Test
     void ourVendoredBlueprintNowDerivesTheDeployedAction() {
-        LoansContractRegistry registry = new LoansContractRegistry(
+        // ⚠ The artefact of the time (see mainnetRegistry). That the SHIPPED artefact derives what mainnet
+        // runs TODAY is asserted against the live 2026-10-01 capture in MainnetBlueprintSelectionTest
+        // (CONVERT) and ConvertActionDerivationTest.
+        LoansContractRegistry registry = new LoansContractRegistry("loans-v4-2026-09-17.plutus.json",
                 CONFIG_POLICY_ID, LM_CONFIG_POLICY_ID, CONFIG_ASSET_NAME, SMART_TOKENS_SPEND,
                 MINSWAP_POOL_POLICY, MINSWAP_POOL_SPEND, MINSWAP_ORDER_SPEND);
 

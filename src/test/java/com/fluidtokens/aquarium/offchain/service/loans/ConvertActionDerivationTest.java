@@ -53,8 +53,13 @@ class ConvertActionDerivationTest {
      * hash; this one proves the ARTEFACT WE SHIP does. They would disagree if the vendored file were
      * ever something other than what FluidTokens built, which is the whole §51/§53 failure class.
      */
+    //
+    // ⛔ MOVED AGAIN 2026-10-01: FluidTokens' FTAI-001 redeploy gave the claim action two new parameters,
+    // and this action takes the claim credential as its last parameter, so it moved with it
+    // (2432ab45… → cbf3e8c5…) without its own code changing. Read off the live LMConfigDatum captured that
+    // day (mainnet-lm-config-datum-2026-10-01.hex, field 5).
     private static final String MAINNET_CONVERT_ACTION =
-            "2432ab45c54570998ad5379c46fec2276ea72a94c7ffb6510bcd3aa8";
+            "cbf3e8c5a42e6d0f505540d5aa2104b7e29a9c3a7ade581df74ba774";
     /** Field 5 of the live preview LMConfigDatum — a DIFFERENT Minswap deployment's. */
     private static final String PREVIEW_CONVERT_ACTION =
             "aa3628d86e3f16b7d797d0633087859c11e3d200a5defc8ff0fc920e";
@@ -93,7 +98,8 @@ class ConvertActionDerivationTest {
         // moved at bb4349c: the convert action's compiled code changed, which is the whole point of
         // the re-vendor. Pinned again rather than dropped, because an inequality that stops being
         // checked against a known value stops noticing anything.
-        assertEquals("7227c4ef46c5895ea0d1d6aca757f9fd3346daee899ba55d5d566470", derived,
+        // ⚠ RE-MEASURED 2026-10-01: the claim credential it is parameterised by moved (FTAI-001 redeploy).
+        assertEquals("29cd6aab6bb38e03dfe14ec68fcd7ddf3de4a1de99b0e2880d2af1cb", derived,
                 "the measured value, pinned so a change in the derivation is visible rather than "
                         + "hidden behind the inequality above");
     }
@@ -161,7 +167,7 @@ class ConvertActionDerivationTest {
     @Test
     void theMainnetLmConfigDatumReallyPublishesThatHashAtFieldFive() throws IOException {
         try (InputStream is = ConvertActionDerivationTest.class
-                .getResourceAsStream("/loans-v4/mainnet-lm-config-datum.hex")) {
+                .getResourceAsStream("/loans-v4/mainnet-lm-config-datum-2026-10-01.hex")) {
             String hex = new String(is.readAllBytes(), StandardCharsets.UTF_8).trim();
             assertTrue(hex.contains(MAINNET_CONVERT_ACTION),
                     "the fixture must actually carry the hash this test asserts against, or the "
