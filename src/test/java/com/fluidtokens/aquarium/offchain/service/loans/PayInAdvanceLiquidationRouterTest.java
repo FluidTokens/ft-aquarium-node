@@ -298,7 +298,8 @@ class PayInAdvanceLiquidationRouterTest {
 
     /**
      * ⛔ And the COLLATERAL's named oracle must price the collateral token: present under that NFT but
-     * pricing another, it is refused by name — before, numbers() priced the loan with it.
+     * pricing another, it is refused by name — before, numbers() priced the loan with it. Not a
+     * PayInAdvanceNotModelledException (round-2 audit finding 2): see the router.
      */
     @Test
     void aCollateralOracleThatPricesAnotherTokenIsRefusedCleanly() {
@@ -309,8 +310,9 @@ class PayInAdvanceLiquidationRouterTest {
                 named.referenceInput(), named.referenceScript(), named.verificationKeys(), named.threshold(),
                 named.feed(), named.signatures(), named.charlieProviderReferenceInput());
 
-        PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
-                PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
+        // IllegalStateException, so the executor quarantines it rather than advising CONVERT (which
+        // refuses the same loan for the same reason).
+        IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(), CONFIG_UTXO,
                         LM_CONFIG_UTXO, Map.of(named.oracleToken().toUnit(), wrongToken), AMPLE_BALANCE,
                         anyWallet(), NOW, VALID_TO_MILLIS));

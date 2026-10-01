@@ -588,10 +588,19 @@ public class LiquidationReadinessController {
      * unavailable the reason survives unchanged; the page must never turn "could not ask" into
      * "no pool", because one says try again shortly and the other says hold capital from now on.
      */
-    private PoolUsability usabilityFor(PoolFetch fetched, Loan loan, LenderBond bond,
+    /** Why an ADA-collateral row has no pool verdict: this node builds no liquidation for one. */
+    static final String ADA_COLLATERAL_NOT_LIQUIDATED =
+            "ada collateral: this node builds no liquidation for it (no collateral oracle leg), so no "
+                    + "pool verdict is given";
+
+    PoolUsability usabilityFor(PoolFetch fetched, Loan loan, LenderBond bond,
                                        AssetType collateral, AssetType principal, long now) {
         if (fetched.unavailable() != null) {
             return fetched.unavailable();
+        }
+        if (loan.datum().collateral().isAda()) {
+            return new PoolUsability(PoolUsability.Verdict.UNKNOWN,
+                    ADA_COLLATERAL_NOT_LIQUIDATED);
         }
         var numbers = numbersFor(loan, bond, now);
         if (numbers == null) {
@@ -835,15 +844,13 @@ public class LiquidationReadinessController {
         // token lookup, tolerated as a "controller-only simplification" while every token had one
         // oracle; since 2026-09-30 a token can have two (v1 Lending v3, v2 Lending v4), and these
         // figures must be the ones the transaction for THIS loan would be built from.
-        // ⚠ ADA collateral has no oracle: retrieve_oracle_data synthesises the 1:1 feed, and numbers()
-        // reads only the feed — so a unit entry stands in. (Before, ADA collateral returned null here,
-        // on main as well: there is no registry entry to find.)
-        Optional<OracleEntry> oracle = loan.datum().collateral().isAda()
-                ? Optional.of(new OracleEntry(AssetType.ada(), AssetType.ada(), null, null, null, null,
-                        List.of(), 0, com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed.unit(),
-                        List.of(), null))
-                : client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
-                        .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
+        // ⚠ ADA collateral gets NO figures, deliberately: its datum names the NONE sentinel, which has no
+        // registry entry, so this returns null. Do not synthesise a 1:1 entry here — neither liquidation
+        // path builds an ada-collateral loan (convert refuses COLLATERAL_ORACLE_MISSING, pay-in-advance
+        // has no collateral oracle to price with), and figures become a pool verdict and a "would act"
+        // the bot cannot honour. usabilityFor says why instead (oracle re-slice, round-2 audit finding 1).
+        Optional<OracleEntry> oracle = client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
+                .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
         if (oracle.isEmpty()) {
             return null;
         }

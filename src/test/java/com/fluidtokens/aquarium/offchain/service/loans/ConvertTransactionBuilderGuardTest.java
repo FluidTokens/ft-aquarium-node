@@ -446,6 +446,26 @@ class ConvertTransactionBuilderGuardTest {
     }
 
     /**
+     * The positive (round-2 audit finding 4): the right-token oracle passes the oracle guard. The build
+     * still stops later — this fixture has no inputs — but never on COLLATERAL_ORACLE_MISSING.
+     */
+    @Test
+    void aCollateralOracleThatPricesTheCollateralPassesTheOracleGuard() {
+        ConvertOrderPlan p = plan();
+        var req = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
+                oracle(), null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L);
+
+        try {
+            builder().build(req);
+        } catch (ConvertTransactionBuilder.RefusedException e) {
+            assertNotEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_ORACLE_MISSING, e.reason(), e.getMessage());
+        } catch (RuntimeException expectedLaterFailure) {
+            // past the oracle guard: anything after it is outside this test's question
+        }
+    }
+
+    /**
      * ⛔ <b>AND NOT THE SIBLING'S CALL.</b> {@code LiquidatePayInAdvanceTransactionBuilder} passes
      * {@code List.of()} for the signatures — correct for a Charli3/Orcfax feed, whose price is proven
      * by a provider reference input instead. <b>Mainnet FLDT is multisig</b> (findings §40), so its

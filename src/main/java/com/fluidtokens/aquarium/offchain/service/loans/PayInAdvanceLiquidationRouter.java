@@ -160,9 +160,13 @@ public class PayInAdvanceLiquidationRouter {
                 datum.collateral().assetType(), datum.collateral().oracleTokenAsset());
         // A token collateral is refused by name, never an NPE in numbers(), which prices it through this
         // entry. (Ada collateral keeps its existing path: no registry entry exists for it.)
+        // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException: the executor answers that one
+        // with "set this market's action to CONVERT", and convert refuses this loan for the same reason
+        // (ConvertLiquidationRouter throws the same) — the advice would re-route a whole market for
+        // nothing. Quarantined like the convert router's refusal and like the NPE it replaces.
         if (collateralOracle == null && !datum.collateral().isAda()) {
-            throw new PayInAdvanceNotModelledException(
-                    "pay-in-advance not yet modelled: no oracle entry for collateral oracle asset "
+            throw new IllegalStateException(
+                    "no oracle entry for collateral oracle asset "
                             + datum.collateral().oracleTokenAsset().toUnit() + " pricing "
                             + datum.collateral().assetType().toUnit());
         }

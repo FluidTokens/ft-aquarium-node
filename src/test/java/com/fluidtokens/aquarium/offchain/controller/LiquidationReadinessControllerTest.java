@@ -664,12 +664,13 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
-     * ADA collateral has no registry oracle — retrieve_oracle_data synthesises the 1:1 feed. The figures
-     * must still come out (oracle re-slice, cross-provider finding 1; null here on main as well): the
-     * same arithmetic as the two-feed test above, whose collateral is also priced 1, gives 97,500,000.
+     * ADA collateral gets no figures (round-2 audit finding 1): neither liquidation path builds one, and
+     * figures here would become a pool verdict and a "would CONVERT" the bot cannot honour. The row
+     * carries {@link LiquidationReadinessController#ADA_COLLATERAL_NOT_LIQUIDATED} instead — even with
+     * the principal's oracle present, so it is the collateral, not a missing feed, that withholds them.
      */
     @Test
-    void advanceAmountIsComputedForAnAdaCollateral() {
+    void anAdaCollateralGetsNoFiguresBecauseNoPathLiquidatesIt() {
         LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
                 BigInteger.valueOf(100_000_000L), BigInteger.ZERO, LoanFixtures.adaCollateral(), 0L,
                 LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
@@ -685,7 +686,15 @@ class LiquidationReadinessControllerTest {
         LiquidationReadinessController controller = controllerWith(
                 new FakeOracleClient(principalOracle), LoanFixtures.registry());
 
-        assertEquals(BigInteger.valueOf(97_500_000L), controller.advanceAmount(loan, bond, 1_000L));
+        assertNull(controller.advanceAmount(loan, bond, 1_000L),
+                "no figures for a loan neither liquidation path can build");
+        // A pool IS available, so the only thing withholding a verdict is the ada collateral — and the
+        // row says so, rather than claiming a pool could fill a liquidation the bot will not build.
+        var usability = controller.usabilityFor(
+                new LiquidationReadinessController.PoolFetch(List.of(), null), loan, bond,
+                AssetType.ada(), PRINCIPAL_TOKEN, 1_000L);
+        assertEquals(PoolUsability.Verdict.UNKNOWN, usability.verdict());
+        assertEquals(LiquidationReadinessController.ADA_COLLATERAL_NOT_LIQUIDATED, usability.detail());
     }
 
     /** The version label is the named oracle's only if it prices the collateral token (finding 3). */
