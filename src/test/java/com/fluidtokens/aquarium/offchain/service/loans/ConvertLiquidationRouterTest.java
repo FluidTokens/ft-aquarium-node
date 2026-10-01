@@ -193,4 +193,62 @@ class ConvertLiquidationRouterTest {
                 "a token-collateral order carries the Minswap overhead and nothing else; the wallet "
                         + "nomination must be sized to that, not to list position");
     }
+
+    /**
+     * ⛔ The collateral oracle the datum names must price the COLLATERAL token (oracle re-slice,
+     * cross-provider finding 2): present under that NFT but pricing another token, it is refused by
+     * name — never built with, and never an NPE inside the equity arithmetic.
+     */
+    @Test
+    void aCollateralOracleThatPricesAnotherTokenIsRefusedByName() {
+        OracleEntry named = collateralOracle().get(LoanFixtures.NO_ORACLE.toUnit());
+        AssetType otherToken = new AssetType("e".repeat(56), FLDT.assetName());
+        OracleEntry wrongToken = new OracleEntry(otherToken, named.oracleToken(), named.rewardAddress(),
+                named.withdrawCredentialHash(), named.referenceInput(), named.referenceScript(),
+                named.verificationKeys(), named.threshold(), named.feed(), named.signatures(),
+                named.charlieProviderReferenceInput());
+
+        var e = assertThrows(IllegalStateException.class,
+                () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        requirement -> Optional.empty(),
+                        Map.of(LoanFixtures.NO_ORACLE.toUnit(), wrongToken), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertTrue(e.getMessage().contains("pricing " + FLDT.toUnit()), e.getMessage());
+    }
+
+    /**
+     * ⛔ The PRINCIPAL leg's named oracle too: a token principal whose datum-named oracle prices another
+     * token is refused by name, not priced with (feedOf goes through OracleEntry.namedForLeg).
+     */
+    @Test
+    void aPrincipalOracleThatPricesAnotherTokenIsRefusedByName() {
+        AssetType principal = new AssetType("c".repeat(56), "4e49474854");
+        AssetType principalNft = new AssetType("d".repeat(56), "6f7261636c65");
+        LiquidationAssessment ada = candidate();
+        LoanDatum datum = LoanFixtures.loanDatum(principal, principalNft, BigInteger.valueOf(20_000_000L),
+                BigInteger.valueOf(100L), ada.loan().datum().collateral(), 1_700_000_000_000L,
+                ada.loan().datum().liquidationMode(), ada.loan().datum().repaymentMode(), false);
+        Loan loan = new Loan("aa".repeat(32), 0, "addr_loan", "cafe",
+                BigInteger.valueOf(100_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("bb".repeat(32), 0, "addr_bond", "cafe", "d87980",
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50L),
+                        LoanFixtures.noStakeCredential(), principal));
+        LiquidationAssessment tokenPrincipal = LiquidationAssessment.buildable(bond, loan, "token principal",
+                BigInteger.valueOf(20_000_000L), BigInteger.ZERO, false, BigInteger.valueOf(5_000_000L));
+        AssetType otherToken = new AssetType("e".repeat(56), principal.assetName());
+        OracleEntry wrongToken = LoanFixtures.multisig(otherToken, principalNft, "ee".repeat(28),
+                new OraclePriceFeed(OraclePriceFeed.Variant.AGGREGATED, otherToken, BigInteger.ONE,
+                        BigInteger.ONE, 1_759_000_000_000L, 1_799_000_000_000L),
+                null, null, java.util.List.of());
+        Map<String, OracleEntry> oracles = new java.util.HashMap<>(collateralOracle());
+        oracles.put(principalNft.toUnit(), wrongToken);
+
+        var e = assertThrows(IllegalStateException.class,
+                () -> router().buildConvertLiquidation(tokenPrincipal, loanUtxo(), null, null, null,
+                        requirement -> Optional.empty(), oracles, "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertTrue(e.getMessage().contains("pricing " + principal.toUnit()), e.getMessage());
+    }
 }

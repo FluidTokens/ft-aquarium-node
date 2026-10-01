@@ -9,12 +9,17 @@ import java.util.List;
  * Everything the registry knows about one asset's oracle — the price, and the deployment a
  * liquidation transaction has to reference.
  * <p>
- * There is one of these per priced asset, not one per protocol: the registry publishes 19 entries
- * with 19 distinct reward addresses. That is forced by the validator, because
+ * There is one of these per ORACLE NFT. Since 2026-09-30 that is not one per priced asset: the
+ * registry lists most tokens twice — {@code oracleVersion} 1 (Lending v3) and 2 (Lending v4), under
+ * different NFT policies — 35 entries across 19 tokens on 2026-10-01. A loan names exactly one of them
+ * ({@link #oracleToken}), and the validator requires exactly that NFT.
+ * <p>
+ * Two versions may share one withdraw CREDENTIAL (FLDT's v1 and v2 run one script under two NFTs).
  * {@code retrieve_oracle_data} resolves its feed with
- * {@code pairs.get_first(redeemers, Withdraw(oraclePaymentCredential))} — one redeemer per
- * credential. A loan with a token principal <em>and</em> token collateral therefore needs two
- * separate oracle withdrawals, one per leg, each with its own reference input.
+ * {@code pairs.get_first(redeemers, Withdraw(oraclePaymentCredential))} — one redeemer per credential —
+ * so a transaction carries ONE withdrawal per credential but ONE reference input per NFT its legs name.
+ * A loan with a token principal and token collateral behind different credentials needs two
+ * withdrawals, one per leg.
  *
  * @param token           the asset being priced, as it appears inside the signed feed
  * @param oracleToken     the oracle's own NFT. This is what a loan datum points at
@@ -37,6 +42,8 @@ import java.util.List;
  *                        omits it. c3 feeds carry no signature over their own bytes — the validator
  *                        checks them structurally against this reference input instead — so this,
  *                        not a signature count, is what decides whether one is liquidatable.
+ * @param oracleVersion   the registry's {@code oracleVersion}: 1 (Lending v3) or 2 (Lending v4) since
+ *                        2026-09-30; null when the registry omits it (unknown, never an error).
  */
 public record OracleEntry(AssetType token,
                           AssetType oracleToken,
@@ -62,6 +69,23 @@ public record OracleEntry(AssetType token,
                        TransactionInput charlieProviderReferenceInput) {
         this(token, oracleToken, rewardAddress, withdrawCredentialHash, referenceInput, referenceScript,
                 verificationKeys, threshold, feed, signatures, charlieProviderReferenceInput, null);
+    }
+
+    /**
+     * ⛔ <b>The oracle a loan names for one LEG — only if it prices that leg's token.</b> The ONE rule
+     * every NFT-keyed lookup on a loan's behalf goes through (oracle re-slice, cross-provider finding 2):
+     * {@code retrieve_oracle_data}'s {@code is_feed_token_correct} refuses an oracle for another token,
+     * so such an entry is no oracle for this leg — never a price to compute with.
+     *
+     * @return the entry, or null when the map has none for {@code oracleToken} or it prices another token
+     */
+    public static OracleEntry namedForLeg(java.util.Map<String, OracleEntry> byOracleNft, AssetType asset,
+                                          AssetType oracleToken) {
+        if (byOracleNft == null || asset == null || oracleToken == null) {
+            return null;
+        }
+        OracleEntry entry = byOracleNft.get(oracleToken.toUnit());
+        return entry != null && asset.equals(entry.token()) ? entry : null;
     }
 
     public OracleEntry {

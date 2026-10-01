@@ -156,8 +156,20 @@ public class PayInAdvanceLiquidationRouter {
 
         // The collateral oracle is found by the oracle NFT the loan datum names — the same key the
         // executor's snapshot and the plain builder use, never the priced asset.
-        OracleEntry collateralOracle =
-                oraclesByUnit.get(datum.collateral().oracleTokenAsset().toUnit());
+        OracleEntry collateralOracle = OracleEntry.namedForLeg(oraclesByUnit,
+                datum.collateral().assetType(), datum.collateral().oracleTokenAsset());
+        // A token collateral is refused by name, never an NPE in numbers(), which prices it through this
+        // entry. (Ada collateral keeps its existing path: no registry entry exists for it.)
+        // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException: the executor answers that one
+        // with "set this market's action to CONVERT", and convert refuses this loan for the same reason
+        // (ConvertLiquidationRouter throws the same) — the advice would re-route a whole market for
+        // nothing. Quarantined like the convert router's refusal and like the NPE it replaces.
+        if (collateralOracle == null && !datum.collateral().isAda()) {
+            throw new IllegalStateException(
+                    "no oracle entry for collateral oracle asset "
+                            + datum.collateral().oracleTokenAsset().toUnit() + " pricing "
+                            + datum.collateral().assetType().toUnit());
+        }
 
         // WALL 3 — the principal's own oracle, keyed by the ORACLE-TOKEN unit the loan datum names
         // (datum.principalOracleAsset()), never by the priced asset — the oraclesByUnit snapshot is
@@ -166,11 +178,12 @@ public class PayInAdvanceLiquidationRouter {
         // documents: ada needs no principal oracle at all.
         OracleEntry principalOracle = null;
         if (!datum.principalAsset().isAda()) {
-            principalOracle = oraclesByUnit.get(datum.principalOracleAsset().toUnit());
+            principalOracle = OracleEntry.namedForLeg(oraclesByUnit, datum.principalAsset(),
+                    datum.principalOracleAsset());
             if (principalOracle == null) {
                 throw new PayInAdvanceNotModelledException(
                         "pay-in-advance not yet modelled: no oracle entry for principal oracle asset "
-                                + datum.principalOracleAsset().toUnit());
+                                + datum.principalOracleAsset().toUnit() + " pricing " + datum.principalAsset().toUnit());
             }
         }
 

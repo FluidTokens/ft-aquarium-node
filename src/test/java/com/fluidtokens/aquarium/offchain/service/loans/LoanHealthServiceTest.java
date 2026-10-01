@@ -269,10 +269,18 @@ class LoanHealthServiceTest {
                 .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 2,");
         String namedV1 = entry(PRINCIPAL, PRINCIPAL_PRICE, VALID_FROM, VALID_TO)
                 .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 1,");
-        String registry = "[%s,%s,%s]".formatted(
+        // ⛔ And the COLLATERAL leg too (oracle audit round 1, finding 3): its other version, also last.
+        String collateralNamedV1 = entry(COLLATERAL, COLLATERAL_PRICE, VALID_FROM, VALID_TO)
+                .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 1,");
+        String collateralOtherVersionLast = entry(COLLATERAL, 7, VALID_FROM, VALID_TO)
+                .replace("cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+                .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 2,");
+        String registry = "[%s,%s,%s,%s]".formatted(
                 namedV1,
-                entry(COLLATERAL, COLLATERAL_PRICE, VALID_FROM, VALID_TO),
-                otherVersionLast);
+                collateralNamedV1,
+                otherVersionLast,
+                collateralOtherVersionLast);
 
         var health = serviceWith(registry).health(loan(liquidation()), NOW);
 
@@ -283,8 +291,32 @@ class LoanHealthServiceTest {
         var debt = Rational.fromInt(LoanFinance.remainingDebt(datum(liquidation()), NOW));
         assertEquals(LoanFinance.currentLtv(debt, Rational.fromInt(COLLATERAL_AMOUNT), namedFeed, collateralFeed),
                 health.currentLtv(),
-                "the debt must be priced off the oracle the datum names (price 5), not the token's "
-                        + "other version listed last (price 9)");
+                "both legs must be priced off the oracles the datum names (principal 5, collateral 2), "
+                        + "not the tokens' other versions listed last (9 and 7)");
+    }
+
+    /**
+     * ⛔ An ADA principal needs no oracle and prices 1:1, whatever the datum's oracle field holds
+     * (oracle audit r2, finding 1: deleting findFeedForLeg's ada branch left every test green while
+     * every ada-principal loan's health went blank).
+     */
+    @Test
+    void anAdaPrincipalLoanIsPricedWithOnlyACollateralOracle() throws Exception {
+        var adaDatum = new LoanDatum(BigInteger.ZERO, BigInteger.valueOf(1_000_000), BigInteger.valueOf(LEND_DATE),
+                BigInteger.ZERO, BigInteger.valueOf(1_000), BigInteger.ZERO,
+                AssetType.ada(), new AssetType("4e4f4e45", "4e4f4e45"),
+                BigInteger.ZERO, BigInteger.ZERO, liquidation(),
+                new RepaymentMode.PerpetualLoan(BigInteger.valueOf(28), BigInteger.valueOf(5)),
+                BigInteger.ZERO, BigInteger.ZERO, false, "00",
+                new CollateralAsset(COLLATERAL.policyId(), Optional.of(COLLATERAL.assetName()), COLLATERAL_ORACLE));
+        var adaLoan = new Loan("ab".repeat(32), 0, "addr_test1", "cafe", COLLATERAL_AMOUNT,
+                BigInteger.valueOf(3_000_000), adaDatum);
+
+        var health = serviceWith("[%s]".formatted(entry(COLLATERAL, COLLATERAL_PRICE, VALID_FROM, VALID_TO)))
+                .health(adaLoan, NOW);
+
+        assertNull(health.unavailableReason(), "ada needs no oracle: " + health.unavailableReason());
+        assertTrue(health.currentLtv() != null, "an ada-principal loan must still get an LTV");
     }
 
     @Test

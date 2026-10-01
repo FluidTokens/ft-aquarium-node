@@ -2151,6 +2151,19 @@ class LiquidationExecutorTest {
                 NOW - 60_000L, NOW + 600_000L);
     }
 
+    /**
+     * The same token's OTHER oracle version: a different NFT policy, its own reference input, and a
+     * different price — the 2026-09-30 v1/v2 shape. Never named by any datum in this class.
+     */
+    private static OracleEntry decoyVersion(OracleEntry named, long price) {
+        OraclePriceFeed feed = OraclePriceFeed.priceDataCharlie(named.token(), BigInteger.valueOf(price),
+                BigInteger.ONE, NOW - 60_000L, NOW + 600_000L);
+        return new OracleEntry(named.token(), new AssetType("dd".repeat(28), named.oracleToken().assetName()),
+                named.rewardAddress(), named.withdrawCredentialHash(), LoanFixtures.input("dd".repeat(32), 7),
+                named.referenceScript(), named.verificationKeys(), named.threshold(), feed, named.signatures(),
+                named.charlieProviderReferenceInput());
+    }
+
     private static OracleEntry principalOracle() {
         return LoanFixtures.charli3(PRINCIPAL_TOKEN_2, PRINCIPAL_TOKEN_2_ORACLE_NFT,
                 PRINCIPAL_TOKEN_2_CREDENTIAL, principalFeed(),
@@ -2199,9 +2212,15 @@ class LiquidationExecutorTest {
         FakeScanner scanner = new FakeScanner(List.of(convert.assessment()));
         FakeResolver resolver = new FakeResolver(allUnspent(List.of(convert)));
         LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        // ⛔ FAB-111 (oracle audit round 1, finding 2): a SECOND oracle version of each token, at a
+        // DIFFERENT price, under another NFT and listed FIRST — so a token lookup (this fake's findEntry
+        // takes the first match) lands on it. The pinned figures below are only reachable through the
+        // oracles the loan's datum names, as the transaction itself uses.
         CountingOracleProvider oracles = new CountingOracleProvider(
-                new FakeOracleClient(List.of(collateralOracle(), principalOracle())),
-                new FakeOracleClient(List.of(collateralOracle(), principalOracle())));
+                new FakeOracleClient(List.of(decoyVersion(collateralOracle(), 77),
+                        decoyVersion(principalOracle(), 9), collateralOracle(), principalOracle())),
+                new FakeOracleClient(List.of(decoyVersion(collateralOracle(), 77),
+                        decoyVersion(principalOracle(), 9), collateralOracle(), principalOracle())));
 
         PayInAdvanceLiquidationRouter router = new PayInAdvanceLiquidationRouter(
                 LoanFixtures.registry(), LoanFixtures.converters(), configuration,

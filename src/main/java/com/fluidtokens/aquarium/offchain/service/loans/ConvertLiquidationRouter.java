@@ -198,11 +198,11 @@ public class ConvertLiquidationRouter {
     }
 
     /** The feed for a non-ada leg, refused by name rather than defaulted when it is absent. */
-    private static OraclePriceFeed feedOf(Map<String, OracleEntry> oracles, AssetType oracleToken) {
-        OracleEntry entry = oracles.get(oracleToken.toUnit());
+    private static OraclePriceFeed feedOf(Map<String, OracleEntry> oracles, AssetType asset, AssetType oracleToken) {
+        OracleEntry entry = OracleEntry.namedForLeg(oracles, asset, oracleToken);
         if (entry == null) {
-            throw new IllegalStateException("no oracle feed for " + oracleToken.toUnit()
-                    + "; the loan's figures cannot be derived at the body's validFrom");
+            throw new IllegalStateException("no oracle feed for " + oracleToken.toUnit() + " pricing "
+                    + asset.toUnit() + "; the loan's figures cannot be derived at the body's validFrom");
         }
         return entry.feed();
     }
@@ -369,8 +369,15 @@ public class ConvertLiquidationRouter {
         // working ones do" — not a search for something novel.
         long[] slots = validitySlots(validFromMillis, validToMillis);
 
-        OracleEntry collateralOracle =
-                oraclesByOracleTokenUnit.get(loan.collateral().oracleTokenAsset().toUnit());
+        OracleEntry collateralOracle = OracleEntry.namedForLeg(oraclesByOracleTokenUnit,
+                loan.collateral().assetType(), loan.collateral().oracleTokenAsset());
+        // A token collateral needs the oracle its datum names, pricing that token; refused by name here
+        // rather than as an NPE inside redeemerEquity (which requires the collateral feed).
+        if (!loan.collateral().isAda() && collateralOracle == null) {
+            throw new IllegalStateException("no oracle feed for " + loan.collateral().oracleTokenAsset().toUnit()
+                    + " pricing " + loan.collateral().assetType().toUnit()
+                    + "; the loan's figures cannot be derived at the body's validFrom");
+        }
 
         // ⛔ THE FIGURES ARE THE LOAN'S AT THE BODY'S OWN validFrom — NOT the assessment's.
         //
@@ -395,7 +402,7 @@ public class ConvertLiquidationRouter {
         // `expectedTokenPolicyId == ""` branch), any other principal needs its own feed.
         OraclePriceFeed principalFeed = loan.principalAsset().isAda()
                 ? OraclePriceFeed.unit()
-                : feedOf(oraclesByOracleTokenUnit, loan.principalOracleAsset());
+                : feedOf(oraclesByOracleTokenUnit, loan.principalAsset(), loan.principalOracleAsset());
         BigInteger equity = LoanFinance.redeemerEquity(
                 (LiquidationMode.Liquidation) loan.liquidationMode(),
                 Rational.fromInt(assessment.loan().collateralAmount()),
