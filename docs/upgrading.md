@@ -17,7 +17,8 @@ error.
 | A setting in `.env` | restart | untouched |
 | You added a **market**, margin, or mode | restart | untouched |
 | You enabled the **UI** | restart | untouched |
-| **FluidTokens redeployed the contracts** | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
+| **FluidTokens redeployed the contracts** (new config NFTs) | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
+| FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01) | §4.8 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 
 The first four are ordinary. The last two are the subject of this guide.
@@ -214,6 +215,37 @@ docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config ver
 
 **Then re-arm in stages** — `shadow` first, read the decisions, then `live`. Same sequence as a first
 deployment (deploying.md §8). A redeploy is a good moment to rehearse rather than assume.
+
+### 4.8 When FluidTokens replace action scripts IN PLACE — the 2026-10-01 update
+
+Not every redeploy is §4. On **2026-10-01** FluidTokens shipped security fixes (FTAI-001/002/102) by
+rewriting their two config datums **in place**: same config NFTs, new hashes for the claim action and
+the LenderManager liquidate actions. Every node running an older image closed its lending gate with:
+
+```
+LENDING_CONFIG_MISMATCH … ConfigDatum[11] … LMConfigDatum[2] … LMConfigDatum[3] … LMConfigDatum[4]
+```
+
+**What to do:** pull the image built from this release and restart. That is all.
+
+- **No wipe, no re-sync.** Only action hashes moved; the payment credentials the node indexes (loan,
+  pool, request, asset-manager, LenderManager, pool-manager spend scripts) did not, so the existing
+  index is correct. Following §4 here would cost a full re-sync for nothing.
+- **No `.env` change** if you use the shipped defaults. ⚠ If you **override** any of
+  `AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION`, `AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION`,
+  `AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION`,
+  `LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION` or
+  `AQUARIUM_COMPOUND_REFERENCE_SCRIPTS`, update them to the new defaults in `application.yaml` or unset
+  them — an old coordinate closes the gate at boot, naming the key.
+- **Verify exactly as §4.7.** Expect one WARN for `ConfigDatum[14]` (recast): FluidTokens point it at a
+  pause hash by design, and the node never recasts. It does not close the gate.
+
+⚠ **Gate open is not the same as ready.** Every liquidation withdraws through these scripts, so their
+reward accounts must be **registered** on chain, or each submit fails with
+`ConwayWithdrawalsMissingAccounts` — which no evaluation, dry-run or `shadow` decision can show you.
+For this update FluidTokens registered them on 2026-10-01. To check a future one, look up each action
+script's stake address (`stake17…`) — e.g. Blockfrost `/accounts/{stake}/registrations`, whose last
+action must be `registered`. `MainnetReferenceScriptsTest` does this when run with a mainnet key.
 
 ---
 
