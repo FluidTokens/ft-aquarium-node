@@ -438,7 +438,8 @@ public class LoansContractRegistry {
      * default must start clean, index nothing, and wait to be told which deployment to watch.
      *
      * <p>⚠ <b>It is a separate question from whether the coordinates are RIGHT.</b> Absent is not
-     * wrong; STALE is wrong, and {@code LoansConfigVerifier} still hard-fails on a mismatch, because
+     * wrong; STALE is wrong, and {@code LoansConfigVerifier} still refuses every lending transaction on
+     * a mismatch (it closes the LendingConfigGate; FAB-115), because
      * a node pointed at a superseded deployment verifies cleanly forever and finds nothing (§12).
      * Collapsing the two would either crash every bare install or silence the one check that catches
      * a redeploy. <b>Keep them distinct.</b>
