@@ -175,7 +175,7 @@ class LoansReferenceScriptVerifierTest {
                 found(utxoPublishing(txHash, index, FOREIGN_SCRIPT_HASH)));
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                () -> verifier(oneCoordinate(), lookup, false).verify());
+                () -> verifier(oneCoordinate(), lookup, false).check());
 
         assertTrue(thrown.getMessage().contains("loans.liquidation.reference-scripts.loan-claim-action"),
                 "the message must name the key an operator has to fix: " + thrown.getMessage());
@@ -183,6 +183,36 @@ class LoansReferenceScriptVerifierTest {
                 "and the hash this node derives: " + thrown.getMessage());
         assertTrue(thrown.getMessage().contains(FOREIGN_SCRIPT_HASH),
                 "and the hash the chain published: " + thrown.getMessage());
+    }
+
+    /**
+     * ⛔ FAB-115: through the STARTUP path, a mismatch no longer throws — it closes the lending gate.
+     * After a re-pin of {@code loans.config.policy-id}, these coordinates are exactly what goes stale
+     * next; a throw here would ground the node, scheduled payments included, on the restart meant to
+     * fix it. (The opt-in fail-on-unreachable throw is pinned separately and still escapes.)
+     */
+    @Test
+    void aMismatchAtStartupClosesTheLendingGateInsteadOfThrowing() {
+        Lookup lookup = new Lookup((txHash, index) ->
+                found(utxoPublishing(txHash, index, FOREIGN_SCRIPT_HASH)));
+        var verifier = verifier(oneCoordinate(), lookup, false);
+
+        assertDoesNotThrow(verifier::verify, "a reference-script mismatch must not stop the node");
+
+        assertTrue(verifier.gate().isBlocked(), "but every Lending v4 transaction must be refused");
+        assertTrue(verifier.gate().blockedReason().orElse("").contains("loan-claim-action"),
+                "naming the coordinate to fix: " + verifier.gate().blockedReason());
+    }
+
+    @Test
+    void matchingCoordinatesLeaveTheGateOpen() {
+        Lookup lookup = new Lookup((txHash, index) -> found(utxoPublishing(txHash, index,
+                REGISTRY.getLoanClaimActionScriptHash())));
+        var verifier = verifier(oneCoordinate(), lookup, false);
+
+        verifier.verify();
+
+        assertTrue(!verifier.gate().isBlocked(), "a clean verification must not close the gate");
     }
 
     /**
@@ -196,7 +226,7 @@ class LoansReferenceScriptVerifierTest {
                 found(utxoPublishing(txHash, index, derivedAt((index + 1) % 6))));
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                () -> verifier(sixCoordinates(), lookup, false).verify());
+                () -> verifier(sixCoordinates(), lookup, false).check());
 
         assertTrue(thrown.getMessage().contains("reference-script mismatch"), thrown.getMessage());
     }
@@ -213,7 +243,7 @@ class LoansReferenceScriptVerifierTest {
                     Result.<Utxo>error("not found").code(code));
 
             IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                    () -> verifier(oneCoordinate(), lookup, false).verify(),
+                    () -> verifier(oneCoordinate(), lookup, false).check(),
                     "HTTP " + code + " must not be treated as a transient failure");
             assertTrue(thrown.getMessage().contains("stale"), thrown.getMessage());
         }
@@ -231,7 +261,7 @@ class LoansReferenceScriptVerifierTest {
                     found(utxoPublishing(txHash, index, published)));
 
             IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                    () -> verifier(oneCoordinate(), lookup, false).verify(),
+                    () -> verifier(oneCoordinate(), lookup, false).check(),
                     "a utxo with reference_script_hash=" + published + " must not verify");
             assertTrue(thrown.getMessage().contains("carries no reference script"), thrown.getMessage());
         }
@@ -243,7 +273,7 @@ class LoansReferenceScriptVerifierTest {
         Lookup lookup = new Lookup((txHash, index) -> Result.<Utxo>success("ok").code(200));
 
         assertThrows(IllegalStateException.class,
-                () -> verifier(oneCoordinate(), lookup, false).verify());
+                () -> verifier(oneCoordinate(), lookup, false).check());
     }
 
     // ======================================================================================
