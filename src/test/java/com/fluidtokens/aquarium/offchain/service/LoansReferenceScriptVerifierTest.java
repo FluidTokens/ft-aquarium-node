@@ -167,15 +167,16 @@ class LoansReferenceScriptVerifierTest {
 
     /**
      * The mismatch. The UTxO exists, is readable, and publishes a perfectly valid script — just not
-     * this one. That is what a redeploy looks like, and it must abort startup.
+     * this one. That is what a redeploy looks like, and check() must refuse it (at startup that refusal
+     * closes the lending gate — see aMismatchAtStartupClosesTheLendingGateInsteadOfThrowing).
      */
     @Test
-    void aUtxoPublishingSomeoneElsesValidatorAbortsStartup() {
+    void aUtxoPublishingSomeoneElsesValidatorIsRefusedByTheCheck() {
         Lookup lookup = new Lookup((txHash, index) ->
                 found(utxoPublishing(txHash, index, FOREIGN_SCRIPT_HASH)));
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                () -> verifier(oneCoordinate(), lookup, false).verify());
+                () -> verifier(oneCoordinate(), lookup, false).check());
 
         assertTrue(thrown.getMessage().contains("loans.liquidation.reference-scripts.loan-claim-action"),
                 "the message must name the key an operator has to fix: " + thrown.getMessage());
@@ -186,17 +187,47 @@ class LoansReferenceScriptVerifierTest {
     }
 
     /**
+     * ⛔ FAB-115: through the STARTUP path, a mismatch no longer throws — it closes the lending gate.
+     * After a re-pin of {@code loans.config.policy-id}, these coordinates are exactly what goes stale
+     * next; a throw here would ground the node, scheduled payments included, on the restart meant to
+     * fix it. (The opt-in fail-on-unreachable throw is pinned separately and still escapes.)
+     */
+    @Test
+    void aMismatchAtStartupClosesTheLendingGateInsteadOfThrowing() {
+        Lookup lookup = new Lookup((txHash, index) ->
+                found(utxoPublishing(txHash, index, FOREIGN_SCRIPT_HASH)));
+        var verifier = verifier(oneCoordinate(), lookup, false);
+
+        assertDoesNotThrow(verifier::verify, "a reference-script mismatch must not stop the node");
+
+        assertTrue(verifier.gate().isBlocked(), "but every Lending v4 transaction must be refused");
+        assertTrue(verifier.gate().blockedReason().orElse("").contains("loan-claim-action"),
+                "naming the coordinate to fix: " + verifier.gate().blockedReason());
+    }
+
+    @Test
+    void matchingCoordinatesLeaveTheGateOpen() {
+        Lookup lookup = new Lookup((txHash, index) -> found(utxoPublishing(txHash, index,
+                REGISTRY.getLoanClaimActionScriptHash())));
+        var verifier = verifier(oneCoordinate(), lookup, false);
+
+        verifier.verify();
+
+        assertTrue(!verifier.gate().isBlocked(), "a clean verification must not close the gate");
+    }
+
+    /**
      * The comparison is per-validator, not "publishes something we know". Here every coordinate
      * carries a hash this node derives — but shifted by one output, so each names the wrong
      * validator. A verifier that merely checked membership would pass this.
      */
     @Test
-    void coordinatesThatPublishTheDerivedHashesInTheWrongOrderAbortStartup() {
+    void coordinatesThatPublishTheDerivedHashesInTheWrongOrderAreRefusedByTheCheck() {
         Lookup lookup = new Lookup((txHash, index) ->
                 found(utxoPublishing(txHash, index, derivedAt((index + 1) % 6))));
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                () -> verifier(sixCoordinates(), lookup, false).verify());
+                () -> verifier(sixCoordinates(), lookup, false).check());
 
         assertTrue(thrown.getMessage().contains("reference-script mismatch"), thrown.getMessage());
     }
@@ -207,13 +238,13 @@ class LoansReferenceScriptVerifierTest {
      * the hole this class exists to close.
      */
     @Test
-    void aFourHundredResponseAbortsStartupRatherThanWarning() {
+    void aFourHundredResponseIsRefusedRatherThanWarned() {
         for (int code : new int[]{400, 403, 404}) {
             Lookup lookup = new Lookup((txHash, index) ->
                     Result.<Utxo>error("not found").code(code));
 
             IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                    () -> verifier(oneCoordinate(), lookup, false).verify(),
+                    () -> verifier(oneCoordinate(), lookup, false).check(),
                     "HTTP " + code + " must not be treated as a transient failure");
             assertTrue(thrown.getMessage().contains("stale"), thrown.getMessage());
         }
@@ -225,13 +256,13 @@ class LoansReferenceScriptVerifierTest {
      * too, and the answer is no.
      */
     @Test
-    void aUtxoCarryingNoReferenceScriptAbortsStartup() {
+    void aUtxoCarryingNoReferenceScriptIsRefusedByTheCheck() {
         for (String published : new String[]{null, ""}) {
             Lookup lookup = new Lookup((txHash, index) ->
                     found(utxoPublishing(txHash, index, published)));
 
             IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                    () -> verifier(oneCoordinate(), lookup, false).verify(),
+                    () -> verifier(oneCoordinate(), lookup, false).check(),
                     "a utxo with reference_script_hash=" + published + " must not verify");
             assertTrue(thrown.getMessage().contains("carries no reference script"), thrown.getMessage());
         }
@@ -239,11 +270,11 @@ class LoansReferenceScriptVerifierTest {
 
     /** A successful call that carries no value at all is the same kind of answer. */
     @Test
-    void aSuccessfulLookupWithNoUtxoAbortsStartup() {
+    void aSuccessfulLookupWithNoUtxoIsRefusedByTheCheck() {
         Lookup lookup = new Lookup((txHash, index) -> Result.<Utxo>success("ok").code(200));
 
         assertThrows(IllegalStateException.class,
-                () -> verifier(oneCoordinate(), lookup, false).verify());
+                () -> verifier(oneCoordinate(), lookup, false).check());
     }
 
     // ======================================================================================
@@ -303,6 +334,32 @@ class LoansReferenceScriptVerifierTest {
                 "the convert action is not verified at startup, so a stale coordinate there boots "
                         + "clean and fails at build with missingRequiredScripts. Covered keys: "
                         + expectationKeys());
+    }
+
+    /**
+     * ⛔ FAB-115 round-2 finding 6. A convert coordinate configured WITHOUT {@code loans.minswap.*}
+     * derives a null hash, and the comparison NPEs. Only IllegalStateException used to be caught, so
+     * this lending misconfiguration still escaped @PostConstruct and grounded the node. Any fault now
+     * closes the gate.
+     */
+    @Test
+    void aNullDerivedHashClosesTheGateInsteadOfEscapingStartup() {
+        var noMinswap = new LoansContractRegistry(
+                "235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200",
+                "fb6ae2027358b4a0b62710eb95102d87fa13f66ecf55d8943699c492",
+                "706172616d6574657273", "fca77bcce1e5e73c97a0bfa8c90f7cd2faff6fd6ed5b6fec1c04eefa",
+                null, null, null);
+        assertTrue(noMinswap.getLmLiquidateAndConvertActionScriptHash() == null,
+                "precondition: without loans.minswap.* the convert action derives nothing");
+        var convertOnly = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30,
+                new LiquidateTransactionBuilder.ReferenceScripts(
+                        null, null, null, null, null, null, null, null, in(9)));
+        var verifier = new LoansReferenceScriptVerifier(noMinswap, convertOnly,
+                (tx, ix) -> found(utxoPublishing(tx, ix, FOREIGN_SCRIPT_HASH)), false);
+
+        assertDoesNotThrow(verifier::verify, "a lending misconfiguration must not stop the node");
+        assertTrue(verifier.gate().isBlocked(), "it must close the lending gate instead");
     }
 
     /** Every named slot configured, so the covered-key set is the only variable. */

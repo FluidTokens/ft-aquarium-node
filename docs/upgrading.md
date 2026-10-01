@@ -195,9 +195,22 @@ curl -s http://localhost:8080/healthcheck | jq .
 curl -s http://localhost:8080/api/v1/loans | jq 'length'
 ```
 
-Startup verification is the real check, and it is strict: the node **refuses to start** if the
-reference-script coordinates it is configured with do not publish the scripts it derives. Reaching a
-clean health check means that comparison passed.
+Startup verification is the real check, and it is strict — but since FAB-115 it no longer stops the
+node. If the config policy ids or the reference-script coordinates do not match what the node derives,
+it **closes the lending gate**: every Lending v4 transaction (liquidation in every mode, convert,
+compound) is refused for the life of the process, while scheduled payments keep running.
+
+⚠ **So a clean `/healthcheck` does NOT mean the lending check passed.** Before re-arming, confirm it:
+
+```bash
+docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified"
+```
+
+- `Lending v4 config verified against chain …` and `… reference scripts verified against chain …` — good.
+- Any `LENDING_CONFIG_MISMATCH` line — the gate is closed; the line names each field (derived vs chain).
+  Fix the coordinates (`loans.config.policy-id`, `loans.lm-config.policy-id`,
+  `loans.smart-tokens-spend-script-hash`, `loans.liquidation.reference-scripts.*`) and restart.
+- With the readiness UI enabled, the page also shows a `LENDING_CONFIG_MISMATCH` banner.
 
 **Then re-arm in stages** — `shadow` first, read the decisions, then `live`. Same sequence as a first
 deployment (deploying.md §8). A redeploy is a good moment to rehearse rather than assume.

@@ -12,6 +12,7 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -24,18 +25,21 @@ import java.util.Map;
 
 /**
  * Checks, at startup, that what {@link LoansContractRegistry} derived matches what the
- * live config UTxOs actually publish — and refuses to start if it does not.
+ * live config UTxOs actually publish — and, if it does not, closes the {@link LendingConfigGate}
+ * so every Lending v4 transaction is refused. It no longer refuses to START (FAB-115): a throw here
+ * failed the whole context, scheduled payments included, on 2026-09-19 and again on 2026-10-01.
  * <p>
  * Without this the node fails <em>silently</em>: FluidTokens redeploys the v4 config NFTs
  * (which already happened once between 2026-07-14 and 2026-08-05), the policy ids in
  * {@code application.yaml} go stale, derivation still succeeds, and the node indexes a
- * dead deployment while looking perfectly healthy. Turning that into a startup failure is
- * the whole point of this class.
+ * dead deployment while looking perfectly healthy. Turning that into a refusal of every Lending
+ * v4 transaction — loud, named, and before anything is built — is the whole point of this class.
  *
  * <h2>Failure modes, deliberately kept distinct</h2>
  * <ul>
- *   <li><b>Mismatch, or config NFT not found</b> — hard fail. Both mean the configured
- *       policy ids no longer describe the deployment.</li>
+ *   <li><b>Mismatch, or config NFT not found</b> — the lending gate closes and the node starts.
+ *       Both mean the configured policy ids no longer describe the deployment, so no Lending v4
+ *       transaction may be built against them; nothing else on the node depends on them.</li>
  *   <li><b>Blockfrost unreachable</b> — warn and continue by default. A network blip must
  *       not take down the Aquarium scheduled-transaction path, which does not depend on
  *       loans at all. Set {@code loans.verify-config.fail-on-unreachable=true} to make
@@ -165,6 +169,23 @@ public class LoansConfigVerifier {
         this.failOnUnreachable = failOnUnreachable;
     }
 
+    /**
+     * Where a config problem is recorded instead of thrown. Setter-injected (required in the container)
+     * so the many direct constructions of this class in tests keep working; those get a private gate.
+     */
+    private LendingConfigGate gate = new LendingConfigGate();
+
+    // ⛔ REQUIRED (audit finding 2): optional injection let a missing gate bean fail OPEN — the
+    // verifier closing a private gate nobody reads, the executors holding null and running normally.
+    @Autowired
+    public void setLendingConfigGate(LendingConfigGate gate) {
+        this.gate = gate;
+    }
+
+    public LendingConfigGate gate() {
+        return gate;
+    }
+
     /** {@code smartTokensSpendScriptHash} as published on chain — the authoritative value. */
     @Getter
     private String onChainSmartTokensSpendScriptHash;
@@ -181,7 +202,8 @@ public class LoansConfigVerifier {
         // correctly treats a 4xx as an ANSWER rather than an outage — so it throws, out of a
         // @PostConstruct, and the pod CRASH-LOOPS with no way to turn it off.
         //
-        // ⚠ The hard fail below is NOT weakened by this and must not be. A MISMATCH means the
+        // ⚠ The mismatch check below is NOT weakened by this and must not be — it closes the lending
+        // gate (FAB-115) rather than stopping the node, but it closes it. A MISMATCH means the
         // configured policy ids no longer describe the deployment, which is precisely the redeploy
         // that verifies cleanly forever while the node indexes a dead world (§12). Absent means the
         // operator has not said which deployment to watch yet. One is a fault; the other is a Tuesday.
@@ -200,10 +222,20 @@ public class LoansConfigVerifier {
                     fetchConfigDatumHex(registry.getLmConfigPolicyId(), "LMConfigDatum"));
         } catch (ConfigUnreachableException e) {
             if (failOnUnreachable) {
+                // ⚠ The one throw left, and it is opt-in: an operator who set fail-on-unreachable has
+                // said a node that cannot verify must not run. Default false.
                 throw new IllegalStateException("Cannot verify Lending v4 config: " + e.getMessage(), e);
             }
             log.warn("Could not verify Lending v4 config against chain ({}). Continuing unverified — " +
                     "the derived hashes may describe a superseded deployment.", e.getMessage());
+            return;
+        } catch (RuntimeException e) {
+            // ⛔ Config NFT gone, a lookup the provider rejected, a datum of the wrong shape — or any
+            // other fault (round-2 finding 6: only IllegalStateException used to be caught): each
+            // means the configured coordinates no longer describe a usable deployment. That is a
+            // LENDING fault, so it closes the lending gate — it no longer stops the node, whose
+            // scheduled-transaction half does not depend on Lending v4 at all.
+            closeGate("Lending v4 config could not be verified: " + e.getMessage());
             return;
         }
 
@@ -220,19 +252,61 @@ public class LoansConfigVerifier {
         }
 
         if (!findings.enforced().isEmpty()) {
-            throw new IllegalStateException("""
+            // ⛔ NO LONGER A THROW (FAB-115). Until 2026-10-01 this was an IllegalStateException out
+            // of @PostConstruct, which took the whole context down — scheduled payments included —
+            // because FluidTokens re-pointed the claim action. A wrong hash here really does mean
+            // our lending transactions would be built against the wrong script, so they are refused;
+            // nothing else is.
+            String paused = pausedReading(findings.all());
+            closeGate("""
                     Lending v4 config mismatch — the derived script hashes do not match the live \
                     config UTxOs, in fields this node DOES use to build transactions or to decide \
-                    what to index. The contracts were almost certainly redeployed; update \
-                    loans.config.policy-id / loans.lm-config.policy-id (and \
-                    loans.smart-tokens-spend-script-hash) in application.yaml. Mismatches: """
-                    + String.join("; ", findings.enforced()));
+                    what to index. %s Every Lending v4 transaction is refused until the coordinates \
+                    are updated (loans.config.policy-id / loans.lm-config.policy-id / \
+                    loans.smart-tokens-spend-script-hash, AND loans.liquidation.reference-scripts.* \
+                    to the new deployment's published scripts) and the node restarted. Mismatches: %s"""
+                    .formatted(paused, String.join("; ", findings.enforced())));
+            return;
         }
         if (findings.advisory().isEmpty()) {
             log.info("Lending v4 config verified against chain: derived hashes match both config datums");
         } else {
             log.info("Lending v4 config verified against chain for every field this node uses");
         }
+    }
+
+    private void closeGate(String reason) {
+        gate.block(reason);
+        log.error("⛔ {} — {}. The node is starting normally: scheduled transactions are unaffected, and "
+                + "only Lending v4 transactions (liquidation in every mode, convert, compound) are refused.",
+                LendingConfigGate.REFUSAL, reason);
+    }
+
+    private static final java.util.regex.Pattern CHAIN_HASH =
+            java.util.regex.Pattern.compile("chain ([0-9a-fA-F]{56})");
+
+    /**
+     * ⚠ <b>Several actions re-pointed at ONE script is a pause, not a redeploy.</b> Measured
+     * 2026-09-30: claim, change-collateral, borrow and one more field all moved to the same
+     * {@code 64d9b13f…}, a script never published on chain, while repay and recast were left alone.
+     * A redeploy moves every hash to a distinct new one. The difference sends an operator to a
+     * different place — "wait for FluidTokens" versus "re-pin the node" — so it is said.
+     */
+    static String pausedReading(List<String> mismatches) {
+        Map<String, List<String>> fieldsByChainHash = new LinkedHashMap<>();
+        for (String m : mismatches) {
+            var matcher = CHAIN_HASH.matcher(m);
+            if (matcher.find()) {
+                fieldsByChainHash.computeIfAbsent(matcher.group(1).toLowerCase(), k -> new ArrayList<>())
+                        .add(m.substring(0, m.indexOf(':')));
+            }
+        }
+        return fieldsByChainHash.entrySet().stream()
+                .filter(e -> e.getValue().size() >= 2)
+                .findFirst()
+                .map(e -> "FluidTokens appears to have PAUSED these actions: %s all point at the same script %s."
+                        .formatted(String.join(", ", e.getValue()), e.getKey()))
+                .orElse("The contracts were almost certainly redeployed.");
     }
 
     /**

@@ -277,6 +277,33 @@ public class LiquidationExecutor {
     }
 
     /**
+     * ⛔ Closed by {@code LoansConfigVerifier} when the live Lending v4 config does not match what this
+     * node derives (FAB-115). Setter-injected and REQUIRED in the container: a missing gate bean must fail
+     * the boot loudly, never leave lending ungated. Direct constructions in tests run ungated.
+     */
+    private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
+    private volatile boolean lendingGateRefusalLogged;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
+        this.lendingConfigGate = gate;
+    }
+
+    /** True, and logged once, when the Lending v4 config gate is closed. */
+    private boolean refusedByLendingConfigGate(String what) {
+        if (lendingConfigGate == null || !lendingConfigGate.isBlocked()) {
+            return false;
+        }
+        if (!lendingGateRefusalLogged) {
+            lendingGateRefusalLogged = true;
+            log.error("{} REFUSED for the life of this process: {} — {}", what,
+                    com.fluidtokens.aquarium.offchain.service.LendingConfigGate.REFUSAL,
+                    lendingConfigGate.blockedReason().orElse(""));
+        }
+        return true;
+    }
+
+    /**
      * The wiring Spring uses. The {@link BFBackendService} is narrowed to a
      * {@link TransactionSubmitter} here and nowhere else, so the only field of this class that
      * can reach the network is that one-method submitter. (The class does hold a
@@ -659,6 +686,11 @@ public class LiquidationExecutor {
      */
     void cycle(long now) {
         if (configuration.getMode() == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
+            return;
+        }
+        // ⛔ Every mode, SHADOW included: a shadow build against a script the chain no longer names
+        // reports figures for a transaction that cannot exist.
+        if (refusedByLendingConfigGate("liquidation")) {
             return;
         }
 

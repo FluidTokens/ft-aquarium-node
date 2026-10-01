@@ -219,6 +219,14 @@ public class LiquidationReadinessController {
         this.network = network;
     }
 
+    /** Closed when the live Lending v4 config does not match this node (FAB-115). Required. */
+    private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
+        this.lendingConfigGate = gate;
+    }
+
     /**
      * ⚠ SORT AND FILTER ARE QUERY PARAMETERS, NOT JAVASCRIPT, and the auto-refresh is why. The page
      * re-GETs its own URL every minute, so client-side state would be silently undone on each tick —
@@ -234,6 +242,11 @@ public class LiquidationReadinessController {
                             @RequestParam(name = "page", required = false) Integer page) {
         model.addAttribute("network", network == null ? "unknown" : network.getNetwork());
         model.addAttribute("generatedAt", java.time.Instant.now().toString());
+        // ⛔ Shown ABOVE everything and independent of the rows: the loan view still works while the
+        // gate is closed, and a page full of healthy-looking loans must not hide that the bot will
+        // refuse every one of them.
+        model.addAttribute("lendingConfigBlocked", lendingConfigGate == null ? null
+                : lendingConfigGate.blockedReason().orElse(null));
         model.addAttribute("status", OperationalStatus.of(liquidationConfiguration,
                 convertEnabled, compoundEnabled, processorEnabled));
         model.addAttribute("sort", sort == null ? "health" : sort);
@@ -514,9 +527,9 @@ public class LiquidationReadinessController {
                 new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
                 advance, principalBalance, wallet.known());
 
-        ActionNow actionNow = ActionNow.of(health.liquidatable(),
+        ActionNow actionNow = gatedAction(lendingConfigGate, ActionNow.of(health.liquidatable(),
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
-                gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance);
+                gate.marketFor(datum.principalAsset()), convertEnabled, usability.usable(), advance));
 
         return new Row(loan.loanId(), loan.utxoRef(),
                 datum.principalAsset().toUnit(), datum.principalAmount(),
@@ -758,6 +771,17 @@ public class LiquidationReadinessController {
     BigInteger advanceAmount(Loan loan, LenderBond bond, long now) {
         var n = numbersFor(loan, bond, now);
         return n == null ? null : n.convertedLoanCollateralToPrincipalAmount();
+    }
+
+    /**
+     * ⛔ FAB-115: a closed lending gate overrides whatever a loan's health and market say — the bot
+     * refuses every lending transaction, so no row may claim it "would act".
+     */
+    static ActionNow gatedAction(com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingGate,
+                                 ActionNow otherwise) {
+        return lendingGate != null && lendingGate.isBlocked()
+                ? ActionNow.refusedByLendingConfig(lendingGate.blockedReason().orElse(""))
+                : otherwise;
     }
 
     /**
