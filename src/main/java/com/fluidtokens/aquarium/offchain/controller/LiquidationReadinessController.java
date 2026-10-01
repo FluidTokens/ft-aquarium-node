@@ -834,14 +834,16 @@ public class LiquidationReadinessController {
         // token lookup, tolerated as a "controller-only simplification" while every token had one
         // oracle; since 2026-09-30 a token can have two (v1 Lending v3, v2 Lending v4), and these
         // figures must be the ones the transaction for THIS loan would be built from.
-        Optional<OracleEntry> oracle = client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset());
+        Optional<OracleEntry> oracle = client.findEntryByOracleToken(loan.datum().collateral().oracleTokenAsset())
+                .filter(e -> e.token().equals(loan.datum().collateral().assetType()));
         if (oracle.isEmpty()) {
             return null;
         }
         AssetType principalAsset = loan.datum().principalAsset();
         OracleEntry principalOracle = null;
         if (!principalAsset.isAda()) {
-            Optional<OracleEntry> principalEntry = client.findEntryByOracleToken(loan.datum().principalOracleAsset());
+            Optional<OracleEntry> principalEntry = client.findEntryByOracleToken(loan.datum().principalOracleAsset())
+                    .filter(e -> e.token().equals(principalAsset));
             if (principalEntry.isEmpty()) {
                 return null;
             }

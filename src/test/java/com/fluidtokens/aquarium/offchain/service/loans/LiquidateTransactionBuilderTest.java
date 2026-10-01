@@ -1896,6 +1896,28 @@ class LiquidateTransactionBuilderTest {
                 "and the shared credential is withdrawn from exactly once");
     }
 
+    /**
+     * Defence in depth behind the scanner (oracle audit round 2, cross-provider finding 2): an entry
+     * found by the datum's NFT that prices ANOTHER token is no oracle for this leg — refused, never built.
+     */
+    @Test
+    void refusesALegWhoseNamedOraclePricesAnotherToken() {
+        TokenScenario scenario = sameOracleBothLegsScenario();
+        OracleEntry named = scenario.oracle();
+        AssetType otherToken = new AssetType("e".repeat(56), COLLATERAL_TOKEN.assetName());
+        OracleEntry wrongToken = new OracleEntry(otherToken, named.oracleToken(), named.rewardAddress(),
+                named.withdrawCredentialHash(), named.referenceInput(), named.referenceScript(),
+                named.verificationKeys(), named.threshold(), named.feed(), named.signatures(),
+                named.charlieProviderReferenceInput());
+
+        var refused = assertThrows(LiquidateTransactionBuilder.RefusedException.class,
+                () -> builder(List.of(scenario.scenario()), Map.of(ORACLE_TOKEN.toUnit(), wrongToken))
+                        .build(request(List.of(scenario.scenario()), Map.of(ORACLE_TOKEN.toUnit(), wrongToken),
+                                WALLET_UTXO, MARGIN, VALID_FROM, VALID_TO,
+                                LiquidateTransactionBuilder.ReferenceScripts.none())));
+        assertTrue(refused.getMessage().contains("prices " + otherToken.toUnit()), refused.getMessage());
+    }
+
     // ======================================================================================
     // request-shape guards
     // ======================================================================================

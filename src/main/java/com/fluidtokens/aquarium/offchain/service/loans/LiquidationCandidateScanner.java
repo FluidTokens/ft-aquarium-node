@@ -163,15 +163,15 @@ public class LiquidationCandidateScanner {
                     "collateral amount " + loan.collateralAmount() + " <= 1");
         }
 
-        FeedLookup principalFeed = lookupFeed(datum.principalAsset().isAda(), datum.principalOracleAsset(),
-                client, atTimeMillis, "principal");
+        FeedLookup principalFeed = lookupFeed(datum.principalAsset().isAda(), datum.principalAsset(),
+                datum.principalOracleAsset(), client, atTimeMillis, "principal");
         if (!principalFeed.usable()) {
             return LiquidationAssessment.excluded(bond, loan, LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE,
                     principalFeed.unusableDetail());
         }
 
-        FeedLookup collateralFeed = lookupFeed(datum.collateral().isAda(), datum.collateral().oracleTokenAsset(),
-                client, atTimeMillis, "collateral");
+        FeedLookup collateralFeed = lookupFeed(datum.collateral().isAda(), datum.collateral().assetType(),
+                datum.collateral().oracleTokenAsset(), client, atTimeMillis, "collateral");
         if (!collateralFeed.usable()) {
             return LiquidationAssessment.excluded(bond, loan, LiquidationExclusion.COLLATERAL_ORACLE_UNUSABLE,
                     collateralFeed.unusableDetail());
@@ -243,8 +243,8 @@ public class LiquidationCandidateScanner {
      * A {@code null} client (disabled/absent {@link FluidOracleClient}) is reported unusable
      * rather than throwing, same as any other missing feed.
      */
-    private static FeedLookup lookupFeed(boolean isAda, AssetType oracleToken, FluidOracleClient client,
-                                         long atTimeMillis, String leg) {
+    private static FeedLookup lookupFeed(boolean isAda, AssetType asset, AssetType oracleToken,
+                                         FluidOracleClient client, long atTimeMillis, String leg) {
         if (isAda) {
             return FeedLookup.usable(OraclePriceFeed.unit());
         }
@@ -256,6 +256,13 @@ public class LiquidationCandidateScanner {
             return FeedLookup.unusable(leg + " leg: no oracle entry for " + oracleToken.toUnit());
         }
         OracleEntry oracleEntry = entry.get();
+        // ⛔ The named oracle must price THIS leg's token (oracle audit round 2, cross-provider finding
+        // 2). retrieve_oracle_data's is_feed_token_correct refuses any other, so a loan naming another
+        // token's oracle cannot be liquidated — and must not be assessed at that token's price.
+        if (!oracleEntry.token().equals(asset)) {
+            return FeedLookup.unusable(leg + " leg: the datum names oracle " + oracleToken.toUnit()
+                    + ", which prices " + oracleEntry.token().toUnit() + ", not the leg's " + asset.toUnit());
+        }
         if (!oracleEntry.usableForLiquidation()) {
             return FeedLookup.unusable(leg + " leg: oracle entry for " + oracleToken.toUnit()
                     + " is not usable for liquidation");

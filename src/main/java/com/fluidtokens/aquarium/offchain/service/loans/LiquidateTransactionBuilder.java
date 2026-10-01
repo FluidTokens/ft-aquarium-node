@@ -1083,10 +1083,10 @@ public final class LiquidateTransactionBuilder {
                             .formatted(bond.loanId()));
         }
 
-        Leg principal = leg(datum.principalAsset().isAda(), datum.principalOracleAsset(), request,
-                loan.loanId(), "principal", validFrom, validTo);
-        Leg collateral = leg(datum.collateral().isAda(), datum.collateral().oracleTokenAsset(), request,
-                loan.loanId(), "collateral", validFrom, validTo);
+        Leg principal = leg(datum.principalAsset().isAda(), datum.principalAsset(), datum.principalOracleAsset(),
+                request, loan.loanId(), "principal", validFrom, validTo);
+        Leg collateral = leg(datum.collateral().isAda(), datum.collateral().assetType(),
+                datum.collateral().oracleTokenAsset(), request, loan.loanId(), "collateral", validFrom, validTo);
 
         // The two time-dependent figures the redeemer carries, computed HERE, at validFrom.
         //
@@ -1187,8 +1187,8 @@ public final class LiquidateTransactionBuilder {
      * synthesised 1:1 feed with no oracle consulted, and anything else is looked up by the oracle
      * NFT the datum names.
      */
-    private Leg leg(boolean isAda, AssetType oracleToken, Request request, String loanId, String which,
-                    long validFrom, long validTo) {
+    private Leg leg(boolean isAda, AssetType asset, AssetType oracleToken, Request request, String loanId,
+                    String which, long validFrom, long validTo) {
         if (isAda) {
             return new Leg(OraclePriceFeed.unit(), null);
         }
@@ -1197,6 +1197,13 @@ public final class LiquidateTransactionBuilder {
         if (entry == null) {
             throw refuse(Refusal.ORACLE_ENTRY_MISSING,
                     "loan %s %s leg: no oracle entry for %s".formatted(loanId, which, oracleToken.toUnit()));
+        }
+        // Defence in depth behind the scanner: an oracle for ANOTHER token is no oracle for this leg —
+        // the validator's is_feed_token_correct would refuse the transaction.
+        if (!entry.token().equals(asset)) {
+            throw refuse(Refusal.ORACLE_ENTRY_MISSING,
+                    "loan %s %s leg: oracle %s prices %s, not the leg's %s".formatted(loanId, which,
+                            oracleToken.toUnit(), entry.token().toUnit(), asset.toUnit()));
         }
 
         // V6 — variants whose redeemer this repo cannot build, and the c3 gap.

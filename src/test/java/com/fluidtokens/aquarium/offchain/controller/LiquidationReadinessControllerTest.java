@@ -632,6 +632,37 @@ class LiquidationReadinessControllerTest {
                         + "not the tokens' other versions registered last (3 and 4)");
     }
 
+    /**
+     * The principal's named oracle prices ANOTHER token (oracle audit round 2, cross-provider finding
+     * 2): no figures, rather than figures at another token's price.
+     */
+    @Test
+    void advanceAmountIsNullWhenThePrincipalsNamedOraclePricesAnotherToken() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN));
+        OracleEntry collateralOracle = LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 10_000_000L),
+                input("22"), input("33"), input("44"));
+        AssetType otherToken = new AssetType("e".repeat(56), PRINCIPAL_TOKEN.assetName());
+        OracleEntry namedNftWrongToken = LoanFixtures.charli3(otherToken, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(otherToken,
+                        BigInteger.TWO, BigInteger.ONE, 0L, 10_000_000L),
+                input("66"), input("77"), input("88"));
+        LiquidationReadinessController controller = controllerWith(
+                new FakeOracleClient(collateralOracle, namedNftWrongToken), LoanFixtures.registry());
+
+        assertNull(controller.advanceAmount(loan, bond, 1_000L),
+                "an oracle pricing another token must not produce this loan's figures");
+    }
+
     /** advanceAmount refuses (null) rather than guess when the loan's OWN principal oracle is missing. */
     @Test
     void advanceAmountIsNullWhenNoPrincipalOracleEntryExists() {
