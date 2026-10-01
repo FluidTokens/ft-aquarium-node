@@ -363,6 +363,10 @@
                 th:classappend="${r.healthFactor < 1.0} ? 'crit' : (${r.healthFactor < 1.25} ? 'warn' : 'ok')"
                 th:text="${#numbers.formatDecimal(r.healthFactor, 1, 3)}">1.000</span>
           <span th:if="${r.healthFactor == null}" class="unknown">unknown</span>
+          <!-- FAB-112: which oracle version the loan's own datum names (v1 = Lending v3's, v2 = v4's) -->
+          <span th:if="${r.collateralOracleVersion != null}" class="reason"
+                th:title="|this loan's datum names the v${r.collateralOracleVersion} oracle; its health is priced from it|"
+                th:text="|oracle v${r.collateralOracleVersion}|">oracle v1</span>
           <span class="reason" th:if="${r.currentLtvPercent != null}"
                 th:text="'LTV ' + ${#numbers.formatDecimal(r.currentLtvPercent, 1, 2)} + '%'">LTV</span>
           <span class="reason" th:if="${r.healthUnknownReason}" th:text="${r.healthUnknownReason}">why</span>

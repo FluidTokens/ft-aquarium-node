@@ -61,6 +61,9 @@ public class FluidOracleClient {
     /** Same entries, keyed by the oracle's own NFT — the way a loan datum names its oracle. */
     private final AtomicReference<Map<AssetType, OracleEntry>> byOracleToken = new AtomicReference<>(Map.of());
 
+    /** Every entry per priced token, for LOAN-FREE lookups that must choose among versions (A3). */
+    private final AtomicReference<Map<AssetType, List<OracleEntry>>> versionsByToken = new AtomicReference<>(Map.of());
+
     private final AtomicReference<Instant> lastRefresh = new AtomicReference<>(Instant.EPOCH);
 
     /** Last state warned about, per asset and warning kind — see {@link #warnOnce}. */
@@ -77,8 +80,15 @@ public class FluidOracleClient {
     }
 
     /**
-     * The price for an asset, or empty if there is none <em>or the one we hold is not usable at
-     * {@code atMillis}</em>.
+     * ⛔ <b>LOAN-FREE pricing only</b> — a wallet balance, a pool's principal, anything with no loan
+     * datum to say which oracle it means. For a LOAN, use {@link #findFeedForLeg}: since 2026-09-30 a
+     * token can have two oracles (v1 for Lending v3, v2 for Lending v4) and a loan's datum names one of
+     * them, so pricing a loan by its token can read the wrong one (FAB-111).
+     *
+     * <p>The price for an asset, or empty if there is none <em>or none we hold is usable at
+     * {@code atMillis}</em>. With several versions: one usable now, preferring the HIGHEST
+     * {@code oracleVersion} (ruling A3, 2026-10-01). They are one feed published twice, so this only
+     * decides anything when one version has lapsed and the other has not.
      * <p>
      * Fail-closed on purpose. A liquidation decision taken on an expired price is worse than no
      * decision: the validator would reject the transaction, and in the meantime we would have
@@ -89,7 +99,21 @@ public class FluidOracleClient {
      * that feed when the asset's policy id is empty.
      */
     public Optional<OraclePriceFeed> findFeed(AssetType asset, long atMillis) {
-        return findFeedIgnoringValidity(asset).filter(feed -> feed.usableAt(atMillis));
+        if (asset == null) {
+            return Optional.empty();
+        }
+        if (asset.isAda()) {
+            return Optional.of(OraclePriceFeed.unit());
+        }
+        List<OracleEntry> versions = versionsByToken.get().getOrDefault(asset, List.of());
+        if (versions.isEmpty()) {
+            // Nothing loaded for it here — and the path a subclass that overrides findEntry takes.
+            return findFeedIgnoringValidity(asset).filter(feed -> feed.usableAt(atMillis));
+        }
+        return versions.stream()
+                .filter(entry -> entry.feed().usableAt(atMillis))
+                .max(BY_VERSION)
+                .map(OracleEntry::feed);
     }
 
     /**
@@ -107,10 +131,46 @@ public class FluidOracleClient {
         return findEntry(asset).map(OracleEntry::feed);
     }
 
-    /** The full oracle deployment for a priced asset — reference input, keys, signatures. */
+    /**
+     * The oracle deployment for a priced asset, LOAN-FREE: the highest {@code oracleVersion} when there
+     * are several. A loan must use {@link #findEntryByOracleToken} with the NFT its datum names.
+     */
     public Optional<OracleEntry> findEntry(AssetType token) {
-        return token == null ? Optional.empty() : Optional.ofNullable(byToken.get().get(token));
+        if (token == null) {
+            return Optional.empty();
+        }
+        List<OracleEntry> versions = versionsByToken.get().getOrDefault(token, List.of());
+        return versions.isEmpty() ? Optional.ofNullable(byToken.get().get(token))
+                : versions.stream().max(BY_VERSION);
     }
+
+    /**
+     * ⛔ <b>The price of one LEG of a loan, from the oracle that loan's datum names</b> (FAB-111).
+     * {@code oracleToken} is {@code LoanDatum.principalOracleAsset} for the principal leg and
+     * {@code collateral.oracleTokenAsset} for the collateral leg. Ada needs no oracle and prices 1:1,
+     * whatever the datum carries — {@code retrieve_oracle_data} short-circuits on the empty policy id.
+     *
+     * <p>Exactly what the validator will check, which is the point: health, readiness and the
+     * economics of a loan must agree with the transaction that would liquidate it.
+     */
+    public Optional<OraclePriceFeed> findFeedForLeg(AssetType asset, AssetType oracleToken, long atMillis) {
+        return findFeedForLegIgnoringValidity(asset, oracleToken).filter(feed -> feed.usableAt(atMillis));
+    }
+
+    /** As {@link #findFeedForLeg}, whether or not still valid — only to explain an absence. */
+    public Optional<OraclePriceFeed> findFeedForLegIgnoringValidity(AssetType asset, AssetType oracleToken) {
+        if (asset == null) {
+            return Optional.empty();
+        }
+        if (asset.isAda()) {
+            return Optional.of(OraclePriceFeed.unit());
+        }
+        return findEntryByOracleToken(oracleToken).map(OracleEntry::feed);
+    }
+
+    /** Higher {@code oracleVersion} wins; an entry without one ranks below any that has one. */
+    private static final java.util.Comparator<OracleEntry> BY_VERSION = java.util.Comparator.comparing(
+            OracleEntry::oracleVersion, java.util.Comparator.nullsFirst(java.util.Comparator.naturalOrder()));
 
     /**
      * The oracle a loan datum actually names. {@code retrieve_oracle_data} requires the reference
@@ -206,6 +266,9 @@ public class FluidOracleClient {
         warnOnVersionPriceDisagreement(versionsPerToken, System.currentTimeMillis());
         byToken.set(Map.copyOf(tokens));
         byOracleToken.set(Map.copyOf(oracleTokens));
+        var versions = new HashMap<AssetType, List<OracleEntry>>();
+        versionsPerToken.forEach((token, list) -> versions.put(token, List.copyOf(list)));
+        versionsByToken.set(Map.copyOf(versions));
         lastRefresh.set(Instant.now());
         reportShapeOnChange(oracleTokens.size(), tokens.size(),
                 (int) versionsPerToken.values().stream().filter(v -> v.size() > 1).count());

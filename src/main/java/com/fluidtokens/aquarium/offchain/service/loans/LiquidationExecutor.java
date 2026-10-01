@@ -1508,8 +1508,12 @@ public class LiquidationExecutor {
                     return;
                 }
                 PricingService pricingService = new PricingService(client);
-                PricingService.Priced pricedAcquired = pricingService.toLovelace(collateralAsset,
-                        acquiredQuantity, now);
+                // ⛔ FAB-111: both legs off the oracles THIS loan's datum names — the ones its
+                // transaction is built from — not a token's preferred version, which since 2026-09-30
+                // can be a different oracle (v1 Lending v3 vs v2 Lending v4).
+                var payInAdvanceDatum = assessment.loan().datum();
+                PricingService.Priced pricedAcquired = pricingService.toLovelaceForLeg(collateralAsset,
+                        payInAdvanceDatum.collateral().oracleTokenAsset(), acquiredQuantity, now);
                 if (!pricedAcquired.isPriced()) {
                     PricingService.PriceRefusal refusal = pricedAcquired.refusal();
                     String priceDetail = ("PRICE_UNAVAILABLE: cannot price the acquired collateral of "
@@ -1522,8 +1526,8 @@ public class LiquidationExecutor {
                             assessment.loan().utxoRef(), priceDetail);
                     return;
                 }
-                PricingService.Priced pricedOutlay = pricingService.toLovelace(payInAdvancePrincipal,
-                        payout, now);
+                PricingService.Priced pricedOutlay = pricingService.toLovelaceForLeg(payInAdvancePrincipal,
+                        payInAdvanceDatum.principalOracleAsset(), payout, now);
                 if (!pricedOutlay.isPriced()) {
                     PricingService.PriceRefusal refusal = pricedOutlay.refusal();
                     String priceDetail = ("PRICE_UNAVAILABLE: cannot price the pay-in-advance outlay of "

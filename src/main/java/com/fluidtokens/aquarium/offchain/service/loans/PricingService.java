@@ -106,6 +106,27 @@ public class PricingService {
      * result. Rounding down is the direction that does not flatter the bot.
      */
     public Priced toLovelace(AssetType asset, BigInteger amount, long atMillis) {
+        return toLovelace(asset, amount, atMillis,
+                () -> oracleClient.findFeed(asset, atMillis),
+                () -> oracleClient.findFeedIgnoringValidity(asset));
+    }
+
+    /**
+     * ⛔ <b>The same, for one leg of a LOAN</b>, priced off the oracle that loan's datum names
+     * ({@code principalOracleAsset} / {@code collateral.oracleTokenAsset}) — FAB-111. Since 2026-09-30
+     * a token can have two oracles (v1 Lending v3, v2 Lending v4); the token-keyed form above picks one
+     * by rule, while the transaction for a loan must use the one its datum names. Anything that values
+     * a loan's own amounts — the pay-in-advance outlay and acquisition among them — belongs here.
+     */
+    public Priced toLovelaceForLeg(AssetType asset, AssetType oracleToken, BigInteger amount, long atMillis) {
+        return toLovelace(asset, amount, atMillis,
+                () -> oracleClient.findFeedForLeg(asset, oracleToken, atMillis),
+                () -> oracleClient.findFeedForLegIgnoringValidity(asset, oracleToken));
+    }
+
+    private Priced toLovelace(AssetType asset, BigInteger amount, long atMillis,
+                              java.util.function.Supplier<Optional<OraclePriceFeed>> usableLookup,
+                              java.util.function.Supplier<Optional<OraclePriceFeed>> anyLookup) {
         Objects.requireNonNull(asset, "asset");
         Objects.requireNonNull(amount, "amount");
 
@@ -113,7 +134,7 @@ public class PricingService {
             return Priced.priced(amount);
         }
 
-        Optional<OraclePriceFeed> usable = oracleClient.findFeed(asset, atMillis);
+        Optional<OraclePriceFeed> usable = usableLookup.get();
         if (usable.isPresent()) {
             OraclePriceFeed feed = usable.get();
             if (feed.variant() == OraclePriceFeed.Variant.POOLED) {
@@ -125,7 +146,7 @@ public class PricingService {
 
         // Not usable at atMillis through findFeed. findFeedIgnoringValidity is used ONLY to
         // classify why — its result is never passed to LoanFinance.toLovelace.
-        Optional<OraclePriceFeed> any = oracleClient.findFeedIgnoringValidity(asset);
+        Optional<OraclePriceFeed> any = anyLookup.get();
         if (any.isEmpty()) {
             return Priced.refused(new PriceRefusal(asset, atMillis, RefusalReason.NO_FEED,
                     null, null, null));

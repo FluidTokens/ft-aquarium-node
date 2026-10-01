@@ -52,12 +52,22 @@ public class LoanHealthService {
             return LoanHealth.debtOnly(remainingDebt, late, "oracle client disabled");
         }
 
+        // ⛔ FAB-111: each leg priced off the oracle THIS LOAN'S DATUM NAMES, never off its token.
+        // Since 2026-09-30 a token can have two oracles (v1 Lending v3, v2 Lending v4) and a token
+        // lookup returns whichever the client prefers — while the validator, and so the liquidation,
+        // uses the one the datum names. Health must describe the transaction that would follow it.
         AssetType collateralAsset = loan.datum().collateral().assetType();
-        Optional<OraclePriceFeed> principalFeed = client.findFeed(datum.principalAsset(), atTimeMillis);
-        Optional<OraclePriceFeed> collateralFeed = client.findFeed(collateralAsset, atTimeMillis);
+        AssetType collateralOracle = loan.datum().collateral().oracleTokenAsset();
+        Optional<OraclePriceFeed> principalFeed = client.findFeedForLeg(
+                datum.principalAsset(), datum.principalOracleAsset(), atTimeMillis);
+        Optional<OraclePriceFeed> collateralFeed = client.findFeedForLeg(
+                collateralAsset, collateralOracle, atTimeMillis);
         if (principalFeed.isEmpty() || collateralFeed.isEmpty()) {
-            var missing = principalFeed.isEmpty() ? datum.principalAsset() : collateralAsset;
-            return LoanHealth.debtOnly(remainingDebt, late, unpriceableReason(client, missing));
+            return principalFeed.isEmpty()
+                    ? LoanHealth.debtOnly(remainingDebt, late,
+                            unpriceableReason(client, datum.principalAsset(), datum.principalOracleAsset()))
+                    : LoanHealth.debtOnly(remainingDebt, late,
+                            unpriceableReason(client, collateralAsset, collateralOracle));
         }
 
         try {
@@ -82,11 +92,12 @@ public class LoanHealthService {
      * operational problems — the first is a coverage gap to raise with FluidTokens, the second
      * usually fixes itself on the next refresh — so they must not read the same in the API.
      */
-    private static String unpriceableReason(FluidOracleClient client, AssetType asset) {
-        return client.findFeedIgnoringValidity(asset)
+    private static String unpriceableReason(FluidOracleClient client, AssetType asset, AssetType oracleToken) {
+        return client.findFeedForLegIgnoringValidity(asset, oracleToken)
                 .map(feed -> "oracle price for %s expired at %s"
                         .formatted(asset.toUnit(), Instant.ofEpochMilli(feed.validTo())))
-                .orElseGet(() -> "no oracle price for " + asset.toUnit());
+                .orElseGet(() -> "no oracle price for %s (oracle %s)".formatted(asset.toUnit(),
+                        oracleToken == null ? "none" : oracleToken.toUnit()));
     }
 
 }

@@ -41,6 +41,16 @@ class LoanHealthServiceTest {
     private static final AssetType COLLATERAL =
             new AssetType("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "434f4c4c");
 
+    /**
+     * The oracle NFTs the registry fixture publishes ({@code cccc…} + the token's asset name), and so
+     * the ones a consistent datum must name. Health reads the datum's oracles since FAB-111: a datum
+     * naming any other NFT is a loan whose oracle the node does not hold.
+     */
+    private static final AssetType PRINCIPAL_ORACLE =
+            new AssetType("cccccccccccccccccccccccccccccccccccccccccccccccccccccccc", PRINCIPAL.assetName());
+    private static final AssetType COLLATERAL_ORACLE =
+            new AssetType("cccccccccccccccccccccccccccccccccccccccccccccccccccccccc", COLLATERAL.assetName());
+
     /** 5 lovelace per principal unit, 2 per collateral unit — distinct, so a swap changes the answer. */
     private static final long PRINCIPAL_PRICE = 5;
     private static final long COLLATERAL_PRICE = 2;
@@ -144,7 +154,7 @@ class LoanHealthServiceTest {
                 BigInteger.valueOf(1_000),            // interestRate — 10%
                 BigInteger.ZERO,                      // totalInstallments
                 PRINCIPAL,
-                PRINCIPAL,                            // principalOracleAsset, unused by health
+                PRINCIPAL_ORACLE,                     // principalOracleAsset — health prices from it (FAB-111)
                 BigInteger.ZERO,                      // installmentPeriod
                 BigInteger.ZERO,                      // initialGracePeriod
                 liquidationMode,
@@ -153,7 +163,7 @@ class LoanHealthServiceTest {
                 BigInteger.ZERO,                      // penaltyFeeForLateRepayment
                 false,
                 "00",
-                new CollateralAsset(COLLATERAL.policyId(), Optional.of(COLLATERAL.assetName()), COLLATERAL));
+                new CollateralAsset(COLLATERAL.policyId(), Optional.of(COLLATERAL.assetName()), COLLATERAL_ORACLE));
     }
 
     private static LiquidationMode.Liquidation liquidation() {
@@ -218,11 +228,11 @@ class LoanHealthServiceTest {
         var lateDatum = new LoanDatum(
                 BigInteger.ZERO, BigInteger.valueOf(1_000_000), BigInteger.valueOf(LEND_DATE),
                 BigInteger.ZERO, BigInteger.valueOf(1_000), BigInteger.valueOf(12),
-                PRINCIPAL, PRINCIPAL, BigInteger.valueOf(24), BigInteger.ZERO,
+                PRINCIPAL, PRINCIPAL_ORACLE, BigInteger.valueOf(24), BigInteger.ZERO,
                 liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(),
                 BigInteger.ZERO, BigInteger.ZERO, false, "00",
-                new CollateralAsset(COLLATERAL.policyId(), Optional.of(COLLATERAL.assetName()), COLLATERAL));
+                new CollateralAsset(COLLATERAL.policyId(), Optional.of(COLLATERAL.assetName()), COLLATERAL_ORACLE));
         var wealthy = new Loan("ab".repeat(32), 0, "addr_test1", "cafe",
                 BigInteger.valueOf(1_000_000_000), BigInteger.valueOf(3_000_000), lateDatum);
 
@@ -240,6 +250,42 @@ class LoanHealthServiceTest {
     }
 
     // ---- the unavailable paths ----------------------------------------------------------
+
+    /**
+     * ⛔ FAB-111. Since 2026-09-30 a token can have TWO oracles (v1 Lending v3, v2 Lending v4). The
+     * registry lists v2 LAST, and a token lookup takes the last — while the validator, and so any
+     * liquidation of this loan, uses the oracle its datum names (v1 here). Health must price the
+     * transaction that would follow it. The versions are given DIFFERENT prices so the two readings
+     * cannot coincide; on the token lookup this test reads the v2 price and fails.
+     */
+    @Test
+    void aLoanIsPricedOffTheOracleItsDatumNamesNotItsTokensOtherVersion() throws Exception {
+        // ⚠ VERSIONED, as the real registry is (v1 = 1, v2 = 2). Without versions the loan-free rule's
+        // tie-break happens to land on the named entry and this test passes on the token lookup too —
+        // measured: it did, until the versions were added.
+        String otherVersionLast = entry(PRINCIPAL, 9, VALID_FROM, VALID_TO)
+                .replace("cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+                .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 2,");
+        String namedV1 = entry(PRINCIPAL, PRINCIPAL_PRICE, VALID_FROM, VALID_TO)
+                .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 1,");
+        String registry = "[%s,%s,%s]".formatted(
+                namedV1,
+                entry(COLLATERAL, COLLATERAL_PRICE, VALID_FROM, VALID_TO),
+                otherVersionLast);
+
+        var health = serviceWith(registry).health(loan(liquidation()), NOW);
+
+        var namedFeed = FluidOracleClient.feedOf(PRINCIPAL, BigInteger.valueOf(PRINCIPAL_PRICE),
+                BigInteger.ONE, VALID_FROM, VALID_TO);
+        var collateralFeed = FluidOracleClient.feedOf(COLLATERAL, BigInteger.valueOf(COLLATERAL_PRICE),
+                BigInteger.ONE, VALID_FROM, VALID_TO);
+        var debt = Rational.fromInt(LoanFinance.remainingDebt(datum(liquidation()), NOW));
+        assertEquals(LoanFinance.currentLtv(debt, Rational.fromInt(COLLATERAL_AMOUNT), namedFeed, collateralFeed),
+                health.currentLtv(),
+                "the debt must be priced off the oracle the datum names (price 5), not the token's "
+                        + "other version listed last (price 9)");
+    }
 
     @Test
     void anExpiredFeedReportsExpiredRatherThanUnknown() throws Exception {

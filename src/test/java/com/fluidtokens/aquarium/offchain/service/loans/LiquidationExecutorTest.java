@@ -317,6 +317,13 @@ class LiquidationExecutorTest {
         public Optional<OracleEntry> findEntry(AssetType token) {
             return entries.stream().filter(e -> e.token().equals(token)).findFirst();
         }
+
+        // FAB-111 — a LOAN's legs are priced off the oracle NFT its datum names
+        // (PricingService.toLovelaceForLeg → findEntryByOracleToken), exactly as the builder resolves it.
+        @Override
+        public Optional<OracleEntry> findEntryByOracleToken(AssetType oracleToken) {
+            return entries.stream().filter(e -> e.oracleToken().equals(oracleToken)).findFirst();
+        }
     }
 
     /**

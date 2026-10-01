@@ -286,19 +286,29 @@ class LiquidationReadinessControllerTest {
 
         private final java.util.Map<AssetType, OracleEntry> byToken;
 
+        private final java.util.Map<AssetType, OracleEntry> byOracleToken;
+
         FakeOracleClient(OracleEntry... entries) {
             super("http://unused.invalid");
             byToken = new java.util.HashMap<>();
+            byOracleToken = new java.util.HashMap<>();
             for (OracleEntry entry : entries) {
-                // findEntry (production) is keyed by the PRICED asset — entry.token() — never the
-                // oracle NFT (entry.oracleToken(), which is findEntryByOracleToken's key instead).
+                // findEntry (loan-free) is keyed by the PRICED asset; findEntryByOracleToken by the
+                // oracle NFT a loan's datum names — which is what the controller resolves a loan's
+                // figures by since FAB-111, exactly as the builder does.
                 byToken.put(entry.token(), entry);
+                byOracleToken.put(entry.oracleToken(), entry);
             }
         }
 
         @Override
         public Optional<OracleEntry> findEntry(AssetType token) {
             return Optional.ofNullable(byToken.get(token));
+        }
+
+        @Override
+        public Optional<OracleEntry> findEntryByOracleToken(AssetType oracleToken) {
+            return Optional.ofNullable(byOracleToken.get(oracleToken));
         }
     }
 
@@ -381,6 +391,45 @@ class LiquidationReadinessControllerTest {
         assertNotEquals(BigInteger.valueOf(195_000_000L), advance,
                 "195,000,000 is what the deprecated null-principal-oracle overload would have "
                         + "produced — seeing it here means the fix regressed");
+    }
+
+    /**
+     * ⛔ FAB-111. The same loan, with a SECOND oracle for its principal token registered last under a
+     * different NFT and a different price — the 2026-09-30 shape (v1 Lending v3, v2 Lending v4). The
+     * figures must still come from the oracle the datum names; a token lookup takes the decoy and the
+     * advance moves. The fake's token map keeps the LAST entry, exactly as the real client's did.
+     */
+    @Test
+    void advanceAmountUsesTheOracleTheDatumNamesWhenTheTokenHasAnotherVersion() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN));
+
+        OracleEntry collateralOracle = LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 10_000_000L),
+                input("22"), input("33"), input("44"));
+        OracleEntry namedPrincipalOracle = LoanFixtures.charli3(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
+                        BigInteger.TWO, BigInteger.ONE, 0L, 10_000_000L),
+                input("66"), input("77"), input("88"));
+        AssetType otherVersionNft = new AssetType("ee".repeat(28), PRINCIPAL_ORACLE_NFT.assetName());
+        OracleEntry otherVersion = LoanFixtures.charli3(PRINCIPAL_TOKEN, otherVersionNft,
+                "99".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
+                        BigInteger.valueOf(3), BigInteger.ONE, 0L, 10_000_000L),
+                input("aa"), input("bb"), input("cc"));
+        FakeOracleClient client = new FakeOracleClient(collateralOracle, namedPrincipalOracle, otherVersion);
+        LiquidationReadinessController controller = controllerWith(client, LoanFixtures.registry());
+
+        assertEquals(BigInteger.valueOf(97_500_000L), controller.advanceAmount(loan, bond, 1_000L),
+                "the advance must be computed off the principal oracle the datum names (price 2), not "
+                        + "the token's other version registered last (price 3)");
     }
 
     /** advanceAmount refuses (null) rather than guess when the loan's OWN principal oracle is missing. */
