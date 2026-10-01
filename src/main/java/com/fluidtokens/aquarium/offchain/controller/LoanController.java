@@ -87,12 +87,12 @@ public class LoanController {
                                  Integer oracleVersion) {
     }
 
-    @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     /**
      * @param trackedAssets  priced TOKENS (19 on 2026-10-01)
      * @param trackedOracles registry ORACLES (35 the same day): two per token where FluidTokens
      *                       publishes both a v1 (Lending v3) and a v2 (Lending v4) oracle
      */
+    @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record OracleStatusView(String lastRefresh,
                                    long secondsSinceRefresh,
                                    int trackedAssets,

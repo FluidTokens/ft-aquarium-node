@@ -1850,6 +1850,52 @@ class LiquidateTransactionBuilderTest {
                         LoanFixtures.rewardAddress(REGISTRY.getLoanClaimActionScriptHash()))));
     }
 
+    /**
+     * ⛔ FAB-114 (oracle audit round 1, finding 1): ONE withdrawal per oracle CREDENTIAL, but one
+     * reference input per oracle NFT a leg NAMES. Since 2026-09-30 FLDT's v1 and v2 oracles share one
+     * script (one credential) under two NFTs. Here the loan's principal names NFT B and its collateral
+     * NFT A, behind one credential: deduplicating reference inputs by credential dropped one NFT and
+     * the build refused STRUCTURAL_ASSERTION_FAILED ("oracle reference input … is not in the
+     * reference input set").
+     */
+    @Test
+    void twoOracleNftsBehindOneCredentialCarryBothReferenceInputsAndOneWithdrawal() {
+        AssetType oracleTokenB = new AssetType("9a".repeat(28), ORACLE_TOKEN.assetName());
+        LoanDatum datum = LoanFixtures.loanDatum(COLLATERAL_TOKEN, oracleTokenB,
+                BigInteger.valueOf(500_000), BigInteger.valueOf(1000),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, ORACLE_TOKEN), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN_A, 0, LOAN_ID_A, datum, 2_000_000L,
+                List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND_A, 0, LOAN_ID_A,
+                LoanFixtures.bondDatum(BigInteger.TEN, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY),
+                        COLLATERAL_TOKEN), 2_000_000L);
+        OraclePriceFeed feed = OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                BigInteger.valueOf(100), BigInteger.ONE, VALID_FROM - 60_000L, VALID_FROM + 600_000L);
+        TransactionInput nftA = LoanFixtures.input(TX_ORACLE_NFT, 0);
+        TransactionInput nftB = LoanFixtures.input(TX_ORACLE_NFT, 1);
+        OracleEntry oracleA = LoanFixtures.charli3(COLLATERAL_TOKEN, ORACLE_TOKEN, ORACLE_CREDENTIAL, feed,
+                nftA, LoanFixtures.input(TX_ORACLE_SCRIPT, 0), LoanFixtures.input(TX_CHARLI3_PROVIDER, 0));
+        OracleEntry oracleB = LoanFixtures.charli3(COLLATERAL_TOKEN, oracleTokenB, ORACLE_CREDENTIAL, feed,
+                nftB, LoanFixtures.input(TX_ORACLE_SCRIPT, 0), LoanFixtures.input(TX_CHARLI3_PROVIDER, 0));
+        assertEquals(oracleA.withdrawCredentialHash(), oracleB.withdrawCredentialHash(),
+                "precondition: two NFTs behind ONE credential, as FLDT v1/v2 on mainnet");
+        LiquidationAssessment assessment = LoanFixtures.assess(bond.bond(), loan.loan(), feed, feed, VALID_FROM);
+        AdaScenario scenario = new AdaScenario(loan, bond, assessment, null);
+
+        Transaction tx = build(List.of(scenario),
+                Map.of(ORACLE_TOKEN.toUnit(), oracleA, oracleTokenB.toUnit(), oracleB),
+                LiquidateTransactionBuilder.ReferenceScripts.none());
+
+        var refs = tx.getBody().getReferenceInputs();
+        assertTrue(refs.contains(nftA) && refs.contains(nftB),
+                "both NFT reference inputs must travel — each leg's own: " + refs);
+        assertEquals(1, tx.getBody().getWithdrawals().stream()
+                        .filter(w -> w.getRewardAddress().equals(oracleA.rewardAddress()))
+                        .count(),
+                "and the shared credential is withdrawn from exactly once");
+    }
+
     // ======================================================================================
     // request-shape guards
     // ======================================================================================

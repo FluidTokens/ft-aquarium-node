@@ -111,6 +111,35 @@ class OracleVersionDuplicatesTest {
         assertEquals(1, warns("DISAGREE"), "agreeing versions are silent");
     }
 
+    /** A LAPSED version differing in price is not a disagreement — only two VALID ones are (finding 7). */
+    @Test
+    void aLapsedVersionWithAnotherPriceIsNotADisagreement() throws Exception {
+        var client = new FluidOracleClient("http://unused.invalid");
+        attach();
+        String lapsedV2 = entry(V2, 2, 9_500, "\"publicKeys\":[\"aa\"],")
+                .replaceFirst("\"validFrom\":\\d+,\"validTo\":\\d+",
+                        "\"validFrom\":1000,\"validTo\":2000");
+        client.load(MAPPER.readTree("[" + entry(V1, 1, 9_000, "\"publicKeys\":[\"aa\"],") + "," + lapsedV2 + "]"));
+
+        assertEquals(0, warns("DISAGREE"), "a lapsed version is not one feed disagreeing with itself");
+    }
+
+    /** A duplicated NFT is one oracle, not a second version of its token (finding 9). */
+    @Test
+    void aDuplicatedNftDoesNotCountAsASecondVersion() throws Exception {
+        var client = new FluidOracleClient("http://unused.invalid");
+        attach();
+        String twice = "[" + entry(V1, 1, 9_000, "\"publicKeys\":[\"aa\"],") + ","
+                + entry(V1, 1, 9_000, "\"publicKeys\":[\"aa\"],") + "]";
+
+        client.load(MAPPER.readTree(twice));
+
+        assertEquals(1, appender.list.stream()
+                .filter(e -> e.getLevel() == Level.INFO)
+                .filter(e -> e.getFormattedMessage().contains("1 oracles across 1 tokens, 0 tokens with more than one"))
+                .count(), "the shape must count one oracle, not two versions");
+    }
+
     @Test
     void theSameOracleNftListedTwiceIsAConflict() throws Exception {
         var client = new FluidOracleClient("http://unused.invalid");

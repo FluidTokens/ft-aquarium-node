@@ -165,7 +165,12 @@ public class FluidOracleClient {
         if (asset.isAda()) {
             return Optional.of(OraclePriceFeed.unit());
         }
-        return findEntryByOracleToken(oracleToken).map(OracleEntry::feed);
+        // ⚠ The named oracle must price THIS leg's token (oracle audit round 1, finding 6). A datum
+        // naming another token's oracle would otherwise be priced at that other token's price; the
+        // validator's is_feed_token_correct refuses such a transaction, so the figures must not claim it.
+        return findEntryByOracleToken(oracleToken)
+                .filter(entry -> asset.equals(entry.token()))
+                .map(OracleEntry::feed);
     }
 
     /** Higher {@code oracleVersion} wins; an entry without one ranks below any that has one. */
@@ -257,6 +262,9 @@ public class FluidOracleClient {
             // that NFT, so two of them make "the oracle this loan uses" ambiguous.
             OracleEntry displaced = oracleTokens.put(entry.oracleToken(), entry);
             if (displaced != null) {
+                // Keep the per-token versions consistent with the NFT map (last wins): the displaced
+                // entry must not stay selectable, nor count as a second "version" (audit finding 9).
+                versionsPerToken.get(displaced.token()).remove(displaced);
                 warnOnce(entry.oracleToken(), "duplicate-oracle-nft", "duplicate",
                         "oracle registry lists oracle NFT {} TWICE (token {}) — keeping the last. A loan "
                                 + "names its oracle by this NFT, so which entry it gets is now arbitrary.",

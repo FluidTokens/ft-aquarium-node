@@ -36,6 +36,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -427,6 +428,89 @@ class LiquidationReadinessControllerTest {
                 "with the lending gate closed, every row must say the bot refuses it");
     }
 
+    /** {@code entry} carrying an oracleVersion — fixtures are built without one. */
+    private static OracleEntry versioned(OracleEntry e, int version) {
+        return new OracleEntry(e.token(), e.oracleToken(), e.rewardAddress(), e.withdrawCredentialHash(),
+                e.referenceInput(), e.referenceScript(), e.verificationKeys(), e.threshold(), e.feed(),
+                e.signatures(), e.charlieProviderReferenceInput(), version);
+    }
+
+    /**
+     * ⛔ FAB-111/112 (oracle audit round 1, finding 3): through the real row path, the fee is valued
+     * off the collateral oracle the DATUM names and the label shows THAT oracle's version — with the
+     * token's other version, differently priced, registered last where a token lookup would land.
+     */
+    @Test
+    void aRowsFeeValueAndOracleLabelComeFromTheOracleTheDatumNames() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN));
+        // readiness() prices at the WALL CLOCK, so the windows must contain it.
+        long now = System.currentTimeMillis();
+        long from = now - 60_000L, to = now + 600_000L;
+        OraclePriceFeed namedCollateralFeed = OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                BigInteger.ONE, BigInteger.ONE, from, to);
+        OracleEntry namedCollateral = versioned(LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), namedCollateralFeed, input("22"), input("33"), input("44")), 1);
+        OracleEntry namedPrincipal = versioned(LoanFixtures.charli3(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN, BigInteger.TWO,
+                        BigInteger.ONE, from, to), input("66"), input("77"), input("88")), 1);
+        OracleEntry otherCollateral = versioned(LoanFixtures.charli3(COLLATERAL_TOKEN,
+                new AssetType("ef".repeat(28), COLLATERAL_ORACLE_NFT.assetName()), "98".repeat(28),
+                OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.valueOf(4), BigInteger.ONE,
+                        from, to), input("ab"), input("ac"), input("ad")), 2);
+        FakeOracleClient client = new FakeOracleClient(namedCollateral, namedPrincipal, otherCollateral);
+
+        var assessment = LoanFixtures.assess(bond, loan, namedPrincipal.feed(), namedCollateralFeed, now);
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(loan), 1, 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(List.of(assessment), census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null) {
+            @Override
+            public com.fluidtokens.aquarium.offchain.model.loans.LoanHealth health(Loan l, long at) {
+                return com.fluidtokens.aquarium.offchain.model.loans.LoanHealth.debtOnly(BigInteger.ZERO, false, "stub");
+            }
+        };
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(client), provide(null), provide(null), provide(LoanFixtures.registry()), provide(null),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+        controller.setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var row = ((List<LiquidationReadinessController.Row>) model.getAttribute("rows")).getFirst();
+
+        assertNotNull(row.feeInCollateral(), "the fixture must produce a fee slice: " + row.feeUnknownReason());
+        assertEquals(row.feeInCollateral(), row.feeValueLovelace(),
+                "the fee is valued at the NAMED collateral oracle's price (1), not the other version's (4)");
+        assertEquals(Integer.valueOf(1), row.collateralOracleVersion(),
+                "the label must show the version of the oracle the datum names, not the token's other one");
+    }
+
     /**
      * A closed gate overrides a row's action: never "would act", and it says why. An open gate leaves
      * the row's own answer untouched.
@@ -533,12 +617,19 @@ class LiquidationReadinessControllerTest {
                 "99".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
                         BigInteger.valueOf(3), BigInteger.ONE, 0L, 10_000_000L),
                 input("aa"), input("bb"), input("cc"));
-        FakeOracleClient client = new FakeOracleClient(collateralOracle, namedPrincipalOracle, otherVersion);
+        // ⛔ And a decoy for the COLLATERAL leg too (oracle audit round 1, finding 3), also last.
+        OracleEntry otherCollateralVersion = LoanFixtures.charli3(COLLATERAL_TOKEN,
+                new AssetType("ef".repeat(28), COLLATERAL_ORACLE_NFT.assetName()),
+                "98".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.valueOf(4), BigInteger.ONE, 0L, 10_000_000L),
+                input("ab"), input("ac"), input("ad"));
+        FakeOracleClient client = new FakeOracleClient(collateralOracle, namedPrincipalOracle, otherVersion,
+                otherCollateralVersion);
         LiquidationReadinessController controller = controllerWith(client, LoanFixtures.registry());
 
         assertEquals(BigInteger.valueOf(97_500_000L), controller.advanceAmount(loan, bond, 1_000L),
-                "the advance must be computed off the principal oracle the datum names (price 2), not "
-                        + "the token's other version registered last (price 3)");
+                "the advance must be computed off the oracles the datum names (principal 2, collateral 1), "
+                        + "not the tokens' other versions registered last (3 and 4)");
     }
 
     /** advanceAmount refuses (null) rather than guess when the loan's OWN principal oracle is missing. */

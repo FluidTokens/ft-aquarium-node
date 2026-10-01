@@ -110,6 +110,10 @@ class PricingServiceTest {
     }
 
     private static String versionEntry(String oraclePolicy, int version, long price, long now) {
+        return versionEntry(oraclePolicy, version, price, now - 600_000L, now + 600_000L);
+    }
+
+    private static String versionEntry(String oraclePolicy, int version, long price, long validFrom, long validTo) {
         return """
                 {"token":{"policyId":"%s","assetName":"%s"},
                  "fluidOracle":{"policyId":"%s","assetName":"6f7261636c65"},
@@ -118,7 +122,60 @@ class PricingServiceTest {
                      "validFrom":%d,"validTo":%d,
                      "multisigOracle":{"publicKeys":["aa"],"signatures":[{"publicKey":"aa","signature":"s"}]}}}}
                 """.formatted(NIGHT.policyId(), NIGHT.assetName(), oraclePolicy, version, price,
-                now - 600_000L, now + 600_000L);
+                validFrom, validTo);
+    }
+
+    private static PricingService loanFree(String... entries) throws Exception {
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new com.fasterxml.jackson.databind.ObjectMapper().readTree("[" + String.join(",", entries) + "]"));
+        return new PricingService(client);
+    }
+
+    private static final String V1 = "93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b";
+    private static final String V2 = "26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26";
+
+    /** A loan leg naming ANOTHER token's oracle is NO_FEED, never priced at that token (audit finding 6). */
+    @Test
+    void aLegNamingAnotherTokensOracleIsNotPricedByIt() throws Exception {
+        var service = loanFree(versionEntry(V1, 1, 2, AT_MILLIS));
+        var nightV1Nft = new AssetType(V1, "6f7261636c65");
+        var otherToken = new AssetType("ab".repeat(28), "4f54484552");
+
+        var leg = service.toLovelaceForLeg(otherToken, nightV1Nft, BigInteger.valueOf(1_000), AT_MILLIS);
+
+        assertTrue(!leg.isPriced() && leg.refusal().reason() == PricingService.RefusalReason.NO_FEED,
+                "the validator refuses a feed for the wrong token, so the figures must not use it");
+    }
+
+    /** A3 is "highest version", not "last listed": v2 FIRST must still win (oracle audit, finding 4). */
+    @Test
+    void loanFreePricingPrefersTheHighestVersionWhateverTheRegistryOrder() throws Exception {
+        var service = loanFree(versionEntry(V2, 2, 3, AT_MILLIS), versionEntry(V1, 1, 2, AT_MILLIS));
+
+        assertEquals(BigInteger.valueOf(3_000), service.toLovelace(NIGHT, BigInteger.valueOf(1_000), AT_MILLIS).lovelace(),
+                "v2 (price 3) wins even when listed before v1");
+    }
+
+    /** The loan-free ENTRY lookup follows A3 too: highest version, whatever the order (finding 4, M6b). */
+    @Test
+    void theLoanFreeEntryLookupIsTheHighestVersionWhateverTheRegistryOrder() throws Exception {
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new com.fasterxml.jackson.databind.ObjectMapper().readTree(
+                "[" + versionEntry(V2, 2, 3, AT_MILLIS) + "," + versionEntry(V1, 1, 2, AT_MILLIS) + "]"));
+
+        assertEquals(Integer.valueOf(2), client.findEntry(NIGHT).orElseThrow().oracleVersion(),
+                "v2 is listed FIRST here, so last-wins would answer v1");
+    }
+
+    /** A3 is "usable now FIRST": a lapsed v2 must not hide a valid v1 (oracle audit, finding 4). */
+    @Test
+    void loanFreePricingFallsBackToAValidLowerVersionWhenTheHigherHasLapsed() throws Exception {
+        var service = loanFree(versionEntry(V1, 1, 2, AT_MILLIS),
+                versionEntry(V2, 2, 3, AT_MILLIS - 1_200_000L, AT_MILLIS - 600_000L));
+
+        var priced = service.toLovelace(NIGHT, BigInteger.valueOf(1_000), AT_MILLIS);
+        assertTrue(priced.isPriced(), "a valid v1 must price while v2 has lapsed: " + priced.refusal());
+        assertEquals(BigInteger.valueOf(2_000), priced.lovelace());
     }
 
     /**

@@ -1482,8 +1482,9 @@ public class LiquidationExecutor {
         // floorProfit is therefore REPLACED (not added to) for this branch: acquired - outlay - txFee
         // - riders, exactly the plain path's shape (fee slice - txFee - riders) with "fee slice"
         // widened to the REAL trade this path actually makes. Both acquired and outlay are priced
-        // through PricingService, at the SAME instant (`now`) — never mixed with collateralFeed above,
-        // which is a DIFFERENT, validator-pinned source that can disagree with PricingService's own.
+        // through PricingService, at the SAME instant (`now`) — never mixed with collateralFeed above.
+        // Since FAB-111 both resolve the oracle the datum NAMES, but collateralFeed comes from this
+        // cycle's snapshot and PricingService reads the live client, so a refresh can still part them.
         //
         // Direction: PricingService.toLovelace ROUNDS FLOOR — correct for acquired (an EARNED amount)
         // and WRONG for the outlay, where floor would UNDERSTATE the cost and flatter the bot. So the

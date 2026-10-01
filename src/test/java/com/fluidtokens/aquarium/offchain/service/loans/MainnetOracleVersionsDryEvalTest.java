@@ -178,25 +178,31 @@ class MainnetOracleVersionsDryEvalTest {
         char flipped = hex.charAt(0) == '0' ? '1' : '0';
         tampered.set(0, new OracleSignature(first.keyPosition(), flipped + hex.substring(1)));
 
-        assertThrows(Exception.class, () -> build(entry, script(hash8.trim()),
+        Exception refused = assertThrows(Exception.class, () -> build(entry, script(hash8.trim()),
                         LiquidationTxEncoder.oracleRedeemer(entry.feed(), tampered)),
                 label + ": a forged signature must be refused, or this rig evaluates nothing");
+        assertScriptRefused(label, refused);
     }
 
-    /** NEGATIVE CONTROL: the right signature at the wrong key position — the script must refuse it. */
+    /**
+     * NEGATIVE CONTROL: a key position the script has no key for. NIGHT v2 carries ONE key, so a shifted
+     * position indexes past the end of the applied key list and the script refuses on that
+     * ({@code Machine(EmptyList)}) — it proves positions are honoured, not a wrong-key signature check.
+     */
     @ParameterizedTest(name = "{0}")
     @CsvSource({
             "NIGHT v2, 26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26, 6f7261636c654e69676874, 756897fd",
     })
-    void aWrongKeyPositionIsRefused(String label, String policy, String oracleAssetName, String hash8) throws Exception {
+    void anOutOfRangeKeyPositionIsRefusedByTheScript(String label, String policy, String oracleAssetName, String hash8) throws Exception {
         OracleEntry entry = entryNamedBy(policy.trim(), oracleAssetName.trim());
         List<OracleSignature> shifted = entry.signatures().stream()
                 .map(s -> new OracleSignature(s.keyPosition() + 1, s.signatureHex()))
                 .toList();
 
-        assertThrows(Exception.class, () -> build(entry, script(hash8.trim()),
+        Exception refused = assertThrows(Exception.class, () -> build(entry, script(hash8.trim()),
                         LiquidationTxEncoder.oracleRedeemer(entry.feed(), shifted)),
-                label + ": a signature verified against the wrong key must be refused");
+                label + ": a key position outside the applied key list must be refused");
+        assertScriptRefused(label, refused);
     }
 
     /**
@@ -220,5 +226,18 @@ class MainnetOracleVersionsDryEvalTest {
         assertTrue(distinct.stream().anyMatch(e -> e.referenceInput().equals(fldtV1.referenceInput()))
                         && distinct.stream().anyMatch(e -> e.referenceInput().equals(fldtV2.referenceInput())),
                 "each version's own NFT reference input");
+    }
+
+    /**
+     * The refusal must come from the SCRIPT (a RedeemerError from the evaluator), not from anything
+     * else in the build — otherwise a rig fault would pass the negative controls (audit finding 5).
+     */
+    private static void assertScriptRefused(String label, Throwable refused) {
+        StringBuilder chain = new StringBuilder();
+        for (Throwable t = refused; t != null; t = t.getCause()) {
+            chain.append(t.getClass().getSimpleName()).append(": ").append(t.getMessage()).append(" | ");
+        }
+        assertTrue(chain.toString().contains("RedeemerError"),
+                label + ": refused, but not by the oracle script — " + chain);
     }
 }

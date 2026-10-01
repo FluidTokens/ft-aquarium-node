@@ -269,10 +269,18 @@ class LoanHealthServiceTest {
                 .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 2,");
         String namedV1 = entry(PRINCIPAL, PRINCIPAL_PRICE, VALID_FROM, VALID_TO)
                 .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 1,");
-        String registry = "[%s,%s,%s]".formatted(
+        // ⛔ And the COLLATERAL leg too (oracle audit round 1, finding 3): its other version, also last.
+        String collateralNamedV1 = entry(COLLATERAL, COLLATERAL_PRICE, VALID_FROM, VALID_TO)
+                .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 1,");
+        String collateralOtherVersionLast = entry(COLLATERAL, 7, VALID_FROM, VALID_TO)
+                .replace("cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+                .replace("\"active\": true,", "\"active\": true, \"oracleVersion\": 2,");
+        String registry = "[%s,%s,%s,%s]".formatted(
                 namedV1,
-                entry(COLLATERAL, COLLATERAL_PRICE, VALID_FROM, VALID_TO),
-                otherVersionLast);
+                collateralNamedV1,
+                otherVersionLast,
+                collateralOtherVersionLast);
 
         var health = serviceWith(registry).health(loan(liquidation()), NOW);
 
@@ -283,8 +291,8 @@ class LoanHealthServiceTest {
         var debt = Rational.fromInt(LoanFinance.remainingDebt(datum(liquidation()), NOW));
         assertEquals(LoanFinance.currentLtv(debt, Rational.fromInt(COLLATERAL_AMOUNT), namedFeed, collateralFeed),
                 health.currentLtv(),
-                "the debt must be priced off the oracle the datum names (price 5), not the token's "
-                        + "other version listed last (price 9)");
+                "both legs must be priced off the oracles the datum names (principal 5, collateral 2), "
+                        + "not the tokens' other versions listed last (9 and 7)");
     }
 
     @Test
