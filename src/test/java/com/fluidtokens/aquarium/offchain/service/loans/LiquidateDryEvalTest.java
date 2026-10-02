@@ -42,10 +42,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * <h2>Reviewer's orientation — and note this is the PLAIN path, not the failing one</h2>
- * <b>This class covers {@code Liquidate}, where the lender receives the collateral itself. The convert
- * path that failed in production is {@code LiquidateAndPayInAdvance}, covered by
+ * <b>This class covers {@code Liquidate}, where the lender receives the collateral itself. The
+ * pay-in-advance path that failed in production is {@code LiquidateAndPayInAdvance}, covered by
  * {@link LiquidatePayInAdvanceDryEvalTest}.</b> They are different on-chain actions with different
- * script hashes; do not read a green run here as saying anything about the convert path.
+ * script hashes; do not read a green run here as saying anything about the pay-in-advance path.
+ * (Minswap convert is a third, separate action, {@code LiquidateAndConvert}.)
  * <b>Proves:</b> the plain transaction's shape is accepted by the real deployed PlutusV3 validators.
  * <b>Does NOT prove:</b> any LEDGER rule — fees, min-ada, collateral adequacy, {@code maxTxSize} —
  * none of which the offline evaluator enforces. <b>Evaluator:</b> offline (aiken-java-binding).

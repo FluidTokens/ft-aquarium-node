@@ -887,7 +887,7 @@ public class AppConfig {
 
         /**
          * {@code txHash#index}, or empty for "not published". Every rejection names the key, because
-         * the value alone does not tell an operator which of seven near-identical lines to fix.
+         * the value alone does not tell an operator which of nine near-identical lines to fix.
          */
         static TransactionInput referenceInput(String key, String value) {
             String coordinate = value == null ? "" : value.trim();
@@ -998,7 +998,7 @@ public class AppConfig {
         /**
          * Published reference scripts, as a comma-separated list of {@code txHash#index} coordinates.
          *
-         * <p>⚑ <b>Deliberately NOT one named key per validator.</b> The liquidation path has eight
+         * <p>⚑ <b>Deliberately NOT one named key per validator.</b> The liquidation path has nine
          * such keys, and its own Argo comment records the confusion they cause: a key named for a
          * validator holds a <em>coordinate</em>, not a contract, and nothing checks that the two
          * agree. Here the operator lists coordinates and <b>the chain says which script each one
@@ -1096,13 +1096,16 @@ public class AppConfig {
          * assessment records which one bound — while the gate can never be more optimistic than the
          * operator's stated cost of touching a DEX.
          *
-         * <p>⚑ <b>Why a floor rather than adding the batcher fee to the measurement.</b> Read at
-         * {@code e0b818e}: for an <b>ada</b> collateral the validator requires the order's total
-         * lovelace to equal {@code swappableCollateralAmount} exactly — <b>no extra ada at all</b> —
-         * so Minswap's {@code max_batcher_fee} of 700,000 comes out of the <em>swap input</em>, which
-         * is the lender's proceeds, not the bot's wallet. Adding it to the bot's outlay would be a
-         * false attribution. A floor captures Giovanni's conservatism <b>without asserting who pays
-         * what</b>, which is the honest instrument for a cost whose incidence is genuinely split.
+         * <p>⚑ Read at {@code e0b818e}: for an <b>ada</b> collateral the validator <b>used to
+         * require</b> the order's total lovelace to equal {@code swappableCollateralAmount} exactly
+         * — no extra ada at all — so Minswap's {@code max_batcher_fee} of 700,000 came out of the
+         * <em>swap input</em>, the lender's proceeds, and adding it to the bot's outlay would then
+         * have been a false attribution. That is history: since {@code db5069e} both collateral
+         * kinds carry {@code minswap_order_overhead} (max_batcher_fee 2,000,000 + output min-ada
+         * 2,000,000) on top of what they swap, and the bot funds it either way
+         * ({@code ConvertEconomics.MINSWAP_ORDER_OVERHEAD}). That cost is now booked explicitly as
+         * {@link #minswapOrderCostLovelace} (below), so this floor survives as a guard on an
+         * under-measured transaction fee, not as a hedge on who pays.
          *
          * <p>⚑ <b>THIS IS WHY IT SURVIVED THE MERGE OF 2026-09-09 while the convert margin did not.</b>
          * It is separable from {@link LiquidationConfiguration#profitMarginLovelace} and cannot

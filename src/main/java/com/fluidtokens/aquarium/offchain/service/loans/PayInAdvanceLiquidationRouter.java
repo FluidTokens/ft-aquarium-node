@@ -20,10 +20,13 @@ import java.time.ZoneOffset;
 import java.util.Map;
 
 /**
- * The routing seam for a <em>convert</em> liquidation — a loan whose lender bond carries
+ * The routing seam for a <em>pay-in-advance</em> liquidation — a loan whose lender bond carries
  * {@code shouldLiquidationConvertToPrincipal == True}, which the plain {@code Liquidate} path refuses
  * ({@code lm_liquidate_action.ak:143}) and the {@code LiquidateAndPayInAdvance} action requires.
- * {@link LiquidationExecutor} selects between the plain builder and this seam by that one datum flag.
+ * {@link LiquidationExecutor} uses that one bond flag to choose between the plain builder and the
+ * convert-eligible branch; within the convert-eligible branch, {@code MarketGate.actionFor} then
+ * chooses between Minswap {@code CONVERT} (routed to {@code ConvertLiquidationRouter}) and
+ * pay-in-advance, routed here.
  *
  * <h2>Assembly only — no arming, no submitting</h2>
  * This class assembles a {@link LiquidatePayInAdvanceTransactionBuilder.Request} and calls
