@@ -2071,8 +2071,8 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * And the preview default, which is {@code shadow} with the arming flag still off — two changes
-     * away from submitting, not one.
+     * And the preview default, which is {@code shadow} — one change ({@code mode: live}) away from
+     * submitting now that the separate arming flag is gone (2026-09-04).
      */
     @Test
     void theShippedPreviewDefaultIsAlsoIncapableOfSubmitting() {
@@ -2082,8 +2082,9 @@ class LiquidationSubmitVetoTest {
                 .run();
 
         // Deliberately no veto name: shadow-without-arming is stopped by S1 and would still be
-        // stopped by S2, and this test is about the shipped configuration rather than about which
-        // of the two got there first.
+        // stopped by S2 (a market can never be more live than the node — MarketGate.effectiveMode),
+        // and this test is about the shipped configuration rather than about which of the two got
+        // there first.
         run.assertNothingWasSubmitted();
         assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, run.onlyDecision().outcome());
     }
