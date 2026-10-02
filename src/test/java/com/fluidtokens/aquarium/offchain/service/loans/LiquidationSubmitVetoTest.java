@@ -1339,7 +1339,7 @@ class LiquidationSubmitVetoTest {
         assertTrue(decision.txSizeBytes() > 16_384,
                 "the fixture must actually be oversized: " + decision.txSizeBytes());
         assertTrue(decision.expectedProfitLovelace().signum() > 0,
-                "and profitable, so S5 cannot be S4 in disguise");
+                "and profitable, so S4 cannot be S3 in disguise");
 
         // Protocol parameters that cannot be fetched. Not knowing the limit is not being under it.
         Run unfetchable = new Rig().params(unfetchableProtocolParams()).run();
@@ -1370,7 +1370,7 @@ class LiquidationSubmitVetoTest {
                 .run();
 
         assertEquals(1, run.submitter().submitted.size(),
-                "with a large enough maxTxSize the very transaction S5 refused must go out");
+                "with a large enough maxTxSize the very transaction S4 refused must go out");
         assertEquals(LiquidationDecision.Outcome.SUBMITTED, run.onlyDecision().outcome());
     }
 
@@ -1814,7 +1814,7 @@ class LiquidationSubmitVetoTest {
         assertEquals(LiquidationDecision.Outcome.SUBMIT_VETOED, decision.outcome(),
                 "the fix is log-only — the recorded outcome must not change");
         assertEquals(null, decision.submitVeto(),
-                "not one of the eight vetoes, so none is named — unchanged by the fix");
+                "not one of the seven vetoes, so none is named — unchanged by the fix");
         assertTrue(decision.detail().contains("signing key rejected"),
                 "the decision detail must carry the ROOT cause, not just the wrapper: " + decision.detail());
         assertTrue(decision.detail().contains(LiquidationExecutor.causeChain(boom)),

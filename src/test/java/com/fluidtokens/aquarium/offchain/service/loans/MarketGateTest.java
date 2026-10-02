@@ -132,7 +132,7 @@ class MarketGateTest {
 
     /**
      * ⛔ <b>A SHADOW market must BUILD — on either scope.</b> This gate refuses nothing for shadow; the
-     * executor's {@code S4 MARKET_NOT_LIVE} veto withholds the submission after the transaction exists.
+     * executor's {@code S2 MARKET_NOT_LIVE} veto withholds the submission after the transaction exists.
      * That is the whole point of the mode: <b>shadow shows you the transactions that would have gone</b>,
      * so a gate that refused before the build would turn the rehearsal back into a refusal.
      *
