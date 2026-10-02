@@ -37,13 +37,14 @@ import java.math.BigInteger;
  * ADA spent to interact with the DEX. So between batcher and tx fee you can round at 4 ada or 5
  * ada."</i> Default 5,000,000 — the conservative end of what he named.
  *
- * <p><b>A floor, not an addend, and the reason is a measurement.</b> Read at {@code e0b818e}: for an
+ * <p><b>A floor, not an addend</b> — originally because of a measurement that is now history; today it
+ * guards an under-measured transaction fee. Read at {@code e0b818e}: for an
  * <b>ada</b> collateral the validator <b>used to require</b> the order's <em>total</em> lovelace to
  * equal {@code swappableCollateralAmount} — no extra ada whatsoever — so Minswap's
  * {@code max_batcher_fee} of 700,000 would have come out of the <b>swap input</b>, the lender's
  * proceeds, and adding it to the bot's outlay would then have been a false attribution. That is
- * history before {@code db5069e}: the deployed validator now requires
- * {@code quantity_of(minswapOrderOutput.value, "", "") >= minswap_order_overhead} (4,000,000 — max
+ * history before {@code db5069e}: the deployed validator now requires every order to carry
+ * {@code minswap_order_overhead} (4,000,000 — max
  * batcher fee 2,000,000 plus output min-ada 2,000,000) on <b>both</b> collateral kinds, on top of
  * what each swaps ({@code ConvertEconomics.MINSWAP_ORDER_OVERHEAD}; {@code ConvertOrderPlan.java:
  * 197-199}). <b>So a convert costs the bot 4 ada it does not get back</b>, which is four to five

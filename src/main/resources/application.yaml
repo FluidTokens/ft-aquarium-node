@@ -636,8 +636,10 @@ loans:
     #   lender-manager       fe791b23...024ffc07#0
     #   lender-manager-spend 13dd3329...663c2571#0
     #   loan-claim-action    b09e23dc...19f243fe#0
-    # ZERO of the six is published now. lm-liquidate-action -- the one that WAS published, for the
-    # third deployment -- was BLANKED 2026-08-25 for the fourth (see below); the reasoning that
+    #   lm-liquidate-action  549b438c...49a47fe0#0
+    # ZERO of the six is published now. loan-claim-action -- the one that WAS published, by us at
+    # 48c102c0...#0 (below), for the third deployment -- was BLANKED 2026-08-25 for the fourth (see
+    # the note above the loan-claim-action key); the reasoning that
     # follows is why referencing exactly one validator was deliberate rather than incomplete, not a
     # description of the current state. Only enough validators have to travel by reference to bring
     # the liquidation under maxTxSize; the rest stay in the witness set and lock nothing.
@@ -652,7 +654,6 @@ loans:
     # spending it back when the bot no longer needs it. LoansReferenceScriptVerifier checks its
     # on-chain reference_script_hash against the freshly derived hash at every boot, so the next
     # redeploy closes the lending gate rather than building against a silent wrong script.
-    #   lm-liquidate-action  549b438c...49a47fe0#0
     reference-scripts:
       loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}
       loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:}
