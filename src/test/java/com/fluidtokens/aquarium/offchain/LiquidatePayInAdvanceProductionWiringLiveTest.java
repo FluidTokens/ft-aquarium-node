@@ -345,7 +345,7 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
         // The real ledger fee, which no offline rig computes.
         assertTrue(reread.getBody().getFee().signum() > 0, "the built transaction must carry a fee");
 
-        // And it fits. 16,384 is the live parameter's value; S5 reads it from the chain at run time.
+        // And it fits. 16,384 is the live parameter's value; S4 reads it from the chain at run time.
         assertTrue(built.serialize().length <= 16_384,
                 "the convert transaction must fit under maxTxSize: " + built.serialize().length);
     }

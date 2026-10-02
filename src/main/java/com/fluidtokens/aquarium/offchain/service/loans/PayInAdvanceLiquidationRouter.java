@@ -32,7 +32,7 @@ import java.util.Map;
  * This class assembles a {@link LiquidatePayInAdvanceTransactionBuilder.Request} and calls
  * {@code build(request)}. That builder is submit-incapable (a {@code null} transaction processor; see
  * its class javadoc), so what comes back is an unsigned {@link Transaction} that flows into the
- * executor's unchanged pricing + eight-veto chain exactly as a plain-path transaction does. Nothing
+ * executor's unchanged pricing + seven-veto chain exactly as a plain-path transaction does. Nothing
  * here signs, submits, or flips a veto.
  *
  * <h2>Refusal is a clean REFUSED row, not a crash</h2>
