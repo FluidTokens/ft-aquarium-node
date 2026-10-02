@@ -266,11 +266,8 @@ the image you restart with:
 ⚠ **Gate open is not the same as ready.** Every liquidation withdraws through the new action scripts, so
 their **reward accounts must be registered** on chain, or each submit fails with
 `ConwayWithdrawalsMissingAccounts` — which no evaluation, dry-run or `shadow` decision can show you.
-The node now checks this itself: the readiness page shows a banner and a per-row blocker for affected
-routes, and the executor refuses the built transaction with `WITHDRAW_ACCOUNT_NOT_REGISTERED` before
-submit. A failed lookup blocks rather than passes. FluidTokens registered the current accounts on
-2026-10-01. To check manually, look up each stake address and confirm its most recent registration
-action is `registered` (e.g. Blockfrost
+FluidTokens registered them on 2026-10-01. To check, look up each stake address and confirm its most
+recent registration action is `registered` (e.g. Blockfrost
 `/accounts/{stake}/registrations?order=desc&count=1`):
 
 | action script | stake address |

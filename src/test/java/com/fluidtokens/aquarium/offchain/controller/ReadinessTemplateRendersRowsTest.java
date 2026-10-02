@@ -202,15 +202,8 @@ class ReadinessTemplateRendersRowsTest {
 
     private static String render(List<LiquidationReadinessController.Row> rows,
                                  OperationalStatus status, String lendingConfigBlocked) {
-        return render(rows, status, lendingConfigBlocked, null);
-    }
-
-    private static String render(List<LiquidationReadinessController.Row> rows,
-                                 OperationalStatus status, String lendingConfigBlocked,
-                                 List<String> withdrawAccountsUnconfirmed) {
         var context = new Context();
         context.setVariable("lendingConfigBlocked", lendingConfigBlocked);
-        context.setVariable("withdrawAccountsUnconfirmed", withdrawAccountsUnconfirmed);
         context.setVariable("network", "preview");
         context.setVariable("generatedAt", "2026-09-04T13:00:00Z");
         context.setVariable("disabledReason", null);
@@ -281,20 +274,6 @@ class ReadinessTemplateRendersRowsTest {
 
         String open = render(List.of(fullRow()), monitoringOnly(), null);
         assertTrue(!open.contains("LENDING_CONFIG_MISMATCH"), "no banner while the gate is open");
-    }
-
-    @Test
-    void unconfirmedWithdrawAccountsAreBanneredBeforeTheRowsAndAbsentOtherwise() {
-        String blocked = render(List.of(fullRow()), monitoringOnly(), null,
-                List.of("PLAIN: lm-liquidate-action, hash abc, stake address stake_test1abc — NOT REGISTERED"));
-        assertTrue(blocked.contains("WITHDRAW_ACCOUNT_NOT_REGISTERED"), blocked);
-        assertTrue(blocked.contains("lm-liquidate-action") && blocked.contains("NOT REGISTERED"), blocked);
-        assertTrue(blocked.indexOf("WITHDRAW_ACCOUNT_NOT_REGISTERED") < blocked.indexOf("<table"),
-                "the refusal banner must come before the table");
-
-        String open = render(List.of(fullRow()), monitoringOnly(), null, null);
-        assertFalse(open.contains("WITHDRAW_ACCOUNT_NOT_REGISTERED"),
-                "the marker must not survive in a template comment or an empty banner");
     }
 
     /**

@@ -1,8 +1,6 @@
 package com.fluidtokens.aquarium.offchain.controller;
 
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
-import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
-import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
 import com.fluidtokens.aquarium.offchain.model.AssetDisplay;
 import com.fluidtokens.aquarium.offchain.model.LoanAge;
 import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
@@ -29,7 +27,6 @@ import com.fluidtokens.aquarium.offchain.service.loans.MarketGate;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
-import com.fluidtokens.aquarium.offchain.service.loans.WithdrawAccountRegistration;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -42,8 +39,6 @@ import org.springframework.web.bind.annotation.RequestParam;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.EnumMap;
-import java.util.LinkedHashMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -249,17 +244,9 @@ public class LiquidationReadinessController {
     /** Closed when the live Lending v4 config does not match this node (FAB-115). Required. */
     private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
 
-    /** Required in the container; null only in direct constructions retained by older tests. */
-    private WithdrawAccountRegistration withdrawAccountRegistration;
-
     @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
         this.lendingConfigGate = gate;
-    }
-
-    @org.springframework.beans.factory.annotation.Autowired
-    public void setWithdrawAccountRegistration(WithdrawAccountRegistration registration) {
-        this.withdrawAccountRegistration = registration;
     }
 
     /**
@@ -282,11 +269,6 @@ public class LiquidationReadinessController {
         // refuse every one of them.
         model.addAttribute("lendingConfigBlocked", lendingConfigGate == null ? null
                 : lendingConfigGate.blockedReason().orElse(null));
-        Map<WithdrawAccountRegistration.Route, List<WithdrawAccountRegistration.Check>> registrationChecks =
-                routeRegistrationChecks();
-        List<String> registrationBanner = registrationBanner(registrationChecks);
-        model.addAttribute("withdrawAccountsUnconfirmed",
-                registrationBanner.isEmpty() ? null : registrationBanner);
         model.addAttribute("status", OperationalStatus.of(liquidationConfiguration,
                 convertEnabled, compoundEnabled, processorEnabled));
         model.addAttribute("sort", sort == null ? "health" : sort);
@@ -320,7 +302,7 @@ public class LiquidationReadinessController {
 
         long now = System.currentTimeMillis();
         model.addAttribute("disabledReason", null);
-        List<Row> all = rows(loans, scan, health, now, registrationChecks);
+        List<Row> all = rows(loans, scan, health, now);
         WalletBalance walletNow = wallet(now);
         model.addAttribute("wallet", walletNow);
         model.addAttribute("walletAgeSeconds", walletNow.ageSeconds(now));
@@ -420,9 +402,7 @@ public class LiquidationReadinessController {
     }
 
     private List<Row> rows(LoanService loans, LiquidationCandidateScanner scan,
-                           LoanHealthService healthService, long now,
-                           Map<WithdrawAccountRegistration.Route,
-                                   List<WithdrawAccountRegistration.Check>> registrationChecks) {
+                           LoanHealthService healthService, long now) {
         LiquidationCandidateScanner.Scan result = scan.scan(now);
 
         Map<String, LiquidationAssessment> byLoanId = result.assessments().stream()
@@ -443,7 +423,7 @@ public class LiquidationReadinessController {
         for (Loan loan : result.loanCensus().loans()) {
             LiquidationAssessment assessment = byLoanId.get(loan.loanId());
             rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo,
-                    metadataMemo, wallet, now, registrationChecks));
+                    metadataMemo, wallet, now));
         }
         rows.sort(Comparator.comparingDouble(Row::sortKey));
         return rows;
@@ -451,9 +431,7 @@ public class LiquidationReadinessController {
 
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
                     MarketGate gate, Map<String, PoolFetch> poolMemo,
-                    Map<String, TokenMetadata> metadataMemo, WalletBalance wallet, long now,
-                    Map<WithdrawAccountRegistration.Route,
-                            List<WithdrawAccountRegistration.Check>> registrationChecks) {
+                    Map<String, TokenMetadata> metadataMemo, WalletBalance wallet, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
 
@@ -580,29 +558,21 @@ public class LiquidationReadinessController {
         // threshold in the next hour, could the bot handle it? A mark that only appeared once a loan
         // was already liquidatable would arrive too late to move capital.
         BigInteger principalBalance = wallet.of(datum.principalAsset().toUnit());
-        Mode effectiveMode = gate.effectiveMode(datum.principalAsset());
-        Action marketAction = gate.actionFor(datum.principalAsset());
-        Optional<WithdrawAccountRegistration.Route> executorRoute =
-                executorRoute(bondRoute, datum.collateral().isAda(), marketAction);
-        List<WithdrawAccountRegistration.Check> checksForRoute = executorRoute
-                .map(routeKey -> registrationChecks.getOrDefault(routeKey, List.of()))
-                .orElseGet(List::of);
-        ProcessingBlocker blocker = registrationBlocker(ProcessingBlocker.of(
-                effectiveMode, marketAction,
+        ProcessingBlocker blocker = ProcessingBlocker.of(
+                gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                 gate.marketFor(datum.principalAsset()), convertEnabled, bondRoute,
                 new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
-                advance, principalBalance, wallet.known()), effectiveMode, executorRoute, checksForRoute);
+                advance, principalBalance, wallet.known());
 
         ActionNow actionNow = gatedAction(lendingConfigGate,
-                registrationAction(
-                        excludedAction(honestAction(health.liquidatable(), datum.collateral().isAda(),
-                                        bondRoute == BondRoute.CONVERT,
-                                        ActionNow.forRoute(bondRoute, health.liquidatable(),
-                                                effectiveMode, marketAction,
-                                                gate.marketFor(datum.principalAsset()), convertEnabled,
-                                                usability.usable(), advance)),
-                                health.liquidatable(), assessment),
-                        health.liquidatable(), effectiveMode, executorRoute, checksForRoute));
+                excludedAction(honestAction(health.liquidatable(), datum.collateral().isAda(),
+                                bondRoute == BondRoute.CONVERT,
+                                ActionNow.forRoute(bondRoute, health.liquidatable(),
+                                        gate.effectiveMode(datum.principalAsset()),
+                                        gate.actionFor(datum.principalAsset()),
+                                        gate.marketFor(datum.principalAsset()), convertEnabled,
+                                        usability.usable(), advance)),
+                        health.liquidatable(), assessment));
 
         return new Row(loan.loanId(), loan.utxoRef(),
                 datum.principalAsset().toUnit(), datum.principalAmount(),
@@ -655,103 +625,6 @@ public class LiquidationReadinessController {
                     false);
         }
         return computed;
-    }
-
-    static Optional<WithdrawAccountRegistration.Route> executorRoute(
-            BondRoute bondRoute, boolean adaCollateral, Action action) {
-        if (bondRoute == BondRoute.NO_BOND || bondRoute == BondRoute.CONVERT && adaCollateral) {
-            return Optional.empty();
-        }
-        if (bondRoute == BondRoute.PLAIN) {
-            return Optional.of(WithdrawAccountRegistration.Route.PLAIN);
-        }
-        return Optional.of(action == Action.ANTICIPATE
-                ? WithdrawAccountRegistration.Route.PAY_IN_ADVANCE
-                : WithdrawAccountRegistration.Route.CONVERT);
-    }
-
-    static ProcessingBlocker registrationBlocker(
-            ProcessingBlocker computed, Mode effectiveMode,
-            Optional<WithdrawAccountRegistration.Route> route,
-            List<WithdrawAccountRegistration.Check> routeChecks) {
-        List<WithdrawAccountRegistration.Check> unconfirmed = routeChecks.stream()
-                .filter(check -> !check.confirmed()).toList();
-        if (effectiveMode == Mode.DISABLED || route.isEmpty() || unconfirmed.isEmpty()) {
-            return computed;
-        }
-        String label = unconfirmed.stream().anyMatch(
-                check -> check.status() == WithdrawAccountRegistration.Status.NOT_REGISTERED)
-                ? "unregistered" : "registration unknown";
-        String detail = registrationCredentials(unconfirmed);
-        if (computed != null && computed.blocked()) {
-            detail += "; otherwise: " + computed.label() + " — " + computed.detail();
-        }
-        return new ProcessingBlocker(label, detail);
-    }
-
-    static ActionNow registrationAction(
-            ActionNow computed, Boolean liquidatable, Mode effectiveMode,
-            Optional<WithdrawAccountRegistration.Route> route,
-            List<WithdrawAccountRegistration.Check> routeChecks) {
-        List<WithdrawAccountRegistration.Check> unconfirmed = routeChecks.stream()
-                .filter(check -> !check.confirmed()).toList();
-        if (!Boolean.TRUE.equals(liquidatable) || effectiveMode == Mode.DISABLED || route.isEmpty()
-                || unconfirmed.isEmpty() || "NONE — excluded".equals(computed.text())) {
-            return computed;
-        }
-        return new ActionNow("REFUSED",
-                "WITHDRAW_ACCOUNT_NOT_REGISTERED — " + registrationCredentials(unconfirmed)
-                        + "; otherwise: " + computed.text() + " — " + computed.detail(),
-                false);
-    }
-
-    private static String registrationCredentials(List<WithdrawAccountRegistration.Check> checks) {
-        return checks.stream()
-                .map(check -> "%s (%s, %s, %s)".formatted(check.label(), check.scriptHash(),
-                        check.stakeAddress(), check.detail()))
-                .collect(Collectors.joining("; "));
-    }
-
-    private Map<WithdrawAccountRegistration.Route, List<WithdrawAccountRegistration.Check>>
-            routeRegistrationChecks() {
-        if (withdrawAccountRegistration == null) {
-            return Map.of();
-        }
-        Map<WithdrawAccountRegistration.Route, List<WithdrawAccountRegistration.Check>> checks =
-                new EnumMap<>(WithdrawAccountRegistration.Route.class);
-        for (WithdrawAccountRegistration.Route route : WithdrawAccountRegistration.Route.values()) {
-            checks.put(route, withdrawAccountRegistration.routeChecks(route));
-        }
-        return checks;
-    }
-
-    private static List<String> registrationBanner(
-            Map<WithdrawAccountRegistration.Route,
-                    List<WithdrawAccountRegistration.Check>> checksByRoute) {
-        record BannerCheck(WithdrawAccountRegistration.Check check,
-                           List<WithdrawAccountRegistration.Route> routes) {
-        }
-        Map<String, BannerCheck> byStake = new LinkedHashMap<>();
-        checksByRoute.forEach((route, checks) -> checks.stream()
-                .filter(check -> !check.confirmed())
-                .forEach(check -> byStake.compute(check.stakeAddress(), (stake, existing) -> {
-                    if (existing == null) {
-                        return new BannerCheck(check, new ArrayList<>(List.of(route)));
-                    }
-                    existing.routes().add(route);
-                    return existing;
-                })));
-        return byStake.values().stream().map(item -> {
-            WithdrawAccountRegistration.Check check = item.check();
-            String state = check.status() == WithdrawAccountRegistration.Status.NOT_REGISTERED
-                    ? "NOT REGISTERED"
-                    : "could not be confirmed (" + check.detail()
-                            .replace(" — not read as registered", "")
-                            + ") — not read as registered";
-            return item.routes().stream().map(Enum::name).collect(Collectors.joining(", "))
-                    + ": " + check.label() + ", hash " + check.scriptHash() + ", stake address "
-                    + check.stakeAddress() + " — " + state;
-        }).toList();
     }
 
     /**

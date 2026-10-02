@@ -129,7 +129,7 @@ public class LiquidationExecutor {
      * this candidate was not submitted; a decision carries exactly the first one that fired.
      * <p>
      * The first two are POLICY — statements about what the operator has authorised — and they
-     * come before the six that are statements about this candidate at this instant. That ordering is
+     * come before the five that are statements about this candidate at this instant. That ordering is
      * deliberate: on a node held back by policy, reporting a downstream symptom would send the
      * operator looking at the wrong thing.
      */
@@ -149,24 +149,19 @@ public class LiquidationExecutor {
          * {@code MARKET_SHADOW_NOT_YET_IMPLEMENTED} refusal existed only until this veto did.
          */
         MARKET_NOT_LIVE,
-        /**
-         * S3 — a withdrawal reward account is not confirmed registered. Findings §57.8 proves that
-         * evaluators do not see this ledger rule, so lookup failures and unknown answers fail closed.
-         */
-        WITHDRAW_ACCOUNT_NOT_REGISTERED,
-        /** S4 — expected profit is not strictly positive. */
+        /** S3 — expected profit is not strictly positive. */
         NOT_PROFITABLE,
-        /** S5 — the serialised transaction is over the live {@code maxTxSize}, or it could not be read. */
+        /** S4 — the serialised transaction is over the live {@code maxTxSize}, or it could not be read. */
         TX_TOO_LARGE,
-        /** S6 — a feed this candidate prices against has less than the margin of window left, now. */
+        /** S5 — a feed this candidate prices against has less than the margin of window left, now. */
         ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT,
-        /** S7 — the loan or bond UTxO is no longer unspent, or that could not be established. */
+        /** S6 — the loan or bond UTxO is no longer unspent, or that could not be established. */
         STALE_UTXO,
         /**
-         * S8 — the built transaction's own validity interval has already ended, or its end could not
+         * S7 — the built transaction's own validity interval has already ended, or its end could not
          * be read.
          * <p>
-         * Not a duplicate of S6, and the gap it closes is a real one. S6 can only speak about loans
+         * Not a duplicate of S7, and the gap it closes is a real one. S7 can only speak about loans
          * that have an oracle feed; <b>an ada/ada loan has no feed at all</b>, so before S8 there was
          * no submit-time staleness check whatsoever on exactly the shape that actually builds today.
          * The direction was already safe — an expired transaction is refused in phase 1 and costs
@@ -289,17 +284,9 @@ public class LiquidationExecutor {
     private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
     private volatile boolean lendingGateRefusalLogged;
 
-    /** Required in the container; null only in direct constructions retained by older tests. */
-    private WithdrawAccountRegistration withdrawAccountRegistration;
-
     @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
         this.lendingConfigGate = gate;
-    }
-
-    @org.springframework.beans.factory.annotation.Autowired
-    public void setWithdrawAccountRegistration(WithdrawAccountRegistration registration) {
-        this.withdrawAccountRegistration = registration;
     }
 
     /** True, and logged once, when the Lending v4 config gate is closed. */
@@ -560,8 +547,8 @@ public class LiquidationExecutor {
      * <h2>It fires for a POLICY hold, never for a rejection</h2>
      * A candidate the gates refused is not a transaction that would have gone, and dumping it would
      * bury the ones that would. So this prints exactly when the verdict is {@code WOULD_SUBMIT} and a
-     * policy veto (S1–S2) held it — the mode or the market. An {@code UNPROFITABLE} row
-     * or a candidate stopped by S3–S8 gets its ordinary line and no payload.
+     * policy veto (S1–S4) held it — mode, arming, network, or the market. An {@code UNPROFITABLE} row
+     * or a candidate stopped by S5–S9 gets its ordinary line and no payload.
      *
      * <h2>⚠ What it proves, and what it does NOT</h2>
      * The ex-units come off the <b>built, deserialised transaction</b> — never off an evaluator's
@@ -1141,7 +1128,7 @@ public class LiquidationExecutor {
                     return;
                 }
                 // Falls through to the shared record-and-maybe-submit path below, deliberately: the
-                // eight submit vetoes, the shadow dump and the decision record are the SAME for every
+                // nine submit vetoes, the shadow dump and the decision record are the SAME for every
                 // variant, and a convert that bypassed them would be the one path an operator cannot
                 // watch through the endpoint they already use.
             } else {
@@ -1631,19 +1618,19 @@ public class LiquidationExecutor {
     /**
      * Runs the veto chain and, only if all eight pass, signs and submits.
      * <p>
-     * The mapping from veto to outcome is deliberate rather than uniform. S1–S2 are standing
+     * The mapping from veto to outcome is deliberate rather than uniform. S1–S3 are standing
      * configuration — the bot is simply not armed for this node — so the row keeps saying what the
      * <em>candidate</em> deserved ({@code WOULD_SUBMIT} / {@code UNPROFITABLE}) and names the veto
-     * alongside; that is exactly what shadow mode is for. S3 and S5–S8 are statements about this
-     * candidate at this instant on an otherwise armed node, and they get
-     * {@link LiquidationDecision.Outcome#SUBMIT_VETOED}; S4 keeps the existing unprofitable outcome.
+     * alongside; that is exactly what shadow mode is for, and what makes "WOULD_SUBMIT next to
+     * armed:false" readable. S5–S8 are statements about this candidate at this instant on an
+     * otherwise armed node, and they get {@link LiquidationDecision.Outcome#SUBMIT_VETOED}.
      */
     private Verdict verdict(LiquidationAssessment assessment, long now, Transaction transaction,
                             Map<String, OracleEntry> oraclesByUnit, BigInteger floorProfit,
                             BigInteger expectedProfit, int size, String detail) {
-        // What the row says on an unarmed node: WOULD_SUBMIT only if it would actually clear S4 (the
-        // profitability gate, renumbered three times: it was S5 before the network veto and the
-        // separate arming flag were removed, then S3, and S4 since the registration veto) on an
+        // What the row says on an unarmed node: WOULD_SUBMIT only if it would actually clear S3 (the
+        // profitability gate, twice renumbered: it was S5 before the network veto and the
+        // separate arming flag were removed) on an
         // armed one — i.e. it passes both the profitability floor and the margin lever.
         LiquidationDecision.Outcome shadowOutcome = wouldSubmit(floorProfit, expectedProfit)
                 ? LiquidationDecision.Outcome.WOULD_SUBMIT
@@ -1651,8 +1638,7 @@ public class LiquidationExecutor {
 
         // S1 — the mode.
         if (configuration.getMode() != AppConfig.LiquidationConfiguration.Mode.LIVE) {
-            return new Verdict(shadowOutcome, SubmitVeto.MODE_NOT_LIVE,
-                    detail + withdrawRegistrationShadowNote(transaction));
+            return new Verdict(shadowOutcome, SubmitVeto.MODE_NOT_LIVE, detail);
         }
         // ⛔ THERE IS NO SEPARATE ARMING FLAG. `loans.liquidation.enabled` was a second boolean that
         // had to agree with the mode, and it was removed on 2026-09-04 — Giovanni: "it's redundant
@@ -1678,22 +1664,9 @@ public class LiquidationExecutor {
                             + (marketMode == AppConfig.LiquidationConfiguration.Mode.SHADOW
                                     ? " — the transaction below is the rehearsal" : ""))
                             .formatted(detail, principalAsset == null ? "<unknown>" : principalAsset.toUnit(),
-                                    marketMode, configuration.getMode())
-                            + withdrawRegistrationShadowNote(transaction));
+                                    marketMode, configuration.getMode()));
         }
-
-        // S3 — reward-account registration. Evaluators do not enforce account existence, so the
-        // BUILT body's withdrawals are checked here and every uncertain answer refuses submission.
-        String registrationProblem = withdrawRegistrationProblem(transaction);
-        if (registrationProblem != null) {
-            log.warn("withdraw accounts not confirmed registered for liquidation of {}: {}",
-                    assessment.loan().utxoRef(), registrationProblem);
-            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED,
-                    SubmitVeto.WITHDRAW_ACCOUNT_NOT_REGISTERED,
-                    detail + "; " + registrationProblem);
-        }
-
-        // S4 — profitability. Two independent gates, and the margin is deliberately NOT inside the
+        // S3 — profitability. Two independent gates, and the margin is deliberately NOT inside the
         // number the floors test (F1.i): a negative margin can no longer inflate a loss past a floor.
         //
         // (a) The absolute floor, applied only when check-profitability is on, tests floorProfit —
@@ -1744,8 +1717,8 @@ public class LiquidationExecutor {
                     + "would otherwise have been refused as unprofitable",
                     assessment.loan().utxoRef(), detail);
         }
-        // S5 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
-        // from S4's profitability arithmetic: a transaction can be handsomely profitable and still not fit.
+        // S4 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
+        // from S4's arithmetic: a transaction can be handsomely profitable and still not fit.
         Integer maxTxSize;
         try {
             maxTxSize = protocolParamsSupplier.getProtocolParams().getMaxTxSize();
@@ -1771,7 +1744,7 @@ public class LiquidationExecutor {
                     "%s; %d bytes over the live maxTxSize of %d — publish the reference scripts"
                             .formatted(detail, size, maxTxSize));
         }
-        // S6 — the oracle windows, re-read against the clock NOW rather than against the window the
+        // S5 — the oracle windows, re-read against the clock NOW rather than against the window the
         // transaction was built for. A build that started a minute ago proves nothing about the feed
         // that is going to be evaluated when this lands in a block.
         String oracleVeto = oracleWindowShortfall(assessment, submitClock.getAsLong(), oraclesByUnit);
@@ -1779,7 +1752,7 @@ public class LiquidationExecutor {
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED,
                     SubmitVeto.ORACLE_WINDOW_TOO_SHORT_TO_SUBMIT, detail + "; " + oracleVeto);
         }
-        // S7 — the two UTxOs, re-read immediately before the wire. They were unspent when the build
+        // S6 — the two UTxOs, re-read immediately before the wire. They were unspent when the build
         // started; a block may have arrived since.
         String staleVeto = staleUtxo(assessment);
         if (staleVeto != null) {
@@ -1787,7 +1760,7 @@ public class LiquidationExecutor {
                     detail + "; " + staleVeto);
         }
 
-        // S8 — the transaction's own validity interval. Last, so that where a feed exists S6 reports
+        // S7 — the transaction's own validity interval. Last, so that where a feed exists S5 reports
         // the more specific reason; but reached on every candidate, including the ada/ada ones S6
         // has nothing to say about.
         String elapsed = transactionWindowElapsed(transaction, submitClock.getAsLong(),
@@ -1798,35 +1771,6 @@ public class LiquidationExecutor {
         }
 
         return submit(assessment, now, transaction, detail);
-    }
-
-    private String withdrawRegistrationShadowNote(Transaction transaction) {
-        String problem = withdrawRegistrationProblem(transaction);
-        return problem == null ? ""
-                : "; NOTE: withdraw accounts not confirmed registered — arming would not submit: "
-                        + problem;
-    }
-
-    private String withdrawRegistrationProblem(Transaction transaction) {
-        if (withdrawAccountRegistration == null) {
-            return null;
-        }
-        try {
-            List<WithdrawAccountRegistration.Check> unconfirmed = withdrawAccountRegistration
-                    .transactionChecks(transaction).stream()
-                    .filter(check -> !check.confirmed())
-                    .toList();
-            if (unconfirmed.isEmpty()) {
-                return null;
-            }
-            return unconfirmed.stream().map(check -> "%s, script hash %s, stake address %s, %s, %s"
-                            .formatted(check.label(), check.scriptHash(), check.stakeAddress(),
-                                    check.status(), check.detail()))
-                    .collect(java.util.stream.Collectors.joining("; "));
-        } catch (RuntimeException e) {
-            return "registration check threw (" + causeChain(e)
-                    + ") — withdraw accounts not read as registered";
-        }
     }
 
     /**
@@ -1966,7 +1910,7 @@ public class LiquidationExecutor {
         try {
             signed = account.sign(transaction).serialize();
         } catch (Exception e) {
-            // Not one of the eight — those are all about whether submitting is *allowed*, and this
+            // Not one of the seven — those are all about whether submitting is *allowed*, and this
             // is the machinery failing after they all said yes. It carries no veto name for exactly
             // that reason, and it still transmits nothing.
             log.error("could not sign the liquidation of {}: {}", loanUtxoRef, causeChain(e), e);
