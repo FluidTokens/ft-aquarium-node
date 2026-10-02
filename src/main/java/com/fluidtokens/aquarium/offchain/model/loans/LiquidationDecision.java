@@ -31,7 +31,7 @@ import java.math.BigInteger;
  * @param reason                 the machine-readable half: a {@code Refusal} name, an exception
  *                               class name, or the outcome's own name
  * @param detail                 the human half
- * @param submitVeto             which of the eight submit vetoes stopped this candidate being
+ * @param submitVeto             which of the seven submit vetoes stopped this candidate being
  *                               submitted, or null — either because the candidate never reached the
  *                               veto chain, or because every veto passed and a submission was
  *                               attempted
@@ -129,7 +129,7 @@ public record LiquidationDecision(long decidedAt,
      * How far a candidate got.
      * <p>
      * {@link #SUBMITTED} and {@link #SUBMIT_FAILED} are the only two states that imply the node
-     * transmitted anything, and reaching either takes all eight vetoes of
+     * transmitted anything, and reaching either takes all seven vetoes of
      * {@code LiquidationExecutor} passing. Everything else is a record of a judgement.
      */
     public enum Outcome {

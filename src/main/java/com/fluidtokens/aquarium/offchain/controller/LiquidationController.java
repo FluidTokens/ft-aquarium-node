@@ -78,7 +78,7 @@ public class LiquidationController {
                                Integer outputs,
                                Integer referenceInputs,
                                Integer redeemers,
-                               // Which of the eight submit vetoes stopped this candidate, or null:
+                               // Which of the seven submit vetoes stopped this candidate, or null:
                                // either it never reached the veto chain, or every veto passed and a
                                // submission was attempted. Read next to `outcome`: WOULD_SUBMIT with
                                // MODE_NOT_LIVE is shadow working, SUBMIT_VETOED with TX_TOO_LARGE is

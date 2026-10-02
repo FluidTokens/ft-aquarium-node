@@ -52,11 +52,11 @@ import java.util.concurrent.TimeUnit;
 /**
  * The liquidation loop: every cycle it scans every indexed lender bond, builds one real
  * {@code Liquidate} transaction per buildable candidate, prices it, and either writes down what it
- * would have done or — when every one of eight vetoes passes — signs it and submits it.
+ * would have done or — when every one of seven vetoes passes — signs it and submits it.
  *
  * <h2>The veto chain is the whole safety story</h2>
  * Submitting is the irreversible act: it burns the loan NFT and moves someone's collateral. Failing
- * to submit costs a cycle. So the eight checks in {@link #verdict} are enumerated explicitly,
+ * to submit costs a cycle. So the seven checks in {@link #verdict} are enumerated explicitly,
  * evaluated in order, and every one of them resolves to <em>not submitting</em> when it cannot be
  * established — a Blockfrost timeout fetching protocol parameters is not evidence that the
  * transaction fits, and an oracle client that is not there is not evidence that its feed is fresh.
@@ -125,8 +125,9 @@ public class LiquidationExecutor {
     private static final long VALID_FROM_BACKDATE_MILLIS = 30_000L;
 
     /**
-     * The eight submit vetoes, in the order they are evaluated. Each is a separate, named reason
+     * The seven submit vetoes, in the order they are evaluated. Each is a separate, named reason
      * this candidate was not submitted; a decision carries exactly the first one that fired.
+     * FAB-123's withdraw-account registration veto (2026-10) was reverted, so the count is back to seven.
      * <p>
      * The first two are POLICY — statements about what the operator has authorised — and they
      * come before the five that are statements about this candidate at this instant. That ordering is
@@ -161,14 +162,14 @@ public class LiquidationExecutor {
          * S7 — the built transaction's own validity interval has already ended, or its end could not
          * be read.
          * <p>
-         * Not a duplicate of S7, and the gap it closes is a real one. S7 can only speak about loans
-         * that have an oracle feed; <b>an ada/ada loan has no feed at all</b>, so before S8 there was
+         * Not a duplicate of S5, and the gap it closes is a real one. S5 can only speak about loans
+         * that have an oracle feed; <b>an ada/ada loan has no feed at all</b>, so before S7 there was
          * no submit-time staleness check whatsoever on exactly the shape that actually builds today.
          * The direction was already safe — an expired transaction is refused in phase 1 and costs
          * nothing — but "we submitted a transaction we knew had expired" is not a thing this loop
          * should do, and the contract's intent was staleness protection at submit time.
          * <p>
-         * Evaluated last on purpose. Where a feed exists, S6's firing region is contained in this
+         * Evaluated last on purpose. Where a feed exists, S5's firing region is contained in this
          * one (the builder demands {@code feed.validTo >= tx.validTo + margin}, so a feed can only
          * run short after the transaction has expired), and the more specific reason is the more
          * useful one to report.
@@ -251,7 +252,7 @@ public class LiquidationExecutor {
     private final TransactionSubmitter submitter;
 
     /**
-     * Slot-to-wall-clock conversion, so S8 can read the validity end off the transaction body rather
+     * Slot-to-wall-clock conversion, so S7 can read the validity end off the transaction body rather
      * than trusting the millisecond window that was <em>requested</em>. The builder clamps that
      * window inwards to whole slots, so the requested end is always at or after the real one — using
      * it would let a transaction that has genuinely expired through by up to one slot.
@@ -264,7 +265,7 @@ public class LiquidationExecutor {
     /**
      * The clock the submit-time checks read, as opposed to the cycle's own {@code now}.
      * <p>
-     * The two are genuinely different instants and the difference is the whole point of S6. A cycle
+     * The two are genuinely different instants and the difference is the whole point of S5. A cycle
      * scans, resolves UTxOs, fetches protocol parameters and evaluates scripts before it gets
      * anywhere near submitting, and every one of those is a Blockfrost round trip; re-checking the
      * oracle windows against the instant the cycle <em>started</em> would be re-checking nothing.
@@ -547,8 +548,9 @@ public class LiquidationExecutor {
      * <h2>It fires for a POLICY hold, never for a rejection</h2>
      * A candidate the gates refused is not a transaction that would have gone, and dumping it would
      * bury the ones that would. So this prints exactly when the verdict is {@code WOULD_SUBMIT} and a
-     * policy veto (S1–S4) held it — mode, arming, network, or the market. An {@code UNPROFITABLE} row
-     * or a candidate stopped by S5–S9 gets its ordinary line and no payload.
+     * policy veto (S1–S2) held it — the node's mode or the market (the arming and network vetoes that
+     * once sat between them were removed on 2026-09-04). An {@code UNPROFITABLE} row or a candidate
+     * stopped by S3–S7 gets its ordinary line and no payload.
      *
      * <h2>⚠ What it proves, and what it does NOT</h2>
      * The ex-units come off the <b>built, deserialised transaction</b> — never off an evaluator's
@@ -834,7 +836,7 @@ public class LiquidationExecutor {
         // ⚠ OPTIONAL, AND DELIBERATELY SO. This is a remote read, and a remote read that ALL selection
         // depends on turns a parameter outage into a liquidation outage. Worse, it would fire before
         // anything else in the cycle and pre-empt the TX_TOO_LARGE veto — the one path whose whole job
-        // is to report an unfetchable maxTxSize (LiquidationSubmitVetoTest S5). When it cannot be had,
+        // is to report an unfetchable maxTxSize (LiquidationSubmitVetoTest S4). When it cannot be had,
         // selection degrades to the pre-T-052 behaviour, largest-nominable: never wrong, only wasteful.
         // T-061 — the PARAMS are held, not just the fee ceiling, because a refusal has to size EVERY
         // gate it can see and the collateral ceiling comes from the same object.
@@ -846,7 +848,7 @@ public class LiquidationExecutor {
             // The fetch used to be `maxPossibleFee(getProtocolParams())` — one expression, one
             // try/catch — so a params object with null fields degraded to "unavailable" like any
             // other failure. Holding the raw object and deriving later moved that derivation OUTSIDE
-            // this catch, and LiquidationSubmitVetoTest S5 (whose supplier returns a deliberately
+            // this catch, and LiquidationSubmitVetoTest S4 (whose supplier returns a deliberately
             // partial object) went from a clean veto to a NullPointerException.
             //
             // ⚠ THAT IS THE THIRD TIME TODAY A COMPUTATION CROSSING AN ERROR BOUNDARY CHANGED A
@@ -1128,7 +1130,7 @@ public class LiquidationExecutor {
                     return;
                 }
                 // Falls through to the shared record-and-maybe-submit path below, deliberately: the
-                // nine submit vetoes, the shadow dump and the decision record are the SAME for every
+                // seven submit vetoes, the shadow dump and the decision record are the SAME for every
                 // variant, and a convert that bypassed them would be the one path an operator cannot
                 // watch through the endpoint they already use.
             } else {
@@ -1420,7 +1422,7 @@ public class LiquidationExecutor {
      * <h3>Two numbers, deliberately kept apart (E5-B Finding 1 / F1.i)</h3>
      * <ul>
      *   <li>{@code floorProfit = expectedFee − txFee − minAdaFunded} — the margin-EXCLUDED profit the
-     *       profitability floors ({@link #verdict}'s S4) test. The margin is <b>not</b> inside it, so a
+     *       profitability floors ({@link #verdict}'s S3) test. The margin is <b>not</b> inside it, so a
      *       negative {@code profit-margin-lovelace} can no longer be subtracted-as-a-negative to
      *       inflate the number past a floor (T-027: at margin −3,000,000 a real −0.19 ADA result scored
      *       +2.81 ADA and cleared).</li>
@@ -1554,7 +1556,7 @@ public class LiquidationExecutor {
             size = bytes.length;
             cborHex = transaction.serializeToHex();
         } catch (Exception e) {
-            // The transaction exists but cannot be measured — which is also the S5 evidence, so
+            // The transaction exists but cannot be measured — which is also the S4 evidence, so
             // there is nothing here that could ever be submitted. The pricing verdict still stands
             // and is recorded without the fields that could not be produced.
             // T-040: was WARN with e.toString() and no throwable — the nearest sibling of the three
@@ -1616,14 +1618,15 @@ public class LiquidationExecutor {
     }
 
     /**
-     * Runs the veto chain and, only if all eight pass, signs and submits.
+     * Runs the veto chain and, only if all seven pass, signs and submits.
      * <p>
-     * The mapping from veto to outcome is deliberate rather than uniform. S1–S3 are standing
-     * configuration — the bot is simply not armed for this node — so the row keeps saying what the
-     * <em>candidate</em> deserved ({@code WOULD_SUBMIT} / {@code UNPROFITABLE}) and names the veto
-     * alongside; that is exactly what shadow mode is for, and what makes "WOULD_SUBMIT next to
-     * armed:false" readable. S5–S8 are statements about this candidate at this instant on an
-     * otherwise armed node, and they get {@link LiquidationDecision.Outcome#SUBMIT_VETOED}.
+     * The mapping from veto to outcome is deliberate rather than uniform. S1–S2 are standing
+     * configuration — the bot is simply not armed for this node or this market — so the row keeps
+     * saying what the <em>candidate</em> deserved ({@code WOULD_SUBMIT} / {@code UNPROFITABLE}) and
+     * names the veto alongside; that is exactly what shadow mode is for, and what makes "WOULD_SUBMIT
+     * next to armed:false" readable. S3 records {@code UNPROFITABLE}. S4–S7 are statements about this
+     * candidate at this instant on an otherwise armed node, and they get
+     * {@link LiquidationDecision.Outcome#SUBMIT_VETOED}.
      */
     private Verdict verdict(LiquidationAssessment assessment, long now, Transaction transaction,
                             Map<String, OracleEntry> oraclesByUnit, BigInteger floorProfit,
@@ -1718,7 +1721,7 @@ public class LiquidationExecutor {
                     assessment.loan().utxoRef(), detail);
         }
         // S4 — the size, against the live parameter. Never a hard-coded 16384, and never inferred
-        // from S4's arithmetic: a transaction can be handsomely profitable and still not fit.
+        // from S3's arithmetic: a transaction can be handsomely profitable and still not fit.
         Integer maxTxSize;
         try {
             maxTxSize = protocolParamsSupplier.getProtocolParams().getMaxTxSize();
@@ -1761,7 +1764,7 @@ public class LiquidationExecutor {
         }
 
         // S7 — the transaction's own validity interval. Last, so that where a feed exists S5 reports
-        // the more specific reason; but reached on every candidate, including the ada/ada ones S6
+        // the more specific reason; but reached on every candidate, including the ada/ada ones S5
         // has nothing to say about.
         String elapsed = transactionWindowElapsed(transaction, submitClock.getAsLong(),
                 assessment.loan().utxoRef());
@@ -1774,7 +1777,7 @@ public class LiquidationExecutor {
     }
 
     /**
-     * S8. The end of the built body's validity interval, converted from its slot and compared with
+     * S7. The end of the built body's validity interval, converted from its slot and compared with
      * the clock now.
      * <p>
      * A body with no ttl is treated as a veto rather than as "never expires": this builder always
@@ -1810,7 +1813,7 @@ public class LiquidationExecutor {
     }
 
     /**
-     * S6. Every leg this loan prices against must still have at least the configured margin of feed
+     * S5. Every leg this loan prices against must still have at least the configured margin of feed
      * window ahead of it at {@code now}. Ada legs are exempt for the reason
      * {@link OraclePriceFeed#isSynthesisedUnitFeed()} gives: {@code retrieve_oracle_data} returns
      * their 1:1 feed before it reaches any window check.
@@ -1860,7 +1863,7 @@ public class LiquidationExecutor {
     }
 
     /**
-     * S7. Both UTxOs, re-resolved against the local index immediately before signing. A resolver
+     * S6. Both UTxOs, re-resolved against the local index immediately before signing. A resolver
      * that throws is treated exactly like a spent UTxO: it did not say the output is still there.
      *
      * @return null when both are still unspent, otherwise why they are not
@@ -1939,8 +1942,8 @@ public class LiquidationExecutor {
     }
 
     /**
-     * Whether this candidate would be submitted on an armed node — the two S4 gates as one predicate,
-     * so the shadow outcome and the unmeasured-body outcome say the same thing S4 does: it clears the
+     * Whether this candidate would be submitted on an armed node — the two S3 gates as one predicate,
+     * so the shadow outcome and the unmeasured-body outcome say the same thing S3 does: it clears the
      * absolute floor (when check-profitability is on) AND clears the operator's margin.
      */
     private boolean wouldSubmit(BigInteger floorProfit, BigInteger expectedProfit) {

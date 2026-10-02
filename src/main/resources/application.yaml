@@ -99,7 +99,7 @@ loans:
   # really help." A redundant gate is not free: it made `disabled` and `live` + `enabled: false` two
   # spellings of "off", and gave an operator who HAD decided to arm one more silent way not to have.
   #
-  # This is not a drill: when mode is live and all eight submit-vetoes pass, the
+  # This is not a drill: when mode is live and all seven submit-vetoes pass, the
   # executor SIGNS AND SUBMITS the liquidation on preview (LiquidationExecutor wires the real
   # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
   # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely.
@@ -309,7 +309,7 @@ loans:
     # profit figure it ignored.
     ignore-profit-check: ${AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK:false}
     # THE ABSOLUTE FLOOR, and it is a SECOND gate that profit-margin-lovelace cannot reach.
-    # S4 tests two independent things: (a) floorProfit = feeSlice - txFee - minAdaFunded against
+    # S3 tests two independent things: (a) floorProfit = feeSlice - txFee - minAdaFunded against
     # min-profit-absolute-lovelace, and only then (b) the margin lever. The margin is deliberately
     # OUTSIDE the floor's number, so lowering it -- even to a large negative -- can never rescue a
     # candidate the floor refuses. Measured on preview 2026-08-24: a convert liquidation logged

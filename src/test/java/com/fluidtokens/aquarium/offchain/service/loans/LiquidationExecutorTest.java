@@ -66,7 +66,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * <h2>Reviewer's orientation — what this class proves, and what it does not</h2>
  * <b>Proves:</b> the executor's decision LOGIC — which candidates it routes where, what it records,
- * what it quarantines, which of the eight submit-vetoes fires, and that shadow mode never reaches the
+ * what it quarantines, which of the seven submit-vetoes fires, and that shadow mode never reaches the
  * wire (every wiring here gets a submitter that fails the test on contact).
  * <b>Does NOT prove:</b> anything about the chain. Its collaborators are hand-built fakes and its
  * evaluator is either the offline PlutusV3 rig or absent entirely. A green run here says the loop
@@ -90,7 +90,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * form of that: it takes the transaction the loop actually produced, parses it back out of the
  * recorded CBOR, and shows the witness set holds zero vkey witnesses.
  * <p>
- * The armed half — the eight submit vetoes and the submission itself — lives in
+ * The armed half — the seven submit vetoes and the submission itself — lives in
  * {@link LiquidationSubmitVetoTest}.
  */
 class LiquidationExecutorTest {
