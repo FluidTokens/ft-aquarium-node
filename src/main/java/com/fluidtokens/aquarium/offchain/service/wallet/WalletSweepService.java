@@ -17,6 +17,7 @@ import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -32,12 +33,14 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
 /**
  * ⛔ <b>The startup wallet sweep: get every wallet UTxO into the local index before anything spends
- * from the wallet.</b> Runs on every node, whatever its configuration (Giovanni, first-hand, FAB-134).
+ * from the wallet.</b> Runs only on a node where something spends (Giovanni, first-hand, FAB-134,
+ * ruled 2026-10-03): the tank processor, liquidation (SHADOW counts as well as LIVE) or compound.
  *
  * <h2>Why</h2>
  * The wallet credential is indexed only from {@code store.sync-start-*} onwards, so UTxOs created
@@ -48,6 +51,11 @@ import java.util.stream.IntStream;
  *
  * <h2>The flow, one step per tick</h2>
  * <ol>
+ *   <li>While nothing spends: nothing — no listing, no Blockfrost call, no build, no submit — and the
+ *       state reads {@link WalletReadiness#IDLE}. The gate stays closed; nothing reads it. The predicate
+ *       is asked afresh on every tick, off the same configuration objects the executors read, so a
+ *       processor enabled later is seen on the next tick, which starts again from an unsettled
+ *       observation.</li>
  *   <li>While syncing: nothing — no listing call.</li>
  *   <li>List the wallet from Blockfrost afresh: the base address AND the enterprise address of the
  *       bot's payment key, every page (a short page ends an address; a 404 is Blockfrost's answer for an
@@ -125,6 +133,7 @@ public class WalletSweepService {
     private final WalletLister lister;
     private final Clock clock;
     private final List<String> addresses;
+    private final BooleanSupplier somethingSpends;
 
     private Observation observation;
     private Sweep lastSweep;
@@ -137,6 +146,8 @@ public class WalletSweepService {
                               Account account,
                               AppConfig.Network network,
                               AppConfig.LiquidationConfiguration liquidationConfiguration,
+                              AppConfig.CompoundConfiguration compoundConfiguration,
+                              @Value("${scheduling.transaction-processor.enabled:false}") boolean tankProcessorEnabled,
                               ProtocolParamsSupplier protocolParamsSupplier,
                               CardanoConverters converters,
                               BFBackendService backendService) {
@@ -144,7 +155,8 @@ public class WalletSweepService {
                 liquidationConfiguration::getMarkets, protocolParamsSupplier, converters,
                 (address, page) -> backendService.getUtxoService().getUtxos(address, PAGE_SIZE, page),
                 bytes -> backendService.getTransactionService().submitTransaction(bytes),
-                Clock.systemUTC());
+                Clock.systemUTC(),
+                () -> somethingSpends(tankProcessorEnabled, liquidationConfiguration, compoundConfiguration));
     }
 
     /** Every seam stated, so a test can drive the listing, the wire and the clock. */
@@ -158,7 +170,8 @@ public class WalletSweepService {
                               CardanoConverters converters,
                               WalletLister lister,
                               WalletShapeTransactions.TransactionSubmitter submitter,
-                              Clock clock) {
+                              Clock clock,
+                              BooleanSupplier somethingSpends) {
         this.blockEventListener = Objects.requireNonNull(blockEventListener, "blockEventListener");
         this.utxoRepository = Objects.requireNonNull(utxoRepository, "utxoRepository");
         this.readiness = Objects.requireNonNull(readiness, "readiness");
@@ -168,9 +181,30 @@ public class WalletSweepService {
         this.converters = Objects.requireNonNull(converters, "converters");
         this.lister = Objects.requireNonNull(lister, "lister");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.somethingSpends = Objects.requireNonNull(somethingSpends, "somethingSpends");
         String enterprise = AddressProvider.getEntAddress(
                 account.getBaseAddress().getPaymentCredential().orElseThrow(), network).toBech32();
         this.addresses = List.of(account.baseAddress(), enterprise);
+    }
+
+    /**
+     * Whether anything on this node spends from the wallet: the tank processor (its bean exists only
+     * when {@code scheduling.transaction-processor.enabled}), liquidation in any mode but
+     * {@code DISABLED} — SHADOW counts, a shadow node prepares its wallet too — or compound armed.
+     * The two configuration objects are the ones the executors read, so this is asked on every tick.
+     */
+    static boolean somethingSpends(boolean tankProcessorEnabled,
+                                   AppConfig.LiquidationConfiguration liquidation,
+                                   AppConfig.CompoundConfiguration compound) {
+        AppConfig.LiquidationConfiguration.Mode mode = liquidation == null ? null : liquidation.getMode();
+        boolean liquidating = mode != null && mode != AppConfig.LiquidationConfiguration.Mode.DISABLED;
+        boolean compounding = compound != null && compound.isEnabled();
+        return tankProcessorEnabled || liquidating || compounding;
+    }
+
+    /** What this sweep's predicate answers now. */
+    boolean somethingSpends() {
+        return somethingSpends.getAsBoolean();
     }
 
     /** The base address and the enterprise address of the bot's payment key, in listing order. */
@@ -191,6 +225,13 @@ public class WalletSweepService {
         if (readiness.isWalletReady()) {
             return;
         }
+        if (!somethingSpends.getAsBoolean()) {
+            log.debug("wallet sweep: no spending processor is enabled, nothing to prepare");
+            observation = null;
+            readiness.markIdle();
+            return;
+        }
+        readiness.markPendingIfIdle();
         if (blockEventListener.getIsSyncing().get()) {
             log.debug("wallet sweep: node is syncing, skipping");
             observation = null;

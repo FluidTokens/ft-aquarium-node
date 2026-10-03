@@ -452,8 +452,10 @@ loans:
       lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:745089d1220a0fa145be3ff521304b4eea9a503a94f20995824f98355a44e4ab#0}
 
   # The startup wallet sweep (FAB-134): until every wallet UTxO Blockfrost lists is in the local
-  # index, the tank processor, liquidation and compound all skip their cycles. Polled on every node,
-  # whatever its configuration; once the wallet is ready the poll does nothing.
+  # index, the tank processor, liquidation and compound all skip their cycles. It runs only when the
+  # tank processor, liquidation (shadow or live) or compound is enabled — a node where all three are
+  # off needs no wallet preparation and the sweep makes no call at all (/healthcheck reads "idle").
+  # Once the wallet is ready the poll does nothing.
   wallet:
     sweep:
       delay-seconds: ${AQUARIUM_WALLET_SWEEP_DELAY_SECONDS:30}
@@ -463,9 +465,9 @@ scheduling:
     # ⛔ OFF BY DEFAULT. The transaction processor builds and SUBMITS transactions from the
     # configured wallet, so an operator who has not said "yes" gets a node that indexes and serves
     # and runs no scheduled transaction. Set to true to arm it.
-    # ⚠ Even with this off, the startup wallet sweep still runs: when the wallet holds UTxOs the
-    # local index does not see, the node signs ONE self-send to its own base address (it costs
-    # only the fee) so the index sees every wallet UTxO.
+    # With this off AND liquidation disabled AND compound off, the node spends nothing: the startup
+    # wallet sweep does not run either. (While any of them is on, the sweep may sign ONE self-send to
+    # the node's own base address, costing only the fee, so the index sees every wallet UTxO.)
     # ⚠ Upgrading across this change: a processor that was running will STOP until this is set.
     enabled: ${SCHEDULING_TRANSACTION_PROCESSOR_ENABLED:false}
     delay-minutes: ${SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES:5}

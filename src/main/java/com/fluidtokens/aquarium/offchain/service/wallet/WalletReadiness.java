@@ -18,13 +18,16 @@ import org.springframework.stereotype.Component;
  * syncing.
  *
  * <p>The sweep state is reported on {@code /healthcheck} as {@code wallet_sweep}: {@code pending},
- * {@code swept <txHash>}, {@code refused <reason>} or {@code ready}.
+ * {@code swept <txHash>}, {@code refused <reason>}, {@code ready}, or {@link #IDLE} on a node where
+ * no spending processor is enabled (the sweep does not run there, and nothing waits on the gate).
  */
 @Component
 public class WalletReadiness {
 
     public static final String PENDING = "pending";
     public static final String READY = "ready";
+    /** The tank processor, liquidation (shadow or live) and compound are all off: no sweep is needed. */
+    public static final String IDLE = "idle: no spending processor enabled";
 
     private volatile boolean walletReady;
 
@@ -35,7 +38,7 @@ public class WalletReadiness {
         return walletReady;
     }
 
-    /** {@code pending}, {@code swept <txHash>}, {@code refused <reason>} or {@code ready}. */
+    /** {@code pending}, {@code swept <txHash>}, {@code refused <reason>}, {@code ready} or {@link #IDLE}. */
     public String sweepState() {
         return sweepState;
     }
@@ -43,6 +46,17 @@ public class WalletReadiness {
     void markReady() {
         sweepState = READY;
         walletReady = true;
+    }
+
+    void markIdle() {
+        sweepState = IDLE;
+    }
+
+    /** Back to {@code pending} from {@link #IDLE}, when a spending processor has been enabled since. */
+    void markPendingIfIdle() {
+        if (IDLE.equals(sweepState)) {
+            sweepState = PENDING;
+        }
     }
 
     void markSwept(String txHash) {

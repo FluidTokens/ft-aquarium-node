@@ -7,6 +7,7 @@ import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
@@ -19,6 +20,9 @@ import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.lang.reflect.Proxy;
 import java.math.BigInteger;
@@ -42,6 +46,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -115,9 +120,26 @@ class WalletSweepServiceTest {
     private ProtocolParamsSupplier params = LoanFixtures.protocolParams();
     private List<AppConfig.LiquidationConfiguration.Market> markets = List.of(anticipate(UNIT_A));
 
+    /**
+     * The three things that spend from the wallet. The tank processor is on by default, so every test
+     * that does not ask about the "something spends" gate drives a node whose sweep runs.
+     */
+    private boolean tankProcessorEnabled = true;
+    private AppConfig.LiquidationConfiguration liquidation = liquidation(AppConfig.LiquidationConfiguration.Mode.DISABLED);
+    private AppConfig.CompoundConfiguration compound = compound(false);
+
     private WalletSweepService service() {
         return new WalletSweepService(listener, index(), readiness, ACCOUNT, Networks.preview(), () -> markets,
-                () -> params.getProtocolParams(), CONVERTERS, this::page, this::submit, clock);
+                () -> params.getProtocolParams(), CONVERTERS, this::page, this::submit, clock,
+                () -> WalletSweepService.somethingSpends(tankProcessorEnabled, liquidation, compound));
+    }
+
+    private static AppConfig.LiquidationConfiguration liquidation(AppConfig.LiquidationConfiguration.Mode mode) {
+        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, BigInteger.valueOf(1_500_000L), 50, 30);
+    }
+
+    private static AppConfig.CompoundConfiguration compound(boolean enabled) {
+        return new AppConfig.CompoundConfiguration(enabled, 60, BigInteger.ZERO);
     }
 
     private Result<List<Utxo>> page(String address, int page) {
@@ -770,5 +792,153 @@ class WalletSweepServiceTest {
         assertTrue(readiness.sweepState().startsWith("refused listing failed"), readiness.sweepState());
         assertFalse(readiness.isWalletReady());
         assertEquals(0, submitted.size());
+    }
+
+    // ---- the sweep runs only on a node where something spends (FAB-134-3c) -----------------------
+
+    /** A wallet with one UTxO the index does not hold: a node that sweeps at all must sweep it. */
+    private void aWalletThatNeedsASweep() {
+        synced();
+        onChain(utxo(WALLET, 200_000_000));
+    }
+
+    @Test
+    void withEverySpendingProcessorOffNothingIsListedComparedOrSubmitted() {
+        tankProcessorEnabled = false;
+        aWalletThatNeedsASweep();
+        listener.getLastAppliedSlot().set(Long.MAX_VALUE);   // the settle condition would hold
+        WalletSweepService service = service();
+
+        for (int i = 0; i < 6; i++) {
+            service.tick();
+            clock.advance(Duration.ofMinutes(11));
+        }
+
+        assertEquals(List.of(), listingCalls, "a node that spends nothing must not even list the wallet");
+        assertEquals(0, findByIdCalls.get());
+        assertEquals(0, submitted.size());
+        assertFalse(readiness.isWalletReady());
+        assertEquals(WalletReadiness.IDLE, readiness.sweepState());
+    }
+
+    /** One spending processor alone on: the sweep runs all the way to its submit. */
+    private void sweepsWith(String which) {
+        aWalletThatNeedsASweep();
+        WalletSweepService service = service();
+
+        tickAndSettle(service);
+        service.tick();
+
+        assertFalse(listingCalls.isEmpty(), which + " alone must make the sweep list the wallet");
+        assertEquals(1, submitted.size(), which + " alone must make the sweep run: " + readiness.sweepState());
+        assertTrue(readiness.sweepState().startsWith("swept "), readiness.sweepState());
+    }
+
+    @Test
+    void theTankProcessorAloneMakesTheSweepRun() {
+        tankProcessorEnabled = true;
+        sweepsWith("the tank processor");
+    }
+
+    @Test
+    void liquidationInShadowAloneMakesTheSweepRun() {
+        tankProcessorEnabled = false;
+        liquidation = liquidation(AppConfig.LiquidationConfiguration.Mode.SHADOW);
+        sweepsWith("liquidation SHADOW");
+    }
+
+    @Test
+    void liquidationLiveAloneMakesTheSweepRun() {
+        tankProcessorEnabled = false;
+        liquidation = liquidation(AppConfig.LiquidationConfiguration.Mode.LIVE);
+        sweepsWith("liquidation LIVE");
+    }
+
+    @Test
+    void compoundAloneMakesTheSweepRun() {
+        tankProcessorEnabled = false;
+        compound = compound(true);
+        sweepsWith("compound");
+    }
+
+    @Test
+    void aProcessorEnabledAtRuntimeIsSeenOnTheNextTick() {
+        tankProcessorEnabled = false;
+        aWalletThatNeedsASweep();
+        WalletSweepService service = service();
+
+        tickAndSettle(service);
+        tickAndSettle(service);
+        assertEquals(List.of(), listingCalls);
+        assertEquals(WalletReadiness.IDLE, readiness.sweepState());
+
+        // The SAME configuration object changes under the sweep, as a live config object would.
+        ReflectionTestUtils.setField(compound, "enabled", true);
+        service.tick();
+        assertFalse(listingCalls.isEmpty(), "the next tick after a processor is enabled must list");
+        assertEquals(WalletReadiness.PENDING, readiness.sweepState(), "it starts again from an unsettled observation");
+        assertEquals(0, submitted.size(), "the first enabled tick only observes");
+
+        clock.advance(Duration.ofSeconds(30));
+        listener.getLastAppliedSlot().set(slotNow());
+        service.tick();
+        assertEquals(1, submitted.size());
+    }
+
+    /**
+     * The bean Spring builds: every input resolves, and the predicate it was given reads the tank flag
+     * property, the liquidation mode and the compound flag — the latter two LIVE, off the very objects
+     * the executors read. The two configuration beans are bound by Spring from properties, exactly as
+     * in production. With all three off, a tick touches no Blockfrost service at all.
+     */
+    @Test
+    void theSpringWiredSweepReadsEveryInputLive() {
+        record Case(String tank, AppConfig.LiquidationConfiguration.Mode mode, boolean compound, boolean spends) {
+        }
+        for (Case c : List.of(
+                new Case("false", AppConfig.LiquidationConfiguration.Mode.DISABLED, false, false),
+                new Case("true", AppConfig.LiquidationConfiguration.Mode.DISABLED, false, true),
+                new Case("false", AppConfig.LiquidationConfiguration.Mode.SHADOW, false, true),
+                new Case("false", AppConfig.LiquidationConfiguration.Mode.LIVE, false, true),
+                new Case("false", AppConfig.LiquidationConfiguration.Mode.DISABLED, true, true))) {
+            BFBackendService blockfrost = Mockito.mock(BFBackendService.class);
+            AppConfig.Network network = new AppConfig.Network();
+            network.setNetworkForTest("preview");
+            BlockEventListener blockEventListener = new BlockEventListener(null);
+            blockEventListener.getIsSyncing().set(false);
+            new ApplicationContextRunner()
+                    .withPropertyValues("scheduling.transaction-processor.enabled=" + c.tank(),
+                            "loans.liquidation.mode=" + c.mode().name().toLowerCase(),
+                            "loans.liquidation.profit-margin-lovelace=1500000",
+                            "loans.compound.enabled=" + c.compound())
+                    .withBean(BlockEventListener.class, () -> blockEventListener)
+                    .withBean(UtxoRepository.class, this::index)
+                    .withBean(WalletReadiness.class)
+                    .withBean(Account.class, () -> ACCOUNT)
+                    .withBean(AppConfig.Network.class, () -> network)
+                    .withBean(AppConfig.LiquidationConfiguration.class)
+                    .withBean(AppConfig.CompoundConfiguration.class)
+                    .withBean(ProtocolParamsSupplier.class, () -> () -> params.getProtocolParams())
+                    .withBean(CardanoConverters.class, () -> CONVERTERS)
+                    .withBean(BFBackendService.class, () -> blockfrost)
+                    .withBean(WalletSweepService.class)
+                    .run(ctx -> {
+                        assertNull(ctx.getStartupFailure(), () -> c + ": " + ctx.getStartupFailure());
+                        WalletSweepService sweep = ctx.getBean(WalletSweepService.class);
+                        assertEquals(c.mode(), ctx.getBean(AppConfig.LiquidationConfiguration.class).getMode());
+                        assertEquals(c.spends(), sweep.somethingSpends(), c.toString());
+                        if (!c.spends()) {
+                            sweep.tick();
+                            Mockito.verifyNoInteractions(blockfrost);
+                            WalletReadiness wired = ctx.getBean(WalletReadiness.class);
+                            assertEquals(WalletReadiness.IDLE, wired.sweepState());
+                            assertFalse(wired.isWalletReady());
+                            // Live: the same compound object, switched on, is seen without a restart.
+                            ReflectionTestUtils.setField(ctx.getBean(AppConfig.CompoundConfiguration.class),
+                                    "enabled", true);
+                            assertTrue(sweep.somethingSpends(), "the wired predicate must read compound live");
+                        }
+                    });
+        }
     }
 }
