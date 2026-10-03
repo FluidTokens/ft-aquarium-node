@@ -192,6 +192,23 @@ public class ScheduledTransactionService {
 
     private final DatumTankConverter datumConverter = new DatumTankConverter();
 
+    /**
+     * ⛔ FAB-134: closed until {@code WalletSweepService} has proven every wallet UTxO is in the local
+     * index. Setter-injected and REQUIRED in the container, like the lending gate: a missing bean must
+     * fail the boot, never leave this processor spending from a partly-indexed wallet. Null only in a
+     * direct test construction, where it means "ready".
+     */
+    private com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setWalletReadiness(com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness) {
+        this.walletReadiness = walletReadiness;
+    }
+
+    private boolean walletNotReady() {
+        return walletReadiness != null && !walletReadiness.isWalletReady();
+    }
+
     private RefInputIndexes resolveRefIndexes(TransactionInput parametersRefInput, TransactionInput stakingRefInput) {
         var sortedRefInputs = Stream.of(parametersRefInput, stakingRefInput, aquariumConfiguration.getTankRefInput())
                 .sorted(new TransactionInputComparator())
@@ -246,6 +263,10 @@ public class ScheduledTransactionService {
 
         if (blockEventListener.getIsSyncing().get()) {
             log.info("node is syncing, skipping...");
+            return;
+        }
+        if (walletNotReady()) {
+            log.debug("wallet sweep not complete, skipping the payment cycle");
             return;
         }
 

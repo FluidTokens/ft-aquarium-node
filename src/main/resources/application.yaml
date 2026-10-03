@@ -451,6 +451,13 @@ loans:
       # unspent -- derived here and named by LMConfigDatum[5].
       lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:745089d1220a0fa145be3ff521304b4eea9a503a94f20995824f98355a44e4ab#0}
 
+  # The startup wallet sweep (FAB-134): until every wallet UTxO Blockfrost lists is in the local
+  # index, the tank processor, liquidation and compound all skip their cycles. Polled on every node,
+  # whatever its configuration; once the wallet is ready the poll does nothing.
+  wallet:
+    sweep:
+      delay-seconds: ${AQUARIUM_WALLET_SWEEP_DELAY_SECONDS:30}
+
 scheduling:
   transaction-processor:
     # ⛔ OFF BY DEFAULT. The transaction processor builds and SUBMITS transactions from the

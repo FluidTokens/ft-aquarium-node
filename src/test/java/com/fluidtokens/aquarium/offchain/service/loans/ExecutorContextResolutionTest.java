@@ -312,5 +312,11 @@ class ExecutorContextResolutionTest {
         BFBackendService backendService() {
             return new BFBackendService(OFFLINE_BLOCKFROST, "dummy");
         }
+
+        /** FAB-134: the executors' wallet-readiness setter is REQUIRED, so the container must hold one. */
+        @Bean
+        com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness() {
+            return new com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness();
+        }
     }
 }

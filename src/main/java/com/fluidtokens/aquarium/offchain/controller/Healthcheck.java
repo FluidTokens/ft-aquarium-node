@@ -7,6 +7,7 @@ import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LendingConfigGate;
 import com.fluidtokens.aquarium.offchain.service.ParametersService;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -27,6 +28,9 @@ public class Healthcheck {
      *                          built. ⚠ Reported, never part of the health verdict: a closed gate refuses
      *                          lending only, and the scheduled-payment half this check guards keeps running.
      * @param lendingGateReason why it is closed (the startup verifier's reason), null while open
+     * @param walletSweep       the startup wallet sweep (FAB-134): {@code pending}, {@code swept <txHash>},
+     *                          {@code refused <reason>} or {@code ready}. ⚠ Reported, never part of the
+     *                          verdict: until it reads {@code ready} the processors skip their cycles.
      */
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record HealthCheck(Boolean dbOk,
@@ -35,7 +39,8 @@ public class Healthcheck {
                               Boolean walletOk,
                               Boolean stakingOk,
                               String lendingGate,
-                              String lendingGateReason) {
+                              String lendingGateReason,
+                              String walletSweep) {
 
     }
 
@@ -48,6 +53,17 @@ public class Healthcheck {
     private final AppUtxoService utxoService;
 
     private final LendingConfigGate lendingConfigGate;
+
+    /**
+     * Setter-injected and REQUIRED in the container, like the processors' gate; null only in a direct
+     * test construction, where {@code wallet_sweep} is reported as null.
+     */
+    private WalletReadiness walletReadiness;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setWalletReadiness(WalletReadiness walletReadiness) {
+        this.walletReadiness = walletReadiness;
+    }
 
     @GetMapping
     public ResponseEntity<?> healthCheck() {
@@ -103,7 +119,8 @@ public class Healthcheck {
                 walletOk,
                 stakingFound,
                 lendingConfigGate.isBlocked() ? "closed" : "open",
-                lendingConfigGate.blockedReason().orElse(null));
+                lendingConfigGate.blockedReason().orElse(null),
+                walletReadiness == null ? null : walletReadiness.sweepState());
 
         if (!walletOk) {
             log.warn("[HEALTH] No utxo found for wallet. Ensure you have at least one UTXO with only ada in it.");
