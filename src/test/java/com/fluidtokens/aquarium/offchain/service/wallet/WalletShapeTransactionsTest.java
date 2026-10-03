@@ -1,15 +1,19 @@
 package com.fluidtokens.aquarium.offchain.service.wallet;
 
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.address.AddressProvider;
+import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.TransactionProcessor;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.crypto.Blake2bUtil;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.Tx;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.VkeyWitness;
 import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.Reason;
@@ -26,6 +30,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -40,6 +45,11 @@ class WalletShapeTransactionsTest {
 
     private static final Account ACCOUNT = new Account(Networks.preview());
     private static final String WALLET = ACCOUNT.baseAddress();
+    /** The same payment key with no stake part: spendable by the one witness that signs for WALLET. */
+    private static final String ENTERPRISE = ACCOUNT.enterpriseAddress();
+    private static final byte[] PAYMENT_KEY_HASH = ACCOUNT.hdKeyPair().getPublicKey().getKeyHash();
+    private static final Credential STAKE = AddressProvider.getDelegationCredential(ACCOUNT.getBaseAddress())
+            .orElseThrow();
     private static final BigInteger C = BigInteger.valueOf(5_000_000L);
     private static final BigInteger TEN_ADA = WalletShape.SHAPED_TOKEN_LOVELACE;
 
@@ -434,5 +444,161 @@ class WalletShapeTransactionsTest {
 
         assertTrue(engine.submit(signed).isSuccessful());
         assertEquals(1, submissions.get());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Inputs are accepted by PAYMENT CREDENTIAL (FAB-134 B1 r2): any address whose payment part is the
+    // bot's key hash — base, enterprise, or a base address under another stake credential. Outputs
+    // still all go to the base address.
+    // ---------------------------------------------------------------------------------------------
+
+    private static Utxo at(String address, Utxo utxo) {
+        utxo.setAddress(address);
+        return utxo;
+    }
+
+    /** The messy wallet with its junk UTxO and its 45-ADA UTxO at the ENTERPRISE address. */
+    private static List<Utxo> mixedWallet() {
+        List<Utxo> wallet = new ArrayList<>(messyWallet());
+        wallet.set(2, at(ENTERPRISE, wallet.get(2)));
+        wallet.set(4, at(ENTERPRISE, wallet.get(4)));
+        return wallet;
+    }
+
+    private static Set<String> refs(List<Utxo> utxos) {
+        return utxos.stream().map(u -> u.getTxHash() + "#" + u.getOutputIndex())
+                .collect(java.util.stream.Collectors.toCollection(java.util.TreeSet::new));
+    }
+
+    private static Set<String> inputRefs(Transaction tx) {
+        return tx.getBody().getInputs().stream().map(i -> i.getTransactionId() + "#" + i.getIndex())
+                .collect(java.util.stream.Collectors.toCollection(java.util.TreeSet::new));
+    }
+
+    /** One vkey witness, and it is the bot's payment key: one signature covers base and enterprise inputs. */
+    private static void assertSignedByThePaymentKeyAlone(Transaction unsigned) throws Exception {
+        Transaction signed = Transaction.deserialize(ACCOUNT.sign(unsigned).serialize());
+        List<VkeyWitness> witnesses = signed.getWitnessSet().getVkeyWitnesses();
+        assertEquals(1, witnesses.size(), "one key spends every input");
+        assertArrayEquals(PAYMENT_KEY_HASH, Blake2bUtil.blake2bHash224(witnesses.get(0).getVkey()),
+                "the witness must be the payment key's");
+    }
+
+    @Test
+    void aBaseAndAnEnterpriseInputBuildTheShapeAtTheBaseAddressUnderOneSignature() throws Exception {
+        List<Utxo> inputs = mixedWallet();
+        assertTrue(inputs.stream().anyMatch(u -> ENTERPRISE.equals(u.getAddress())));
+
+        Outcome outcome = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        assertEquals(refs(inputs), inputRefs(tx), "every given input, base and enterprise, is spent");
+        assertEquals(5, tx.getBody().getOutputs().size());
+        tx.getBody().getOutputs().forEach(o -> assertEquals(WALLET, o.getAddress(), "every output at the BASE address"));
+        assertConserved(inputs, tx);
+        assertSignedByThePaymentKeyAlone(outcome.transaction());
+    }
+
+    @Test
+    void aBaseAndAnEnterpriseInputConsolidateAtTheBaseAddressUnderOneSignature() throws Exception {
+        List<Utxo> inputs = mixedWallet();
+
+        Outcome outcome = engine.buildConsolidation(inputs);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        assertEquals(refs(inputs), inputRefs(tx), "every given input, base and enterprise, is spent");
+        assertEquals(2, tx.getBody().getOutputs().size());
+        tx.getBody().getOutputs().forEach(o -> assertEquals(WALLET, o.getAddress(), "every output at the BASE address"));
+        assertConserved(inputs, tx);
+        assertSignedByThePaymentKeyAlone(outcome.transaction());
+    }
+
+    @Test
+    void anAdaOnlyEnterpriseInputAloneConsolidatesIntoTheBaseAddress() throws Exception {
+        List<Utxo> inputs = List.of(at(ENTERPRISE, utxo(30_000_000)));
+
+        Outcome outcome = engine.buildConsolidation(inputs);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        assertEquals(refs(inputs), inputRefs(tx));
+        assertEquals(1, tx.getBody().getOutputs().size());
+        assertEquals(WALLET, tx.getBody().getOutputs().get(0).getAddress());
+        assertConserved(inputs, tx);
+    }
+
+    @Test
+    void anInputUnderOurPaymentKeyWithAnotherStakeCredentialIsAccepted() throws Exception {
+        Credential otherStake = AddressProvider.getDelegationCredential(new Account(Networks.preview()).getBaseAddress())
+                .orElseThrow();
+        String ourKeyOtherStake = AddressProvider.getBaseAddress(Credential.fromKey(PAYMENT_KEY_HASH), otherStake,
+                Networks.preview()).toBech32();
+        List<Utxo> inputs = List.of(utxo(30_000_000), at(ourKeyOtherStake, utxo(20_000_000)));
+
+        Outcome outcome = engine.buildConsolidation(inputs);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+        assertEquals(refs(inputs), inputRefs(tx));
+        tx.getBody().getOutputs().forEach(o -> assertEquals(WALLET, o.getAddress()));
+    }
+
+    private void assertBothBuildersRefuse(Utxo offending) {
+        List<Utxo> inputs = List.of(utxo(30_000_000), offending);
+        String ref = offending.getTxHash() + "#" + offending.getOutputIndex();
+        Outcome shaped = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.REFUSED, shaped.status(), shaped.detail());
+        assertTrue(shaped.detail().startsWith("input " + ref), shaped.detail());
+        Outcome consolidation = engine.buildConsolidation(inputs);
+        assertEquals(Status.REFUSED, consolidation.status(), consolidation.detail());
+        assertTrue(consolidation.detail().startsWith("input " + ref), consolidation.detail());
+    }
+
+    @Test
+    void anInputUnderAnotherAccountsKeyIsRefusedByBothBuilders() {
+        Account other = new Account(Networks.preview());
+        assertBothBuildersRefuse(at(other.baseAddress(), utxo(50_000_000)));
+        assertBothBuildersRefuse(at(other.enterpriseAddress(), utxo(50_000_000)));
+        // Another key under OUR stake credential: the stake part is not what spends it.
+        String otherKeyOurStake = AddressProvider.getBaseAddress(
+                Credential.fromKey(other.hdKeyPair().getPublicKey().getKeyHash()), STAKE, Networks.preview()).toBech32();
+        assertBothBuildersRefuse(at(otherKeyOurStake, utxo(50_000_000)));
+    }
+
+    @Test
+    void anInputAtAScriptAddressIsRefusedByBothBuilders() {
+        // The script hash is our own key hash's bytes: a script credential must be refused even when its
+        // 28 bytes equal the payment key hash — the credential TYPE is part of the check.
+        Credential script = Credential.fromScript(PAYMENT_KEY_HASH);
+        assertBothBuildersRefuse(at(AddressProvider.getEntAddress(script, Networks.preview()).toBech32(),
+                utxo(50_000_000)));
+        assertBothBuildersRefuse(at(AddressProvider.getBaseAddress(script, STAKE, Networks.preview()).toBech32(),
+                utxo(50_000_000)));
+        assertBothBuildersRefuse(at(AddressProvider.getEntAddress(Credential.fromScript("ab".repeat(28)),
+                Networks.preview()).toBech32(), utxo(50_000_000)));
+    }
+
+    @Test
+    void anUnparsableInputAddressIsRefusedNamingTheInput() {
+        assertBothBuildersRefuse(at("not-an-address", utxo(50_000_000)));
+        // A Byron (base58) address has no Shelley payment credential.
+        assertBothBuildersRefuse(at("Ae2tdPwUPEZFRbyhz3cpfC2CumGzNkFBN2L42rcUc2yjQpEkxDbkPodpMAi",
+                utxo(50_000_000)));
+    }
+
+    @Test
+    void anOutputAtOurOwnEnterpriseAddressFailsTheAddressCheck() throws Exception {
+        List<Utxo> inputs = messyWallet();
+        Outcome outcome = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        // Our own key, no stake part: spendable by us, but every OUTPUT belongs at the base address.
+        changeOf(tx).setAddress(ENTERPRISE);
+
+        String deviation = WalletShapeTransactions.shapeDeviation(tx, inputs, outcome.plan(), WALLET);
+        assertNotNull(deviation);
+        assertTrue(deviation.startsWith("output 4 is at " + ENTERPRISE), deviation);
     }
 }

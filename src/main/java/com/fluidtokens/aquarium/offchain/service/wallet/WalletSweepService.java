@@ -76,11 +76,9 @@ import java.util.stream.IntStream;
  * {@link #tick()} — one escaping a {@code @Scheduled} method would lose the run, and this one runs on the
  * single scheduler thread every processor shares.
  *
- * <h2>Known limit: enterprise-address UTxOs</h2>
- * The engine spends only UTxOs at the wallet's BASE address and refuses any other input. A UTxO at the
- * enterprise address is listed and judged like any other, but a sweep that has to spend one is refused
- * by both builders — so it is reported ({@code refused ...}) and the gate stays closed rather than the
- * node running on a wallet the index only partly sees.
+ * <h2>Enterprise-address UTxOs</h2>
+ * A UTxO at the enterprise address is listed, judged and spent like any other, and the sweep moves it
+ * into the base address, where every output of the engine goes.
  */
 @Component
 @Slf4j

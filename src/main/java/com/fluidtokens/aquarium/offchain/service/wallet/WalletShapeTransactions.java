@@ -1,6 +1,10 @@
 package com.fluidtokens.aquarium.offchain.service.wallet;
 
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.address.Address;
+import com.bloxbean.cardano.client.address.AddressProvider;
+import com.bloxbean.cardano.client.address.Credential;
+import com.bloxbean.cardano.client.address.CredentialType;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.common.OrderEnum;
@@ -20,6 +24,7 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
 import com.bloxbean.cardano.client.transaction.spec.Value;
 
 import java.math.BigInteger;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
@@ -39,6 +44,14 @@ import static com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.norma
  * shape — or, as a fallback, a plain consolidation — and verifies the BUILT body before handing it
  * back. Where the input list came from is the caller's business; this class spends exactly that list
  * and nothing else.
+ *
+ * <h2>Which inputs it accepts, and where every output goes</h2>
+ * An input is accepted when its address's PAYMENT credential is the bot account's payment key hash — the
+ * base address, the enterprise address, or a base address under any other stake credential. All of them
+ * are spent by the one vkey witness {@link #sign} adds; the stake part of an address plays no part in
+ * spending it. Anything else — a script payment credential (even one whose 28 bytes equal the key hash),
+ * another key, an unreadable or Byron address — is refused, naming the input. Every OUTPUT goes to the
+ * base address, whatever address its value came from (owner ruling, FAB-134 B1 r2).
  *
  * <h2>Why every built body is re-verified</h2>
  * The request is not the artefact (officina CCL trap 21). cardano-client-lib is free to:
@@ -137,6 +150,8 @@ public final class WalletShapeTransactions {
 
     private final Account account;
     private final String walletAddress;
+    /** The key hash every input's payment credential must equal — taken from the account, never from a string. */
+    private final byte[] paymentKeyHash;
     private final ProtocolParamsSupplier protocolParamsSupplier;
     private final TransactionSubmitter submitter;
 
@@ -145,11 +160,15 @@ public final class WalletShapeTransactions {
                                    TransactionSubmitter submitter) {
         this.account = Objects.requireNonNull(account, "account");
         this.walletAddress = account.baseAddress();
+        this.paymentKeyHash = account.hdKeyPair().getPublicKey().getKeyHash();
         this.protocolParamsSupplier = Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
         this.submitter = Objects.requireNonNull(submitter, "submitter");
     }
 
-    /** The wallet every input must come from and every output goes to. */
+    /**
+     * The base address every output goes to. Inputs may also sit at any other address under the same
+     * payment key (see the class javadoc).
+     */
     public String walletAddress() {
         return walletAddress;
     }
@@ -295,16 +314,40 @@ public final class WalletShapeTransactions {
         };
     }
 
-    /** A reason the given inputs cannot be spent by this wallet alone, or null. */
+    /** A reason the given inputs cannot be spent by this wallet's payment key alone, or null. */
     private String inputProblem(List<Utxo> inputs) {
         Set<String> seen = new HashSet<>();
         for (Utxo utxo : inputs) {
-            if (!walletAddress.equals(utxo.getAddress())) {
-                return "input " + ref(utxo) + " is at " + utxo.getAddress() + ", not the wallet " + walletAddress;
+            String credentialProblem = paymentCredentialProblem(utxo);
+            if (credentialProblem != null) {
+                return "input " + ref(utxo) + " " + credentialProblem;
             }
             if (!seen.add(ref(utxo))) {
                 return "input " + ref(utxo) + " is listed twice";
             }
+        }
+        return null;
+    }
+
+    /**
+     * Why this UTxO's address is not spendable by the bot's payment key, or null. The credential TYPE is
+     * checked as well as the bytes: a script credential is refused even when its hash equals the key hash.
+     */
+    private String paymentCredentialProblem(Utxo utxo) {
+        Optional<Credential> credential;
+        try {
+            credential = AddressProvider.getPaymentCredential(new Address(utxo.getAddress()));
+        } catch (Exception e) {
+            return "is at an unreadable address " + utxo.getAddress() + ": " + e.getMessage();
+        }
+        if (credential.isEmpty()) {
+            return "is at " + utxo.getAddress() + ", which has no payment credential";
+        }
+        if (credential.get().getType() != CredentialType.Key) {
+            return "is at " + utxo.getAddress() + ", whose payment credential is a script";
+        }
+        if (!Arrays.equals(paymentKeyHash, credential.get().getBytes())) {
+            return "is at " + utxo.getAddress() + ", whose payment key is not the wallet's";
         }
         return null;
     }
@@ -447,8 +490,9 @@ public final class WalletShapeTransactions {
     }
 
     /**
-     * Checks both builders share: inputs exactly the given list, every output at the wallet with no
-     * datum or script, nothing script-bearing or ledger-effectful in the body, and per-unit
+     * Checks both builders share: inputs exactly the given list, every output at the wallet's BASE address
+     * (never merely under its payment key — inputs may come from the enterprise address, outputs may not)
+     * with no datum or script, nothing script-bearing or ledger-effectful in the body, and per-unit
      * conservation.
      */
     private static String commonDeviation(Transaction tx, List<Utxo> inputs, String wallet) {

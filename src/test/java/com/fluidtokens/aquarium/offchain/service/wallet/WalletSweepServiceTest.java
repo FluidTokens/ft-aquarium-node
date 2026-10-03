@@ -365,11 +365,10 @@ class WalletSweepServiceTest {
     @Test
     void f_bothBuildsRefusedSubmitsNothingAndKeepsTheGateClosed() {
         synced();
-        // A UTxO at the ENTERPRISE address: the engine spends only the base address, so both refuse.
-        Utxo base = utxo(WALLET, 200_000_000);
-        Utxo enterprise = utxo(ENTERPRISE, 20_000_000);
-        onChain(base, enterprise);
-        indexed(base);
+        // The whole listing is one unindexed 0.1-ADA UTxO: too small to fund the shape's outputs, and too
+        // small to pay the consolidation's fee, so both builders refuse.
+        Utxo dust = utxo(WALLET, 100_000);
+        onChain(dust);
         WalletSweepService service = service();
 
         tickAndSettle(service);
@@ -397,6 +396,37 @@ class WalletSweepServiceTest {
 
         assertTrue(listingCalls.contains(ENTERPRISE + "@1"), "the enterprise address must be listed: " + listingCalls);
         assertTrue(readiness.isWalletReady(), "an enterprise address Blockfrost 404s is empty, not an outage");
+    }
+
+    @Test
+    void anUnindexedEnterpriseUtxoIsSweptIntoTheBaseAddressAndThenTheWalletIsReady() {
+        synced();
+        Utxo base = utxo(WALLET, 150_000_000);
+        Utxo enterprise = utxo(ENTERPRISE, 20_000_000);
+        onChain(base, enterprise);
+        indexed(base);
+        Set<String> wholeListing = listedRefs();
+        WalletSweepService service = service();
+
+        tickAndSettle(service);
+        tickAndSettle(service);
+
+        assertEquals(1, submitted.size(), readiness.sweepState());
+        Transaction tx = submitted.getFirst();
+        assertEquals(wholeListing, inputRefs(tx), "the sweep spends the whole listing, enterprise UTxO included");
+        assertTrue(inputRefs(tx).contains(ref(enterprise)));
+        tx.getBody().getOutputs().forEach(o -> assertEquals(WALLET, o.getAddress(), "every output at the BASE address"));
+        assertEquals(1, tx.getWitnessSet().getVkeyWitnesses().size(), "one key spends base and enterprise inputs");
+        assertFalse(readiness.isWalletReady(), "submitted is not indexed");
+        assertFalse(chain.containsKey(ENTERPRISE) && !chain.get(ENTERPRISE).isEmpty(),
+                "after the sweep lands the enterprise address holds nothing");
+
+        listedRefs().forEach(index::add);
+        tickAndSettle(service);
+        tickAndSettle(service);
+        assertTrue(readiness.isWalletReady(), readiness.sweepState());
+        assertEquals("ready", readiness.sweepState());
+        assertEquals(1, submitted.size());
     }
 
     @Test
