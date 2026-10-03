@@ -18,8 +18,12 @@ import java.util.Objects;
  * <p>Protocol parameters change only at an epoch boundary, so asking Blockfrost for them on every
  * transaction and every tank cycle spends the provider budget on an answer that cannot have moved.
  * This wraps the real supplier (Blockfrost's in production) and serves the value it last returned
- * until about {@link #REFRESH_DELAY_AFTER_EPOCH_START ten minutes} into the next epoch, then fetches
- * again. The delay lets the boundary settle before the new epoch's values are read.
+ * until the next {@link #REFRESH_DELAY_AFTER_EPOCH_START settling point}, ten minutes after an epoch
+ * starts, then fetches again. The delay lets the boundary settle before the new epoch's values are
+ * read. A value fetched after the current epoch's settling point is served until ten minutes into the
+ * next epoch; a value fetched INSIDE the settling window (a boot, restart or empty-cache recovery in
+ * an epoch's first ten minutes) is exactly the read the delay exists to avoid, so it is served only
+ * until that window ends and then fetched again.
  *
  * <h2>⛔ Every value served is one the chain published</h2>
  * Protocol parameters and cost models must be the chain's own (CCL trap 7): a stale or invented value
@@ -110,11 +114,20 @@ public class EpochProtocolParamsSupplier implements ProtocolParamsSupplier {
         return e.getCause() == null ? e.toString() : e + " (cause: " + e.getCause() + ")";
     }
 
-    /** The start of the epoch after the one {@code now} falls in, plus the settling delay. */
+    /**
+     * The next settling point after {@code now}: the current epoch's start plus the settling delay when
+     * {@code now} is still inside that window, otherwise the next epoch's start plus the delay.
+     */
     private Instant nextRefreshInstant(Instant now) {
         long slot = converters.time().toSlot(LocalDateTime.ofInstant(now, ZoneOffset.UTC));
         int currentEpoch = converters.slot().slotToEpoch(slot).intValue();
-        return converters.epoch().beginningOfEpochToUTCTime(currentEpoch + 1)
+        Instant settle = settlingPoint(currentEpoch);
+        return now.isBefore(settle) ? settle : settlingPoint(currentEpoch + 1);
+    }
+
+    /** The start of {@code epoch} plus the settling delay. */
+    private Instant settlingPoint(int epoch) {
+        return converters.epoch().beginningOfEpochToUTCTime(epoch)
                 .toInstant(ZoneOffset.UTC)
                 .plus(REFRESH_DELAY_AFTER_EPOCH_START);
     }

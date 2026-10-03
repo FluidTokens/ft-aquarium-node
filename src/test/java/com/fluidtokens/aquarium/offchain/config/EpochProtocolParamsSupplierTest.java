@@ -140,11 +140,62 @@ class EpochProtocolParamsSupplierTest {
         assertSame(delegate.lastReturned, params);
     }
 
+    @Test
+    void aFreshSupplierBuiltInsideTheSettlingWindowFetchesAgainWhenTheWindowEnds() {
+        clock.set(epochStart.plus(Duration.ofMinutes(5)));
+        var supplier = new EpochProtocolParamsSupplier(delegate, CONVERTERS, clock);
+        assertEquals(1, delegate.calls, "the eager load at construction is the first fetch");
+
+        clock.set(epochStart.plus(Duration.ofMinutes(9)));
+        ProtocolParams inside = supplier.getProtocolParams();
+        assertEquals(1, delegate.calls, "fetched again while the settling window is still open");
+
+        clock.set(epochStart.plus(Duration.ofMinutes(11)));
+        ProtocolParams settled = supplier.getProtocolParams();
+        assertEquals(2, delegate.calls,
+                "a value read inside the settling window was kept past it, for the whole epoch");
+        assertSame(delegate.lastReturned, settled, "the value served must be the settled one just fetched");
+        assertNotSame(inside, settled);
+    }
+
+    @Test
+    void aNullDelegateWithNothingCachedThrows() {
+        delegate.returningNull = true;
+        var supplier = new EpochProtocolParamsSupplier(delegate, CONVERTERS, clock);
+        assertEquals(1, delegate.calls, "construction did not attempt the eager load");
+
+        assertThrows(IllegalStateException.class, supplier::getProtocolParams,
+                "a null from the provider is not a chain value and must never be served");
+        assertEquals(2, delegate.calls);
+    }
+
+    @Test
+    void aNullDelegateWithAValueCachedServesTheCachedValueAndBacksOff() {
+        var supplier = new EpochProtocolParamsSupplier(delegate, CONVERTERS, clock);
+        ProtocolParams cached = supplier.getProtocolParams();
+
+        delegate.returningNull = true;
+        Instant due = nextEpochStart.plus(Duration.ofMinutes(11));
+        clock.set(due);
+        assertSame(cached, supplier.getProtocolParams(),
+                "a null refresh must keep serving the last value the chain returned");
+        assertEquals(2, delegate.calls);
+
+        clock.set(due.plusSeconds(59));
+        assertSame(cached, supplier.getProtocolParams());
+        assertEquals(2, delegate.calls, "retried within 60 s of a null answer");
+
+        clock.set(due.plusSeconds(61));
+        assertSame(cached, supplier.getProtocolParams());
+        assertEquals(3, delegate.calls, "never retried after the back-off elapsed");
+    }
+
     /** Counts calls; each success returns a fresh instance so "which value was served" is checkable. */
     static final class CountingSupplier implements ProtocolParamsSupplier {
         static final RuntimeException FAILURE = new RuntimeException("provider down (test)");
         int calls;
         boolean failing;
+        boolean returningNull;
         ProtocolParams lastReturned;
 
         @Override
@@ -152,6 +203,9 @@ class EpochProtocolParamsSupplierTest {
             calls++;
             if (failing) {
                 throw FAILURE;
+            }
+            if (returningNull) {
+                return null;
             }
             lastReturned = new ProtocolParams();
             return lastReturned;
