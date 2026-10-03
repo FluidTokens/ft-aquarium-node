@@ -1659,4 +1659,75 @@ class LiquidationReadinessControllerTest {
                 "the index says the wallet is empty now; the earlier 5 ADA must not be shown");
         assertEquals(T0 + 61_000L, later.asOfMillis());
     }
+
+    /**
+     * ⛔ FAB-134 B2b (slice-4 audit residue): the REASON reaches the page through the real
+     * {@code readiness()} path — a test of {@code walletNotReadyReason()} alone could not see a
+     * controller that never put it on the model.
+     */
+    @Test
+    void theReadinessPageCarriesWhyTheWalletIsNotReadyAndNothingOnceItIs() {
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(), 0, 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(List.of(), census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null);
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
+        var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(null), provide(null), provide(null), provide(null), provide(utxos),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+        controller.setBlockEventListener(syncing(false));
+        var readiness = ready(false);
+        controller.setWalletReadiness(readiness);
+
+        var notReady = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(notReady, null, null, null, null, null);
+        Object reason = notReady.getAttribute("walletNotReady");
+        assertNotNull(reason, "while the wallet is not ready the page must be told why");
+        assertTrue(reason.toString().startsWith("wallet not ready"), String.valueOf(reason));
+
+        org.mockito.Mockito.when(readiness.isWalletReady()).thenReturn(true);
+        var isReady = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(isReady, null, null, null, null, null);
+        assertNull(isReady.getAttribute("walletNotReady"), "once ready there is no reason to show");
+        assertTrue(((WalletBalance) isReady.getAttribute("wallet")).known());
+    }
+
+    /**
+     * ⛔ A read that THROWS is a failed read, not an answer: the previous balance stays standing. Only an
+     * empty RESULT is authoritative (see the test above).
+     */
+    @Test
+    void aWalletReadThatThrowsKeepsThePreviousBalance() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo())
+                .thenReturn(List.of(walletUtxo(5_000_000L)))
+                .thenThrow(new IllegalStateException("fixture: database unreachable"));
+        var controller = walletController(utxos);
+
+        assertEquals(BigInteger.valueOf(5_000_000L), controller.wallet(T0).of("lovelace"));
+        WalletBalance later = controller.wallet(T0 + 61_000L);
+
+        org.mockito.Mockito.verify(utxos, org.mockito.Mockito.times(2)).listWalletUtxo();
+        assertTrue(later.known(), "a failed read must not blank a balance that was known");
+        assertEquals(BigInteger.valueOf(5_000_000L), later.of("lovelace"));
+        assertEquals(T0, later.asOfMillis(), "the balance shown is the earlier one, honestly dated");
+    }
 }

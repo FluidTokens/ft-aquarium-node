@@ -4,6 +4,7 @@ import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.bloxbean.cardano.yaci.store.common.domain.AddressUtxo;
 import com.bloxbean.cardano.yaci.store.common.domain.TxInput;
+import com.bloxbean.cardano.yaci.store.common.domain.UtxoKey;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.UtxoCache;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.UtxoStorageImpl;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.UtxoId;
@@ -19,8 +20,12 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.PlatformTransactionManager;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 @Repository
@@ -30,6 +35,14 @@ public class TankUtxoStorage extends UtxoStorageImpl {
     private final UtxoRepository utxoRepository;
 
     private final Set<String> contractPaymentPkh;
+
+    /**
+     * Inputs of the CURRENT block whose output was not indexed when {@link #saveSpent} saw them, keyed
+     * by the output they spend. ⚠ Thread-confined on purpose: Yaci 0.1.7's {@code UtxoProcessor} calls
+     * {@code saveSpent} then {@code saveUnspent} for one block on one thread, and this bean is a
+     * singleton — a shared field would let one block's inputs attach to another block's outputs.
+     */
+    private final ThreadLocal<Map<UtxoKey, TxInput>> pendingSpends = ThreadLocal.withInitial(HashMap::new);
 
     public TankUtxoStorage(UtxoRepository utxoRepository,
                            TxInputRepository spentOutputRepository,
@@ -67,12 +80,33 @@ public class TankUtxoStorage extends UtxoStorageImpl {
 
     @Override
     public void saveUnspent(List<AddressUtxo> addressUtxoList) {
-        var fluidtokensRentsAddresses = addressUtxoList
-                .stream()
-                .filter(this::shouldSaveUtxo)
-                .toList();
+        try {
+            var fluidtokensRentsAddresses = addressUtxoList
+                    .stream()
+                    .filter(this::shouldSaveUtxo)
+                    .toList();
 
-        super.saveUnspent(fluidtokensRentsAddresses);
+            super.saveUnspent(fluidtokensRentsAddresses);
+
+            // ⛔ FAB-134 B2b: an output this block both CREATED and SPENT. Its input reached saveSpent
+            // first (Yaci 0.1.7 UtxoProcessor writes every input of a block, then every output) and was
+            // held back because the output was not indexed yet. Now that it is, its spend is recorded —
+            // without this the output stays "unspent" in the index forever: a ghost that coin and
+            // collateral selection pick and every build fails on. Only SAVED outputs qualify, so a
+            // foreign pair (filtered out above) leaves no row of either kind.
+            Map<UtxoKey, TxInput> pending = pendingSpends.get();
+            if (!pending.isEmpty()) {
+                var sameBlockSpends = fluidtokensRentsAddresses.stream()
+                        .map(utxo -> pending.get(new UtxoKey(utxo.getTxHash(), utxo.getOutputIndex())))
+                        .filter(Objects::nonNull)
+                        .toList();
+                super.saveSpent(sameBlockSpends);
+            }
+        } finally {
+            // The remembered inputs live exactly one block. Inputs of outputs that are not ours are
+            // dropped here, as they always were.
+            pendingSpends.remove();
+        }
     }
 
     private boolean shouldSaveUtxo(AddressUtxo addressUtxo) {
@@ -81,11 +115,25 @@ public class TankUtxoStorage extends UtxoStorageImpl {
 
     @Override
     public void saveSpent(List<TxInput> txInputs) {
-        var fluidtokensRentsInputs = txInputs
-                .stream()
-                .filter(txInput -> utxoRepository.findById(new UtxoId(txInput.getTxHash(), txInput.getOutputIndex())).isPresent())
-                .toList();
-        super.saveSpent(fluidtokensRentsInputs);
+        var fluidtokensRentsInputs = new ArrayList<TxInput>();
+        Map<UtxoKey, TxInput> pending = pendingSpends.get();
+        for (TxInput txInput : txInputs) {
+            if (utxoRepository.findById(new UtxoId(txInput.getTxHash(), txInput.getOutputIndex())).isPresent()) {
+                fluidtokensRentsInputs.add(txInput);
+            } else {
+                // Not indexed YET — possibly an output created earlier in this same block, which
+                // saveUnspent is about to store. Held until then; see saveUnspent.
+                pending.put(new UtxoKey(txInput.getTxHash(), txInput.getOutputIndex()), txInput);
+            }
+        }
+        try {
+            super.saveSpent(fluidtokensRentsInputs);
+        } catch (RuntimeException e) {
+            // The block is abandoned (UtxoProcessor rethrows and stops the fetcher); its remembered
+            // inputs must not survive on this thread into whatever block runs next.
+            pendingSpends.remove();
+            throw e;
+        }
     }
 
 }
