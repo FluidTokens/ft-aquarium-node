@@ -37,24 +37,22 @@ import java.math.BigInteger;
  * ADA spent to interact with the DEX. So between batcher and tx fee you can round at 4 ada or 5
  * ada."</i> Default 5,000,000 — the conservative end of what he named.
  *
- * <p><b>A floor rather than an addend, and the reason is a measurement.</b> Read at {@code e0b818e}:
- * for an <b>ada</b> collateral the validator requires the order's <em>total</em> lovelace to equal
- * {@code swappableCollateralAmount} — no extra ada whatsoever — so Minswap's {@code max_batcher_fee}
- * of 700,000 comes out of the <b>swap input</b>, which is the lender's proceeds and not the bot's
- * wallet. Adding it to the bot's outlay would be a false attribution; refusing to account for it at
- * all would be optimistic. <b>A floor captures the conservatism without asserting who pays what</b>,
- * and the assessment records both figures so an operator can see which one bound.
- * The second term is the validator's, read at the deployed sha {@code db5069e}: when the collateral
- * is <b>not</b> ada, {@code lm_liquidate_and_convert_action} requires
- * {@code quantity_of(minswapOrderOutput.value, "", "") >= 4000000} — the order output must carry
- * at least 4 ada alongside the collateral, and that ada leaves with the order (Minswap's batcher fee
- * is 2,000,000 of it, and the receiver is the lender's asset manager, not the bot). <b>So a convert
- * costs the bot 4 ada it does not get back</b>, which is four to five times a typical
- * transaction fee and would dominate any model that omitted it. When the collateral IS ada the
- * validator constrains the order's lovelace to the swappable amount alone and there is no extra term.
+ * <p><b>A floor, not an addend</b> — originally because of a measurement that is now history; today it
+ * guards an under-measured transaction fee. Read at {@code e0b818e}: for an
+ * <b>ada</b> collateral the validator <b>used to require</b> the order's <em>total</em> lovelace to
+ * equal {@code swappableCollateralAmount} — no extra ada whatsoever — so Minswap's
+ * {@code max_batcher_fee} of 700,000 would have come out of the <b>swap input</b>, the lender's
+ * proceeds, and adding it to the bot's outlay would then have been a false attribution. That is
+ * history before {@code db5069e}: the deployed validator now requires every order to carry
+ * {@code minswap_order_overhead} (4,000,000 — max
+ * batcher fee 2,000,000 plus output min-ada 2,000,000) on <b>both</b> collateral kinds, on top of
+ * what each swaps ({@code ConvertEconomics.MINSWAP_ORDER_OVERHEAD}; {@code ConvertOrderPlan.java:
+ * 197-199}). <b>So a convert costs the bot 4 ada it does not get back</b>, which is four to five
+ * times a typical transaction fee and would dominate any model that omitted it. The bot funds this
+ * overhead either way — there is no collateral kind that escapes it.
  *
- * <p>⚠ <b>Provenance, stated rather than assumed:</b> the measurement counts the whole 2.8 ada as the bot's,
- * which is the conservative reading. The loan input carries its own min-ada and it is not yet
+ * <p>⚠ <b>Provenance, stated rather than assumed:</b> the measurement counts the whole 4 ada as the
+ * bot's, which is the conservative reading. The loan input carries its own min-ada and it is not yet
  * measured how much of it {@code loan_claim_action} lets flow into the order output. If a later
  * measurement shows the loan funds part of it, this gate gets <em>less</em> strict, never more —
  * which is the safe direction to be wrong in.

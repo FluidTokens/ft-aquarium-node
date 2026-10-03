@@ -129,7 +129,7 @@ public record LiquidationDecision(long decidedAt,
      * How far a candidate got.
      * <p>
      * {@link #SUBMITTED} and {@link #SUBMIT_FAILED} are the only two states that imply the node
-     * transmitted anything, and reaching either takes all eight vetoes of
+     * transmitted anything, and reaching either takes all seven vetoes of
      * {@code LiquidationExecutor} passing. Everything else is a record of a judgement.
      */
     public enum Outcome {
@@ -161,7 +161,7 @@ public record LiquidationDecision(long decidedAt,
          * Skipped because an earlier failure quarantined this loan UTxO and the quarantine has not
          * yet lapsed. {@code detail} carries the remaining hold.
          *
-         * <p>⚠ <b>This is the one outcome that says nothing about the candidate.</b> The other seven
+         * <p>⚠ <b>This is the one outcome that says nothing about the candidate.</b> The other eight
          * are judgements about the loan; this is a statement about the bot's own recent history, and
          * an operator reading it as "not liquidatable" would be reading it wrong.
          *

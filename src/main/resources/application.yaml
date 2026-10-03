@@ -309,7 +309,7 @@ loans:
     # profit figure it ignored.
     ignore-profit-check: ${AQUARIUM_LIQUIDATION_IGNORE_PROFIT_CHECK:false}
     # THE ABSOLUTE FLOOR, and it is a SECOND gate that profit-margin-lovelace cannot reach.
-    # S4 tests two independent things: (a) floorProfit = feeSlice - txFee - minAdaFunded against
+    # S3 tests two independent things: (a) floorProfit = feeSlice - txFee - minAdaFunded against
     # min-profit-absolute-lovelace, and only then (b) the margin lever. The margin is deliberately
     # OUTSIDE the floor's number, so lowering it -- even to a large negative -- can never rescue a
     # candidate the floor refuses. Measured on preview 2026-08-24: a convert liquidation logged
@@ -418,12 +418,13 @@ loans:
       # reference_script 8f469373…, 4,227 bytes, unspent, and 8f469373… is exactly what this node derives
       # and what the live LMConfigDatum names at field 2.
       lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:668605c0fba76ab5c4c6551c914f5ebe50d4afec3fc454f96e99064c764e8670#0}
-      # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
-      # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
-      # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
-      # at all, so it could not be referenced however much else was published -- which is why a convert
-      # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
-      # referenced and working. Referencing this one alone sheds ~7,051 bytes.
+      # The PAY-IN-ADVANCE path's action validator -- distinct from lm-liquidate-action, which is the
+      # PLAIN path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
+      # largest script left inline on a pay-in-advance liquidation. Until 2026-08-25 there was no key
+      # for it at all, so it could not be referenced however much else was published -- which is why a
+      # pay-in-advance transaction measured 20,548 bytes against a 16,384 maxTxSize with
+      # loan-claim-action already referenced and working. Referencing this one alone sheds ~7,051
+      # bytes. Minswap convert has its own lm-liquidate-and-convert-action key, below.
       # ⭐ RE-POINTED 2026-10-01 (was 2026-09-22's bec0ed6f…). Carries 0e000364…, 7,051 bytes, unspent —
       # the largest script this path carried inline, so referencing it is the bigger of the two savings.
       lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:7b52267a32d4855dfe6360a4c8c4a7d28cc006c2b22162590646af549cbebc52#0}
@@ -596,13 +597,11 @@ loans:
       # to let it fall below -- it would not be harmless if the two were ever allowed to diverge.
       minswap-order-cost-lovelace: 4000000
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
-    # Six of the seven, verified on chain: each of these UTxOs publishes a reference_script_hash
-    # equal to the hash this repo derives for that validator, and LoansReferenceScriptVerifier
-    # re-checks that at every startup — a redeploy turns these into a CLOSED LENDING GATE
-    # (LENDING_CONFIG_MISMATCH: every Lending v4 transaction refused, scheduled payments untouched),
-    # which is an answer and not an outage. asset-manager is deliberately left empty: a plain Liquidate only
-    # *creates* asset-manager outputs and never spends one, so its script is neither attached nor
-    # needed; publishing a coordinate for it would only add a reference input and its fee.
+    # None of the nine is set on preview: every coordinate below is blank (see the BLANKED notes).
+    # When one IS set, LoansReferenceScriptVerifier checks at every startup that its UTxO publishes
+    # a reference_script_hash equal to the hash this repo derives — a redeploy turns these into a
+    # CLOSED LENDING GATE (LENDING_CONFIG_MISMATCH: every Lending v4 transaction refused, scheduled
+    # payments untouched), which is an answer and not an outage.
     #
     # Resolution rule, per validator: a coordinate configured here for a validator -- and verified
     # resolvable on chain by LoansReferenceScriptVerifier at startup -- means that validator travels
@@ -637,12 +636,17 @@ loans:
     #   lender-manager       fe791b23...024ffc07#0
     #   lender-manager-spend 13dd3329...663c2571#0
     #   loan-claim-action    b09e23dc...19f243fe#0
-    # ONE of the six is published, and that is deliberate rather than incomplete. Only enough
-    # validators have to travel by reference to bring the liquidation under maxTxSize; the rest stay
-    # in the witness set and lock nothing. loan_claim_action is 8,662 of the 18,720 validator bytes,
-    # so shedding that one alone suffices: measured on the real loan, five inline + this one
-    # referenced is 11,713 bytes unsigned / 11,819 signed against 16,384. All six inline is 20,342
-    # and does not fit; all six referenced would lock 86.84 ADA to buy bytes we do not need.
+    #   lm-liquidate-action  549b438c...49a47fe0#0
+    # ZERO of the six is published now. loan-claim-action -- the one that WAS published, by us at
+    # 48c102c0...#0 (below), for the third deployment -- was BLANKED 2026-08-25 for the fourth (see
+    # the note above the loan-claim-action key); the reasoning that
+    # follows is why referencing exactly one validator was deliberate rather than incomplete, not a
+    # description of the current state. Only enough validators have to travel by reference to bring
+    # the liquidation under maxTxSize; the rest stay in the witness set and lock nothing.
+    # loan_claim_action is 8,662 of the 18,720 validator bytes, so shedding that one alone suffices:
+    # measured on the real loan, five inline + this one referenced is 11,713 bytes unsigned / 11,819
+    # signed against 16,384. All six inline is 20,342 and does not fit; all six referenced would lock
+    # 86.84 ADA to buy bytes we do not need.
     #
     # Published by US, not by FluidTokens, who have not republished for this deployment:
     #   tx 48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0, preview block 4579719.
@@ -650,7 +654,6 @@ loans:
     # spending it back when the bot no longer needs it. LoansReferenceScriptVerifier checks its
     # on-chain reference_script_hash against the freshly derived hash at every boot, so the next
     # redeploy closes the lending gate rather than building against a silent wrong script.
-    #   lm-liquidate-action  549b438c...49a47fe0#0
     reference-scripts:
       loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}
       loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:}
@@ -666,12 +669,13 @@ loans:
       # is republished under the fourth deployment. Scanning, health and pricing are unaffected.
       loan-claim-action: ${AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION:}
       lm-liquidate-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION:}
-      # The CONVERT path's action validator -- distinct from lm-liquidate-action, which is the PLAIN
-      # path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
-      # largest script left inline on a convert liquidation. Until 2026-08-25 there was no key for it
-      # at all, so it could not be referenced however much else was published -- which is why a convert
-      # transaction measured 20,548 bytes against a 16,384 maxTxSize with loan-claim-action already
-      # referenced and working. Referencing this one alone sheds ~7,051 bytes.
+      # The PAY-IN-ADVANCE path's action validator -- distinct from lm-liquidate-action, which is the
+      # PLAIN path's. Measured on the fourth deployment: 7,051 bytes against that one's 4,227, and the
+      # largest script left inline on a pay-in-advance liquidation. Until 2026-08-25 there was no key
+      # for it at all, so it could not be referenced however much else was published -- which is why a
+      # pay-in-advance transaction measured 20,548 bytes against a 16,384 maxTxSize with
+      # loan-claim-action already referenced and working. Referencing this one alone sheds ~7,051
+      # bytes. Minswap convert has its own lm-liquidate-and-convert-action key, below.
       lm-liquidate-and-pay-in-advance-action: ${AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION:}
       # ⛔ BLANKED EXPLICITLY, not omitted. The base document now BAKES mainnet coordinates as its
       # defaults, and a preview node inherits every base key it does not override. A mainnet

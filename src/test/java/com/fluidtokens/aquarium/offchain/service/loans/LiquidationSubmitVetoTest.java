@@ -57,7 +57,7 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.spy;
 
 /**
- * The armed half of the liquidation loop: the eight submit vetoes, and the one path that reaches the
+ * The armed half of the liquidation loop: the seven submit vetoes, and the one path that reaches the
  * wire.
  *
  * <h2>What every test here asserts</h2>
@@ -139,7 +139,7 @@ class LiquidationSubmitVetoTest {
     /**
      * The six validators a {@code Liquidate} invokes, published. Not decoration: with none of them
      * published the transaction measures 19_838 bytes against a 16_384-byte maxTxSize, so without
-     * this every test in this class would be an S5 test.
+     * this every test in this class would be an S4 test.
      */
     private static final LiquidateTransactionBuilder.ReferenceScripts PUBLISHED =
             new LiquidateTransactionBuilder.ReferenceScripts(
@@ -151,7 +151,7 @@ class LiquidationSubmitVetoTest {
                     new TransactionInput(TX_REF_SCRIPTS, 5),
                     null);
 
-    // Token collateral leg, priced by a Charli3 feed — the only shape whose oracle window S6 can
+    // Token collateral leg, priced by a Charli3 feed — the only shape whose oracle window S5 can
     // have anything to say about.
     private static final AssetType COLLATERAL_TOKEN = new AssetType("c0".repeat(28), "544f4b");
     private static final AssetType ORACLE_TOKEN = new AssetType("b0".repeat(28), "4f52434c");
@@ -378,7 +378,7 @@ class LiquidationSubmitVetoTest {
     /** The root-cause message {@link #unfetchableProtocolParams()} buries one level down. */
     private static final String PARAMS_ROOT_CAUSE = "connect timed out";
 
-    /** Real parameters with the one field S5 reads removed. */
+    /** Real parameters with the one field S4 reads removed. */
     private static ProtocolParamsSupplier protocolParamsWithoutMaxTxSize() {
         ProtocolParams params = protocolParams().getProtocolParams();
         params.setMaxTxSize(null);
@@ -412,7 +412,7 @@ class LiquidationSubmitVetoTest {
         return new Scenario(loan, bond, assessment);
     }
 
-    /** A token-collateral loan priced by a Charli3 feed, so there is a window for S6 to check. */
+    /** A token-collateral loan priced by a Charli3 feed, so there is a window for S5 to check. */
     private static Scenario tokenScenario() {
         LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(50_000_000),
                 BigInteger.valueOf(1000),
@@ -647,7 +647,7 @@ class LiquidationSubmitVetoTest {
 
         /**
          * T-037: overrides the default {@code ACCOUNT} — a spy of it with {@code sign} stubbed to
-         * throw is how the sign-failure catch (not one of the eight vetoes) gets driven.
+         * throw is how the sign-failure catch (not one of the seven vetoes) gets driven.
          */
         Rig account(Account account) {
             this.account = account;
@@ -657,7 +657,7 @@ class LiquidationSubmitVetoTest {
         /**
          * T-040: overrides the converters handed to the EXECUTOR only — the builders keep their own
          * real instance. Safe to replace wholesale because the executor uses {@code converters} in
-         * exactly one place, the S8 slot-to-time conversion this override exists to break.
+         * exactly one place, the S7 slot-to-time conversion this override exists to break.
          */
         Rig executorConverters(CardanoConverters executorConverters) {
             this.executorConverters = executorConverters;
@@ -1324,7 +1324,7 @@ class LiquidationSubmitVetoTest {
     /**
      * No reference scripts published, so all six validators travel in the witness set: 19_838 bytes
      * against a 16_384-byte maxTxSize. The candidate is handsomely profitable, which is the point —
-     * S5 is not S4's arithmetic wearing a different name.
+     * S4 is not S3's arithmetic wearing a different name.
      */
     @Test
     void s5ATransactionThatCannotBeShownToFitSubmitsNothing() {
@@ -1339,7 +1339,7 @@ class LiquidationSubmitVetoTest {
         assertTrue(decision.txSizeBytes() > 16_384,
                 "the fixture must actually be oversized: " + decision.txSizeBytes());
         assertTrue(decision.expectedProfitLovelace().signum() > 0,
-                "and profitable, so S5 cannot be S4 in disguise");
+                "and profitable, so S4 cannot be S3 in disguise");
 
         // Protocol parameters that cannot be fetched. Not knowing the limit is not being under it.
         Run unfetchable = new Rig().params(unfetchableProtocolParams()).run();
@@ -1355,7 +1355,7 @@ class LiquidationSubmitVetoTest {
 
     /**
      * The size veto reads the live parameter rather than a constant. Here maxTxSize is raised above
-     * the 19_838-byte transaction, and the same candidate that S5 refused above goes out — so the
+     * the 19_838-byte transaction, and the same candidate that S4 refused above goes out — so the
      * check cannot be a hard-coded 16384.
      */
     @Test
@@ -1370,7 +1370,7 @@ class LiquidationSubmitVetoTest {
                 .run();
 
         assertEquals(1, run.submitter().submitted.size(),
-                "with a large enough maxTxSize the very transaction S5 refused must go out");
+                "with a large enough maxTxSize the very transaction S4 refused must go out");
         assertEquals(LiquidationDecision.Outcome.SUBMITTED, run.onlyDecision().outcome());
     }
 
@@ -1384,7 +1384,7 @@ class LiquidationSubmitVetoTest {
      * fetch and the script evaluation, which are Blockfrost round trips — the clock had moved past
      * the point where the configured 30 s margin still fits.
      * <p>
-     * This is why S6 reads a submit-time clock and not the cycle's {@code now}: against the cycle's
+     * This is why S5 reads a submit-time clock and not the cycle's {@code now}: against the cycle's
      * own instant it could never say anything the builder had not already said.
      */
     @Test
@@ -1394,9 +1394,9 @@ class LiquidationSubmitVetoTest {
         // to check is failing the check.
         //
         // It is deliberately first. The two clock-driven cases below can only fire at instants where
-        // S8 would also fire (see SubmitVeto.TRANSACTION_WINDOW_ELAPSED), so on their own they would
-        // let a "delete S6" mutation be caught by S8 and reported as a name mismatch rather than as
-        // a submission. This case fires at NOW, well inside the transaction's window, so deleting S6
+        // S7 would also fire (see SubmitVeto.TRANSACTION_WINDOW_ELAPSED), so on their own they would
+        // let a "delete S5" mutation be caught by S7 and reported as a name mismatch rather than as
+        // a submission. This case fires at NOW, well inside the transaction's window, so deleting S5
         // submits — and the failure is then the consequence, not the label.
         Run noClient = new Rig().oracle(null).run();
         LiquidationDecision absent = vetoed(noClient,
@@ -1494,14 +1494,14 @@ class LiquidationSubmitVetoTest {
     // ======================================================================================
     // T-040 — the three catches that logged NOTHING
     //
-    // S5's maxTxSize fetch, S8's slot-to-time conversion and S7's UTxO re-check each swallowed their
+    // S4's maxTxSize fetch, S7's slot-to-time conversion and S6's UTxO re-check each swallowed their
     // exception into a veto detail with no log line at all, so an operator saw a refusal and had no
     // way to find out why. Each test below drives a WRAPPED fault and asserts on the ROOT cause's
     // message: a cause-less fixture would pass under the very e.toString() these fixes replace, which
     // is how the same hole was dug on the build paths and the outer net.
     // ======================================================================================
 
-    /** S5: the protocol-parameter fetch throws. The veto is unchanged; the ERROR line is new. */
+    /** S4: the protocol-parameter fetch throws. The veto is unchanged; the ERROR line is new. */
     @Test
     void s5AnUnfetchableMaxTxSizeIsLoggedAtErrorWithTheRootCause() {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
@@ -1532,7 +1532,7 @@ class LiquidationSubmitVetoTest {
         assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
     }
 
-    /** S7: the UTxO re-check throws. Still treated as "not shown unspent"; now it says why. */
+    /** S6: the UTxO re-check throws. Still treated as "not shown unspent"; now it says why. */
     @Test
     void s7AThrowingUtxoRecheckIsLoggedAtErrorWithTheRootCause() {
         RuntimeException boom = new IllegalStateException("the local index is not readable",
@@ -1566,7 +1566,7 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * S8: the slot-to-time conversion throws. Only the EXECUTOR's converters are replaced — the
+     * S7: the slot-to-time conversion throws. Only the EXECUTOR's converters are replaced — the
      * builders keep their real one, so the transaction under test is a genuinely built one and the
      * failure is isolated to the single line the executor uses converters for.
      */
@@ -1619,7 +1619,7 @@ class LiquidationSubmitVetoTest {
     // ======================================================================================
 
     /**
-     * The gap S6 cannot cover. This is an ada/ada loan: it has no oracle feed at all, so before S8
+     * The gap S5 cannot cover. This is an ada/ada loan: it has no oracle feed at all, so before S7
      * there was no submit-time staleness check on it whatsoever, and a transaction whose validity
      * interval had already elapsed would be signed and sent.
      * <p>
@@ -1631,7 +1631,7 @@ class LiquidationSubmitVetoTest {
     void s8AnExpiredTransactionSubmitsNothing() {
         Run run = new Rig()
                 // Well past the transaction's own validity end, and note there is no feed here for
-                // S6 to have had an opinion about.
+                // S5 to have had an opinion about.
                 .submitAt(TX_VALID_TO + 80_000L)
                 .run();
 
@@ -1657,7 +1657,7 @@ class LiquidationSubmitVetoTest {
     // ======================================================================================
 
     /**
-     * All eight vetoes pass. The bytes that reach the submitter are the bytes that were vetted, plus
+     * All seven vetoes pass. The bytes that reach the submitter are the bytes that were vetted, plus
      * exactly one signature.
      * <p>
      * The comparison is made against the CBOR the decision recorded — that is the transaction the
@@ -1784,7 +1784,7 @@ class LiquidationSubmitVetoTest {
     /**
      * T-037: the sibling swallow, on the sign path. Before the fix this catch was also
      * {@code log.warn(..., e.toString())}. Driven with a spy of {@code ACCOUNT} whose {@code sign} is
-     * stubbed to throw — this is the machinery failing after all eight vetoes already said yes, so
+     * stubbed to throw — this is the machinery failing after all seven vetoes already said yes, so
      * nothing here is one of them: the recorded outcome stays {@code SUBMIT_VETOED} with no veto name,
      * exactly as before the fix, and nothing reaches the wire.
      */
@@ -1814,7 +1814,7 @@ class LiquidationSubmitVetoTest {
         assertEquals(LiquidationDecision.Outcome.SUBMIT_VETOED, decision.outcome(),
                 "the fix is log-only — the recorded outcome must not change");
         assertEquals(null, decision.submitVeto(),
-                "not one of the eight vetoes, so none is named — unchanged by the fix");
+                "not one of the seven vetoes, so none is named — unchanged by the fix");
         assertTrue(decision.detail().contains("signing key rejected"),
                 "the decision detail must carry the ROOT cause, not just the wrapper: " + decision.detail());
         assertTrue(decision.detail().contains(LiquidationExecutor.causeChain(boom)),
@@ -1911,8 +1911,9 @@ class LiquidationSubmitVetoTest {
     // ======================================================================================
 
     /**
-     * {@code mode: disabled} and {@code enabled: false} — what an operator gets if they change
-     * nothing. Nothing is scanned, nothing is built, nothing is submitted.
+     * {@code mode: disabled} — the whole arming story now that {@code loans.liquidation.enabled} is
+     * gone — is what an operator gets if they change nothing. Nothing is scanned, nothing is built,
+     * nothing is submitted.
      */
     @Test
     void withTheShippedDefaultsNothingIsSubmitted() {
@@ -1930,8 +1931,8 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * And the preview default, which is {@code shadow} with the arming flag still off — two changes
-     * away from submitting, not one.
+     * And the preview default, which is {@code shadow} — one change ({@code mode: live}) away from
+     * submitting now that the separate arming flag is gone (2026-09-04).
      */
     @Test
     void theShippedPreviewDefaultIsAlsoIncapableOfSubmitting() {
@@ -1941,8 +1942,9 @@ class LiquidationSubmitVetoTest {
                 .run();
 
         // Deliberately no veto name: shadow-without-arming is stopped by S1 and would still be
-        // stopped by S2, and this test is about the shipped configuration rather than about which
-        // of the two got there first.
+        // stopped by S2 (a market can never be more live than the node — MarketGate.effectiveMode),
+        // and this test is about the shipped configuration rather than about which of the two got
+        // there first.
         run.assertNothingWasSubmitted();
         assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, run.onlyDecision().outcome());
     }

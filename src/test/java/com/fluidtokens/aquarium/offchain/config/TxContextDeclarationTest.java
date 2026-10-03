@@ -195,7 +195,7 @@ class TxContextDeclarationTest {
         for (String knob : List.of("withSigner", "withRequiredSigners")) {
             d.put(knob, new LinkedHashMap<>(Map.of(
                     LIQ, Entry.omitted("DELIBERATELY SUBMIT-INCAPABLE: these call build(), never "
-                            + "complete(); the executor signs and submits separately behind eight vetoes"),
+                            + "complete(); the executor signs and submits separately behind seven vetoes"),
                     CONVERT, Entry.omitted("as LIQ — submit-incapable by construction"),
                     TANK, Entry.set())));
         }

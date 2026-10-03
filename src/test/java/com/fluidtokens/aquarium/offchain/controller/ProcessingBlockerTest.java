@@ -42,7 +42,7 @@ class ProcessingBlockerTest {
     @Test
     void aConvertLoanIsNotMarkedJustBecauseTheWalletIsEmpty() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null),
-                true, true, GOOD_POOL, null, BigInteger.ZERO, true);
+                true, BondRoute.CONVERT, GOOD_POOL, null, BigInteger.ZERO, true);
 
         assertFalse(blocker.blocked(),
                 "convert needs no capital from the operator: " + blocker.label());
@@ -52,7 +52,7 @@ class ProcessingBlockerTest {
     @Test
     void aConvertLoanWithNoUsablePoolIsMarked() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null),
-                true, true, THIN_POOL, null, BigInteger.ZERO, true);
+                true, BondRoute.CONVERT, THIN_POOL, null, BigInteger.ZERO, true);
 
         assertTrue(blocker.blocked());
         assertEquals("no pool", blocker.label());
@@ -64,7 +64,7 @@ class ProcessingBlockerTest {
     @Test
     void anAnticipateLoanBeyondTheWalletIsMarkedWithTheReasonToActOnEarly() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE,
-                market(null, BigInteger.valueOf(10_000L)), true, true, GOOD_POOL,
+                market(null, BigInteger.valueOf(10_000L)), true, BondRoute.CONVERT, GOOD_POOL,
                 BigInteger.valueOf(5_000L), BigInteger.valueOf(900L), true);
 
         assertEquals("funds", blocker.label());
@@ -76,7 +76,7 @@ class ProcessingBlockerTest {
     @Test
     void anAffordableAnticipateLoanCarriesNothing() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE,
-                market(null, BigInteger.valueOf(10_000L)), true, true, GOOD_POOL,
+                market(null, BigInteger.valueOf(10_000L)), true, BondRoute.CONVERT, GOOD_POOL,
                 BigInteger.valueOf(5_000L), BigInteger.valueOf(9_000L), true);
 
         assertFalse(blocker.blocked());
@@ -87,7 +87,7 @@ class ProcessingBlockerTest {
     @Test
     void aCapBelowTheAdvanceIsReportedAsTheCapRatherThanAsFunds() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE,
-                market(null, BigInteger.valueOf(100L)), true, true, GOOD_POOL,
+                market(null, BigInteger.valueOf(100L)), true, BondRoute.CONVERT, GOOD_POOL,
                 BigInteger.valueOf(5_000L), BigInteger.valueOf(9_000L), true);
 
         assertEquals("cap", blocker.label(),
@@ -102,7 +102,7 @@ class ProcessingBlockerTest {
     @Test
     void anUnreadableWalletIsUnknownRatherThanShort() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE,
-                market(null, BigInteger.valueOf(10_000L)), true, true, GOOD_POOL,
+                market(null, BigInteger.valueOf(10_000L)), true, BondRoute.CONVERT, GOOD_POOL,
                 BigInteger.valueOf(5_000L), BigInteger.ZERO, false);
 
         assertEquals("unknown", blocker.label());
@@ -113,7 +113,7 @@ class ProcessingBlockerTest {
     @Test
     void aPlainLiquidateLoanIsCleanBecauseItNeedsNeitherCapitalNorAPool() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE,
-                market(null, BigInteger.ONE), true, false, THIN_POOL, BigInteger.valueOf(9_999L),
+                market(null, BigInteger.ONE), true, BondRoute.PLAIN, THIN_POOL, BigInteger.valueOf(9_999L),
                 BigInteger.ZERO, true);
 
         assertFalse(blocker.blocked(),
@@ -124,7 +124,7 @@ class ProcessingBlockerTest {
     @Test
     void aDisabledNodeIsTheFirstThingReported() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.DISABLED, Action.CONVERT,
-                market(null, null), true, true, GOOD_POOL, null, BigInteger.ZERO, true);
+                market(null, null), true, BondRoute.CONVERT, GOOD_POOL, null, BigInteger.ZERO, true);
 
         assertEquals("bot off", blocker.label());
     }
@@ -132,9 +132,35 @@ class ProcessingBlockerTest {
     @Test
     void convertDisabledGloballyIsDistinctFromHavingNoPool() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null),
-                false, true, GOOD_POOL, null, BigInteger.ZERO, true);
+                false, BondRoute.CONVERT, GOOD_POOL, null, BigInteger.ZERO, true);
 
         assertEquals("convert off", blocker.label(),
                 "a setting and a market condition send an operator to different places");
+    }
+
+    @Test
+    void aLoanWithNoBondIsNotAProcessingFailure() {
+        ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null),
+                true, BondRoute.NO_BOND, GOOD_POOL, null, BigInteger.ZERO, true);
+
+        assertFalse(blocker.blocked());
+        assertEquals(null, blocker.label());
+    }
+
+    @Test
+    void aNullRouteIsTheSameNonProcessingCase() {
+        ProcessingBlocker blocker = ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null),
+                true, null, GOOD_POOL, null, BigInteger.ZERO, true);
+
+        assertFalse(blocker.blocked());
+        assertEquals(null, blocker.label());
+    }
+
+    @Test
+    void aDisabledNodeIsReportedBeforeAMissingBond() {
+        ProcessingBlocker blocker = ProcessingBlocker.of(Mode.DISABLED, Action.CONVERT, market(null, null),
+                true, BondRoute.NO_BOND, GOOD_POOL, null, BigInteger.ZERO, true);
+
+        assertEquals("bot off", blocker.label());
     }
 }

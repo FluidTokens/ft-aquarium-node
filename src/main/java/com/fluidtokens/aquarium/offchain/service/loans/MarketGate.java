@@ -151,7 +151,7 @@ public final class MarketGate {
                     "market " + unit + " is DISABLED (node mode " + globalMode + "), so the bot does "
                             + "nothing in it");
         }
-        // ⛔ SHADOW is NOT refused here any more, on either scope. The executor's S4 MARKET_NOT_LIVE
+        // ⛔ SHADOW is NOT refused here any more, on either scope. The executor's S2 MARKET_NOT_LIVE
         // veto now gives a market-level SHADOW the same build-then-veto path a node-wide SHADOW always
         // had — which is the whole point: a shadow market must produce the transaction and withhold
         // only the submission. Refusing here would turn the rehearsal back into a refusal.
