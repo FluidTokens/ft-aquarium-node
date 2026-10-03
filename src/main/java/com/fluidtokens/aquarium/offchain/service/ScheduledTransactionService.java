@@ -349,9 +349,10 @@ public class ScheduledTransactionService {
 
         // ⛔ ONE WALLET READ AND ONE PROTOCOL-PARAMS READ PER CYCLE, NOT PER TANK.
         //
-        // Both of these are PROVIDER CALLS and both were inside the loop below. With 535 processable
-        // tanks that is 1,070 Blockfrost calls per cycle, every five minutes — and AppUtxoService's
-        // own javadoc promises "one provider call per cycle", which had quietly stopped being true.
+        // Both used to be Blockfrost calls inside the loop below: with 535 processable tanks, 1,070 calls
+        // per cycle. The wallet is now read from the local index (FAB-134 B2) and the protocol params
+        // from the per-epoch cache (B4), so neither costs a call — but one read per cycle is still the
+        // rule: every tank must see the same wallet snapshot.
         //
         // ⇒ And the read is hoisted because the dependency it served is gone: a tank transaction
         // now spends ONLY ITS OWN TANK, so two of them share no input and cannot conflict.
