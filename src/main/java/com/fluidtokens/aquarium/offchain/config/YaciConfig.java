@@ -20,6 +20,8 @@ import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import java.time.Clock;
+
 @Configuration
 @Slf4j
 public class YaciConfig {
@@ -43,9 +45,17 @@ public class YaciConfig {
         return new DefaultUtxoSupplier(bfBackendService.getUtxoService());
     }
 
+    /**
+     * Blockfrost's protocol parameters, fetched once at boot and then once per epoch rather than on
+     * every call (see {@link EpochProtocolParamsSupplier}). Every injection point of this bean gets the
+     * cached supplier; the values it serves are still only ever the chain's own.
+     */
     @Bean
-    public ProtocolParamsSupplier protocolParamsSupplier(BFBackendService bfBackendService) {
-        return new DefaultProtocolParamsSupplier(bfBackendService.getEpochService());
+    public ProtocolParamsSupplier protocolParamsSupplier(BFBackendService bfBackendService,
+                                                         CardanoConverters cardanoConverters) {
+        return new EpochProtocolParamsSupplier(
+                new DefaultProtocolParamsSupplier(bfBackendService.getEpochService()),
+                cardanoConverters, Clock.systemUTC());
     }
 
     /**

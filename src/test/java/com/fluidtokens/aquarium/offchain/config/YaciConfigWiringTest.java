@@ -1,7 +1,19 @@
 package com.fluidtokens.aquarium.offchain.config;
 
+import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
+import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
+import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
+import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.ParametersService;
+import com.fluidtokens.aquarium.offchain.service.ScheduledTransactionService;
+import com.fluidtokens.aquarium.offchain.service.StakerService;
+import com.fluidtokens.aquarium.offchain.service.TankContractService;
 import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
@@ -9,9 +21,17 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * The production wiring, asserted on the production wiring.
@@ -138,6 +158,77 @@ class YaciConfigWiringTest {
         assertTrue(java.util.Arrays.stream(evaluatorType.getMethods())
                         .noneMatch(method -> method.getName().toLowerCase().contains("submit")),
                 "the object wired as the script-cost evaluator exposes a submit method: " + evaluatorType);
+    }
+
+    /**
+     * The protocol-params bean is the per-epoch cache, not the bare Blockfrost supplier that makes one
+     * HTTP call per {@code getProtocolParams()}. Every builder and the tank processor share this bean,
+     * so if it reverted to the raw supplier every one of them would go back to a provider call per use.
+     * <p>
+     * Constructing it attempts the eager load against the unresolvable URL; that load is soft by
+     * contract, so construction succeeding here is itself part of the assertion.
+     */
+    @Test
+    void theProtocolParamsBeanIsTheEpochCache() {
+        ProtocolParamsSupplier bean = new YaciConfig().protocolParamsSupplier(
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), LoanFixtures.converters());
+
+        assertInstanceOf(EpochProtocolParamsSupplier.class, bean,
+                "YaciConfig's ProtocolParamsSupplier bean is a " + bean.getClass().getName()
+                        + ": every injection point would fetch protocol parameters from Blockfrost on "
+                        + "every call instead of once per epoch");
+    }
+
+    /**
+     * The tank processor reads protocol parameters through the injected supplier bean, not through a
+     * Blockfrost supplier it builds for itself. Driven through {@code processPayments()} with an empty
+     * tank set and an empty wallet, which reaches the params read and then returns before anything is
+     * built: the counting supplier must be asked exactly once, and the backend's epoch service never.
+     */
+    @Test
+    void theTankProcessorReadsProtocolParamsThroughTheInjectedSupplier() {
+        var input = TransactionInput.builder()
+                .transactionId("0000000000000000000000000000000000000000000000000000000000000000")
+                .index(0).build();
+
+        BFBackendService backend = mock(BFBackendService.class);
+        BlockEventListener blockEventListener = mock(BlockEventListener.class);
+        when(blockEventListener.getIsSyncing()).thenReturn(new AtomicBoolean(false));
+        StakerService stakerService = mock(StakerService.class);
+        when(stakerService.findStakerRefInput()).thenReturn(List.of(input));
+        ParametersService parametersService = mock(ParametersService.class);
+        when(parametersService.loadParametersRefInput()).thenReturn(input);
+        AppConfig.AquariumConfiguration aquarium = mock(AppConfig.AquariumConfiguration.class);
+        when(aquarium.getTankRefInput()).thenReturn(input);
+        AppUtxoService appUtxoService = mock(AppUtxoService.class);
+        when(appUtxoService.listWalletUtxo()).thenReturn(List.of());
+
+        AtomicInteger calls = new AtomicInteger();
+        ProtocolParamsSupplier injected = () -> {
+            calls.incrementAndGet();
+            return new ProtocolParams();
+        };
+
+        var processor = new ScheduledTransactionService(
+                new AppConfig.Network(),
+                aquarium,
+                mock(Account.class),
+                mock(QuickTxBuilder.class),
+                backend,
+                injected,
+                mock(UtxoRepository.class),
+                stakerService,
+                LoanFixtures.converters(),
+                parametersService,
+                mock(TankContractService.class),
+                appUtxoService,
+                blockEventListener);
+
+        processor.processPayments();
+
+        assertEquals(1, calls.get(),
+                "the tank processor did not read protocol parameters through the injected supplier");
+        verify(backend, never()).getEpochService();
     }
 
     /**

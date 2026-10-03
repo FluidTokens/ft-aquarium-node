@@ -13,7 +13,7 @@ import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import java.util.Comparator;
 import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
-import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
@@ -162,6 +162,12 @@ public class ScheduledTransactionService {
      */
     private final BFBackendService bfBackendService;
 
+    /**
+     * The shared {@code YaciConfig} bean: the chain's protocol parameters, fetched once per epoch
+     * rather than on every cycle. Unconditional, like the backend above.
+     */
+    private final ProtocolParamsSupplier protocolParamsSupplier;
+
     private final UtxoRepository utxoRepository;
 
     private final StakerService service;
@@ -291,8 +297,9 @@ public class ScheduledTransactionService {
         // payouts, against 551 sound ones.
         // ⚠ Fetched BEFORE classification, because the min-UTxO floor is derived from
         // coinsPerUtxoByte and must never be a hardcoded guess -- it has changed before.
-        var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
-                .getProtocolParams();
+        // The shared supplier bean serves the chain's own values, fetched once per epoch rather than
+        // once per cycle (EpochProtocolParamsSupplier).
+        var protocolParams = protocolParamsSupplier.getProtocolParams();
 
         var processableScheduledTransactions = new java.util.ArrayList<DatumTankUtxo>();
         int refusedBeforeStarting = 0;
