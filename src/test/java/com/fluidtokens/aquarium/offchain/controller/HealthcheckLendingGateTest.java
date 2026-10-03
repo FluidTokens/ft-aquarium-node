@@ -56,6 +56,18 @@ class HealthcheckLendingGateTest {
         assertNull(body.lendingGateReason());
     }
 
+    /** FAB-134: the one-shot rebalance's state is on {@code /healthcheck}, whatever it is. */
+    @Test
+    void theWalletSweepStateIsReported() {
+        Healthcheck check = healthcheck(new LendingConfigGate());
+        var readiness = new com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness();
+        check.setWalletReadiness(readiness);
+
+        Healthcheck.HealthCheck waiting = (Healthcheck.HealthCheck) check.healthCheck().getBody();
+        assertEquals(readiness.sweepState(), waiting.walletSweep());
+        assertTrue(waiting.walletSweep().contains("waiting for tip"), waiting.walletSweep());
+    }
+
     /** The JSON an operator's curl sees: snake_case, like every other field. */
     @Test
     void theFieldsSerialiseInSnakeCase() throws Exception {

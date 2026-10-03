@@ -1,5 +1,6 @@
 package com.fluidtokens.aquarium.offchain.service.wallet;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
@@ -113,6 +114,8 @@ class WalletSweepServiceTest {
     private boolean submitLands = true;
     /** When set, every submit is recorded and then throws it: the bytes' fate is unknown. */
     private Exception submitThrows;
+    /** When set, every submit is recorded and then throws this ERROR (not an Exception). */
+    private Error submitError;
     /** When set, every findById throws it: the local index fails during the comparison. */
     private RuntimeException indexThrows;
     /** When set, a submit lands (if {@link #submitLands}) and THEN reports this HTTP error code. */
@@ -166,6 +169,9 @@ class WalletSweepServiceTest {
     private Result<String> submit(byte[] bytes) throws Exception {
         Transaction tx = Transaction.deserialize(bytes);
         submitted.add(tx);
+        if (submitError != null) {
+            throw submitError;
+        }
         if (submitThrows != null) {
             throw submitThrows;
         }
@@ -719,6 +725,69 @@ class WalletSweepServiceTest {
         assertDoneForGood(service);
         assertEquals(1, submitted.size());
         assertEquals(1, listings());
+    }
+
+    @Test
+    void anErrorAfterTheSubmitEndsTheOneShotBeforeItPropagatesSoNothingIsReplayed() {
+        Utxo a = utxo(WALLET, 150_000_000);
+        Utxo missing = utxo(WALLET, 25_000_000);
+        onChain(a, missing);
+        indexed(a);
+        submitError = new LinkageError("an Error escaping the submit");
+        WalletSweepService service = service();
+
+        atTip(service);
+        clock.advance(Duration.ofSeconds(20));
+        // The Error reaches Yaci (which may roll the block back) — but only after the one-shot is DONE.
+        assertThrows(LinkageError.class, () -> atTip(service));
+
+        assertEquals(1, submitted.size());
+        assertTrue(readiness.sweepState().startsWith("done: rebalance failed: "), readiness.sweepState());
+        submitError = null;
+        assertDoneForGood(service);
+        assertEquals(1, submitted.size(), "a replayed block must not compare or submit again");
+    }
+
+    @Test
+    void aClockThatThrowsBeforeTipKeepsWaitingWithTheGateClosed() {
+        aWalletThatNeedsASweep();
+        Clock broken = new Clock() {
+            @Override
+            public ZoneId getZone() {
+                return ZoneOffset.UTC;
+            }
+
+            @Override
+            public Clock withZone(ZoneId zone) {
+                return this;
+            }
+
+            @Override
+            public Instant instant() {
+                throw new IllegalStateException("clock unavailable");
+            }
+        };
+        WalletSweepService service = new WalletSweepService(index(), readiness, ACCOUNT, Networks.preview(),
+                () -> markets, () -> params.getProtocolParams(), CONVERTERS, this::page, this::submit, broken,
+                () -> true);
+
+        assertDoesNotThrow(() -> service.onCommit(slotNow()));
+
+        assertFalse(readiness.isWalletReady(), "a near-tip check that cannot be made must not release anything");
+        assertEquals(WalletReadiness.WAITING_FOR_TIP, readiness.sweepState());
+        assertEquals(0, listings());
+    }
+
+    @Test
+    void aCommitEventWithoutMetadataNeverReachesYaciAsAnException() {
+        aWalletThatNeedsASweep();
+        WalletSweepService service = service();
+        CommitEvent<?> broken = Mockito.mock(CommitEvent.class);
+        Mockito.when(broken.getMetadata()).thenReturn(null);
+
+        assertDoesNotThrow(() -> service.onCommitEvent(broken));
+        assertEquals(WalletReadiness.WAITING_FOR_TIP, readiness.sweepState());
+        assertFalse(readiness.isWalletReady());
     }
 
     @Test

@@ -291,10 +291,11 @@ public class LiquidationExecutor {
     }
 
     /**
-     * ⛔ FAB-134: closed until {@code WalletSweepService} has proven every wallet UTxO is in the local
-     * index. Setter-injected and REQUIRED in the container, like the lending gate: a missing bean must
-     * fail the boot, never leave this processor spending from a partly-indexed wallet. Null only in a
-     * direct test construction, where it means "ready".
+     * ⛔ FAB-134: closed until the node is within 5 minutes of tip and {@code WalletSweepService}'s
+     * one-shot rebalance has run — in ANY outcome, failure included (Giovanni 2026-10-03: "even if the
+     * rebalance fails we don't hold anything back"). So it guarantees "never before tip", NOT "every
+     * wallet UTxO is indexed". Setter-injected and REQUIRED in the container, like the lending gate: a
+     * missing bean must fail the boot. Null only in a direct test construction, where it means "ready".
      */
     private com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness;
 

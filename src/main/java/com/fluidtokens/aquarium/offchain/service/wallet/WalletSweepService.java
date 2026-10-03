@@ -207,7 +207,10 @@ public class WalletSweepService {
         }
     }
 
-    /** One applied block. Never throws. */
+    /**
+     * One applied block. Never throws an {@link Exception}. An {@link Error} near tip still ends the one-shot
+     * (DONE, gate open) BEFORE it propagates, so a block Yaci rolls back cannot replay a compare or a submit.
+     */
     public synchronized void onCommit(long slot) {
         if (phase == Phase.DONE) {
             return;
@@ -223,15 +226,18 @@ public class WalletSweepService {
             } else if (slot >= settleSlot) {
                 compareAndAct();
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
             if (!nearTip) {
                 log.error("wallet sweep: could not tell whether slot {} is near tip; still waiting: {}",
                         slot, e.toString(), e);
-                return;
+            } else {
+                log.error("wallet sweep FAILED: {}; the processors are released anyway, and the rebalance is not "
+                        + "tried again in this process", e.toString(), e);
+                done("rebalance failed: " + e);
             }
-            log.error("wallet sweep FAILED: {}; the processors are released anyway, and the rebalance is not "
-                    + "tried again in this process", e.toString(), e);
-            done("rebalance failed: " + e);
+            if (e instanceof Error error) {
+                throw error;
+            }
         }
     }
 
