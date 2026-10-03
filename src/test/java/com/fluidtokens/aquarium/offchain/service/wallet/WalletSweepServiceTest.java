@@ -107,6 +107,10 @@ class WalletSweepServiceTest {
     private final List<Transaction> submitted = new ArrayList<>();
     /** When true, a submit lands on the fake chain: inputs leave the listing, outputs join it. */
     private boolean submitLands = true;
+    /** When set, every submit is recorded and then throws it: the bytes' fate is unknown. */
+    private Exception submitThrows;
+    /** How long one Blockfrost page call takes on the test clock (zero: instantaneous). */
+    private Duration listingLatency = Duration.ZERO;
 
     private ProtocolParamsSupplier params = LoanFixtures.protocolParams();
     private List<AppConfig.LiquidationConfiguration.Market> markets = List.of(anticipate(UNIT_A));
@@ -118,6 +122,7 @@ class WalletSweepServiceTest {
 
     private Result<List<Utxo>> page(String address, int page) {
         listingCalls.add(address + "@" + page);
+        clock.advance(listingLatency);
         if (forcedListingException != null) {
             throw forcedListingException;
         }
@@ -136,30 +141,39 @@ class WalletSweepServiceTest {
     private Result<String> submit(byte[] bytes) throws Exception {
         Transaction tx = Transaction.deserialize(bytes);
         submitted.add(tx);
+        if (submitThrows != null) {
+            throw submitThrows;
+        }
         String hash = TransactionUtil.getTxHash(bytes);
         if (submitLands) {
-            Set<String> spent = tx.getBody().getInputs().stream()
-                    .map(i -> i.getTransactionId() + "#" + i.getIndex()).collect(Collectors.toSet());
-            chain.replaceAll((address, utxos) -> utxos.stream().filter(u -> !spent.contains(ref(u))).collect(
-                    Collectors.toCollection(ArrayList::new)));
-            List<TransactionOutput> outputs = tx.getBody().getOutputs();
-            for (int i = 0; i < outputs.size(); i++) {
-                Utxo u = new Utxo();
-                u.setTxHash(hash);
-                u.setOutputIndex(i);
-                u.setAddress(outputs.get(i).getAddress());
-                List<Amount> amounts = new ArrayList<>();
-                amounts.add(Amount.lovelace(outputs.get(i).getValue().getCoin()));
-                units(outputs.get(i)).forEach((unit, quantity) -> {
-                    if (!"lovelace".equals(unit)) {
-                        amounts.add(Amount.asset(unit, quantity));
-                    }
-                });
-                u.setAmount(amounts);
-                chain.computeIfAbsent(u.getAddress(), a -> new ArrayList<>()).add(u);
-            }
+            land(tx);
         }
         return Result.<String>success("ok").withValue(hash);
+    }
+
+    /** The transaction lands on the fake chain: its inputs leave the listing, its outputs join it. */
+    private void land(Transaction tx) throws Exception {
+        String hash = TransactionUtil.getTxHash(tx);
+        Set<String> spent = tx.getBody().getInputs().stream()
+                .map(i -> i.getTransactionId() + "#" + i.getIndex()).collect(Collectors.toSet());
+        chain.replaceAll((address, utxos) -> utxos.stream().filter(u -> !spent.contains(ref(u))).collect(
+                Collectors.toCollection(ArrayList::new)));
+        List<TransactionOutput> outputs = tx.getBody().getOutputs();
+        for (int i = 0; i < outputs.size(); i++) {
+            Utxo u = new Utxo();
+            u.setTxHash(hash);
+            u.setOutputIndex(i);
+            u.setAddress(outputs.get(i).getAddress());
+            List<Amount> amounts = new ArrayList<>();
+            amounts.add(Amount.lovelace(outputs.get(i).getValue().getCoin()));
+            units(outputs.get(i)).forEach((unit, quantity) -> {
+                if (!"lovelace".equals(unit)) {
+                    amounts.add(Amount.asset(unit, quantity));
+                }
+            });
+            u.setAmount(amounts);
+            chain.computeIfAbsent(u.getAddress(), a -> new ArrayList<>()).add(u);
+        }
     }
 
     private UtxoRepository index() {
@@ -616,5 +630,145 @@ class WalletSweepServiceTest {
         assertEquals(0, submitted.size(), "an oversize SIGNED transaction must never reach the wire");
         assertTrue(readiness.sweepState().startsWith("refused signed transaction too large"), readiness.sweepState());
         assertFalse(readiness.isWalletReady());
+    }
+
+    // ---- revision 3 ----------------------------------------------------------------------------
+
+    /** Settled ticks every 30 s until {@code until}: the index keeps up with the wall clock. */
+    private void settledTicksUntil(WalletSweepService service, Instant until) {
+        while (clock.instant().isBefore(until)) {
+            clock.advance(Duration.ofSeconds(30));
+            listener.getLastAppliedSlot().set(slotNow());
+            service.tick();
+        }
+    }
+
+    @Test
+    void aSweepLandingAfterTheWindowClosesKeepsTheGateClosedUntilItsOutputsAreIndexed() throws Exception {
+        synced();
+        Utxo a = utxo(WALLET, 150_000_000);
+        Utxo missing = utxo(WALLET, 25_000_000);
+        onChain(a, missing);
+        indexed(a);
+        submitLands = false;
+        WalletSweepService service = service();
+
+        tickAndSettle(service);
+        Instant submitTime = clock.instant();
+        service.tick();
+        assertEquals(1, submitted.size());
+
+        // Settled ticks up to 9:30 after the submit; Blockfrost still lists the pre-sweep wallet.
+        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(570)));
+        assertEquals(1, submitted.size());
+
+        // The sweep lands now, after the 9:30 tick: Blockfrost lists ONLY its outputs, the index none of them.
+        land(submitted.getFirst());
+        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(600)));   // window closed at this tick
+        assertFalse(readiness.isWalletReady(),
+                "Blockfrost lists the sweep's outputs and the index holds none of them: " + readiness.sweepState());
+        assertEquals(1, submitted.size(), "freshly landed outputs are not a reason to resubmit");
+
+        listedRefs().forEach(index::add);
+        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(630)));
+        assertTrue(readiness.isWalletReady(), readiness.sweepState());
+        assertEquals(1, submitted.size());
+    }
+
+    @Test
+    void aSubmitThatThrowsHoldsBackAResubmitForTheWholeWindow() {
+        synced();
+        Utxo a = utxo(WALLET, 150_000_000);
+        Utxo missing = utxo(WALLET, 25_000_000);
+        onChain(a, missing);
+        indexed(a);
+        submitThrows = new java.io.IOException("connection reset mid-submit");
+        WalletSweepService service = service();
+
+        tickAndSettle(service);
+        Instant submitTime = clock.instant();
+        assertDoesNotThrow(service::tick);
+        assertEquals(1, submitted.size());
+        assertTrue(readiness.sweepState().startsWith("refused submit outcome unknown for "), readiness.sweepState());
+
+        // Nineteen settled ticks inside the window: the bytes may be on chain, so nothing is resubmitted.
+        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(570)));
+        assertEquals(1, submitted.size(), "a submit of unknown outcome must hold back a resubmit for the window");
+        assertTrue(readiness.sweepState().startsWith("refused submit outcome unknown for "), readiness.sweepState());
+        assertFalse(readiness.isWalletReady());
+
+        // Past the window: one rebuild and resubmit, and then the window holds again.
+        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(900)));
+        assertEquals(2, submitted.size(), "after the window exactly one resubmit");
+        assertFalse(readiness.isWalletReady());
+    }
+
+    @Test
+    void protocolParametersWithoutMaxTxSizeAtSignTimeRefuseTheSubmit() {
+        synced();
+        Utxo a = utxo(WALLET, 150_000_000);
+        Utxo missing = utxo(WALLET, 25_000_000);
+        onChain(a, missing);
+        indexed(a);
+        // The engine builds with a real limit; the parameters read at sign time carry none (refreshed
+        // between the build and the size check).
+        ProtocolParams full = LoanFixtures.protocolParams().getProtocolParams();
+        ProtocolParams noLimit = LoanFixtures.protocolParams().getProtocolParams();
+        noLimit.setMaxTxSize(null);
+        params = () -> StackWalker.getInstance().walk(frames -> frames.anyMatch(
+                f -> f.getMethodName().equals("signedSizeProblem"))) ? noLimit : full;
+        WalletSweepService service = service();
+
+        tickAndSettle(service);
+        service.tick();
+
+        assertEquals(0, submitted.size(), "no limit to check against means no submit");
+        assertTrue(readiness.sweepState().startsWith("refused protocol parameters carry no maxTxSize"),
+                readiness.sweepState());
+        assertFalse(readiness.isWalletReady());
+    }
+
+    @Test
+    void theSettleSlotIsTakenWhenTheListingCompletesNotWhenItStarts() {
+        synced();
+        Utxo a = utxo(WALLET, 150_000_000);
+        onChain(a);
+        indexed(a);
+        listingLatency = Duration.ofSeconds(60);   // one page call; the listing is base + enterprise
+        WalletSweepService service = service();
+
+        Instant started = clock.instant();
+        service.tick();
+        assertEquals(started.plus(Duration.ofSeconds(120)), clock.instant());
+        // The index has passed the listing's START, but not the moment Blockfrost answered.
+        listener.getLastAppliedSlot().set(CONVERTERS.time().toSlot(
+                LocalDateTime.ofInstant(started.plus(Duration.ofSeconds(60)), ZoneOffset.UTC)));
+        service.tick();
+
+        assertEquals(0, findByIdCalls.get(), "the listing is not settled until the index reaches its completion");
+        assertFalse(readiness.isWalletReady());
+    }
+
+    @Test
+    void aListingFailureIsVisibleOnTheStateAndKeepsTheGateClosed() {
+        synced();
+        Utxo a = utxo(WALLET, 150_000_000);
+        onChain(a);
+        indexed(a);
+        WalletSweepService service = service();
+
+        forcedListingResult = Result.<List<Utxo>>error("Internal Server Error").code(500);
+        tickAndSettle(service);
+        tickAndSettle(service);
+        assertTrue(readiness.sweepState().startsWith("refused listing failed"), readiness.sweepState());
+        assertFalse(readiness.isWalletReady());
+
+        forcedListingResult = null;
+        forcedListingException = new IllegalStateException("blockfrost exploded");
+        readiness.markSwept("x");   // any non-failure state: the exception path must overwrite it too
+        tickAndSettle(service);
+        assertTrue(readiness.sweepState().startsWith("refused listing failed"), readiness.sweepState());
+        assertFalse(readiness.isWalletReady());
+        assertEquals(0, submitted.size());
     }
 }

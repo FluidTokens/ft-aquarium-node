@@ -462,7 +462,10 @@ scheduling:
   transaction-processor:
     # ⛔ OFF BY DEFAULT. The transaction processor builds and SUBMITS transactions from the
     # configured wallet, so an operator who has not said "yes" gets a node that indexes and serves
-    # and spends nothing. Set to true to arm it.
+    # and runs no scheduled transaction. Set to true to arm it.
+    # ⚠ Even with this off, the startup wallet sweep still runs: when the wallet holds UTxOs the
+    # local index does not see, the node signs ONE self-send to its own base address (it costs
+    # only the fee) so the index sees every wallet UTxO.
     # ⚠ Upgrading across this change: a processor that was running will STOP until this is set.
     enabled: ${SCHEDULING_TRANSACTION_PROCESSOR_ENABLED:false}
     delay-minutes: ${SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES:5}

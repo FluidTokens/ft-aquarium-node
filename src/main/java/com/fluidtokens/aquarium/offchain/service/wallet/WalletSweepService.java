@@ -60,7 +60,10 @@ import java.util.stream.IntStream;
  *   <li>A judged UTxO is <i>missing</i> when {@code UtxoRepository.findById} has no row for it (spent
  *       rows count as known — the index saw it).</li>
  *   <li>Nothing missing (and the last sweep's outputs indexed): {@code walletReady = true}; the poller
- *       does nothing from then on.</li>
+ *       does nothing from then on. A listed output of the last sweep is judged DIRECTLY, whatever the
+ *       previous listing held: while any of them has no index row the gate stays closed, and a sweep that
+ *       lands between two ticks is waited for, not resubmitted. Only a sweep none of whose outputs is
+ *       listed (it never landed) may be given up on once its window has closed.</li>
  *   <li>Something missing: ONE self-send spending the whole listing — {@code buildShaped} first,
  *       {@code buildConsolidation} if that is refused — signed, its SIGNED size checked against
  *       {@code maxTxSize} (the engine measured the unsigned body; a vkey witness adds about 100 bytes),
@@ -72,9 +75,10 @@ import java.util.stream.IntStream;
  *
  * <h2>Every ambiguous case means no submit</h2>
  * Syncing, not yet settled, a listing failure, both builds refused, an oversize signed transaction, and
- * any exception: no submit, the gate stays closed, the next tick tries again. No exception ever leaves
- * {@link #tick()} — one escaping a {@code @Scheduled} method would lose the run, and this one runs on the
- * single scheduler thread every processor shares.
+ * any exception: no submit, the gate stays closed, the next tick tries again. A listing failure is shown
+ * on the state as {@code refused listing failed: …}. No exception ever leaves {@link #tick()}: one
+ * escaping a {@code @Scheduled} method is only logged by the scheduler, so it is caught and logged here,
+ * with its cause, instead.
  *
  * <h2>Enterprise-address UTxOs</h2>
  * A UTxO at the enterprise address is listed, judged and spent like any other, and the sweep moves it
@@ -193,11 +197,12 @@ public class WalletSweepService {
             return;
         }
 
-        Instant now = clock.instant();
         Optional<List<Utxo>> listed = listWallet();
         if (listed.isEmpty()) {
             return;
         }
+        // t0 is when Blockfrost has ANSWERED: the index must reach that slot, not the one the listing began at.
+        Instant now = clock.instant();
         List<Utxo> listing = listed.get();
         Set<String> refs = refsOf(listing);
         long lastAppliedSlot = blockEventListener.getLastAppliedSlot().get();
@@ -219,7 +224,13 @@ public class WalletSweepService {
 
         boolean windowOpen = lastSweep != null && now.isBefore(lastSweep.submittedAt().plus(CONVERGENCE_WINDOW));
         boolean sweepIndexed = lastSweep == null || sweepOutputsIndexed(lastSweep);
-        if (missing.isEmpty() && (sweepIndexed || !windowOpen)) {
+        // The last sweep's outputs in THIS listing are judged directly: one that just landed was never in
+        // the previous listing, so `judged` cannot see it.
+        List<String> sweepListed = lastSweep == null ? List.of()
+                : refs.stream().filter(ref -> ref.startsWith(lastSweep.txHash() + "#")).toList();
+        List<String> sweepListedUnindexed = sweepListed.stream().filter(ref -> !indexed(ref)).toList();
+        if (missing.isEmpty() && sweepListedUnindexed.isEmpty()
+                && (sweepIndexed || (!windowOpen && sweepListed.isEmpty()))) {
             readiness.markReady();
             log.info("wallet sweep: all {} wallet UTxOs Blockfrost lists are in the local index — wallet READY",
                     listing.size());
@@ -229,6 +240,12 @@ public class WalletSweepService {
             log.info("wallet sweep: awaiting {} ({} listed UTxOs still missing, its outputs {}indexed); no "
                             + "resubmit before {}", lastSweep.txHash(), missing.size(), sweepIndexed ? "" : "not yet ",
                     lastSweep.submittedAt().plus(CONVERGENCE_WINDOW));
+            return;
+        }
+        if (missing.isEmpty() && !sweepListedUnindexed.isEmpty()) {
+            // Freshly landed (a settled one would be in `missing`): wait for the index, do not resubmit.
+            log.info("wallet sweep: {} landed, {} of its listed outputs not indexed yet; waiting for the index",
+                    lastSweep.txHash(), sweepListedUnindexed.size());
             return;
         }
         sweep(listing, missing, now);
@@ -302,10 +319,17 @@ public class WalletSweepService {
         List<Utxo> all = new ArrayList<>();
         for (String address : addresses) {
             for (int page = 1; ; page++) {
-                Result<List<Utxo>> result = lister.page(address, page);
+                Result<List<Utxo>> result;
+                try {
+                    result = lister.page(address, page);
+                } catch (Exception e) {
+                    readiness.markRefused("listing failed: " + address + " page " + page + ": " + e);
+                    throw e;
+                }
                 if (result == null) {
                     log.warn("wallet sweep: listing {} page {} returned nothing; retrying on the next tick",
                             address, page);
+                    readiness.markRefused("listing failed: " + address + " page " + page + " returned nothing");
                     return Optional.empty();
                 }
                 if (!result.isSuccessful()) {
@@ -314,6 +338,8 @@ public class WalletSweepService {
                     }
                     log.warn("wallet sweep: listing {} page {} failed (HTTP {}: {}); retrying on the next tick",
                             address, page, result.code(), result.getResponse());
+                    readiness.markRefused("listing failed: " + address + " page " + page + " HTTP " + result.code()
+                            + ": " + result.getResponse());
                     return Optional.empty();
                 }
                 List<Utxo> items = result.getValue() == null ? List.of() : result.getValue();
