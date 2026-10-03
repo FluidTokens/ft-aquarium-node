@@ -16,7 +16,7 @@ import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.UtxoId;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
-import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.bloxbean.cardano.yaci.store.events.internal.CommitEvent;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.junit.jupiter.api.Test;
@@ -96,7 +96,6 @@ class WalletSweepServiceTest {
     }
 
     private final MutableClock clock = new MutableClock();
-    private final BlockEventListener listener = new BlockEventListener(null);
     private final WalletReadiness readiness = new WalletReadiness();
 
     /** Blockfrost's view: address → UTxOs. An address absent from the map answers 404, as Blockfrost does. */
@@ -114,6 +113,8 @@ class WalletSweepServiceTest {
     private boolean submitLands = true;
     /** When set, every submit is recorded and then throws it: the bytes' fate is unknown. */
     private Exception submitThrows;
+    /** When set, every findById throws it: the local index fails during the comparison. */
+    private RuntimeException indexThrows;
     /** When set, a submit lands (if {@link #submitLands}) and THEN reports this HTTP error code. */
     private Integer submitFailsWithCode;
     /** How long one Blockfrost page call takes on the test clock (zero: instantaneous). */
@@ -131,7 +132,7 @@ class WalletSweepServiceTest {
     private AppConfig.CompoundConfiguration compound = compound(false);
 
     private WalletSweepService service() {
-        return new WalletSweepService(listener, index(), readiness, ACCOUNT, Networks.preview(), () -> markets,
+        return new WalletSweepService(index(), readiness, ACCOUNT, Networks.preview(), () -> markets,
                 () -> params.getProtocolParams(), CONVERTERS, this::page, this::submit, clock,
                 () -> WalletSweepService.somethingSpends(tankProcessorEnabled, liquidation, compound));
     }
@@ -208,6 +209,9 @@ class WalletSweepServiceTest {
                 (proxy, method, args) -> switch (method.getName()) {
                     case "findById" -> {
                         findByIdCalls.incrementAndGet();
+                        if (indexThrows != null) {
+                            throw indexThrows;
+                        }
                         UtxoId id = (UtxoId) args[0];
                         yield index.contains(id.getTxHash() + "#" + id.getOutputIndex())
                                 ? Optional.of(new AddressUtxoEntity()) : Optional.empty();
@@ -264,15 +268,49 @@ class WalletSweepServiceTest {
         return CONVERTERS.time().toSlot(LocalDateTime.ofInstant(clock.instant(), ZoneOffset.UTC));
     }
 
-    private void synced() {
-        listener.getIsSyncing().set(false);
+    /** The slot of a block minted {@code behind} before the test clock. */
+    private long slotBehind(Duration behind) {
+        return CONVERTERS.time().toSlot(LocalDateTime.ofInstant(clock.instant().minus(behind), ZoneOffset.UTC));
     }
 
-    /** One tick, then the clock and the index's last applied block move past it: the next tick is settled. */
-    private void tickAndSettle(WalletSweepService service) {
-        service.tick();
-        clock.advance(Duration.ofSeconds(30));
-        listener.getLastAppliedSlot().set(slotNow());
+    /** A commit event for a block minted now: near tip. */
+    private void atTip(WalletSweepService service) {
+        service.onCommit(slotNow());
+    }
+
+    /** The near-tip event that lists, then 20 s later the next block, which is past the settle slot. */
+    private void runOneShot(WalletSweepService service) {
+        atTip(service);
+        clock.advance(Duration.ofSeconds(20));
+        atTip(service);
+    }
+
+    /** How many times the wallet was listed: each listing starts with page 1 of the base address. */
+    private long listings() {
+        return listingCalls.stream().filter(c -> c.equals(WALLET + "@1")).count();
+    }
+
+    /**
+     * Once done, twenty-five more blocks change nothing: no listing, no comparison, no submit, the gate
+     * stays open and the state stays put.
+     */
+    private void assertDoneForGood(WalletSweepService service) {
+        assertTrue(readiness.isWalletReady(), "the one-shot finished: the gate must be open: " + readiness.sweepState());
+        assertTrue(readiness.sweepState().startsWith("done: "), readiness.sweepState());
+        String state = readiness.sweepState();
+        int calls = listingCalls.size();
+        int finds = findByIdCalls.get();
+        int submits = submitted.size();
+        for (int i = 0; i < 25; i++) {
+            clock.advance(Duration.ofSeconds(20));
+            assertDoesNotThrow(() -> atTip(service));
+        }
+        assertEquals(calls, listingCalls.size(), "no listing after the one-shot: " + listingCalls);
+        assertTrue(listings() <= 1, "at most ONE listing per process: " + listingCalls);
+        assertEquals(finds, findByIdCalls.get(), "no comparison after the one-shot");
+        assertEquals(submits, submitted.size(), "no submit after the one-shot");
+        assertTrue(readiness.isWalletReady(), "the gate never re-closes");
+        assertEquals(state, readiness.sweepState());
     }
 
     private static Set<String> inputRefs(Transaction tx) {
@@ -289,70 +327,109 @@ class WalletSweepServiceTest {
         return WalletShapeTransactions.unitsOf(output.getValue());
     }
 
-    // ---- (a)–(k) -------------------------------------------------------------------------------
+    // ---- waiting for tip ------------------------------------------------------------------------
 
     @Test
-    void a_whileSyncingNothingIsListedAndNothingSubmitted() {
-        Utxo missing = utxo(WALLET, 200_000_000);
-        onChain(missing);
-        listener.getLastAppliedSlot().set(Long.MAX_VALUE);   // the settle condition would hold
+    void behindTipNothingIsListedOrComparedHoweverManyBlocksArrive() {
+        onChain(utxo(WALLET, 200_000_000));
         WalletSweepService service = service();
 
-        for (int i = 0; i < 4; i++) {
-            service.tick();
-            clock.advance(Duration.ofMinutes(11));
+        for (int minutes = 600; minutes > 5; minutes--) {   // a sync from ten hours behind to 6 minutes behind
+            service.onCommit(slotBehind(Duration.ofMinutes(minutes)));
         }
+        service.onCommit(slotBehind(Duration.ofMinutes(5).plusSeconds(1)));
 
-        assertEquals(List.of(), listingCalls, "a syncing node must not even list the wallet");
+        assertEquals(List.of(), listingCalls, "behind tip the sweep must not call Blockfrost");
+        assertEquals(0, findByIdCalls.get(), "behind tip the sweep must not read the index");
         assertEquals(0, submitted.size());
-        assertFalse(readiness.isWalletReady());
-        assertEquals("pending", readiness.sweepState());
+        assertFalse(readiness.isWalletReady(), "the gate never opens before the node is near tip");
+        assertEquals(WalletReadiness.WAITING_FOR_TIP, readiness.sweepState());
     }
 
     @Test
-    void b_beforeTheIndexReachesTheListingsSlotNothingIsComparedOrSubmitted() {
-        synced();
-        Utxo missing = utxo(WALLET, 200_000_000);
-        onChain(missing);
-        listener.getLastAppliedSlot().set(slotNow() - 1);
+    void aBlockExactlyFiveMinutesOldIsNearTip() {
+        onChain(utxo(WALLET, 200_000_000));
         WalletSweepService service = service();
 
-        for (int i = 0; i < 5; i++) {
-            service.tick();
-            clock.advance(Duration.ofMinutes(1));   // wall clock moves; the index does not
-        }
-
-        assertTrue(listingCalls.size() >= 5, "every tick lists afresh: " + listingCalls);
-        assertEquals(0, findByIdCalls.get(), "nothing may be compared before the index has settled");
-        assertEquals(0, submitted.size());
-        assertFalse(readiness.isWalletReady());
+        service.onCommit(slotBehind(Duration.ofMinutes(5).plusSeconds(1)));
+        assertEquals(0, listings(), "one second past the boundary is behind tip");
+        service.onCommit(slotBehind(Duration.ofMinutes(5)));
+        assertEquals(1, listings(), "a block exactly five minutes old is near tip");
+        assertEquals(WalletReadiness.SETTLING, readiness.sweepState());
     }
 
     @Test
-    void c_everythingAlreadyIndexedMakesTheWalletReadyWithoutASubmit() {
-        synced();
+    void aBlockJustInsideFiveMinutesIsNearTip() {
+        onChain(utxo(WALLET, 200_000_000));
+        WalletSweepService service = service();
+
+        service.onCommit(slotBehind(Duration.ofMinutes(4).plusSeconds(59)));
+        assertEquals(1, listings());
+        assertFalse(readiness.isWalletReady(), "listed, not yet compared");
+    }
+
+    @Test
+    void theNearTipCheckUsesTheBlocksTimeNotItsSlotNumberAgainstAnotherClock() {
+        onChain(utxo(WALLET, 200_000_000));
+        WalletSweepService service = service();
+        // The block time is read through CardanoConverters: a block minted 4 minutes ago by the test clock.
+        long slot = slotBehind(Duration.ofMinutes(4));
+        assertEquals(clock.instant().minus(Duration.ofMinutes(4)),
+                CONVERTERS.slot().slotToTime(slot).toInstant(ZoneOffset.UTC));
+        service.onCommit(slot);
+        assertEquals(1, listings());
+    }
+
+    // ---- the one Blockfrost read, and settling --------------------------------------------------
+
+    @Test
+    void nothingIsComparedBeforeABlockAtOrAfterTheSettleSlotTakenWhenTheListingCompleted() {
+        Utxo a = utxo(WALLET, 150_000_000);
+        onChain(a);
+        indexed(a);
+        listingLatency = Duration.ofSeconds(60);   // one page call; the listing is base + enterprise
+        WalletSweepService service = service();
+
+        Instant started = clock.instant();
+        atTip(service);
+        Instant completed = started.plus(Duration.ofSeconds(120));
+        assertEquals(completed, clock.instant());
+        assertEquals(WalletReadiness.SETTLING, readiness.sweepState());
+
+        long settleSlot = CONVERTERS.time().toSlot(LocalDateTime.ofInstant(completed, ZoneOffset.UTC));
+        // Blocks past the listing's START, but before the moment Blockfrost answered.
+        service.onCommit(slotNow() - 60);
+        service.onCommit(settleSlot - 1);
+        assertEquals(0, findByIdCalls.get(), "nothing may be compared before the settle slot");
+        assertFalse(readiness.isWalletReady());
+        assertEquals(1, listings(), "settling makes no further Blockfrost call");
+
+        service.onCommit(settleSlot);
+        assertTrue(findByIdCalls.get() > 0, "the block AT the settle slot compares");
+        assertEquals(WalletReadiness.NOTHING_TO_REBALANCE, readiness.sweepState());
+        assertDoneForGood(service);
+    }
+
+    @Test
+    void nothingMissingOpensTheGateWithoutASubmit() {
         Utxo a = utxo(WALLET, 200_000_000);
         Utxo b = utxo(WALLET, 10_000_000, UNIT_A, 5L);
         onChain(a, b);
         indexed(a, b);
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        assertFalse(readiness.isWalletReady(), "the first tick only observes");
-        service.tick();
+        atTip(service);
+        assertFalse(readiness.isWalletReady(), "the listing event only lists");
+        clock.advance(Duration.ofSeconds(20));
+        atTip(service);
 
-        assertTrue(readiness.isWalletReady());
-        assertEquals("ready", readiness.sweepState());
         assertEquals(0, submitted.size());
-
-        int calls = listingCalls.size();
-        service.tick();
-        assertEquals(calls, listingCalls.size(), "once ready the poller does nothing");
+        assertEquals(WalletReadiness.NOTHING_TO_REBALANCE, readiness.sweepState());
+        assertDoneForGood(service);
     }
 
     @Test
-    void d_oneMissingUtxoSubmitsExactlyOneShapedSweepOfTheWholeListing() {
-        synced();
+    void oneMissingUtxoSubmitsExactlyOneShapedSweepOfTheWholeListingAndOpensTheGate() throws Exception {
         Utxo a = utxo(WALLET, 3_000_000, UNIT_A, 300L, JUNK, 7L);
         Utxo b = utxo(WALLET, 150_000_000);
         Utxo c = utxo(WALLET, 40_000_000);
@@ -362,8 +439,7 @@ class WalletSweepServiceTest {
         Set<String> wholeListing = listedRefs();
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        service.tick();
+        runOneShot(service);
 
         assertEquals(1, submitted.size());
         Transaction tx = submitted.getFirst();
@@ -374,13 +450,13 @@ class WalletSweepServiceTest {
         assertEquals(Map.of("lovelace", TEN_ADA, UNIT_A, BigInteger.valueOf(300)), units(outputs.get(0)));
         assertEquals(Map.of("lovelace", TEN_ADA, JUNK, BigInteger.valueOf(7)), units(outputs.get(1)));
         assertEquals(Map.of("lovelace", FIVE_ADA), units(outputs.get(2)));
-        assertTrue(readiness.sweepState().startsWith("swept "), readiness.sweepState());
-        assertFalse(readiness.isWalletReady());
+        assertEquals("done: rebalanced " + TransactionUtil.getTxHash(tx), readiness.sweepState());
+        assertTrue(readiness.isWalletReady(), "the gate opens as soon as the rebalance is submitted");
+        assertDoneForGood(service);
     }
 
     @Test
-    void e_aRefusedShapeFallsBackToTheConsolidation() {
-        synced();
+    void aRefusedShapeFallsBackToTheConsolidation() {
         // The engine's small wallet: the change would not be the largest output, so the shape is refused.
         Utxo tokens = utxo(WALLET, 1_500_000, UNIT_A, 300L, JUNK, 5L);
         Utxo ada = utxo(WALLET, 26_000_000);
@@ -389,8 +465,7 @@ class WalletSweepServiceTest {
         Set<String> wholeListing = listedRefs();
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        service.tick();
+        runOneShot(service);
 
         assertEquals(1, submitted.size(), readiness.sweepState());
         Transaction tx = submitted.getFirst();
@@ -401,47 +476,28 @@ class WalletSweepServiceTest {
         assets.remove("lovelace");
         assertEquals(Map.of(UNIT_A, BigInteger.valueOf(300), JUNK, BigInteger.valueOf(5)), assets);
         assertEquals(Set.of("lovelace"), units(outputs.get(1)).keySet());
-    }
-
-    @Test
-    void f_bothBuildsRefusedSubmitsNothingAndKeepsTheGateClosed() {
-        synced();
-        // The whole listing is one unindexed 0.1-ADA UTxO: too small to fund the shape's outputs, and too
-        // small to pay the consolidation's fee, so both builders refuse.
-        Utxo dust = utxo(WALLET, 100_000);
-        onChain(dust);
-        WalletSweepService service = service();
-
-        tickAndSettle(service);
-        tickAndSettle(service);
-        tickAndSettle(service);
-
-        assertEquals(0, submitted.size());
-        assertFalse(readiness.isWalletReady());
-        assertTrue(readiness.sweepState().startsWith("refused "), readiness.sweepState());
-        assertTrue(listingCalls.stream().filter(c -> c.startsWith(WALLET + "@")).count() >= 3,
-                "a refusal is retried on the next tick: " + listingCalls);
+        assertTrue(readiness.sweepState().startsWith("done: rebalanced "), readiness.sweepState());
+        assertDoneForGood(service);
     }
 
     @Test
     void enterpriseAddressIsListedAndAnUnusedOneReadsAsEmpty() {
-        synced();
         Utxo base = utxo(WALLET, 200_000_000);
         onChain(base);
         indexed(base);
         WalletSweepService service = service();
         assertEquals(List.of(WALLET, ENTERPRISE), service.listedAddresses());
 
-        tickAndSettle(service);
-        service.tick();
+        runOneShot(service);
 
         assertTrue(listingCalls.contains(ENTERPRISE + "@1"), "the enterprise address must be listed: " + listingCalls);
-        assertTrue(readiness.isWalletReady(), "an enterprise address Blockfrost 404s is empty, not an outage");
+        assertEquals(WalletReadiness.NOTHING_TO_REBALANCE, readiness.sweepState(),
+                "an enterprise address Blockfrost 404s is empty, not an outage");
+        assertDoneForGood(service);
     }
 
     @Test
-    void anUnindexedEnterpriseUtxoIsSweptIntoTheBaseAddressAndThenTheWalletIsReady() {
-        synced();
+    void anUnindexedEnterpriseUtxoIsSweptIntoTheBaseAddress() {
         Utxo base = utxo(WALLET, 150_000_000);
         Utxo enterprise = utxo(ENTERPRISE, 20_000_000);
         onChain(base, enterprise);
@@ -449,8 +505,7 @@ class WalletSweepServiceTest {
         Set<String> wholeListing = listedRefs();
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        tickAndSettle(service);
+        runOneShot(service);
 
         assertEquals(1, submitted.size(), readiness.sweepState());
         Transaction tx = submitted.getFirst();
@@ -458,138 +513,12 @@ class WalletSweepServiceTest {
         assertTrue(inputRefs(tx).contains(ref(enterprise)));
         tx.getBody().getOutputs().forEach(o -> assertEquals(WALLET, o.getAddress(), "every output at the BASE address"));
         assertEquals(1, tx.getWitnessSet().getVkeyWitnesses().size(), "one key spends base and enterprise inputs");
-        assertFalse(readiness.isWalletReady(), "submitted is not indexed");
-        assertFalse(chain.containsKey(ENTERPRISE) && !chain.get(ENTERPRISE).isEmpty(),
-                "after the sweep lands the enterprise address holds nothing");
-
-        listedRefs().forEach(index::add);
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertTrue(readiness.isWalletReady(), readiness.sweepState());
-        assertEquals("ready", readiness.sweepState());
-        assertEquals(1, submitted.size());
+        assertTrue(readiness.sweepState().startsWith("done: rebalanced "), readiness.sweepState());
+        assertDoneForGood(service);
     }
 
     @Test
-    void g_afterASubmitTheWalletIsReadyOnlyOnceTheOutputsAreIndexed() {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        Utxo missing = utxo(WALLET, 25_000_000);
-        onChain(a, missing);
-        indexed(a);
-        WalletSweepService service = service();
-
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertEquals(1, submitted.size());
-        assertFalse(readiness.isWalletReady(), "submitted is not indexed");
-
-        // Blockfrost now lists the sweep's outputs; the index has not seen them yet.
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertFalse(readiness.isWalletReady(), "the outputs are not in the index yet");
-        assertEquals(1, submitted.size(), "no resubmit inside the window");
-
-        listedRefs().forEach(index::add);
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertTrue(readiness.isWalletReady());
-        assertEquals("ready", readiness.sweepState());
-        assertEquals(1, submitted.size());
-    }
-
-    @Test
-    void sweptOutputsNotYetIndexedKeepTheGateClosedEvenWhenBlockfrostListsNothingMissing() {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        Utxo missing = utxo(WALLET, 25_000_000);
-        onChain(a, missing);
-        indexed(a);
-        submitLands = false;
-        WalletSweepService service = service();
-
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertEquals(1, submitted.size());
-
-        // Blockfrost's lag: it lists neither the spent inputs nor the new outputs.
-        chain.clear();
-        chain.put(WALLET, new ArrayList<>());
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertFalse(readiness.isWalletReady(), "the sweep's own outputs must reach the index first");
-    }
-
-    @Test
-    void h_notConvergedAfterTenMinutesRebuildsAndResubmits() {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        Utxo missing = utxo(WALLET, 25_000_000);
-        onChain(a, missing);
-        indexed(a);
-        WalletSweepService service = service();
-
-        tickAndSettle(service);
-        Instant submitTime = clock.instant();
-        service.tick();
-        assertEquals(1, submitted.size());
-
-        // Nine and a half minutes of settled ticks: the outputs never reach the index, no resubmit.
-        while (clock.instant().isBefore(submitTime.plus(Duration.ofSeconds(570)))) {
-            clock.advance(Duration.ofSeconds(30));
-            listener.getLastAppliedSlot().set(slotNow());
-            service.tick();
-        }
-        assertEquals(1, submitted.size(), "a resubmit fired inside the ten-minute window");
-
-        while (clock.instant().isBefore(submitTime.plus(Duration.ofSeconds(660)))) {
-            clock.advance(Duration.ofSeconds(30));
-            listener.getLastAppliedSlot().set(slotNow());
-            service.tick();
-        }
-        assertEquals(2, submitted.size(), "not converged after ten minutes: rebuild and resubmit");
-        assertEquals(inputRefs(submitted.get(1)).size(), submitted.get(0).getBody().getOutputs().size(),
-                "the resubmit spends the fresh listing — the first sweep's outputs");
-    }
-
-    @Test
-    void i_aListingFailureSubmitsNothingAndIsRetriedOnTheNextTick() {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        Utxo missing = utxo(WALLET, 25_000_000);
-        onChain(a, missing);
-        indexed(a);
-        WalletSweepService service = service();
-
-        tickAndSettle(service);
-        forcedListingResult = Result.<List<Utxo>>error("Internal Server Error").code(500);
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertEquals(0, submitted.size());
-        assertFalse(readiness.isWalletReady());
-
-        forcedListingResult = null;
-        service.tick();
-        assertEquals(1, submitted.size(), "the next good listing proceeds");
-    }
-
-    @Test
-    void anExceptionNeverEscapesTheScheduledTick() {
-        synced();
-        onChain(utxo(WALLET, 150_000_000));
-        forcedListingException = new IllegalStateException("blockfrost exploded");
-        WalletSweepService service = service();
-
-        assertDoesNotThrow(service::tick);
-        listener.getLastAppliedSlot().set(Long.MAX_VALUE);
-        assertDoesNotThrow(service::tick);
-        assertEquals(0, submitted.size());
-        assertFalse(readiness.isWalletReady());
-    }
-
-    @Test
-    void j_aFullPageIsFollowedAndTheShortPageIsRead() {
-        synced();
+    void aFullPageIsFollowedAndTheShortPageIsRead() {
         List<Utxo> utxos = new ArrayList<>();
         for (int i = 0; i < 100; i++) {
             utxos.add(utxo(WALLET, 2_000_000));
@@ -600,32 +529,108 @@ class WalletSweepServiceTest {
         indexed(utxos.subList(0, 100).toArray(Utxo[]::new));
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        service.tick();
+        runOneShot(service);
 
         assertTrue(listingCalls.contains(WALLET + "@2"), "page 2 was never read: " + listingCalls);
         assertFalse(listingCalls.contains(WALLET + "@3"), "a short page ends the address: " + listingCalls);
-        assertFalse(readiness.isWalletReady(), "the UTxO on page 2 is missing from the index");
-        assertEquals(1, submitted.size());
+        assertEquals(1, submitted.size(), "the UTxO on page 2 is missing from the index");
         assertEquals(101, inputRefs(submitted.getFirst()).size());
+        assertDoneForGood(service);
     }
 
     @Test
-    void k_anEmptyWalletIsReadyWithoutASubmit() {
-        synced();
+    void anEmptyWalletHasNothingToRebalance() {
         chain.put(WALLET, new ArrayList<>());
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        service.tick();
+        runOneShot(service);
 
-        assertTrue(readiness.isWalletReady());
+        assertEquals(0, submitted.size());
+        assertEquals(WalletReadiness.NOTHING_TO_REBALANCE, readiness.sweepState());
+        assertDoneForGood(service);
+    }
+
+    // ---- every failure: logged, the gate opens, nothing is tried again ---------------------------
+
+    @Test
+    void aListingErrorOpensTheGateAndIsNeverRetried() {
+        onChain(utxo(WALLET, 150_000_000));
+        forcedListingResult = Result.<List<Utxo>>error("Internal Server Error").code(500);
+        WalletSweepService service = service();
+
+        atTip(service);
+
+        assertTrue(readiness.sweepState().startsWith("done: listing failed"), readiness.sweepState());
+        assertTrue(readiness.sweepState().contains("500"), readiness.sweepState());
+        assertEquals(0, findByIdCalls.get());
+        forcedListingResult = null;   // Blockfrost recovers: still no second listing
+        assertDoneForGood(service);
+        assertEquals(1, listings());
         assertEquals(0, submitted.size());
     }
 
     @Test
+    void aListingThatThrowsOpensTheGateAndIsNeverRetried() {
+        onChain(utxo(WALLET, 150_000_000));
+        forcedListingException = new IllegalStateException("blockfrost exploded");
+        WalletSweepService service = service();
+
+        assertDoesNotThrow(() -> atTip(service));
+
+        assertTrue(readiness.sweepState().startsWith("done: listing failed"), readiness.sweepState());
+        assertTrue(readiness.sweepState().contains("blockfrost exploded"), readiness.sweepState());
+        forcedListingException = null;
+        assertDoneForGood(service);
+        assertEquals(1, listings());
+        assertEquals(0, submitted.size());
+    }
+
+    @Test
+    void aListingThatAnswersNothingOpensTheGateAndIsNeverRetried() {
+        onChain(utxo(WALLET, 150_000_000));
+        WalletSweepService service = new WalletSweepService(index(), readiness, ACCOUNT, Networks.preview(),
+                () -> markets, () -> params.getProtocolParams(), CONVERTERS, (address, page) -> {
+                    listingCalls.add(address + "@" + page);
+                    return null;
+                }, this::submit, clock, () -> true);
+
+        atTip(service);
+
+        assertTrue(readiness.sweepState().startsWith("done: listing failed"), readiness.sweepState());
+        assertDoneForGood(service);
+        assertEquals(1, listings());
+    }
+
+    @Test
+    void bothBuildsRefusedSubmitsNothingOpensTheGateAndNeverRetries() {
+        // The whole listing is one unindexed 0.1-ADA UTxO: too small to fund the shape's outputs, and too
+        // small to pay the consolidation's fee, so both builders refuse.
+        onChain(utxo(WALLET, 100_000));
+        WalletSweepService service = service();
+
+        runOneShot(service);
+
+        assertEquals(0, submitted.size());
+        assertTrue(readiness.sweepState().startsWith("done: rebalance failed: "), readiness.sweepState());
+        assertDoneForGood(service);
+        assertEquals(1, listings());
+    }
+
+    private static ProtocolParams withMaxTxSize(Integer maxTxSize) {
+        ProtocolParams p = LoanFixtures.protocolParams().getProtocolParams();
+        return ProtocolParams.builder()
+                .minFeeA(p.getMinFeeA()).minFeeB(p.getMinFeeB()).maxTxSize(maxTxSize)
+                .maxValSize(p.getMaxValSize()).coinsPerUtxoSize(p.getCoinsPerUtxoSize())
+                .priceMem(p.getPriceMem()).priceStep(p.getPriceStep()).maxTxExMem(p.getMaxTxExMem())
+                .maxTxExSteps(p.getMaxTxExSteps()).collateralPercent(p.getCollateralPercent())
+                .maxCollateralInputs(p.getMaxCollateralInputs())
+                .minFeeRefScriptCostPerByte(p.getMinFeeRefScriptCostPerByte())
+                .protocolMajorVer(p.getProtocolMajorVer()).protocolMinorVer(p.getProtocolMinorVer())
+                .costModelsRaw(p.getCostModelsRaw()).build();
+    }
+
+    @Test
     void aSignedTransactionOverMaxTxSizeIsRefusedEvenWhenTheUnsignedBodyFits() throws Exception {
-        synced();
         Utxo a = utxo(WALLET, 150_000_000);
         Utxo missing = utxo(WALLET, 25_000_000);
         onChain(a, missing);
@@ -638,101 +643,21 @@ class WalletSweepServiceTest {
         int unsignedSize = unsigned.transaction().serialize().length;
         int signedSize = engine.sign(unsigned.transaction()).serialize().length;
         assertTrue(signedSize > unsignedSize + 50, "a vkey witness should add ~100 bytes");
-        ProtocolParams tight = LoanFixtures.protocolParams().getProtocolParams();
-        ProtocolParams copy = ProtocolParams.builder()
-                .minFeeA(tight.getMinFeeA()).minFeeB(tight.getMinFeeB()).maxTxSize(unsignedSize + 10)
-                .maxValSize(tight.getMaxValSize()).coinsPerUtxoSize(tight.getCoinsPerUtxoSize())
-                .priceMem(tight.getPriceMem()).priceStep(tight.getPriceStep()).maxTxExMem(tight.getMaxTxExMem())
-                .maxTxExSteps(tight.getMaxTxExSteps()).collateralPercent(tight.getCollateralPercent())
-                .maxCollateralInputs(tight.getMaxCollateralInputs())
-                .minFeeRefScriptCostPerByte(tight.getMinFeeRefScriptCostPerByte())
-                .protocolMajorVer(tight.getProtocolMajorVer()).protocolMinorVer(tight.getProtocolMinorVer())
-                .costModelsRaw(tight.getCostModelsRaw()).build();
-        params = () -> copy;
+        ProtocolParams tight = withMaxTxSize(unsignedSize + 10);
+        params = () -> tight;
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        service.tick();
+        runOneShot(service);
 
         assertEquals(0, submitted.size(), "an oversize SIGNED transaction must never reach the wire");
-        assertTrue(readiness.sweepState().startsWith("refused signed transaction too large"), readiness.sweepState());
-        assertFalse(readiness.isWalletReady());
-    }
-
-    // ---- revision 3 ----------------------------------------------------------------------------
-
-    /** Settled ticks every 30 s until {@code until}: the index keeps up with the wall clock. */
-    private void settledTicksUntil(WalletSweepService service, Instant until) {
-        while (clock.instant().isBefore(until)) {
-            clock.advance(Duration.ofSeconds(30));
-            listener.getLastAppliedSlot().set(slotNow());
-            service.tick();
-        }
-    }
-
-    @Test
-    void aSweepLandingAfterTheWindowClosesKeepsTheGateClosedUntilItsOutputsAreIndexed() throws Exception {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        Utxo missing = utxo(WALLET, 25_000_000);
-        onChain(a, missing);
-        indexed(a);
-        submitLands = false;
-        WalletSweepService service = service();
-
-        tickAndSettle(service);
-        Instant submitTime = clock.instant();
-        service.tick();
-        assertEquals(1, submitted.size());
-
-        // Settled ticks up to 9:30 after the submit; Blockfrost still lists the pre-sweep wallet.
-        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(570)));
-        assertEquals(1, submitted.size());
-
-        // The sweep lands now, after the 9:30 tick: Blockfrost lists ONLY its outputs, the index none of them.
-        land(submitted.getFirst());
-        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(600)));   // window closed at this tick
-        assertFalse(readiness.isWalletReady(),
-                "Blockfrost lists the sweep's outputs and the index holds none of them: " + readiness.sweepState());
-        assertEquals(1, submitted.size(), "freshly landed outputs are not a reason to resubmit");
-
-        listedRefs().forEach(index::add);
-        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(630)));
-        assertTrue(readiness.isWalletReady(), readiness.sweepState());
-        assertEquals(1, submitted.size());
-    }
-
-    @Test
-    void aSubmitThatThrowsHoldsBackAResubmitForTheWholeWindow() {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        Utxo missing = utxo(WALLET, 25_000_000);
-        onChain(a, missing);
-        indexed(a);
-        submitThrows = new java.io.IOException("connection reset mid-submit");
-        WalletSweepService service = service();
-
-        tickAndSettle(service);
-        Instant submitTime = clock.instant();
-        assertDoesNotThrow(service::tick);
-        assertEquals(1, submitted.size());
-        assertTrue(readiness.sweepState().startsWith("refused submit outcome unknown for "), readiness.sweepState());
-
-        // Nineteen settled ticks inside the window: the bytes may be on chain, so nothing is resubmitted.
-        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(570)));
-        assertEquals(1, submitted.size(), "a submit of unknown outcome must hold back a resubmit for the window");
-        assertTrue(readiness.sweepState().startsWith("refused submit outcome unknown for "), readiness.sweepState());
-        assertFalse(readiness.isWalletReady());
-
-        // Past the window: one rebuild and resubmit, and then the window holds again.
-        settledTicksUntil(service, submitTime.plus(Duration.ofSeconds(900)));
-        assertEquals(2, submitted.size(), "after the window exactly one resubmit");
-        assertFalse(readiness.isWalletReady());
+        assertTrue(readiness.sweepState().startsWith("done: rebalance failed: signed transaction too large"),
+                readiness.sweepState());
+        assertDoneForGood(service);
+        assertEquals(1, listings());
     }
 
     @Test
     void protocolParametersWithoutMaxTxSizeAtSignTimeRefuseTheSubmit() {
-        synced();
         Utxo a = utxo(WALLET, 150_000_000);
         Utxo missing = utxo(WALLET, 25_000_000);
         onChain(a, missing);
@@ -746,165 +671,113 @@ class WalletSweepServiceTest {
                 f -> f.getMethodName().equals("signedSizeProblem"))) ? noLimit : full;
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        service.tick();
+        runOneShot(service);
 
         assertEquals(0, submitted.size(), "no limit to check against means no submit");
-        assertTrue(readiness.sweepState().startsWith("refused protocol parameters carry no maxTxSize"),
+        assertTrue(readiness.sweepState().startsWith("done: rebalance failed: protocol parameters carry no maxTxSize"),
                 readiness.sweepState());
-        assertFalse(readiness.isWalletReady());
+        assertDoneForGood(service);
     }
 
     @Test
-    void theSettleSlotIsTakenWhenTheListingCompletesNotWhenItStarts() {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        onChain(a);
-        indexed(a);
-        listingLatency = Duration.ofSeconds(60);   // one page call; the listing is base + enterprise
-        WalletSweepService service = service();
-
-        Instant started = clock.instant();
-        service.tick();
-        assertEquals(started.plus(Duration.ofSeconds(120)), clock.instant());
-        // The index has passed the listing's START, but not the moment Blockfrost answered.
-        listener.getLastAppliedSlot().set(CONVERTERS.time().toSlot(
-                LocalDateTime.ofInstant(started.plus(Duration.ofSeconds(60)), ZoneOffset.UTC)));
-        service.tick();
-
-        assertEquals(0, findByIdCalls.get(), "the listing is not settled until the index reaches its completion");
-        assertFalse(readiness.isWalletReady());
-    }
-
-    @Test
-    void aListingFailureIsVisibleOnTheStateAndKeepsTheGateClosed() {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        onChain(a);
-        indexed(a);
-        WalletSweepService service = service();
-
-        forcedListingResult = Result.<List<Utxo>>error("Internal Server Error").code(500);
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertTrue(readiness.sweepState().startsWith("refused listing failed"), readiness.sweepState());
-        assertFalse(readiness.isWalletReady());
-
-        forcedListingResult = null;
-        forcedListingException = new IllegalStateException("blockfrost exploded");
-        readiness.markSwept("x");   // any non-failure state: the exception path must overwrite it too
-        tickAndSettle(service);
-        assertTrue(readiness.sweepState().startsWith("refused listing failed"), readiness.sweepState());
-        assertFalse(readiness.isWalletReady());
-        assertEquals(0, submitted.size());
-    }
-
-    // ---- owner rework after the slice-3 bounce ---------------------------------------------------
-
-    @Test
-    void aSubmitReportedFailedThatLandedAnywayDoesNotOpenTheGate() {
-        synced();
+    void aRejectedSubmitIsNeverRetried() {
         Utxo a = utxo(WALLET, 150_000_000);
         Utxo missing = utxo(WALLET, 25_000_000);
         onChain(a, missing);
         indexed(a);
-        // Blockfrost forwards the bytes and then answers 502: the sweep reads as rejected, yet it lands.
-        submitFailsWithCode = 502;
+        submitLands = false;
+        submitFailsWithCode = 400;
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        tickAndSettle(service);
+        runOneShot(service);
+
         assertEquals(1, submitted.size());
-        assertTrue(readiness.sweepState().startsWith("refused submit rejected"), readiness.sweepState());
-
-        // Blockfrost now lists ONLY the landed outputs; the index holds none of them.
-        tickAndSettle(service);
-        assertFalse(readiness.isWalletReady(),
-                "the listing holds only outputs the index has never seen: " + readiness.sweepState());
-
-        listedRefs().forEach(index::add);
-        tickAndSettle(service);
-        assertTrue(readiness.isWalletReady(), readiness.sweepState());
+        assertTrue(readiness.sweepState().startsWith("done: rebalance failed: submit rejected"), readiness.sweepState());
+        submitFailsWithCode = null;   // the wire recovers: still no second submit
+        assertDoneForGood(service);
+        assertEquals(1, submitted.size());
+        assertEquals(1, listings());
     }
 
     @Test
-    void goingIdleDropsTheObservationSoTheFirstTickBackOnlyObserves() {
-        synced();
-        Utxo a = utxo(WALLET, 150_000_000);
-        onChain(a);
-        WalletSweepService service = service();
-
-        service.tick();                                   // observes, unsettled
-        tankProcessorEnabled = false;
-        service.tick();                                   // idle
-        assertEquals(WalletReadiness.IDLE, readiness.sweepState());
-
-        tankProcessorEnabled = true;
-        clock.advance(Duration.ofSeconds(30));
-        listener.getLastAppliedSlot().set(Long.MAX_VALUE);   // the OLD observation would count as settled
-        service.tick();
-
-        assertEquals(0, findByIdCalls.get(), "the first tick back starts from a fresh, unsettled observation");
-        assertEquals(0, submitted.size());
-    }
-
-    @Test
-    void aListingThatSucceedsAgainClearsTheListingFailureFromTheState() {
-        synced();
+    void aSubmitThatThrowsIsNeverRetriedAndNothingEscapes() {
         Utxo a = utxo(WALLET, 150_000_000);
         Utxo missing = utxo(WALLET, 25_000_000);
         onChain(a, missing);
         indexed(a);
+        submitThrows = new java.io.IOException("connection reset mid-submit");
         WalletSweepService service = service();
 
-        forcedListingResult = Result.<List<Utxo>>error("Internal Server Error").code(500);
-        tickAndSettle(service);
-        assertTrue(readiness.sweepState().startsWith("refused listing failed"), readiness.sweepState());
+        atTip(service);
+        clock.advance(Duration.ofSeconds(20));
+        assertDoesNotThrow(() -> atTip(service));
 
-        forcedListingResult = null;
-        tickAndSettle(service);                           // observes only
-        assertEquals(WalletReadiness.PENDING, readiness.sweepState());
-        assertFalse(readiness.isWalletReady());
+        assertEquals(1, submitted.size());
+        assertTrue(readiness.sweepState().startsWith("done: rebalance failed: "), readiness.sweepState());
+        assertTrue(readiness.sweepState().contains("connection reset mid-submit"), readiness.sweepState());
+        submitThrows = null;
+        assertDoneForGood(service);
+        assertEquals(1, submitted.size());
+        assertEquals(1, listings());
     }
 
-    // ---- the sweep runs only on a node where something spends (FAB-134-3c) -----------------------
+    @Test
+    void anIndexThatThrowsDuringTheComparisonOpensTheGateAndNothingEscapes() {
+        onChain(utxo(WALLET, 150_000_000));
+        indexThrows = new IllegalStateException("database gone");
+        WalletSweepService service = service();
+
+        atTip(service);
+        clock.advance(Duration.ofSeconds(20));
+        assertDoesNotThrow(() -> atTip(service));
+
+        assertEquals(0, submitted.size());
+        assertTrue(readiness.sweepState().startsWith("done: rebalance failed: "), readiness.sweepState());
+        assertTrue(readiness.sweepState().contains("database gone"), readiness.sweepState());
+        indexThrows = null;
+        assertDoneForGood(service);
+        assertEquals(1, listings());
+    }
+
+    // ---- only on a node where something spends (FAB-134-3c), decided once near tip --------------
 
     /** A wallet with one UTxO the index does not hold: a node that sweeps at all must sweep it. */
     private void aWalletThatNeedsASweep() {
-        synced();
         onChain(utxo(WALLET, 200_000_000));
     }
 
     @Test
-    void withEverySpendingProcessorOffNothingIsListedComparedOrSubmitted() {
+    void withEverySpendingProcessorOffNothingIsListedAndTheGateOpensNearTip() {
         tankProcessorEnabled = false;
         aWalletThatNeedsASweep();
-        listener.getLastAppliedSlot().set(Long.MAX_VALUE);   // the settle condition would hold
         WalletSweepService service = service();
 
-        for (int i = 0; i < 6; i++) {
-            service.tick();
-            clock.advance(Duration.ofMinutes(11));
-        }
+        service.onCommit(slotBehind(Duration.ofMinutes(30)));
+        assertFalse(readiness.isWalletReady(), "even an idle node opens the gate only near tip");
+        assertEquals(WalletReadiness.WAITING_FOR_TIP, readiness.sweepState());
 
+        atTip(service);
+        assertEquals(WalletReadiness.IDLE, readiness.sweepState());
+        assertTrue(readiness.isWalletReady(), "an idle node opens the gate so the readiness page shows the wallet");
+
+        // Decided once: a processor enabled afterwards changes nothing in this process.
+        ReflectionTestUtils.setField(compound, "enabled", true);
+        assertDoneForGood(service);
         assertEquals(List.of(), listingCalls, "a node that spends nothing must not even list the wallet");
         assertEquals(0, findByIdCalls.get());
         assertEquals(0, submitted.size());
-        assertFalse(readiness.isWalletReady());
-        assertEquals(WalletReadiness.IDLE, readiness.sweepState());
     }
 
-    /** One spending processor alone on: the sweep runs all the way to its submit. */
+    /** One spending processor alone on: the one-shot runs all the way to its submit. */
     private void sweepsWith(String which) {
         aWalletThatNeedsASweep();
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        service.tick();
+        runOneShot(service);
 
-        assertFalse(listingCalls.isEmpty(), which + " alone must make the sweep list the wallet");
+        assertEquals(1, listings(), which + " alone must make the sweep list the wallet");
         assertEquals(1, submitted.size(), which + " alone must make the sweep run: " + readiness.sweepState());
-        assertTrue(readiness.sweepState().startsWith("swept "), readiness.sweepState());
+        assertTrue(readiness.sweepState().startsWith("done: rebalanced "), readiness.sweepState());
     }
 
     @Test
@@ -935,37 +808,29 @@ class WalletSweepServiceTest {
     }
 
     @Test
-    void aProcessorEnabledAtRuntimeIsSeenOnTheNextTick() {
-        tankProcessorEnabled = false;
+    void theSpringEventListenerDelegatesTheCommitSlot() {
         aWalletThatNeedsASweep();
         WalletSweepService service = service();
 
-        tickAndSettle(service);
-        tickAndSettle(service);
-        assertEquals(List.of(), listingCalls);
-        assertEquals(WalletReadiness.IDLE, readiness.sweepState());
+        CommitEvent<?> behind = Mockito.mock(CommitEvent.class, Mockito.RETURNS_DEEP_STUBS);
+        Mockito.when(behind.getMetadata().getSlot()).thenReturn(slotBehind(Duration.ofMinutes(30)));
+        service.onCommitEvent(behind);
+        assertEquals(0, listings());
 
-        // The SAME configuration object changes under the sweep, as a live config object would.
-        ReflectionTestUtils.setField(compound, "enabled", true);
-        service.tick();
-        assertFalse(listingCalls.isEmpty(), "the next tick after a processor is enabled must list");
-        assertEquals(WalletReadiness.PENDING, readiness.sweepState(), "it starts again from an unsettled observation");
-        assertEquals(0, submitted.size(), "the first enabled tick only observes");
-
-        clock.advance(Duration.ofSeconds(30));
-        listener.getLastAppliedSlot().set(slotNow());
-        service.tick();
-        assertEquals(1, submitted.size());
+        CommitEvent<?> tip = Mockito.mock(CommitEvent.class, Mockito.RETURNS_DEEP_STUBS);
+        Mockito.when(tip.getMetadata().getSlot()).thenReturn(slotNow());
+        service.onCommitEvent(tip);
+        assertEquals(1, listings());
     }
 
     /**
      * The bean Spring builds: every input resolves, and the predicate it was given reads the tank flag
-     * property, the liquidation mode and the compound flag — the latter two LIVE, off the very objects
-     * the executors read. The two configuration beans are bound by Spring from properties, exactly as
-     * in production. With all three off, a tick touches no Blockfrost service at all.
+     * property, the liquidation mode and the compound flag off the very objects the executors read. The
+     * two configuration beans are bound by Spring from properties, exactly as in production. With all
+     * three off, a near-tip block touches no Blockfrost service at all and opens the gate.
      */
     @Test
-    void theSpringWiredSweepReadsEveryInputLive() {
+    void theSpringWiredSweepReadsEveryInput() {
         record Case(String tank, AppConfig.LiquidationConfiguration.Mode mode, boolean compound, boolean spends) {
         }
         for (Case c : List.of(
@@ -977,14 +842,11 @@ class WalletSweepServiceTest {
             BFBackendService blockfrost = Mockito.mock(BFBackendService.class);
             AppConfig.Network network = new AppConfig.Network();
             network.setNetworkForTest("preview");
-            BlockEventListener blockEventListener = new BlockEventListener(null);
-            blockEventListener.getIsSyncing().set(false);
             new ApplicationContextRunner()
                     .withPropertyValues("scheduling.transaction-processor.enabled=" + c.tank(),
                             "loans.liquidation.mode=" + c.mode().name().toLowerCase(),
                             "loans.liquidation.profit-margin-lovelace=1500000",
                             "loans.compound.enabled=" + c.compound())
-                    .withBean(BlockEventListener.class, () -> blockEventListener)
                     .withBean(UtxoRepository.class, this::index)
                     .withBean(WalletReadiness.class)
                     .withBean(Account.class, () -> ACCOUNT)
@@ -1001,12 +863,12 @@ class WalletSweepServiceTest {
                         assertEquals(c.mode(), ctx.getBean(AppConfig.LiquidationConfiguration.class).getMode());
                         assertEquals(c.spends(), sweep.somethingSpends(), c.toString());
                         if (!c.spends()) {
-                            sweep.tick();
+                            sweep.onCommit(CONVERTERS.time().toSlot(LocalDateTime.now(ZoneOffset.UTC)));
                             Mockito.verifyNoInteractions(blockfrost);
                             WalletReadiness wired = ctx.getBean(WalletReadiness.class);
                             assertEquals(WalletReadiness.IDLE, wired.sweepState());
-                            assertFalse(wired.isWalletReady());
-                            // Live: the same compound object, switched on, is seen without a restart.
+                            assertTrue(wired.isWalletReady());
+                            // The same compound object, switched on, is what the predicate reads.
                             ReflectionTestUtils.setField(ctx.getBean(AppConfig.CompoundConfiguration.class),
                                     "enabled", true);
                             assertTrue(sweep.somethingSpends(), "the wired predicate must read compound live");

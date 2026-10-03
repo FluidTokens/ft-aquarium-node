@@ -28,9 +28,13 @@ public class Healthcheck {
      *                          built. ⚠ Reported, never part of the health verdict: a closed gate refuses
      *                          lending only, and the scheduled-payment half this check guards keeps running.
      * @param lendingGateReason why it is closed (the startup verifier's reason), null while open
-     * @param walletSweep       the startup wallet sweep (FAB-134): {@code pending}, {@code swept <txHash>},
-     *                          {@code refused <reason>} or {@code ready}. ⚠ Reported, never part of the
-     *                          verdict: until it reads {@code ready} the processors skip their cycles.
+     * @param walletSweep       the startup one-shot wallet rebalance (FAB-134): {@code waiting for tip},
+     *                          {@code settling}, then {@code done: …} ({@code nothing to rebalance},
+     *                          {@code rebalanced <txHash>}, {@code rebalance failed: <reason>},
+     *                          {@code listing failed: <reason>} or {@code idle, no spending processor
+     *                          enabled}). ⚠ Reported, never part of the verdict: until it reads
+     *                          {@code done: …} the processors skip their cycles; a failure is logged
+     *                          and processing continues.
      */
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record HealthCheck(Boolean dbOk,

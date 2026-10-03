@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.service.wallet;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
+import com.bloxbean.cardano.yaci.store.events.internal.CommitEvent;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.controller.Healthcheck;
@@ -19,6 +20,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.LiquidationExecutor;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -58,7 +60,7 @@ class WalletReadinessGateTest {
 
     private static WalletReadiness open() {
         WalletReadiness readiness = new WalletReadiness();
-        readiness.markReady();
+        readiness.markDone("nothing to rebalance");
         return readiness;
     }
 
@@ -139,15 +141,17 @@ class WalletReadinessGateTest {
         }
     }
 
-    /** The sweep itself: a component, one constructor Spring can pick, and a scheduled tick. */
+    /** The sweep itself: a component, one constructor Spring can pick, and a commit-event listener. */
     @Test
-    void theSweepIsAScheduledComponentWithOneAutowiredConstructor() throws Exception {
+    void theSweepIsACommitEventListenerComponentWithOneAutowiredConstructor() throws Exception {
         assertTrue(WalletSweepService.class.isAnnotationPresent(Component.class));
         Constructor<?>[] constructors = WalletSweepService.class.getDeclaredConstructors();
         long annotated = Arrays.stream(constructors).filter(c -> c.isAnnotationPresent(Autowired.class)).count();
         assertEquals(1L, annotated, "exactly one constructor must be @Autowired, or the context cannot start");
-        Scheduled scheduled = WalletSweepService.class.getMethod("tick").getAnnotation(Scheduled.class);
-        assertNotNull(scheduled, "tick() must be @Scheduled");
-        assertTrue(scheduled.fixedDelayString().contains("loans.wallet.sweep.delay-seconds"), scheduled.fixedDelayString());
+        var listener = WalletSweepService.class.getMethod("onCommitEvent", CommitEvent.class);
+        assertNotNull(listener.getAnnotation(EventListener.class), "onCommitEvent must be an @EventListener");
+        assertTrue(Arrays.stream(WalletSweepService.class.getMethods())
+                        .noneMatch(m -> m.isAnnotationPresent(Scheduled.class)),
+                "the one-shot is driven by commit events only: no @Scheduled poll");
     }
 }
