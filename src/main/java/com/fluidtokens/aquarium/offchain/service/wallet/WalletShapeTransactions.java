@@ -5,9 +5,11 @@ import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.common.OrderEnum;
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.TransactionProcessor;
+import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.Tx;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
@@ -57,6 +59,27 @@ import static com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.norma
  * ({@code containsScriptTx} is set only for a {@code ScriptTx}, {@code QuickTxBuilder:321-350}). The
  * missing evaluator is therefore never read — and the body check refuses any transaction carrying a
  * redeemer or a script, so a script reaching this path is refused rather than priced with placeholders.
+ *
+ * <h2>Why the size is checked after building</h2>
+ * cardano-client-lib checks neither the ledger's {@code maxTxSize} nor its per-output {@code maxValSize}:
+ * measured, 700 given inputs built a 25,350-byte transaction and a 150-policy bundle built a ~10 KB output,
+ * and both came back as ordinary successes. The ledger rejects both at submission. So both builders
+ * measure the built transaction and every output's value against the current protocol parameters and
+ * refuse, naming the measured size and the limit, before returning {@link Status#BUILT}.
+ *
+ * <h2>Non-convergence is the CALLER's to own</h2>
+ * This class builds one transaction from the list it is given; it does not promise that repeating the
+ * build ever reaches the target shape. Some wallets never will — a wallet holding C plus a few lovelace
+ * cannot fund the collateral, a change output and a fee, and {@link #buildShaped} refuses it every time.
+ * Each caller's contract decides what that means (owner ruling, FAB-134 r2):
+ * <ul>
+ *   <li><b>The startup sweep</b> exists only to get UTxOs indexed. A consolidation moves them into an
+ *       indexed output, after which the sweep has nothing left to do — it stops whether or not the wallet
+ *       is in the target shape.</li>
+ *   <li><b>The rebalance (FAB-130)</b> calls only {@link #buildShaped}, which refuses without signing or
+ *       submitting, so a wallet that cannot be shaped costs no fee. Retrying a refusal forever is the
+ *       caller's bug to prevent, not this class's.</li>
+ * </ul>
  *
  * <h2>Signing and submitting are separate calls</h2>
  * Neither builder signs or submits. {@link #sign} and {@link #submit} are the only paths to a
@@ -168,6 +191,9 @@ public final class WalletShapeTransactions {
         }
 
         String deviation = shapeDeviation(built, inputs, plan, walletAddress);
+        if (deviation == null) {
+            deviation = sizeDeviation(built, protocolParamsSupplier.getProtocolParams());
+        }
         if (deviation != null) {
             return Outcome.refused(plan, deviation);
         }
@@ -215,6 +241,9 @@ public final class WalletShapeTransactions {
         }
 
         String deviation = consolidationDeviation(built, inputs, assets, walletAddress);
+        if (deviation == null) {
+            deviation = sizeDeviation(built, protocolParamsSupplier.getProtocolParams());
+        }
         if (deviation != null) {
             return Outcome.refused(null, deviation);
         }
@@ -312,8 +341,69 @@ public final class WalletShapeTransactions {
             }
         }
         TransactionOutput change = outputs.get(planned.size());
+        // Not reachable through a balanced body: every non-lovelace unit is pinned to an exact quantity
+        // in a planned output above, and conservation has already proven that the outputs hold exactly
+        // what the inputs hold — so a token in the change would have to be missing from a planned output,
+        // which the loop above refuses first. Kept as the last line of defence should either check move.
         if (!unitsOf(change.getValue()).keySet().equals(Set.of(LOVELACE))) {
             return "change output " + planned.size() + " is not ADA-only: " + unitsOf(change.getValue());
+        }
+        if (change.getValue().getCoin().signum() <= 0) {
+            return "change output " + planned.size() + " holds no lovelace: " + change.getValue().getCoin();
+        }
+        return null;
+    }
+
+    /**
+     * Why the built transaction is too large for the ledger, or null: the whole serialised transaction
+     * against {@code maxTxSize}, and each output's serialised VALUE against {@code maxValSize}.
+     *
+     * <p>The value is measured as the ledger measures it — the CBOR encoding of the output's value alone
+     * (the ledger's {@code OutputTooBigUTxO} check serialises {@code txOut ^. valueTxOutL}). In
+     * cardano-client-lib that encoding is {@code Value.serialize()} ({@code Value.java:83}), the very
+     * {@code DataItem} {@code TransactionOutput} embeds in the body ({@code TransactionOutput.java:87}
+     * post-Alonzo, {@code :127} legacy), so its {@code CborSerializationUtil.serialize} length is the
+     * bytes the ledger counts.
+     *
+     * <p>Fails closed: parameters missing either limit are a refusal, not a pass.
+     *
+     * <p>{@code maxTxSize} is compared against the UNSIGNED transaction, as built; the bot's signature
+     * adds one vkey witness on top.
+     */
+    static String sizeDeviation(Transaction built, ProtocolParams params) {
+        if (params == null || params.getMaxTxSize() == null || params.getMaxValSize() == null) {
+            return "protocol parameters carry no maxTxSize or maxValSize: refusing to guess the ledger's limits";
+        }
+        long maxTxSize = params.getMaxTxSize();
+        long maxValSize;
+        try {
+            maxValSize = Long.parseLong(params.getMaxValSize().trim());
+        } catch (NumberFormatException e) {
+            return "protocol parameters carry an unreadable maxValSize: " + params.getMaxValSize();
+        }
+
+        int txSize;
+        try {
+            txSize = built.serialize().length;
+        } catch (Exception e) {
+            return "built transaction does not serialise: " + e.getMessage();
+        }
+        if (txSize > maxTxSize) {
+            return "transaction too large: " + txSize + " bytes > maxTxSize " + maxTxSize;
+        }
+
+        List<TransactionOutput> outputs = built.getBody().getOutputs();
+        for (int i = 0; i < outputs.size(); i++) {
+            int valueSize;
+            try {
+                valueSize = CborSerializationUtil.serialize(outputs.get(i).getValue().serialize()).length;
+            } catch (Exception e) {
+                return "output " + i + " value does not serialise: " + e.getMessage();
+            }
+            if (valueSize > maxValSize) {
+                return "output value too large: output " + i + " value is " + valueSize + " bytes > maxValSize "
+                        + maxValSize;
+            }
         }
         return null;
     }

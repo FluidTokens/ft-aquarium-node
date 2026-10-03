@@ -3,10 +3,14 @@ package com.fluidtokens.aquarium.offchain.service.wallet;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Result;
+import com.bloxbean.cardano.client.api.TransactionProcessor;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
+import com.bloxbean.cardano.client.quicktx.Tx;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.Reason;
 import com.fluidtokens.aquarium.offchain.service.wallet.WalletShapeTransactions.Outcome;
@@ -176,6 +180,148 @@ class WalletShapeTransactionsTest {
         String deviation = WalletShapeTransactions.shapeDeviation(tx, inputs, outcome.plan(), WALLET);
         assertNotNull(deviation);
         assertTrue(deviation.startsWith("not conserved: lovelace"), deviation);
+    }
+
+    /** The last output of a decoded shaped build — the change. */
+    private static TransactionOutput changeOf(Transaction tx) {
+        return tx.getBody().getOutputs().get(tx.getBody().getOutputs().size() - 1);
+    }
+
+    @Test
+    void anInputCclAddedBeyondTheGivenListFailsTheInputsCheck() throws Exception {
+        // Plan for the whole wallet, but hand CCL only the token UTxOs (5 ADA) through collectFrom, with a
+        // supplier that also knows the ADA-only ones: the plan's 35 ADA cannot be met from the given list, so
+        // CCL's coin selection reaches into the supplier and spends inputs nobody gave it.
+        List<Utxo> wallet = messyWallet();
+        List<Utxo> given = wallet.subList(0, 3);
+        WalletShape.Plan plan = WalletShape.plan(wallet, RELEVANT, C);
+
+        Tx tx = new Tx().from(WALLET).collectFrom(given);
+        plan.outputs().forEach(output -> tx.payToAddress(WALLET, output.amounts()));
+        tx.withChangeAddress(WALLET);
+        Transaction built = new QuickTxBuilder(WalletShapeTransactions.inMemorySupplierOf(wallet),
+                LoanFixtures.protocolParams(), (TransactionProcessor) null)
+                .compose(tx).mergeOutputs(false).feePayer(WALLET).build();
+        assertTrue(built.getBody().getInputs().size() > given.size(),
+                "CCL must actually have added an input for this test to mean anything: " + built.getBody().getInputs());
+
+        String deviation = WalletShapeTransactions.shapeDeviation(built, given, plan, WALLET);
+        assertNotNull(deviation);
+        assertTrue(deviation.startsWith("built inputs "), deviation);
+    }
+
+    @Test
+    void anExtraAdaOnlyOutputFailsTheOutputCountCheck() throws Exception {
+        List<Utxo> inputs = messyWallet();
+        Outcome outcome = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        // Split one ADA off the change into a trailing ADA-only output: still conserved, still at the
+        // wallet, every planned output intact — only the count can see it.
+        BigInteger oneAda = BigInteger.valueOf(1_000_000L);
+        TransactionOutput change = changeOf(tx);
+        change.getValue().setCoin(change.getValue().getCoin().subtract(oneAda));
+        tx.getBody().getOutputs().add(new TransactionOutput(WALLET, Value.builder().coin(oneAda).build()));
+
+        String deviation = WalletShapeTransactions.shapeDeviation(tx, inputs, outcome.plan(), WALLET);
+        assertNotNull(deviation);
+        assertTrue(deviation.startsWith("built body has 6 outputs"), deviation);
+    }
+
+    @Test
+    void anOutputAtAForeignAddressFailsTheAddressCheck() throws Exception {
+        List<Utxo> inputs = messyWallet();
+        Outcome outcome = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        // Same value, someone else's address: conservation and the shape both still hold.
+        changeOf(tx).setAddress(LoanFixtures.botAddress());
+
+        String deviation = WalletShapeTransactions.shapeDeviation(tx, inputs, outcome.plan(), WALLET);
+        assertNotNull(deviation);
+        assertTrue(deviation.startsWith("output 4 is at " + LoanFixtures.botAddress()), deviation);
+    }
+
+    @Test
+    void aZeroFeeFailsTheFeeCheck() throws Exception {
+        List<Utxo> inputs = messyWallet();
+        Outcome outcome = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        // Move the fee into the change: inputs == outputs + 0 still balances, so only the fee check sees it.
+        TransactionOutput change = changeOf(tx);
+        change.getValue().setCoin(change.getValue().getCoin().add(tx.getBody().getFee()));
+        tx.getBody().setFee(BigInteger.ZERO);
+
+        String deviation = WalletShapeTransactions.shapeDeviation(tx, inputs, outcome.plan(), WALLET);
+        assertNotNull(deviation);
+        assertTrue(deviation.startsWith("built body has no positive fee"), deviation);
+    }
+
+    @Test
+    void anEmptyChangeFailsTheChangeCheck() throws Exception {
+        List<Utxo> inputs = messyWallet();
+        Outcome outcome = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        // Burn the whole change as fee: conserved, positive fee, ADA-only change — of zero lovelace.
+        TransactionOutput change = changeOf(tx);
+        tx.getBody().setFee(tx.getBody().getFee().add(change.getValue().getCoin()));
+        change.getValue().setCoin(BigInteger.ZERO);
+
+        String deviation = WalletShapeTransactions.shapeDeviation(tx, inputs, outcome.plan(), WALLET);
+        assertNotNull(deviation);
+        assertTrue(deviation.startsWith("change output 4 holds no lovelace"), deviation);
+    }
+
+    @Test
+    void sevenHundredInputsExceedMaxTxSizeInBothBuilders() {
+        // Measured in the round-1 audit: 700 inputs build a ~25 KB transaction; the fixture's maxTxSize is 16,384.
+        List<Utxo> inputs = new ArrayList<>();
+        for (int i = 0; i < 700; i++) {
+            inputs.add(utxo(2_000_000));
+        }
+
+        Outcome shaped = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.REFUSED, shaped.status(), shaped.detail());
+        assertNull(shaped.transaction());
+        assertTrue(shaped.detail().startsWith("transaction too large: "), shaped.detail());
+        assertTrue(shaped.detail().endsWith(" > maxTxSize 16384"), shaped.detail());
+
+        Outcome consolidation = engine.buildConsolidation(inputs);
+        assertEquals(Status.REFUSED, consolidation.status(), consolidation.detail());
+        assertNull(consolidation.transaction());
+        assertTrue(consolidation.detail().startsWith("transaction too large: "), consolidation.detail());
+        assertTrue(consolidation.detail().endsWith(" > maxTxSize 16384"), consolidation.detail());
+        assertEquals(0, submissions.get());
+    }
+
+    @Test
+    void aHundredAndFiftyPolicyBundleExceedsMaxValSizeInTheConsolidation() {
+        // 150 distinct policies spread over three UTxOs (each of which could exist on chain), consolidated
+        // into ONE output whose value alone is ~10 KB; the fixture's maxValSize is 5,000.
+        List<Utxo> inputs = new ArrayList<>();
+        for (int u = 0; u < 3; u++) {
+            List<Object> pairs = new ArrayList<>();
+            for (int i = 0; i < 50; i++) {
+                int n = u * 50 + i;
+                pairs.add(String.format("%056x", 0xdef000 + n) + String.format("%064x", n));
+                pairs.add(1_000_000L + n);
+            }
+            inputs.add(utxo(40_000_000, pairs.toArray()));
+        }
+        inputs.add(utxo(200_000_000));
+
+        Outcome consolidation = engine.buildConsolidation(inputs);
+        assertEquals(Status.REFUSED, consolidation.status(), consolidation.detail());
+        assertNull(consolidation.transaction());
+        assertTrue(consolidation.detail().startsWith("output value too large: output 0 value is "),
+                consolidation.detail());
+        assertTrue(consolidation.detail().endsWith(" > maxValSize 5000"), consolidation.detail());
     }
 
     @Test
