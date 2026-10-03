@@ -193,14 +193,14 @@ public class LiquidationReadinessController {
     private final AppConfig.Network network;
 
     /**
-     * ⛔ CACHED, because reading it is a PROVIDER CALL. {@code AppUtxoService.listWalletUtxo()} asks
-     * Blockfrost first by design — an index-backed balance cannot tell an empty wallet from one whose
-     * history starts below the sync point — and this page re-renders every sixty seconds in every
-     * open tab. Per-render reads would multiply provider traffic by the number of people looking.
+     * ⚠ A RENDER-FREQUENCY THROTTLE ON A LOCAL READ, not a cache of chain data against a provider.
+     * {@code AppUtxoService.listWalletUtxo()} reads the local Yaci index by the wallet's payment
+     * credential (FAB-134 B2) — no Blockfrost call is involved — and this page re-renders every sixty
+     * seconds in every open tab, so the TTL only bounds how often one render path queries Postgres.
      *
-     * <p>⚠ And a cached number shown as live is the failure that replaces the one being avoided, so
-     * the reading's AGE is rendered beside it. Volatile rather than synchronized: a duplicate read
-     * under a race costs one provider call, and a lock on a render path costs a stall.
+     * <p>⚠ A throttled number shown as live is still a stale number, so the reading's AGE is rendered
+     * beside it. Volatile rather than synchronized: a duplicate read under a race costs one database
+     * query, and a lock on a render path costs a stall.
      */
     private static final long WALLET_TTL_MILLIS = 60_000L;
 
@@ -247,6 +247,24 @@ public class LiquidationReadinessController {
     @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
         this.lendingConfigGate = gate;
+    }
+
+    /**
+     * ⛔ FAB-134 B2: the wallet panel is gated on {@code !isSyncing && walletReady}, exactly as the
+     * processors are, because the local index is the only place the wallet is read from. Setter-injected
+     * and REQUIRED in the container; null only in a direct test construction, where it reads as open.
+     */
+    private com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness;
+    private com.fluidtokens.aquarium.offchain.service.BlockEventListener blockEventListener;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setWalletReadiness(com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness) {
+        this.walletReadiness = walletReadiness;
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setBlockEventListener(com.fluidtokens.aquarium.offchain.service.BlockEventListener blockEventListener) {
+        this.blockEventListener = blockEventListener;
     }
 
     /**
@@ -305,6 +323,7 @@ public class LiquidationReadinessController {
         List<Row> all = rows(loans, scan, health, now);
         WalletBalance walletNow = wallet(now);
         model.addAttribute("wallet", walletNow);
+        model.addAttribute("walletNotReady", walletNotReadyReason());
         model.addAttribute("walletAgeSeconds", walletNow.ageSeconds(now));
         // ⚠ Scaled and tickered through the SAME AssetDisplay the table uses, so the balance cannot
         // render in different units from the loan figures it is meant to be compared against.
@@ -372,11 +391,27 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * The wallet, at most once per {@link #WALLET_TTL_MILLIS}. A failed read leaves the previous
-     * value standing rather than replacing a known balance with an unknown one — a transient
-     * provider blip should not make every affordability mark on the page go grey.
+     * The wallet, at most once per {@link #WALLET_TTL_MILLIS}, and only once the local index is
+     * known to hold all of it.
+     *
+     * <h2>⛔ Gated exactly like the processors</h2>
+     * The read is the local index (FAB-134 B2), which is complete only once the node has caught up
+     * ({@code !isSyncing}) AND the startup sweep has proven every wallet UTxO is indexed
+     * ({@code walletReady}). Before that, a balance read from it may be PARTIAL, and a partial balance
+     * understates silently ({@code officina:yaci-store-index-scoping} §5) — so while either gate is
+     * closed the page shows NO balance ({@link WalletBalance#unknown()}) and
+     * {@link #walletNotReadyReason()} says why. The database is not even queried.
+     *
+     * <h2>An empty answer is authoritative</h2>
+     * With the gate open, an empty result is an empty wallet and is shown as one — it is no longer
+     * treated as "we learned nothing" and papered over with a previous balance. A read that THROWS
+     * (the database is unreachable) still leaves the previous value standing: that is a failed read,
+     * not an answer, and a transient database blip should not grey every affordability mark.
      */
     WalletBalance wallet(long now) {
+        if (walletNotReadyReason() != null) {
+            return WalletBalance.unknown();
+        }
         WalletBalance cached = cachedWallet;
         if (cached.known() && now - cached.asOfMillis() < WALLET_TTL_MILLIS) {
             return cached;
@@ -387,18 +422,26 @@ public class LiquidationReadinessController {
         }
         try {
             WalletBalance fresh = WalletBalance.of(service.listWalletUtxo(), now);
-            // ⚠ listWalletUtxo() logs and returns an EMPTY LIST when the provider cannot be reached,
-            // so an empty result is ambiguous. Keeping a previously known balance is the honest
-            // reading of "we learned nothing new", and it is also the safe one.
-            if (fresh.byUnit().isEmpty() && cached.known()) {
-                return cached;
-            }
             cachedWallet = fresh;
             return fresh;
         } catch (RuntimeException e) {
             log.warn("the wallet balance could not be read for the readiness page: {}", e.toString());
             return cached;
         }
+    }
+
+    /**
+     * Why the wallet cannot be shown yet, or {@code null} when it can. Null collaborators mean a
+     * direct test construction and read as open, like the processors' gates.
+     */
+    String walletNotReadyReason() {
+        if (blockEventListener != null && blockEventListener.getIsSyncing().get()) {
+            return "wallet not ready: the node is still syncing";
+        }
+        if (walletReadiness != null && !walletReadiness.isWalletReady()) {
+            return "wallet not ready: sweep " + walletReadiness.sweepState();
+        }
+        return null;
     }
 
     private List<Row> rows(LoanService loans, LiquidationCandidateScanner scan,
@@ -417,7 +460,7 @@ public class LiquidationReadinessController {
         // of the ASSET, not of the row, and a table is mostly two or three distinct assets.
         Map<String, TokenMetadata> metadataMemo = new HashMap<>();
         List<Row> rows = new ArrayList<>();
-        // ⚠ ONCE per render, not once per row: it is a provider call behind a TTL, and twenty loans
+        // ⚠ ONCE per render, not once per row: it is a database read behind a TTL, and twenty loans
         // asking the same question twenty times would defeat the cache on the first miss.
         WalletBalance wallet = wallet(now);
         for (Loan loan : result.loanCensus().loans()) {

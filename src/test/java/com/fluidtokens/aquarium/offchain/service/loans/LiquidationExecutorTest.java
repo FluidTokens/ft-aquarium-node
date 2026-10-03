@@ -283,7 +283,7 @@ class LiquidationExecutorTest {
         private final List<Utxo> utxos;
 
         FakeAppUtxoService(List<Utxo> utxos) {
-            super(null, null, null);
+            super(null, null);
             this.utxos = utxos;
         }
 

@@ -300,7 +300,7 @@ class LiquidationSubmitVetoTest {
     private static final class FakeAppUtxoService extends AppUtxoService {
 
         FakeAppUtxoService() {
-            super(null, null, null);
+            super(null, null);
         }
 
         @Override

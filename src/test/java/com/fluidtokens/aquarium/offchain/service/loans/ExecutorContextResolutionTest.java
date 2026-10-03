@@ -257,7 +257,7 @@ class ExecutorContextResolutionTest {
 
         @Bean
         AppUtxoService appUtxoService() {
-            return new AppUtxoService(null, null, null);
+            return new AppUtxoService(null, null);
         }
 
         @Bean

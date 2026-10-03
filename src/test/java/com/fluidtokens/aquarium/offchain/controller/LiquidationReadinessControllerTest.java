@@ -1557,4 +1557,106 @@ class LiquidationReadinessControllerTest {
         market.setCap(BigInteger.valueOf(cap));
         return market;
     }
+
+    // ---- FAB-134 B2: the wallet panel reads the local index, gated like the processors ----------
+
+    private static final long T0 = 1_800_000_000_000L;
+
+    private static com.bloxbean.cardano.client.api.model.Utxo walletUtxo(long lovelace) {
+        var utxo = new com.bloxbean.cardano.client.api.model.Utxo();
+        utxo.setTxHash("aa".repeat(32));
+        utxo.setOutputIndex(0);
+        utxo.setAmount(new ArrayList<>(List.of(com.bloxbean.cardano.client.api.model.Amount.builder()
+                .unit("lovelace").quantity(BigInteger.valueOf(lovelace)).build())));
+        return utxo;
+    }
+
+    private static LiquidationReadinessController walletController(
+            com.fluidtokens.aquarium.offchain.service.AppUtxoService utxos) {
+        return new LiquidationReadinessController(provide(null), provide(null), provide(null),
+                provide(null), provide(null), provide(null), provide(null), provide(utxos),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200, 30), null);
+    }
+
+    private static com.fluidtokens.aquarium.offchain.service.BlockEventListener syncing(boolean syncing) {
+        var listener = new com.fluidtokens.aquarium.offchain.service.BlockEventListener(null);
+        listener.getIsSyncing().set(syncing);
+        return listener;
+    }
+
+    private static com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness ready(boolean ready) {
+        var readiness = org.mockito.Mockito.mock(
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness.class);
+        org.mockito.Mockito.when(readiness.isWalletReady()).thenReturn(ready);
+        org.mockito.Mockito.when(readiness.sweepState()).thenReturn(ready ? "ready" : "pending");
+        return readiness;
+    }
+
+    /** ⛔ Before the sweep has proven the index complete, the index may hold PART of the wallet. */
+    @Test
+    void beforeTheWalletIsReadyThePanelShowsNoBalanceAndDoesNotReadTheIndex() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
+        var controller = walletController(utxos);
+        controller.setBlockEventListener(syncing(false));
+        controller.setWalletReadiness(ready(false));
+
+        WalletBalance wallet = controller.wallet(T0);
+
+        assertFalse(wallet.known(), "a balance read before walletReady may be partial and must not be shown");
+        assertTrue(wallet.byUnit().isEmpty());
+        assertNotNull(controller.walletNotReadyReason());
+        assertTrue(controller.walletNotReadyReason().startsWith("wallet not ready"));
+        org.mockito.Mockito.verify(utxos, org.mockito.Mockito.never()).listWalletUtxo();
+    }
+
+    @Test
+    void whileTheNodeIsSyncingThePanelShowsNoBalanceAndDoesNotReadTheIndex() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
+        var controller = walletController(utxos);
+        controller.setBlockEventListener(syncing(true));
+        controller.setWalletReadiness(ready(true));
+
+        assertFalse(controller.wallet(T0).known());
+        assertTrue(controller.walletNotReadyReason().startsWith("wallet not ready"));
+        org.mockito.Mockito.verify(utxos, org.mockito.Mockito.never()).listWalletUtxo();
+    }
+
+    @Test
+    void onceSyncedAndReadyTheWalletIsReadAndShown() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
+        var controller = walletController(utxos);
+        controller.setBlockEventListener(syncing(false));
+        controller.setWalletReadiness(ready(true));
+
+        WalletBalance wallet = controller.wallet(T0);
+
+        assertTrue(wallet.known());
+        assertEquals(BigInteger.valueOf(5_000_000L), wallet.of("lovelace"));
+        assertNull(controller.walletNotReadyReason());
+    }
+
+    /**
+     * ⛔ An empty index answer is now AUTHORITATIVE. Keeping the previous balance over it would show
+     * money the wallet has since spent.
+     */
+    @Test
+    void anEmptyReadIsShownAsEmptyAndNeverPaperedOverWithTheCachedBalance() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo())
+                .thenReturn(List.of(walletUtxo(5_000_000L)))
+                .thenReturn(List.of());
+        var controller = walletController(utxos);
+
+        assertEquals(BigInteger.valueOf(5_000_000L), controller.wallet(T0).of("lovelace"));
+        WalletBalance later = controller.wallet(T0 + 61_000L);
+
+        assertTrue(later.known(), "an empty wallet is a known balance");
+        assertTrue(later.byUnit().isEmpty(),
+                "the index says the wallet is empty now; the earlier 5 ADA must not be shown");
+        assertEquals(T0 + 61_000L, later.asOfMillis());
+    }
 }
