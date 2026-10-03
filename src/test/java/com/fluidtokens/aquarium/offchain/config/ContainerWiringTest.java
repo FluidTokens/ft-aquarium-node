@@ -98,7 +98,7 @@ class ContainerWiringTest {
                         // source, so a synthetic context must state it as a node must.
                         "loans.liquidation.profit-margin-lovelace=5000000")
                 .withBean(BFBackendService.class,
-                        () -> new BFBackendService("https://cardano-preview.blockfrost.io/api/v0/", "test"))
+                        () -> new BFBackendService("https://example.invalid/api/v0/", "test"))
                 .withBean(AppConfig.Network.class, () -> network)
                 .withBean(LoansContractRegistry.class, ContainerWiringTest::previewRegistry)
                 .withBean(AppConfig.LoansConfiguration.class, AppConfig.LoansConfiguration::new)
@@ -203,7 +203,7 @@ class ContainerWiringTest {
                 .withPropertyValues("loans.liquidation.profit-margin-lovelace=5000000")
                 .withUserConfiguration(YaciConfig.class)
                 .withBean(BFBackendService.class,
-                        () -> new BFBackendService("https://cardano-preview.blockfrost.io/api/v0/", "test"))
+                        () -> new BFBackendService("https://example.invalid/api/v0/", "test"))
                 .withBean(AppConfig.Network.class, () -> network)
                 // ⛔ THE BARE-INSTALL REGISTRY: built through the same path Spring uses, from a
                 // LoansConfiguration whose coordinates are all empty — which is exactly what a public
