@@ -59,6 +59,13 @@ public class WalletReadiness {
         }
     }
 
+    /** Back to {@code pending} once a listing succeeds again, so a recovered Blockfrost does not read as failing. */
+    void clearListingFailure() {
+        if (sweepState.startsWith("refused listing failed")) {
+            sweepState = PENDING;
+        }
+    }
+
     void markSwept(String txHash) {
         sweepState = "swept " + txHash;
     }

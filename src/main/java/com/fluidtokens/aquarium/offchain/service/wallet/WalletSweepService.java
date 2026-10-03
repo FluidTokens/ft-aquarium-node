@@ -84,7 +84,7 @@ import java.util.stream.IntStream;
  * <h2>Every ambiguous case means no submit</h2>
  * Syncing, not yet settled, a listing failure, both builds refused, an oversize signed transaction, and
  * any exception: no submit, the gate stays closed, the next tick tries again. A listing failure is shown
- * on the state as {@code refused listing failed: …}. No exception ever leaves {@link #tick()}: one
+ * on the state as {@code refused listing failed: …} until a listing succeeds again. No exception ever leaves {@link #tick()}: one
  * escaping a {@code @Scheduled} method is only logged by the scheduler, so it is caught and logged here,
  * with its cause, instead.
  *
@@ -242,6 +242,7 @@ public class WalletSweepService {
         if (listed.isEmpty()) {
             return;
         }
+        readiness.clearListingFailure();
         // t0 is when Blockfrost has ANSWERED: the index must reach that slot, not the one the listing began at.
         Instant now = clock.instant();
         List<Utxo> listing = listed.get();
@@ -270,8 +271,12 @@ public class WalletSweepService {
         List<String> sweepListed = lastSweep == null ? List.of()
                 : refs.stream().filter(ref -> ref.startsWith(lastSweep.txHash() + "#")).toList();
         List<String> sweepListedUnindexed = sweepListed.stream().filter(ref -> !indexed(ref)).toList();
+        // ⛔ And EVERY ref Blockfrost lists now must have an index row. `judged` and `lastSweep` cannot see
+        // a self-send whose submit was reported failed (a 502 after the bytes were forwarded) yet landed:
+        // the listing then holds only its outputs, `judged` is empty, `lastSweep` is null.
         if (missing.isEmpty() && sweepListedUnindexed.isEmpty()
-                && (sweepIndexed || (!windowOpen && sweepListed.isEmpty()))) {
+                && (sweepIndexed || (!windowOpen && sweepListed.isEmpty()))
+                && refs.stream().allMatch(this::indexed)) {
             readiness.markReady();
             log.info("wallet sweep: all {} wallet UTxOs Blockfrost lists are in the local index — wallet READY",
                     listing.size());

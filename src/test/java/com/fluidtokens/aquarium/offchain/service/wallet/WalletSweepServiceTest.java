@@ -114,6 +114,8 @@ class WalletSweepServiceTest {
     private boolean submitLands = true;
     /** When set, every submit is recorded and then throws it: the bytes' fate is unknown. */
     private Exception submitThrows;
+    /** When set, a submit lands (if {@link #submitLands}) and THEN reports this HTTP error code. */
+    private Integer submitFailsWithCode;
     /** How long one Blockfrost page call takes on the test clock (zero: instantaneous). */
     private Duration listingLatency = Duration.ZERO;
 
@@ -169,6 +171,9 @@ class WalletSweepServiceTest {
         String hash = TransactionUtil.getTxHash(bytes);
         if (submitLands) {
             land(tx);
+        }
+        if (submitFailsWithCode != null) {
+            return Result.<String>error("Bad Gateway").code(submitFailsWithCode);
         }
         return Result.<String>success("ok").withValue(hash);
     }
@@ -792,6 +797,74 @@ class WalletSweepServiceTest {
         assertTrue(readiness.sweepState().startsWith("refused listing failed"), readiness.sweepState());
         assertFalse(readiness.isWalletReady());
         assertEquals(0, submitted.size());
+    }
+
+    // ---- owner rework after the slice-3 bounce ---------------------------------------------------
+
+    @Test
+    void aSubmitReportedFailedThatLandedAnywayDoesNotOpenTheGate() {
+        synced();
+        Utxo a = utxo(WALLET, 150_000_000);
+        Utxo missing = utxo(WALLET, 25_000_000);
+        onChain(a, missing);
+        indexed(a);
+        // Blockfrost forwards the bytes and then answers 502: the sweep reads as rejected, yet it lands.
+        submitFailsWithCode = 502;
+        WalletSweepService service = service();
+
+        tickAndSettle(service);
+        tickAndSettle(service);
+        assertEquals(1, submitted.size());
+        assertTrue(readiness.sweepState().startsWith("refused submit rejected"), readiness.sweepState());
+
+        // Blockfrost now lists ONLY the landed outputs; the index holds none of them.
+        tickAndSettle(service);
+        assertFalse(readiness.isWalletReady(),
+                "the listing holds only outputs the index has never seen: " + readiness.sweepState());
+
+        listedRefs().forEach(index::add);
+        tickAndSettle(service);
+        assertTrue(readiness.isWalletReady(), readiness.sweepState());
+    }
+
+    @Test
+    void goingIdleDropsTheObservationSoTheFirstTickBackOnlyObserves() {
+        synced();
+        Utxo a = utxo(WALLET, 150_000_000);
+        onChain(a);
+        WalletSweepService service = service();
+
+        service.tick();                                   // observes, unsettled
+        tankProcessorEnabled = false;
+        service.tick();                                   // idle
+        assertEquals(WalletReadiness.IDLE, readiness.sweepState());
+
+        tankProcessorEnabled = true;
+        clock.advance(Duration.ofSeconds(30));
+        listener.getLastAppliedSlot().set(Long.MAX_VALUE);   // the OLD observation would count as settled
+        service.tick();
+
+        assertEquals(0, findByIdCalls.get(), "the first tick back starts from a fresh, unsettled observation");
+        assertEquals(0, submitted.size());
+    }
+
+    @Test
+    void aListingThatSucceedsAgainClearsTheListingFailureFromTheState() {
+        synced();
+        Utxo a = utxo(WALLET, 150_000_000);
+        Utxo missing = utxo(WALLET, 25_000_000);
+        onChain(a, missing);
+        indexed(a);
+        WalletSweepService service = service();
+
+        forcedListingResult = Result.<List<Utxo>>error("Internal Server Error").code(500);
+        tickAndSettle(service);
+        assertTrue(readiness.sweepState().startsWith("refused listing failed"), readiness.sweepState());
+
+        forcedListingResult = null;
+        tickAndSettle(service);                           // observes only
+        assertEquals(WalletReadiness.PENDING, readiness.sweepState());
+        assertFalse(readiness.isWalletReady());
     }
 
     // ---- the sweep runs only on a node where something spends (FAB-134-3c) -----------------------
