@@ -333,6 +333,23 @@ seems to have no effect, confirm it reached the process and that the name still 
 docker compose exec aquarium-node env | grep AQUARIUM_
 ```
 
+### The startup wallet rebalance is gone (FAB-136)
+
+Older images listed the wallet at startup and, if any of its UTxOs predated the index, spent the
+whole wallet back to itself before letting anything run. **That no longer happens**, and with it
+**`/healthcheck`'s `wallet_sweep` field is gone** — if your monitoring reads that field, stop: it
+will not come back, and a missing field reads exactly like a check that never ran.
+
+What replaces it is a requirement on you, stated in [deploying.md §2](deploying.md#2-keys-and-secrets--read-this-before-creating-anything):
+**the wallet must hold no UTxO created before 2025-05-06** (mainnet slot `154984561`, where the
+node's index starts). The node reads its wallet only from that index, so an older UTxO is invisible
+to it. **If you are not sure, send the wallet's whole balance to the node's own address once — a
+single self-send — before restarting on the new image.**
+
+New, optional: `AQUARIUM_SYNCING_THRESHOLD_MINUTES` (default `10`). The node counts as syncing — no
+processing, `/healthcheck` answers `...syncing...` — while its last applied block is more than this
+many minutes old.
+
 ---
 
 ## 8. ⛔ The image runs as a non-root user — if you mount secrets as FILES, read this first

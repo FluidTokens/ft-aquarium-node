@@ -27,11 +27,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * FAB-134 B2 — the wallet is read <b>only from the local Yaci index, by payment credential</b>.
  *
  * <h2>Why there is no provider here any more</h2>
- * Giovanni ruled it first-hand: the wallet is never read from Blockfrost. The index is complete
- * because the startup wallet sweep and its {@code walletReady} gate (FAB-134-3) guarantee every
- * wallet UTxO is an output the index watched being created — which is what retires the old fear
- * ({@code officina:yaci-store-index-scoping} §5) that an index-backed view is silently partial.
- * Because the gate closes that hole, there is NO fallback: an empty index answer is the answer.
+ * Giovanni ruled it first-hand: the wallet is never read from Blockfrost. The wallet is read from the
+ * index once the node is not syncing (FAB-136), and its completeness rests on the operator requirement
+ * in {@code docs/deploying.md} §2 — no wallet UTxO created before the index's sync start — which is
+ * what answers the old fear ({@code officina:yaci-store-index-scoping} §5) that an index-backed view is
+ * silently partial. There is NO fallback: an empty index answer is the answer.
  *
  * <h2>What each test kills</h2>
  * <ul>

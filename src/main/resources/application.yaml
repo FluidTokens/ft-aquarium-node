@@ -57,6 +57,13 @@ aquarium:
     ref-input:
       txHash: 354ffe7958d62a8a2bf0b0bd97a06694d59dc49b6d02f1ab40165a3955257168
       outputIndex: 0
+  # The node is SYNCING while the last block it applied is more than this many minutes old: the drift
+  # is now − (block time of the last CommitEvent's slot), and syncing ⇔ drift > N. While syncing, the
+  # three spending processors (scheduled transactions, liquidation, compound) do nothing, /healthcheck
+  # answers "...syncing..." and the readiness wallet is not read. The flag starts true and moves only
+  # when a block arrives — ⚠ a stalled relay leaves its last value (accepted residue, no watchdog).
+  # Must be a positive whole number of minutes.
+  syncing-threshold-minutes: ${AQUARIUM_SYNCING_THRESHOLD_MINUTES:10}
 
 # FluidTokens Lending v4.
 #

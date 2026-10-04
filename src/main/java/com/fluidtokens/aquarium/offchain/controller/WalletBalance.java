@@ -19,10 +19,12 @@ import com.bloxbean.cardano.client.api.model.Utxo;
  * rendered beside it for that reason.
  *
  * <h2>⚠ What an empty map means, and what it does not</h2>
- * A KNOWN empty {@code byUnit} is an empty wallet: the read is gated on the node being synced and the
- * startup sweep having proven the index complete ({@code walletReady}), so an empty index answer is
- * authoritative. {@link #known()} false means NO answer — the gate is still closed or the read failed
- * — so the page can say so instead of rendering a confident zero over money that may be there.
+ * A KNOWN empty {@code byUnit} is an empty INDEXED wallet: the read is made from the index once the
+ * node is not syncing (FAB-136), and its completeness rests on the operator requirement in
+ * {@code docs/deploying.md} §2 — the wallet holds no UTxO created before the index's sync start. Nothing
+ * here proves that requirement was met. {@link #known()} false means NO answer — the node is still
+ * syncing or the read failed — so the page can say so instead of rendering a confident zero over money
+ * that may be there.
  */
 public record WalletBalance(Map<String, BigInteger> byUnit, long asOfMillis, boolean known) {
 

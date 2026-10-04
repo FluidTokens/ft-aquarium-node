@@ -86,9 +86,9 @@ import static com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.norma
  * cannot fund the collateral, a change output and a fee, and {@link #buildShaped} refuses it every time.
  * Each caller's contract decides what that means (owner ruling, FAB-134 r2):
  * <ul>
- *   <li><b>The startup sweep</b> exists only to get UTxOs indexed. A consolidation moves them into an
- *       indexed output, after which the sweep has nothing left to do — it stops whether or not the wallet
- *       is in the target shape.</li>
+ *   <li><b>There is no startup caller (FAB-136).</b> The startup wallet rebalance that used to call
+ *       {@link #buildConsolidation} is gone; this class is currently unwired and kept for the FAB-130
+ *       rebalance. Wallet completeness is now an operator requirement ({@code docs/deploying.md} §2).</li>
  *   <li><b>The rebalance (FAB-130)</b> calls only {@link #buildShaped}, which refuses without signing or
  *       submitting, so a wallet that cannot be shaped costs no fee. Retrying a refusal forever is the
  *       caller's bug to prevent, not this class's.</li>

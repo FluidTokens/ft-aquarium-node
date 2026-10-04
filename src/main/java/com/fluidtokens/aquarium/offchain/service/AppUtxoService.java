@@ -27,11 +27,11 @@ public class AppUtxoService {
      * <h2>⛔ No provider, and no fallback (FAB-134 B2)</h2>
      * Giovanni ruled it first-hand: the wallet is never read from Blockfrost. The old fear —
      * {@code officina:yaci-store-index-scoping} §5, an index-backed balance that is silently PARTIAL
-     * because the wallet's history starts below the sync point — is addressed by the startup one-shot
-     * rebalance ({@code WalletSweepService}): near tip it lists the wallet once and, if any UTxO is not
-     * indexed, spends the whole wallet into fresh outputs the index watches being created. It is NOT a
-     * guarantee: a failed listing or rebalance releases the processors anyway (Giovanni 2026-10-03), and
-     * a partial view then simply under-reports — "eventually consistent; a tx with a missing input just
+     * because the wallet's history starts below the sync point — is addressed by an operator
+     * requirement, not by code (FAB-136): the wallet is read from the index once the node is not
+     * syncing, and its completeness rests on {@code docs/deploying.md} §2 — the wallet holds no UTxO
+     * created before the index's sync start (remedy: one self-send). It is NOT checked here: a wallet
+     * that breaks it simply under-reports — "eventually consistent; a tx with a missing input just
      * fails". Nothing here second-guesses the index either way.
      *
      * <h2>By credential, not by address</h2>
