@@ -122,7 +122,26 @@ class ContainerWiringTest {
                                 network))
                 .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
                         () -> org.cardanofoundation.conversions.ClasspathConversionsFactory
-                                .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW));
+                                .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW))
+                // ⚑ FAB-134 B3a: the UtxoSupplier bean now reads the local index first, so it takes the
+                // Yaci UtxoRepository and the TankUtxoStorage that owns the watched-credential set.
+                .withBean(com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class,
+                        ContainerWiringTest::indexRepository)
+                .withBean(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class,
+                        () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class));
+    }
+
+    /** A Yaci repository stub: the container only needs it to exist; nothing here queries it. */
+    private static com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository indexRepository() {
+        return (com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository)
+                java.lang.reflect.Proxy.newProxyInstance(ContainerWiringTest.class.getClassLoader(),
+                        new Class<?>[]{com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class},
+                        (proxy, method, args) -> switch (method.getName()) {
+                            case "toString" -> "stub UtxoRepository";
+                            case "hashCode" -> System.identityHashCode(proxy);
+                            case "equals" -> proxy == args[0];
+                            default -> throw new UnsupportedOperationException(method.getName());
+                        });
     }
 
     /** The fourth preview deployment, the one application.yaml ships. */
@@ -232,6 +251,12 @@ class ContainerWiringTest {
                 .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
                         () -> org.cardanofoundation.conversions.ClasspathConversionsFactory
                                 .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW))
+                // ⚑ FAB-134 B3a: the UtxoSupplier bean now reads the local index first, so it takes the
+                // Yaci UtxoRepository and the TankUtxoStorage that owns the watched-credential set.
+                .withBean(com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class,
+                        ContainerWiringTest::indexRepository)
+                .withBean(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class,
+                        () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class))
                 .run(ctx -> {
                     assertNull(ctx.getStartupFailure(),
                             () -> "a bare install — no flag, no coordinates — must START. There is no "

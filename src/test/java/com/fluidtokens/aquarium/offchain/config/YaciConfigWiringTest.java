@@ -3,10 +3,16 @@ package com.fluidtokens.aquarium.offchain.config;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.api.model.Result;
+import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.backend.api.UtxoService;
 import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.client.util.HexUtil;
+import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
@@ -17,10 +23,15 @@ import com.fluidtokens.aquarium.offchain.service.TankContractService;
 import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
+import com.fluidtokens.aquarium.offchain.storage.IndexFirstUtxoSupplier;
+import com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Proxy;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -30,7 +41,9 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -229,6 +242,46 @@ class YaciConfigWiringTest {
         assertEquals(1, calls.get(),
                 "the tank processor did not read protocol parameters through the injected supplier");
         verify(backend, never()).getEpochService();
+    }
+
+    /**
+     * ⛔ FAB-134 B3a: the {@code UtxoSupplier} bean is the INDEX-FIRST supplier, built from the
+     * production collaborators. Coin selection ({@code getAll}) must never reach Blockfrost's
+     * {@code UtxoService}; an out-ref the index does not hold ({@code getTxOutput} miss) must reach it,
+     * once. Reverting the bean to {@code new DefaultUtxoSupplier(...)} turns this red.
+     */
+    @Test
+    void theUtxoSupplierBeanIsIndexFirstAndOnlyAMissReachesBlockfrost() throws Exception {
+        var wallet = new Account(com.bloxbean.cardano.client.common.model.Networks.testnet());
+        String walletPkh = wallet.getBaseAddress().getPaymentCredentialHash().map(HexUtil::encodeHexString).get();
+        String missTx = "cd".repeat(32);
+
+        UtxoService utxoService = mock(UtxoService.class);
+        Utxo fromBlockfrost = Utxo.builder().txHash(missTx).outputIndex(4).address("blockfrost").build();
+        when(utxoService.getTxOutput(missTx, 4))
+                .thenReturn(Result.<Utxo>success("ok").withValue(fromBlockfrost));
+        BFBackendService bf = mock(BFBackendService.class);
+        when(bf.getUtxoService()).thenReturn(utxoService);
+        TankUtxoStorage storage = mock(TankUtxoStorage.class);
+        when(storage.indexedPaymentCredentials()).thenReturn(Set.of(walletPkh));
+        UtxoRepository repo = (UtxoRepository) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{UtxoRepository.class},
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "findUnspentByOwnerAddr" -> Optional.of(List.<AddressUtxoEntity>of());
+                    case "findById" -> Optional.empty();
+                    default -> throw new UnsupportedOperationException(method.getName());
+                });
+
+        UtxoSupplier bean = new YaciConfig().utxoSupplier(repo, storage, bf);
+
+        assertInstanceOf(IndexFirstUtxoSupplier.class, bean,
+                "YaciConfig's UtxoSupplier bean is a " + bean.getClass().getName()
+                        + ": every coin selection would be a Blockfrost read again");
+        assertTrue(bean.getAll(wallet.baseAddress()).isEmpty());
+        verifyNoInteractions(utxoService);
+
+        assertEquals("blockfrost", bean.getTxOutput(missTx, 4).orElseThrow().getAddress());
+        verify(utxoService, times(1)).getTxOutput(missTx, 4);
     }
 
     /**

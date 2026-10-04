@@ -7,6 +7,7 @@ import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
+import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
@@ -15,6 +16,8 @@ import com.fluidtokens.aquarium.offchain.service.loans.ConvertLiquidationRouter;
 import com.fluidtokens.aquarium.offchain.service.loans.ConvertTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.storage.IndexFirstUtxoSupplier;
+import com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.context.annotation.Bean;
@@ -32,17 +35,29 @@ public class YaciConfig {
     }
 
     /**
-     * The two suppliers {@link LiquidateTransactionBuilder} needs, taken off the same Blockfrost
-     * backend the rest of the node uses.
+     * The node's {@link UtxoSupplier}: the local Yaci index first (FAB-134 B3a), see
+     * {@link IndexFirstUtxoSupplier}.
+     * <ul>
+     *   <li>UTxOs at an address — coin selection — come ONLY from the index, for the payment credentials
+     *       {@link TankUtxoStorage#indexedPaymentCredentials()} watches; any other address is refused,
+     *       and an empty answer is never topped up from Blockfrost.</li>
+     *   <li>One output by out-ref comes from the index when it holds the row with a faithful
+     *       reference-script hash, and otherwise from Blockfrost's {@code UtxoService} — one direct read
+     *       per miss, nothing cached. That covers the reference inputs this node does not index (oracle
+     *       feeds and scripts, FluidTokens-published reference scripts).</li>
+     * </ul>
      * <p>
-     * Deliberately narrower than handing the builder a {@code BackendService}: a supplier can answer
-     * "what is at this address" and "what are the protocol params", and nothing else — in particular
-     * it cannot submit. That is what keeps the builder's "never takes a BackendService, never
-     * submits" property a matter of wiring rather than of discipline.
+     * Deliberately narrower than handing a builder a {@code BackendService}: a supplier can answer
+     * "what is at this address" and "what is at this out-ref", and nothing else — in particular it
+     * cannot submit. That keeps a builder's "never submits" property a matter of wiring rather than of
+     * discipline.
      */
     @Bean
-    public UtxoSupplier utxoSupplier(BFBackendService bfBackendService) {
-        return new DefaultUtxoSupplier(bfBackendService.getUtxoService());
+    public UtxoSupplier utxoSupplier(UtxoRepository utxoRepository,
+                                     TankUtxoStorage tankUtxoStorage,
+                                     BFBackendService bfBackendService) {
+        return new IndexFirstUtxoSupplier(utxoRepository, tankUtxoStorage::indexedPaymentCredentials,
+                new DefaultUtxoSupplier(bfBackendService.getUtxoService()));
     }
 
     /**

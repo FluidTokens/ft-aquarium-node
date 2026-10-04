@@ -78,6 +78,15 @@ public class TankUtxoStorage extends UtxoStorageImpl {
         log.info("Indexing UTxOs for {} payment credentials: {}", contractPaymentPkh.size(), contractPaymentPkh);
     }
 
+    /**
+     * The payment credentials this index keeps, fixed at construction — the ONLY source of truth for
+     * "what the index watches". An output under any other credential was discarded at write time and
+     * left no trace, so an index answer about it would be indistinguishable from "empty".
+     */
+    public Set<String> indexedPaymentCredentials() {
+        return contractPaymentPkh;
+    }
+
     @Override
     public void saveUnspent(List<AddressUtxo> addressUtxoList) {
         try {
