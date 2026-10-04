@@ -118,6 +118,7 @@ class YaciConfigWiringTest {
                 previewNetwork(),
                 LoanFixtures.utxoSupplier(List.of()),
                 LoanFixtures.protocolParams(),
+                hash -> Optional.empty(),
                 new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
 
         Field field = CompoundTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
@@ -135,22 +136,44 @@ class YaciConfigWiringTest {
     }
 
     /**
-     * The compound builder must also be handed the BackendService, not a bare supplier trio: a
-     * transaction carrying reference scripts can only be priced by something that can fetch them
-     * (CCL trap 9), and the offline three-argument form cannot.
+     * ⛔ FAB-134 B3b-4: the compound bean holds EXACTLY what the container injected — the index-first
+     * {@link UtxoSupplier}, the per-epoch {@link ProtocolParamsSupplier} and the byte-serving
+     * {@link ScriptSupplier} — and no {@code BackendService} field at all. A fresh supplier here would send
+     * every compound's coin selection, collateral and indexed reference inputs back to Blockfrost; a
+     * backend field would hand the builder a submission path through the back door. This replaces the
+     * pre-B3b assertion that the builder HELD a BackendService (then its only route to script bytes).
      */
     @Test
-    void theProductionCompoundBuilderCanReachAScriptSupplier() throws Exception {
+    void theProductionCompoundBuilderHoldsTheInjectedSuppliersAndNoBackend() throws Exception {
+        UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(List.of());
+        ProtocolParamsSupplier protocolParamsSupplier = LoanFixtures.protocolParams();
+        ScriptSupplier scriptSupplier = hash -> Optional.empty();
+
         CompoundTransactionBuilder builder = new YaciConfig().compoundTransactionBuilder(
                 LoanFixtures.shippedPreviewRegistry(), previewNetwork(),
-                LoanFixtures.utxoSupplier(List.of()), LoanFixtures.protocolParams(),
+                utxoSupplier, protocolParamsSupplier, scriptSupplier,
                 new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
 
-        Field field = CompoundTransactionBuilder.class.getDeclaredField("backendService");
-        field.setAccessible(true);
-        assertNotNull(field.get(builder),
-                "the compound builder holds no BackendService, so QuickTxBuilder gets the offline "
-                        + "three-argument form and cannot price a referenced script");
+        assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
+                "the compound builder does not hold the injected (index-first) UtxoSupplier");
+        assertSame(protocolParamsSupplier, fieldOf(builder, "protocolParamsSupplier"),
+                "the compound builder does not hold the injected (per-epoch) ProtocolParamsSupplier");
+        assertSame(scriptSupplier, fieldOf(builder, "scriptSupplier"),
+                "the compound builder does not hold the injected ScriptSupplier, so QuickTxBuilder cannot be "
+                        + "handed the bytes of a referenced script (CCL trap 9)");
+
+        Object evaluator = fieldOf(builder, "scriptCostEvaluator");
+        assertNotNull(evaluator, "YaciConfig built the compound builder WITHOUT a script-cost evaluator");
+        for (java.lang.reflect.Method method : evaluator.getClass().getMethods()) {
+            assertFalse(method.getName().toLowerCase().contains("submit"),
+                    "the evaluator the compound builder holds exposes " + method.getName()
+                            + ": a submission path through the back door");
+        }
+        for (Field field : CompoundTransactionBuilder.class.getDeclaredFields()) {
+            assertFalse(BackendService.class.isAssignableFrom(field.getType()),
+                    "the compound builder declares a BackendService field (" + field.getName()
+                            + "): a submission path, and a route back to Blockfrost for every read");
+        }
     }
 
     /**

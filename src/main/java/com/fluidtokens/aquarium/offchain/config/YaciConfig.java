@@ -148,17 +148,27 @@ public class YaciConfig {
      * builder holds can price a transaction and nothing else. <b>The operator's whole risk case for
      * arming this path — "exposure is the transaction fee per execution" — is true only while the
      * ex-units are measured</b>: placeholder ex-units move the exposure to the collateral (CCL trap 8).
+     *
+     * <p>FAB-134 B3b-4: built from the three injected suppliers and the evaluator, and holding nothing
+     * else — the {@link UtxoSupplier} (index-first: coin selection, collateral and the indexed config and
+     * pool-side reference inputs), the per-epoch {@link ProtocolParamsSupplier} (not a fetch per build)
+     * and the hash-checked {@link ScriptSupplier}. Per compound build Blockfrost now sees one evaluate,
+     * plus {@code getTxOutput} for out-refs the index does not hold — today the FT-published
+     * reference-script coordinates {@code CompoundExecutor} resolves per candidate. The builder is handed
+     * no {@code BFBackendService}: that would hand it a submission path through the back door.
      */
     @Bean
     public CompoundTransactionBuilder compoundTransactionBuilder(LoansContractRegistry registry,
                                                                  AppConfig.Network network,
                                                                  UtxoSupplier utxoSupplier,
                                                                  ProtocolParamsSupplier protocolParamsSupplier,
+                                                                 ScriptSupplier scriptSupplier,
                                                                  BFBackendService bfBackendService) {
         TransactionEvaluator scriptCostEvaluator =
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
-        return new CompoundTransactionBuilder(registry, network.getCardanoNetwork(), bfBackendService,
-                utxoSupplier, protocolParamsSupplier, scriptCostEvaluator);
+        // The three injected suppliers and the evaluator lambda — never the BackendService itself.
+        return new CompoundTransactionBuilder(registry, network.getCardanoNetwork(),
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator);
     }
 
     /**

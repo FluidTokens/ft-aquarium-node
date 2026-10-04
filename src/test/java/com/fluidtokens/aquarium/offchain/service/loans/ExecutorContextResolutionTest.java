@@ -288,9 +288,9 @@ class ExecutorContextResolutionTest {
 
         @Bean
         CompoundTransactionBuilder builder(BFBackendService backendService) {
-            return new CompoundTransactionBuilder(REGISTRY, Networks.preview(), backendService,
+            return new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                     LoanFixtures.utxoSupplier(List.of()), LoanFixtures.protocolParams(),
-                    (cbor, utxos) -> null);
+                    scriptHash -> java.util.Optional.empty(), (cbor, utxos) -> null);
         }
 
         @Bean
