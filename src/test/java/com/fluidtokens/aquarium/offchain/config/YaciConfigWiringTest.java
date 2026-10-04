@@ -509,7 +509,13 @@ class YaciConfigWiringTest {
             "addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a";
     private static final String SHIPPED_POOL_SPEND_HASH = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
 
+    private static final String SHIPPED_POOL_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+
     private static AppConfig.LoansConfiguration minswap(String poolAddress, String spendHash) {
+        return minswap(poolAddress, spendHash, SHIPPED_POOL_POLICY);
+    }
+
+    private static AppConfig.LoansConfiguration minswap(String poolAddress, String spendHash, String policyId) {
         return new AppConfig.LoansConfiguration() {
             @Override
             public String getMinswapPoolAddress() {
@@ -523,7 +529,7 @@ class YaciConfigWiringTest {
 
             @Override
             public String getMinswapPoolPolicyId() {
-                return "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+                return policyId;
             }
         };
     }
@@ -551,6 +557,54 @@ class YaciConfigWiringTest {
 
         assertSame(repository, fieldOf(resolver, "utxoRepository"));
         assertEquals(SHIPPED_POOL_SPEND_HASH, fieldOf(resolver, "poolSpendScriptHash"));
+    }
+
+    /** ⚑ The real ada/ASCEND pool datum, read off {@code 4c805499…#1} on 2026-09-18 (as in MinswapPoolResolverTest). */
+    private static final String ASCEND_POOL_DATUM = "d8799fd8799fd87a9f581c1eae96baf29e27682ea3f815aba361a0c6059d45e4bfbe95bbd2f44affffd8799f4040ffd8799f581ceb7a93ebc321647673490810f618b548d7c24aa64d30ae342dba70764a0014df10415343454e44ff1b000000ba6be20bdc1b000000ce9358c8a91b000000ed5e5802cf18641864d8799f190682ffd87980ff";
+    private static final com.fluidtokens.aquarium.offchain.model.AssetType ASCEND =
+            com.fluidtokens.aquarium.offchain.model.AssetType.fromUnit(
+                    "eb7a93ebc321647673490810f618b548d7c24aa64d30ae342dba70760014df10415343454e44");
+
+    private static com.bloxbean.cardano.yaci.store.common.domain.Amt amt(String unit, long quantity) {
+        var amount = new com.bloxbean.cardano.yaci.store.common.domain.Amt();
+        amount.setUnit(unit);
+        amount.setQuantity(java.math.BigInteger.valueOf(quantity));
+        return amount;
+    }
+
+    /**
+     * ⛔ FAB-135 T2c (amendment 2): Yaci stores payment credentials and asset units LOWERCASE. A pool
+     * hash or policy id configured in uppercase -- which the boot check accepts, comparing
+     * case-insensitively -- would query a credential no row carries and match no MSP or LP unit, so
+     * every pair would read "not indexed" while the pool sat in the index. The bean lowercases both.
+     */
+    @Test
+    void anUppercaseConfiguredPoolResolverStillFindsTheIndexedPool() {
+        String lp = SHIPPED_POOL_POLICY + com.fluidtokens.aquarium.offchain.service.loans.ConvertTxEncoder
+                .computeLpAssetName(com.fluidtokens.aquarium.offchain.model.AssetType.ada(), ASCEND);
+        AddressUtxoEntity row = new AddressUtxoEntity();
+        row.setTxHash("4c805499".repeat(8));
+        row.setOutputIndex(1);
+        row.setOwnerAddr(SHIPPED_POOL_ADDRESS);
+        row.setOwnerPaymentCredential(SHIPPED_POOL_SPEND_HASH);
+        row.setInlineDatum(ASCEND_POOL_DATUM);
+        row.setAmounts(new java.util.ArrayList<>(List.of(amt("lovelace", 5_000_000L),
+                amt(SHIPPED_POOL_POLICY + com.fluidtokens.aquarium.offchain.service.loans.ConvertTxEncoder
+                        .POOL_NFT_ASSET_NAME, 1L),
+                amt(lp, 9_000_000_000L))));
+        UtxoRepository repository = mock(UtxoRepository.class);
+        // Answers ONLY for the lowercase credential, exactly as the database would.
+        when(repository.findUnspentByOwnerPaymentCredential(
+                org.mockito.ArgumentMatchers.eq(SHIPPED_POOL_SPEND_HASH),
+                org.mockito.ArgumentMatchers.any(org.springframework.data.domain.Pageable.class)))
+                .thenReturn(Optional.of(List.of(row)));
+
+        var resolver = new YaciConfig().minswapPoolResolver(minswap(SHIPPED_POOL_ADDRESS,
+                SHIPPED_POOL_SPEND_HASH.toUpperCase(), SHIPPED_POOL_POLICY.toUpperCase()), repository);
+
+        var pool = resolver.snapshot().resolveEitherOrder(com.fluidtokens.aquarium.offchain.model.AssetType.ada(), ASCEND);
+        assertTrue(pool.isPresent(), "an uppercase-configured resolver must still find the indexed pool");
+        assertEquals("4c805499".repeat(8), pool.get().utxo().getTxHash());
     }
 
     @Test

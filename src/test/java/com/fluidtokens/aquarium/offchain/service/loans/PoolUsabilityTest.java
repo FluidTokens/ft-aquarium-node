@@ -106,7 +106,7 @@ class PoolUsabilityTest {
                 "collapsing these two tells an operator to hold capital forever over a timeout");
         assertTrue(failed.detail().contains("not evidence that no pool exists"),
                 "the failed check must say it proves nothing: " + failed.detail());
-        assertTrue(none.detail().contains("no Minswap pool exists"));
+        assertTrue(none.detail().contains("no Minswap pool for this pair is indexed (pools idle since 2025-05-06 are invisible)"));
     }
 
     // ---- the states that are about the pool rather than the loan ---------------------------------

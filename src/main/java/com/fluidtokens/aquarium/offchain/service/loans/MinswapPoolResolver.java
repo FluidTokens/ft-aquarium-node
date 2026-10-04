@@ -139,13 +139,6 @@ public class MinswapPoolResolver {
         return new Snapshot(byLpUnit, poolPolicyId);
     }
 
-    /**
-     * ⛔ Scaffolding for the readiness page only; removed by FAB-135-T2c. One snapshot per call.
-     */
-    public List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
-        return snapshot().resolveEitherOrder(one, other).map(List::of).orElse(List.of());
-    }
-
     /** The authentic pool this row is, if it is one; empty for anything else at the address. */
     private Optional<ResolvedPool> authenticate(AddressUtxoEntity row, String msp) {
         Utxo utxo;

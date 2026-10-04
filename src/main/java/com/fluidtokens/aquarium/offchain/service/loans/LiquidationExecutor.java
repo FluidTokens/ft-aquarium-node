@@ -1065,20 +1065,23 @@ public class LiquidationExecutor {
                     return;
                 } catch (MinswapPoolResolver.RefusedException e) {
                     // ⛔ THE POOL LOOKUP REFUSED — and WHICH refusal decides whether this is a verdict
-                    // or a transport problem. They are not the same fact and must not read alike.
+                    // or a failure to read the local pool index. They are not the same fact and must not
+                    // read alike.
                     if (e.refusal() == MinswapPoolResolver.Refusal.LOOKUP_FAILED) {
-                        // A TRANSPORT failure on an eligible candidate: retried on the very next cycle
+                        // An INDEX READ failure (the node's own database, FAB-137 — no provider is asked
+                        // any more) on an eligible candidate: retried on the very next cycle
                         // and logged at ERROR on every cycle it happens (FAB-134 NQ). It used to be held
                         // for two cycles at WARN — and before that, measured on mainnet 2026-09-09, for
                         // thirty minutes — and a candidate the bot should liquidate but cannot is a
                         // fault to be seen and fixed, not waited out.
                         decisionLog.record(decision(assessment, now,
                                 LiquidationDecision.Outcome.REFUSED, e.refusal().name(),
-                                e.getMessage() + ". This is a TRANSPORT failure, not a verdict: it says "
-                                        + "nothing about whether a pool exists, which is what "
-                                        + "NO_MINSWAP_POOL reports."));
-                        log.error("the pool lookup for {} failed in transport: {} — the candidate itself "
-                                        + "was never assessed; retried next cycle",
+                                e.getMessage() + ". This is not a verdict: the local pool index (the "
+                                        + "node's own database) could not be read, which says nothing "
+                                        + "about whether a pool exists, which is what NO_MINSWAP_POOL "
+                                        + "reports."));
+                        log.error("the pool lookup for {} failed reading the local pool index: {} — the "
+                                        + "candidate itself was never assessed; retried next cycle",
                                 loanUtxoRef, causeChain(e), e);
                         walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
                         return;

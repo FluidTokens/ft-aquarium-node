@@ -3883,10 +3883,15 @@ class LiquidationExecutorTest {
             assertEquals("LOOKUP_FAILED", decision.reason(),
                     "a transport failure must be distinguishable from NO_MINSWAP_POOL, which is a verdict");
             assertFalse(decision.detail().contains("held for"), "no hold: " + decision.detail());
+            // FAB-137 T2c: the pool is read from the node's own index, so the failure is named as one --
+            // "transport" / "the provider" would send an operator looking at a network that was never used.
+            assertTrue(decision.detail().contains("the local pool index (the node's own database) could not "
+                    + "be read"), decision.detail());
+            assertFalse(decision.detail().contains("TRANSPORT"), decision.detail());
         }
         List<ILoggingEvent> errors = appender.list.stream()
                 .filter(event -> event.getLevel() == Level.ERROR)
-                .filter(event -> event.getFormattedMessage().contains("failed in transport"))
+                .filter(event -> event.getFormattedMessage().contains("failed reading the local pool index"))
                 .toList();
         assertEquals(2, errors.size(), "ERROR on each cycle, never WARN: " + appender.list);
         assertTrue(errors.getFirst().getFormattedMessage().contains("SocketTimeoutException"),

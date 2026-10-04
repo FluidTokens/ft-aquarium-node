@@ -242,8 +242,13 @@ public class YaciConfig {
                         + "Minswap pool script");
             }
         }
-        return new MinswapPoolResolver(utxoRepository, spendHash,
-                loansConfiguration.getMinswapPoolPolicyId());
+        // ⛔ Yaci stores payment credentials and asset units LOWERCASE, and the check above compares
+        // case-insensitively — so an uppercase hash or policy id would pass it, then query a credential
+        // no row carries and match no MSP or LP unit: every pair "not indexed" with the pool in the index.
+        String policyId = loansConfiguration.getMinswapPoolPolicyId();
+        return new MinswapPoolResolver(utxoRepository,
+                spendHash == null ? null : spendHash.toLowerCase(java.util.Locale.ROOT),
+                policyId == null ? null : policyId.toLowerCase(java.util.Locale.ROOT));
     }
 
     /**
