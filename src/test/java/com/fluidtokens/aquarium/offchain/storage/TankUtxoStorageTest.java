@@ -182,6 +182,27 @@ class TankUtxoStorageTest {
                 "X was spent in the block that created it; without a spend row it is a ghost forever");
         assertEquals(List.of(tx2 + "#0"), unspentFor(walletPkh),
                 "the wallet's unspent read must return only Y — never the already-spent X");
+        // The spend row must carry the SPENDING block and tx: Yaci's rollback deletes tx_input rows by
+        // spent_at_slot, so a row without it would survive a rollback and hide a live output forever.
+        var row = dsl.fetchOne("SELECT spent_at_slot, spent_at_block, spent_tx_hash FROM tx_input "
+                + "WHERE tx_hash = ? AND output_index = 0", tx1);
+        assertEquals(SLOT, row.get(0, Long.class));
+        assertEquals(SLOT, row.get(1, Long.class));
+        assertEquals(tx2, row.get(2, String.class));
+    }
+
+    /** A block that died between its two calls leaves nothing behind for the next block's saveSpent. */
+    @Test
+    void aBlockThatDiedBeforeSaveUnspentLeavesNothingForTheNextBlock() {
+        var storage = storage();
+        String x = tx(41), spender = tx(42), next = tx(43);
+
+        storage.saveSpent(List.of(spend(x, 0, spender, SLOT)));      // block N: saveUnspent never runs
+        // Block N' (a fork that never spends X) creates X.
+        block(storage, List.of(spend(next, 0, tx(44), SLOT + 1)), List.of(output(x, 0, walletPkh, SLOT + 1)));
+
+        assertTrue(!spentRow(x, 0), "a dead block's remembered spend must not attach to a later block's output");
+        assertEquals(List.of(x + "#0"), unspentFor(walletPkh));
     }
 
     /** A chain inside one block: tx1 → X, tx2 spends X → Y, tx3 spends Y → Z. Only Z is unspent. */

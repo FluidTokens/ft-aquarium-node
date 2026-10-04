@@ -124,6 +124,9 @@ public class TankUtxoStorage extends UtxoStorageImpl {
 
     @Override
     public void saveSpent(List<TxInput> txInputs) {
+        // A block's remembered inputs live from its saveSpent to its saveUnspent. Starting clean here makes a
+        // leak across blocks impossible even if a previous block died between the two calls.
+        pendingSpends.remove();
         var fluidtokensRentsInputs = new ArrayList<TxInput>();
         Map<UtxoKey, TxInput> pending = pendingSpends.get();
         for (TxInput txInput : txInputs) {
@@ -137,7 +140,7 @@ public class TankUtxoStorage extends UtxoStorageImpl {
         }
         try {
             super.saveSpent(fluidtokensRentsInputs);
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | Error e) {
             // The block is abandoned (UtxoProcessor rethrows and stops the fetcher); its remembered
             // inputs must not survive on this thread into whatever block runs next.
             pendingSpends.remove();
