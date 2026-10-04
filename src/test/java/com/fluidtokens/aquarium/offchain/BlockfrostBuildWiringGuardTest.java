@@ -10,6 +10,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -140,6 +142,10 @@ class BlockfrostBuildWiringGuardTest {
         assertEquals(3, argumentsOf("new QuickTxBuilder(supplierOf(a, b), params, (TransactionProcessor) null)"));
         assertEquals(4, argumentsOf("new QuickTxBuilder(u, p, s -> Optional.of(m.get(s, t)), new X<A, B>())"));
         assertEquals(0, argumentsOf("new QuickTxBuilder()"));
+        assertEquals(1, argumentsOf("new com.bloxbean.cardano.client.quicktx.QuickTxBuilder(backendService)"));
+        assertEquals(1, argumentsOf("new  com.bloxbean . cardano.client.quicktx.QuickTxBuilder\n    (backendService)"));
+        assertEquals(List.of(), sitesIn("x.java", "new NotAQuickTxBuilder(b); new QuickTxBuilderFactory(b);",
+                "QuickTxBuilder"), "a different type whose name merely contains the guarded one is not a site");
         assertEquals(List.of(), sitesIn("x.java",
                 "/* new QuickTxBuilder(backend) */ String s = \"new QuickTxBuilder(b)\"; // new QuickTxBuilder(b)\n",
                 "QuickTxBuilder"),
@@ -170,25 +176,23 @@ class BlockfrostBuildWiringGuardTest {
         return sites;
     }
 
-    /** Every {@code new <type>(} in the code (comments and literals blanked), with its top-level argument count. */
+    /**
+     * Every construction of {@code type} in the code (comments and literals blanked), with its top-level
+     * argument count. ⚠ The type may be written FULLY QUALIFIED — this codebase does that routinely
+     * ({@code new com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier(...)}) — and a guard that
+     * matched only the simple name was walked straight past by exactly that spelling.
+     */
     private static List<Site> sitesIn(String file, String source, String type) {
         String code = blankCommentsAndLiterals(source);
-        String needle = "new " + type + "(";
+        Matcher matcher = Pattern.compile("\\bnew\\s+(?:[A-Za-z_$][\\w$]*\\s*\\.\\s*)*"
+                + Pattern.quote(type) + "\\s*(?:<[^()]*>\\s*)?\\(").matcher(code);
         List<Site> sites = new ArrayList<>();
-        int from = 0;
-        while (true) {
-            int at = code.indexOf(needle, from);
-            if (at < 0) {
-                return sites;
-            }
-            boolean wordStart = at == 0 || !Character.isJavaIdentifierPart(code.charAt(at - 1));
-            from = at + needle.length();
-            if (!wordStart) {
-                continue;
-            }
+        while (matcher.find()) {
+            int at = matcher.start();
             int line = 1 + (int) code.substring(0, at).chars().filter(c -> c == '\n').count();
-            sites.add(new Site(file, line, topLevelArguments(code, from)));
+            sites.add(new Site(file, line, topLevelArguments(code, matcher.end())));
         }
+        return sites;
     }
 
     /** Arguments of the call whose opening parenthesis ends just before {@code start}, up to its matching one. */
