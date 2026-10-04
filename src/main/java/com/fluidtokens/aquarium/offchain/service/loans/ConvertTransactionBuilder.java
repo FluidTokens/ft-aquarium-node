@@ -499,7 +499,18 @@ public class ConvertTransactionBuilder {
                 // reference script, and ChangeOutputAdjustments falls through to its own selector.
                 .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
                 .preBalanceTx((ctx, txn) ->
-                        ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)));
+                        ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                // ⛔ CCL trap 9b, the THIRD seam: with no collateral inputs named, QuickTxBuilder's
+                // buildCollateralOutput picks collateral with its own unguarded
+                // DefaultUtxoSelectionStrategyImpl (a hardcoded 5 ADA target) — blind to both guards
+                // above. Measured (FAB-134 B3b-3 pin, ConvertProductionWiringTest): with the published
+                // scripts listed before the wallet — production's IndexFirstUtxoSupplier pages by tx id,
+                // so that order is as likely as any — every 9-50 ADA wallet pledged a 20 ADA reference
+                // script as its ONLY collateral, which a phase-2 failure consumes. So the collateral is
+                // chosen here from reference-script-free wallet UTxOs, sized from the protocol
+                // parameters — the liquidation builders' helper, shared rather than copied (as compound).
+                .withCollateralInputs(LiquidateTransactionBuilder.collateralInputsFor(utxoSupplier,
+                        protocolParamsSupplier, request.changeAddress(), request.walletUtxo()));
 
         if (verify != null) {
             context = context.postBalanceTx(verify);
