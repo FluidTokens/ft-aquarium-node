@@ -515,6 +515,17 @@ store:
     keep-alive-interval: 1000
   blocks:
     epoch-calculation-interval=14400:  # 14400 = 4 hours
+  # FAB-137: Yaci's UTxO pruning, ON. Every 600 s it deletes outputs (address_utxo) and their spend
+  # rows (tx_input) that were SPENT more than pruning-safe-blocks blocks behind the tip (Yaci's
+  # default, 2160, kept on purpose: a rollback can never reach a pruned row). An UNSPENT row is
+  # never pruned. Why now: the Minswap V2 pool credential is indexed, and a pool UTxO is spent and
+  # recreated on every swap, so without pruning both tables grow with every batch forever.
+  # ⛔ The key is `pruning-interval`, NOT `pruning.interval`: Yaci 0.1.7 binds the fields
+  # pruningEnabled / pruningInterval / pruningSafeBlocks, a misspelt key is silently ignored and the
+  # 86400 s default stays in force. ShippedDefaultsTest binds this block into Yaci's own class.
+  utxo:
+    pruning-enabled: true
+    pruning-interval: 600
 
 apiPrefix: /api/v1
 

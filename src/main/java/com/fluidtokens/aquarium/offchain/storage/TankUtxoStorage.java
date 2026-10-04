@@ -17,6 +17,7 @@ import com.fluidtokens.aquarium.offchain.service.TankContractService;
 import lombok.extern.slf4j.Slf4j;
 import org.jooq.DSLContext;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.PlatformTransactionManager;
 
@@ -24,6 +25,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -53,7 +55,8 @@ public class TankUtxoStorage extends UtxoStorageImpl {
                            ParametersContractService parametersContractService,
                            StakerContractService stakerContractService,
                            TankContractService tankContractService,
-                           ObjectProvider<LoansContractRegistry> loansContractRegistry) {
+                           ObjectProvider<LoansContractRegistry> loansContractRegistry,
+                           @Value("${loans.minswap.pool-spend-script-hash:}") String minswapPoolSpendScriptHash) {
         super(utxoRepository, spentOutputRepository, dsl, utxoCache, platformTransactionManager);
         this.utxoRepository = utxoRepository;
         var pkhs = new LinkedHashSet<>(List.of(
@@ -74,6 +77,23 @@ public class TankUtxoStorage extends UtxoStorageImpl {
         // that moment on; the ones that passed meanwhile are unrecoverable short of a cursor delete
         // and a full re-sync. A filter that narrows at startup is a filter that loses history.
         loansContractRegistry.ifAvailable(loans -> pkhs.addAll(loans.indexedPaymentCredentials()));
+        // ⛔ FAB-137: THE MINSWAP V2 POOL PAYMENT CREDENTIAL IS WATCHED UNCONDITIONALLY — whatever the
+        // registry's state, whatever any convert setting says. A flag here would be a DATA-RETENTION
+        // switch, not a feature toggle: while off, a pool UTxO that swaps is marked spent (saveSpent is
+        // not filtered) and its successor is dropped, so the pool vanishes from the index while live on
+        // chain, and turning the flag back on restores nothing (officina yaci-store-index-scoping §2a).
+        // Configuration alone decides: blank means "no Minswap deployment on this network" and adds
+        // nothing; malformed is a typo and fails here, naming the key. ⚠ Like every credential in this
+        // set, it only sees blocks from the cursor onwards: a pool idle since then is invisible until it
+        // next trades, which is why upgrading to the release that added it requires a cursor wipe.
+        String minswapPool = minswapPoolSpendScriptHash == null ? "" : minswapPoolSpendScriptHash.strip();
+        if (!minswapPool.isEmpty()) {
+            if (!minswapPool.matches("[0-9a-fA-F]{56}")) {
+                throw new IllegalStateException("loans.minswap.pool-spend-script-hash must be blank or a 56-hex "
+                        + "script hash, got [" + minswapPoolSpendScriptHash + "]");
+            }
+            pkhs.add(minswapPool.toLowerCase(Locale.ROOT));
+        }
         this.contractPaymentPkh = Set.copyOf(pkhs);
         log.info("Indexing UTxOs for {} payment credentials: {}", contractPaymentPkh.size(), contractPaymentPkh);
     }

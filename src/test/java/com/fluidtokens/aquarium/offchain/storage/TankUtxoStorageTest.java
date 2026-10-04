@@ -27,13 +27,16 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -53,14 +56,18 @@ import static org.mockito.Mockito.when;
  * The bug lives in the interaction between our filter and the superclass's writes, so the superclass
  * must really write. The Yaci migrations run from {@code classpath:db/store/h2} (the same location
  * production names, H2 copy) and {@code UtxoStorageImpl} writes through a real jOOQ {@link DSLContext}.
- * Only the Spring Data {@link UtxoRepository} is stood in for — no JPA context is booted anywhere in this
- * suite — and its {@code findById} answers from the same {@code address_utxo} table, so the filter reads
+ * Only the Spring Data {@link UtxoRepository} is stood in for — the real JPA repositories are exercised by
+ * {@link TankUtxoStoragePoolRollbackTest} — and its {@code findById} answers from the same {@code address_utxo} table, so the filter reads
  * exactly what the superclass wrote. The unspent check mirrors {@code findUnspentByOwnerPaymentCredential}
  * (the wallet read since slice 4): {@code address_utxo LEFT JOIN tx_input ... WHERE tx_input IS NULL}.
  */
 class TankUtxoStorageTest {
 
     private static final String FOREIGN_PKH = "ff".repeat(28);
+    /** The Minswap V2 pool payment credential the base document ships (loans.minswap.pool-spend-script-hash). */
+    private static final String POOL_PKH = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+    private static final String STAKE_1 = "c1".repeat(28);
+    private static final String STAKE_2 = "c2".repeat(28);
     private static final long SLOT = 1_000L;
 
     private DSLContext dsl;
@@ -77,6 +84,11 @@ class TankUtxoStorageTest {
     }
 
     private TankUtxoStorage storage(UtxoCache cache) {
+        return storage(cache, POOL_PKH, emptyLoans());
+    }
+
+    private TankUtxoStorage storage(UtxoCache cache, String minswapPoolSpendScriptHash,
+                                    ObjectProvider<LoansContractRegistry> loans) {
         var utxoRepository = mock(UtxoRepository.class);
         when(utxoRepository.findById(any())).thenAnswer(inv -> {
             UtxoId id = inv.getArgument(0);
@@ -91,14 +103,35 @@ class TankUtxoStorageTest {
         when(staker.getScriptHashHex()).thenReturn("a2".repeat(28));
         var tank = mock(TankContractService.class);
         when(tank.getScriptHashHex()).thenReturn("a3".repeat(28));
-        @SuppressWarnings("unchecked")
-        ObjectProvider<LoansContractRegistry> loans = mock(ObjectProvider.class);
         return new TankUtxoStorage(utxoRepository, mock(TxInputRepository.class), dsl, cache, null,
-                account, parameters, staker, tank, loans);
+                account, parameters, staker, tank, loans, minswapPoolSpendScriptHash);
     }
 
     private TankUtxoStorage storage() {
         return storage(new UtxoCache());
+    }
+
+    private TankUtxoStorage storage(String minswapPoolSpendScriptHash, ObjectProvider<LoansContractRegistry> loans) {
+        return storage(new UtxoCache(), minswapPoolSpendScriptHash, loans);
+    }
+
+    /** No registry bean at all: {@code ifAvailable} does nothing. */
+    @SuppressWarnings("unchecked")
+    private static ObjectProvider<LoansContractRegistry> emptyLoans() {
+        return mock(ObjectProvider.class);
+    }
+
+    /** A registry that exists but has blank coordinates — the bare-install state. */
+    @SuppressWarnings("unchecked")
+    private static ObjectProvider<LoansContractRegistry> unconfiguredLoans() {
+        var registry = new LoansContractRegistry("", "", "706172616d6574657273", "");
+        assertFalse(registry.isConfigured(), "fixture: this registry must be the UNCONFIGURED one");
+        ObjectProvider<LoansContractRegistry> provider = mock(ObjectProvider.class);
+        doAnswer(inv -> {
+            ((Consumer<LoansContractRegistry>) inv.getArgument(0)).accept(registry);
+            return null;
+        }).when(provider).ifAvailable(any());
+        return provider;
     }
 
     // ---- reads straight off the tables -------------------------------------------------------------
@@ -132,6 +165,10 @@ class TankUtxoStorageTest {
     }
 
     private static AddressUtxo output(String txHash, int index, String ownerPkh, long slot) {
+        return output(txHash, index, ownerPkh, null, slot);
+    }
+
+    private static AddressUtxo output(String txHash, int index, String ownerPkh, String stakePkh, long slot) {
         return AddressUtxo.builder()
                 .txHash(txHash)
                 .outputIndex(index)
@@ -140,6 +177,7 @@ class TankUtxoStorageTest {
                 .blockHash("bb".repeat(32))
                 .ownerAddr("addr_test1_fixture")
                 .ownerPaymentCredential(ownerPkh)
+                .ownerStakeCredential(stakePkh)
                 .lovelaceAmount(BigInteger.valueOf(2_000_000L))
                 .amounts(new ArrayList<>())
                 .build();
@@ -309,5 +347,113 @@ class TankUtxoStorageTest {
         storage.saveUnspent(List.of(output(x, 0, walletPkh, SLOT + 1)));
 
         assertFalse(spentRow(x, 0), "a failed saveUnspent must still end the block's remembered set");
+    }
+
+    // ---- FAB-137 T2a: the Minswap V2 pool payment credential --------------------------------------
+
+    /** The base set: wallet + parameters + staker + tank, and nothing else. */
+    private Set<String> baseSet() {
+        return Set.of(walletPkh, "a1".repeat(28), "a2".repeat(28), "a3".repeat(28));
+    }
+
+    /**
+     * (i) The pool credential is watched whatever stake credential the pool output carries — S1, S2 or
+     * none (enterprise) — and the addition is UNCONDITIONAL: no registry bean, or a registry with blank
+     * coordinates, must not take it away (a flag on a write-time filter is a data-retention switch).
+     */
+    @Test
+    void thePoolCredentialIsIndexedUnderAnyStakeCredentialWithNoRegistry() {
+        assertPoolOutputsAreSavedUnderEveryStakeShape(storage(POOL_PKH, emptyLoans()));
+    }
+
+    @Test
+    void thePoolCredentialIsIndexedUnderAnyStakeCredentialWithAnUnconfiguredRegistry() {
+        assertPoolOutputsAreSavedUnderEveryStakeShape(storage(POOL_PKH, unconfiguredLoans()));
+    }
+
+    private void assertPoolOutputsAreSavedUnderEveryStakeShape(TankUtxoStorage storage) {
+        assertTrue(storage.indexedPaymentCredentials().contains(POOL_PKH),
+                "the Minswap pool payment credential must be in the indexed set: "
+                        + storage.indexedPaymentCredentials());
+        assertEquals(baseSet().size() + 1, storage.indexedPaymentCredentials().size(),
+                "the set grows by exactly the pool credential");
+
+        String withS1 = tx(101), withS2 = tx(102), enterprise = tx(103);
+        block(storage, List.of(), List.of(
+                output(withS1, 0, POOL_PKH, STAKE_1, SLOT),
+                output(withS2, 0, POOL_PKH, STAKE_2, SLOT),
+                output(enterprise, 0, POOL_PKH, null, SLOT)));
+
+        assertTrue(indexed(withS1, 0), "pool output under stake credential S1 must be stored");
+        assertTrue(indexed(withS2, 0), "pool output under a DIFFERENT stake credential S2 must be stored");
+        assertTrue(indexed(enterprise, 0), "pool output with no stake part (enterprise) must be stored");
+        assertEquals(Set.of(withS1 + "#0", withS2 + "#0", enterprise + "#0"), Set.copyOf(unspentFor(POOL_PKH)));
+    }
+
+    /** The configured hash is normalised to lowercase, which is how Yaci writes owner_payment_credential. */
+    @Test
+    void anUppercasePoolCredentialIsIndexedLowercase() {
+        var storage = storage(POOL_PKH.toUpperCase(), emptyLoans());
+        assertTrue(storage.indexedPaymentCredentials().contains(POOL_PKH));
+        assertFalse(storage.indexedPaymentCredentials().contains(POOL_PKH.toUpperCase()));
+    }
+
+    /** (ii) Blank means "this network has no Minswap deployment": the set is exactly the base set. */
+    @Test
+    void aBlankPoolCredentialAddsNothing() {
+        for (String blank : java.util.Arrays.asList("", "  ", null)) {
+            var storage = storage(blank, emptyLoans());
+            assertEquals(baseSet(), storage.indexedPaymentCredentials(), "blank value [" + blank + "]");
+        }
+    }
+
+    /** (iii) Present but malformed is a typo, not an absence: construction fails, naming the key. */
+    @Test
+    void aMalformedPoolCredentialFailsConstructionNamingTheProperty() {
+        for (String malformed : List.of(
+                POOL_PKH.substring(1),                    // 55 characters
+                POOL_PKH + "0",                           // 57 characters
+                "zz" + POOL_PKH.substring(2),             // 56 characters, not hex
+                "addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a")) {
+            var e = assertThrows(IllegalStateException.class, () -> storage(malformed, emptyLoans()),
+                    "a malformed value must not start: " + malformed);
+            assertTrue(e.getMessage().contains("loans.minswap.pool-spend-script-hash"),
+                    "the failure must name the property: " + e.getMessage());
+            assertTrue(e.getMessage().contains(malformed), "the failure must name the value: " + e.getMessage());
+        }
+    }
+
+    /**
+     * (iv) + (v) Minswap batchers routinely create and spend a pool UTxO in one block. The created
+     * output must end up spent — a tx_input row exists and the unspent join returns nothing for it —
+     * with the pool output first in the block's output list, and last after a wallet output.
+     */
+    @Test
+    void aPoolOutputCreatedAndSpentInTheSameBlockIsRecordedSpentPoolFirst() {
+        var storage = storage();
+        String created = tx(201), batch = tx(202);
+
+        block(storage,
+                List.of(spend(created, 0, batch, SLOT)),
+                List.of(output(created, 0, POOL_PKH, STAKE_1, SLOT), output(batch, 0, POOL_PKH, STAKE_1, SLOT)));
+
+        assertTrue(indexed(created, 0), "the pool output is ours, so its row is kept");
+        assertTrue(spentRow(created, 0), "spent in the block that created it: it needs a tx_input row");
+        assertEquals(List.of(batch + "#0"), unspentFor(POOL_PKH));
+    }
+
+    @Test
+    void aPoolOutputCreatedAndSpentInTheSameBlockIsRecordedSpentPoolLastAfterAWalletOutput() {
+        var storage = storage();
+        String walletTx = tx(301), created = tx(302), batch = tx(303);
+
+        block(storage,
+                List.of(spend(created, 0, batch, SLOT)),
+                List.of(output(walletTx, 0, walletPkh, SLOT), output(created, 0, POOL_PKH, STAKE_2, SLOT)));
+
+        assertTrue(indexed(created, 0), "the pool output is ours, so its row is kept");
+        assertTrue(spentRow(created, 0), "spent in the block that created it: it needs a tx_input row");
+        assertTrue(unspentFor(POOL_PKH).isEmpty(), "the created-and-spent pool output must not read unspent");
+        assertEquals(List.of(walletTx + "#0"), unspentFor(walletPkh));
     }
 }
