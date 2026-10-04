@@ -67,6 +67,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>The reference-script fee is charged for every referenced script, the oracle's included.</li>
  *   <li>No script is both witnessed and referenced ({@code ExtraneousScriptWitnessesUTXOW}).</li>
  *   <li>A failed evaluation refuses the build — the production flag is strict.</li>
+ *   <li>A short wallet never spends a published reference script held at the bot's own address
+ *       (CCL trap 9b, the SELECTOR seam), and the constructor refuses a null evaluator (CCL trap 8).</li>
  * </ol>
  */
 @Slf4j
@@ -257,14 +259,75 @@ class LiquidateProductionWiringTest {
                 "a failed evaluation on the production path must refuse by name, not ship placeholders");
     }
 
+    /**
+     * (v) CCL trap 9b, the SELECTOR seam. The bot address holds the six published loans-v4 reference
+     * scripts (ada-only, 20 ADA each) and ONE short wallet utxo. When the wallet cannot cover the build,
+     * cardano-client-lib's ChangeOutputAdjustments tops the change up through the context's UtxoSelector
+     * ({@code findFirst(sender, adaOnly && qty > required)}, no reference-script check) — so without the
+     * selector installed in {@code preBalanceTx} it consumes a published script. Measured 2026-10-04 on
+     * this rig with that line deleted: the failure text is recorded in the FAB-134 B3b-1 pin commit.
+     * For every wallet value the build either refuses or spends no reference-script utxo.
+     */
+    @Test
+    void aShortWalletNeverSpendsAPublishedReferenceScriptHeldAtTheBotAddress() throws Exception {
+        long[] walletLovelace = {2_000_000L, 2_500_000L, 2_750_000L, 3_000_000L, 3_500_000L, 4_000_000L,
+                6_000_000L};
+        int built = 0;
+        List<String> outcomes = new ArrayList<>();
+        for (long lovelace : walletLovelace) {
+            Utxo wallet = LoanFixtures.adaUtxo("e1".repeat(32), 0, LoanFixtures.botAddress(), lovelace);
+            List<Utxo> universe = universe(wallet, LoanFixtures.botAddress());
+            Set<TransactionInput> published = new HashSet<>();
+            universe.stream().filter(u -> u.getReferenceScriptHash() != null)
+                    .forEach(u -> published.add(new TransactionInput(u.getTxHash(), u.getOutputIndex())));
+            assertEquals(7, published.size(), "six loans-v4 reference scripts and the oracle's");
+
+            Transaction transaction;
+            try {
+                transaction = production(universe, new HashCheckedScriptSupplier(rigScripts()),
+                        new Recording(aiken(universe))).build(request(wallet));
+            } catch (LiquidateTransactionBuilder.RefusedException refused) {
+                outcomes.add(lovelace + ": refused " + refused.getReason());
+                continue;
+            }
+            Transaction reread = Transaction.deserialize(transaction.serialize());
+            List<TransactionInput> spent = new ArrayList<>(reread.getBody().getInputs());
+            if (reread.getBody().getCollateral() != null) {
+                spent.addAll(reread.getBody().getCollateral());
+            }
+            for (TransactionInput input : spent) {
+                assertTrue(!published.contains(input), "wallet " + lovelace + " lovelace: the build spends "
+                        + "the published reference-script utxo " + input.getTransactionId() + "#"
+                        + input.getIndex() + " (CCL trap 9b — the selector seam is unguarded)");
+            }
+            built++;
+            outcomes.add(lovelace + ": built, " + reread.getBody().getInputs().size() + " inputs");
+        }
+        log.info("FAB-134 B3b-1 short-wallet sweep: {}", outcomes);
+        assertTrue(built > 0, "no wallet value built at all, so the sweep proves nothing: " + outcomes);
+    }
+
+    /** (vi) The production constructor has no null-evaluator form (CCL trap 8). */
+    @Test
+    void theProductionConstructorRefusesANullEvaluator() {
+        NullPointerException npe = assertThrows(NullPointerException.class,
+                () -> production(new HashCheckedScriptSupplier(rigScripts()), null));
+        assertEquals("scriptCostEvaluator", npe.getMessage());
+    }
+
     // ======================================================================================
     // The rig's leaves
     // ======================================================================================
 
     /** The production constructor, exactly the one YaciConfig calls. */
     private static LiquidateTransactionBuilder production(ScriptSupplier scripts, TransactionEvaluator evaluator) {
+        return production(universe(), scripts, evaluator);
+    }
+
+    private static LiquidateTransactionBuilder production(List<Utxo> universe, ScriptSupplier scripts,
+                                                          TransactionEvaluator evaluator) {
         return new LiquidateTransactionBuilder(REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(),
-                LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), scripts, evaluator);
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), scripts, evaluator);
     }
 
     /** The provider leaf: the registry's applied scripts plus the deployed oracle, served by hash. */
@@ -273,7 +336,11 @@ class LiquidateProductionWiringTest {
     }
 
     private static AikenTransactionEvaluator aiken() {
-        return new AikenTransactionEvaluator(LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(),
+        return aiken(universe());
+    }
+
+    private static AikenTransactionEvaluator aiken(List<Utxo> universe) {
+        return new AikenTransactionEvaluator(LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
                 rigScripts(), SlotConfigs.preview());
     }
 
@@ -298,6 +365,10 @@ class LiquidateProductionWiringTest {
     }
 
     private static LiquidateTransactionBuilder.Request request() {
+        return request(WALLET_UTXO);
+    }
+
+    private static LiquidateTransactionBuilder.Request request(Utxo wallet) {
         LoanDatum datum = new LoanDatumConverter().deserialize(LOAN_DATUM_HEX);
         LenderManagerDatum bondDatum = new LenderManagerDatumConverter().deserialize(BOND_DATUM_HEX);
         Loan loan = new Loan(LOAN_TX, LOAN_OUTPUT_INDEX, LOAN_ADDRESS, LOAN_ID,
@@ -310,7 +381,7 @@ class LiquidateProductionWiringTest {
                 oracle.feed(), VALID_FROM);
         return new LiquidateTransactionBuilder.Request(
                 List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loanUtxo(), bondUtxo())),
-                CONFIG_UTXO, LM_CONFIG_UTXO, Map.of(ORACLE_NFT.toUnit(), oracle), WALLET_UTXO,
+                CONFIG_UTXO, LM_CONFIG_UTXO, Map.of(ORACLE_NFT.toUnit(), oracle), wallet,
                 LoanFixtures.botAddress(), VALID_FROM, VALID_TO, MARGIN, REFERENCE_SCRIPTS);
     }
 
@@ -333,7 +404,15 @@ class LiquidateProductionWiringTest {
      * bytes), and the six published loans-v4 reference-script UTxOs carrying the derived hashes.
      */
     private static List<Utxo> universe() {
-        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+        return universe(WALLET_UTXO, null);
+    }
+
+    /**
+     * @param referenceScriptAddress where the six loans-v4 reference-script UTxOs sit; {@code null} puts
+     *                               each at its own script's enterprise address
+     */
+    private static List<Utxo> universe(Utxo wallet, String referenceScriptAddress) {
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, wallet,
                 loanUtxo(), bondUtxo()));
         universe.add(LoanFixtures.utxo(ORACLE_REF_INPUT.getTransactionId(), ORACLE_REF_INPUT.getIndex(),
                 ORACLE_ADDRESS, List.of(Amount.lovelace(BigInteger.valueOf(1_038_710L)),
@@ -352,7 +431,7 @@ class LiquidateProductionWiringTest {
             String hash = hashOf(REGISTRY_SCRIPTS.get(i));
             universe.add(Utxo.builder().txHash(coordinates.get(i).getTransactionId())
                     .outputIndex(coordinates.get(i).getIndex())
-                    .address(LoanFixtures.entAddress(hash))
+                    .address(referenceScriptAddress != null ? referenceScriptAddress : LoanFixtures.entAddress(hash))
                     .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
                     .referenceScriptHash(hash).build());
         }
