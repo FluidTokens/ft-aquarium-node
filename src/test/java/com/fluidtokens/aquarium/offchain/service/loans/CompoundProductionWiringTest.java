@@ -311,48 +311,112 @@ class CompoundProductionWiringTest {
     }
 
     /**
-     * CCL trap 9b, the SELECTOR seam. The bot address holds the eleven published compound reference
-     * scripts (ada-only, 20 ADA each) beside ONE short wallet utxo. When the wallet cannot cover the build,
-     * cardano-client-lib's ChangeOutputAdjustments tops the change up through the context's UtxoSelector,
-     * which checks no reference script — so without the selector installed in {@code preBalanceTx} it
-     * consumes a published script. For every wallet value the build either refuses or spends none.
+     * The order in which the rig's UTxO supplier lists the bot address. {@code LoanFixtures.utxoSupplier}
+     * answers in LIST order, while production's {@code IndexFirstUtxoSupplier} pages by transaction id —
+     * effectively random against the wallet — and CCL's selectors take the first UTxOs that fit. A sweep
+     * that only ever lists the wallet first can stay green while production picks a reference script.
+     */
+    enum Ordering {
+        /** The wallet utxo before the eleven published scripts. */
+        WALLET_FIRST,
+        /** The eleven published scripts before the wallet utxo. */
+        SCRIPTS_FIRST,
+        /** Scripts first, then the wallet split into utxos of at most 4 ADA (the first is the nominated one). */
+        WALLET_SPLIT
+    }
+
+    /**
+     * CCL trap 9b, ALL THREE seams: the bot address holds the eleven published compound reference scripts
+     * (ada-only, 20 ADA each) beside a short wallet.
+     * <ul>
+     *   <li>the STRATEGY and the {@code preBalanceTx} SELECTOR: when the wallet cannot cover the build,
+     *       ChangeOutputAdjustments tops the change up through the context's UtxoSelector, which checks no
+     *       reference script;</li>
+     *   <li>the COLLATERAL: with no collateral inputs named, {@code buildCollateralOutput} selects its own
+     *       with an unguarded default strategy and a 5 ADA target — measured pledging a published script
+     *       for a 3.0–4.5 ADA wallet before {@code withCollateralInputs} was wired (FAB-134 B3b-4).</li>
+     * </ul>
+     * For every wallet value, under every {@link Ordering}, the build either refuses or neither spends nor
+     * pledges a published script.
      */
     @Test
     void aShortWalletNeverSpendsAPublishedReferenceScriptHeldAtTheBotAddress() throws Exception {
         long[] walletLovelace = {1_000_000L, 1_500_000L, 2_000_000L, 2_500_000L, 3_000_000L, 3_500_000L,
-                4_000_000L, 5_000_000L, 6_000_000L, 8_000_000L, 12_000_000L};
-        int built = 0;
-        List<String> outcomes = new ArrayList<>();
-        for (long lovelace : walletLovelace) {
-            Fixture f = fixture(wallet(lovelace), BOT);
-            Set<TransactionInput> published = new HashSet<>();
-            f.universe.stream().filter(u -> u.getReferenceScriptHash() != null && BOT.equals(u.getAddress()))
-                    .forEach(u -> published.add(new TransactionInput(u.getTxHash(), u.getOutputIndex())));
-            assertEquals(11, published.size(), "the eleven compound reference scripts sit at the bot address");
+                4_000_000L, 4_500_000L, 5_000_000L, 6_000_000L, 8_000_000L, 12_000_000L};
+        for (Ordering ordering : Ordering.values()) {
+            int built = 0;
+            List<String> outcomes = new ArrayList<>();
+            for (long lovelace : walletLovelace) {
+                Fixture f = ordered(fixture(wallet(lovelace), BOT), ordering, lovelace);
+                Set<TransactionInput> published = new HashSet<>();
+                f.universe.stream().filter(u -> u.getReferenceScriptHash() != null && BOT.equals(u.getAddress()))
+                        .forEach(u -> published.add(new TransactionInput(u.getTxHash(), u.getOutputIndex())));
+                assertEquals(11, published.size(), "the eleven compound reference scripts sit at the bot address");
 
-            Transaction transaction;
-            try {
-                transaction = production(f.universe, new HashCheckedScriptSupplier(rigScripts()),
-                        new Recording(aiken(f.universe))).build(f.request);
-            } catch (RuntimeException refused) {
-                outcomes.add(lovelace + ": refused " + refused.getClass().getSimpleName());
-                continue;
+                Transaction transaction;
+                try {
+                    transaction = production(f.universe, new HashCheckedScriptSupplier(rigScripts()),
+                            new Recording(aiken(f.universe))).build(f.request);
+                } catch (RuntimeException refused) {
+                    outcomes.add(lovelace + ": refused " + refused.getClass().getSimpleName());
+                    continue;
+                }
+                Transaction reread = Transaction.deserialize(transaction.serialize());
+                for (TransactionInput input : reread.getBody().getInputs()) {
+                    assertFalse(published.contains(input), ordering + ", wallet " + lovelace + " lovelace: the "
+                            + "build SPENDS the published reference-script utxo " + input.getTransactionId() + "#"
+                            + input.getIndex() + " (CCL trap 9b — the selector seam is unguarded)");
+                }
+                List<TransactionInput> collateral = reread.getBody().getCollateral() == null
+                        ? List.of() : reread.getBody().getCollateral();
+                for (TransactionInput input : collateral) {
+                    assertFalse(published.contains(input), ordering + ", wallet " + lovelace + " lovelace: the "
+                            + "build pledges the published reference-script utxo " + input.getTransactionId() + "#"
+                            + input.getIndex() + " as COLLATERAL, which a phase-2 failure consumes (CCL trap 9b — "
+                            + "the collateral seam is unguarded)");
+                }
+                built++;
+                outcomes.add(lovelace + ": built, " + reread.getBody().getInputs().size() + " inputs, "
+                        + collateral.size() + " collateral");
             }
-            Transaction reread = Transaction.deserialize(transaction.serialize());
-            List<TransactionInput> spent = new ArrayList<>(reread.getBody().getInputs());
-            if (reread.getBody().getCollateral() != null) {
-                spent.addAll(reread.getBody().getCollateral());
-            }
-            for (TransactionInput input : spent) {
-                assertFalse(published.contains(input), "wallet " + lovelace + " lovelace: the build spends "
-                        + "the published reference-script utxo " + input.getTransactionId() + "#"
-                        + input.getIndex() + " (CCL trap 9b — the selector seam is unguarded)");
-            }
-            built++;
-            outcomes.add(lovelace + ": built, " + reread.getBody().getInputs().size() + " inputs");
+            log.info("FAB-134 B3b-4 compound short-wallet sweep {}: {}", ordering, outcomes);
+            assertTrue(built > 0, ordering + ": no wallet value built at all, so the sweep proves nothing: "
+                    + outcomes);
         }
-        log.info("FAB-134 B3b-4 compound short-wallet sweep: {}", outcomes);
-        assertTrue(built > 0, "no wallet value built at all, so the sweep proves nothing: " + outcomes);
+    }
+
+    /** Reorders (and for WALLET_SPLIT re-shapes) the bot-address utxos; everything else keeps its place. */
+    private static Fixture ordered(Fixture f, Ordering ordering, long walletLovelace) {
+        Utxo nominated = f.request.walletUtxo();
+        List<Utxo> scripts = f.universe.stream().filter(u -> u.getReferenceScriptHash() != null).toList();
+        List<Utxo> rest = f.universe.stream()
+                .filter(u -> u.getReferenceScriptHash() == null && u != nominated).toList();
+        List<Utxo> universe = new ArrayList<>(rest);
+        switch (ordering) {
+            case WALLET_FIRST -> {
+                universe.add(nominated);
+                universe.addAll(scripts);
+                return new Fixture(universe, f.request);
+            }
+            case SCRIPTS_FIRST -> {
+                universe.addAll(scripts);
+                universe.add(nominated);
+                return new Fixture(universe, f.request);
+            }
+            default -> {
+                universe.addAll(scripts);
+                List<Utxo> chunks = new ArrayList<>();
+                long remaining = walletLovelace;
+                for (int i = 0; remaining > 0; i++) {
+                    long chunk = Math.min(4_000_000L, remaining);
+                    chunks.add(Utxo.builder().txHash("9e".repeat(32)).outputIndex(i).address(BOT)
+                            .amount(List.of(Amount.lovelace(BigInteger.valueOf(chunk)))).build());
+                    remaining -= chunk;
+                }
+                universe.addAll(chunks);
+                return new Fixture(universe, request(f.request.referenceScripts(), chunks.get(0)));
+            }
+        }
     }
 
     /** The production constructor has no null-evaluator form (CCL trap 8). */
