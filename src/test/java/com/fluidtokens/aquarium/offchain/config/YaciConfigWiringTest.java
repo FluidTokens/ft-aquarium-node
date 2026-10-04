@@ -503,6 +503,73 @@ class YaciConfigWiringTest {
                         + "unverified bytes would be served");
     }
 
+    // ===== the Minswap pool resolver reads the index, and its two coordinates must agree (FAB-137 T2b) =====
+
+    private static final String SHIPPED_POOL_ADDRESS =
+            "addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a";
+    private static final String SHIPPED_POOL_SPEND_HASH = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+
+    private static AppConfig.LoansConfiguration minswap(String poolAddress, String spendHash) {
+        return new AppConfig.LoansConfiguration() {
+            @Override
+            public String getMinswapPoolAddress() {
+                return poolAddress;
+            }
+
+            @Override
+            public String getMinswapPoolSpendScriptHash() {
+                return spendHash;
+            }
+
+            @Override
+            public String getMinswapPoolPolicyId() {
+                return "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+            }
+        };
+    }
+
+    @Test
+    void aPoolAddressThatDoesNotCarryThePoolSpendHashFailsStartupNamingBoth() {
+        String wrongHash = "11".repeat(28);
+        var e = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> new YaciConfig().minswapPoolResolver(minswap(SHIPPED_POOL_ADDRESS, wrongHash),
+                        mock(UtxoRepository.class)));
+
+        assertTrue(e.getMessage().contains("loans.minswap.pool-address"), e.getMessage());
+        assertTrue(e.getMessage().contains("loans.minswap.pool-spend-script-hash"), e.getMessage());
+        assertTrue(e.getMessage().contains(SHIPPED_POOL_ADDRESS), e.getMessage());
+        assertTrue(e.getMessage().contains(wrongHash), e.getMessage());
+        assertTrue(e.getMessage().contains(SHIPPED_POOL_SPEND_HASH), "and the credential the address does carry: "
+                + e.getMessage());
+    }
+
+    @Test
+    void aMatchingPoolAddressBuildsAResolverOverTheInjectedIndex() throws Exception {
+        UtxoRepository repository = mock(UtxoRepository.class);
+        var resolver = new YaciConfig().minswapPoolResolver(
+                minswap(SHIPPED_POOL_ADDRESS, SHIPPED_POOL_SPEND_HASH), repository);
+
+        assertSame(repository, fieldOf(resolver, "utxoRepository"));
+        assertEquals(SHIPPED_POOL_SPEND_HASH, fieldOf(resolver, "poolSpendScriptHash"));
+    }
+
+    @Test
+    void aBlankPoolAddressIsNotChecked() {
+        assertNotNull(new YaciConfig().minswapPoolResolver(minswap("", ""), mock(UtxoRepository.class)));
+    }
+
+    @Test
+    void thePoolResolverBeanIsHandedNoProvider() {
+        java.lang.reflect.Method bean = java.util.Arrays.stream(YaciConfig.class.getDeclaredMethods())
+                .filter(m -> m.getName().equals("minswapPoolResolver"))
+                .findFirst().orElseThrow();
+        for (Class<?> parameter : bean.getParameterTypes()) {
+            assertFalse(BackendService.class.isAssignableFrom(parameter)
+                            || UtxoService.class.isAssignableFrom(parameter),
+                    "minswapPoolResolver takes a " + parameter.getName() + ": a route back to Blockfrost");
+        }
+    }
+
     private static Object fieldOf(Object target, String name) throws Exception {
         Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);

@@ -111,6 +111,29 @@ public class ConvertLiquidationRouter {
     }
 
     /**
+     * The pool snapshot of the current liquidation cycle, taken lazily by the first candidate that
+     * reaches the pool step and shared by every later one. {@code null} until then.
+     */
+    private volatile MinswapPoolResolver.Snapshot cycleSnapshot;
+
+    /**
+     * Starts a liquidation cycle: forgets the previous cycle's pool snapshot, so the next candidate to
+     * reach the pool step takes exactly one fresh one. Called once per cycle by the executor.
+     */
+    public void beginCycle() {
+        cycleSnapshot = null;
+    }
+
+    private MinswapPoolResolver.Snapshot cycleSnapshot() {
+        MinswapPoolResolver.Snapshot snapshot = cycleSnapshot;
+        if (snapshot == null) {
+            snapshot = poolResolver.snapshot();
+            cycleSnapshot = snapshot;
+        }
+        return snapshot;
+    }
+
+    /**
      * Builds the convert liquidation for one already-resolved candidate.
      *
      * <p>⛔ <b>The order of operations is not arbitrary.</b> The pool is resolved first because
@@ -339,10 +362,10 @@ public class ConvertLiquidationRouter {
         }
         AssetType collateral = loan.collateral().assetType();
 
-        // ⛔ NO POOL ADDRESS CONFIGURED = NO MINSWAP ON THIS NETWORK. Checked BEFORE the provider is
-        // called, because calling it is the bug: a preview node used to send the mainnet address to a
-        // preview provider and take a 400 back, at ERROR, for every candidate on every scheduling
-        // cycle. There is nothing to retry and nothing an operator can do about it from the log.
+        // ⛔ NO POOL ADDRESS CONFIGURED = NO MINSWAP ON THIS NETWORK. Checked BEFORE the pool snapshot is
+        // taken. Historically the provider was called here, and calling it was the bug: a preview node
+        // used to send the mainnet address to a preview provider and take a 400 back, at ERROR, for
+        // every candidate on every scheduling cycle. There is nothing to retry and nothing an operator can do about it from the log.
         //
         // ⚠ NoPoolException rather than a new type: this is the same fact the resolver reports when a
         // pair has no pool — a convert is IMPOSSIBLE here, not unprofitable — and the executor already
@@ -356,12 +379,14 @@ public class ConvertLiquidationRouter {
                             + "if the loan should still be liquidated");
         }
 
-        // 1. The pool, by NFT at run time. Either order — the datum then states the ordering.
-        MinswapPoolResolver.ResolvedPool pool = poolResolver
+        // 1. The pool: the authentic one in this cycle's index snapshot (ONE query per cycle, taken
+        // here lazily, after the checks above). Either order — the datum then states the ordering.
+        MinswapPoolResolver.ResolvedPool pool = cycleSnapshot()
                 .resolveEitherOrder(collateral, loan.principalAsset())
                 .orElseThrow(() -> new NoPoolException(
                         "no Minswap pool for " + collateral.toUnit() + "/" + loan.principalAsset().toUnit()
-                                + "; convert is impossible for this loan, not merely unprofitable — "
+                                + " is indexed — not indexed (pools idle since 2025-05-06 are invisible); "
+                                + "convert is impossible for this loan, not merely unprofitable — "
                                 + "set this market to action: ANTICIPATE if it should be liquidated"));
 
         // ⛔ MILLISECONDS ARE NOT SLOTS, and until 2026-09-05 this router handed the caller's

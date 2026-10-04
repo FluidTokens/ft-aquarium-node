@@ -704,6 +704,11 @@ public class LiquidationExecutor {
             log.info("node is syncing, skipping...");
             return;
         }
+        // A new cycle: the convert route takes at most ONE Minswap pool snapshot from here on, shared
+        // by every candidate that reaches the pool step.
+        if (convertRouter != null) {
+            convertRouter.beginCycle();
+        }
 
         LiquidationCandidateScanner.Scan scan = scanner.scan(now);
         List<LiquidationAssessment> assessments = scan.assessments();
@@ -1078,11 +1083,13 @@ public class LiquidationExecutor {
                         walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
                         return;
                     }
-                    // AMBIGUOUS_POOL and POOL_DATUM_UNREADABLE are facts about the CHAIN, reproducible
-                    // next cycle and unaffected by waiting — a verdict, reconsidered like any other.
+                    // ⛔ AMBIGUOUS_POOL: two AUTHENTIC pools for one pair in the local index. Minswap
+                    // cannot produce that on chain, so it is an index-integrity fault, not a verdict
+                    // about the candidate — ERROR on every cycle it persists, no pool is chosen, and
+                    // nothing was built, so the wallet is untouched.
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             e.refusal().name(), e.getMessage()));
-                    log.info("the convert liquidation of {} was refused as {}: {}",
+                    log.error("the convert liquidation of {} was refused as {}: {}",
                             loanUtxoRef, e.refusal(), e.getMessage());
                     return;
                 } catch (ConvertLiquidationRouter.WalletInputTooSmallException e) {

@@ -3933,17 +3933,83 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * The resolver's OTHER refusals are facts about the chain — reproducible next cycle and unaffected
-     * by waiting — so they are verdicts, held no longer than any other verdict. Only
-     * {@code LOOKUP_FAILED} is transport.
+     * ⛔ Two AUTHENTIC pools for one pair is an index-integrity fault (FAB-137 T2b): Minswap cannot
+     * produce it on chain, so no pool is chosen — REFUSED with the message as detail, and ERROR on every
+     * cycle it persists, never a quiet INFO verdict.
      */
     @Test
-    void anAmbiguousPoolIsAVerdictAboutTheChainAndIsNotHeld() {
+    void anAmbiguousPoolIsAnIndexIntegrityErrorOnEveryCycle() {
+        String detail = "index integrity: 2 authentic Minswap pools for lovelace/x (aa#1, bb#1)";
         ConvertWiring wiring = convertWiringThrowing(new MinswapPoolResolver.RefusedException(
-                MinswapPoolResolver.Refusal.AMBIGUOUS_POOL, "2 UTxOs hold the LP asset"));
+                MinswapPoolResolver.Refusal.AMBIGUOUS_POOL, detail));
 
-        wiring.executor().cycle(NOW);
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+            wiring.executor().cycle(NOW + 60_000L);
+        } finally {
+            logger.detachAppender(appender);
+        }
 
-        assertEquals("AMBIGUOUS_POOL", wiring.log().newestFirst(10).getFirst().reason());
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(2, decisions.size(), "reconsidered every cycle");
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+            assertEquals("AMBIGUOUS_POOL", decision.reason());
+            assertTrue(decision.detail().contains(detail), decision.detail());
+        }
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .filter(event -> event.getFormattedMessage().contains("AMBIGUOUS_POOL"))
+                .toList();
+        assertEquals(2, errors.size(), "ERROR on each cycle: " + appender.list);
+    }
+
+    /** Counts the cycles the executor starts on the convert router. */
+    private static final class CycleCountingConvertRouter extends ConvertLiquidationRouter {
+        int beginCycles;
+        CycleCountingConvertRouter() {
+            super(null, null, null, null, null, null, null, null);
+        }
+        @Override
+        public void beginCycle() {
+            beginCycles++;
+        }
+    }
+
+    /** One pool snapshot per cycle needs exactly one {@code beginCycle()} per cycle (FAB-137 T2b). */
+    @Test
+    void eachCycleStartsExactlyOneConvertRouterCycle() {
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200);
+        Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
+        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+                convert.loan().utxo(), convert.bond().utxo());
+        LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+        CycleCountingConvertRouter router = new CycleCountingConvertRouter();
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT,
+                new FakeScanner(List.of(convert.assessment())),
+                new FakeResolver(allUnspent(List.of(convert))), plainBuilder, payInAdvanceRouter,
+                router, LoanFixtures.registry(), new LiquidationDecisionLog(configuration), metrics(),
+                noOracle(), previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(),
+                EXPLODING_SUBMITTER);
+
+        executor.cycle(NOW);
+        assertEquals(1, router.beginCycles);
+        executor.cycle(NOW + 60_000L);
+        executor.cycle(NOW + 120_000L);
+        assertEquals(3, router.beginCycles, "exactly one per cycle");
     }
 }

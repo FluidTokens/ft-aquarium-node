@@ -121,8 +121,9 @@ public class ConvertTransactionBuilder {
     }
 
     /**
-     * @param poolRefUtxo the Minswap pool UTxO, located BY ITS NFT at scan time — never a pinned
-     *                    coordinate, because a pool is respent on every swap
+     * @param poolRefUtxo the authentic Minswap pool UTxO from {@link MinswapPoolResolver}'s per-cycle
+     *                    index snapshot — never a pinned coordinate, because a pool is respent on
+     *                    every swap
      * @param collateralOracle the feed for the COLLATERAL leg. ⛔ Never {@code null} on this path:
      *                    a convert exchanges two distinct assets, so at least one leg is a token and
      *                    {@code retrieve_oracle_data} demands an oracle withdrawal for it. The

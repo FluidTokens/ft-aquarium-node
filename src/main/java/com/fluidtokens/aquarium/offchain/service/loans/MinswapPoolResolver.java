@@ -1,51 +1,70 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
-import com.bloxbean.cardano.client.api.model.Result;
+import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
-import com.bloxbean.cardano.client.backend.api.UtxoService;
+import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
+import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
+import com.fluidtokens.aquarium.offchain.util.UtxoUtil;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Pageable;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
- * Finds the live Minswap V2 pool for one (collateral, principal) pair.
+ * Finds the live Minswap V2 pool for one (collateral, principal) pair — from the node's OWN INDEX.
  *
- * <h2>⛔ Why this queries the provider instead of the node's own index</h2>
- * {@code TankUtxoStorage} keeps only UTxOs at the derived lending credentials, so <b>a Minswap pool
- * UTxO is discarded at write time with no trace it was ever offered</b> —
- * {@code officina:yaci-store-index-scoping}'s exact failure mode, and it would read as "no pool
- * exists" rather than "we never kept it". Indexing them instead would pull every V2 pool on the
- * network into this node's storage and need a {@code sync-start} far enough back to catch old ones.
- * <b>One query per candidate is proportionate</b>, and it is the shape the oracle registry client
- * already uses (findings §39.2).
+ * <h2>One query per liquidation cycle</h2>
+ * {@link #snapshot()} issues exactly one {@code findUnspentByOwnerPaymentCredential(poolSpendScriptHash,
+ * unpaged)} — the LEFT JOIN on {@code tx_input}, because {@code address_utxo} alone still holds every
+ * pool UTxO a swap has since spent ({@code officina:yaci-store-index-scoping} §4b). The caller takes
+ * one snapshot per cycle and asks it about every candidate; no candidate ever triggers a query of its
+ * own. The pool credential is indexed like the wallet's (FAB-137 T2a), so pools that have been idle
+ * since before the index's start point are not in it.
  *
- * <h2>⚠ By NFT at run time, never a pinned coordinate</h2>
- * A pool UTxO is spent and re-created on <b>every swap</b> — measured: the coordinate this project
- * recorded in the morning was stale by the afternoon. The lookup is therefore
- * {@code /addresses/{poolAddress}/utxos/{lpAssetUnit}}, where the LP asset name is <b>computed</b>
- * (SHA3-256, twice — §34) rather than looked up, and which returns exactly one row.
+ * <h2>⛔ Authentication is the filter, not the query</h2>
+ * The pool payment credential is a <b>public script address</b>: anyone can pay anything there, with
+ * any datum, any LP token and any stake part, and a credential-scoped scan returns all of it
+ * (§2b). A row is an authentic pool only when ALL of these hold:
+ * <ol>
+ *   <li>it sits at the pool payment credential — under ANY stake credential;</li>
+ *   <li>it holds exactly one MSP ({@code <pool-policy-id>4d5350}, quantity 1) — the one asset only the
+ *       pool validator can move, so it is the authentication (CCL §12: assert on content that moves).
+ *       An LP token or a datum authenticates nothing: anyone can pay either to the address;</li>
+ *   <li>its inline datum decodes and states a pair;</li>
+ *   <li>the LP name recomputed from that pair ({@link ConvertTxEncoder#computeLpAssetName}, SHA3-256
+ *       twice, order-sensitive) is an LP unit the UTxO actually holds.</li>
+ * </ol>
+ * An authentic pool is filed under that recomputed LP unit and no other, so the pair check IS the key:
+ * a pool for another pair that merely <em>holds</em> this pair's LP asset (the real mainnet ada /
+ * LP-token pool, 2026-09-18) is filed under its own pair and is never an answer for this one. Every
+ * other row is ignored.
+ *
+ * <h2>⛔ Two authentic pools for one pair is an index-integrity error</h2>
+ * Minswap V2 mints one MSP per pool and one LP asset per pair, so two authentic pools for a pair
+ * cannot both be live on chain. The index saying otherwise means the index is wrong, and no pool is
+ * chosen between them: {@link Refusal#AMBIGUOUS_POOL}, naming both out-refs.
  */
 @Slf4j
 public class MinswapPoolResolver {
 
-    /** Why no pool could be used for this pair. Each is a fact about the chain, not a policy. */
+    /** Why no pool could be used for this pair. */
     public enum Refusal {
-        /** No UTxO at the pool address holds this pair's LP asset — no such pool exists. */
-        NO_POOL_FOR_PAIR,
         /**
-         * ⚠ More than one. Minswap mints one LP asset per pool, so this cannot happen for a healthy
-         * deployment — and picking one arbitrarily would build against a pool nobody chose. Refused.
+         * ⛔ Index integrity: more than one authentic pool for one pair. Minswap cannot produce that on
+         * chain, so the index is wrong — and picking one would build against a pool nobody chose.
          */
         AMBIGUOUS_POOL,
-        /** The pool UTxO carries no inline datum, or one this node cannot decode. */
-        POOL_DATUM_UNREADABLE,
-        /** The provider could not be reached, which is not evidence that no pool exists. */
+        /** The index could not be read, which is not evidence that no pool exists. */
         LOOKUP_FAILED
     }
 
@@ -54,6 +73,11 @@ public class MinswapPoolResolver {
 
         RefusedException(Refusal refusal, String detail) {
             super(refusal + ": " + detail);
+            this.refusal = refusal;
+        }
+
+        RefusedException(Refusal refusal, String detail, Throwable cause) {
+            super(refusal + ": " + detail, cause);
             this.refusal = refusal;
         }
 
@@ -66,226 +90,132 @@ public class MinswapPoolResolver {
     public record ResolvedPool(Utxo utxo, MinswapPoolDatum datum, String lpAssetName) {
     }
 
-    private final UtxoService utxoService;
-    private final String poolAddress;
+    private final UtxoRepository utxoRepository;
+    private final String poolSpendScriptHash;
     private final String poolPolicyId;
     private final MinswapPoolDatumConverter converter = new MinswapPoolDatumConverter();
 
-    public MinswapPoolResolver(UtxoService utxoService, String poolAddress, String poolPolicyId) {
-        this.utxoService = utxoService;
-        this.poolAddress = poolAddress;
+    public MinswapPoolResolver(UtxoRepository utxoRepository, String poolSpendScriptHash, String poolPolicyId) {
+        this.utxoRepository = utxoRepository;
+        this.poolSpendScriptHash = poolSpendScriptHash;
         this.poolPolicyId = poolPolicyId;
     }
 
     /**
-     * @param assetA the pool's own {@code asset_a}, and {@code assetB} its {@code asset_b} — the LP
-     *               name is order-sensitive, so a caller that has not established the pool's ordering
-     *               must try both and take the one the chain serves
+     * Every authentic pool in the index, read with ONE unpaged credential query.
+     *
+     * @throws RefusedException {@link Refusal#LOOKUP_FAILED} when the index cannot be read — never an
+     *                          empty snapshot, which would read as "no pool exists"
      */
-    /** The deepest pool for the pair in this ordering. See {@link #resolveAll} for why depth is only an ordering. */
-    public ResolvedPool resolve(AssetType assetA, AssetType assetB) {
-        return resolveAll(assetA, assetB).getFirst();
-    }
-
-    /** Every pool for the pair in this ordering, deepest first. Never empty: refuses instead. */
-    public List<ResolvedPool> resolveAll(AssetType assetA, AssetType assetB) {
-        String lpAssetName = ConvertTxEncoder.computeLpAssetName(assetA, assetB);
-        String unit = poolPolicyId + lpAssetName;
-
-        List<Utxo> found;
+    public Snapshot snapshot() {
+        List<AddressUtxoEntity> rows;
         try {
-            Result<List<Utxo>> result = utxoService.getUtxos(poolAddress, unit, 10, 1);
-            if (!result.isSuccessful()) {
-                // ⛔ A 404 IS AN ANSWER, NOT AN OUTAGE — and reading it as one broke the whole
-                // either-order mechanism below. Measured on mainnet 2026-09-05: the ADA/FLDT pool
-                // exists and is healthy (1.69M ada / 7.6M FLDT, one UTxO, inline datum), and this
-                // method reported LOOKUP_FAILED for it.
-                //
-                // `compute_lp_asset_name` is ORDER-SENSITIVE, so exactly one of the two orderings
-                // names a real asset:
-                //     LP(ada, fldt)  bc53f5c2…  -> HTTP 200
-                //     LP(fldt, ada)  df40ef9f…  -> HTTP 404
-                // Blockfrost expresses "no UTxO with that asset at this address" as a 404, not as an
-                // empty list — so the WRONG ordering landed here rather than in the `found.isEmpty()`
-                // branch below, and `resolveEitherOrder` RETHROWS anything that is not
-                // NO_POOL_FOR_PAIR. The correct ordering was therefore never tried.
-                //
-                // ⚠ Two consequences, and the second is why this is not a mislabel but a defect:
-                //   1. the `found.isEmpty()` -> NO_POOL_FOR_PAIR branch is UNREACHABLE via this
-                //      provider, so it has never fired in production;
-                //   2. the either-order fallback fails whenever the wrong ordering happens to be
-                //      tried first — a coin flip per pair — and presents as "no pool exists".
-                //
-                // The rule is not new to this repo: LoansConfigVerifier.fetchConfigDatumHex already
-                // says "a 4xx is an answer, not an outage". This class is the sibling that never
-                // applied it. 404 alone is the "no such asset here" answer; every other 4xx is about
-                // US (a bad key, a quota), and 5xx / 429 / transport are genuinely transient.
-                int code = result.code();
-                if (code == 404) {
-                    throw refuse(Refusal.NO_POOL_FOR_PAIR,
-                            "the provider has no UTxO at " + poolAddress + " holding the LP asset "
-                                    + unit + " (HTTP 404). If this is one of two orderings, the other "
-                                    + "is the one to try; if both 404, there is no Minswap pool for "
-                                    + "this pair and a convert is impossible rather than unprofitable");
-                }
-                throw refuse(Refusal.LOOKUP_FAILED, "the provider refused the pool lookup (HTTP "
-                        + code + "): " + result.getResponse());
-            }
-            found = result.getValue();
-        } catch (RefusedException e) {
-            throw e;
-        } catch (Exception e) {
-            // ⚠ NOT "no pool": an unreachable provider is a statement about us, not about the chain.
-            throw refuse(Refusal.LOOKUP_FAILED, "the pool lookup failed: " + e);
+            rows = utxoRepository
+                    .findUnspentByOwnerPaymentCredential(poolSpendScriptHash, Pageable.unpaged())
+                    .stream()
+                    .flatMap(Collection::stream)
+                    .toList();
+        } catch (RuntimeException e) {
+            // ⚠ NOT "no pool": a database that cannot answer is a statement about us, not about the chain.
+            throw new RefusedException(Refusal.LOOKUP_FAILED, "the pool index query failed: " + e, e);
         }
 
-        if (found == null || found.isEmpty()) {
-            throw refuse(Refusal.NO_POOL_FOR_PAIR,
-                    "no UTxO at " + poolAddress + " holds the LP asset " + unit
-                            + "; there is no Minswap pool for this pair, so a convert is impossible "
-                            + "rather than merely unprofitable");
-        }
-        // ⛔ MORE THAN ONE POOL PER PAIR IS NORMAL, AND THIS USED TO REFUSE IT.
-        //
-        // The old code threw AMBIGUOUS_POOL on found.size() > 1, reasoning that "Minswap mints one
-        // per pool, so choosing between them would build against a pool nobody chose". The premise
-        // is false: the LP asset name is derived from the PAIR, so every pool for the same pair
-        // carries the same LP asset and two of them are simply two pools. Confirmed on mainnet
-        // 2026-09-18 for ada/ASCEND -- one tiny, one deep -- and the refusal made every ada/ASCEND
-        // loan read CHECK FAILED forever, which is indistinguishable from an outage.
-        //
-        // ⚠ The original concern was right even though the rule was wrong: picking arbitrarily WOULD
-        // build against a pool nobody chose. So the choice is made on the only property that matters
-        // for filling a swap -- DEPTH -- and it is stated in the log rather than left implicit.
-        List<Candidate> candidates = new ArrayList<>();
-        List<String> rejected = new ArrayList<>();
-        for (Utxo utxo : found) {
-            if (utxo.getInlineDatum() == null || utxo.getInlineDatum().isBlank()) {
-                rejected.add(utxo.getTxHash() + "#" + utxo.getOutputIndex() + " carries no inline datum");
+        String msp = poolPolicyId + ConvertTxEncoder.POOL_NFT_ASSET_NAME;
+        Map<String, List<ResolvedPool>> byLpUnit = new HashMap<>();
+        int rejected = 0;
+        for (AddressUtxoEntity row : rows) {
+            Optional<ResolvedPool> pool = authenticate(row, msp);
+            if (pool.isEmpty()) {
+                rejected++;
                 continue;
             }
-            MinswapPoolDatum candidateDatum;
-            try {
-                candidateDatum = converter.deserialize(utxo.getInlineDatum());
-            } catch (RuntimeException e) {
-                rejected.add(utxo.getTxHash() + "#" + utxo.getOutputIndex() + " datum did not decode: " + e);
-                continue;
-            }
-            // ⛔ The datum states the pair authoritatively. A UTxO carrying this LP asset whose datum
-            // is NOT this pair cannot fill this swap, whatever its depth, so it is never a candidate.
-            if (!pairMatches(candidateDatum, assetA, assetB)) {
-                rejected.add(utxo.getTxHash() + "#" + utxo.getOutputIndex() + " is "
-                        + candidateDatum.assetA().toUnit() + "/" + candidateDatum.assetB().toUnit());
-                continue;
-            }
-            candidates.add(new Candidate(utxo, candidateDatum));
+            byLpUnit.computeIfAbsent(poolPolicyId + pool.get().lpAssetName(), k -> new ArrayList<>())
+                    .add(pool.get());
         }
-
-        if (candidates.isEmpty()) {
-            throw refuse(Refusal.POOL_DATUM_UNREADABLE,
-                    "every UTxO holding the LP asset " + unit + " was unusable: " + rejected);
+        if (rejected > 0) {
+            log.debug("Minswap pool snapshot: {} row(s) at {} are not authentic pools and were ignored; "
+                    + "{} authentic", rejected, poolSpendScriptHash, rows.size() - rejected);
         }
-
-        // Constant-product depth. Direction-agnostic and derived from the reserves themselves rather
-        // than the pool's own LP accounting, so it compares pools that price differently.
-        candidates.sort(Comparator.comparing(Candidate::depth).reversed());
-        Candidate best = candidates.getFirst();
-
-        if (candidates.size() > 1 || !rejected.isEmpty()) {
-            log.info("{} pools carry the LP asset {}; chose the deepest, {}#{} (reserves {}/{}). "
-                            + "Others: {}{}",
-                    candidates.size(), unit, best.utxo().getTxHash(), best.utxo().getOutputIndex(),
-                    best.datum().reserveA(), best.datum().reserveB(),
-                    candidates.stream().skip(1)
-                            .map(c -> c.utxo().getTxHash() + "#" + c.utxo().getOutputIndex()
-                                    + " (" + c.datum().reserveA() + "/" + c.datum().reserveB() + ")")
-                            .toList(),
-                    rejected.isEmpty() ? "" : "; not candidates: " + rejected);
-        }
-
-        log.debug("resolved {} Minswap pool(s) for {}/{}: deepest {}#{} (lp {})", candidates.size(),
-                assetA.toUnit(), assetB.toUnit(), best.utxo().getTxHash(), best.utxo().getOutputIndex(),
-                lpAssetName);
-        return candidates.stream()
-                .map(c -> new ResolvedPool(c.utxo(), c.datum(), lpAssetName))
-                .toList();
+        return new Snapshot(byLpUnit, poolPolicyId);
     }
 
     /**
-     * The pair in whichever order the chain actually serves. ⚠ {@code compute_lp_asset_name} is
-     * order-sensitive and the caller usually knows only <em>which two assets</em>, not which Minswap
-     * calls {@code asset_a} — so both orders are tried and the one that exists wins. The returned
-     * datum then states the ordering authoritatively.
-     */
-    /**
-     * ⛔ EVERY pool for the pair, deepest first — because DEPTH IS A PROXY FOR FILL AND NOT THE SAME
-     * THING.
-     *
-     * <p>Constant-product output is
-     * {@code in·(1−fee)·reserveOut / (reserveIn + in·(1−fee))}: it depends on the pool's PRICE
-     * ({@code reserveOut/reserveIn}) and its FEE, not on depth alone. Two pools of one pair are
-     * separate AMMs — arbitrage keeps their prices close but not equal, and their fee numerators can
-     * differ outright. <b>So a deeper pool at a worse price, or with a higher fee, can return LESS
-     * than a shallower one</b>, and picking purely by depth can report a pair as too thin while a
-     * pool that would have filled sits unexamined.
-     *
-     * <p>Ranking is still by depth, because it is the right order to TRY them in. The caller decides
-     * by asking each whether it clears the debt.
+     * ⛔ Scaffolding for the readiness page only; removed by FAB-135-T2c. One snapshot per call.
      */
     public List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
-        try {
-            return resolveAll(one, other);
-        } catch (RefusedException first) {
-            if (first.refusal() != Refusal.NO_POOL_FOR_PAIR) {
-                throw first;
-            }
-            try {
-                return resolveAll(other, one);
-            } catch (RefusedException second) {
-                if (second.refusal() == Refusal.NO_POOL_FOR_PAIR) {
-                    return List.of();
-                }
-                throw second;
-            }
-        }
+        return snapshot().resolveEitherOrder(one, other).map(List::of).orElse(List.of());
     }
 
-    public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
+    /** The authentic pool this row is, if it is one; empty for anything else at the address. */
+    private Optional<ResolvedPool> authenticate(AddressUtxoEntity row, String msp) {
+        Utxo utxo;
         try {
-            return Optional.of(resolve(one, other));
-        } catch (RefusedException first) {
-            if (first.refusal() != Refusal.NO_POOL_FOR_PAIR) {
-                throw first;
-            }
-        }
-        try {
-            return Optional.of(resolve(other, one));
-        } catch (RefusedException second) {
-            if (second.refusal() != Refusal.NO_POOL_FOR_PAIR) {
-                throw second;
-            }
+            utxo = UtxoUtil.toUtxo(row);
+        } catch (RuntimeException e) {
             return Optional.empty();
         }
-    }
+        List<Amount> amounts = utxo.getAmount() == null ? List.of() : utxo.getAmount();
 
-    /** One UTxO that carries the pair's LP asset, with its decoded datum. */
-    private record Candidate(Utxo utxo, MinswapPoolDatum datum) {
-        /** Constant-product depth: what actually limits how much a swap can take out. */
-        BigInteger depth() {
-            return datum.reserveA().multiply(datum.reserveB());
+        List<Amount> msps = amounts.stream().filter(a -> msp.equals(a.getUnit())).toList();
+        if (msps.size() != 1 || !BigInteger.ONE.equals(msps.getFirst().getQuantity())) {
+            return Optional.empty();
         }
+
+        String datumHex = utxo.getInlineDatum();
+        if (datumHex == null || datumHex.isBlank()) {
+            return Optional.empty();
+        }
+        MinswapPoolDatum datum;
+        try {
+            datum = converter.deserialize(datumHex);
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+
+        String lpAssetName = ConvertTxEncoder.computeLpAssetName(datum.assetA(), datum.assetB());
+        String lpUnit = poolPolicyId + lpAssetName;
+        boolean holdsOwnLp = amounts.stream().anyMatch(a -> lpUnit.equals(a.getUnit())
+                && a.getQuantity() != null && a.getQuantity().signum() > 0);
+        if (!holdsOwnLp) {
+            return Optional.empty();
+        }
+        return Optional.of(new ResolvedPool(utxo, datum, lpAssetName));
     }
 
-    /** Whether a pool's declared pair is the pair asked for, in either order. */
-    private static boolean pairMatches(MinswapPoolDatum datum, AssetType one, AssetType other) {
-        String a = datum.assetA().toUnit();
-        String b = datum.assetB().toUnit();
-        String x = one.toUnit();
-        String y = other.toUnit();
-        return (a.equals(x) && b.equals(y)) || (a.equals(y) && b.equals(x));
-    }
+    /** The authentic pools of one index read, keyed by LP unit. Asking it issues no query. */
+    public static class Snapshot {
+        private final Map<String, List<ResolvedPool>> byLpUnit;
+        private final String poolPolicyId;
 
-    private static RefusedException refuse(Refusal refusal, String detail) {
-        return new RefusedException(refusal, detail);
+        Snapshot(Map<String, List<ResolvedPool>> byLpUnit, String poolPolicyId) {
+            this.byLpUnit = byLpUnit;
+            this.poolPolicyId = poolPolicyId;
+        }
+
+        /**
+         * The pool for the pair in whichever order Minswap calls {@code asset_a}: both LP names are
+         * tried, and the returned datum states the ordering authoritatively.
+         *
+         * @return empty when no authentic pool for the pair is indexed
+         * @throws RefusedException {@link Refusal#AMBIGUOUS_POOL} when more than one is
+         */
+        public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
+            Set<String> units = new LinkedHashSet<>(List.of(
+                    poolPolicyId + ConvertTxEncoder.computeLpAssetName(one, other),
+                    poolPolicyId + ConvertTxEncoder.computeLpAssetName(other, one)));
+            List<ResolvedPool> found = new ArrayList<>();
+            for (String unit : units) {
+                found.addAll(byLpUnit.getOrDefault(unit, List.of()));
+            }
+            if (found.size() > 1) {
+                throw new RefusedException(Refusal.AMBIGUOUS_POOL, "index integrity: " + found.size()
+                        + " authentic Minswap pools for " + one.toUnit() + "/" + other.toUnit() + " ("
+                        + String.join(", ", found.stream()
+                        .map(p -> p.utxo().getTxHash() + "#" + p.utxo().getOutputIndex()).toList())
+                        + "); Minswap cannot produce two live pools for one pair, so the index is wrong "
+                        + "and no pool is chosen between them");
+            }
+            return found.stream().findFirst();
+        }
     }
 }

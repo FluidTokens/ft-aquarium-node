@@ -206,19 +206,43 @@ public class YaciConfig {
     }
 
     /**
-     * The Minswap pool resolver — how a convert finds the ONE pool for a loan's pair.
+     * The Minswap pool resolver — how a convert finds the ONE authentic pool for a loan's pair.
      *
-     * <p>⛔ <b>It queries the provider; it does NOT read the node's index, and no index is needed.</b>
-     * The LP asset name is <em>computable</em> from the pair (SHA3-256, twice — findings §34), so this
-     * asks for one specific asset rather than searching: {@code /addresses/{poolAddress}/utxos/{lpUnit}}
-     * returns exactly one row. Indexing Minswap instead would pull every V2 pool on the network into
-     * this node's storage and need a far-back {@code sync-start} (§39.2).
+     * <p>⛔ <b>It reads the node's own index, never the provider.</b> One unpaged
+     * {@code findUnspentByOwnerPaymentCredential(pool-spend-script-hash)} per liquidation cycle, then
+     * authentication by MSP, datum pair and recomputed LP name ({@link MinswapPoolResolver}). The pool
+     * credential is indexed alongside the wallet's (FAB-137 T2a); no {@code BFBackendService} reaches
+     * this bean.
+     *
+     * <p>⚠ {@link UtxoRepository} is Yaci Store's JPA repository and is registered unconditionally, so
+     * this bean does not inherit a feature-flag condition from its new dependency (CCL §9b: check what a
+     * new dependency is conditional on).
+     *
+     * <p>⛔ <b>Startup fails on a pool address whose payment credential is not the pool spend script
+     * hash.</b> The resolver queries by the hash; the router and the readiness page gate on the
+     * address. Configured apart, they would name two different places, and every convert would read
+     * "no pool" against a pool that exists. A blank address means "no Minswap on this network" and is
+     * not checked.
      */
     @Bean
     public MinswapPoolResolver minswapPoolResolver(AppConfig.LoansConfiguration loansConfiguration,
-                                                   BFBackendService bfBackendService) {
-        return new MinswapPoolResolver(bfBackendService.getUtxoService(),
-                loansConfiguration.getMinswapPoolAddress(),
+                                                   UtxoRepository utxoRepository) {
+        String poolAddress = loansConfiguration.getMinswapPoolAddress();
+        String spendHash = loansConfiguration.getMinswapPoolSpendScriptHash();
+        if (poolAddress != null && !poolAddress.isBlank()) {
+            String credential = new com.bloxbean.cardano.client.address.Address(poolAddress)
+                    .getPaymentCredentialHash()
+                    .map(com.bloxbean.cardano.client.util.HexUtil::encodeHexString)
+                    .orElse(null);
+            if (credential == null || !credential.equalsIgnoreCase(spendHash)) {
+                throw new IllegalStateException("loans.minswap.pool-address (" + poolAddress
+                        + ") has payment credential " + credential
+                        + ", which is not loans.minswap.pool-spend-script-hash (" + spendHash
+                        + "); the pool index is read by the hash, so the two must name the same "
+                        + "Minswap pool script");
+            }
+        }
+        return new MinswapPoolResolver(utxoRepository, spendHash,
                 loansConfiguration.getMinswapPoolPolicyId());
     }
 
