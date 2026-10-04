@@ -107,6 +107,11 @@ class IndexFirstUtxoSupplierTest {
                 (proxy, method, args) -> switch (method.getName()) {
                     case "findUnspentByOwnerAddr" -> {
                         repoCalls.incrementAndGet();
+                        // The supplier pages ITSELF over the whole answer: a paged query sliced again would
+                        // silently truncate a wallet of more than one page.
+                        if (!((org.springframework.data.domain.Pageable) args[1]).isUnpaged()) {
+                            throw new AssertionError("the address query must be unpaged: " + args[1]);
+                        }
                         yield byAddress.apply((String) args[0]);
                     }
                     case "findById" -> {
@@ -281,6 +286,39 @@ class IndexFirstUtxoSupplierTest {
     }
 
     // ------------------------------------------------------------------ (f)
+
+    // ------------------------------------------------------------------ (i)
+
+    /**
+     * ⛔ The OTHER half of the sentinel rule: coin selection must still SEE that a wallet row carries a
+     * reference script. {@code ReferenceScriptSafeUtxoSelection} refuses a UTxO only while its
+     * {@code referenceScriptHash} is non-null, and the bot's published reference script lives at the very
+     * address {@code getPage} serves. A {@code getPage} that nulled the hash (or the sentinel) would let
+     * the selector spend it — an unrecoverable loss. So the sentinel is blocked in {@code getTxOutput}
+     * only, and both shapes come out of {@code getPage} with the hash set.
+     */
+    @Test
+    void getPageKeepsEveryReferenceScriptMarkSoTheSelectorNeverSpendsOne() {
+        String scriptRef = "8203" + "4e4d01000033222220051200120011";
+        AddressUtxoEntity withHash = row(TX_A, 0, WALLET.baseAddress(), 30_000_000L);
+        withHash.setScriptRef(scriptRef);
+        AddressUtxoEntity undecodable = row(TX_A, 1, WALLET.baseAddress(), 40_000_000L);
+        undecodable.setScriptRef("zz-not-hex");
+        AddressUtxoEntity plain = row(TX_B, 0, WALLET.baseAddress(), 5_000_000L);
+        var supplier = supplier(addressIndex(List.of(withHash, undecodable, plain)), new CountingProvider());
+
+        List<Utxo> page = supplier.getPage(WALLET.baseAddress(), 100, 0, OrderEnum.asc);
+
+        for (Utxo utxo : page) {
+            boolean carriesScript = !utxo.getTxHash().equals(TX_B);
+            assertEquals(carriesScript, utxo.getReferenceScriptHash() != null,
+                    utxo.getTxHash() + "#" + utxo.getOutputIndex() + " lost its reference-script mark");
+            assertEquals(!carriesScript,
+                    com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptSafeUtxoSelection.spendable(utxo),
+                    "the selector's verdict on " + utxo.getTxHash() + "#" + utxo.getOutputIndex());
+        }
+        assertEquals(3, page.size());
+    }
 
     /** ⛔ The "hash unresolved" sentinel must never reach CCL, which would price a script that is not one. */
     @Test
