@@ -221,11 +221,14 @@ jobs:
       # rather than composed from a delta: 147 files / 1168 tests / 0 failures / 0 errors / 46 skipped,
       # 0 orphans. Floor 147.
       #
+      # FAB-134 (Blockfrost budget) re-measured cold on feat/blockfrost-budget at d18d3ca:
+      # 185 files / 1579 tests / 0 failures / 0 errors / 50 skipped, 0 orphans. Floor 185.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '169'
+          RESULT_FILE_FLOOR: '185'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
