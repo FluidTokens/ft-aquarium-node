@@ -7,7 +7,6 @@ import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
-import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptSafeUtxoSelection;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
@@ -100,8 +99,9 @@ public class ScheduledTransactionService {
      * ⛔ <b>A DIAGNOSTIC, NOT A DESIGN CHANGE — and it ships OFF.</b>
      *
      * <p>Left unset (the default) nothing changes: evaluation goes through the shared
-     * {@code QuickTxBuilder(bfBackendService)} bean, i.e. Blockfrost's
-     * {@code /utils/txs/evaluate}, exactly as before.
+     * {@code QuickTxBuilder} bean's {@code DefaultTransactionProcessor} (see
+     * {@code YaciConfig.quickTxBuilder}), i.e. Blockfrost's {@code /utils/txs/evaluate}, exactly as
+     * before.
      *
      * <h2>What it is for</h2>
      * On mainnet 2026-09-22 every tank transaction failed with Blockfrost answering
@@ -152,13 +152,9 @@ public class ScheduledTransactionService {
 
 
     /**
-     * Only used to build the reference-script-safe coin selection; see the guard at compose().
-     * <p>
-     * <b>Deliberately the backend and not the {@code UtxoSupplier} bean.</b> That bean is
-     * {@code @ConditionalOnProperty(loans.enabled=true)}, and this service is the Aquarium tank
-     * subsystem, which runs on mainnet where lending is disabled by default — injecting it here
-     * would have failed startup on exactly the production deployment this repo ships. The backend
-     * is unconditional, and this is the same construction {@code YaciConfig} performs.
+     * Only the dump-mode evaluator reads this ({@code scheduling.transaction-processor.dump-cbor}):
+     * it wraps the same Blockfrost evaluation the {@code QuickTxBuilder} bean's processor performs.
+     * Coin selection no longer goes through it — see {@link #utxoSupplier}.
      */
     private final BFBackendService bfBackendService;
 
@@ -167,6 +163,19 @@ public class ScheduledTransactionService {
      * rather than on every cycle. Unconditional, like the backend above.
      */
     private final ProtocolParamsSupplier protocolParamsSupplier;
+
+    /**
+     * ⛔ FAB-134 B3b-5: the shared {@code YaciConfig} bean — the INDEX-FIRST supplier — and what both
+     * reference-script-safe selection seams in {@link #balanceTankTx} read, the same supplier the
+     * {@code QuickTxBuilder} bean holds. It replaced a fresh Blockfrost {@code DefaultUtxoSupplier} built
+     * on every call, which sent each selection pass's wallet {@code getAll} to the provider.
+     * <p>
+     * Unconditional, like the backend above: {@code YaciConfig} declares it with no condition, so
+     * injecting it cannot fail startup on a deployment where lending is off. The operator wallet's
+     * payment credential is one the index always watches ({@code TankUtxoStorage}); the cycle reads the
+     * wallet only once {@code walletReadiness} is open.
+     */
+    private final UtxoSupplier utxoSupplier;
 
     private final UtxoRepository utxoRepository;
 
@@ -217,12 +226,6 @@ public class ScheduledTransactionService {
         var parametersRefInputIndex = sortedRefInputs.indexOf(parametersRefInput);
         var stakingRefInputIndex = sortedRefInputs.indexOf(stakingRefInput);
         return new RefInputIndexes(BigInteger.valueOf(parametersRefInputIndex), BigInteger.valueOf(stakingRefInputIndex));
-    }
-
-
-    /** The supplier the selection guard reads through; see the field javadoc for why it is built here. */
-    private UtxoSupplier referenceScriptSafeSupplier() {
-        return new DefaultUtxoSupplier(bfBackendService.getUtxoService());
     }
 
     /**
@@ -522,7 +525,7 @@ public class ScheduledTransactionService {
                 // evaluation-error policy, and the structural verifier, which needs datum-derived
                 // arguments the caller already holds.
                 var context = balanceTankTx(composed, tankPaymentUtxo, collateralUtxo,
-                                account.baseAddress(), referenceScriptSafeSupplier(), slot, firstValidSlot)
+                                account.baseAddress(), utxoSupplier, slot, firstValidSlot)
                         .withSigner(SignerProviders.signerFrom(account))
                         .withSigner(SignerProviders.stakeKeySignerFrom(account))
                         .ignoreScriptCostEvaluationError(dumpCbor)

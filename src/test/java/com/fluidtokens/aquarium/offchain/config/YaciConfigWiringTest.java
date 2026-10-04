@@ -205,6 +205,46 @@ class YaciConfigWiringTest {
     }
 
     /**
+     * ⛔ FAB-134 B3b-5: the tank processor's {@code QuickTxBuilder} bean is built from the three injected
+     * suppliers — the index-first {@link UtxoSupplier}, the per-epoch {@link ProtocolParamsSupplier} and
+     * the byte-serving {@link ScriptSupplier} — and a REAL {@code DefaultTransactionProcessor}.
+     * <p>
+     * The processor is not optional here, unlike in the loans builders: the tank path SUBMITS
+     * ({@code context.complete()}), and the same slot is cardano-client-lib's default script-cost
+     * evaluator (CCL trap 8). A null there would build every tank transaction on placeholder ex-units —
+     * accepted by the mempool, failed in phase 2, collateral forfeit — and then fail to submit it.
+     * Reverting the bean to {@code new QuickTxBuilder(bfBackendService)} turns the first three
+     * assertions red: CCL builds its own Blockfrost suppliers from the backend.
+     */
+    @Test
+    void theTankQuickTxBuilderHoldsTheInjectedSuppliersAndARealProcessor() throws Exception {
+        UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(List.of());
+        ProtocolParamsSupplier protocolParamsSupplier = LoanFixtures.protocolParams();
+        ScriptSupplier scriptSupplier = hash -> Optional.empty();
+
+        QuickTxBuilder builder = new YaciConfig().quickTxBuilder(utxoSupplier, protocolParamsSupplier,
+                scriptSupplier, new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+
+        assertSame(utxoSupplier, quickTxBuilderField(builder, "utxoSupplier"),
+                "the tank QuickTxBuilder does not hold the injected (index-first) UtxoSupplier: its coin "
+                        + "selection and every indexed reference input go back to Blockfrost");
+        assertSame(protocolParamsSupplier, quickTxBuilderField(builder, "protocolParamsSupplier"),
+                "the tank QuickTxBuilder does not hold the injected (per-epoch) ProtocolParamsSupplier");
+        assertSame(scriptSupplier, quickTxBuilderField(builder, "backendScriptSupplier"),
+                "the tank QuickTxBuilder does not hold the injected (hash-checked) ScriptSupplier");
+        assertInstanceOf(com.bloxbean.cardano.client.backend.api.DefaultTransactionProcessor.class,
+                quickTxBuilderField(builder, "transactionProcessor"),
+                "the tank QuickTxBuilder has no DefaultTransactionProcessor: it can neither submit nor — the "
+                        + "same slot being the default evaluator — measure ex-units (CCL trap 8)");
+    }
+
+    private static Object quickTxBuilderField(QuickTxBuilder builder, String name) throws Exception {
+        Field field = QuickTxBuilder.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(builder);
+    }
+
+    /**
      * The protocol-params bean is the per-epoch cache, not the bare Blockfrost supplier that makes one
      * HTTP call per {@code getProtocolParams()}. Every builder and the tank processor share this bean,
      * so if it reverted to the raw supplier every one of them would go back to a provider call per use.
@@ -260,6 +300,7 @@ class YaciConfigWiringTest {
                 mock(QuickTxBuilder.class),
                 backend,
                 injected,
+                mock(UtxoSupplier.class),
                 mock(UtxoRepository.class),
                 stakerService,
                 LoanFixtures.converters(),

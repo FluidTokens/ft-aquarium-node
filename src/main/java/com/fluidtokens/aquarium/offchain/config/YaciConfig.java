@@ -6,6 +6,7 @@ import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultScriptSupplier;
+import com.bloxbean.cardano.client.backend.api.DefaultTransactionProcessor;
 import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
@@ -31,9 +32,37 @@ import java.time.Clock;
 @Slf4j
 public class YaciConfig {
 
+    /**
+     * The tank processor's builder ({@code ScheduledTransactionService}, by injection — the one
+     * {@code QuickTxBuilder} in this node with no {@code new} at its call site). FAB-134 B3b-5: built from
+     * the three injected suppliers below and Blockfrost's transaction processor, and from nothing else.
+     * <ul>
+     *   <li>{@link UtxoSupplier} — the index-first bean: coin selection, the pinned collateral and the
+     *       parameters and staker reference inputs come from the local index; only out-refs the index
+     *       cannot hold (the tank reference script) reach Blockfrost.</li>
+     *   <li>{@link ProtocolParamsSupplier} — the per-epoch bean, not a fetch per build.</li>
+     *   <li>{@link ScriptSupplier} — the hash-checked bean, so the tank's reference script is priced from
+     *       bytes fetched once rather than on every build.</li>
+     * </ul>
+     * <p>
+     * ⛔ <b>The processor is there to SUBMIT AND TO EVALUATE, and is never null.</b> Unlike the loans
+     * builders, the tank path submits ({@code context.complete()}), so it needs a processor; and
+     * cardano-client-lib uses that same slot as the default script-cost evaluator (CCL trap 8). A null
+     * here would not make the tank "safely submit-incapable": it would build every tank transaction on
+     * placeholder ex-units. {@link DefaultTransactionProcessor} is both Blockfrost's
+     * {@code /tx/submit} and its {@code /utils/txs/evaluate} — the two Blockfrost calls a tank build
+     * still makes by design.
+     * <p>
+     * Never {@code new QuickTxBuilder(bfBackendService)}: that form builds its own Blockfrost UTxO,
+     * protocol-params and script suppliers and bypasses all three beans ({@code BlockfrostBuildWiringGuardTest}).
+     */
     @Bean
-    public QuickTxBuilder quickTxBuilder(BFBackendService bfBackendService) {
-        return new QuickTxBuilder(bfBackendService);
+    public QuickTxBuilder quickTxBuilder(UtxoSupplier utxoSupplier,
+                                         ProtocolParamsSupplier protocolParamsSupplier,
+                                         ScriptSupplier scriptSupplier,
+                                         BFBackendService bfBackendService) {
+        return new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier,
+                new DefaultTransactionProcessor(bfBackendService.getTransactionService()));
     }
 
     /**

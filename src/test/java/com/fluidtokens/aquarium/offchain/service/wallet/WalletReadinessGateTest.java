@@ -88,7 +88,7 @@ class WalletReadinessGateTest {
         var processor = new ScheduledTransactionService(
                 new AppConfig.Network(), mock(AppConfig.AquariumConfiguration.class), mock(Account.class),
                 mock(QuickTxBuilder.class), mock(BFBackendService.class), LoanFixtures.protocolParams(),
-                mock(UtxoRepository.class), staker, LoanFixtures.converters(), mock(ParametersService.class),
+                mock(com.bloxbean.cardano.client.api.UtxoSupplier.class), mock(UtxoRepository.class), staker, LoanFixtures.converters(), mock(ParametersService.class),
                 mock(TankContractService.class), mock(AppUtxoService.class), synced());
 
         assertGated("ScheduledTransactionService", staker, processor::setWalletReadiness, processor::processPayments);
