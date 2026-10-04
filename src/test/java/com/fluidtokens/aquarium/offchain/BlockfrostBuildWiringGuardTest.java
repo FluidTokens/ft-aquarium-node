@@ -39,7 +39,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>{@code new DefaultUtxoSupplier(}, {@code new DefaultProtocolParamsSupplier(} or
  *       {@code new DefaultScriptSupplier(} anywhere but {@code config/YaciConfig.java}, or more than once
  *       each inside it — there they are the index's out-ref fallback, the epoch cache's delegate and the
- *       script memo's delegate, and nothing else.</li>
+ *       script memo's delegate, and nothing else — written as {@code new} or as a {@code ::new} method
+ *       reference;</li>
+ *   <li>{@code QuickTxBuilder::new} or {@code extends QuickTxBuilder} anywhere (FAB-134 B3b-5 r2).</li>
  * </ul>
  * Comments and string literals are blanked before scanning, so javadoc that QUOTES a construction is not
  * one. The scan must also find the sites it knows exist, so an empty or broken scan cannot pass.
@@ -84,10 +86,14 @@ class BlockfrostBuildWiringGuardTest {
     void blockfrostSuppliersAreBuiltOnlyAsYaciConfigsThreeDelegates() {
         List<String> violations = new ArrayList<>();
         for (String supplier : BLOCKFROST_SUPPLIERS) {
-            List<Site> sites = constructionSites(supplier);
+            // ⚠ Method references count as constructions: `DefaultUtxoSupplier::new` handed to a
+            // Function builds exactly the supplier `new DefaultUtxoSupplier(` does, and a round-1 audit
+            // mutant used that spelling to send both tank seams back to Blockfrost with this test green.
+            List<Site> sites = new ArrayList<>(constructionSites(supplier));
+            sites.addAll(scan(methodReference(supplier)));
             for (Site site : sites) {
                 if (!site.file().equals(YACI_CONFIG)) {
-                    violations.add("new " + supplier + "( at " + site.file() + ":" + site.line()
+                    violations.add("new " + supplier + "( or " + supplier + "::new at " + site.file() + ":" + site.line()
                             + " — outside YaciConfig: a Blockfrost read the index-first, per-epoch or "
                             + "hash-checked bean was built to replace");
                 }
@@ -99,6 +105,65 @@ class BlockfrostBuildWiringGuardTest {
             }
         }
         assertTrue(violations.isEmpty(), String.join("\n", violations));
+    }
+
+    /**
+     * ⛔ The two spellings that build a {@code QuickTxBuilder} with no {@code new QuickTxBuilder(} to count
+     * arguments on — both walked past the round-1 guard with the suite green:
+     * <ul>
+     *   <li>{@code QuickTxBuilder::new} — a method reference resolves to whichever constructor fits the
+     *       functional interface, the one-argument {@code BackendService} form included, and has no
+     *       argument list to read. Nothing in src/main needs one, so it fails anywhere;</li>
+     *   <li>{@code class X extends QuickTxBuilder} — {@code super(backendService)} inside a subclass
+     *       constructor is the one-argument form under another name, and {@code new X(backend)} then
+     *       counts as an unrelated type.</li>
+     * </ul>
+     * (A provider-backed anonymous {@code UtxoSupplier} that reads {@code getUtxoService()} is accepted
+     * residue: it has no name to scan for.)
+     */
+    @Test
+    void noQuickTxBuilderIsBuiltByMethodReferenceOrSubclass() {
+        List<String> violations = new ArrayList<>();
+        scan(methodReference("QuickTxBuilder")).forEach(site ->
+                violations.add("QuickTxBuilder::new at " + site.file() + ":" + site.line()
+                        + " — a constructor reference can resolve to the BackendService form, and has no "
+                        + "argument list this guard can check"));
+        scan(EXTENDS_QUICK_TX_BUILDER).forEach(site ->
+                violations.add("a subclass of QuickTxBuilder at " + site.file() + ":" + site.line()
+                        + " — its super(...) call can be the BackendService form under another name"));
+        assertTrue(violations.isEmpty(), String.join("\n", violations));
+    }
+
+    /** Each method-reference and subclass form, on inputs whose answer is known. */
+    @Test
+    void theMethodReferenceAndSubclassPatternsMatchEveryForm() {
+        for (String code : List.of(
+                "Function<BackendService, QuickTxBuilder> f = QuickTxBuilder::new;",
+                "x(com.bloxbean.cardano.client.quicktx.QuickTxBuilder::new)",
+                "x(QuickTxBuilder :: new)")) {
+            assertEquals(1, matches(code, methodReference("QuickTxBuilder")), code);
+        }
+        for (String code : List.of(
+                "f = DefaultUtxoSupplier::new;",
+                "f = com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier::new;",
+                "f = DefaultUtxoSupplier\n        ::new;")) {
+            assertEquals(1, matches(code, methodReference("DefaultUtxoSupplier")), code);
+        }
+        assertEquals(1, matches("f = DefaultProtocolParamsSupplier::new;", methodReference("DefaultProtocolParamsSupplier")));
+        assertEquals(1, matches("f = DefaultScriptSupplier::new;", methodReference("DefaultScriptSupplier")));
+        for (String code : List.of(
+                "class X extends QuickTxBuilder { X(BackendService b) { super(b); } }",
+                "static final class X extends com.bloxbean.cardano.client.quicktx.QuickTxBuilder {}",
+                "new Object() { class Y extends\n QuickTxBuilder {} }")) {
+            assertEquals(1, matches(code, EXTENDS_QUICK_TX_BUILDER), code);
+        }
+        // Near misses: other types, other members, and spellings inside comments or literals.
+        assertEquals(0, matches("f = NotAQuickTxBuilder::new; g = QuickTxBuilder::compose;",
+                methodReference("QuickTxBuilder")));
+        assertEquals(0, matches("f = MyDefaultUtxoSupplier::new; // DefaultUtxoSupplier::new",
+                methodReference("DefaultUtxoSupplier")));
+        assertEquals(0, matches("class X extends QuickTxBuilderHelper {} /* extends QuickTxBuilder */ "
+                + "String s = \"extends QuickTxBuilder\";", EXTENDS_QUICK_TX_BUILDER));
     }
 
     /**
@@ -156,6 +221,46 @@ class BlockfrostBuildWiringGuardTest {
         List<Site> sites = sitesIn("x.java", code, "QuickTxBuilder");
         assertEquals(1, sites.size(), "expected exactly one site in: " + code);
         return sites.getFirst().arguments();
+    }
+
+    private static final String QUALIFIER = "(?:[A-Za-z_$][\\w$]*\\s*\\.\\s*)*";
+
+    private static final Pattern EXTENDS_QUICK_TX_BUILDER =
+            Pattern.compile("\\bextends\\s+" + QUALIFIER + "QuickTxBuilder\\b");
+
+    /** {@code Type::new}, the type optionally qualified, with any spacing around {@code ::}. */
+    private static Pattern methodReference(String type) {
+        return Pattern.compile("\\b" + QUALIFIER + Pattern.quote(type) + "\\s*::\\s*new\\b");
+    }
+
+    private static int matches(String code, Pattern pattern) {
+        return scanSource("x.java", code, pattern).size();
+    }
+
+    /** Every match of {@code pattern} across src/main (comments and literals blanked); argument count -1. */
+    private static List<Site> scan(Pattern pattern) {
+        assertTrue(Files.isDirectory(MAIN), "not run from the project root: " + MAIN.toAbsolutePath());
+        List<Site> sites = new ArrayList<>();
+        try (Stream<Path> files = Files.walk(MAIN)) {
+            for (Path file : files.filter(p -> p.toString().endsWith(".java")).sorted().toList()) {
+                String relative = MAIN.relativize(file).toString().replace('\\', '/');
+                sites.addAll(scanSource(relative, Files.readString(file, StandardCharsets.UTF_8), pattern));
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return sites;
+    }
+
+    private static List<Site> scanSource(String file, String source, Pattern pattern) {
+        String code = blankCommentsAndLiterals(source);
+        Matcher matcher = pattern.matcher(code);
+        List<Site> sites = new ArrayList<>();
+        while (matcher.find()) {
+            int line = 1 + (int) code.substring(0, matcher.start()).chars().filter(c -> c == '\n').count();
+            sites.add(new Site(file, line, -1));
+        }
+        return sites;
     }
 
     private static List<Site> quickTxBuilderSites() {

@@ -839,8 +839,17 @@ public class ScheduledTransactionService {
                 // (QuickTxBuilder:263 assigns), so a second call would silently discard the
                 // first. Whatever this hook needs to do has to happen here or not at all.
                 .preBalanceTx((ctx, txn) -> {
-                    ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(
-                            referenceScriptSafeSupplier));
+                    // ⛔ AND NEVER THE PINNED COLLATERAL. QuickTxBuilder.build() wraps its selector in
+                    // ExcludeUtxoSelector(collateralInputs); replacing it here dropped that wrapper, so
+                    // a build that had to select more spent the cycle's shared collateral as an input,
+                    // invalidating every other tank transaction naming it (FAB-134 B3b-5 r2,
+                    // TankProductionWiringTest).
+                    ctx.setUtxoSelector(new com.bloxbean.cardano.client.coinselection.impl.ExcludeUtxoSelector(
+                            ReferenceScriptSafeUtxoSelection.selector(referenceScriptSafeSupplier),
+                            java.util.Set.of(TransactionInput.builder()
+                                    .transactionId(collateralUtxo.getTxHash())
+                                    .index(collateralUtxo.getOutputIndex())
+                                    .build())));
                     // ⚠ NOTHING ELSE HAPPENS HERE. A previous version also set the fee so the
                     // evaluator would price a balanced body; that belonged to the self-funding
                     // shape and was withdrawn with it. Vanilla CCL balances after evaluation.
