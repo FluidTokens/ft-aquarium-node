@@ -190,6 +190,69 @@ class EpochProtocolParamsSupplierTest {
         assertEquals(3, delegate.calls, "never retried after the back-off elapsed");
     }
 
+    // ---- invalidate(reason): a ledger rejection naming the parameters (FAB-134 B5a) ----
+
+    @Test
+    void invalidateAfterTheGuardWindowMakesTheNextCallFetchOnce() {
+        var supplier = new EpochProtocolParamsSupplier(delegate, CONVERTERS, clock);
+        ProtocolParams before = supplier.getProtocolParams();
+
+        clock.set(clock.instant().plus(EpochProtocolParamsSupplier.RETRY_AFTER_FAILURE));
+        supplier.invalidate("PPViewHashesDontMatch (test)");
+        ProtocolParams after = supplier.getProtocolParams();
+        assertEquals(2, delegate.calls, "an invalidation past the 60 s guard must make the next call fetch");
+        assertSame(delegate.lastReturned, after, "the value served must be the one just fetched");
+        assertNotSame(before, after);
+
+        supplier.getProtocolParams();
+        assertEquals(2, delegate.calls, "one invalidation is one fetch, not a disabled cache");
+    }
+
+    @Test
+    void invalidateInsideTheGuardWindowFetchesNothing() {
+        var supplier = new EpochProtocolParamsSupplier(delegate, CONVERTERS, clock);
+        ProtocolParams cached = supplier.getProtocolParams();
+
+        clock.set(clock.instant().plus(EpochProtocolParamsSupplier.RETRY_AFTER_FAILURE).minusSeconds(1));
+        supplier.invalidate("FeeTooSmallUTxO (test)");
+        assertSame(cached, supplier.getProtocolParams());
+        assertEquals(1, delegate.calls, "a refresh within 60 s of the last fetch: the guard did not hold");
+    }
+
+    @Test
+    void invalidateWithNothingCachedIsANoOp() {
+        delegate.failing = true;
+        var supplier = new EpochProtocolParamsSupplier(delegate, CONVERTERS, clock);
+        assertEquals(1, delegate.calls);
+
+        clock.set(clock.instant().plusSeconds(120));
+        supplier.invalidate("PPViewHashesDontMatch (test)");
+        assertEquals(1, delegate.calls, "invalidate must never fetch by itself");
+
+        delegate.failing = false;
+        ProtocolParams params = supplier.getProtocolParams();
+        assertEquals(2, delegate.calls, "with nothing cached the next caller fetches, as it always did");
+        assertSame(delegate.lastReturned, params);
+    }
+
+    @Test
+    void aFailedRefetchAfterInvalidateStillServesTheLastChainValue() {
+        var supplier = new EpochProtocolParamsSupplier(delegate, CONVERTERS, clock);
+        ProtocolParams cached = supplier.getProtocolParams();
+
+        clock.set(clock.instant().plusSeconds(61));
+        supplier.invalidate("PPViewHashesDontMatch (test)");
+        delegate.failing = true;
+        assertSame(cached, supplier.getProtocolParams(),
+                "a failed refetch after an invalidation must keep serving the last value the chain returned");
+        assertEquals(2, delegate.calls, "the invalidation did not trigger a refetch");
+
+        // A second rejection right after the failed attempt must not hammer the provider.
+        supplier.invalidate("PPViewHashesDontMatch (test, again)");
+        assertSame(cached, supplier.getProtocolParams());
+        assertEquals(2, delegate.calls, "a second refresh attempt within 60 s of the first");
+    }
+
     /** Counts calls; each success returns a fresh instance so "which value was served" is checkable. */
     static final class CountingSupplier implements ProtocolParamsSupplier {
         static final RuntimeException FAILURE = new RuntimeException("provider down (test)");

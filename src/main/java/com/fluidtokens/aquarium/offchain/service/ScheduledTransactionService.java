@@ -566,7 +566,10 @@ public class ScheduledTransactionService {
                 // indexer when the next cycle reads. Resubmitting it is harmless: the input is gone,
                 // so the ledger rejects it at phase 1, free of charge, and it is counted transient
                 // rather than blacklisted.
-                context.complete();
+                // FAB-134 B5a: a rejection naming the protocol parameters refreshes them. Nothing
+                // else is read from this result; the loop goes on exactly as before.
+                com.fluidtokens.aquarium.offchain.config.ProtocolParamsRejections
+                        .refreshIfParamsRejected(protocolParamsSupplier, context.complete());
                 submitted++;
 
             } catch (com.fluidtokens.aquarium.offchain.util.UnusableTankDatumException e) {

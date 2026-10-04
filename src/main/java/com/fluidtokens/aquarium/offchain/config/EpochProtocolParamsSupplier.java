@@ -38,6 +38,13 @@ import java.util.Objects;
  * <p>The first fetch happens at construction, and it is soft: a provider that is down at boot logs a
  * WARN and leaves the cache empty, so the node still starts and the first caller retries.
  *
+ * <h2>A ledger rejection can bring the refresh forward</h2>
+ * Parameters can move outside the epoch schedule, and the ledger says so at submission
+ * ({@code PPViewHashesDontMatch}, {@code FeeTooSmallUTxO}; see {@link ProtocolParamsRejections}).
+ * {@link #invalidate(String)} then makes the next call fetch — at most once per
+ * {@link #RETRY_AFTER_FAILURE}, counted from the last fetch attempt, so a burst of rejections is one
+ * provider call. A failed refetch keeps serving the last chain value, exactly as above.
+ *
  * <p>UTxOs are NOT cached here or anywhere near here. This holds protocol parameters only.
  */
 @Slf4j
@@ -60,6 +67,9 @@ public class EpochProtocolParamsSupplier implements ProtocolParamsSupplier {
 
     /** Guarded by {@code this}. Meaningful only while {@link #cached} is set. */
     private Instant refreshAt;
+
+    /** Guarded by {@code this}. When the delegate was last asked, successfully or not; the invalidation guard. */
+    private Instant lastFetchAttempt;
 
     public EpochProtocolParamsSupplier(ProtocolParamsSupplier delegate,
                                        CardanoConverters converters,
@@ -96,8 +106,33 @@ public class EpochProtocolParamsSupplier implements ProtocolParamsSupplier {
         }
     }
 
+    /**
+     * The ledger rejected a transaction for a reason that names the protocol parameters: make the next
+     * {@link #getProtocolParams()} fetch afresh — if a value is cached and the delegate was last asked at
+     * least {@link #RETRY_AFTER_FAILURE} ago; otherwise nothing changes. Never fetches by itself, never
+     * drops the cached value (a failed refetch still serves it), never throws.
+     *
+     * @param reason what triggered it, for the log
+     */
+    public synchronized void invalidate(String reason) {
+        Instant now = clock.instant();
+        if (cached == null) {
+            log.warn("Protocol parameters invalidation ignored, nothing is cached (the next caller fetches "
+                    + "anyway): {}", reason);
+            return;
+        }
+        if (lastFetchAttempt != null && now.isBefore(lastFetchAttempt.plus(RETRY_AFTER_FAILURE))) {
+            log.warn("Protocol parameters invalidation ignored, the last fetch was less than {} ago ({}): {}",
+                    RETRY_AFTER_FAILURE, lastFetchAttempt, reason);
+            return;
+        }
+        refreshAt = now;
+        log.warn("Protocol parameters invalidated, the next request fetches afresh: {}", reason);
+    }
+
     /** Calls the delegate once; caches and returns its answer, or throws without touching the cache. */
     private ProtocolParams fetch(Instant now) {
+        lastFetchAttempt = now;
         ProtocolParams fresh = delegate.getProtocolParams();
         if (fresh == null) {
             throw new IllegalStateException("the protocol parameters supplier returned null");

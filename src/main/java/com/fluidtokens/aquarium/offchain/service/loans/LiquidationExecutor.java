@@ -17,6 +17,7 @@ import com.bloxbean.cardano.client.util.HexUtil;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.ProtocolParamsRejections;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
@@ -350,7 +351,13 @@ public class LiquidationExecutor {
         this(configuration, blockEventListener, appUtxoService, account, scanner, utxoResolver, builder,
                 payInAdvanceRouter, convertRouter.getIfAvailable(), registry, decisionLog, marketCoverage,
                 oracleClient, network, protocolParamsSupplier, converters,
-                bytes -> backendService.getTransactionService().submitTransaction(bytes));
+                bytes -> {
+                    // FAB-134 B5a: a rejection naming the parameters refreshes them; the result itself
+                    // is returned untouched (nothing retried, no outcome changed).
+                    Result<String> result = backendService.getTransactionService().submitTransaction(bytes);
+                    ProtocolParamsRejections.refreshIfParamsRejected(protocolParamsSupplier, result);
+                    return result;
+                });
     }
 
     /** The same loop with the submitter stated, so a test can watch exactly what reaches the wire. */

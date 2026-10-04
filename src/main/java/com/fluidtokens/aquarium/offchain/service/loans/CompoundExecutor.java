@@ -5,9 +5,11 @@ import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.ProtocolParamsRejections;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
@@ -145,10 +147,17 @@ public class CompoundExecutor {
                             LiquidationUtxoResolver utxoResolver,
                             UtxoSupplier utxoSupplier,
                             CardanoConverters converters,
+                            ProtocolParamsSupplier protocolParamsSupplier,
                             BFBackendService backendService) {
         this(configuration, network, blockEventListener, appUtxoService, account, scanner, economics,
                 builder, utxoResolver, utxoSupplier, converters,
-                bytes -> backendService.getTransactionService().submitTransaction(bytes));
+                bytes -> {
+                    // FAB-134 B5a: a rejection naming the parameters refreshes them; the result itself
+                    // is returned untouched (nothing retried, no outcome changed).
+                    Result<String> result = backendService.getTransactionService().submitTransaction(bytes);
+                    ProtocolParamsRejections.refreshIfParamsRejected(protocolParamsSupplier, result);
+                    return result;
+                });
     }
 
     /** The same loop with the submitter stated, so a test can watch exactly what reaches the wire. */

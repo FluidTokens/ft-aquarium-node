@@ -308,6 +308,12 @@ class ExecutorContextResolutionTest {
             return LoanFixtures.converters();
         }
 
+        /** FAB-134 B5a: the Spring constructor takes the supplier a params rejection refreshes. */
+        @Bean
+        com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier() {
+            return LoanFixtures.protocolParams();
+        }
+
         @Bean
         BFBackendService backendService() {
             return new BFBackendService(OFFLINE_BLOCKFROST, "dummy");
