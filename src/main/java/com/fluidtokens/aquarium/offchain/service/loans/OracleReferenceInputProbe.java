@@ -9,11 +9,16 @@ import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 
 import java.util.Collection;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * ⛔ <b>Is every oracle out-ref a build is about to reference still LIVE?</b> (FAB-138.) Asked on Blockfrost
@@ -53,6 +58,14 @@ public class OracleReferenceInputProbe {
 
     /** Blockfrost's largest page; a feed or provider NFT is one token, so one page always suffices. */
     private static final int PAGE_SIZE = 100;
+
+    /**
+     * The two spent-input words, each letter allowed whitespace after it: {@code LiquidationExecutor} removes
+     * ALL whitespace before matching, so {@code "Bad Inputs UTxO"} is its {@code BadInputsUTxO}.
+     */
+    private static final Pattern BAD_INPUTS = whitespaceTolerant("BadInputs");
+
+    private static final Pattern SCRIPT_FAILURES = whitespaceTolerant("ScriptFailures");
 
     private final UtxoSupplier contentSource;
 
@@ -121,7 +134,7 @@ public class OracleReferenceInputProbe {
         } catch (Exception e) {
             throw new OracleReferenceInputNotLiveException(
                     "oracle out-ref %s (expected NFT %s at %s): live-UTxO check failed, provider error %s"
-                            .formatted(ref(outRef), unit, address, scrubbed(e.toString())));
+                            .formatted(ref(outRef), unit, address, scrubbedCauseChain(e)));
         }
         if (answer == null) {
             throw new OracleReferenceInputNotLiveException(
@@ -139,7 +152,9 @@ public class OracleReferenceInputProbe {
                             .formatted(ref(outRef), unit, address, answer.code(), scrubbed(answer.getResponse())));
         }
         List<Utxo> live = answer.getValue() == null ? List.of() : answer.getValue();
-        boolean present = live.stream().anyMatch(utxo -> outRef.getTransactionId().equals(utxo.getTxHash())
+        // The output INDEX is part of the identity: a sibling output of the same transaction holding the NFT
+        // means this out-ref is spent. Hex case is not: a registry may write the hash in uppercase.
+        boolean present = live.stream().anyMatch(utxo -> outRef.getTransactionId().equalsIgnoreCase(utxo.getTxHash())
                 && outRef.getIndex() == utxo.getOutputIndex());
         if (!present) {
             throw new OracleReferenceInputNotLiveException(
@@ -151,12 +166,38 @@ public class OracleReferenceInputProbe {
 
     /**
      * A provider's own text, with the two spent-input markers {@code LiquidationExecutor} matches on defused,
-     * so no answer Blockfrost gives can make a probe refusal read as a spent wallet utxo. Deliberately no
-     * exception cause either: the executor's detail is the cause chain, and a cause's text is not scrubbed.
+     * so no answer Blockfrost gives can make a probe refusal read as a spent wallet utxo. The match tolerates
+     * whitespace INSIDE each word, because the executor compacts all whitespace before it looks: a scrub that
+     * missed {@code "Bad Inputs"} would hand it {@code BadInputs} after compaction.
      */
-    private static String scrubbed(String providerText) {
-        return String.valueOf(providerText).replace("BadInputs", "Bad-Inputs")
-                .replace("ScriptFailures", "Script-Failures");
+    static String scrubbed(String providerText) {
+        String text = String.valueOf(providerText);
+        text = BAD_INPUTS.matcher(text).replaceAll("Bad-Inputs");
+        return SCRIPT_FAILURES.matcher(text).replaceAll("Script-Failures");
+    }
+
+    /**
+     * Every link of a provider failure's cause chain, each scrubbed. CCL wraps the transport failure
+     * ({@code ApiException("Error getting utxos…", SocketTimeoutException)}), so the outer text alone says
+     * nothing about what happened. The refusal itself carries no cause: the executor's detail is the cause
+     * chain, and an unscrubbed cause would reach it — so the chain travels as scrubbed TEXT instead.
+     */
+    static String scrubbedCauseChain(Throwable failure) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        StringBuilder chain = new StringBuilder();
+        for (Throwable link = failure; link != null && seen.add(link); link = link.getCause()) {
+            if (!chain.isEmpty()) {
+                chain.append(" <- caused by ");
+            }
+            chain.append(scrubbed(link.toString()));
+        }
+        return chain.toString();
+    }
+
+    private static Pattern whitespaceTolerant(String word) {
+        return Pattern.compile(word.chars()
+                .mapToObj(c -> Pattern.quote(String.valueOf((char) c)))
+                .collect(Collectors.joining("\\s*")));
     }
 
     private static String ref(TransactionInput outRef) {

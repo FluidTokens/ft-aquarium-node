@@ -12,6 +12,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -268,6 +269,119 @@ class OracleReferenceInputProbeTest {
 
         verify(blockfrost).getUtxos(PROVIDER_ADDRESS, C3_NFT.toUnit(), 100, 1);
         verify(blockfrost, never()).getUtxos(PROVIDER_ADDRESS, FEED_NFT.toUnit(), 100, 1);
+    }
+
+    // ---- FAB-135 T4 amendment 2: the T3a audit residue ------------------------------------------------
+
+    /**
+     * What {@code LiquidationExecutor.spentInputEffect} would read as "a wallet input is spent": the text
+     * with ALL whitespace removed, then either marker. Mirrored here with the executor's own constants, so
+     * a whitespace-split marker that survives a naive scrub is caught exactly as the executor would catch it.
+     */
+    private static void assertExecutorReadsNoSpentInput(String message) {
+        String compact = message.replaceAll("\\s", "");
+        assertFalse(compact.contains(LiquidationExecutor.BAD_INPUTS_MARKER),
+                "after the executor's whitespace compaction this refusal carries "
+                        + LiquidationExecutor.BAD_INPUTS_MARKER + ": " + message);
+        assertFalse(compact.contains(LiquidationExecutor.EMPTY_SCRIPT_FAILURES_MARKER),
+                "after the executor's whitespace compaction this refusal carries "
+                        + LiquidationExecutor.EMPTY_SCRIPT_FAILURES_MARKER + ": " + message);
+    }
+
+    /**
+     * (a) CCL's real shape: {@code DefaultUtxoService} wraps the transport failure, so the outer message is
+     * generic and the CAUSE is the one that says what happened. The refusal must keep it.
+     */
+    @Test
+    void aWrappedProviderFailureKeepsItsRootCause() throws Exception {
+        UtxoService blockfrost = mock(UtxoService.class);
+        when(blockfrost.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1)).thenThrow(new ApiException(
+                "Error getting utxos for address: " + FEED_ADDRESS,
+                new SocketTimeoutException("Read timed out")));
+
+        var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(multisig())));
+
+        assertTrue(e.getMessage().contains("Error getting utxos"), e.getMessage());
+        assertTrue(e.getMessage().contains("SocketTimeoutException") && e.getMessage().contains("Read timed out"),
+                "the root cause of a wrapped provider failure is lost: " + e.getMessage());
+        assertExecutorReadsNoSpentInput(e.getMessage());
+    }
+
+    /** (a)+(c) every link of the cause chain is scrubbed, not just the outer one. */
+    @Test
+    void everyLinkOfTheCauseChainIsScrubbed() throws Exception {
+        UtxoService blockfrost = mock(UtxoService.class);
+        when(blockfrost.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1)).thenThrow(new ApiException(
+                "Error getting utxos: BadInputsUTxO",
+                new IllegalStateException("{\"ScriptFailures\":{}}",
+                        new RuntimeException("Bad Inputs UTxO and \"Script Failures\" : { }"))));
+
+        var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(multisig())));
+
+        assertTrue(e.getMessage().contains("IllegalStateException"), "the middle link is missing: " + e.getMessage());
+        assertTrue(e.getMessage().contains("RuntimeException"), "the root link is missing: " + e.getMessage());
+        assertExecutorReadsNoSpentInput(e.getMessage());
+    }
+
+    /** (c) a provider's 500 body carrying both markers — plain and whitespace-split — is defused. */
+    @Test
+    void aServerErrorBodyCarryingTheMarkersIsDefused() throws Exception {
+        for (String body : List.of(
+                "{\"error\":\"BadInputsUTxO\",\"result\":{\"ScriptFailures\":{}}}",
+                "{\"error\":\"Bad Inputs\nUTxO\"}",
+                "{\"result\": {\"Script\tFailures\" : { } } }")) {
+            UtxoService blockfrost = mock(UtxoService.class);
+            when(blockfrost.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1)).thenReturn(failed(500, body));
+
+            var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(multisig())));
+
+            assertTrue(e.getMessage().contains("500"), e.getMessage());
+            assertExecutorReadsNoSpentInput(e.getMessage());
+        }
+    }
+
+    /** (c) an exception message carrying a whitespace-split marker is defused too. */
+    @Test
+    void anExceptionMessageWithAWhitespaceSplitMarkerIsDefused() throws Exception {
+        for (String text : List.of("BadInputsUTxO", "Bad  Inputs UTxO", "\"ScriptFailures\":{}",
+                "\"Script Failures\": {}")) {
+            UtxoService blockfrost = mock(UtxoService.class);
+            when(blockfrost.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1)).thenThrow(new ApiException(text));
+
+            var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(multisig())));
+
+            assertExecutorReadsNoSpentInput(e.getMessage());
+        }
+    }
+
+    /** (b) the same transaction, a DIFFERENT output holding the NFT: this out-ref is spent. */
+    @Test
+    void theSameTxHashAtAnotherIndexIsNotLive() throws Exception {
+        Utxo sibling = holding(LoanFixtures.input(FEED_REF.getTransactionId(), FEED_REF.getIndex() + 1),
+                FEED_ADDRESS, FEED_NFT);
+        UtxoService blockfrost = mock(UtxoService.class);
+        when(blockfrost.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1)).thenReturn(ok(sibling));
+
+        var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(multisig())));
+
+        assertTrue(e.getMessage().contains("spent"), e.getMessage());
+        assertTrue(e.getMessage().contains(FEED_REF.getTransactionId() + "#" + (FEED_REF.getIndex() + 1)),
+                e.getMessage());
+    }
+
+    /** (b) a registry out-ref written in UPPERCASE is the same out-ref Blockfrost answers in lowercase. */
+    @Test
+    void theTxHashIsComparedCaseInsensitively() throws Exception {
+        String upper = "9A".repeat(32);
+        TransactionInput upperRef = LoanFixtures.input(upper, 0);
+        Utxo content = holding(upperRef, FEED_ADDRESS, FEED_NFT);
+        UtxoService blockfrost = mock(UtxoService.class);
+        when(blockfrost.getUtxos(FEED_ADDRESS, FEED_NFT.toUnit(), 100, 1)).thenReturn(ok(FEED_UTXO));
+        OracleEntry entry = new OracleEntry(PRICED, FEED_NFT, "", "a0".repeat(28), upperRef, SCRIPT_REF,
+                List.of("00".repeat(32)), 1, OraclePriceFeed.aggregated(PRICED, BigInteger.ONE, BigInteger.ONE,
+                0L, 1L), List.of(), null, 2, null);
+
+        assertDoesNotThrow(() -> probe(blockfrost, content).requireLive(List.of(entry)));
     }
 
     @Test

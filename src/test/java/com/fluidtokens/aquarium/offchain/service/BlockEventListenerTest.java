@@ -9,6 +9,7 @@ import org.mockito.Answers;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.core.env.PropertySource;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.env.SystemEnvironmentPropertySource;
@@ -17,6 +18,7 @@ import org.springframework.core.io.ClassPathResource;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
@@ -153,6 +155,53 @@ class BlockEventListenerTest {
                     () -> new BlockEventListener(MAINNET, bad, Clock.systemUTC()));
             assertTrue(e.getMessage().contains("aquarium.syncing-threshold-minutes"), e.getMessage());
         }
+    }
+
+    // ---- FAB-135 T4 amendment: the T1b audit residue ------------------------------------------------
+
+    /**
+     * ⛔ The production path, end to end: the PROPERTY reaches the bean Spring builds. Every other test here
+     * calls the package-private constructor with the threshold in hand, so a production constructor that
+     * ignored its {@code @Value} argument (passing the class default instead) would pass all of them. With
+     * N = 7, a block 8 minutes old is syncing and one 6 minutes old is not — under the default 10 the first
+     * would be caught up. Real clock: the production constructor takes {@code Clock.systemUTC()}, so the
+     * events are placed relative to now, a full minute either side of the boundary.
+     */
+    @Test
+    void thePropertyReachesTheSpringBuiltBean() {
+        new ApplicationContextRunner()
+                .withPropertyValues("aquarium.syncing-threshold-minutes=7")
+                .withBean(CardanoConverters.class, () -> MAINNET)
+                .withUserConfiguration(BlockEventListener.class)
+                .run(context -> {
+                    BlockEventListener listener = context.getBean(BlockEventListener.class);
+                    listener.processBlock(eventAt(slotMinutesAgo(8)));
+                    assertTrue(listener.getIsSyncing().get(), "with N = 7 an 8-minute-old block is syncing");
+                    listener.processBlock(eventAt(slotMinutesAgo(6)));
+                    assertFalse(listener.getIsSyncing().get(), "with N = 7 a 6-minute-old block is caught up");
+                });
+    }
+
+    /** A block further in the FUTURE than N is caught up: the drift is signed, never its magnitude. */
+    @Test
+    void aBlockFurtherInTheFutureThanTheThresholdIsNotSyncing() {
+        assertFalse(syncingAfter(10, Duration.ofMinutes(-30)),
+                "a block 30 minutes ahead of the clock is caught up — |drift| would call it syncing");
+    }
+
+    /** The one-argument constructor's threshold is the shipped 10 minutes, asserted by what it does. */
+    @Test
+    void theOneArgumentConstructorBehavesAsTenMinutes() {
+        BlockEventListener listener = new BlockEventListener(MAINNET);
+        listener.processBlock(eventAt(slotMinutesAgo(11)));
+        assertTrue(listener.getIsSyncing().get(), "an 11-minute-old block is syncing under the 10-minute default");
+        listener.processBlock(eventAt(slotMinutesAgo(9)));
+        assertFalse(listener.getIsSyncing().get(), "a 9-minute-old block is caught up under the 10-minute default");
+    }
+
+    private static long slotMinutesAgo(long minutes) {
+        return MAINNET.time().toSlot(LocalDateTime.ofInstant(Instant.now().minus(Duration.ofMinutes(minutes)),
+                ZoneOffset.UTC));
     }
 
     // ---- binding: the SHIPPED base document, not a fixture -------------------------------------

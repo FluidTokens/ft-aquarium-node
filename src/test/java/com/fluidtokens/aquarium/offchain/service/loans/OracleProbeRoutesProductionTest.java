@@ -297,7 +297,12 @@ class OracleProbeRoutesProductionTest {
         }
 
         PayInAdvanceRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos) {
-            LoanDatum datum = piaLoanDatum();
+            return wire(mode, walletUtxos, piaLoanDatum(), piaCollateralOracle(), piaPrincipalOracle());
+        }
+
+        /** The same scenario with a chosen loan datum and oracle registry (FAB-135 T4 amendment 3). */
+        PayInAdvanceRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos, LoanDatum datum,
+                             OracleEntry... oracles) {
             Loan loan = new Loan(PIA_LOAN_TX, 1, PIA_LOAN_ADDRESS, PIA_LOAN_ID,
                     BigInteger.valueOf(PIA_COLLATERAL_AMOUNT), BigInteger.valueOf(3_000_000L), datum);
             LenderBond bond = new LenderBond(PIA_LOAN_TX, 3, PIA_BOND_ADDRESS, PIA_LOAN_ID, PIA_BOND_DATUM_HEX,
@@ -343,7 +348,7 @@ class OracleProbeRoutesProductionTest {
                     new LiquidateTransactionBuilder(PREVIEW_REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(),
                             contentHold, EvalFixtures.protocolParams()),
                     router, null, PREVIEW_REGISTRY, log, new MarketCoverageReporter(new SimpleMeterRegistry()),
-                    new FixedOracles(piaCollateralOracle(), piaPrincipalOracle()), network("preview"),
+                    new FixedOracles(oracles), network("preview"),
                     EvalFixtures.protocolParams(), LoanFixtures.converters(),
                     bytes -> {
                         submissions.incrementAndGet();
@@ -448,6 +453,57 @@ class OracleProbeRoutesProductionTest {
         assertRefusedAtErrorEveryCycle(rig, 1, PRINCIPAL_C3_REF, PRINCIPAL_C3_NFT);
     }
 
+    /**
+     * FAB-135 T4 amendment 3 (a), PIA with an ADA principal through the bean-wired, probed builder: an ada
+     * principal has no oracle entry and adds no reference input, so only the collateral leg's feed and Charli3
+     * provider are probed — each once — and the build is evaluated exactly once. A probe handed
+     * {@code List.of(oracle, principalOracle)} unconditionally would meet a null principal oracle here.
+     */
+    @Test
+    void payInAdvanceAnAdaPrincipalProbesOnlyTheCollateralLegAndIsEvaluatedOnce() throws Exception {
+        // an ada principal repays the lender in ada: a second, larger ada-only utxo funds that payout
+        Utxo adaFunding = LoanFixtures.adaUtxo("e2".repeat(32), 0, PREVIEW_ACCOUNT.baseAddress(), 100_000_000L);
+        PayInAdvanceRig rig = new PayInAdvanceRig().allLive().wire(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                List.of(ADA_WALLET, adaFunding), new LoanDatumConverter().deserialize(PIA_LOAN_DATUM_HEX),
+                piaCollateralOracle());
+
+        rig.cycles(PIA_NOW, 1);
+
+        List<LiquidationDecision> decisions = rig.decisions();
+        assertEquals(1, decisions.size(), decisions.toString());
+        assertEquals(1, rig.evaluations.get(), "an ada-principal build is priced exactly once: " + decisions);
+        verify(rig.utxoService, times(1)).getUtxos(PIA_ORACLE_ADDRESS, PIA_ORACLE_NFT.toUnit(), 100, 1);
+        verify(rig.utxoService, times(1)).getUtxos(PIA_C3_ADDRESS, PIA_C3_NFT.toUnit(), 100, 1);
+        verify(rig.utxoService, never()).getTxOutput(anyString(), anyInt());
+        verifyNoMoreInteractions(rig.utxoService);
+        assertEquals(0, rig.submissions.get(), "shadow never submits");
+    }
+
+    /**
+     * FAB-135 T4 amendment 3 (b), the PIA analogue: a principal feed whose window has ALREADY closed is
+     * refused by the builder's V3 window wall — a cheap, local refusal — and makes no Blockfrost call at all.
+     * The probe runs only after every cheap refusal.
+     */
+    @Test
+    void payInAdvanceAPrincipalFeedWindowRefusalMakesNoProviderCall() throws Exception {
+        OracleEntry expiredPrincipal = withProviderNft(LoanFixtures.charli3(TOKEN_PRINCIPAL, PRINCIPAL_ORACLE_NFT,
+                PRINCIPAL_ORACLE_CREDENTIAL, OraclePriceFeed.priceDataCharlie(TOKEN_PRINCIPAL, BigInteger.ONE,
+                        BigInteger.ONE, PIA_FEED_FROM - 1_200_000L, PIA_FEED_FROM - 600_000L),
+                PRINCIPAL_ORACLE_REF, PRINCIPAL_ORACLE_SCRIPT_REF, PRINCIPAL_C3_REF), PRINCIPAL_C3_NFT);
+        PayInAdvanceRig rig = new PayInAdvanceRig().allLive().wire(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                List.of(ADA_WALLET, TOKEN_WALLET), piaLoanDatum(), piaCollateralOracle(), expiredPrincipal);
+
+        rig.cycles(PIA_NOW, 1);
+
+        List<LiquidationDecision> decisions = rig.decisions();
+        assertEquals(1, decisions.size(), decisions.toString());
+        assertTrue(decisions.getFirst().detail().contains("principal oracle feed window"),
+                "the builder's own window wall refused it: " + decisions.getFirst().detail());
+        assertEquals(0, rig.evaluations.get());
+        verify(rig.utxoService, never()).getUtxos(anyString(), anyString(), anyInt(), anyInt());
+        verifyNoMoreInteractions(rig.utxoService);
+    }
+
     // ======================================================================================
     // CONVERT — the recorded mainnet d832b78e loan, a Charli3 collateral oracle, an indexed pool
     // ======================================================================================
@@ -499,6 +555,8 @@ class OracleProbeRoutesProductionTest {
         Utxo oracleUtxo;
         Utxo providerUtxo;
         OracleEntry collateralOracle;
+        /** The loan datum's {@code repaymentReceipts} flag, forced true (FAB-135 T4 amendment 3). */
+        boolean repaymentReceipts;
 
         ConvertRig() throws Exception {
             super();
@@ -542,7 +600,13 @@ class OracleProbeRoutesProductionTest {
         ConvertRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos) throws Exception {
             String loanDatumHex = LoanFixtures.fixture("mainnet-loan-datum-d832b78e.hex");
             String bondDatumHex = LoanFixtures.fixture("mainnet-lender-bond-datum-d832b78e.hex");
-            LoanDatum datum = new LoanDatumConverter().deserialize(loanDatumHex);
+            LoanDatum recorded = new LoanDatumConverter().deserialize(loanDatumHex);
+            LoanDatum datum = !repaymentReceipts ? recorded : new LoanDatum(recorded.doneRecasts(),
+                    recorded.principalAmount(), recorded.lendDate(), recorded.repaidInstallments(),
+                    recorded.interestRate(), recorded.totalInstallments(), recorded.principalAsset(),
+                    recorded.principalOracleAsset(), recorded.installmentPeriod(), recorded.initialGracePeriod(),
+                    recorded.liquidationMode(), recorded.repaymentMode(), recorded.repaymentTimeWindow(),
+                    recorded.penaltyFeeForLateRepayment(), true, recorded.originId(), recorded.collateral());
             LenderManagerDatum bondDatum = new LenderManagerDatumConverter().deserialize(bondDatumHex);
             String loanAddress = scriptAddress(MAINNET_REGISTRY.getLoanSpendScriptHash(), MAINNET);
             String bondAddress = scriptAddress(MAINNET_REGISTRY.getLenderManagerSpendScriptHash(), MAINNET);
@@ -717,6 +781,28 @@ class OracleProbeRoutesProductionTest {
         assertRefusedAtErrorEveryCycle(rig, 1, CV_C3_REF, CV_C3_NFT);
         verify(rig.utxoService).getUtxos(CV_C3_ADDRESS, CV_C3_NFT.toUnit(), 100, 1);
         verify(rig.utxoService, never()).getUtxos(CV_C3_ADDRESS, rig.collateralOracle.oracleToken().toUnit(), 100, 1);
+    }
+
+    /**
+     * FAB-135 T4 amendment 3 (b): a convert the builder refuses CHEAPLY — {@code repaymentReceipts = true}, a
+     * shape it does not model — makes ZERO Blockfrost calls. The probe runs after every cheap refusal, so a
+     * candidate the bot would refuse anyway costs nothing.
+     */
+    @Test
+    void convertARepaymentReceiptsRefusalMakesNoProviderCall() throws Exception {
+        ConvertRig rig = new ConvertRig().prepare().allLive();
+        rig.repaymentReceipts = true;
+        rig.wire(AppConfig.LiquidationConfiguration.Mode.SHADOW, List.of(CV_WALLET_A, CV_WALLET_B));
+
+        rig.cycles(CV_NOW, 1);
+
+        List<LiquidationDecision> decisions = rig.decisions();
+        assertEquals(1, decisions.size(), decisions.toString());
+        assertTrue(decisions.getFirst().detail().contains("REPAYMENT_RECEIPTS"),
+                "the builder's own repayment-receipts refusal: " + decisions.getFirst().detail());
+        assertEquals(0, rig.evaluations.get());
+        verify(rig.utxoService, never()).getUtxos(anyString(), anyString(), anyInt(), anyInt());
+        verifyNoMoreInteractions(rig.utxoService);
     }
 
     /** The rigs really are the beans: each builder they drive holds the probe the container would inject. */
