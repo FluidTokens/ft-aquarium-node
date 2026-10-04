@@ -99,7 +99,7 @@ public record PoolUsability(Verdict verdict, String detail) {
 
     public static PoolUsability noPool() {
         return new PoolUsability(Verdict.NO_POOL,
-                "no Minswap pool exists for this pair, in either asset ordering");
+                "no Minswap pool for this pair is indexed (pools idle since 2025-05-06 are invisible)");
     }
 
     public static PoolUsability checkFailed(String why) {

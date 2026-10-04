@@ -353,7 +353,7 @@ class LiquidationUtxoResolverTest {
      * The one case the index CAN settle: something minted this pool's NFT, so the pool exists and the
      * missing half is a gap rather than a non-existent pool. Distinguished from
      * {@link LiquidationUtxoResolver.PoolLookup#NOT_VISIBLE} on purpose (M-2) — one refusal for both
-     * would be the repeating-quarantine shape this epic refuses elsewhere.
+     * would conflate a gap the index can close with a pool that does not exist.
      */
     @Test
     void aVisiblePoolWithNoManagerIsHalfVisibleRatherThanAbsent() {

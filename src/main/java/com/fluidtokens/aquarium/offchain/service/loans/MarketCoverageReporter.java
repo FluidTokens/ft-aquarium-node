@@ -57,8 +57,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * that only ever fills is a one-shot, ~1000-ada switch-off of an operator's market alerting for the
  * life of the process — roughly 256 min-ada junk bonds and the bot goes quiet forever, and
  * {@code LenderBondService.findAll()} returns every bond at the credential, not only this
- * operator's. So the bound behaves like {@code LiquidationExecutor.MAX_QUARANTINED}, whose two
- * mechanisms this mirrors:
+ * operator's. So the bound has two mechanisms:
  * <ul>
  *   <li><b>eviction</b> — at the ceiling a newcomer is admitted by dropping a series that is
  *       currently reading {@code 0} (the one that has read 0 longest), never one reading {@code 1}
@@ -325,10 +324,9 @@ public class MarketCoverageReporter {
 
     /**
      * Drops the series that has been reading {@code 0} longest, so a newly unservable market can
-     * have its slot. Mirrors {@code LiquidationExecutor.quarantineUntil}'s "evict the entry closest
-     * to expiry and admit the newcomer" — the difference being that a series reading {@code 1} is an
-     * active alert and is never a candidate, and neither is one that is unservable on this cycle but
-     * has not been raised to 1 yet.
+     * have its slot: the newcomer is admitted by evicting, never refused — except that a series
+     * reading {@code 1} is an active alert and is never a candidate, and neither is one that is
+     * unservable on this cycle but has not been raised to 1 yet.
      *
      * @return whether anything could be given up
      */

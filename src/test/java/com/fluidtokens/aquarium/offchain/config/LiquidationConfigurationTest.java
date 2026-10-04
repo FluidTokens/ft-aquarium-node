@@ -138,7 +138,7 @@ class LiquidationConfigurationTest {
     void armingIsExactlyLiveModeWithNoSecondBoolean() {
         for (Mode mode : Mode.values()) {
             LiquidationConfiguration configuration = new LiquidationConfiguration(mode,
-                    60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
+                    60, 120, 30, BigInteger.valueOf(1_500_000), 200);
             assertEquals(mode == Mode.LIVE, configuration.isArmed(), "mode=" + mode);
         }
     }
@@ -160,13 +160,13 @@ class LiquidationConfigurationTest {
     @Test
     void theConvenienceConstructorsDefaultToTheSafeProfitabilityFloors() {
         LiquidationConfiguration eightArg = new LiquidationConfiguration(Mode.SHADOW,
-                60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
+                60, 120, 30, BigInteger.valueOf(1_500_000), 200);
         assertTrue(eightArg.isCheckProfitability(), "profitability checking defaults ON");
         assertEquals(BigInteger.ZERO, eightArg.getMinProfitAbsoluteLovelace(),
                 "the absolute floor defaults to zero");
 
         LiquidationConfiguration nineArg = new LiquidationConfiguration(Mode.SHADOW,
-                60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30, eightArg.getReferenceScripts());
+                60, 120, 30, BigInteger.valueOf(1_500_000), 200, eightArg.getReferenceScripts());
         assertTrue(nineArg.isCheckProfitability());
         assertEquals(BigInteger.ZERO, nineArg.getMinProfitAbsoluteLovelace());
     }
@@ -175,7 +175,7 @@ class LiquidationConfigurationTest {
     @Test
     void theFullConstructorCarriesTheStatedFloors() {
         LiquidationConfiguration stated = new LiquidationConfiguration(Mode.LIVE,
-                60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30,
+                60, 120, 30, BigInteger.valueOf(1_500_000), 200,
                 false, BigInteger.valueOf(2_000_000),
                 com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder
                         .ReferenceScripts.none());
@@ -294,7 +294,7 @@ class LiquidationConfigurationTest {
     @Test
     void aHandBuiltConfigurationPublishesNothingRatherThanNull() {
         LiquidationConfiguration configuration = new LiquidationConfiguration(Mode.SHADOW,
-                60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
+                60, 120, 30, BigInteger.valueOf(1_500_000), 200);
 
         assertNotNull(configuration.getReferenceScripts());
         assertNull(configuration.getReferenceScripts().loan());

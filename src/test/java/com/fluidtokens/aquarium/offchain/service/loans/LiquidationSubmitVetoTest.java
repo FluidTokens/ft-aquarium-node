@@ -192,9 +192,22 @@ class LiquidationSubmitVetoTest {
 
         private final RuntimeException throwable;
 
+        /** What every submission after the first answers; null means the same as the first. */
+        private Result<String> later;
+
         RecordingSubmitter(Result<String> answer, RuntimeException throwable) {
             this.answer = answer;
             this.throwable = throwable;
+        }
+
+        /**
+         * Accepts the first submission, rejects every later one with {@code response} — a liquidation
+         * that landed, resubmitted from an index that has not seen it yet.
+         */
+        static RecordingSubmitter acceptingThenRejecting(String txHash, String response) {
+            RecordingSubmitter submitter = accepting(txHash);
+            submitter.later = Result.error(response).code(400);
+            return submitter;
         }
 
         static RecordingSubmitter accepting(String txHash) {
@@ -215,7 +228,7 @@ class LiquidationSubmitVetoTest {
             if (throwable != null) {
                 throw throwable;
             }
-            return answer;
+            return later != null && submitted.size() > 1 ? later : answer;
         }
     }
 
@@ -299,13 +312,20 @@ class LiquidationSubmitVetoTest {
 
     private static final class FakeAppUtxoService extends AppUtxoService {
 
+        private final List<Utxo> utxos;
+
         FakeAppUtxoService() {
-            super(null, null, null);
+            this(List.of(WALLET_UTXO));
+        }
+
+        FakeAppUtxoService(List<Utxo> utxos) {
+            super(null, null);
+            this.utxos = utxos;
         }
 
         @Override
         public List<Utxo> listWalletUtxo() {
-            return List.of(WALLET_UTXO);
+            return utxos;
         }
     }
 
@@ -563,7 +583,7 @@ class LiquidationSubmitVetoTest {
     private static AppConfig.LiquidationConfiguration configuration(
             AppConfig.LiquidationConfiguration.Mode mode, BigInteger margin,
             LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
-        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, margin, 200, 30,
+        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, margin, 200,
                 referenceScripts);
     }
 
@@ -667,7 +687,7 @@ class LiquidationSubmitVetoTest {
         /**
          * How many cycles to drive against the same executor. Each subsequent cycle advances both
          * the cycle clock and the submit clock by one minute, which is what a real scheduler does
-         * and what makes the quarantine's effect observable.
+         * and what makes "attempted again next cycle" observable.
          */
         Rig cycles(int cycles) {
             this.cycles = cycles;
@@ -716,23 +736,17 @@ class LiquidationSubmitVetoTest {
     private record Run(LiquidationDecisionLog log, RecordingSubmitter submitter) {
 
         /**
-         * The two decisions a two-cycle quarantine run now leaves, newest first: the outcome that
-         * caused the hold, then the {@code QUARANTINED} record of the cycle that respected it.
-         *
-         * <p>These tests used to assert a decision count of one, reading the skip's SILENCE as proof
-         * that nothing was retried. The skip records now, so the proof is the record itself — which
-         * is stronger: a count of one was equally consistent with the candidate having dropped out of
-         * the scan, and could not tell the two apart.
+         * The two decisions a two-cycle run leaves when nothing holds the candidate (FAB-134 NQ):
+         * one per cycle, both with {@code outcome}. A second-cycle skip — the quarantine this
+         * replaced — would leave one decision, or a second one of a different kind.
          */
-        LiquidationDecision heldOnTheSecondCycle(LiquidationDecision.Outcome causedBy) {
+        List<LiquidationDecision> attemptedOnBothCycles(LiquidationDecision.Outcome outcome) {
             List<LiquidationDecision> decisions = log.newestFirst(10);
-            assertEquals(2, decisions.size(),
-                    "expected the outcome that quarantined the loan and the QUARANTINED record of "
-                            + "the cycle that respected it");
-            assertEquals(causedBy, decisions.get(1).outcome(), "the first cycle's outcome");
-            assertEquals(LiquidationDecision.Outcome.QUARANTINED, decisions.getFirst().outcome(),
-                    "the second cycle must say WHY it did nothing");
-            return decisions.get(1);
+            assertEquals(2, decisions.size(), "expected one decision per cycle: " + decisions);
+            for (LiquidationDecision decision : decisions) {
+                assertEquals(outcome, decision.outcome(), decision.detail());
+            }
+            return decisions;
         }
 
         LiquidationDecision onlyDecision() {
@@ -1127,7 +1141,7 @@ class LiquidationSubmitVetoTest {
                                                                   BigInteger expectedFloor) {
         return new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30,
-                BigInteger.ZERO, 200, 30, true, absoluteFloor, expectedFloor, PUBLISHED);
+                BigInteger.ZERO, 200, true, absoluteFloor, expectedFloor, PUBLISHED);
     }
 
     /** Far below anything this fixture can lose, so the floor is never the binding constraint. */
@@ -1605,12 +1619,17 @@ class LiquidationSubmitVetoTest {
         assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
     }
 
-    /** The single ERROR event these three sites must each produce — exactly one, never zero or two. */
+    /**
+     * The single cause-carrying ERROR event these three sites must each produce — exactly one, never
+     * zero or two. Cause-carrying because the veto's own summary line is ERROR too since FAB-134 NQ
+     * (an armed node's S4–S7 veto is a failure, loud every cycle), and it carries no throwable.
+     */
     private static ILoggingEvent onlyError(ListAppender<ILoggingEvent> appender) {
         List<ILoggingEvent> errors = appender.list.stream()
                 .filter(event -> event.getLevel() == Level.ERROR)
+                .filter(event -> event.getThrowableProxy() != null)
                 .toList();
-        assertEquals(1, errors.size(), "expected exactly one ERROR event: " + appender.list);
+        assertEquals(1, errors.size(), "expected exactly one cause-carrying ERROR event: " + appender.list);
         return errors.getFirst();
     }
 
@@ -1705,25 +1724,46 @@ class LiquidationSubmitVetoTest {
         assertTrue(decision.detail().contains("ValueNotConservedUTxO"), decision.detail());
     }
 
+    /** Drives the run with the executor's log captured, and returns every event it logged. */
+    private static List<ILoggingEvent> logged(Rig rig, Run[] run) {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            run[0] = rig.run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return appender.list;
+    }
+
+    private static List<ILoggingEvent> errorsContaining(List<ILoggingEvent> events, String text) {
+        return events.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .filter(event -> event.getFormattedMessage().contains(text))
+                .toList();
+    }
+
     /**
      * A backend that throws. Same conclusion: the attempt happened, so it is not a veto.
      * <p>
-     * And the second cycle is the point of this test, not an afterthought. A connection reset is
-     * thrown <em>after</em> the bytes have gone out as readily as before, so this is precisely the
-     * case where transmission status is unknown — and precisely where a quarantine taken only on the
-     * success path would let the next cycle re-derive the same still-unspent loan UTxO and submit a
-     * second transaction against it. The quarantine is taken before the attempt, either way.
+     * FAB-134 NQ (Giovanni, 2026-10-03: "no quarantine ... logging the issue again and again is the
+     * expected 'loud' result"): this used to hold the loan for thirty minutes so the next cycle could
+     * not resubmit. Nothing holds it now. The next cycle rebuilds and resubmits; if the first one
+     * landed, that resubmission fails in phase 1 — free — and is logged like any failure.
      */
     @Test
-    void aThrowingSubmissionIsRecordedAsSubmitFailedAndStillQuarantinesTheLoan() {
+    void aThrowingSubmissionIsRetriedOnTheNextCycleAndLoggedAtErrorOnBoth() {
         RecordingSubmitter submitter = RecordingSubmitter.throwing(
                 new IllegalStateException("connection reset"));
-        Run run = new Rig().submitter(submitter).cycles(2).run();
+        Run[] run = new Run[1];
+        List<ILoggingEvent> events = logged(new Rig().submitter(submitter).cycles(2), run);
 
-        run.heldOnTheSecondCycle(LiquidationDecision.Outcome.SUBMIT_FAILED);
-        assertEquals(1, submitter.submitted.size(),
-                "a submission whose outcome is UNKNOWN was retried on the next cycle — that is the "
-                        + "double-submit the quarantine exists to prevent");
+        run[0].attemptedOnBothCycles(LiquidationDecision.Outcome.SUBMIT_FAILED);
+        assertEquals(2, submitter.submitted.size(), "the second cycle submitted again — nothing held it");
+        assertEquals(2, errorsContaining(events, "submitting the liquidation of").size(),
+                "the failure is logged at ERROR on BOTH cycles: " + events);
     }
 
     /**
@@ -1836,51 +1876,69 @@ class LiquidationSubmitVetoTest {
                 "the exception itself must be attached for the stack trace, not just the message");
     }
 
-    /** The same property for a cleanly rejected submission. */
+    /**
+     * The same property for a cleanly rejected submission — which used to be held too, although a
+     * rejected transaction can never land. It is retried next cycle, and the rejection, which was
+     * logged at WARN, is ERROR on every cycle.
+     */
     @Test
-    void aRejectedSubmissionAlsoQuarantinesTheLoan() {
+    void aRejectedSubmissionIsRetriedOnTheNextCycleAndLoggedAtErrorOnBoth() {
         RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
-        Run run = new Rig().submitter(submitter).cycles(2).run();
+        Run[] run = new Run[1];
+        List<ILoggingEvent> events = logged(new Rig().submitter(submitter).cycles(2), run);
 
-        run.heldOnTheSecondCycle(LiquidationDecision.Outcome.SUBMIT_FAILED);
-        assertEquals(1, submitter.submitted.size(),
-                "a rejected submission was retried on the next cycle");
+        run[0].attemptedOnBothCycles(LiquidationDecision.Outcome.SUBMIT_FAILED);
+        assertEquals(2, submitter.submitted.size(), "a rejected submission is retried on the next cycle");
+        List<ILoggingEvent> errors = errorsContaining(events, "was rejected");
+        assertEquals(2, errors.size(), "ERROR on each cycle, never WARN: " + events);
+        assertTrue(errors.getLast().getFormattedMessage().contains("ValueNotConservedUTxO"),
+                errors.getLast().getFormattedMessage());
+    }
+
+    /**
+     * An armed node's S4–S7 veto is a candidate the bot priced as worth doing and is NOT submitting:
+     * not configuration (S1/S2), not economics (S3) — a failure, so it is ERROR on every cycle. S7
+     * here, because its own path logs nothing at ERROR: the summary line is the only loud one.
+     */
+    @Test
+    void anArmedNodesVetoIsLoggedAtErrorOnEveryCycle() {
+        Run[] run = new Run[1];
+        List<ILoggingEvent> events = logged(new Rig().submitAt(TX_VALID_TO + 80_000L).cycles(2), run);
+
+        run[0].attemptedOnBothCycles(LiquidationDecision.Outcome.SUBMIT_VETOED);
+        run[0].assertNothingWasSubmitted();
+        assertEquals(2, errorsContaining(events, "TRANSACTION_WINDOW_ELAPSED").size(),
+                "the veto is loud on each cycle: " + events);
     }
 
     // ======================================================================================
-    // one submission per loan utxo
+    // no hold after a submission, and the cycle's wallet list
     // ======================================================================================
 
-    /**
-     * The property is about the loan <b>UTxO</b>, not about the decision row: a submitted liquidation
-     * takes a quarantine on {@code txHash#index}, and the local index cannot possibly have seen the
-     * spend by the next cycle. Without it the very next cycle would re-derive the same candidate from
-     * the same still-unspent loan output and submit a second transaction spending it.
-     */
-    @Test
-    void aSubmittedLoanUtxoIsNotSubmittedAgainOnTheNextCycleBeforeTheIndexCatchesUp() {
-        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
-
-        // The rig's run() drives one cycle; this test needs two against the same executor, so it
-        // builds the wiring directly rather than through the rig.
-        Scenario scenario = adaScenario();
-        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
-                scenario.loan().utxo(), scenario.bond().utxo());
+    /** An executor wired for {@code scenarios} on an armed node, with {@code walletUtxos} to spend. */
+    private static LiquidationExecutor armedExecutor(List<Scenario> scenarios, List<Utxo> walletUtxos,
+                                                     LiquidationDecisionLog log,
+                                                     RecordingSubmitter submitter) {
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
+        universe.addAll(walletUtxos);
         Map<String, Utxo> unspent = new LinkedHashMap<>();
-        unspent.put(scenario.loan().loan().utxoRef(), scenario.loan().utxo());
-        unspent.put(scenario.bond().bond().utxoRef(), scenario.bond().utxo());
-
+        List<LiquidationAssessment> assessments = new ArrayList<>();
+        for (Scenario scenario : scenarios) {
+            universe.add(scenario.loan().utxo());
+            universe.add(scenario.bond().utxo());
+            unspent.put(scenario.loan().loan().utxoRef(), scenario.loan().utxo());
+            unspent.put(scenario.bond().bond().utxoRef(), scenario.bond().utxo());
+            assessments.add(scenario.assessment());
+        }
         AppConfig.LiquidationConfiguration configuration = armed();
-        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
         BlockEventListener blockEventListener = new BlockEventListener(null);
         blockEventListener.getIsSyncing().set(false);
-
         PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
                 LoanFixtures.registry(), LoanFixtures.converters(), configuration,
                 new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                         LoanFixtures.utxoSupplier(universe), protocolParams()));
-        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(), ACCOUNT, new FakeScanner(List.of(scenario.assessment())),
+        return new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, new FakeScanner(assessments),
                 FakeResolver.stable(unspent),
                 new LiquidateTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                         LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
@@ -1889,21 +1947,183 @@ class LiquidationSubmitVetoTest {
                 provider(new FakeOracleClient(List.of())),
                 networkNamed("preview"), protocolParams(),
                 LoanFixtures.converters(), submitter);
+    }
+
+    /**
+     * FAB-134 NQ, Option B. A SUBMITTED liquidation used to hold its loan utxo for thirty minutes, so
+     * that the next cycle — reading an index that has not seen the spend yet — could not submit a
+     * second transaction against it. Nothing holds it now: the next cycle attempts it again, the
+     * backend rejects the resubmission (phase 1, free: the loan utxo is gone), and that rejection is
+     * logged at ERROR like any other failure. Accepted by Giovanni's ruling, and preferred to a timer.
+     */
+    @Test
+    void aSubmittedLiquidationIsAttemptedAgainNextCycleAndItsRejectionIsLoggedAtError() {
+        RecordingSubmitter submitter = RecordingSubmitter.acceptingThenRejecting("ab".repeat(32),
+                "ConwayMempoolFailure \"All inputs are spent. Transaction has probably already been "
+                        + "included\"");
+        AppConfig.LiquidationConfiguration configuration = armed();
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        LiquidationExecutor executor = armedExecutor(List.of(adaScenario()), List.of(WALLET_UTXO), log,
+                submitter);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            executor.setSubmitClock(() -> NOW);
+            executor.cycle(NOW);
+            assertEquals(1, submitter.submitted.size());
+            assertEquals(LiquidationDecision.Outcome.SUBMITTED, log.newestFirst(1).getFirst().outcome());
+
+            // The chain has not caught up: the loan utxo is still unspent as far as this node can see.
+            executor.setSubmitClock(() -> NOW + 60_000L);
+            executor.cycle(NOW + 60_000L);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertEquals(2, submitter.submitted.size(), "the next cycle attempted the candidate again");
+        assertEquals(2, log.size());
+        LiquidationDecision second = log.newestFirst(1).getFirst();
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, second.outcome(), second.detail());
+        assertTrue(second.detail().contains("All inputs are spent"), second.detail());
+        assertEquals(1, errorsContaining(appender.list, "was rejected").size(),
+                "the resubmission's rejection is loud: " + appender.list);
+    }
+
+    private static final String TX_LOAN_2 = "ab".repeat(32);
+    private static final String TX_BOND_2 = "de".repeat(32);
+    private static final String LOAN_ID_2 = "b1b2c3d4e5f6a1b2";
+
+    /** A wallet utxo the fee-only selector prefers to {@link #WALLET_UTXO}: smaller, still ample. */
+    private static final Utxo WALLET_UTXO_SMALL = LoanFixtures.adaUtxo("e3".repeat(32), 0,
+            ACCOUNT.baseAddress(), 20_000_000L);
+
+    /** {@link #adaScenario()} again, under other refs and another loan id. */
+    private static Scenario secondAdaScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN_2, 0, LOAN_ID_2, datum,
+                COLLATERAL_LOVELACE, List.of());
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND_2, 0, LOAN_ID_2,
+                LoanFixtures.bondDatum(FAT_FEE_PER_MILLE,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
+                2_000_000L);
+        return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.unit(), OraclePriceFeed.unit(), VALID_FROM));
+    }
+
+    private static List<TransactionInput> inputsOf(byte[] signed) throws Exception {
+        return Transaction.deserialize(signed).getBody().getInputs();
+    }
+
+    /**
+     * FAB-134 NQ task 4. Two candidates in one cycle. The index answers "unspent" from
+     * {@code tx_input}, so the wallet utxo the first transmitted transaction spent is still listed
+     * when the second candidate is built; nominating it again would fail the second at phase 1. The
+     * second must be built on a different wallet input.
+     */
+    @Test
+    void aSecondCandidateNeverNominatesAWalletUtxoTheFirstTransmittedTransactionSpent() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        AppConfig.LiquidationConfiguration configuration = armed();
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        LiquidationExecutor executor = armedExecutor(List.of(adaScenario(), secondAdaScenario()),
+                List.of(WALLET_UTXO, WALLET_UTXO_SMALL), log, submitter);
         executor.setSubmitClock(() -> NOW);
 
         executor.cycle(NOW);
-        assertEquals(1, submitter.submitted.size());
-        assertEquals(LiquidationDecision.Outcome.SUBMITTED, log.newestFirst(1).getFirst().outcome());
 
-        // The chain has not caught up: the loan utxo is still unspent as far as this node can see.
-        executor.setSubmitClock(() -> NOW + 60_000L);
-        executor.cycle(NOW + 60_000L);
+        assertEquals(2, submitter.submitted.size(), "both candidates were submitted: " + log.newestFirst(10));
+        TransactionInput small = new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0);
+        TransactionInput large = new TransactionInput(TX_WALLET, 0);
+        assertTrue(inputsOf(submitter.submitted.get(0)).contains(small),
+                "the fee-only selector nominates the smaller utxo first");
+        List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
+        assertFalse(second.contains(small),
+                "the second candidate nominated a wallet utxo the first transmitted transaction spent: "
+                        + second);
+        assertTrue(second.contains(large), "and nominated the remaining one instead: " + second);
+    }
 
-        assertEquals(1, submitter.submitted.size(),
-                "the same loan utxo was submitted twice — the quarantine is what has to stop that");
-        assertEquals(2, log.size(), "the held cycle must leave a record of why it built nothing");
-        assertEquals(LiquidationDecision.Outcome.QUARANTINED, log.newestFirst(1).getFirst().outcome(),
-                "the second cycle was held by the quarantine the submission took, and says so");
+    /** Two ada candidates in one armed cycle against {@code submitter}; returns the log events. */
+    private static List<ILoggingEvent> twoArmedCandidates(RecordingSubmitter submitter) {
+        AppConfig.LiquidationConfiguration configuration = armed();
+        LiquidationExecutor executor = armedExecutor(List.of(adaScenario(), secondAdaScenario()),
+                List.of(WALLET_UTXO, WALLET_UTXO_SMALL), new LiquidationDecisionLog(configuration), submitter);
+        executor.setSubmitClock(() -> NOW);
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            executor.cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+        assertEquals(2, submitter.submitted.size(), "both candidates reached the wire: " + appender.list);
+        return appender.list;
+    }
+
+    /**
+     * FAB-134 NQ r2 (THROWN). A submission that THROWS may have gone out — a connection reset arrives
+     * after the bytes as readily as before — so its inputs are treated as spent exactly like a
+     * SUBMITTED one's, and the second candidate is built on the other wallet utxo.
+     */
+    @Test
+    void aThrownSubmissionsWalletInputIsNotNominatedAgainInTheSameCycle() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.throwing(new IllegalStateException("connection reset"));
+
+        twoArmedCandidates(submitter);
+
+        TransactionInput small = new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0);
+        assertTrue(inputsOf(submitter.submitted.get(0)).contains(small),
+                "the fee-only selector nominates the smaller utxo first");
+        List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
+        assertFalse(second.contains(small),
+                "the second candidate reused an input of a transmission whose outcome is unknown: " + second);
+        assertTrue(second.contains(new TransactionInput(TX_WALLET, 0)), second.toString());
+    }
+
+    /**
+     * FAB-134 NQ r2 (REJ). A DEFINITE rejection transmitted nothing, so its inputs are not dropped as
+     * spent — unless the ledger says one of them already is. A {@code BadInputsUTxO} rejection drops
+     * the nominated wallet utxo for the rest of the cycle, and says so at WARN.
+     */
+    @Test
+    void aBadInputsRejectionDropsTheNominatedWalletUtxoForTheRestOfTheCycle() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.rejecting(
+                "ConwayUtxowFailure (UtxoFailure (BadInputsUTxO (fromList [TxIn ...])))");
+
+        List<ILoggingEvent> events = twoArmedCandidates(submitter);
+
+        TransactionInput small = new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0);
+        assertTrue(inputsOf(submitter.submitted.get(0)).contains(small),
+                "the fee-only selector nominates the smaller utxo first");
+        List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
+        assertFalse(second.contains(small),
+                "the second candidate nominated the utxo the ledger had just called spent: " + second);
+        assertTrue(second.contains(new TransactionInput(TX_WALLET, 0)), second.toString());
+        assertEquals(1, events.stream()
+                        .filter(event -> event.getLevel() == Level.WARN)
+                        .filter(event -> event.getFormattedMessage().equals("dropped wallet utxo "
+                                + WALLET_UTXO_SMALL.getTxHash() + "#0 from this cycle: BadInputsUTxO"))
+                        .count(),
+                "the drop is logged at WARN naming the utxo and the marker: " + events);
+    }
+
+    /** And an ordinary rejection keeps the input: nothing said it was spent, and nothing went out. */
+    @Test
+    void anOrdinaryRejectionLeavesTheWalletInputNominable() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
+
+        twoArmedCandidates(submitter);
+
+        assertTrue(inputsOf(submitter.submitted.get(1))
+                        .contains(new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0)),
+                "a rejection that names no spent input must not cost the cycle a wallet utxo");
     }
 
     // ======================================================================================

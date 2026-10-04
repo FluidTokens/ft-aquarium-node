@@ -1,6 +1,15 @@
 package com.fluidtokens.aquarium.offchain.config;
 
+import com.bloxbean.cardano.yaci.store.starter.utxo.UtxoStoreAutoConfigProperties;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
+import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.core.env.EnumerablePropertySource;
+import org.springframework.core.env.MutablePropertySources;
+import org.springframework.core.env.PropertySource;
+import org.springframework.core.env.StandardEnvironment;
+import org.springframework.core.io.ClassPathResource;
 import org.yaml.snakeyaml.Yaml;
 
 import java.io.IOException;
@@ -480,8 +489,7 @@ class ShippedDefaultsTest {
             // which is the opposite of "not the default setting but it must be possible".
             Map.entry("min-expected-profit-lovelace", "${AQUARIUM_LIQUIDATION_MIN_EXPECTED_PROFIT_LOVELACE:0}"),
             Map.entry("check-profitability", "${AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY:true}"),
-            Map.entry("decision-log-size", "${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}"),
-            Map.entry("quarantine-minutes", "${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}"));
+            Map.entry("decision-log-size", "${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}"));
 
     /**
      * ⚠ {@code mode} and {@code enabled} are pinned again here on purpose. They have their own tests
@@ -527,6 +535,62 @@ class ShippedDefaultsTest {
                 "the set of operator-facing liquidation defaults changed. A new knob must be pinned in "
                         + "SHIPPED_LIQUIDATION_DEFAULTS, and a removed one deleted from it — otherwise "
                         + "the pins above stop being exhaustive and start being a sample.");
+    }
+
+    /**
+     * ⛔ FAB-137 T2a: <b>UTxO pruning is ON every 600 s, and the key is spelled the way Yaci 0.1.7 binds it.</b>
+     *
+     * <p>The Minswap pool credential churns on every swap, so without pruning {@code address_utxo} and
+     * {@code tx_input} grow with every batch forever. The 0.1.7 fields are {@code pruningEnabled},
+     * {@code pruningInterval} and {@code pruningSafeBlocks} on {@code UtxoStoreAutoConfigProperties.Utxo},
+     * so the keys are {@code store.utxo.pruning-enabled} / {@code -interval} / {@code -safe-blocks}.
+     * <b>{@code store.utxo.pruning.interval} binds to NOTHING</b> — Spring ignores the unknown key and
+     * Yaci's 86400 s default stays in force, silently. So this binds the shipped base document with
+     * Spring's own {@link Binder} into Yaci's own properties class rather than reading YAML paths: a
+     * misspelt key reads as the class default here, and fails.
+     *
+     * <p>It also resolves the two keys the way Yaci's pruning service actually reads them —
+     * {@code @ConditionalOnProperty("store.utxo.pruning-enabled")} and
+     * {@code @Scheduled(fixedRateString = "${store.utxo.pruning-interval:86400}")}, neither of which goes
+     * through the properties class.
+     */
+    @Test
+    void theBaseDocumentShipsUtxoPruningEveryTenMinutesUnderKeysYaciBinds() throws IOException {
+        List<PropertySource<?>> documents = new YamlPropertySourceLoader()
+                .load(RESOURCE, new ClassPathResource(RESOURCE));
+        PropertySource<?> baseDocument = documents.getFirst();
+        int classDefaultSafeBlocks = new UtxoStoreAutoConfigProperties().getUtxo().getPruningSafeBlocks();
+
+        UtxoStoreAutoConfigProperties.Utxo utxo = new Binder(ConfigurationPropertySources.from(baseDocument))
+                .bindOrCreate("store", UtxoStoreAutoConfigProperties.class)
+                .getUtxo();
+        assertTrue(utxo.isPruningEnabled(), "store.utxo.pruning-enabled must ship true");
+        assertEquals(600, utxo.getPruningInterval(),
+                "store.utxo.pruning-interval must ship 600 — a value other than 600 here, and in particular "
+                        + "Yaci's 86400 default, means the key is misspelt (e.g. pruning.interval) or gone");
+        assertEquals(classDefaultSafeBlocks, utxo.getPruningSafeBlocks(),
+                "pruning-safe-blocks keeps Yaci's own default (" + classDefaultSafeBlocks + ")");
+
+        var environment = new StandardEnvironment();
+        MutablePropertySources sources = environment.getPropertySources();
+        sources.addFirst(baseDocument);
+        ConfigurationPropertySources.attach(environment);
+        assertEquals("true", environment.getProperty("store.utxo.pruning-enabled"),
+                "UtxoPruningService's @ConditionalOnProperty reads this exact key");
+        assertEquals("600", environment.resolvePlaceholders("${store.utxo.pruning-interval:86400}"),
+                "UtxoPruningService's @Scheduled reads this exact placeholder");
+
+        // The preview document must not override any of the three: it inherits the base values.
+        PropertySource<?> previewDocument = documents.stream()
+                .filter(d -> "preview".equals(d.getProperty("spring.config.activate.on-profile")))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no document activates the preview profile"));
+        assertTrue(previewDocument instanceof EnumerablePropertySource<?>, "fixture: preview must be enumerable");
+        List<String> previewUtxoKeys = java.util.Arrays.stream(
+                        ((EnumerablePropertySource<?>) previewDocument).getPropertyNames())
+                .filter(name -> name.startsWith("store.utxo."))
+                .toList();
+        assertEquals(List.of(), previewUtxoKeys, "the preview document must not override store.utxo.*");
     }
 
     private static Object liquidationBlockOf(Map<String, Object> document) {

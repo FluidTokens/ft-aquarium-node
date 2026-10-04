@@ -7,13 +7,12 @@ import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.function.helper.SignerProviders;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
-import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.fluidtokens.aquarium.offchain.service.loans.ReferenceScriptSafeUtxoSelection;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import java.util.Comparator;
 import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
-import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
@@ -100,8 +99,9 @@ public class ScheduledTransactionService {
      * ⛔ <b>A DIAGNOSTIC, NOT A DESIGN CHANGE — and it ships OFF.</b>
      *
      * <p>Left unset (the default) nothing changes: evaluation goes through the shared
-     * {@code QuickTxBuilder(bfBackendService)} bean, i.e. Blockfrost's
-     * {@code /utils/txs/evaluate}, exactly as before.
+     * {@code QuickTxBuilder} bean's {@code DefaultTransactionProcessor} (see
+     * {@code YaciConfig.quickTxBuilder}), i.e. Blockfrost's {@code /utils/txs/evaluate}, exactly as
+     * before.
      *
      * <h2>What it is for</h2>
      * On mainnet 2026-09-22 every tank transaction failed with Blockfrost answering
@@ -152,15 +152,30 @@ public class ScheduledTransactionService {
 
 
     /**
-     * Only used to build the reference-script-safe coin selection; see the guard at compose().
-     * <p>
-     * <b>Deliberately the backend and not the {@code UtxoSupplier} bean.</b> That bean is
-     * {@code @ConditionalOnProperty(loans.enabled=true)}, and this service is the Aquarium tank
-     * subsystem, which runs on mainnet where lending is disabled by default — injecting it here
-     * would have failed startup on exactly the production deployment this repo ships. The backend
-     * is unconditional, and this is the same construction {@code YaciConfig} performs.
+     * Only the dump-mode evaluator reads this ({@code scheduling.transaction-processor.dump-cbor}):
+     * it wraps the same Blockfrost evaluation the {@code QuickTxBuilder} bean's processor performs.
+     * Coin selection no longer goes through it — see {@link #utxoSupplier}.
      */
     private final BFBackendService bfBackendService;
+
+    /**
+     * The shared {@code YaciConfig} bean: the chain's protocol parameters, fetched once per epoch
+     * rather than on every cycle. Unconditional, like the backend above.
+     */
+    private final ProtocolParamsSupplier protocolParamsSupplier;
+
+    /**
+     * ⛔ FAB-134 B3b-5: the shared {@code YaciConfig} bean — the INDEX-FIRST supplier — and what both
+     * reference-script-safe selection seams in {@link #balanceTankTx} read, the same supplier the
+     * {@code QuickTxBuilder} bean holds. It replaced a fresh Blockfrost {@code DefaultUtxoSupplier} built
+     * on every call, which sent each selection pass's wallet {@code getAll} to the provider.
+     * <p>
+     * Unconditional, like the backend above: {@code YaciConfig} declares it with no condition, so
+     * injecting it cannot fail startup on a deployment where lending is off. The operator wallet's
+     * payment credential is one the index always watches ({@code TankUtxoStorage}); the cycle reads the
+     * wallet only while the node is not syncing.
+     */
+    private final UtxoSupplier utxoSupplier;
 
     private final UtxoRepository utxoRepository;
 
@@ -193,12 +208,6 @@ public class ScheduledTransactionService {
         var parametersRefInputIndex = sortedRefInputs.indexOf(parametersRefInput);
         var stakingRefInputIndex = sortedRefInputs.indexOf(stakingRefInput);
         return new RefInputIndexes(BigInteger.valueOf(parametersRefInputIndex), BigInteger.valueOf(stakingRefInputIndex));
-    }
-
-
-    /** The supplier the selection guard reads through; see the field javadoc for why it is built here. */
-    private UtxoSupplier referenceScriptSafeSupplier() {
-        return new DefaultUtxoSupplier(bfBackendService.getUtxoService());
     }
 
     /**
@@ -291,8 +300,9 @@ public class ScheduledTransactionService {
         // payouts, against 551 sound ones.
         // ⚠ Fetched BEFORE classification, because the min-UTxO floor is derived from
         // coinsPerUtxoByte and must never be a hardcoded guess -- it has changed before.
-        var protocolParams = new DefaultProtocolParamsSupplier(bfBackendService.getEpochService())
-                .getProtocolParams();
+        // The shared supplier bean serves the chain's own values, fetched once per epoch rather than
+        // once per cycle (EpochProtocolParamsSupplier).
+        var protocolParams = protocolParamsSupplier.getProtocolParams();
 
         var processableScheduledTransactions = new java.util.ArrayList<DatumTankUtxo>();
         int refusedBeforeStarting = 0;
@@ -321,9 +331,10 @@ public class ScheduledTransactionService {
 
         // ⛔ ONE WALLET READ AND ONE PROTOCOL-PARAMS READ PER CYCLE, NOT PER TANK.
         //
-        // Both of these are PROVIDER CALLS and both were inside the loop below. With 535 processable
-        // tanks that is 1,070 Blockfrost calls per cycle, every five minutes — and AppUtxoService's
-        // own javadoc promises "one provider call per cycle", which had quietly stopped being true.
+        // Both used to be Blockfrost calls inside the loop below: with 535 processable tanks, 1,070 calls
+        // per cycle. The wallet is now read from the local index (FAB-134 B2) and the protocol params
+        // from the per-epoch cache (B4), so neither costs a call — but one read per cycle is still the
+        // rule: every tank must see the same wallet snapshot.
         //
         // ⇒ And the read is hoisted because the dependency it served is gone: a tank transaction
         // now spends ONLY ITS OWN TANK, so two of them share no input and cannot conflict.
@@ -492,7 +503,7 @@ public class ScheduledTransactionService {
                 // evaluation-error policy, and the structural verifier, which needs datum-derived
                 // arguments the caller already holds.
                 var context = balanceTankTx(composed, tankPaymentUtxo, collateralUtxo,
-                                account.baseAddress(), referenceScriptSafeSupplier(), slot, firstValidSlot)
+                                account.baseAddress(), utxoSupplier, slot, firstValidSlot)
                         .withSigner(SignerProviders.signerFrom(account))
                         .withSigner(SignerProviders.stakeKeySignerFrom(account))
                         .ignoreScriptCostEvaluationError(dumpCbor)
@@ -533,7 +544,10 @@ public class ScheduledTransactionService {
                 // indexer when the next cycle reads. Resubmitting it is harmless: the input is gone,
                 // so the ledger rejects it at phase 1, free of charge, and it is counted transient
                 // rather than blacklisted.
-                context.complete();
+                // FAB-134 B5a: a rejection naming the protocol parameters refreshes them. Nothing
+                // else is read from this result; the loop goes on exactly as before.
+                com.fluidtokens.aquarium.offchain.config.ProtocolParamsRejections
+                        .refreshIfParamsRejected(protocolParamsSupplier, context.complete());
                 submitted++;
 
             } catch (com.fluidtokens.aquarium.offchain.util.UnusableTankDatumException e) {
@@ -803,8 +817,17 @@ public class ScheduledTransactionService {
                 // (QuickTxBuilder:263 assigns), so a second call would silently discard the
                 // first. Whatever this hook needs to do has to happen here or not at all.
                 .preBalanceTx((ctx, txn) -> {
-                    ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(
-                            referenceScriptSafeSupplier));
+                    // ⛔ AND NEVER THE PINNED COLLATERAL. QuickTxBuilder.build() wraps its selector in
+                    // ExcludeUtxoSelector(collateralInputs); replacing it here dropped that wrapper, so
+                    // a build that had to select more spent the cycle's shared collateral as an input,
+                    // invalidating every other tank transaction naming it (FAB-134 B3b-5 r2,
+                    // TankProductionWiringTest).
+                    ctx.setUtxoSelector(new com.bloxbean.cardano.client.coinselection.impl.ExcludeUtxoSelector(
+                            ReferenceScriptSafeUtxoSelection.selector(referenceScriptSafeSupplier),
+                            java.util.Set.of(TransactionInput.builder()
+                                    .transactionId(collateralUtxo.getTxHash())
+                                    .index(collateralUtxo.getOutputIndex())
+                                    .build())));
                     // ⚠ NOTHING ELSE HAPPENS HERE. A previous version also set the fee so the
                     // evaluator would price a balanced body; that belonged to the self-funding
                     // shape and was withdrawn with it. Vanilla CCL balances after evaluation.

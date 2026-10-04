@@ -27,8 +27,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * ⛔ <b>The convert router's WALLET NOMINATION seam, driven at the router rather than through a fake.</b>
  *
  * <p>Audit finding F1: {@code WalletInputTooSmallException} was a decorative guard. The executor's
- * catch for it was pinned by nothing (mutant M12 — neuter the catch so it falls to the 30-minute
- * machinery quarantine — killed <b>0 of 1062</b> tests), and the THROW site was unreachable from the
+ * catch for it was pinned by nothing (mutant M12 — neuter the catch so it falls to the (then
+ * 30-minute) machinery quarantine — killed <b>0 of 1062</b> tests), and the THROW site was unreachable from the
  * suite entirely, because this class did not exist and every executor test injects a fake router.
  *
  * <p>⚠ <b>A fake router cannot pin the router's own behaviour.</b> That is the whole reason this class
@@ -51,19 +51,25 @@ class ConvertLiquidationRouterTest {
     }
 
     /**
-     * A resolver that answers with a pool without touching a provider — the {@code UtxoService} is
-     * {@code null}, so any real lookup would NPE and the test would say so.
+     * A resolver that answers with a pool without touching the index — the {@code UtxoRepository} is
+     * {@code null}, so any real query would NPE and the test would say so.
      */
     private static final class FixedPoolResolver extends MinswapPoolResolver {
         FixedPoolResolver() {
             super(null, "addr_pool", MINSWAP_POOL_POLICY);
         }
 
+        /** Answers the same pool for any pair asked, as this fake always has. */
         @Override
-        public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
+        public Snapshot snapshot() {
             Utxo poolUtxo = Utxo.builder().txHash("dd".repeat(32)).outputIndex(0)
                     .address("addr_pool").build();
-            return Optional.of(new ResolvedPool(poolUtxo, deepPool(), "lp"));
+            return new Snapshot(Map.of(), MINSWAP_POOL_POLICY) {
+                @Override
+                public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
+                    return Optional.of(new ResolvedPool(poolUtxo, deepPool(), "lp"));
+                }
+            };
         }
     }
 
@@ -144,7 +150,7 @@ class ConvertLiquidationRouterTest {
      * ⛔ <b>THE THROW SITE, and the requirement it must state.</b> When no single nominable wallet UTxO
      * covers what the order takes, the router refuses BY NAME rather than handing the builder a null
      * (which would surface as a bare {@code NullPointerException} through the executor's generic catch
-     * and be quarantined for thirty minutes as a machinery fault).
+     * and be logged at ERROR as a machinery fault).
      *
      * <p>⚠ The selector returning {@code Optional.empty()} is the ONLY thing this fixture makes go
      * wrong — the pool is deep, the bond permits conversion and the plan is computable — so the
@@ -256,7 +262,7 @@ class ConvertLiquidationRouterTest {
      * FAB-117: ada collateral is refused BY NAME. The convert route builds none (its datum names the NONE
      * sentinel, and redeemerEquity needs a collateral feed) -- only the PLAIN route liquidates ada collateral --
      * and it used to die as a NullPointerException
-     * there -- quarantined, but saying nothing. Same quarantine now, with the reason the readiness page shows.
+     * there -- a machinery failure, but saying nothing. Same branch now, with the reason the readiness page shows.
      */
     @Test
     void anAdaCollateralIsRefusedByNameRatherThanCrashing() {
@@ -293,5 +299,115 @@ class ConvertLiquidationRouterTest {
                         requirement -> Optional.empty(), collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertTrue(first.getMessage().startsWith("ada collateral:"), first.getMessage());
+    }
+
+    // ===== the pool snapshot: ONE index query per liquidation cycle (FAB-137 T2b) =====
+
+    private static final String POOL_CREDENTIAL = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+
+    /** A real-resolver router over a mocked index holding the given rows at the pool credential. */
+    private static ConvertLiquidationRouter indexedRouter(
+            com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository repository) {
+        return new ConvertLiquidationRouter(LoanFixtures.registry(), configuredForMinswap(), null,
+                new MinswapPoolResolver(repository, POOL_CREDENTIAL, MINSWAP_POOL_POLICY), null, null,
+                LoanFixtures.converters(), LoanFixtures.NETWORK);
+    }
+
+    private static com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository indexHolding(
+            java.util.List<com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity> rows) {
+        var repository = org.mockito.Mockito.mock(
+                com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class);
+        org.mockito.Mockito.when(repository.findUnspentByOwnerPaymentCredential(
+                org.mockito.ArgumentMatchers.eq(POOL_CREDENTIAL), org.mockito.ArgumentMatchers.any()))
+                .thenReturn(Optional.of(rows));
+        return repository;
+    }
+
+    /** The live ada/FLDT pool's real datum, with SYNTHESISED amounts: its MSP and its own LP unit. */
+    private static com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity adaFldtPool()
+            throws java.io.IOException {
+        var row = new com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity();
+        row.setTxHash("0f1d".repeat(16));
+        row.setOutputIndex(0);
+        row.setOwnerAddr("addr_pool");
+        row.setOwnerPaymentCredential(POOL_CREDENTIAL);
+        row.setInlineDatum(java.nio.file.Files.readString(
+                java.nio.file.Path.of("src/test/resources/loans-v4/mainnet-minswap-pool-ada-fldt.hex")).trim());
+        java.util.List<com.bloxbean.cardano.yaci.store.common.domain.Amt> amounts = new java.util.ArrayList<>();
+        for (Object[] unitAndQty : new Object[][]{{"lovelace", 1_692_342_884_761L},
+                {MINSWAP_POOL_POLICY + ConvertTxEncoder.POOL_NFT_ASSET_NAME, 1L},
+                {MINSWAP_POOL_POLICY + ConvertTxEncoder.computeLpAssetName(AssetType.ada(), FLDT), 1_000L},
+                {FLDT.toUnit(), 7_596_442_927_398L}}) {
+            var amt = new com.bloxbean.cardano.yaci.store.common.domain.Amt();
+            amt.setUnit((String) unitAndQty[0]);
+            amt.setQuantity(BigInteger.valueOf((Long) unitAndQty[1]));
+            amounts.add(amt);
+        }
+        row.setAmounts(amounts);
+        return row;
+    }
+
+    private static void buildOnce(ConvertLiquidationRouter router) {
+        try {
+            router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                    requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                    1_760_000_000_000L, 1_760_000_120_000L);
+        } catch (RuntimeException expected) {
+            // Whatever the outcome past the pool step: this test counts index queries, not verdicts.
+        }
+    }
+
+    @Test
+    void threeCandidatesInOneCycleMakeOneIndexQueryAndANewCycleMakesTheNext() throws Exception {
+        var repository = indexHolding(java.util.List.of(adaFldtPool()));
+        ConvertLiquidationRouter router = indexedRouter(repository);
+
+        router.beginCycle();
+        buildOnce(router);
+        buildOnce(router);
+        buildOnce(router);
+        org.mockito.Mockito.verify(repository, org.mockito.Mockito.times(1))
+                .findUnspentByOwnerPaymentCredential(org.mockito.ArgumentMatchers.eq(POOL_CREDENTIAL),
+                        org.mockito.ArgumentMatchers.argThat(org.springframework.data.domain.Pageable::isUnpaged));
+
+        router.beginCycle();
+        buildOnce(router);
+        org.mockito.Mockito.verify(repository, org.mockito.Mockito.times(2))
+                .findUnspentByOwnerPaymentCredential(org.mockito.ArgumentMatchers.eq(POOL_CREDENTIAL),
+                        org.mockito.ArgumentMatchers.argThat(org.springframework.data.domain.Pageable::isUnpaged));
+        org.mockito.Mockito.verifyNoMoreInteractions(repository);
+    }
+
+    @Test
+    void aPairWithNoIndexedPoolSaysItIsNotIndexed() {
+        ConvertLiquidationRouter router = indexedRouter(indexHolding(java.util.List.of()));
+        router.beginCycle();
+
+        var e = assertThrows(ConvertLiquidationRouter.NoPoolException.class,
+                () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals("no Minswap pool for " + FLDT.toUnit() + "/lovelace is indexed — not indexed (pools "
+                + "idle since 2025-05-06 are invisible); convert is impossible for this loan, not merely "
+                + "unprofitable — set this market to action: ANTICIPATE if it should be liquidated", e.getMessage());
+    }
+
+    /** CCL §19: the lookup is now a database read, and its failure must still arrive as LOOKUP_FAILED. */
+    @Test
+    void aDatabaseFailureReachesTheExecutorAsLookupFailedNotAsNoPool() {
+        var repository = org.mockito.Mockito.mock(
+                com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class);
+        org.mockito.Mockito.when(repository.findUnspentByOwnerPaymentCredential(
+                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenThrow(new org.springframework.dao.DataAccessResourceFailureException("db down"));
+        ConvertLiquidationRouter router = indexedRouter(repository);
+        router.beginCycle();
+
+        var e = assertThrows(MinswapPoolResolver.RefusedException.class,
+                () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+        assertEquals(MinswapPoolResolver.Refusal.LOOKUP_FAILED, e.refusal());
     }
 }

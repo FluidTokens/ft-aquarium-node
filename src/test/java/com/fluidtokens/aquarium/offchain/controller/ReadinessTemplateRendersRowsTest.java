@@ -202,7 +202,13 @@ class ReadinessTemplateRendersRowsTest {
 
     private static String render(List<LiquidationReadinessController.Row> rows,
                                  OperationalStatus status, String lendingConfigBlocked) {
+        return render(rows, status, lendingConfigBlocked, null);
+    }
+
+    private static String render(List<LiquidationReadinessController.Row> rows,
+                                 OperationalStatus status, String lendingConfigBlocked, String walletNotReady) {
         var context = new Context();
+        context.setVariable("walletNotReady", walletNotReady);
         context.setVariable("lendingConfigBlocked", lendingConfigBlocked);
         context.setVariable("network", "preview");
         context.setVariable("generatedAt", "2026-09-04T13:00:00Z");
@@ -215,7 +221,7 @@ class ReadinessTemplateRendersRowsTest {
         context.setVariable("filterQuery", "");
         // ⚠ A KNOWN, non-empty wallet: the strip's branches are amount/ticker rendering, and a fixture
         // with an unknown balance would only ever exercise the "unknown" path.
-        context.setVariable("wallet", new WalletBalance(
+        context.setVariable("wallet", walletNotReady != null ? WalletBalance.unknown() : new WalletBalance(
                 java.util.Map.of("lovelace", BigInteger.valueOf(12_500_000L)),
                 System.currentTimeMillis(), true));
         context.setVariable("walletDisplay", java.util.Map.of("lovelace",
@@ -274,6 +280,18 @@ class ReadinessTemplateRendersRowsTest {
 
         String open = render(List.of(fullRow()), monitoringOnly(), null);
         assertTrue(!open.contains("LENDING_CONFIG_MISMATCH"), "no banner while the gate is open");
+    }
+
+    /** FAB-134 B2: before the wallet is ready the strip says why, not "could not be read". */
+    @Test
+    void aWalletThatIsNotReadyYetSaysWhyInsteadOfReadingAsAFailure() {
+        String reason = "wallet not ready: the node is still syncing";
+        String html = render(List.of(fullRow()), monitoringOnly(), null, reason);
+        assertTrue(html.contains(reason), "the not-ready reason must be on the page");
+        assertTrue(!html.contains("the balance could not be read"), "not ready is not a failed read");
+
+        String ready = render(List.of(fullRow()), monitoringOnly(), null, null);
+        assertTrue(!ready.contains("wallet not ready"), "no not-ready text once ready");
     }
 
     /**

@@ -226,7 +226,8 @@
        was avoiding. -->
   <div class="wallet" th:unless="${disabledReason}">
     <span class="wallet-label">node wallet</span>
-    <span th:unless="${wallet.known()}" class="unknown">unknown &mdash; the balance could not be read</span>
+    <span th:if="${walletNotReady != null}" class="unknown" th:text="${walletNotReady}">wallet not ready</span>
+    <span th:unless="${wallet.known() or walletNotReady != null}" class="unknown">unknown &mdash; the balance could not be read</span>
     <span th:if="${wallet.known() and #lists.isEmpty(wallet.ordered())}" class="unknown">empty</span>
     <span class="bal" th:each="b : ${wallet.ordered()}" th:with="d=${walletDisplay.get(b.key)}">
       <span th:text="${d != null ? d.amountText : b.value}">0</span>

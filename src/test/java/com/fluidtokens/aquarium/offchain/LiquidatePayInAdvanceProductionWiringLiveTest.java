@@ -310,7 +310,10 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
         // THE POINT OF THE TEST: the production constructor. Backend-supplied script supplier,
         // Blockfrost evaluator, real ledger fee.
         Transaction built = new LiquidatePayInAdvanceTransactionBuilder(registry, Networks.preview(),
-                backend, productionEvaluator(backend)).build(request);
+                new com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier(backend.getUtxoService()),
+                new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(backend.getEpochService()),
+                new com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier(new com.bloxbean.cardano.client.backend.api.DefaultScriptSupplier(backend.getScriptService())),
+                productionEvaluator(backend)).build(request);
 
         assertNotNull(built, "the production wiring must produce a transaction");
 

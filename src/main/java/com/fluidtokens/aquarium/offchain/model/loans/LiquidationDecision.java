@@ -158,29 +158,13 @@ public record LiquidationDecision(long decidedAt,
         /** Signed and transmitted, and the backend rejected it. {@code detail} is its response. */
         SUBMIT_FAILED,
         /**
-         * Skipped because an earlier failure quarantined this loan UTxO and the quarantine has not
-         * yet lapsed. {@code detail} carries the remaining hold.
-         *
-         * <p>⚠ <b>This is the one outcome that says nothing about the candidate.</b> The other eight
-         * are judgements about the loan; this is a statement about the bot's own recent history, and
-         * an operator reading it as "not liquidatable" would be reading it wrong.
-         *
-         * <p>It exists because the quarantine skip was the <b>only silent exit</b> from
-         * {@code consider()} — five of the six paths recorded a decision and this one returned with a
-         * debug line. A held loan therefore looked exactly like a loan that was never a candidate,
-         * which is the same ambiguity a quiet market has with a dead deployment: <b>absence of a
-         * record is not a record of absence.</b> Confirmed 2026-08-25 by waiting out a real 30-minute
-         * quarantine and observing the first decision land at the first cycle past expiry.
-         */
-        QUARANTINED,
-        /**
          * The economics gate could not price a leg of the candidate into lovelace — {@code
          * PricingService.toLovelace} refused (no feed, a feed not usable at the instant asked, or a
          * {@code POOLED} variant). Landed live for the pay-in-advance path's token outlay
          * (token-principals slice, 2026-09-10): before this it was RESERVED here — see
          * {@code CompoundExclusion.PRICE_UNAVAILABLE} for the sibling that has carried the compound
-         * path's equivalent refusal since the oracle-pricing slice. Not quarantined: a feed coming
-         * back into its validity window cures it without the bot's own state changing.
+         * path's equivalent refusal since the oracle-pricing slice. Reconsidered every cycle: a feed
+         * coming back into its validity window cures it without the bot's own state changing.
          */
         PRICE_UNAVAILABLE
     }
