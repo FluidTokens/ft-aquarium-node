@@ -179,21 +179,41 @@ public class YaciConfig {
     }
 
     /**
-     * The convert builder. Wired exactly as its siblings above, and for the same reason: <b>the
-     * operator's whole risk case for this path — "exposure is the transaction fee per execution" — is
-     * true only while the ex-units are MEASURED.</b> Placeholder ex-units move the exposure to the
-     * collateral (CCL trap 8), and this class has no constructor that permits them.
+     * The production convert builder (FAB-134 B3b-3) — wired exactly as its two liquidation siblings above,
+     * and for the same reason: <b>the operator's whole risk case for this path — "exposure is the
+     * transaction fee per execution" — is true only while the ex-units are MEASURED.</b> Placeholder
+     * ex-units move the exposure to the collateral (CCL trap 8), and this class has no constructor that
+     * permits them. Built from the three injected suppliers and a real script-cost evaluator, and holding
+     * nothing else:
+     * <ul>
+     *   <li>{@link UtxoSupplier} — the index-first bean: coin selection, collateral and every indexed
+     *       reference input come from the local index; only out-refs the index cannot hold reach
+     *       Blockfrost.</li>
+     *   <li>{@link ProtocolParamsSupplier} — the per-epoch bean, not a fetch per build (a convert builds
+     *       twice: the layout probe and the real pass).</li>
+     *   <li>{@link ScriptSupplier} — the hash-checked bean, so every referenced script is priced, the
+     *       collateral oracle's included. The convert used to declare a partial list of its registry
+     *       scripts, which cardano-client-lib prices INSTEAD of asking a supplier — leaving the oracle's
+     *       bytes unpriced, the shape of the 2026-08-24 {@code FeeTooSmallUTxO}.</li>
+     * </ul>
+     * The evaluator is Blockfrost's {@code /utils/txs/evaluate}, narrowed to the one-method
+     * {@link TransactionEvaluator}: it is the one Blockfrost call a build still makes (with
+     * {@code getTxOutput} for reference inputs the index does not hold). The builder is handed no
+     * {@code BFBackendService} — that would hand it a submission path through the back door; arming and
+     * submission stay in {@code LiquidationExecutor} behind its two independent flags.
      */
     @Bean
     public ConvertTransactionBuilder convertTransactionBuilder(LoansContractRegistry registry,
                                                                AppConfig.Network network,
                                                                UtxoSupplier utxoSupplier,
                                                                ProtocolParamsSupplier protocolParamsSupplier,
+                                                               ScriptSupplier scriptSupplier,
                                                                BFBackendService bfBackendService) {
         TransactionEvaluator scriptCostEvaluator =
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
-        return new ConvertTransactionBuilder(registry, network.getCardanoNetwork(), bfBackendService,
-                utxoSupplier, protocolParamsSupplier, scriptCostEvaluator);
+        // The three injected suppliers and the evaluator lambda — never the BackendService itself.
+        return new ConvertTransactionBuilder(registry, network.getCardanoNetwork(),
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator);
     }
 
     /**

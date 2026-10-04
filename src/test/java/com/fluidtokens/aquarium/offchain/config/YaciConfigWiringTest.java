@@ -23,6 +23,7 @@ import com.fluidtokens.aquarium.offchain.service.ScheduledTransactionService;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
 import com.fluidtokens.aquarium.offchain.service.TankContractService;
 import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.loans.ConvertTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
@@ -359,6 +360,48 @@ class YaciConfigWiringTest {
         for (Field field : LiquidatePayInAdvanceTransactionBuilder.class.getDeclaredFields()) {
             assertFalse(BackendService.class.isAssignableFrom(field.getType()),
                     "the pay-in-advance builder declares a BackendService field (" + field.getName()
+                            + "): a submission path, and a route back to Blockfrost for every read");
+        }
+    }
+
+    /**
+     * ⛔ FAB-134 B3b-3: the CONVERT builder bean, asserted the same way as its two liquidation siblings
+     * above (T-043 found fixes landing in one sibling only). It holds the SAME three supplier instances
+     * the container injected — a fresh supplier here would read every convert's coin selection, collateral
+     * and indexed reference inputs from Blockfrost again, twice per convert (layout probe and real pass) —
+     * a non-null evaluator that is a {@link TransactionEvaluator} with no {@code submit} method, and no
+     * {@code BackendService} field at all.
+     */
+    @Test
+    void theConvertBuilderBeanHoldsTheInjectedSuppliersAnEvaluatorAndNoBackend() throws Exception {
+        UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(List.of());
+        ProtocolParamsSupplier protocolParamsSupplier = LoanFixtures.protocolParams();
+        ScriptSupplier scriptSupplier = hash -> Optional.empty();
+
+        ConvertTransactionBuilder builder = new YaciConfig().convertTransactionBuilder(
+                LoanFixtures.registry(), previewNetwork(),
+                utxoSupplier, protocolParamsSupplier, scriptSupplier,
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+
+        assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
+                "the convert builder does not hold the injected (index-first) UtxoSupplier");
+        assertSame(protocolParamsSupplier, fieldOf(builder, "protocolParamsSupplier"),
+                "the convert builder does not hold the injected (per-epoch) ProtocolParamsSupplier");
+        assertSame(scriptSupplier, fieldOf(builder, "scriptSupplier"),
+                "the convert builder does not hold the injected ScriptSupplier");
+
+        Object evaluator = fieldOf(builder, "scriptCostEvaluator");
+        assertNotNull(evaluator, "YaciConfig built the convert builder WITHOUT a script-cost evaluator: "
+                + "placeholder ex-units, a phase-2 failure, forfeited collateral (CCL trap 8)");
+        assertInstanceOf(TransactionEvaluator.class, evaluator);
+        for (java.lang.reflect.Method method : evaluator.getClass().getMethods()) {
+            assertFalse(method.getName().toLowerCase().contains("submit"),
+                    "the evaluator the convert builder holds exposes " + method.getName()
+                            + ": a submission path through the back door");
+        }
+        for (Field field : ConvertTransactionBuilder.class.getDeclaredFields()) {
+            assertFalse(BackendService.class.isAssignableFrom(field.getType()),
+                    "the convert builder declares a BackendService field (" + field.getName()
                             + "): a submission path, and a route back to Blockfrost for every read");
         }
     }
