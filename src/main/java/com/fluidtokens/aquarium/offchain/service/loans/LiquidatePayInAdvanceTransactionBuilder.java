@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.function.TxBuilder;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
@@ -10,9 +11,6 @@ import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
-import com.bloxbean.cardano.client.backend.api.BackendService;
-import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
-import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
 import com.bloxbean.cardano.client.common.model.Network;
 import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
@@ -83,19 +81,20 @@ import java.util.stream.Stream;
  *       as it was: placeholder ex-units, no throw.</li>
  * </ul>
  *
- * <h2>Holds a backend in production, and never submits</h2>
- * {@link #build} returns an <b>unsigned</b> {@link Transaction}; there is no signer, no key. In the
- * offline rigs the {@link QuickTxBuilder} is constructed with a <b>null</b> {@code TransactionProcessor}
- * and every script is handed in explicitly. In production it is constructed from a
- * {@code BackendService} — the one-argument constructor the library documents — so cardano-client-lib
- * can fetch a validator travelling as a reference script (the oracle script and, on preview,
- * {@code loan_claim_action}) to price and fee the transaction correctly; this mirrors
- * {@link LiquidateTransactionBuilder} exactly, which found on its first armed night that a
- * reference-script transaction cannot be priced without that supplier. The safety property is
- * therefore <b>a stated decision, not a constructor trick</b>: nothing in this class calls
- * {@code submit}, and arming and submission live only in {@code LiquidationExecutor} behind its two
- * independent flags. The evaluator ({@link TransactionEvaluator}) has one method and no way to submit,
- * so pricing the transaction does not grant submitting it.
+ * <h2>Holds no backend, and cannot submit</h2>
+ * {@link #build} returns an <b>unsigned</b> {@link Transaction}; there is no signer, no key. The
+ * {@link QuickTxBuilder} is always constructed with a <b>null</b> {@code TransactionProcessor}. In the
+ * offline rigs every script is handed in explicitly. In production (FAB-134 B3b) it is constructed from
+ * the injected index-first {@link UtxoSupplier}, the per-epoch {@link ProtocolParamsSupplier} and a
+ * {@link ScriptSupplier} that serves verified script BYTES by hash, so cardano-client-lib can price a
+ * validator travelling as a reference script (the oracle script and, on preview,
+ * {@code loan_claim_action}) — mirroring {@link LiquidateTransactionBuilder} exactly, which found on its
+ * first armed night that a reference-script transaction cannot be priced without that supplier. This
+ * class holds no {@code BackendService}, so the safety property is <b>structural</b>: there is nothing
+ * in it that could submit. The evaluator ({@link TransactionEvaluator}) arrives through
+ * {@code withTxEvaluator}, has one method and no way to submit, so pricing the transaction does not
+ * grant submitting it; arming and submission live only in {@code LiquidationExecutor} behind its two
+ * independent flags.
  *
  * <h2>How it differs from the plain {@code Liquidate} builder</h2>
  * The transaction is the plain-liquidation shape with three changes the pay-in-advance validators
@@ -159,24 +158,26 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
     private final TransactionEvaluator scriptCostEvaluator;
 
     /**
-     * The backend cardano-client-lib builds against in production, or {@code null} for the offline rigs.
-     * When present, {@code QuickTxBuilder} is constructed from it directly so it has the utxo supplier,
-     * protocol params, <b>script supplier</b> and transaction processor in one object — the script
-     * supplier is what lets it fetch a validator travelling as a reference script. See the class javadoc
-     * for why holding this does not reopen the submission path.
+     * Where cardano-client-lib fetches the BYTES of a script that travels as a reference script, or
+     * {@code null} for the offline rigs (which hand every script in explicitly). Production builds with
+     * {@code new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier, null)}: priced,
+     * because this supplier serves the bytes (CCL trap 9), and submit-incapable, because the processor
+     * slot is null and the evaluator arrives through {@code withTxEvaluator} (CCL trap 8). Mirrors
+     * {@link LiquidateTransactionBuilder}'s field of the same name (FAB-134 B3b-1).
      */
-    private final BackendService backendService;
+    private final ScriptSupplier scriptSupplier;
 
     /**
      * The offline builder: no evaluator, so redeemers keep cardano-client-lib's placeholder ex-units.
-     * For the test rigs, which evaluate separately. Production goes through the {@code BackendService}
-     * constructor.
+     * For the test rigs, which evaluate separately, and for {@link #numbers}-only callers, which pass
+     * {@code null} suppliers because they never build. Production goes through the constructor that
+     * takes a {@link ScriptSupplier} and a {@link TransactionEvaluator}.
      */
     public LiquidatePayInAdvanceTransactionBuilder(LoansContractRegistry registry,
                                                    Network network,
                                                    UtxoSupplier utxoSupplier,
                                                    ProtocolParamsSupplier protocolParamsSupplier) {
-        this(registry, network, utxoSupplier, protocolParamsSupplier, null, null);
+        this(registry, network, utxoSupplier, protocolParamsSupplier, (TransactionEvaluator) null);
     }
 
     /**
@@ -188,38 +189,37 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                                                    UtxoSupplier utxoSupplier,
                                                    ProtocolParamsSupplier protocolParamsSupplier,
                                                    TransactionEvaluator scriptCostEvaluator) {
-        this(registry, network, utxoSupplier, protocolParamsSupplier, null, scriptCostEvaluator);
-    }
-
-    /**
-     * The production constructor. {@code QuickTxBuilder} is built from the {@code BackendService}
-     * exactly as the library documents, so it has a script supplier that can fetch a validator
-     * travelling as a reference script. The evaluator is passed separately (Blockfrost's
-     * {@code /utils/txs/evaluate}, wired in {@code YaciConfig}) so its parameters and cost models are
-     * the chain's by construction.
-     */
-    public LiquidatePayInAdvanceTransactionBuilder(LoansContractRegistry registry,
-                                                   Network network,
-                                                   BackendService backendService,
-                                                   TransactionEvaluator scriptCostEvaluator) {
-        this(registry, network,
-                new DefaultUtxoSupplier(Objects.requireNonNull(backendService, "backendService").getUtxoService()),
-                new DefaultProtocolParamsSupplier(backendService.getEpochService()),
-                backendService, scriptCostEvaluator);
-    }
-
-    private LiquidatePayInAdvanceTransactionBuilder(LoansContractRegistry registry,
-                                                    Network network,
-                                                    UtxoSupplier utxoSupplier,
-                                                    ProtocolParamsSupplier protocolParamsSupplier,
-                                                    BackendService backendService,
-                                                    TransactionEvaluator scriptCostEvaluator) {
+        // Offline: suppliers stay nullable — LiquidationReadinessController and the shadow run construct
+        // this for numbers() alone and never build.
         this.registry = registry;
         this.network = network;
         this.utxoSupplier = utxoSupplier;
         this.protocolParamsSupplier = protocolParamsSupplier;
-        this.backendService = backendService;
+        this.scriptSupplier = null;
         this.scriptCostEvaluator = scriptCostEvaluator;
+    }
+
+    /**
+     * The production constructor (FAB-134 B3b). Every collaborator is injected and none may be null —
+     * <b>the evaluator included</b>: production has no constructor that permits placeholder ex-units.
+     * {@code YaciConfig} hands over the index-first {@link UtxoSupplier}, the per-epoch
+     * {@link ProtocolParamsSupplier}, a {@link ScriptSupplier} that serves verified script bytes, and
+     * Blockfrost's {@code /utils/txs/evaluate} narrowed to a {@link TransactionEvaluator} — so its
+     * parameters and cost models are the chain's by construction. Nothing here is a
+     * {@code BackendService}; see the {@link #scriptSupplier} field for why that is the point.
+     */
+    public LiquidatePayInAdvanceTransactionBuilder(LoansContractRegistry registry,
+                                                   Network network,
+                                                   UtxoSupplier utxoSupplier,
+                                                   ProtocolParamsSupplier protocolParamsSupplier,
+                                                   ScriptSupplier scriptSupplier,
+                                                   TransactionEvaluator scriptCostEvaluator) {
+        this.registry = Objects.requireNonNull(registry, "registry");
+        this.network = Objects.requireNonNull(network, "network");
+        this.utxoSupplier = Objects.requireNonNull(utxoSupplier, "utxoSupplier");
+        this.protocolParamsSupplier = Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
+        this.scriptSupplier = Objects.requireNonNull(scriptSupplier, "scriptSupplier");
+        this.scriptCostEvaluator = Objects.requireNonNull(scriptCostEvaluator, "scriptCostEvaluator");
     }
 
     /**
@@ -836,13 +836,16 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
         TransactionEvaluator evaluator =
                 scriptCostEvaluator != null ? reporting(scriptCostEvaluator) : null;
         try {
-            // Production: the one-argument constructor the library documents, which wires the utxo
-            // supplier, protocol params, SCRIPT SUPPLIER and transaction processor from one backend —
-            // the script supplier is what lets it fetch a validator that only exists on chain as a
-            // reference script. Offline: the three-argument form with no processor and no supplier,
-            // because the rigs hand every script in explicitly and evaluate for themselves.
-            QuickTxBuilder quickTxBuilder = backendService != null
-                    ? new QuickTxBuilder(backendService)
+            // Production: the injected utxo supplier (the local index first), the per-epoch protocol
+            // params, and a SCRIPT SUPPLIER that serves the bytes of every validator travelling as a
+            // reference script — without which cardano-client-lib prices that script's fee as zero (CCL
+            // trap 9). The processor slot is null and stays null: the evaluator arrives through
+            // withTxEvaluator below, never through the processor (CCL trap 8), so this builder can price
+            // a transaction and has nothing that could submit one. Offline: the three-argument form with
+            // no processor and no supplier, because the rigs hand every script in explicitly and
+            // evaluate for themselves. Mirrors LiquidateTransactionBuilder.complete (FAB-134 B3b-1).
+            QuickTxBuilder quickTxBuilder = scriptSupplier != null
+                    ? new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier, null)
                     : new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null);
             QuickTxBuilder.TxContext context = quickTxBuilder
                     .compose(tx)
@@ -896,7 +899,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
                             utxoSupplier, protocolParamsSupplier,
                             request.changeAddress(), request.walletUtxo()));
 
-            if (backendService == null) {
+            if (scriptSupplier == null) {
                 // Offline: cardano-client-lib would otherwise walk every reference input looking for a
                 // script to fetch and NPE on the missing supplier. The rig hands scripts in explicitly.
                 context = context.withScriptSupplier(scriptHash -> Optional.empty());
@@ -921,9 +924,10 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
             // by 61,996 -- and the oracle script is 4,138 bytes, ~62,070 at the reference-script rate.
             // That is not a plausible match, it is the thing itself.
             //
-            // With a backend we therefore declare NOTHING and let its supplier price them all.
-            // Verified before relying on it: Blockfrost serves BOTH by hash --
-            // loan_claim_action 9ae63b26… (8,662 bytes) and the oracle 402c984d… (4,138 bytes).
+            // With a script supplier (production) we therefore declare NOTHING and let it price them
+            // all. Verified before relying on it: Blockfrost serves BOTH by hash --
+            // loan_claim_action 9ae63b26… (8,662 bytes) and the oracle 402c984d… (4,138 bytes) -- and
+            // the injected HashCheckedScriptSupplier fails closed rather than answer empty.
             // Offline there is no supplier and no ledger to satisfy, so the declaration stays.
             //
             // removeDuplicateScriptWitnesses is no longer needed on either path: since e11ccca a
@@ -934,7 +938,7 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
             }
 
             List<PlutusScript> published = publishedScripts(request.referenceScripts());
-            if (backendService == null && !published.isEmpty()) {
+            if (scriptSupplier == null && !published.isEmpty()) {
                 context = context.withReferenceScripts(published.toArray(PlutusScript[]::new))
                         .removeDuplicateScriptWitnesses(true);
             }

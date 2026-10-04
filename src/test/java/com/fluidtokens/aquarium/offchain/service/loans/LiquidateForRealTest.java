@@ -135,7 +135,10 @@ public class LiquidateForRealTest {
 
             // 3+4+5. Build through the PRODUCTION constructor: backend script supplier, real
             // Blockfrost evaluator, guarded coin selection and pinned collateral.
-            Transaction tx = new LiquidatePayInAdvanceTransactionBuilder(reg, Networks.preview(), b,
+            Transaction tx = new LiquidatePayInAdvanceTransactionBuilder(reg, Networks.preview(),
+                    new com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier(b.getUtxoService()),
+                    new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(b.getEpochService()),
+                    new com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier(new com.bloxbean.cardano.client.backend.api.DefaultScriptSupplier(b.getScriptService())),
                     (cbor, in) -> b.getTransactionService().evaluateTx(cbor)).build(req);
             System.out.println("LQ BUILT size=" + tx.serialize().length + " fee=" + tx.getBody().getFee());
             tx.getWitnessSet().getRedeemers().forEach(r ->

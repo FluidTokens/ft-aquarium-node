@@ -1,6 +1,7 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
+import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
@@ -21,6 +22,7 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
@@ -34,12 +36,19 @@ import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -605,6 +614,269 @@ class LiquidatePayInAdvanceDryEvalTest {
 
         assertTrue(causeChain(thrown).contains("costed 0 of "),
                 "the failure must say how many of how many were costed: " + causeChain(thrown));
+    }
+
+    // ======================================================================================
+    // ⛔ FAB-134 B3b-2: the PRODUCTION constructor — the one YaciConfig calls — with rig leaves only
+    //
+    // Every test above builds through an OFFLINE constructor. The 2026-08-21 incident was a rig
+    // supplying what production must earn (CLAUDE.md, "Promoting test code to src/main requires a
+    // production-wiring test"), so these build through (registry, network, UtxoSupplier,
+    // ProtocolParamsSupplier, ScriptSupplier, TransactionEvaluator) and the rig supplies only the
+    // leaves: the UTxO set, the protocol parameters, the script bytes (behind the production
+    // HashCheckedScriptSupplier) and the offline PlutusV3 evaluator. Mirrors
+    // LiquidateProductionWiringTest, the plain sibling's (FAB-134 B3b-1).
+    //
+    // The request publishes five loans-v4 validators by reference (the pay-in-advance action stays
+    // witness-attached: EvalFixtures#scriptSupplier does not carry it), and the oracle's script is a
+    // third party's, reachable only through its reference input. That mix is exactly the 2026-08-24
+    // shape: a PARTIAL withReferenceScripts list un-prices the oracle (FeeTooSmallUTxO, CCL trap 9).
+    // ======================================================================================
+
+    /** Five synthetic coordinates whose UTxOs carry the derived loans-v4 hashes — see {@link #productionUniverse}. */
+    private static final LiquidateTransactionBuilder.ReferenceScripts PRODUCTION_REFERENCE_SCRIPTS =
+            new LiquidateTransactionBuilder.ReferenceScripts(
+                    new TransactionInput("b1".repeat(32), 0),
+                    new TransactionInput("b2".repeat(32), 0),
+                    new TransactionInput("b3".repeat(32), 0),
+                    new TransactionInput("b4".repeat(32), 0),
+                    new TransactionInput("b5".repeat(32), 0),
+                    null,
+                    null);
+
+    /** The five validators in {@link #PRODUCTION_REFERENCE_SCRIPTS}' order. */
+    private static List<PlutusScript> productionReferencedScripts() {
+        return List.of(REGISTRY.getLoanScript(), REGISTRY.getLoanSpendScript(), REGISTRY.getLenderManagerScript(),
+                REGISTRY.getLenderManagerSpendScript(), REGISTRY.getLoanClaimActionScript());
+    }
+
+    /** CCL's placeholder mem (CCL trap 8): a redeemer still carrying it was never costed. */
+    private static final BigInteger PLACEHOLDER_MEM = BigInteger.valueOf(10_000);
+
+    /** (i) The redeemers carry the evaluator's ex-units, read off the DESERIALISED transaction. */
+    @Test
+    void theProductionConstructorShipsTheEvaluatedExUnits() throws Exception {
+        List<Utxo> universe = productionUniverse(WALLET_UTXO, null);
+        Recording evaluator = new Recording(aiken(universe));
+        Transaction built = production(universe, new HashCheckedScriptSupplier(rigScripts()), evaluator)
+                .build(productionRequest(WALLET_UTXO));
+
+        assertEquals(1, evaluator.calls.get(), "exactly one evaluation per build");
+        Transaction reread = Transaction.deserialize(built.serialize());
+        List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
+        assertEquals(8, redeemers.size(), "two spends, one mint, five withdrawals (the oracle's included)");
+        for (Redeemer redeemer : redeemers) {
+            String key = redeemer.getTag() + "#" + redeemer.getIndex();
+            EvaluationResult costing = costingFor(evaluator.last.get(), redeemer);
+            assertEquals(costing.getExUnits().getMem(), redeemer.getExUnits().getMem(),
+                    "declared mem for " + key + " is not the evaluated one");
+            assertEquals(costing.getExUnits().getSteps(), redeemer.getExUnits().getSteps(),
+                    "declared steps for " + key + " is not the evaluated one");
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    key + " carries CCL's 10000-mem placeholder: the evaluator was not load-bearing");
+        }
+    }
+
+    /**
+     * (ii) Every referenced script is priced, the ORACLE'S included. Compared against the same build
+     * through the same production constructor whose script supplier serves nothing — the state in which
+     * cardano-client-lib charges the reference-script fee as zero (CCL trap 9). Same body, same
+     * redeemers, same ex-units otherwise, so the fee delta is the reference-script fee.
+     */
+    @Test
+    void theProductionReferenceScriptFeeIsChargedForEveryReferencedScriptIncludingTheOracles() throws Exception {
+        List<Utxo> universe = productionUniverse(WALLET_UTXO, null);
+        Transaction priced = Transaction.deserialize(
+                production(universe, new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(universe)))
+                        .build(productionRequest(WALLET_UTXO)).serialize());
+        ScriptSupplier servesNothing = hash -> Optional.empty();
+        Transaction unpriced = Transaction.deserialize(
+                production(universe, servesNothing, new Recording(aiken(universe)))
+                        .build(productionRequest(WALLET_UTXO)).serialize());
+
+        long registryBytes = 0;
+        for (PlutusScript script : productionReferencedScripts()) {
+            registryBytes += script.scriptRefBytes().length;
+        }
+        long oracleBytes = oracleScript().scriptRefBytes().length;
+        BigDecimal perByte = EvalFixtures.protocolParams().getProtocolParams().getMinFeeRefScriptCostPerByte();
+        BigInteger flatFloor = perByte.multiply(BigDecimal.valueOf(registryBytes + oracleBytes))
+                .setScale(0, RoundingMode.CEILING).toBigIntegerExact();
+        BigInteger oracleShare = perByte.multiply(BigDecimal.valueOf(oracleBytes))
+                .setScale(0, RoundingMode.CEILING).toBigIntegerExact();
+
+        BigInteger delta = priced.getBody().getFee().subtract(unpriced.getBody().getFee());
+        log.info("FAB-134 B3b-2 pay-in-advance ref-script fee: priced {} unpriced {} delta {} | registry {} B "
+                        + "+ oracle {} B = {} B x {} = flat floor {} (oracle share {})",
+                priced.getBody().getFee(), unpriced.getBody().getFee(), delta, registryBytes, oracleBytes,
+                registryBytes + oracleBytes, perByte, flatFloor, oracleShare);
+
+        // Tolerance: the two bodies differ ONLY in the fee field and the change output's coin, and the
+        // size fee moves by minFeeA (44) per byte. Both fees and both change coins sit in the same CBOR
+        // width class, so the honest size difference is 0 bytes; one byte each for the fee and the
+        // change coin, 2 x 44 = 88 lovelace, is allowed for a width-class boundary. It must stay below
+        // the oracle's share, or this assertion could not tell "the oracle was priced" from "it was not".
+        BigInteger tolerance = BigInteger.valueOf(2 * 44);
+        assertTrue(tolerance.compareTo(oracleShare) < 0, "the tolerance would hide the oracle's fee");
+        assertTrue(delta.compareTo(flatFloor.subtract(tolerance)) >= 0,
+                "the reference-script fee charged (" + delta + ") is below the flat floor for all six "
+                        + "referenced scripts (" + flatFloor + ", the oracle's share " + oracleShare
+                        + "): a referenced script went unpriced, which the ledger rejects as FeeTooSmallUTxO");
+    }
+
+    /** (iii) The production flag is strict: an evaluator error refuses, never placeholder ex-units. */
+    @Test
+    void anEvaluatorErrorRefusesTheBuildOnTheProductionPath() {
+        List<Utxo> universe = productionUniverse(WALLET_UTXO, null);
+        TransactionEvaluator failing = (cbor, inputs) -> Result.error("ScriptFailures: {} (rig)");
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> production(universe, new HashCheckedScriptSupplier(rigScripts()), failing)
+                        .build(productionRequest(WALLET_UTXO)));
+        String chain = causeChain(thrown);
+        assertEquals("cannot build the pay-in-advance transaction", thrown.getMessage(), chain);
+        assertTrue(chain.contains("ScriptCostEvaluationException: ScriptFailures: {} (rig)"),
+                "a failed evaluation on the production path must refuse with the evaluator's marker in the "
+                        + "cause chain, never ship placeholders: " + chain);
+    }
+
+    /**
+     * (iv) CCL trap 9b, the SELECTOR seam, through the production constructor. The bot address holds the
+     * five published loans-v4 reference scripts (ada-only, 20 ADA each) and ONE wallet utxo swept from
+     * short to ample. When the wallet cannot cover the build, cardano-client-lib's ChangeOutputAdjustments
+     * tops the change up through the context's UtxoSelector (no reference-script check) — so without the
+     * selector installed in {@code preBalanceTx} it consumes a published script. For every wallet value
+     * the build either refuses or spends (inputs and collateral) no reference-script utxo, and at least
+     * one value must build or the sweep proves nothing.
+     */
+    @Test
+    void aShortWalletNeverSpendsAPublishedReferenceScriptOnTheProductionPath() throws Exception {
+        long[] walletLovelace = {28_000_000L, 30_000_000L, 31_000_000L, 32_000_000L, 33_000_000L,
+                34_000_000L, 36_000_000L, 40_000_000L, 60_000_000L};
+        int built = 0;
+        List<String> outcomes = new ArrayList<>();
+        for (long lovelace : walletLovelace) {
+            Utxo wallet = LoanFixtures.adaUtxo("e1".repeat(32), 0, LoanFixtures.botAddress(), lovelace);
+            List<Utxo> universe = productionUniverse(wallet, LoanFixtures.botAddress());
+            Set<TransactionInput> published = new HashSet<>();
+            universe.stream().filter(u -> u.getReferenceScriptHash() != null)
+                    .forEach(u -> published.add(new TransactionInput(u.getTxHash(), u.getOutputIndex())));
+            assertEquals(6, published.size(), "five loans-v4 reference scripts and the oracle's");
+
+            Transaction transaction;
+            try {
+                transaction = production(universe, new HashCheckedScriptSupplier(rigScripts()),
+                        new Recording(aiken(universe))).build(productionRequest(wallet));
+            } catch (IllegalStateException refused) {
+                outcomes.add(lovelace + ": refused " + refused.getMessage());
+                continue;
+            }
+            Transaction reread = Transaction.deserialize(transaction.serialize());
+            List<TransactionInput> spent = new ArrayList<>(reread.getBody().getInputs());
+            if (reread.getBody().getCollateral() != null) {
+                spent.addAll(reread.getBody().getCollateral());
+            }
+            for (TransactionInput input : spent) {
+                assertFalse(published.contains(input), "wallet " + lovelace + " lovelace: the build spends "
+                        + "the published reference-script utxo " + input.getTransactionId() + "#"
+                        + input.getIndex() + " (CCL trap 9b — the selector seam is unguarded)");
+            }
+            built++;
+            outcomes.add(lovelace + ": built, " + reread.getBody().getInputs().size() + " inputs");
+        }
+        log.info("FAB-134 B3b-2 pay-in-advance short-wallet sweep: {}", outcomes);
+        assertTrue(built > 0, "no wallet value built at all, so the sweep proves nothing: " + outcomes);
+        assertTrue(outcomes.stream().anyMatch(o -> o.contains("refused")),
+                "no wallet value was short, so the selector seam was never reached: " + outcomes);
+    }
+
+    /** (v) The production constructor has no null-evaluator form (CCL trap 8). */
+    @Test
+    void theProductionConstructorRefusesANullEvaluator() {
+        NullPointerException npe = assertThrows(NullPointerException.class,
+                () -> production(universe(fixture()), new HashCheckedScriptSupplier(rigScripts()), null));
+        assertEquals("scriptCostEvaluator", npe.getMessage());
+    }
+
+    /** The production constructor, exactly the one YaciConfig calls. */
+    private static LiquidatePayInAdvanceTransactionBuilder production(List<Utxo> universe, ScriptSupplier scripts,
+                                                                      TransactionEvaluator evaluator) {
+        return new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), scripts, evaluator);
+    }
+
+    /** The provider leaf: the registry's applied scripts plus the deployed oracle, served by hash. */
+    private static ScriptSupplier rigScripts() {
+        return EvalFixtures.scriptSupplier(REGISTRY, List.of(oracleScript()));
+    }
+
+    private static AikenTransactionEvaluator aiken(List<Utxo> universe) {
+        return new AikenTransactionEvaluator(LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
+                rigScripts(), SlotConfigs.preview());
+    }
+
+    /**
+     * The fixture universe with {@code wallet} in place of the funded wallet utxo, plus the five
+     * published loans-v4 reference-script UTxOs carrying the derived hashes (a Blockfrost Utxo never
+     * carries the bytes).
+     *
+     * @param referenceScriptAddress where they sit; {@code null} puts each at its own script's
+     *                               enterprise address
+     */
+    private static List<Utxo> productionUniverse(Utxo wallet, String referenceScriptAddress) {
+        List<Utxo> universe = new ArrayList<>(universe(fixture()).stream()
+                .filter(u -> !(u.getTxHash().equals(TX_WALLET) && u.getOutputIndex() == 0))
+                .toList());
+        universe.add(wallet);
+        List<TransactionInput> coordinates = List.of(PRODUCTION_REFERENCE_SCRIPTS.loan(),
+                PRODUCTION_REFERENCE_SCRIPTS.loanSpend(), PRODUCTION_REFERENCE_SCRIPTS.lenderManager(),
+                PRODUCTION_REFERENCE_SCRIPTS.lenderManagerSpend(), PRODUCTION_REFERENCE_SCRIPTS.loanClaimAction());
+        List<PlutusScript> scripts = productionReferencedScripts();
+        for (int i = 0; i < coordinates.size(); i++) {
+            String hash = hashOf(scripts.get(i));
+            universe.add(Utxo.builder().txHash(coordinates.get(i).getTransactionId())
+                    .outputIndex(coordinates.get(i).getIndex())
+                    .address(referenceScriptAddress != null ? referenceScriptAddress : LoanFixtures.entAddress(hash))
+                    .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                    .referenceScriptHash(hash).build());
+        }
+        return universe;
+    }
+
+    /** The fixture request with {@code wallet} and {@link #PRODUCTION_REFERENCE_SCRIPTS}. */
+    private static LiquidatePayInAdvanceTransactionBuilder.Request productionRequest(Utxo wallet) {
+        var r = fixture().request();
+        return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
+                r.bondUtxo(), wallet, r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.principalOracle(),
+                r.validFromMillis(), r.validToMillis(), r.validFromSlot(), r.validToSlot(), r.changeAddress(),
+                PRODUCTION_REFERENCE_SCRIPTS, r.oracleWindowMarginMillis());
+    }
+
+    private static String hashOf(PlutusScript script) {
+        try {
+            return HexUtil.encodeHexString(script.getScriptHash());
+        } catch (Exception e) {
+            throw new AssertionError("cannot hash a script", e);
+        }
+    }
+
+    /** Records how often it was asked and what it last returned. */
+    private static final class Recording implements TransactionEvaluator {
+        final TransactionEvaluator delegate;
+        final AtomicInteger calls = new AtomicInteger();
+        final AtomicReference<List<EvaluationResult>> last = new AtomicReference<>();
+
+        Recording(TransactionEvaluator delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Result<List<EvaluationResult>> evaluateTx(byte[] cbor, Set<Utxo> inputUtxos)
+                throws com.bloxbean.cardano.client.api.exception.ApiException {
+            calls.incrementAndGet();
+            Result<List<EvaluationResult>> result = delegate.evaluateTx(cbor, inputUtxos);
+            last.set(result.getValue());
+            return result;
+        }
     }
 
     private static String causeChain(Throwable thrown) {

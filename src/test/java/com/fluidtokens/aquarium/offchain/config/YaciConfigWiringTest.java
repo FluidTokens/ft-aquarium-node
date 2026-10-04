@@ -23,6 +23,7 @@ import com.fluidtokens.aquarium.offchain.service.ScheduledTransactionService;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
 import com.fluidtokens.aquarium.offchain.service.TankContractService;
 import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import com.fluidtokens.aquarium.offchain.storage.IndexFirstUtxoSupplier;
@@ -317,6 +318,47 @@ class YaciConfigWiringTest {
         for (Field field : LiquidateTransactionBuilder.class.getDeclaredFields()) {
             assertFalse(BackendService.class.isAssignableFrom(field.getType()),
                     "the liquidation builder declares a BackendService field (" + field.getName()
+                            + "): a submission path, and a route back to Blockfrost for every read");
+        }
+    }
+
+    /**
+     * ⛔ FAB-134 B3b-2: the PAY-IN-ADVANCE builder bean, asserted the same way as its sibling above
+     * (T-043 found fixes landing in one sibling only). It holds the SAME three supplier instances the
+     * container injected, a non-null evaluator that is a {@link TransactionEvaluator} and exposes no
+     * {@code submit} method, and no {@code BackendService} field at all — the pay-in-advance path fronts
+     * the operator's own ada, so a submission path or a per-build Blockfrost read here costs the most.
+     */
+    @Test
+    void thePayInAdvanceBuilderBeanHoldsTheInjectedSuppliersAnEvaluatorAndNoBackend() throws Exception {
+        UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(List.of());
+        ProtocolParamsSupplier protocolParamsSupplier = LoanFixtures.protocolParams();
+        ScriptSupplier scriptSupplier = hash -> Optional.empty();
+
+        LiquidatePayInAdvanceTransactionBuilder builder = new YaciConfig().liquidatePayInAdvanceTransactionBuilder(
+                LoanFixtures.registry(), previewNetwork(),
+                utxoSupplier, protocolParamsSupplier, scriptSupplier,
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+
+        assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
+                "the pay-in-advance builder does not hold the injected (index-first) UtxoSupplier");
+        assertSame(protocolParamsSupplier, fieldOf(builder, "protocolParamsSupplier"),
+                "the pay-in-advance builder does not hold the injected (per-epoch) ProtocolParamsSupplier");
+        assertSame(scriptSupplier, fieldOf(builder, "scriptSupplier"),
+                "the pay-in-advance builder does not hold the injected ScriptSupplier");
+
+        Object evaluator = fieldOf(builder, "scriptCostEvaluator");
+        assertNotNull(evaluator, "YaciConfig built the pay-in-advance builder WITHOUT a script-cost evaluator: "
+                + "placeholder ex-units, a phase-2 failure, forfeited collateral (CCL trap 8)");
+        assertInstanceOf(TransactionEvaluator.class, evaluator);
+        for (java.lang.reflect.Method method : evaluator.getClass().getMethods()) {
+            assertFalse(method.getName().toLowerCase().contains("submit"),
+                    "the evaluator the pay-in-advance builder holds exposes " + method.getName()
+                            + ": a submission path through the back door");
+        }
+        for (Field field : LiquidatePayInAdvanceTransactionBuilder.class.getDeclaredFields()) {
+            assertFalse(BackendService.class.isAssignableFrom(field.getType()),
+                    "the pay-in-advance builder declares a BackendService field (" + field.getName()
                             + "): a submission path, and a route back to Blockfrost for every read");
         }
     }

@@ -227,31 +227,43 @@ public class YaciConfig {
     }
 
     /**
-     * The pay-in-advance liquidation builder, with a real script-cost evaluator — the convert-path
-     * mirror of {@code liquidateTransactionBuilder} above (T-014).
+     * The production pay-in-advance liquidation builder (FAB-134 B3b-2) — the mirror of
+     * {@code liquidateTransactionBuilder} above, wired identically (T-043: fixes that land in one
+     * sibling only). Built from the three injected suppliers and a real script-cost evaluator, and
+     * holding nothing else:
+     * <ul>
+     *   <li>{@link UtxoSupplier} — the index-first bean: coin selection, collateral and every indexed
+     *       reference input come from the local index; only out-refs the index cannot hold reach
+     *       Blockfrost.</li>
+     *   <li>{@link ProtocolParamsSupplier} — the per-epoch bean, not a fetch per build.</li>
+     *   <li>{@link ScriptSupplier} — the hash-checked bean, so every referenced script is priced, the
+     *       oracle's included (the 2026-08-24 {@code FeeTooSmallUTxO} was the oracle's going unpriced).</li>
+     * </ul>
      * <p>
      * Without an evaluator, cardano-client-lib leaves every redeemer holding placeholder ex-units, and a
      * transaction that under-declares is not rejected by the mempool: it lands and then fails on chain,
      * forfeiting the collateral. So this path is given the same Blockfrost {@code /utils/txs/evaluate}
      * evaluator the plain builder's bean uses — its protocol parameters and cost models are the chain's
      * by construction — narrowed to the one-method {@link TransactionEvaluator} so the builder can price
-     * a transaction and nothing else. And, exactly as the plain builder, the builder is constructed from
-     * the {@code BFBackendService}: its {@code QuickTxBuilder} needs the backend's script supplier to
-     * fetch a validator travelling as a reference script (the oracle script, and on preview
-     * {@code loan_claim_action}) so the transaction can be priced and feed correctly. Holding a backend
-     * does not reopen submission — nothing in the builder calls {@code submit}; the routing seam
-     * ({@code PayInAdvanceLiquidationRouter}) only ever invokes {@code build(Request)}, and arming and
-     * submission stay in {@code LiquidationExecutor} behind its two independent flags.
+     * a transaction and nothing else. It is the one Blockfrost call a build still makes (with
+     * {@code getTxOutput} for reference inputs the index does not hold). The builder is handed no
+     * {@code BFBackendService} and no {@code DefaultTransactionProcessor} — either would hand it a
+     * submission path through the back door; arming and submission stay in {@code LiquidationExecutor}
+     * behind its two independent flags.
      */
     @Bean
     public LiquidatePayInAdvanceTransactionBuilder liquidatePayInAdvanceTransactionBuilder(
             LoansContractRegistry registry,
             AppConfig.Network network,
+            UtxoSupplier utxoSupplier,
+            ProtocolParamsSupplier protocolParamsSupplier,
+            ScriptSupplier scriptSupplier,
             BFBackendService bfBackendService) {
         TransactionEvaluator scriptCostEvaluator =
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
+        // The three injected suppliers and the evaluator lambda — never the BackendService itself.
         return new LiquidatePayInAdvanceTransactionBuilder(registry, network.getCardanoNetwork(),
-                bfBackendService, scriptCostEvaluator);
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator);
     }
 
 }
