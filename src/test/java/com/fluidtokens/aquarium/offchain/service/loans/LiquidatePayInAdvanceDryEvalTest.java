@@ -577,7 +577,7 @@ class LiquidatePayInAdvanceDryEvalTest {
      * turned "there is no evaluator" into a {@code log.warn} and a transaction full of placeholders. With
      * an evaluator wired, the builder sets it to {@code false}, so an evaluator that fails — Blockfrost
      * down, the transaction rejected by the evaluation endpoint — fails the build (which the executor
-     * quarantines with the cause) instead of producing an unsubmittable-but-submitted transaction. The
+     * logs at ERROR with the cause) instead of producing an unsubmittable-but-submitted transaction. The
      * evaluator's own words must survive to the operator, two cardano-client-lib wrappers notwithstanding.
      */
     @Test

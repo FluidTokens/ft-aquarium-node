@@ -141,7 +141,7 @@ class WalletSweepServiceTest {
     }
 
     private static AppConfig.LiquidationConfiguration liquidation(AppConfig.LiquidationConfiguration.Mode mode) {
-        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, BigInteger.valueOf(1_500_000L), 50, 30);
+        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, BigInteger.valueOf(1_500_000L), 50);
     }
 
     private static AppConfig.CompoundConfiguration compound(boolean enabled) {

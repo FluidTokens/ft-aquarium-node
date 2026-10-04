@@ -421,7 +421,7 @@ public final class LiquidateTransactionBuilder {
          * assembled. The detail carries the evaluator's own root-cause text, which cardano-client-lib
          * otherwise flattens into a bare "Error while evaluating script cost".
          * <p>
-         * Refusals are deliberately not quarantined, so during an evaluator outage every candidate
+         * Nothing is held after a refusal (FAB-134 NQ), so during an evaluator outage every candidate
          * re-attempts a remote evaluation every cycle with no backoff. That is a T-010 question, not
          * this one's: the direction is already safe (nothing is built, nothing is submitted), it is only
          * wasteful.

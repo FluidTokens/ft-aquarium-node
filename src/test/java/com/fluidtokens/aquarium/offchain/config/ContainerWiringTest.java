@@ -110,7 +110,7 @@ class ContainerWiringTest {
                 .withBean(AppConfig.LiquidationConfiguration.class, () ->
                         new AppConfig.LiquidationConfiguration(
                                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                                java.math.BigInteger.ZERO, 200, 30))
+                                java.math.BigInteger.ZERO, 200))
                 // ⚑ 2026-09-09: ConvertEconomics now takes the LiquidationConfiguration too — the
                 // convert margin was merged into the shared loans.liquidation.profit-margin-lovelace.
                 // Same lesson as the line above: the constructor grew and this runner is what says so.
@@ -119,7 +119,7 @@ class ContainerWiringTest {
                                 new AppConfig.ConvertConfiguration(),
                                 new AppConfig.LiquidationConfiguration(
                                         AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                                        java.math.BigInteger.ZERO, 200, 30),
+                                        java.math.BigInteger.ZERO, 200),
                                 network))
                 .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
                         () -> org.cardanofoundation.conversions.ClasspathConversionsFactory
@@ -241,7 +241,7 @@ class ContainerWiringTest {
                 .withBean(AppConfig.LiquidationConfiguration.class, () ->
                         new AppConfig.LiquidationConfiguration(
                                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                                java.math.BigInteger.ZERO, 200, 30))
+                                java.math.BigInteger.ZERO, 200))
                 // ⚑ 2026-09-09: ConvertEconomics now takes the LiquidationConfiguration too — the
                 // convert margin was merged into the shared loans.liquidation.profit-margin-lovelace.
                 // Same lesson as the line above: the constructor grew and this runner is what says so.
@@ -250,7 +250,7 @@ class ContainerWiringTest {
                                 new AppConfig.ConvertConfiguration(),
                                 new AppConfig.LiquidationConfiguration(
                                         AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                                        java.math.BigInteger.ZERO, 200, 30),
+                                        java.math.BigInteger.ZERO, 200),
                                 network))
                 .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
                         () -> org.cardanofoundation.conversions.ClasspathConversionsFactory

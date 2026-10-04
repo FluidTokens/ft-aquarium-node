@@ -509,7 +509,7 @@ class LiquidationExecutorTest {
     private static AppConfig.LiquidationConfiguration config(
             AppConfig.LiquidationConfiguration.Mode mode, BigInteger margin, int decisionLogSize) {
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, margin,
-                decisionLogSize, 30);
+                decisionLogSize);
         // The market gate defaults to DISABLED for every market (Giovanni's defensive-default
         // ruling). A pay-in-advance test must therefore name the market it operates in, exactly
         // as an operator must — an ample ada cap, so the gate is satisfied and never the thing
@@ -995,7 +995,7 @@ class LiquidationExecutorTest {
      */
     private static Wiring convertViaMinswapWiring(Transaction canned) {
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200);
         // markets left EMPTY: an unlisted market is action: CONVERT at the node's own mode.
 
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
@@ -2088,7 +2088,7 @@ class LiquidationExecutorTest {
         AppConfig.LiquidationConfiguration configuration = payInAdvance
                 ? shadow(SMALL_MARGIN)
                 : new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW, 60,
-                        120, 30, SMALL_MARGIN, 200, 30);
+                        120, 30, SMALL_MARGIN, 200);
         Scenario first = convertScenario(FAT_FEE_PER_MILLE);
         Scenario second = secondConvertScenario();
         List<Scenario> both = List.of(first, second);
@@ -2411,7 +2411,7 @@ class LiquidationExecutorTest {
     void aBuilderWindowNotModelledRefusalOnATokenPrincipalNeverAdvisesConvert() {
         var configuration = new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 600,
-                SMALL_MARGIN, 200, 30);
+                SMALL_MARGIN, 200);
         configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_500_000_000L)));
         Wiring wiring = tokenPrincipalConvertEconomicsWiring(configuration);
 
@@ -3575,7 +3575,7 @@ class LiquidationExecutorTest {
     @Test
     void aConvertUnavailableRefusalIsStillRecordedWithTheMinswapVariant() {
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200);
         // markets left EMPTY: an unlisted market is action: CONVERT at the node's own mode.
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
 
@@ -3684,7 +3684,7 @@ class LiquidationExecutorTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(30_000_000L))))
                 .referenceScriptHash("9ae63b26c98d90024a45f9cdb57e4154f72144d44325f0a261b8bc1d").build();
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200);
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
         List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO, refScriptUtxo,
                 convert.loan().utxo(), convert.bond().utxo());
@@ -3734,7 +3734,7 @@ class LiquidationExecutorTest {
     void theConvertRouteNominatesAWalletUtxoLargeEnoughForTheOrderNotMerelyTheFirstNominableOne() {
         Utxo tooSmall = LoanFixtures.adaUtxo("ab".repeat(32), 0, ACCOUNT.baseAddress(), 5_000_000L);
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200);
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
         List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, tooSmall, WALLET_UTXO,
                 convert.loan().utxo(), convert.bond().utxo());
@@ -3789,7 +3789,7 @@ class LiquidationExecutorTest {
     /** Wires a shadow executor whose convert router throws, sharing the fixtures of the tests above. */
     private static ConvertWiring convertWiringThrowing(RuntimeException toThrow) {
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200);
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
         List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
                 convert.loan().utxo(), convert.bond().utxo());

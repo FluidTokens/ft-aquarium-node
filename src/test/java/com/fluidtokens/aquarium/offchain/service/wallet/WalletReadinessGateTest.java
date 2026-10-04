@@ -97,7 +97,7 @@ class WalletReadinessGateTest {
     @Test
     void liquidationSkipsItsCycleUntilTheWalletIsReady() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200);
         var network = new AppConfig.Network();
         network.setNetworkForTest("preview");
         LiquidationCandidateScanner scanner = mock(LiquidationCandidateScanner.class);

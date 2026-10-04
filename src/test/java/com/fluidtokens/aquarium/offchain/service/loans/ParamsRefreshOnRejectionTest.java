@@ -61,7 +61,7 @@ class ParamsRefreshOnRejectionTest {
     @Test
     void theLiquidationExecutorsWiredSubmitterRefreshesOnAParamsRejection() throws Exception {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.valueOf(1_500_000), 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.valueOf(1_500_000), 200);
         @SuppressWarnings("unchecked")
         ObjectProvider<ConvertLiquidationRouter> convert = mock(ObjectProvider.class);
         @SuppressWarnings("unchecked")

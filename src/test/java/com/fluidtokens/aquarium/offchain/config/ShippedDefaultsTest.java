@@ -480,8 +480,7 @@ class ShippedDefaultsTest {
             // which is the opposite of "not the default setting but it must be possible".
             Map.entry("min-expected-profit-lovelace", "${AQUARIUM_LIQUIDATION_MIN_EXPECTED_PROFIT_LOVELACE:0}"),
             Map.entry("check-profitability", "${AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY:true}"),
-            Map.entry("decision-log-size", "${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}"),
-            Map.entry("quarantine-minutes", "${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}"));
+            Map.entry("decision-log-size", "${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}"));
 
     /**
      * ⚠ {@code mode} and {@code enabled} are pinned again here on purpose. They have their own tests

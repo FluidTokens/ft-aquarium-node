@@ -656,7 +656,7 @@ class PayInAdvanceLiquidationRouterTest {
     private static AppConfig.LiquidationConfiguration configuration() {
         AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60L, 120L, 30L,
-                BigInteger.valueOf(1_500_000L), 200, 30L);
+                BigInteger.valueOf(1_500_000L), 200);
         // The market gate defaults to DISABLED for every market (Giovanni's defensive-default
         // ruling). A pay-in-advance test must therefore name the market it operates in, exactly
         // as an operator must — an ample ada cap, so the gate is satisfied and never the thing

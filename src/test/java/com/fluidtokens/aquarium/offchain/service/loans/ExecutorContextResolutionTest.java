@@ -138,7 +138,7 @@ class ExecutorContextResolutionTest {
     @Test
     void aReferenceScriptMismatchClosesTheContainersSharedGate() {
         var claimOnly = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30,
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
                         new com.bloxbean.cardano.client.transaction.spec.TransactionInput("ab".repeat(32), 0),
                         null, null));

@@ -583,7 +583,7 @@ class LiquidationSubmitVetoTest {
     private static AppConfig.LiquidationConfiguration configuration(
             AppConfig.LiquidationConfiguration.Mode mode, BigInteger margin,
             LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
-        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, margin, 200, 30,
+        return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30, margin, 200,
                 referenceScripts);
     }
 
@@ -1141,7 +1141,7 @@ class LiquidationSubmitVetoTest {
                                                                   BigInteger expectedFloor) {
         return new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30,
-                BigInteger.ZERO, 200, 30, true, absoluteFloor, expectedFloor, PUBLISHED);
+                BigInteger.ZERO, 200, true, absoluteFloor, expectedFloor, PUBLISHED);
     }
 
     /** Far below anything this fixture can lose, so the floor is never the binding constraint. */

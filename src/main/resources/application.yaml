@@ -344,7 +344,6 @@ loans:
     # and leaves only the margin lever.
     check-profitability: ${AQUARIUM_LIQUIDATION_CHECK_PROFITABILITY:true}
     decision-log-size: ${AQUARIUM_LIQUIDATION_DECISION_LOG_SIZE:200}
-    quarantine-minutes: ${AQUARIUM_LIQUIDATION_QUARANTINE_MINUTES:30}
     # Published reference-script UTxOs, one `txHash#index` per validator a Liquidate invokes. Empty
     # means "not published" and that validator travels in the witness set instead.
     #

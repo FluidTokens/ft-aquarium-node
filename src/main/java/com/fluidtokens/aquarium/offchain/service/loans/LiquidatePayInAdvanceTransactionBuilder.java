@@ -72,7 +72,7 @@ import java.util.stream.Stream;
  * <ul>
  *   <li><b>Supplied</b> (the production wiring in {@code YaciConfig}) — it is set with
  *       {@code withTxEvaluator}, and {@code ignoreScriptCostEvaluationError(false)} turns a failed
- *       evaluation into a build failure the executor quarantines with its cause, instead of a
+ *       evaluation into a build failure the executor logs at ERROR with its cause, instead of a
  *       {@code log.warn} followed by a transaction that would burn collateral. Since T-051 there is
  *       exactly one assembly per build and it is always priced — the throwaway layout probe, which was
  *       deliberately unpriced, is gone.</li>
@@ -945,8 +945,8 @@ public final class LiquidatePayInAdvanceTransactionBuilder {
             return context.build();
         } catch (Exception e) {
             // An evaluator failure arrives here with the ScriptCostEvaluationException marker at the
-            // head of its cause chain; the executor's convert branch quarantines this candidate and
-            // logs the whole cause chain at ERROR, so the evaluator's own words ("Blockfrost is down",
+            // head of its cause chain; the executor records this candidate's failure and logs the
+            // whole cause chain at ERROR, so the evaluator's own words ("Blockfrost is down",
             // "costed 3 of 8 redeemers") reach the operator rather than a bare "Error while evaluating
             // script cost". See LiquidationExecutor's pay-in-advance catch.
             throw new IllegalStateException("cannot build the pay-in-advance transaction", e);

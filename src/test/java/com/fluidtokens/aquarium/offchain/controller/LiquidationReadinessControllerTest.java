@@ -356,7 +356,7 @@ class LiquidationReadinessControllerTest {
         var controller = new LiquidationReadinessController(provide(null), provide(null), provide(null),
                 provide(null), provide(null), provide(null), provide(null), provide(null),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+                        60, 120, 30, BigInteger.ZERO, 200), network);
         var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
         controller.setLendingConfigGate(gate);
 
@@ -412,7 +412,7 @@ class LiquidationReadinessControllerTest {
         var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
                 provide(null), provide(null), provide(null), provide(LoanFixtures.registry()), provide(null),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+                        60, 120, 30, BigInteger.ZERO, 200), network);
         var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
         controller.setLendingConfigGate(gate);
 
@@ -500,7 +500,7 @@ class LiquidationReadinessControllerTest {
         var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
                 provide(client), provide(null), provide(null), provide(LoanFixtures.registry()), provide(null),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+                        60, 120, 30, BigInteger.ZERO, 200), network);
         controller.setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
 
         var model = new org.springframework.ui.ConcurrentModel();
@@ -1016,7 +1016,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void aPlainBondIgnoresAnAnticipateMarketAndItsCap() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200);
         configuration.setMarkets(List.of(anticipateMarket("lovelace", 1)));
 
         LiquidationReadinessController.Row row = renderLiquidatableRow(
@@ -1030,7 +1030,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void aPlainBondInShadowWouldLiquidateWithoutActing() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200);
 
         LiquidationReadinessController.Row row = renderLiquidatableRow(
                 LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()),
@@ -1043,7 +1043,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void aLoanWithNoBondNeverActsOnAnAnticipateMarket() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200);
         configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
 
         LiquidationReadinessController.Row row = renderLiquidatableRow(
@@ -1070,7 +1070,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void anAdaCollateralConvertBondHasNoExecutableRoute() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200);
         configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
 
         LiquidationReadinessController.Row row = renderLiquidatableRow(
@@ -1452,7 +1452,7 @@ class LiquidationReadinessControllerTest {
     private static AppConfig.LiquidationConfiguration liveConfiguration() {
         return new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30,
-                BigInteger.ZERO, 200, 30);
+                BigInteger.ZERO, 200);
     }
 
     private static Rendered renderLiquidatable(
@@ -1576,7 +1576,7 @@ class LiquidationReadinessControllerTest {
         return new LiquidationReadinessController(provide(null), provide(null), provide(null),
                 provide(null), provide(null), provide(null), provide(null), provide(utxos),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), null);
+                        60, 120, 30, BigInteger.ZERO, 200), null);
     }
 
     private static com.fluidtokens.aquarium.offchain.service.BlockEventListener syncing(boolean syncing) {
@@ -1692,7 +1692,7 @@ class LiquidationReadinessControllerTest {
         var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
                 provide(null), provide(null), provide(null), provide(null), provide(utxos),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+                        60, 120, 30, BigInteger.ZERO, 200), network);
         controller.setBlockEventListener(syncing(false));
         var readiness = ready(false);
         controller.setWalletReadiness(readiness);
