@@ -427,7 +427,7 @@ class YaciConfigWiringTest {
         LiquidatePayInAdvanceTransactionBuilder builder = new YaciConfig().liquidatePayInAdvanceTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(),
                 utxoSupplier, protocolParamsSupplier, scriptSupplier,
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), offlineProbe());
 
         assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
                 "the pay-in-advance builder does not hold the injected (index-first) UtxoSupplier");
@@ -469,7 +469,7 @@ class YaciConfigWiringTest {
         ConvertTransactionBuilder builder = new YaciConfig().convertTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(),
                 utxoSupplier, protocolParamsSupplier, scriptSupplier,
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), offlineProbe());
 
         assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
                 "the convert builder does not hold the injected (index-first) UtxoSupplier");
@@ -668,6 +668,38 @@ class YaciConfigWiringTest {
             assertFalse(BackendService.class.isAssignableFrom(field.getType()),
                     "the probe declares a BackendService field (" + field.getName() + "): a submission path");
         }
+    }
+
+    /**
+     * ⛔ FAB-138 T3b: the pay-in-advance and convert builder beans PROBE their oracle out-refs too, with the
+     * very probe the container holds. Every test-built builder is unprobed by design, so this is the only
+     * thing that notices either bean losing its probe — and with it, a spent feed on those routes going back
+     * to surfacing as Blockfrost's empty {@code ScriptFailures}, which the executor reads as a spent WALLET
+     * input.
+     */
+    @Test
+    void thePayInAdvanceAndConvertBuilderBeansHoldTheProbeBean() throws Exception {
+        UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(List.of());
+        BFBackendService backend = mock(BFBackendService.class);
+        when(backend.getUtxoService()).thenReturn(mock(UtxoService.class));
+        YaciConfig config = new YaciConfig();
+        OracleReferenceInputProbe probe = config.oracleReferenceInputProbe(utxoSupplier, backend);
+
+        LiquidatePayInAdvanceTransactionBuilder payInAdvance = config.liquidatePayInAdvanceTransactionBuilder(
+                LoanFixtures.registry(), previewNetwork(), utxoSupplier, LoanFixtures.protocolParams(),
+                hash -> Optional.empty(), new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), probe);
+        ConvertTransactionBuilder convert = config.convertTransactionBuilder(
+                LoanFixtures.registry(), previewNetwork(), utxoSupplier, LoanFixtures.protocolParams(),
+                hash -> Optional.empty(), new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), probe);
+
+        assertNotNull(fieldOf(payInAdvance, "oracleReferenceInputProbe"),
+                "the production pay-in-advance builder carries NO oracle probe");
+        assertSame(probe, fieldOf(payInAdvance, "oracleReferenceInputProbe"),
+                "the pay-in-advance builder does not hold the probe the container injected");
+        assertNotNull(fieldOf(convert, "oracleReferenceInputProbe"),
+                "the production convert builder carries NO oracle probe");
+        assertSame(probe, fieldOf(convert, "oracleReferenceInputProbe"),
+                "the convert builder does not hold the probe the container injected");
     }
 
     private static Object fieldOf(Object target, String name) throws Exception {

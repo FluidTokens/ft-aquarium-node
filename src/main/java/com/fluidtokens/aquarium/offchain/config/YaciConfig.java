@@ -298,6 +298,12 @@ public class YaciConfig {
      * {@code getTxOutput} for reference inputs the index does not hold). The builder is handed no
      * {@code BFBackendService} — that would hand it a submission path through the back door; arming and
      * submission stay in {@code LiquidationExecutor} behind its two independent flags.
+     * <p>
+     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} bean, which asks Blockfrost —
+     * once per build, before either pass is evaluated — whether the collateral oracle's out-refs (feed and,
+     * for a Charli3 feed, provider) are still live: one or two more Blockfrost reads per build. That probe
+     * holds a read-only {@code UtxoService} and nothing that can submit, so the builder still gets no
+     * submission path.
      */
     @Bean
     public ConvertTransactionBuilder convertTransactionBuilder(LoansContractRegistry registry,
@@ -305,12 +311,14 @@ public class YaciConfig {
                                                                UtxoSupplier utxoSupplier,
                                                                ProtocolParamsSupplier protocolParamsSupplier,
                                                                ScriptSupplier scriptSupplier,
-                                                               BFBackendService bfBackendService) {
+                                                               BFBackendService bfBackendService,
+                                                               OracleReferenceInputProbe oracleReferenceInputProbe) {
         TransactionEvaluator scriptCostEvaluator =
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
         // The three injected suppliers and the evaluator lambda — never the BackendService itself.
         return new ConvertTransactionBuilder(registry, network.getCardanoNetwork(),
-                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator);
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator,
+                oracleReferenceInputProbe);
     }
 
     /**
@@ -367,6 +375,13 @@ public class YaciConfig {
      * {@code BFBackendService} and no {@code DefaultTransactionProcessor} — either would hand it a
      * submission path through the back door; arming and submission stay in {@code LiquidationExecutor}
      * behind its two independent flags.
+     * <p>
+     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} bean, which asks Blockfrost —
+     * once per build, before any evaluation — whether every oracle out-ref the build references is still
+     * live: the collateral leg's feed and Charli3 provider, and the principal leg's too when the principal
+     * is a token — one Blockfrost read per distinct out-ref, up to four per build. That probe holds a
+     * read-only {@code UtxoService} and nothing that can submit, so the builder still gets no submission
+     * path.
      */
     @Bean
     public LiquidatePayInAdvanceTransactionBuilder liquidatePayInAdvanceTransactionBuilder(
@@ -375,12 +390,14 @@ public class YaciConfig {
             UtxoSupplier utxoSupplier,
             ProtocolParamsSupplier protocolParamsSupplier,
             ScriptSupplier scriptSupplier,
-            BFBackendService bfBackendService) {
+            BFBackendService bfBackendService,
+            OracleReferenceInputProbe oracleReferenceInputProbe) {
         TransactionEvaluator scriptCostEvaluator =
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
         // The three injected suppliers and the evaluator lambda — never the BackendService itself.
         return new LiquidatePayInAdvanceTransactionBuilder(registry, network.getCardanoNetwork(),
-                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator);
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator,
+                oracleReferenceInputProbe);
     }
 
 }

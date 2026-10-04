@@ -200,14 +200,24 @@ public class ConvertTransactionBuilder {
      */
     private final ScriptSupplier scriptSupplier;
     private final TransactionEvaluator scriptCostEvaluator;
+    /**
+     * ⛔ FAB-138: asks Blockfrost, inside {@link #build} and before any evaluation, whether the collateral
+     * oracle's out-refs — its feed and, for a Charli3 feed, its provider — are still live; or {@code null}
+     * for the test-built builders, which are unprobed by design. Production's is {@code YaciConfig}'s bean,
+     * pinned by {@code YaciConfigWiringTest}. Without it a spent feed reaches Blockfrost's evaluation as an
+     * empty {@code ScriptFailures}, which the executor reads as a spent WALLET input
+     * ({@code ccl-transaction-building-traps} §13). Mirrors the field of the same name in
+     * {@link LiquidateTransactionBuilder} and {@link LiquidatePayInAdvanceTransactionBuilder}.
+     */
+    private final OracleReferenceInputProbe oracleReferenceInputProbe;
 
-    /** Offline: a rig supplies the scripts and evaluates for itself. */
+    /** Offline: a rig supplies the scripts and evaluates for itself. Unprobed: tests only. */
     public ConvertTransactionBuilder(LoansContractRegistry registry, Network network,
                                      UtxoSupplier utxoSupplier,
                                      ProtocolParamsSupplier protocolParamsSupplier,
                                      TransactionEvaluator scriptCostEvaluator) {
         this(registry, network, (ScriptSupplier) null, utxoSupplier, protocolParamsSupplier,
-                scriptCostEvaluator);
+                scriptCostEvaluator, null);
     }
 
     /**
@@ -216,22 +226,38 @@ public class ConvertTransactionBuilder {
      * the per-epoch {@link ProtocolParamsSupplier}, a {@link ScriptSupplier} that serves verified script
      * bytes, and Blockfrost's {@code /utils/txs/evaluate} narrowed to a {@link TransactionEvaluator}.
      * Nothing here is a {@code BackendService}; see the {@link #scriptSupplier} field.
+     * Unprobed: tests only — production goes through the constructor that also takes the oracle probe.
      */
     public ConvertTransactionBuilder(LoansContractRegistry registry, Network network,
                                      UtxoSupplier utxoSupplier,
                                      ProtocolParamsSupplier protocolParamsSupplier,
                                      ScriptSupplier scriptSupplier,
                                      TransactionEvaluator scriptCostEvaluator) {
-        this(registry, network, Objects.requireNonNull(scriptSupplier, "scriptSupplier"), utxoSupplier,
-                protocolParamsSupplier, scriptCostEvaluator);
+        this(registry, network, utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator, null);
     }
 
-    /** Both public constructors land here; {@code scriptSupplier} is null only on the offline path. */
+    /**
+     * ⛔ The production constructor (FAB-138), the one {@code YaciConfig} calls: as the one above, plus the
+     * {@link OracleReferenceInputProbe} every {@link #build} runs before evaluation. The probe holds a
+     * read-only {@code UtxoService}, so this builder still holds nothing that could submit.
+     */
+    public ConvertTransactionBuilder(LoansContractRegistry registry, Network network,
+                                     UtxoSupplier utxoSupplier,
+                                     ProtocolParamsSupplier protocolParamsSupplier,
+                                     ScriptSupplier scriptSupplier,
+                                     TransactionEvaluator scriptCostEvaluator,
+                                     OracleReferenceInputProbe oracleReferenceInputProbe) {
+        this(registry, network, Objects.requireNonNull(scriptSupplier, "scriptSupplier"), utxoSupplier,
+                protocolParamsSupplier, scriptCostEvaluator, oracleReferenceInputProbe);
+    }
+
+    /** Every public constructor lands here; {@code scriptSupplier} is null only on the offline path. */
     private ConvertTransactionBuilder(LoansContractRegistry registry, Network network,
                                       ScriptSupplier scriptSupplier,
                                       UtxoSupplier utxoSupplier,
                                       ProtocolParamsSupplier protocolParamsSupplier,
-                                      TransactionEvaluator scriptCostEvaluator) {
+                                      TransactionEvaluator scriptCostEvaluator,
+                                      OracleReferenceInputProbe oracleReferenceInputProbe) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.network = Objects.requireNonNull(network, "network");
         this.utxoSupplier = Objects.requireNonNull(utxoSupplier, "utxoSupplier");
@@ -242,6 +268,7 @@ public class ConvertTransactionBuilder {
         this.scriptCostEvaluator = Objects.requireNonNull(scriptCostEvaluator,
                 "a convert builder without a TransactionEvaluator would ship placeholder ex-units and "
                         + "fail in phase 2 — CCL trap 8. There is no constructor without one.");
+        this.oracleReferenceInputProbe = oracleReferenceInputProbe;
     }
 
     // ---- the one entry point --------------------------------------------------------------------
@@ -267,6 +294,15 @@ public class ConvertTransactionBuilder {
                             + "receipt NFT in the equity output that this builder does not mint");
         }
 
+        // ⛔ FAB-138: the collateral oracle's out-refs (its feed and, for a Charli3 feed, its provider) must
+        // still be LIVE — asked once per build, here, after the refusals above and before either pass below:
+        // pass 1 (the layout probe) and pass 2 share this one answer. Spent, wrong NFT or a provider error
+        // throws OracleReferenceInputNotLiveException, which the executor records REFUSED and logs at ERROR
+        // every cycle. After evaluation it would be too late: a spent feed comes back from Blockfrost as an
+        // empty ScriptFailures, which the executor reads as a spent WALLET input (CCL trap 13).
+        if (oracleReferenceInputProbe != null) {
+            oracleReferenceInputProbe.requireLive(List.of(request.collateralOracle()));
+        }
         List<TransactionInput> refInputs = referenceInputs(request);
         long configRefIndex = indexOf(refInputs, inputOf(request.configUtxo()), "main config");
         // ⛔ The LM config, not the main one: lender_manager.withdraw resolves the ACTION script from
