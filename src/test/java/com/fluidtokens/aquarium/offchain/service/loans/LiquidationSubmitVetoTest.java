@@ -2048,6 +2048,84 @@ class LiquidationSubmitVetoTest {
         assertTrue(second.contains(large), "and nominated the remaining one instead: " + second);
     }
 
+    /** Two ada candidates in one armed cycle against {@code submitter}; returns the log events. */
+    private static List<ILoggingEvent> twoArmedCandidates(RecordingSubmitter submitter) {
+        AppConfig.LiquidationConfiguration configuration = armed();
+        LiquidationExecutor executor = armedExecutor(List.of(adaScenario(), secondAdaScenario()),
+                List.of(WALLET_UTXO, WALLET_UTXO_SMALL), new LiquidationDecisionLog(configuration), submitter);
+        executor.setSubmitClock(() -> NOW);
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            executor.cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+        assertEquals(2, submitter.submitted.size(), "both candidates reached the wire: " + appender.list);
+        return appender.list;
+    }
+
+    /**
+     * FAB-134 NQ r2 (THROWN). A submission that THROWS may have gone out — a connection reset arrives
+     * after the bytes as readily as before — so its inputs are treated as spent exactly like a
+     * SUBMITTED one's, and the second candidate is built on the other wallet utxo.
+     */
+    @Test
+    void aThrownSubmissionsWalletInputIsNotNominatedAgainInTheSameCycle() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.throwing(new IllegalStateException("connection reset"));
+
+        twoArmedCandidates(submitter);
+
+        TransactionInput small = new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0);
+        assertTrue(inputsOf(submitter.submitted.get(0)).contains(small),
+                "the fee-only selector nominates the smaller utxo first");
+        List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
+        assertFalse(second.contains(small),
+                "the second candidate reused an input of a transmission whose outcome is unknown: " + second);
+        assertTrue(second.contains(new TransactionInput(TX_WALLET, 0)), second.toString());
+    }
+
+    /**
+     * FAB-134 NQ r2 (REJ). A DEFINITE rejection transmitted nothing, so its inputs are not dropped as
+     * spent — unless the ledger says one of them already is. A {@code BadInputsUTxO} rejection drops
+     * the nominated wallet utxo for the rest of the cycle, and says so at WARN.
+     */
+    @Test
+    void aBadInputsRejectionDropsTheNominatedWalletUtxoForTheRestOfTheCycle() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.rejecting(
+                "ConwayUtxowFailure (UtxoFailure (BadInputsUTxO (fromList [TxIn ...])))");
+
+        List<ILoggingEvent> events = twoArmedCandidates(submitter);
+
+        TransactionInput small = new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0);
+        assertTrue(inputsOf(submitter.submitted.get(0)).contains(small),
+                "the fee-only selector nominates the smaller utxo first");
+        List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
+        assertFalse(second.contains(small),
+                "the second candidate nominated the utxo the ledger had just called spent: " + second);
+        assertTrue(second.contains(new TransactionInput(TX_WALLET, 0)), second.toString());
+        assertEquals(1, events.stream()
+                        .filter(event -> event.getLevel() == Level.WARN)
+                        .filter(event -> event.getFormattedMessage().equals("dropped wallet utxo "
+                                + WALLET_UTXO_SMALL.getTxHash() + "#0 from this cycle: BadInputsUTxO"))
+                        .count(),
+                "the drop is logged at WARN naming the utxo and the marker: " + events);
+    }
+
+    /** And an ordinary rejection keeps the input: nothing said it was spent, and nothing went out. */
+    @Test
+    void anOrdinaryRejectionLeavesTheWalletInputNominable() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
+
+        twoArmedCandidates(submitter);
+
+        assertTrue(inputsOf(submitter.submitted.get(1))
+                        .contains(new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0)),
+                "a rejection that names no spent input must not cost the cycle a wallet utxo");
+    }
+
     // ======================================================================================
     // the shipped defaults
     // ======================================================================================

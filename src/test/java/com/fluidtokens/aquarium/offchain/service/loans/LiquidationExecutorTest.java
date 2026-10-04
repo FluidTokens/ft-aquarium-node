@@ -34,6 +34,8 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 
@@ -1992,6 +1994,136 @@ class LiquidationExecutorTest {
                 "the second candidate must not nominate the utxo the first one's evaluation named spent");
     }
 
+    /**
+     * FAB-134 NQ r2 (RC). The plain route's OTHER spent-input site: the builder wraps Blockfrost's
+     * empty-failures evaluation as {@code RefusedException(SCRIPT_COST_EVALUATION_FAILED, cause)} —
+     * a refusal WITH a cause, which takes its own branch rather than the machinery catch. That exact
+     * shape must drop the nominated wallet utxo too.
+     */
+    @Test
+    void aScriptCostEvaluationRefusalWithEmptyScriptFailuresDropsTheNominatedWalletUtxo() {
+        var result = twoCandidatesFirstFailing(new LiquidateTransactionBuilder.RefusedException(
+                LiquidateTransactionBuilder.Refusal.SCRIPT_COST_EVALUATION_FAILED,
+                "script cost evaluation failed",
+                new IllegalStateException("evaluate rejected",
+                        new RuntimeException("{\"ScriptFailures\":{}}"))));
+
+        assertEquals(WALLET_UTXO_SMALL, result.getKey().get(0));
+        assertEquals(WALLET_UTXO, result.getKey().get(1),
+                "the second candidate nominated the utxo the first one's evaluation named spent");
+        assertTrue(result.getValue().stream().anyMatch(event -> event.getLevel() == Level.WARN
+                        && event.getFormattedMessage().equals("dropped wallet utxo " + TX_WALLET_SMALL
+                        + "#0 from this cycle: \"ScriptFailures\":{}")),
+                "the drop is logged naming the marker: " + result.getValue());
+    }
+
+    /** {@link #convertScenario(BigInteger)} again, under other refs and another loan id. */
+    private static Scenario secondConvertScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN_2, 0, LOAN_ID_2, datum,
+                COLLATERAL_LOVELACE, List.of());
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND_2, 0, LOAN_ID_2,
+                LoanFixtures.convertToPrincipalBondDatum(FAT_FEE_PER_MILLE,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
+                2_000_000L);
+        return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.unit(), OraclePriceFeed.unit(), VALID_FROM));
+    }
+
+    /** The first failure a {@link NominatingPayInAdvanceRouter} / {@link NominatingConvertRouter} throws. */
+    private static RuntimeException badInputs() {
+        return new IllegalStateException("cannot build the pay-in-advance transaction",
+                new RuntimeException("ConwayUtxoFailure (BadInputsUTxO (fromList [TxIn ...]))"));
+    }
+
+    /** Applies the executor's selector for a 4 ADA payout, records the choice, then fails the build. */
+    private static final class NominatingPayInAdvanceRouter extends PayInAdvanceLiquidationRouter {
+        final List<Utxo> nominated = new ArrayList<>();
+        NominatingPayInAdvanceRouter(AppConfig.LiquidationConfiguration configuration, List<Utxo> universe) {
+            super(LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                    new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                            LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+        }
+        @Override
+        Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo, Utxo bondUtxo,
+                                            Utxo configUtxo, Utxo lmConfigUtxo,
+                                            Map<String, OracleEntry> oraclesByUnit, BigInteger principalBalance,
+                                            Function<BigInteger, Optional<Utxo>> walletSelector,
+                                            long validFromMillis, long validToMillis) {
+            nominated.add(walletSelector.apply(BigInteger.valueOf(4_000_000L)).orElse(null));
+            throw nominated.size() == 1 ? badInputs() : new IllegalStateException("second build, irrelevant");
+        }
+    }
+
+    /** The convert route's twin of {@link NominatingPayInAdvanceRouter}. */
+    private static final class NominatingConvertRouter extends ConvertLiquidationRouter {
+        final List<Utxo> nominated = new ArrayList<>();
+        NominatingConvertRouter() {
+            super(null, null, null, null, null, null, null, null);
+        }
+        @Override
+        public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
+                                                    Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
+                                                    Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Map<String, OracleEntry> oracles,
+                                                    String changeAddress, long validFromMillis, long validToMillis) {
+            nominated.add(walletSelector.apply(BigInteger.valueOf(4_000_000L)).orElse(null));
+            throw nominated.size() == 1 ? badInputs() : new IllegalStateException("second build, irrelevant");
+        }
+    }
+
+    /**
+     * FAB-134 NQ r2 (PIA, convert). The two convert-bond routes' machinery catches carry the same
+     * spent-input drop as the plain one: two convert-bond candidates in one cycle, the first build
+     * failing with {@code BadInputsUTxO} after nominating the smaller wallet utxo — the second must
+     * nominate the other. The route is chosen by the ada market's action: ANTICIPATE (listed) routes to
+     * pay-in-advance, an unlisted market converts.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"PAY_IN_ADVANCE", "CONVERT"})
+    void aBadInputsMachineryFailureOnAConvertBondRouteDropsTheNominatedWalletUtxo(String route) {
+        boolean payInAdvance = route.equals("PAY_IN_ADVANCE");
+        AppConfig.LiquidationConfiguration configuration = payInAdvance
+                ? shadow(SMALL_MARGIN)
+                : new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW, 60,
+                        120, 30, SMALL_MARGIN, 200, 30);
+        Scenario first = convertScenario(FAT_FEE_PER_MILLE);
+        Scenario second = secondConvertScenario();
+        List<Scenario> both = List.of(first, second);
+        List<Utxo> wallet = List.of(WALLET_UTXO, WALLET_UTXO_SMALL);
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
+        universe.addAll(wallet);
+        both.forEach(scenario -> {
+            universe.add(scenario.loan().utxo());
+            universe.add(scenario.bond().utxo());
+        });
+        LiquidateTransactionBuilder plainBuilder = mock(LiquidateTransactionBuilder.class);
+        when(plainBuilder.build(any(LiquidateTransactionBuilder.Request.class)))
+                .thenThrow(new AssertionError("a convert-bond candidate reached the plain builder"));
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        NominatingPayInAdvanceRouter payInAdvanceRouter = new NominatingPayInAdvanceRouter(configuration, universe);
+        NominatingConvertRouter convertRouter = new NominatingConvertRouter();
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(wallet), ACCOUNT,
+                new FakeScanner(List.of(first.assessment(), second.assessment())),
+                new FakeResolver(allUnspent(both)), plainBuilder, payInAdvanceRouter, convertRouter,
+                LoanFixtures.registry(), new LiquidationDecisionLog(configuration), metrics(), noOracle(),
+                previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
+
+        executor.cycle(NOW);
+
+        List<Utxo> nominated = payInAdvance ? payInAdvanceRouter.nominated : convertRouter.nominated;
+        assertTrue((payInAdvance ? convertRouter.nominated : payInAdvanceRouter.nominated).isEmpty(),
+                "the candidates took the other route");
+        assertEquals(2, nominated.size(), "both candidates reached the " + route + " router");
+        assertEquals(WALLET_UTXO_SMALL, nominated.get(0), "the sized selector prefers the smaller");
+        assertEquals(WALLET_UTXO, nominated.get(1),
+                "the second candidate nominated the wallet utxo the first one's failure named as spent");
+    }
+
     /** And an ordinary failure drops nothing: the second candidate may reuse the same input. */
     @Test
     void anOrdinaryFailureLeavesTheWalletListAlone() {
@@ -2067,7 +2199,7 @@ class LiquidationExecutorTest {
      * depth for the router's own precondition rather than a scenario the loan/oracle data produces.
      */
     @Test
-    void aNegativeEquityAssessmentIsRefusedNotQuarantined() {
+    void aNegativeEquityAssessmentIsRefusedAsAVerdictNotAMachineryFailure() {
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
         assertTrue(convert.bond().bond().datum().shouldLiquidationConvertToPrincipal(),
                 "the fixture must be a convert bond, or the executor would not route it");
@@ -2432,7 +2564,7 @@ class LiquidationExecutorTest {
     @Test
     void aPayInAdvanceNotModelledRefusalLogsAtInfoNamingThePrincipalAsset() {
         // F0 (round 2) — a genuinely negative equity, overridden directly on the assessment (defence
-        // in depth for the router's precondition; see aNegativeEquityAssessmentIsRefusedNotQuarantined
+        // in depth for the router's precondition; see aNegativeEquityAssessmentIsRefusedAsAVerdictNotAMachineryFailure
         // for why the ada/ada fixture's naturally-zero equity no longer refuses at all).
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
         LiquidationAssessment negativeEquity = LiquidationAssessment.buildable(
