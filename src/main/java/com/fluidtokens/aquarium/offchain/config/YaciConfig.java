@@ -12,6 +12,7 @@ import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.StaticReferenceInputs;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics;
@@ -73,9 +74,12 @@ public class YaciConfig {
      *       {@link TankUtxoStorage#indexedPaymentCredentials()} watches; any other address is refused,
      *       and an empty answer is never topped up from Blockfrost.</li>
      *   <li>One output by out-ref comes from the index when it holds the row with a faithful
-     *       reference-script hash, and otherwise from Blockfrost's {@code UtxoService} — one direct read
-     *       per miss, nothing cached. That covers the reference inputs this node does not index (oracle
-     *       feeds and scripts, FluidTokens-published reference scripts).</li>
+     *       reference-script hash, and otherwise from Blockfrost's {@code UtxoService}. That covers the
+     *       reference inputs this node does not index (oracle feeds, scripts and Charli3 providers,
+     *       FluidTokens-published reference scripts, the tank reference input). FAB-134 B5b: a miss whose
+     *       out-ref is in {@link StaticReferenceInputs#current()} is read ONCE and then held by out-ref
+     *       (an output's content never changes; liveness is the ledger's to judge); any other miss is one
+     *       direct read, not held.</li>
      * </ul>
      * <p>
      * Deliberately narrower than handing a builder a {@code BackendService}: a supplier can answer
@@ -86,9 +90,10 @@ public class YaciConfig {
     @Bean
     public UtxoSupplier utxoSupplier(UtxoRepository utxoRepository,
                                      TankUtxoStorage tankUtxoStorage,
-                                     BFBackendService bfBackendService) {
+                                     BFBackendService bfBackendService,
+                                     StaticReferenceInputs staticReferenceInputs) {
         return new IndexFirstUtxoSupplier(utxoRepository, tankUtxoStorage::indexedPaymentCredentials,
-                new DefaultUtxoSupplier(bfBackendService.getUtxoService()));
+                new DefaultUtxoSupplier(bfBackendService.getUtxoService()), staticReferenceInputs::current);
     }
 
     /**

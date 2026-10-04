@@ -320,7 +320,10 @@ class YaciConfigWiringTest {
      * ⛔ FAB-134 B3a: the {@code UtxoSupplier} bean is the INDEX-FIRST supplier, built from the
      * production collaborators. Coin selection ({@code getAll}) must never reach Blockfrost's
      * {@code UtxoService}; an out-ref the index does not hold ({@code getTxOutput} miss) must reach it,
-     * once. Reverting the bean to {@code new DefaultUtxoSupplier(...)} turns this red.
+     * on every call. Reverting the bean to {@code new DefaultUtxoSupplier(...)} turns this red.
+     * <p>FAB-134 B5b: and a miss that is a STATIC reference input (the {@code StaticReferenceInputs} bean)
+     * reaches it once and is then held by out-ref — a bean wired without the static set would read it
+     * three times.
      */
     @Test
     void theUtxoSupplierBeanIsIndexFirstAndOnlyAMissReachesBlockfrost() throws Exception {
@@ -344,7 +347,18 @@ class YaciConfigWiringTest {
                     default -> throw new UnsupportedOperationException(method.getName());
                 });
 
-        UtxoSupplier bean = new YaciConfig().utxoSupplier(repo, storage, bf);
+        // FAB-134 B5b: the static-reference-input source, read on each miss.
+        String staticTx = "ef".repeat(32);
+        Utxo staticFromBlockfrost = Utxo.builder().txHash(staticTx).outputIndex(1).address("blockfrost").build();
+        when(utxoService.getTxOutput(staticTx, 1))
+                .thenReturn(Result.<Utxo>success("ok").withValue(staticFromBlockfrost));
+        com.fluidtokens.aquarium.offchain.service.StaticReferenceInputs staticReferenceInputs =
+                mock(com.fluidtokens.aquarium.offchain.service.StaticReferenceInputs.class);
+        when(staticReferenceInputs.current()).thenReturn(Set.of(
+                com.bloxbean.cardano.client.transaction.spec.TransactionInput.builder()
+                        .transactionId(staticTx).index(1).build()));
+
+        UtxoSupplier bean = new YaciConfig().utxoSupplier(repo, storage, bf, staticReferenceInputs);
 
         assertInstanceOf(IndexFirstUtxoSupplier.class, bean,
                 "YaciConfig's UtxoSupplier bean is a " + bean.getClass().getName()
@@ -353,7 +367,14 @@ class YaciConfigWiringTest {
         verifyNoInteractions(utxoService);
 
         assertEquals("blockfrost", bean.getTxOutput(missTx, 4).orElseThrow().getAddress());
-        verify(utxoService, times(1)).getTxOutput(missTx, 4);
+        assertEquals("blockfrost", bean.getTxOutput(missTx, 4).orElseThrow().getAddress());
+        verify(utxoService, times(2)).getTxOutput(missTx, 4);
+
+        // ⛔ The bean is wired with the static set: a static reference input reaches Blockfrost ONCE.
+        assertEquals("blockfrost", bean.getTxOutput(staticTx, 1).orElseThrow().getAddress());
+        assertEquals("blockfrost", bean.getTxOutput(staticTx, 1).orElseThrow().getAddress());
+        assertEquals("blockfrost", bean.getTxOutput(staticTx, 1).orElseThrow().getAddress());
+        verify(utxoService, times(1)).getTxOutput(staticTx, 1);
     }
 
     /**

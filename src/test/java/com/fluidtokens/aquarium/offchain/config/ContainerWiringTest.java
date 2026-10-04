@@ -129,7 +129,10 @@ class ContainerWiringTest {
                 .withBean(com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class,
                         ContainerWiringTest::indexRepository)
                 .withBean(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class,
-                        () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class));
+                        () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class))
+                // ⚑ FAB-134 B5b: and the static-reference-input set it may hold by out-ref — a @Component
+                // whose sources are all optional, so it is the real class, built by the container.
+                .withBean(com.fluidtokens.aquarium.offchain.service.StaticReferenceInputs.class);
     }
 
     /** A Yaci repository stub: the container only needs it to exist; nothing here queries it. */
@@ -258,6 +261,9 @@ class ContainerWiringTest {
                         ContainerWiringTest::indexRepository)
                 .withBean(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class,
                         () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class))
+                // ⚑ FAB-134 B5b: and the static-reference-input set it may hold by out-ref — a @Component
+                // whose sources are all optional, so it is the real class, built by the container.
+                .withBean(com.fluidtokens.aquarium.offchain.service.StaticReferenceInputs.class)
                 .run(ctx -> {
                     assertNull(ctx.getStartupFailure(),
                             () -> "a bare install — no flag, no coordinates — must START. There is no "

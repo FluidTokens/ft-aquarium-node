@@ -6,6 +6,7 @@ import com.bloxbean.cardano.client.api.common.OrderEnum;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.bloxbean.cardano.yaci.store.common.domain.Amt;
 import com.bloxbean.cardano.yaci.store.common.util.ScriptReferenceUtil;
@@ -28,7 +29,9 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -51,6 +54,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>(e) a memoised provider answer;</li>
  *   <li>(f) the {@code UtxoUtil} "hash unresolved" sentinel handed to CCL as if it were a hash;</li>
  *   <li>(g) a database failure turned into an empty answer or a provider call.</li>
+ * </ul>
+ *
+ * <h2>FAB-134 B5b — the hold of static reference inputs, by out-ref</h2>
+ * <ul>
+ *   <li>(4a) a static out-ref the index misses reaches the provider ONCE, then is served from the hold;</li>
+ *   <li>(4b) a miss that is NOT static is never held (mutant H1: hold every provider answer);</li>
+ *   <li>(4c) the index always wins — a hit never fills the hold, and a row the index gains later is
+ *       served over a held answer (mutant H3: consult the hold before the index);</li>
+ *   <li>(4d) an absent provider answer is never held (mutant H2);</li>
+ *   <li>(4e) an out-ref that leaves the static set is evicted (mutant H4: never prune);</li>
+ *   <li>(4f) coin selection never sees a held UTxO (mutant H6: {@code getAll} merges held entries) —
+ *       a held reference-script UTxO in coin selection is CCL trap 9b.</li>
  * </ul>
  */
 class IndexFirstUtxoSupplierTest {
@@ -138,7 +153,16 @@ class IndexFirstUtxoSupplierTest {
     }
 
     private static IndexFirstUtxoSupplier supplier(UtxoRepository repo, UtxoSupplier provider) {
-        return new IndexFirstUtxoSupplier(repo, () -> Set.of(WALLET_PKH), provider);
+        return supplier(repo, provider, Set::of);
+    }
+
+    private static IndexFirstUtxoSupplier supplier(UtxoRepository repo, UtxoSupplier provider,
+                                                   Supplier<Set<TransactionInput>> staticReferenceInputs) {
+        return new IndexFirstUtxoSupplier(repo, () -> Set.of(WALLET_PKH), provider, staticReferenceInputs);
+    }
+
+    private static TransactionInput outRef(String txHash, int index) {
+        return TransactionInput.builder().transactionId(txHash).index(index).build();
     }
 
     private static AddressUtxoEntity row(String txHash, int outputIndex, String ownerAddr, long lovelace) {
@@ -270,7 +294,7 @@ class IndexFirstUtxoSupplierTest {
 
     // ------------------------------------------------------------------ (e)
 
-    /** ⛔ A miss goes to the provider — every time. Nothing is cached in this slice. */
+    /** ⛔ A miss of an out-ref that is not a static reference input goes to the provider — every time. */
     @Test
     void aTxOutputMissIsTheProvidersAnswerAndIsNeverMemoised() {
         var provider = new CountingProvider();
@@ -356,5 +380,161 @@ class IndexFirstUtxoSupplierTest {
         assertSame(failure, assertThrows(DataAccessResourceFailureException.class,
                 () -> supplier.getTxOutput(TX_A, 0)));
         assertEquals(0, provider.calls(), "a database failure must not become a provider call");
+    }
+
+    // ------------------------------------------------------------------ B5b: the hold
+
+    /** A provider whose answer can be switched between present and absent, counting every call. */
+    static final class SwitchableProvider implements UtxoSupplier {
+        final AtomicInteger pageCalls = new AtomicInteger();
+        final AtomicInteger txOutputCalls = new AtomicInteger();
+        volatile boolean present = true;
+        volatile String address = "provider";
+
+        @Override
+        public List<Utxo> getPage(String address, Integer nrOfItems, Integer page, OrderEnum order) {
+            pageCalls.incrementAndGet();
+            return List.of();
+        }
+
+        @Override
+        public Optional<Utxo> getTxOutput(String txHash, int outputIndex) {
+            txOutputCalls.incrementAndGet();
+            return present
+                    ? Optional.of(Utxo.builder().txHash(txHash).outputIndex(outputIndex).address(address)
+                            .amount(List.of(Amount.lovelace(BigInteger.valueOf(1_234_567L)))).build())
+                    : Optional.empty();
+        }
+    }
+
+    /** An index whose single by-id row can be added and removed while the supplier is live. */
+    private static UtxoRepository mutableIdIndex(AtomicReference<AddressUtxoEntity> row) {
+        return index(addr -> Optional.of(List.of()),
+                id -> Optional.ofNullable(row.get())
+                        .filter(r -> r.getTxHash().equals(id.getTxHash())
+                                && r.getOutputIndex().equals(id.getOutputIndex())),
+                new AtomicInteger());
+    }
+
+    /** (4a) ⛔ A static reference input reaches the provider once per process, then comes from the hold. */
+    @Test
+    void aStaticOutRefMissReadsTheProviderOnceAndIsHeldAfterThat() {
+        var provider = new SwitchableProvider();
+        var supplier = supplier(idIndex(row(TX_A, 0, WALLET.baseAddress(), 1L)), provider,
+                () -> Set.of(outRef(TX_B, 3)));
+
+        Utxo first = supplier.getTxOutput(TX_B, 3).orElseThrow();
+        assertEquals("provider", first.getAddress());
+        assertEquals(1, provider.txOutputCalls.get());
+
+        for (int i = 0; i < 5; i++) {
+            Utxo again = supplier.getTxOutput(TX_B, 3).orElseThrow();
+            assertEquals(TX_B, again.getTxHash());
+            assertEquals(3, again.getOutputIndex());
+            assertEquals("provider", again.getAddress());
+        }
+        assertEquals(1, provider.txOutputCalls.get(),
+                "a static reference input must reach the provider ONCE: its content at an out-ref is immutable");
+    }
+
+    /** (4b) ⛔ Only static out-refs are held: any other miss is a plain provider read, every time. */
+    @Test
+    void aNonStaticMissIsReadFromTheProviderEveryTimeEvenBesideAStaticSet() {
+        var provider = new SwitchableProvider();
+        var supplier = supplier(idIndex(row(TX_A, 0, WALLET.baseAddress(), 1L)), provider,
+                () -> Set.of(outRef(TX_B, 3)));
+
+        for (int i = 1; i <= 3; i++) {
+            supplier.getTxOutput(TX_B, 4).orElseThrow();
+            assertEquals(i, provider.txOutputCalls.get(),
+                    "a miss that is not a static reference input must never be held (call " + i + ")");
+        }
+    }
+
+    /** (4c) ⛔ An index hit for a static out-ref never reaches the provider and never fills the hold. */
+    @Test
+    void anIndexHitForAStaticOutRefNeverReadsTheProviderAndNeverFillsTheHold() {
+        var provider = new SwitchableProvider();
+        var indexed = new AtomicReference<>(row(TX_B, 3, WALLET.baseAddress(), 7L));
+        var supplier = supplier(mutableIdIndex(indexed), provider, () -> Set.of(outRef(TX_B, 3)));
+
+        for (int i = 0; i < 3; i++) {
+            assertEquals(WALLET.baseAddress(), supplier.getTxOutput(TX_B, 3).orElseThrow().getAddress(),
+                    "an index hit is the index row");
+        }
+        assertEquals(0, provider.txOutputCalls.get(), "an index hit must never reach the provider");
+
+        indexed.set(null);   // the row leaves the index: if a hit had filled the hold, nothing would ask
+        assertEquals("provider", supplier.getTxOutput(TX_B, 3).orElseThrow().getAddress());
+        assertEquals(1, provider.txOutputCalls.get(), "an index hit must never fill the hold");
+    }
+
+    /** (4c) ⛔ The index always wins, even over an out-ref already held. */
+    @Test
+    void theIndexWinsOverAHeldAnswer() {
+        var provider = new SwitchableProvider();
+        var indexed = new AtomicReference<AddressUtxoEntity>();
+        var supplier = supplier(mutableIdIndex(indexed), provider, () -> Set.of(outRef(TX_B, 3)));
+
+        assertEquals("provider", supplier.getTxOutput(TX_B, 3).orElseThrow().getAddress());
+        indexed.set(row(TX_B, 3, WALLET.baseAddress(), 7L));
+
+        assertEquals(WALLET.baseAddress(), supplier.getTxOutput(TX_B, 3).orElseThrow().getAddress(),
+                "the index row must be served over a held answer: the index always wins");
+    }
+
+    /** (4d) ⛔ An absent answer is never held: the next call asks again, and a later answer is held. */
+    @Test
+    void anAbsentProviderAnswerIsNeverHeld() {
+        var provider = new SwitchableProvider();
+        provider.present = false;
+        var supplier = supplier(idIndex(row(TX_A, 0, WALLET.baseAddress(), 1L)), provider,
+                () -> Set.of(outRef(TX_B, 3)));
+
+        assertTrue(supplier.getTxOutput(TX_B, 3).isEmpty());
+        assertTrue(supplier.getTxOutput(TX_B, 3).isEmpty());
+        assertEquals(2, provider.txOutputCalls.get(), "an absent answer must never be held: ask again");
+
+        provider.present = true;
+        assertTrue(supplier.getTxOutput(TX_B, 3).isPresent());
+        assertTrue(supplier.getTxOutput(TX_B, 3).isPresent());
+        assertEquals(3, provider.txOutputCalls.get(), "once present, the answer is held");
+    }
+
+    /** (4e) ⛔ An out-ref that leaves the static set is dropped; re-entering, it is read again. */
+    @Test
+    void anOutRefThatLeavesTheStaticSetIsEvicted() {
+        var provider = new SwitchableProvider();
+        var staticSet = new AtomicReference<Set<TransactionInput>>(Set.of(outRef(TX_B, 3)));
+        var supplier = supplier(idIndex(row(TX_A, 0, WALLET.baseAddress(), 1L)), provider, staticSet::get);
+
+        supplier.getTxOutput(TX_B, 3).orElseThrow();
+        supplier.getTxOutput(TX_B, 3).orElseThrow();
+        assertEquals(1, provider.txOutputCalls.get());
+
+        staticSet.set(Set.of(outRef(TX_B, 5)));      // the registry moved the feed: TX_B#3 left the set
+        supplier.getTxOutput(TX_B, 5).orElseThrow(); // any miss prunes
+        assertEquals(2, provider.txOutputCalls.get());
+
+        staticSet.set(Set.of(outRef(TX_B, 3), outRef(TX_B, 5)));
+        supplier.getTxOutput(TX_B, 3).orElseThrow();
+        assertEquals(3, provider.txOutputCalls.get(),
+                "an out-ref that left the static set must have been evicted: the hold is bounded by the set");
+    }
+
+    /** (4f) ⛔ Coin selection never sees a held UTxO — not even one at the very address it selects from. */
+    @Test
+    void getAllNeverReturnsAHeldUtxo() {
+        var provider = new SwitchableProvider();
+        provider.address = WALLET.baseAddress();   // a reference script published at the wallet itself
+        var supplier = supplier(addressIndex(List.of()), provider, () -> Set.of(outRef(TX_B, 3)));
+
+        assertEquals(WALLET.baseAddress(), supplier.getTxOutput(TX_B, 3).orElseThrow().getAddress());
+
+        assertTrue(supplier.getAll(WALLET.baseAddress()).isEmpty(),
+                "getAll must come from the index only: a held reference-script UTxO in coin selection "
+                        + "is CCL trap 9b");
+        assertTrue(supplier.getPage(WALLET.baseAddress(), 100, 0, OrderEnum.asc).isEmpty());
+        assertEquals(0, provider.pageCalls.get());
     }
 }
