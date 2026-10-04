@@ -7,7 +7,6 @@ import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LendingConfigGate;
 import com.fluidtokens.aquarium.offchain.service.ParametersService;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
-import com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -28,13 +27,6 @@ public class Healthcheck {
      *                          built. ⚠ Reported, never part of the health verdict: a closed gate refuses
      *                          lending only, and the scheduled-payment half this check guards keeps running.
      * @param lendingGateReason why it is closed (the startup verifier's reason), null while open
-     * @param walletSweep       the startup one-shot wallet rebalance (FAB-134): {@code waiting for tip},
-     *                          {@code settling}, then {@code done: …} ({@code nothing to rebalance},
-     *                          {@code rebalanced <txHash>}, {@code rebalance failed: <reason>},
-     *                          {@code listing failed: <reason>} or {@code idle, no spending processor
-     *                          enabled}). ⚠ Reported, never part of the verdict: until it reads
-     *                          {@code done: …} the processors skip their cycles; a failure is logged
-     *                          and processing continues.
      */
     @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     public record HealthCheck(Boolean dbOk,
@@ -43,8 +35,7 @@ public class Healthcheck {
                               Boolean walletOk,
                               Boolean stakingOk,
                               String lendingGate,
-                              String lendingGateReason,
-                              String walletSweep) {
+                              String lendingGateReason) {
 
     }
 
@@ -57,17 +48,6 @@ public class Healthcheck {
     private final AppUtxoService utxoService;
 
     private final LendingConfigGate lendingConfigGate;
-
-    /**
-     * Setter-injected and REQUIRED in the container, like the processors' gate; null only in a direct
-     * test construction, where {@code wallet_sweep} is reported as null.
-     */
-    private WalletReadiness walletReadiness;
-
-    @org.springframework.beans.factory.annotation.Autowired(required = true)
-    public void setWalletReadiness(WalletReadiness walletReadiness) {
-        this.walletReadiness = walletReadiness;
-    }
 
     @GetMapping
     public ResponseEntity<?> healthCheck() {
@@ -123,8 +103,7 @@ public class Healthcheck {
                 walletOk,
                 stakingFound,
                 lendingConfigGate.isBlocked() ? "closed" : "open",
-                lendingConfigGate.blockedReason().orElse(null),
-                walletReadiness == null ? null : walletReadiness.sweepState());
+                lendingConfigGate.blockedReason().orElse(null));
 
         if (!walletOk) {
             log.warn("[HEALTH] No utxo found for wallet. Ensure you have at least one UTXO with only ada in it.");

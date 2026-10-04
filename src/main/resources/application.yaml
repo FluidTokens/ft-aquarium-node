@@ -450,22 +450,13 @@ loans:
       # unspent -- derived here and named by LMConfigDatum[5].
       lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:745089d1220a0fa145be3ff521304b4eea9a503a94f20995824f98355a44e4ab#0}
 
-  # The startup wallet rebalance (FAB-134), one-shot, no configuration: the first time a block
-  # within 5 minutes of tip is applied, the node lists its wallet from Blockfrost ONCE, compares it
-  # with the local index, and — if any wallet UTxO is missing from the index — submits ONE self-send
-  # of the whole wallet. Whatever the outcome (failures are logged at ERROR and shown on
-  # /healthcheck as wallet_sweep "done: ... failed ..."), processing then continues; it is never
-  # retried in the same process. Until then the tank processor, liquidation and compound skip their
-  # cycles. With all three off nothing is listed at all (/healthcheck reads "done: idle, ...").
-
 scheduling:
   transaction-processor:
     # ⛔ OFF BY DEFAULT. The transaction processor builds and SUBMITS transactions from the
     # configured wallet, so an operator who has not said "yes" gets a node that indexes and serves
     # and runs no scheduled transaction. Set to true to arm it.
-    # With this off AND liquidation disabled AND compound off, the node spends nothing: the startup
-    # wallet rebalance lists nothing either. (While any of them is on, the rebalance may sign ONE
-    # self-send to the node's own base address, costing only the fee, so the index sees every wallet UTxO.)
+    # With this off AND liquidation disabled AND compound off, the node spends nothing. While the
+    # node is syncing, the tank processor, liquidation and compound all skip their cycles.
     # ⚠ Upgrading across this change: a processor that was running will STOP until this is set.
     enabled: ${SCHEDULING_TRANSACTION_PROCESSOR_ENABLED:false}
     delay-minutes: ${SCHEDULING_TRANSACTION_PROCESSOR_DELAY_MINUTES:5}

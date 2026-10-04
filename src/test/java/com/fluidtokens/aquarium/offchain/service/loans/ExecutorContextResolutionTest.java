@@ -23,6 +23,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -195,6 +196,30 @@ class ExecutorContextResolutionTest {
     }
 
     /**
+     * FAB-136: the startup wallet sweep and its readiness gate are gone. None of the former readers may
+     * still declare the setter or hold the field — a leftover setter would be dead injection, and a
+     * leftover field a gate nothing opens. Matched by NAME, because the type itself no longer exists.
+     */
+    @Test
+    void noFormerReaderStillDeclaresTheWalletReadinessSetterOrField() {
+        for (Class<?> type : List.of(
+                com.fluidtokens.aquarium.offchain.service.ScheduledTransactionService.class,
+                LiquidationExecutor.class,
+                CompoundExecutor.class,
+                com.fluidtokens.aquarium.offchain.controller.Healthcheck.class,
+                com.fluidtokens.aquarium.offchain.controller.LiquidationReadinessController.class)) {
+            for (var method : type.getDeclaredMethods()) {
+                assertFalse(method.getName().equals("setWalletReadiness"),
+                        type.getSimpleName() + " still declares setWalletReadiness");
+            }
+            for (var field : type.getDeclaredFields()) {
+                assertFalse(field.getType().getSimpleName().equals("WalletReadiness"),
+                        type.getSimpleName() + "." + field.getName() + " is still a WalletReadiness");
+            }
+        }
+    }
+
+    /**
      * The generalisation, so the next executor cannot repeat it. Spring's rule is simple and
      * unforgiving: with more than one constructor it will not guess. This encodes the rule itself
      * rather than one instance of it, and it needs no container, so it also covers classes whose
@@ -317,12 +342,6 @@ class ExecutorContextResolutionTest {
         @Bean
         BFBackendService backendService() {
             return new BFBackendService(OFFLINE_BLOCKFROST, "dummy");
-        }
-
-        /** FAB-134: the executors' wallet-readiness setter is REQUIRED, so the container must hold one. */
-        @Bean
-        com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness() {
-            return new com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness();
         }
     }
 }

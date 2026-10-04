@@ -1558,7 +1558,7 @@ class LiquidationReadinessControllerTest {
         return market;
     }
 
-    // ---- FAB-134 B2: the wallet panel reads the local index, gated like the processors ----------
+    // ---- FAB-134 B2 / FAB-136: the wallet panel reads the local index, gated on !isSyncing only ----
 
     private static final long T0 = 1_800_000_000_000L;
 
@@ -1585,58 +1585,39 @@ class LiquidationReadinessControllerTest {
         return listener;
     }
 
-    private static com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness ready(boolean ready) {
-        var readiness = org.mockito.Mockito.mock(
-                com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness.class);
-        org.mockito.Mockito.when(readiness.isWalletReady()).thenReturn(ready);
-        org.mockito.Mockito.when(readiness.sweepState()).thenReturn(ready ? "ready" : "pending");
-        return readiness;
-    }
-
-    /** ⛔ Before the sweep has proven the index complete, the index may hold PART of the wallet. */
+    /**
+     * FAB-136: with the startup sweep gone, the only gate is {@code !isSyncing}. Not syncing, the wallet
+     * is read from the index — exactly once — and shown.
+     */
     @Test
-    void beforeTheWalletIsReadyThePanelShowsNoBalanceAndDoesNotReadTheIndex() {
+    void whenNotSyncingTheWalletIsReadOnceAndShown() {
         var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
         org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
         var controller = walletController(utxos);
         controller.setBlockEventListener(syncing(false));
-        controller.setWalletReadiness(ready(false));
 
+        assertNull(controller.walletNotReadyReason());
         WalletBalance wallet = controller.wallet(T0);
 
-        assertFalse(wallet.known(), "a balance read before walletReady may be partial and must not be shown");
-        assertTrue(wallet.byUnit().isEmpty());
-        assertNotNull(controller.walletNotReadyReason());
-        assertTrue(controller.walletNotReadyReason().startsWith("wallet not ready"));
-        org.mockito.Mockito.verify(utxos, org.mockito.Mockito.never()).listWalletUtxo();
+        assertTrue(wallet.known());
+        assertEquals(BigInteger.valueOf(5_000_000L), wallet.of("lovelace"));
+        org.mockito.Mockito.verify(utxos, org.mockito.Mockito.times(1)).listWalletUtxo();
     }
 
+    /** ⛔ While syncing the index may hold PART of the wallet: no balance, and the database is not queried. */
     @Test
     void whileTheNodeIsSyncingThePanelShowsNoBalanceAndDoesNotReadTheIndex() {
         var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
         org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
         var controller = walletController(utxos);
         controller.setBlockEventListener(syncing(true));
-        controller.setWalletReadiness(ready(true));
 
-        assertFalse(controller.wallet(T0).known());
-        assertTrue(controller.walletNotReadyReason().startsWith("wallet not ready"));
-        org.mockito.Mockito.verify(utxos, org.mockito.Mockito.never()).listWalletUtxo();
-    }
-
-    @Test
-    void onceSyncedAndReadyTheWalletIsReadAndShown() {
-        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
-        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
-        var controller = walletController(utxos);
-        controller.setBlockEventListener(syncing(false));
-        controller.setWalletReadiness(ready(true));
-
+        assertEquals("wallet not ready: the node is still syncing", controller.walletNotReadyReason());
         WalletBalance wallet = controller.wallet(T0);
 
-        assertTrue(wallet.known());
-        assertEquals(BigInteger.valueOf(5_000_000L), wallet.of("lovelace"));
-        assertNull(controller.walletNotReadyReason());
+        assertFalse(wallet.known(), "a balance read while syncing may be partial and must not be shown");
+        assertTrue(wallet.byUnit().isEmpty());
+        org.mockito.Mockito.verifyNoInteractions(utxos);
     }
 
     /**
@@ -1666,7 +1647,7 @@ class LiquidationReadinessControllerTest {
      * controller that never put it on the model.
      */
     @Test
-    void theReadinessPageCarriesWhyTheWalletIsNotReadyAndNothingOnceItIs() {
+    void theReadinessPageCarriesWhyTheWalletIsNotReadyWhileSyncingAndNothingOnceSynced() {
         var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(), 0, 0, 0);
         var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
             @Override
@@ -1693,21 +1674,27 @@ class LiquidationReadinessControllerTest {
                 provide(null), provide(null), provide(null), provide(null), provide(utxos),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
                         60, 120, 30, BigInteger.ZERO, 200), network);
-        controller.setBlockEventListener(syncing(false));
-        var readiness = ready(false);
-        controller.setWalletReadiness(readiness);
+        var listener = syncing(true);
+        controller.setBlockEventListener(listener);
 
         var notReady = new org.springframework.ui.ConcurrentModel();
         controller.readiness(notReady, null, null, null, null, null);
-        Object reason = notReady.getAttribute("walletNotReady");
-        assertNotNull(reason, "while the wallet is not ready the page must be told why");
-        assertTrue(reason.toString().startsWith("wallet not ready"), String.valueOf(reason));
+        assertEquals("wallet not ready: the node is still syncing", notReady.getAttribute("walletNotReady"),
+                "while syncing the page must be told why");
 
-        org.mockito.Mockito.when(readiness.isWalletReady()).thenReturn(true);
+        listener.getIsSyncing().set(false);
         var isReady = new org.springframework.ui.ConcurrentModel();
         controller.readiness(isReady, null, null, null, null, null);
-        assertNull(isReady.getAttribute("walletNotReady"), "once ready there is no reason to show");
+        assertNull(isReady.getAttribute("walletNotReady"), "once synced there is no reason to show");
         assertTrue(((WalletBalance) isReady.getAttribute("wallet")).known());
+    }
+
+    /** FAB-136: there is no wallet-readiness gate to inject any more. */
+    @Test
+    void theControllerDeclaresNoWalletReadinessSetter() {
+        assertTrue(java.util.Arrays.stream(LiquidationReadinessController.class.getDeclaredMethods())
+                        .noneMatch(m -> m.getName().equals("setWalletReadiness")),
+                "LiquidationReadinessController still declares setWalletReadiness");
     }
 
     /**

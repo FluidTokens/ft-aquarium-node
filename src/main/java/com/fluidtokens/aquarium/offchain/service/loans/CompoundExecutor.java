@@ -90,24 +90,6 @@ public class CompoundExecutor {
         this.lendingConfigGate = gate;
     }
 
-    /**
-     * ⛔ FAB-134: closed until the node is within 5 minutes of tip and {@code WalletSweepService}'s
-     * one-shot rebalance has run — in ANY outcome, failure included (Giovanni 2026-10-03: "even if the
-     * rebalance fails we don't hold anything back"). So it guarantees "never before tip", NOT "every
-     * wallet UTxO is indexed". Setter-injected and REQUIRED in the container, like the lending gate: a
-     * missing bean must fail the boot. Null only in a direct test construction, where it means "ready".
-     */
-    private com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness;
-
-    @org.springframework.beans.factory.annotation.Autowired(required = true)
-    public void setWalletReadiness(com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness) {
-        this.walletReadiness = walletReadiness;
-    }
-
-    private boolean walletNotReady() {
-        return walletReadiness != null && !walletReadiness.isWalletReady();
-    }
-
     /** True, and logged once, when the Lending v4 config gate is closed. */
     private boolean refusedByLendingConfigGate(String what) {
         if (lendingConfigGate == null || !lendingConfigGate.isBlocked()) {
@@ -203,10 +185,6 @@ public class CompoundExecutor {
         }
         if (blockEventListener.getIsSyncing().get()) {
             log.debug("compound: still syncing, skipping the cycle");
-            return;
-        }
-        if (walletNotReady()) {
-            log.debug("compound: wallet sweep not complete, skipping the cycle");
             return;
         }
 

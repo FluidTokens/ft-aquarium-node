@@ -250,17 +250,11 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * ⛔ FAB-134 B2: the wallet panel is gated on {@code !isSyncing && walletReady}, exactly as the
-     * processors are, because the local index is the only place the wallet is read from. Setter-injected
-     * and REQUIRED in the container; null only in a direct test construction, where it reads as open.
+     * ⛔ FAB-134 B2 / FAB-136: the wallet panel is gated on {@code !isSyncing}, exactly as the processors
+     * are, because the local index is the only place the wallet is read from. Setter-injected and
+     * REQUIRED in the container; null only in a direct test construction, where it reads as open.
      */
-    private com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness;
     private com.fluidtokens.aquarium.offchain.service.BlockEventListener blockEventListener;
-
-    @org.springframework.beans.factory.annotation.Autowired(required = true)
-    public void setWalletReadiness(com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness) {
-        this.walletReadiness = walletReadiness;
-    }
 
     @org.springframework.beans.factory.annotation.Autowired(required = true)
     public void setBlockEventListener(com.fluidtokens.aquarium.offchain.service.BlockEventListener blockEventListener) {
@@ -391,16 +385,14 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * The wallet, at most once per {@link #WALLET_TTL_MILLIS}, and only once the local index is
-     * known to hold all of it.
+     * The wallet, at most once per {@link #WALLET_TTL_MILLIS}, and only once the node has caught up.
      *
      * <h2>⛔ Gated exactly like the processors</h2>
-     * The read is the local index (FAB-134 B2), which is complete only once the node has caught up
-     * ({@code !isSyncing}) AND the startup sweep has proven every wallet UTxO is indexed
-     * ({@code walletReady}). Before that, a balance read from it may be PARTIAL, and a partial balance
-     * understates silently ({@code officina:yaci-store-index-scoping} §5) — so while either gate is
-     * closed the page shows NO balance ({@link WalletBalance#unknown()}) and
-     * {@link #walletNotReadyReason()} says why. The database is not even queried.
+     * The read is the local index (FAB-134 B2), and the gate is {@code !isSyncing} only (FAB-136). While
+     * the node is syncing a balance read from it may be PARTIAL, and a partial balance understates
+     * silently ({@code officina:yaci-store-index-scoping} §5) — so while syncing the page shows NO
+     * balance ({@link WalletBalance#unknown()}) and {@link #walletNotReadyReason()} says why. The
+     * database is not even queried.
      *
      * <h2>An empty answer is authoritative</h2>
      * With the gate open, an empty result is an empty wallet and is shown as one — it is no longer
@@ -437,9 +429,6 @@ public class LiquidationReadinessController {
     String walletNotReadyReason() {
         if (blockEventListener != null && blockEventListener.getIsSyncing().get()) {
             return "wallet not ready: the node is still syncing";
-        }
-        if (walletReadiness != null && !walletReadiness.isWalletReady()) {
-            return "wallet not ready: sweep " + walletReadiness.sweepState();
         }
         return null;
     }

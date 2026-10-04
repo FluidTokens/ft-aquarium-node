@@ -173,7 +173,7 @@ public class ScheduledTransactionService {
      * Unconditional, like the backend above: {@code YaciConfig} declares it with no condition, so
      * injecting it cannot fail startup on a deployment where lending is off. The operator wallet's
      * payment credential is one the index always watches ({@code TankUtxoStorage}); the cycle reads the
-     * wallet only once {@code walletReadiness} is open.
+     * wallet only while the node is not syncing.
      */
     private final UtxoSupplier utxoSupplier;
 
@@ -200,24 +200,6 @@ public class ScheduledTransactionService {
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private final DatumTankConverter datumConverter = new DatumTankConverter();
-
-    /**
-     * ⛔ FAB-134: closed until the node is within 5 minutes of tip and {@code WalletSweepService}'s
-     * one-shot rebalance has run — in ANY outcome, failure included (Giovanni 2026-10-03: "even if the
-     * rebalance fails we don't hold anything back"). So it guarantees "never before tip", NOT "every
-     * wallet UTxO is indexed". Setter-injected and REQUIRED in the container, like the lending gate: a
-     * missing bean must fail the boot. Null only in a direct test construction, where it means "ready".
-     */
-    private com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness;
-
-    @org.springframework.beans.factory.annotation.Autowired(required = true)
-    public void setWalletReadiness(com.fluidtokens.aquarium.offchain.service.wallet.WalletReadiness walletReadiness) {
-        this.walletReadiness = walletReadiness;
-    }
-
-    private boolean walletNotReady() {
-        return walletReadiness != null && !walletReadiness.isWalletReady();
-    }
 
     private RefInputIndexes resolveRefIndexes(TransactionInput parametersRefInput, TransactionInput stakingRefInput) {
         var sortedRefInputs = Stream.of(parametersRefInput, stakingRefInput, aquariumConfiguration.getTankRefInput())
@@ -267,10 +249,6 @@ public class ScheduledTransactionService {
 
         if (blockEventListener.getIsSyncing().get()) {
             log.info("node is syncing, skipping...");
-            return;
-        }
-        if (walletNotReady()) {
-            log.debug("wallet sweep not complete, skipping the payment cycle");
             return;
         }
 
