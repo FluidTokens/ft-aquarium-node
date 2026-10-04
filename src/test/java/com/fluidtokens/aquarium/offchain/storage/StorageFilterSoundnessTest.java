@@ -322,6 +322,7 @@ class StorageFilterSoundnessTest {
                 violations.add(site + ": UtxoRepository::" + site.group() + " — a method reference hides its "
                         + "argument from part c");
             }
+            violations.addAll(methodReferenceReads(file, code));
             for (String stake : STAKE_SCOPED_READS) {
                 for (Site site : scanSource(file, code, Pattern.compile("\\b" + stake + "\\b"))) {
                     violations.add(site + ": " + stake + " is stake-scoped and bypasses the payment-credential filter");
@@ -337,6 +338,120 @@ class StorageFilterSoundnessTest {
         assertTrue(calls >= KNOWN_CREDENTIAL_READ_SITES + 3,
                 "the call scan found " + calls + " utxoRepository calls, fewer than the known ones: it is not "
                         + "reading the source it guards");
+    }
+
+    /**
+     * ⛔ FAB-135 T4 r2: an INSTANCE method reference to a repository read — {@code utxoRepository::findUnspentBy…},
+     * {@code this.utxoRepository::findById}, {@code repo :: findUnspentByOwnerAddr} — is a read whose argument
+     * no call scan sees: it is applied later, through a functional interface, to whatever value its caller
+     * chooses. So each one is a violation, like the type form {@code UtxoRepository::m}:
+     * <ul>
+     *   <li>any {@code ::} reference to a {@code find…} method whose receiver is a field or variable declared
+     *       {@code UtxoRepository} in that file (any name, {@code this.}-qualified or not);</li>
+     *   <li>any {@code ::} reference to a {@code findUnspentByOwner…} method, whatever the receiver.</li>
+     * </ul>
+     */
+    private static List<String> methodReferenceReads(String file, String source) {
+        String code = blankCommentsAndLiterals(source);
+        Set<String> receivers = new HashSet<>(Set.of("utxoRepository"));
+        Matcher declared = Pattern.compile("(?<![\\w$])" + QUALIFIER + "UtxoRepository\\s+([\\w$]+)").matcher(code);
+        while (declared.find()) {
+            receivers.add(declared.group(1));
+        }
+        List<String> violations = new ArrayList<>();
+        Matcher reference = Pattern.compile("(?:\\bthis\\s*\\.\\s*)?([\\w$]*)\\s*::\\s*(find\\w*)\\b").matcher(code);
+        while (reference.find()) {
+            if (receivers.contains(reference.group(1)) || reference.group(2).startsWith("findUnspentByOwner")) {
+                int line = 1 + (int) code.substring(0, reference.start()).chars().filter(c -> c == '\n').count();
+                violations.add(file + ":" + line + ": " + reference.group(1) + "::" + reference.group(2)
+                        + " — a method-reference read of the index hides its argument from part c");
+            }
+        }
+        return violations;
+    }
+
+    /** Each method-reference spelling, on inputs whose answer is known. */
+    @Test
+    void theMethodReferenceReadPatternMatchesEverySpelling() {
+        for (String code : List.of(
+                "private final UtxoRepository utxoRepository; Object f = utxoRepository::findUnspentByOwnerPaymentCredential;",
+                "Object f = utxoRepository :: findById;",
+                "Object f = this.utxoRepository::findAllById;",
+                "Object f = this . utxoRepository\n    ::\n findUnspentByOwnerAddr;",
+                "private final " + UTXO_REPOSITORY_FQN + " repo; Object f = repo :: findById;",
+                "UtxoRepository r = x; Object f = r::findUnspentByOwnerPaymentCredential;",
+                "Object f = someOtherName :: findUnspentByOwnerPaymentCredential;",
+                "Object f = holder.repository()::findUnspentByOwnerAddr;")) {
+            assertEquals(1, methodReferenceReads("x.java", code).size(), code);
+        }
+        // Near misses: a non-repository receiver's find method, comments and literals.
+        assertEquals(0, methodReferenceReads("x.java", "Object f = list::findFirst; Object g = map::find; "
+                + "/* utxoRepository::findById */ String s = \"repo :: findUnspentByOwnerAddr\"; "
+                + "// utxoRepository::findUnspentByOwnerPaymentCredential\n").size());
+    }
+
+    // ---- b. raw access to the index tables ----------------------------------------------------------
+
+    /**
+     * ⛔ FAB-135 T4 r2: {@code UtxoRepository} is not the only way into the index. Yaci's
+     * {@code UtxoStorageReader}, a jOOQ {@code DSLContext}, or SQL naming {@code address_utxo} / {@code tx_input}
+     * read the same tables and would escape every check above. None may appear in {@code src/main} outside
+     * {@code TankUtxoStorage} (which hands its {@code DSLContext} to Yaci's own writer), and
+     * {@code UtxoStorageReader} nowhere at all. Scanned with comments blanked but string literals KEPT, since
+     * raw SQL lives in literals.
+     */
+    private static final Pattern RAW_INDEX_ACCESS =
+            Pattern.compile("(?i)(?<![\\w$])(UtxoStorageReader|DSLContext|address_utxo|tx_input)(?![\\w$])");
+
+    private static final String TANK_UTXO_STORAGE = "storage/TankUtxoStorage.java";
+
+    private static List<String> rawIndexAccess(String file, String source) {
+        String code = blankComments(source);
+        Matcher matcher = RAW_INDEX_ACCESS.matcher(code);
+        List<String> violations = new ArrayList<>();
+        while (matcher.find()) {
+            boolean storageReader = matcher.group(1).equalsIgnoreCase("UtxoStorageReader");
+            if (storageReader || !file.equals(TANK_UTXO_STORAGE)) {
+                int line = 1 + (int) code.substring(0, matcher.start()).chars().filter(c -> c == '\n').count();
+                violations.add(file + ":" + line + ": " + matcher.group(1) + " — raw access to the index tables "
+                        + "outside TankUtxoStorage escapes the reader inventory and part c");
+            }
+        }
+        return violations;
+    }
+
+    @Test
+    void noClassReachesTheIndexTablesOutsideTheRepository() {
+        List<String> violations = new ArrayList<>();
+        rawSources().forEach((file, source) -> violations.addAll(rawIndexAccess(file, source)));
+        assertTrue(violations.isEmpty(), String.join("\n", violations));
+
+        // The scan must see what is there: TankUtxoStorage's own DSLContext (allowed, so counted directly).
+        String tank = rawSources().get(TANK_UTXO_STORAGE);
+        assertTrue(tank != null && RAW_INDEX_ACCESS.matcher(blankComments(tank)).find(),
+                "the raw-access scan did not see TankUtxoStorage's DSLContext: it is not reading the source it guards");
+    }
+
+    /** Each raw-access spelling, on inputs whose answer is known. */
+    @Test
+    void theRawAccessPatternMatchesEverySpelling() {
+        for (String code : List.of(
+                "private final DSLContext dsl;",
+                "private final org.jooq.DSLContext dsl;",
+                "dsl.fetch(\"select * from address_utxo where owner_payment_credential = ?\", x);",
+                "dsl.fetch(\"\"\"\n  select 1 from TX_INPUT\n\"\"\");",
+                "dsl.selectFrom(ADDRESS_UTXO);",
+                "private final UtxoStorageReader reader;",
+                "private final com.bloxbean.cardano.yaci.store.utxo.storage.UtxoStorageReader reader;")) {
+            assertEquals(1, rawIndexAccess("service/X.java", code).size(), code);
+        }
+        assertEquals(1, rawIndexAccess(TANK_UTXO_STORAGE, "UtxoStorageReader r;").size(),
+                "UtxoStorageReader is refused even in TankUtxoStorage");
+        assertEquals(0, rawIndexAccess(TANK_UTXO_STORAGE, "DSLContext dsl;").size(),
+                "TankUtxoStorage's own DSLContext is the one allowed site");
+        assertEquals(0, rawIndexAccess("service/X.java", "/* DSLContext address_utxo */ // tx_input\n"
+                + "MyDSLContextHolder h; address_utxo_count n; tx_inputs m;").size(),
+                "comments and other identifiers are not raw access");
     }
 
     // ---- c. every read stays inside the set ----------------------------------------------------------
@@ -611,8 +726,33 @@ class StorageFilterSoundnessTest {
         throw new IllegalStateException("unbalanced parentheses after offset " + start);
     }
 
+    /** Every {@code .java} under src/main, by path relative to it, untouched. */
+    private static Map<String, String> rawSources() {
+        assertTrue(Files.isDirectory(MAIN), "not run from the project root: " + MAIN.toAbsolutePath());
+        Map<String, String> sources = new TreeMap<>();
+        try (Stream<Path> files = Files.walk(MAIN)) {
+            for (Path file : files.filter(p -> p.toString().endsWith(".java")).sorted().toList()) {
+                String relative = MAIN.relativize(file).toString().replace('\\', '/')
+                        .replaceFirst("^com/fluidtokens/aquarium/offchain/", "");
+                sources.put(relative, Files.readString(file, StandardCharsets.UTF_8));
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return sources;
+    }
+
     /** Comments, string, char and text-block contents become spaces; newlines survive so lines still count. */
     private static String blankCommentsAndLiterals(String source) {
+        return blank(source, false);
+    }
+
+    /** Comments become spaces; string, char and text-block literals are KEPT (raw SQL lives in them). */
+    private static String blankComments(String source) {
+        return blank(source, true);
+    }
+
+    private static String blank(String source, boolean keepLiterals) {
         StringBuilder out = new StringBuilder(source.length());
         int i = 0;
         int n = source.length();
@@ -631,7 +771,11 @@ class StorageFilterSoundnessTest {
             } else if (source.startsWith("\"\"\"", i)) {
                 int end = source.indexOf("\"\"\"", i + 3);
                 end = end < 0 ? n : end + 3;
-                blank(source, i, end, out);
+                if (keepLiterals) {
+                    out.append(source, i, end);
+                } else {
+                    blank(source, i, end, out);
+                }
                 i = end;
             } else if (c == '"' || c == '\'') {
                 int j = i + 1;
@@ -639,7 +783,11 @@ class StorageFilterSoundnessTest {
                     j += source.charAt(j) == '\\' ? 2 : 1;
                 }
                 int end = Math.min(n, j + 1);
-                blank(source, i, end, out);
+                if (keepLiterals) {
+                    out.append(source, i, end);
+                } else {
+                    blank(source, i, end, out);
+                }
                 i = end;
             } else {
                 out.append(c);

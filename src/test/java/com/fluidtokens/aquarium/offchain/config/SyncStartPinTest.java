@@ -28,12 +28,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>{@value #SYNC_START_SLOT} is 2025-05-06T17:00:52Z by Shelley arithmetic
  *       ({@code slot − 4,492,800 + 1,596,059,091}): the "2025-05-06" every operator message cites as the
  *       wallet precondition (no wallet UTxO before it).</li>
- *   <li>{@value #AQUARIUM_GENESIS_SLOT} is the slot of the Aquarium genesis transaction <b>per FAB-139
- *       ruling</b> — NOT observed by this ticket's owner. ⚠ The ruling names that transaction
- *       {@code d35f81f6bc88babe5dcf088e3a800ecbb4d75373df6b144f7561d393cb5d9b2f}, which is the PREVIEW
- *       document's {@code aquarium.genesis.tx-hash}; the mainnet base document's is
- *       {@code 45f379b3436263146ab3a5423506ce11555113384d45655b50c77dab8a3473ff}. Which transaction the slot
- *       belongs to is for a read-only chain query to settle, not this test.</li>
+ *   <li>{@value #AQUARIUM_GENESIS_SLOT} is the slot of the MAINNET Aquarium genesis transaction
+ *       {@code 45f379b3436263146ab3a5423506ce11555113384d45655b50c77dab8a3473ff} (the base document's
+ *       {@code aquarium.genesis.tx-hash}), as ruled in FAB-139 and OBSERVED on chain by a read-only Blockfrost
+ *       query on 2026-10-04. ({@code d35f81f6…} is the PREVIEW genesis hash, not this one.)</li>
  * </ul>
  * Nothing here says anything about the preview document (not ruled).
  */
@@ -44,7 +42,7 @@ class SyncStartPinTest {
     private static final String SYNC_START_BLOCKHASH =
             "586ead1770fc2a59021b824bc0d65bf1d6060585384f257971204d5925f054c2";
 
-    /** Per FAB-139 ruling (see the class javadoc): unverified by the owner. */
+    /** Per FAB-139 ruling, observed on chain 2026-10-04 as mainnet genesis tx 45f379b3… (see the class javadoc). */
     private static final long AQUARIUM_GENESIS_SLOT = 154_984_582L;
 
     private static StandardEnvironment baseDocument() throws Exception {
@@ -77,7 +75,7 @@ class SyncStartPinTest {
 
         assertTrue(slot != null && slot <= AQUARIUM_GENESIS_SLOT,
                 "the mainnet sync-start-slot " + slot + " is after Aquarium genesis (slot " + AQUARIUM_GENESIS_SLOT
-                        + ", per FAB-139 ruling): every object created before it is invisible to the index, and "
+                        + ", mainnet genesis tx 45f379b3…): every object created before it is invisible to the index, and "
                         + "an empty index answer reads as \"nothing there\"");
     }
 }
