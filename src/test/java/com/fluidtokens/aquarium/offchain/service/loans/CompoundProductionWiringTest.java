@@ -141,12 +141,12 @@ class CompoundProductionWiringTest {
                 CompoundTransactionBuilder.rewardRedeemerIndex(order, REGISTRY.getPoolPolicyId()),
                 CompoundTransactionBuilder.rewardRedeemerIndex(order, REGISTRY.getLenderManagerWithdrawScriptHash()));
 
-        // Completeness of the declared list: every reference input whose UTxO publishes a script names a
-        // validator the builder DECLARES (CCL prices the declared list and nothing else).
+        // The rig's mainnet shape: the reference inputs publish exactly the eleven compound validators. This pins
+        // the FIXTURE, not pricing — production declares no reference-script list and the injected supplier
+        // prices every referenced script (the fee-floor tests pin that).
         Set<String> referenced = referencedScriptHashes(reread, f.universe);
         assertEquals(compoundHashes(), referenced,
-                "the reference inputs must publish exactly the eleven compound validators — a script outside "
-                        + "the declared list is priced at ZERO by cardano-client-lib (FeeTooSmallUTxO)");
+                "the rig's reference inputs must publish exactly the eleven compound validators (mainnet shape)");
         assertEquals(f.request.referenceScripts().keySet(), referenced,
                 "every requested reference script reaches the body, and nothing else publishing a script does");
 
