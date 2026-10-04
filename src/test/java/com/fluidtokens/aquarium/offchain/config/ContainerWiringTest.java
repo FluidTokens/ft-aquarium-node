@@ -80,7 +80,8 @@ class ContainerWiringTest {
                 MinswapPoolResolver.class,
                 ConvertTransactionBuilder.class,
                 ConvertLiquidationRouter.class,
-                LiquidatePayInAdvanceTransactionBuilder.class);
+                LiquidatePayInAdvanceTransactionBuilder.class,
+                com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe.class);
     }
 
     /**

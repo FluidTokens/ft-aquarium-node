@@ -575,9 +575,18 @@ public final class LiquidateTransactionBuilder {
     private final ScriptSupplier scriptSupplier;
 
     /**
+     * ⛔ FAB-138: asks Blockfrost, inside {@link #build} and before any evaluation, whether every oracle
+     * out-ref the build references is still live — or {@code null} for the test-built builders, which are
+     * unprobed by design. Production's is {@code YaciConfig}'s bean, pinned by {@code YaciConfigWiringTest}.
+     * Without it a spent feed reaches Blockfrost's evaluation as an empty {@code ScriptFailures}, which the
+     * executor reads as a spent WALLET input ({@code ccl-transaction-building-traps} §13).
+     */
+    private final OracleReferenceInputProbe oracleReferenceInputProbe;
+
+    /**
      * The offline builder: no evaluator, so redeemers keep cardano-client-lib's placeholder ex-units.
      * For the test rigs, which evaluate separately. Production goes through the constructor that takes
-     * a {@link ScriptSupplier} and a {@link TransactionEvaluator}.
+     * a {@link ScriptSupplier} and a {@link TransactionEvaluator}. Unprobed: tests only.
      */
     public LiquidateTransactionBuilder(LoansContractRegistry registry,
                                        Network network,
@@ -589,7 +598,7 @@ public final class LiquidateTransactionBuilder {
 
     /**
      * Offline builder with an evaluator — what the dry-eval rigs use to prove the priced path against
-     * the deployed validators without a network.
+     * the deployed validators without a network. Unprobed: tests only.
      */
     public LiquidateTransactionBuilder(LoansContractRegistry registry,
                                        Network network,
@@ -604,6 +613,7 @@ public final class LiquidateTransactionBuilder {
         this.protocolParamsSupplier = Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
         this.scriptSupplier = null;
         this.scriptCostEvaluator = scriptCostEvaluator;
+        this.oracleReferenceInputProbe = null;
     }
 
     /**
@@ -613,6 +623,7 @@ public final class LiquidateTransactionBuilder {
      * {@link ProtocolParamsSupplier}, a {@link ScriptSupplier} that serves verified script bytes, and
      * Blockfrost's {@code /utils/txs/evaluate} narrowed to a {@link TransactionEvaluator}. Nothing here is
      * a {@code BackendService}; see the {@link #scriptSupplier} field for why that is the point.
+     * Unprobed: tests only — production goes through the constructor that also takes the oracle probe.
      */
     public LiquidateTransactionBuilder(LoansContractRegistry registry,
                                        Network network,
@@ -621,6 +632,23 @@ public final class LiquidateTransactionBuilder {
                                        ProtocolParamsSupplier protocolParamsSupplier,
                                        ScriptSupplier scriptSupplier,
                                        TransactionEvaluator scriptCostEvaluator) {
+        this(registry, network, converters, utxoSupplier, protocolParamsSupplier, scriptSupplier,
+                scriptCostEvaluator, null);
+    }
+
+    /**
+     * ⛔ The production constructor (FAB-138), the one {@code YaciConfig} calls: as the one above, plus the
+     * {@link OracleReferenceInputProbe} every {@link #build} runs before evaluation. The probe holds a
+     * read-only {@code UtxoService}, so this builder still holds nothing that could submit.
+     */
+    public LiquidateTransactionBuilder(LoansContractRegistry registry,
+                                       Network network,
+                                       CardanoConverters converters,
+                                       UtxoSupplier utxoSupplier,
+                                       ProtocolParamsSupplier protocolParamsSupplier,
+                                       ScriptSupplier scriptSupplier,
+                                       TransactionEvaluator scriptCostEvaluator,
+                                       OracleReferenceInputProbe oracleReferenceInputProbe) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.network = Objects.requireNonNull(network, "network");
         this.converters = Objects.requireNonNull(converters, "converters");
@@ -628,6 +656,7 @@ public final class LiquidateTransactionBuilder {
         this.protocolParamsSupplier = Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
         this.scriptSupplier = Objects.requireNonNull(scriptSupplier, "scriptSupplier");
         this.scriptCostEvaluator = Objects.requireNonNull(scriptCostEvaluator, "scriptCostEvaluator");
+        this.oracleReferenceInputProbe = oracleReferenceInputProbe;
     }
 
     // ---- the one entry point ---------------------------------------------------------------
@@ -679,7 +708,16 @@ public final class LiquidateTransactionBuilder {
         // oracles share one script (one credential) under two NFTs, so deduplicating reference inputs
         // by credential dropped one NFT and refused the transaction.
         List<OracleEntry> oracles = distinctOracles(loanOrder);
-        List<TransactionInput> refInputs = referenceInputs(request, oraclesNamedByLegs(loanOrder));
+        List<OracleEntry> referencedOracles = oraclesNamedByLegs(loanOrder);
+        // ⛔ FAB-138: every oracle out-ref this body will reference must still be LIVE — asked once per
+        // build, here, before any QuickTxBuilder build or evaluation. Spent, wrong NFT or a provider error
+        // throws OracleReferenceInputNotLiveException, which the executor records REFUSED and logs at ERROR
+        // every cycle. After evaluation it would be too late: a spent feed comes back from Blockfrost as an
+        // empty ScriptFailures, which the executor reads as a spent WALLET input (CCL trap 13).
+        if (oracleReferenceInputProbe != null) {
+            oracleReferenceInputProbe.requireLive(referencedOracles);
+        }
+        List<TransactionInput> refInputs = referenceInputs(request, referencedOracles);
 
         int configRefIndex = refIndex(refInputs, inputOf(request.configUtxo()), "main config");
         int lmConfigRefIndex = refIndex(refInputs, inputOf(request.lmConfigUtxo()), "lm config");

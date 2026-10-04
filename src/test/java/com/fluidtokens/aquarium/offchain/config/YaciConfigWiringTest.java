@@ -27,6 +27,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.ConvertTransactionBuilder
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
+import com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe;
 import com.fluidtokens.aquarium.offchain.storage.IndexFirstUtxoSupplier;
 import com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage;
 import org.junit.jupiter.api.Test;
@@ -87,7 +88,8 @@ class YaciConfigWiringTest {
                 LoanFixtures.utxoSupplier(List.of()),
                 LoanFixtures.protocolParams(),
                 hash -> Optional.empty(),
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"),
+                offlineProbe());
 
         Field field = LiquidateTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
         field.setAccessible(true);
@@ -191,7 +193,8 @@ class YaciConfigWiringTest {
                 LoanFixtures.utxoSupplier(List.of()),
                 LoanFixtures.protocolParams(),
                 hash -> Optional.empty(),
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"),
+                offlineProbe());
 
         Field field = LiquidateTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
         field.setAccessible(true);
@@ -393,7 +396,7 @@ class YaciConfigWiringTest {
         LiquidateTransactionBuilder builder = new YaciConfig().liquidateTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(), LoanFixtures.converters(),
                 utxoSupplier, protocolParamsSupplier, scriptSupplier,
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), offlineProbe());
 
         assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
                 "the builder does not hold the injected (index-first) UtxoSupplier");
@@ -621,6 +624,49 @@ class YaciConfigWiringTest {
             assertFalse(BackendService.class.isAssignableFrom(parameter)
                             || UtxoService.class.isAssignableFrom(parameter),
                     "minswapPoolResolver takes a " + parameter.getName() + ": a route back to Blockfrost");
+        }
+    }
+
+    /** A probe over an unreachable backend — constructing it makes no request (see the class javadoc). */
+    private static OracleReferenceInputProbe offlineProbe() {
+        return new YaciConfig().oracleReferenceInputProbe(LoanFixtures.utxoSupplier(List.of()),
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+    }
+
+    /**
+     * ⛔ FAB-138 T3a: the production liquidation builder PROBES its oracle out-refs. Every test-built
+     * builder is unprobed by design, so this is the only thing that notices the bean losing its probe —
+     * and with it, a spent feed going back to surfacing as Blockfrost's empty {@code ScriptFailures},
+     * which the executor reads as a spent WALLET input. The probe holds the bean's own
+     * {@code UtxoSupplier} (the content hold, for the out-ref's address) and the backend's read-only
+     * {@code UtxoService} — never a {@code BackendService}, so the builder still holds no submission path.
+     */
+    @Test
+    void theLiquidateBuilderBeanHoldsAProbeOverTheBeanSupplierAndTheBackendUtxoService() throws Exception {
+        UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(List.of());
+        BFBackendService backend = mock(BFBackendService.class);
+        UtxoService utxoService = mock(UtxoService.class);
+        when(backend.getUtxoService()).thenReturn(utxoService);
+        YaciConfig config = new YaciConfig();
+        OracleReferenceInputProbe probe = config.oracleReferenceInputProbe(utxoSupplier, backend);
+
+        LiquidateTransactionBuilder builder = config.liquidateTransactionBuilder(
+                LoanFixtures.registry(), previewNetwork(), LoanFixtures.converters(),
+                utxoSupplier, LoanFixtures.protocolParams(), hash -> Optional.empty(),
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), probe);
+
+        assertNotNull(fieldOf(builder, "oracleReferenceInputProbe"),
+                "the production liquidation builder carries NO oracle probe: a spent feed would reach "
+                        + "Blockfrost's evaluation as an empty ScriptFailures and drop an innocent wallet utxo");
+        assertSame(probe, fieldOf(builder, "oracleReferenceInputProbe"),
+                "the builder does not hold the probe the container injected");
+        assertSame(utxoSupplier, fieldOf(probe, "contentSource"),
+                "the probe must read the out-ref's address through the bean's own (index-first) supplier");
+        assertSame(utxoService, fieldOf(probe, "blockfrost"),
+                "the probe must ask the backend's own UtxoService");
+        for (Field field : OracleReferenceInputProbe.class.getDeclaredFields()) {
+            assertFalse(BackendService.class.isAssignableFrom(field.getType()),
+                    "the probe declares a BackendService field (" + field.getName() + "): a submission path");
         }
     }
 

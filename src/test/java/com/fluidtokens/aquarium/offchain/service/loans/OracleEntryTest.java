@@ -488,4 +488,68 @@ class OracleEntryTest {
         assertEquals(mixed, fromMixed.getTransactionId());
         assertEquals(0, fromMixed.getIndex());
     }
+
+    /**
+     * ⛔ FAB-138 T3a: every c3 entry carries the Charli3 PROVIDER's NFT — the registry's
+     * {@code supportedOracle.c3.policyId} + {@code 4f7261636c6546656564} ("OracleFeed") — and every
+     * multisig entry carries none. Asserted against the RAW json of all three committed registries, entry
+     * by entry, so a parse that dropped the policy (null) or copied the feed's NFT is caught on each.
+     */
+    @Test
+    void everyC3EntryCarriesTheProviderNftAndNoMultisigEntryDoes() throws Exception {
+        int c3Seen = 0;
+        int multisigSeen = 0;
+        for (String fixture : List.of("/loans-v4/oracle-registry.json", "/loans-v4/oracle-registry-preview.json",
+                "/loans-v4/mainnet-oracle-registry-2026-10-01.json")) {
+            JsonNode payload;
+            try (InputStream in = OracleEntryTest.class.getResourceAsStream(fixture)) {
+                assertNotNull(in, fixture);
+                payload = new ObjectMapper().readTree(in);
+            }
+            var client = new FluidOracleClient("http://unused.invalid");
+            client.load(payload);
+            for (JsonNode raw : payload) {
+                if (!raw.path("active").asBoolean(false)) {
+                    continue;
+                }
+                var oracleNft = new AssetType(raw.path("fluidOracle").path("policyId").asText(),
+                        raw.path("fluidOracle").path("assetName").asText());
+                OracleEntry entry = client.entries().stream()
+                        .filter(e -> e.oracleToken().equals(oracleNft)).findFirst()
+                        .orElseThrow(() -> new AssertionError(fixture + ": no entry for " + oracleNft.toUnit()));
+                String preferred = raw.path("preferredOracle").asText();
+                if ("c3".equals(preferred)) {
+                    c3Seen++;
+                    String c3Policy = raw.path("supportedOracle").path("c3").path("policyId").asText();
+                    assertEquals(56, c3Policy.length(), fixture + ": the fixture names a c3 policy");
+                    assertEquals(new AssetType(c3Policy, "4f7261636c6546656564"), entry.charlieProviderNft(),
+                            fixture + ": " + oracleNft.toUnit());
+                } else {
+                    multisigSeen++;
+                    assertNull(entry.charlieProviderNft(), fixture + ": " + oracleNft.toUnit());
+                }
+            }
+        }
+        assertEquals(5, c3Seen, "1 + 3 + 1 c3 entries across the three registries");
+        assertEquals(54, multisigSeen, "18 + 2 + 34 multisig entries across the three registries");
+    }
+
+    /** A c3 node that omits its policy id yields no provider NFT, never a policy-less unit. */
+    @Test
+    void aC3EntryWithoutAPolicyIdHasNoProviderNft() throws Exception {
+        String json = """
+                [{"token":{"policyId":"%s","assetName":"544f4b"},
+                  "fluidOracle":{"policyId":"%s","assetName":"4f52434c",
+                    "referenceScript":"%s#0","rewardAddress":"","referenceInput":"%s#0"},
+                  "preferredOracle":"c3","active":true,
+                  "supportedOracle":{"c3":{"assetName":"4f7261636c6546656564","referenceInput":"%s#0",
+                    "validFrom":1,"validTo":2,"tokenPriceInLovelaces":5,"tokenPriceDenominator":1}}}]
+                """.formatted("c0".repeat(28), "b0".repeat(28), "9b".repeat(32), "9a".repeat(32), "9c".repeat(32));
+        var client = new FluidOracleClient("http://unused.invalid");
+        client.load(new ObjectMapper().readTree(json));
+
+        OracleEntry entry = client.entries().stream().findFirst().orElseThrow();
+        assertNotNull(entry.charlieProviderReferenceInput(), "the provider out-ref still parses");
+        assertNull(entry.charlieProviderNft(), "a blank c3 policy is no NFT to probe for");
+    }
 }

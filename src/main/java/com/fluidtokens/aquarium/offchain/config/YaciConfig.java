@@ -20,6 +20,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.ConvertLiquidationRouter;
 import com.fluidtokens.aquarium.offchain.service.loans.ConvertTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe;
 import com.fluidtokens.aquarium.offchain.storage.IndexFirstUtxoSupplier;
 import com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage;
 import lombok.extern.slf4j.Slf4j;
@@ -124,6 +125,21 @@ public class YaciConfig {
     }
 
     /**
+     * ⛔ FAB-138: the oracle reference-input probe the production liquidation builder runs inside
+     * {@code build()}, before script-cost evaluation. It reads an out-ref's ADDRESS through the index-first
+     * {@link UtxoSupplier} above (the content hold, which says nothing about liveness) and asks Blockfrost's
+     * {@code UtxoService} — one {@code getUtxos(address, nft)} per distinct oracle out-ref — whether the
+     * out-ref is still in the live set holding its NFT. It is handed the {@code UtxoService} alone, never
+     * the {@code BFBackendService}: a {@code UtxoService} can read and cannot submit, so neither the probe
+     * nor the builder that holds it has a path to the wire.
+     */
+    @Bean
+    public OracleReferenceInputProbe oracleReferenceInputProbe(UtxoSupplier utxoSupplier,
+                                                               BFBackendService bfBackendService) {
+        return new OracleReferenceInputProbe(utxoSupplier, bfBackendService.getUtxoService());
+    }
+
+    /**
      * The production liquidation builder (FAB-134 B3b): built from the three injected suppliers and a
      * real script-cost evaluator, and holding nothing else.
      * <ul>
@@ -141,15 +157,21 @@ public class YaciConfig {
      * armed path has to be given an evaluator, and Blockfrost's {@code /utils/txs/evaluate} is the one
      * to give it: it evaluates against the chain's own protocol parameters and cost models, so the
      * question "is our pinned cost model still the chain's?" cannot arise, and it resolves the
-     * transaction's inputs itself because in production they are real on-chain UTxOs. It is the one
-     * Blockfrost call a build still makes (with {@code getTxOutput} for reference inputs the index does
-     * not hold).
+     * transaction's inputs itself because in production they are real on-chain UTxOs. Besides the oracle
+     * probe below, it is the one Blockfrost call a build still makes (with {@code getTxOutput} for reference
+     * inputs the index does not hold).
      * <p>
      * The lambda is the narrowing, exactly as {@code LiquidationExecutor}'s {@code TransactionSubmitter}
      * is: {@link TransactionEvaluator} declares one operation and no submit method, so what the builder
      * holds can price a transaction and nothing else. The builder is handed no {@code BFBackendService}
      * and no {@code DefaultTransactionProcessor} — either would hand it a submission path through the
      * back door.
+     * <p>
+     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} above, which asks Blockfrost —
+     * before any evaluation — whether every oracle out-ref the build references is still live: one more
+     * Blockfrost read per distinct oracle out-ref per build, on top of the evaluation. That probe holds a
+     * read-only {@code UtxoService} and nothing that can submit, so the builder still gets no submission
+     * path.
      */
     @Bean
     public LiquidateTransactionBuilder liquidateTransactionBuilder(LoansContractRegistry registry,
@@ -158,14 +180,16 @@ public class YaciConfig {
                                                                    UtxoSupplier utxoSupplier,
                                                                    ProtocolParamsSupplier protocolParamsSupplier,
                                                                    ScriptSupplier scriptSupplier,
-                                                                   BFBackendService bfBackendService) {
+                                                                   BFBackendService bfBackendService,
+                                                                   OracleReferenceInputProbe oracleReferenceInputProbe) {
         TransactionEvaluator scriptCostEvaluator =
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
         // The three injected suppliers and the evaluator lambda — never the BackendService itself. The
         // builder constructs QuickTxBuilder from the suppliers with a null processor, so it can price a
         // transaction (evaluator + script bytes) and has nothing that could submit one.
         return new LiquidateTransactionBuilder(registry, network.getCardanoNetwork(), cardanoConverters,
-                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator);
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator,
+                oracleReferenceInputProbe);
     }
 
     /**
