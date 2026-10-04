@@ -157,6 +157,11 @@ class TankProductionWiringTest {
                 assertTrue(chain(refused).toLowerCase().contains("evaluat"),
                         ordering + "/" + mode + ": the build failed, but not at script-cost evaluation: "
                                 + chain(refused));
+                // ...and at the BEAN's evaluator trying to reach Blockfrost — not at a missing evaluator, which
+                // fails with the same word ("Transaction evaluator is not set").
+                assertTrue(chain(refused).contains("Connection refused") || chain(refused).contains("ConnectException"),
+                        ordering + "/" + mode + ": the failure is not the bean's evaluator calling out: "
+                                + chain(refused));
             }
         }
     }
@@ -232,8 +237,11 @@ class TankProductionWiringTest {
     void withNothingSafeToSelectTheBuildIsRefusedRatherThanSpendingAReferenceScript() throws Exception {
         for (Ordering ordering : Ordering.values()) {
             Rig rig = rig(ordering, Mode.NO_SAFE_UTXO, new BFBackendService(UNREACHABLE_BLOCKFROST, "dummy"));
-            assertThrows(Exception.class, () -> rig.balanced().withTxEvaluator(rig.scalus()).build(),
+            Exception refused = assertThrows(Exception.class,
+                    () -> rig.balanced().withTxEvaluator(rig.scalus()).build(),
                     ordering + ": only reference-script UTxOs could fund this, and the build did not refuse");
+            assertTrue(chain(refused).contains("Not enough funds"),
+                    ordering + ": refused, but not for lack of a spendable UTxO: " + chain(refused));
         }
     }
 

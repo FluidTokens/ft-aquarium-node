@@ -41,7 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       each inside it — there they are the index's out-ref fallback, the epoch cache's delegate and the
  *       script memo's delegate, and nothing else — written as {@code new} or as a {@code ::new} method
  *       reference;</li>
- *   <li>{@code QuickTxBuilder::new} or {@code extends QuickTxBuilder} anywhere (FAB-134 B3b-5 r2).</li>
+ *   <li>{@code QuickTxBuilder::new}, or {@code extends} QuickTxBuilder or a {@code Default*Supplier}, anywhere (FAB-134 B3b-5 r2).</li>
  * </ul>
  * Comments and string literals are blanked before scanning, so javadoc that QUOTES a construction is not
  * one. The scan must also find the sites it knows exist, so an empty or broken scan cannot pass.
@@ -154,7 +154,10 @@ class BlockfrostBuildWiringGuardTest {
         for (String code : List.of(
                 "class X extends QuickTxBuilder { X(BackendService b) { super(b); } }",
                 "static final class X extends com.bloxbean.cardano.client.quicktx.QuickTxBuilder {}",
-                "new Object() { class Y extends\n QuickTxBuilder {} }")) {
+                "new Object() { class Y extends\n QuickTxBuilder {} }",
+                // A named subclass of a Blockfrost supplier is the same reintroduction under another name.
+                "class IndexlessSupplier extends DefaultUtxoSupplier { IndexlessSupplier(UtxoService s) { super(s); } }",
+                "class P extends com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier {}")) {
             assertEquals(1, matches(code, EXTENDS_QUICK_TX_BUILDER), code);
         }
         // Near misses: other types, other members, and spellings inside comments or literals.
@@ -226,7 +229,8 @@ class BlockfrostBuildWiringGuardTest {
     private static final String QUALIFIER = "(?:[A-Za-z_$][\\w$]*\\s*\\.\\s*)*";
 
     private static final Pattern EXTENDS_QUICK_TX_BUILDER =
-            Pattern.compile("\\bextends\\s+" + QUALIFIER + "QuickTxBuilder\\b");
+            Pattern.compile("\\bextends\\s+" + QUALIFIER
+                    + "(?:QuickTxBuilder|Default(?:Utxo|ProtocolParams|Script)Supplier)\\b");
 
     /** {@code Type::new}, the type optionally qualified, with any spacing around {@code ::}. */
     private static Pattern methodReference(String type) {
