@@ -332,7 +332,8 @@ public class ConvertLiquidationRouter {
         // ⛔ Ada collateral is refused by name FIRST (FAB-117): convert needs a collateral oracle leg and ada
         // has none (it used to die as an NPE inside redeemerEquity). First, so it is never answered with the
         // no-pool branches' "set this market to action: ANTICIPATE" -- pay-in-advance refuses it too.
-        // Quarantined; the PLAIN route (a bond that forbids conversion) is unaffected and does liquidate it.
+        // A machinery failure (ERROR, every cycle); the PLAIN route (a bond that forbids conversion) is
+        // unaffected and does liquidate it.
         if (loan.collateral().isAda()) {
             throw new IllegalStateException("ada collateral: this node builds no convert liquidation for it");
         }

@@ -46,7 +46,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code shouldLiquidationConvertToPrincipal == True} reaches the pay-in-advance builder rather than
  * the plain one, that the shape this router cannot model (a negative equity) is refused cleanly, and
  * that loans it cannot price (ada collateral, a missing or wrong-token principal oracle) are refused by
- * name as {@code IllegalStateException}, so the executor quarantines them (FAB-117). <b>Does NOT prove:</b> that the routed transaction is valid, buildable against live data,
+ * name as {@code IllegalStateException}, so the executor logs them as machinery failures (FAB-117). <b>Does NOT prove:</b> that the routed transaction is valid, buildable against live data,
  * or acceptable to the chain — the builder's own tests and the live check answer that.
  * <b>Evaluator:</b> none; this class does not evaluate scripts at all.
  *
@@ -224,7 +224,7 @@ class PayInAdvanceLiquidationRouterTest {
     }
 
     // ======================================================================================
-    // (3) the clean refusals — never a crash, a quarantine or a transaction
+    // (3) the clean refusals — never a crash, a machinery failure or a transaction
     // ======================================================================================
 
     /**
@@ -290,7 +290,7 @@ class PayInAdvanceLiquidationRouterTest {
     void nonAdaPrincipalWithNoMatchingOracleIsRefusedCleanly() {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY),
                 nonAdaPrincipalLoanDatum());
-        // IllegalStateException (FAB-117): quarantined, never answered with CONVERT advice -- convert
+        // IllegalStateException (FAB-117): a machinery failure, never answered with CONVERT advice -- convert
         // needs this same principal oracle.
         IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
@@ -301,7 +301,7 @@ class PayInAdvanceLiquidationRouterTest {
 
     /**
      * FAB-117: ada collateral is refused BY NAME. numbers() prices the collateral through its oracle entry
-     * and ada has none, so this used to die as a NullPointerException there -- quarantined, but silent.
+     * and ada has none, so this used to die as a NullPointerException there -- a machinery failure, but silent.
      */
     @Test
     void anAdaCollateralIsRefusedByNameRatherThanCrashing() {
@@ -329,7 +329,7 @@ class PayInAdvanceLiquidationRouterTest {
                 named.referenceInput(), named.referenceScript(), named.verificationKeys(), named.threshold(),
                 named.feed(), named.signatures(), named.charlieProviderReferenceInput());
 
-        // IllegalStateException, so the executor quarantines it rather than advising CONVERT (which
+        // IllegalStateException, so the executor logs it as a machinery failure rather than advising CONVERT (which
         // refuses the same loan for the same reason).
         IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(), CONFIG_UTXO,
@@ -355,7 +355,7 @@ class PayInAdvanceLiquidationRouterTest {
         Map<String, OracleEntry> byUnit = new java.util.LinkedHashMap<>(oraclesByUnit());
         byUnit.put(named.oracleToken().toUnit(), wrongToken);
 
-        // IllegalStateException (FAB-117): quarantined, never answered with CONVERT advice -- convert
+        // IllegalStateException (FAB-117): a machinery failure, never answered with CONVERT advice -- convert
         // needs this same principal oracle.
         IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),

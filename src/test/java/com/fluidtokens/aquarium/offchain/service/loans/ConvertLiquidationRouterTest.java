@@ -27,8 +27,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * ⛔ <b>The convert router's WALLET NOMINATION seam, driven at the router rather than through a fake.</b>
  *
  * <p>Audit finding F1: {@code WalletInputTooSmallException} was a decorative guard. The executor's
- * catch for it was pinned by nothing (mutant M12 — neuter the catch so it falls to the 30-minute
- * machinery quarantine — killed <b>0 of 1062</b> tests), and the THROW site was unreachable from the
+ * catch for it was pinned by nothing (mutant M12 — neuter the catch so it falls to the (then
+ * 30-minute) machinery quarantine — killed <b>0 of 1062</b> tests), and the THROW site was unreachable from the
  * suite entirely, because this class did not exist and every executor test injects a fake router.
  *
  * <p>⚠ <b>A fake router cannot pin the router's own behaviour.</b> That is the whole reason this class
@@ -144,7 +144,7 @@ class ConvertLiquidationRouterTest {
      * ⛔ <b>THE THROW SITE, and the requirement it must state.</b> When no single nominable wallet UTxO
      * covers what the order takes, the router refuses BY NAME rather than handing the builder a null
      * (which would surface as a bare {@code NullPointerException} through the executor's generic catch
-     * and be quarantined for thirty minutes as a machinery fault).
+     * and be logged at ERROR as a machinery fault).
      *
      * <p>⚠ The selector returning {@code Optional.empty()} is the ONLY thing this fixture makes go
      * wrong — the pool is deep, the bond permits conversion and the plan is computable — so the
@@ -256,7 +256,7 @@ class ConvertLiquidationRouterTest {
      * FAB-117: ada collateral is refused BY NAME. The convert route builds none (its datum names the NONE
      * sentinel, and redeemerEquity needs a collateral feed) -- only the PLAIN route liquidates ada collateral --
      * and it used to die as a NullPointerException
-     * there -- quarantined, but saying nothing. Same quarantine now, with the reason the readiness page shows.
+     * there -- a machinery failure, but saying nothing. Same branch now, with the reason the readiness page shows.
      */
     @Test
     void anAdaCollateralIsRefusedByNameRatherThanCrashing() {

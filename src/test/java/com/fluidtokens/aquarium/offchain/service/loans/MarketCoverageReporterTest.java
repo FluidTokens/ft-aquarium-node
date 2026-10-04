@@ -582,9 +582,8 @@ class MarketCoverageReporterTest {
      * operator's — would permanently exhaust the slots, and even after every one of those markets
      * recovered, a genuine new unservable market would get no series for the life of the process.
      *
-     * <p>So a slot that has fallen back to 0 is reclaimable, exactly as
-     * {@code LiquidationExecutor.quarantineUntil} evicts the entry closest to expiry rather than
-     * refusing the newcomer.
+     * <p>So a slot that has fallen back to 0 is reclaimable, as the executor's former (removed in
+     * FAB-134 NQ) quarantine evicted the entry closest to expiry rather than refusing the newcomer.
      */
     @Test
     void aRecoveredSlotIsReclaimedForANewlyUnservableMarket() {

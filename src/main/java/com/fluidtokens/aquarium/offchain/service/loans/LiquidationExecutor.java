@@ -40,15 +40,15 @@ import java.math.BigInteger;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * The liquidation loop: every cycle it scans every indexed lender bond, builds one real
@@ -92,30 +92,30 @@ import java.util.concurrent.TimeUnit;
  * <p>
  * One divergence is deliberate and material. {@code ScheduledTransactionService} quarantines a
  * failing UTxO in an unbounded {@code Vector} that is never cleaned out, so one failure disables
- * that item until the process restarts. Here the quarantine is keyed on the loan UTxO ref, bounded,
- * and expires after {@code loans.liquidation.quarantine-minutes}: a transient Blockfrost hiccup
- * while fetching protocol params must not permanently exclude one borrower's loan from every future
- * cycle, and a loan UTxO ref is consumed the moment anyone liquidates it, so entries for real
- * failures die out on their own anyway.
+ * that item until the process restarts. <b>Here nothing is held at all</b> (FAB-134 NQ, Giovanni's
+ * ruling of 2026-10-03): once a candidate has passed the eligibility filters — its route, its
+ * market, its funds — the bot attempts it on EVERY cycle. A failure past that point is a logic bug,
+ * and it is logged at ERROR with its cause on every cycle it happens: no back-off, no suppression,
+ * because a failure that goes quiet after its first occurrence is a failure nobody fixes. A
+ * liquidation that landed is re-derived until the index catches up, and its resubmission fails in
+ * phase 1 (free) and is logged like any other failure — accepted, and preferred to a timer.
+ * <p>
+ * The one thing a failure DOES change is the cycle's wallet list. A wallet UTxO that was an input
+ * of a transmitted transaction, or that a failure names as already spent ({@code BadInputsUTxO},
+ * or Blockfrost's empty {@code "ScriptFailures":{}} evaluation), is dropped from the list for the
+ * rest of that cycle, so the next candidate does not nominate an input the index still lists but
+ * the ledger no longer has.
  *
  * <h2>One transaction per candidate</h2>
  * {@link LiquidateTransactionBuilder} accepts a batch, and this loop always hands it exactly one
  * loan. Batching is not a size question but a failure-isolation one: a batch is atomic, so one loan
- * whose UTxO was spent a block ago kills the liquidation of every other loan in it, and the
- * per-UTxO quarantine below cannot express "this batch failed because of that member". Until a
+ * whose UTxO was spent a block ago kills the liquidation of every other loan in it, and a
+ * per-candidate failure record cannot express "this batch failed because of that member". Until a
  * failure model exists that can, N stays 1.
  */
 @Service
 @Slf4j
 public class LiquidationExecutor {
-
-    /**
-     * How many quarantine entries are kept at once. A bound rather than a policy: entries expire on
-     * their own, and this only stops a pathological cycle — thousands of loans all failing to build
-     * — from growing the map without limit. When it is reached the entry closest to expiry is
-     * dropped, because it is the one whose exclusion is about to end anyway.
-     */
-    static final int MAX_QUARANTINED = 1_024;
 
     /**
      * How far before "now" the transaction's validity interval starts. Mirrors
@@ -259,9 +259,6 @@ public class LiquidationExecutor {
      * it would let a transaction that has genuinely expired through by up to one slot.
      */
     private final CardanoConverters converters;
-
-    /** Loan UTxO ref to the epoch-millis at which its quarantine lapses. */
-    private final Map<String, Long> quarantine = new ConcurrentHashMap<>();
 
     /**
      * The clock the submit-time checks read, as opposed to the cycle's own {@code now}.
@@ -813,12 +810,6 @@ public class LiquidationExecutor {
                                 .formatted(unreadable)
                                 + "and must not be read as loans that are simply gone");
 
-        // Before the early return, not after it: a cycle that finds nothing buildable is exactly the
-        // cycle in which every quarantined loan was already skipped by the scanner, and letting the
-        // expiries lapse only when there happens to be work would keep entries alive far past their
-        // configured lifetime.
-        expireQuarantine(now);
-
         if (buildable.isEmpty()) {
             return;
         }
@@ -857,7 +848,13 @@ public class LiquidationExecutor {
         // token-principal one, both applied downstream (nominate(), the principal-balance sum,
         // collateralGate, walletDiagnosis) — so handing them the UNFILTERED wallet is what makes each
         // one see what it is actually looking for.
-        List<Utxo> walletUtxos = allWalletUtxos;
+        //
+        // ⛔ A MUTABLE COPY, consumed as the cycle goes (FAB-134 NQ). The index answers "unspent" from
+        // tx_input, so a utxo this cycle's own transaction just spent is still listed until its block
+        // is indexed: without the copy the next candidate would nominate the same input and fail at
+        // phase 1. dropFromCycle() removes what a transmitted transaction spent, and what a failure
+        // names as already spent.
+        List<Utxo> walletUtxos = new ArrayList<>(allWalletUtxos);
         // T-052 — the fee ceiling every liquidation must cover regardless of its shape. The
         // principal-repaying path adds its lender payout on top; the fee-only path needs nothing more,
         // which is the whole point: it must not be made to demand an input sized for the other case.
@@ -937,8 +934,9 @@ public class LiquidationExecutor {
 
         for (LiquidationAssessment assessment : buildable) {
             try {
-                consider(assessment, now, validFromMillis, validToMillis, walletUtxos, params, configUtxo.get(), lmConfigUtxo.get(),
-                        oraclesByUnit);
+                consider(assessment, now, validFromMillis, validToMillis, walletUtxos, params,
+                        configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit,
+                        effect -> dropFromCycle(walletUtxos, effect));
             } catch (Exception e) {
                 // consider() already turns every expected failure into a decision; this is the last
                 // net, so that one unexpected candidate does not cost the rest of the cycle.
@@ -958,34 +956,21 @@ public class LiquidationExecutor {
                           long validFromMillis, long validToMillis,
                           List<Utxo> walletUtxos,
                           Optional<ProtocolParams> params, Utxo configUtxo, Utxo lmConfigUtxo,
-                          Map<String, OracleEntry> oraclesByUnit) {
+                          Map<String, OracleEntry> oraclesByUnit,
+                          Consumer<WalletEffect> walletEffects) {
         // Derived here rather than passed alongside, so the two can never disagree about which
         // parameters they came from.
         Optional<BigInteger> feeCeiling = params.map(LedgerCeilings::maxPossibleFee);
         String loanUtxoRef = assessment.loan().utxoRef();
-        Long heldUntil = quarantine.get(loanUtxoRef);
-        if (isQuarantined(loanUtxoRef, now)) {
-            // Recorded, not merely logged (task 1): a held loan must not be indistinguishable from one
-            // never considered — the hold is the bot's own doing. Detail computed ONCE, shared by the
-            // log line and the record, so the two can never disagree about why the loan is held.
-            // IN-MEMORY: quarantine is a ConcurrentHashMap (see its field javadoc) — a restart clears
-            // every hold, which is the remedy an operator reaches for.
-            String detail = heldUntil == null
-                    ? "held by an earlier failure; the hold lapses shortly"
-                    : "held by an earlier failure for another %d s (until epoch-millis %d)"
-                            .formatted(Math.max(0L, (heldUntil - now) / 1000L), heldUntil);
-            log.info("loan {} is quarantined: {} — IN-MEMORY ONLY, does not survive a restart",
-                    loanUtxoRef, detail);
-            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.QUARANTINED,
-                    LiquidationDecision.Outcome.QUARANTINED.name(), detail));
-            return;
-        }
+        // The wallet utxo this candidate nominated, whichever route asked for it — what a failure
+        // naming a spent input is about (see spentInputEffect).
+        Utxo[] nominated = new Utxo[1];
 
         Optional<Utxo> loanUtxo = utxoResolver.resolveLoanUtxo(assessment.loan());
         Optional<Utxo> bondUtxo = utxoResolver.resolveBondUtxo(assessment.bond());
         if (loanUtxo.isEmpty() || bondUtxo.isEmpty()) {
-            // Spent between the scan and now. Not an error and not quarantined: the ref is gone for
-            // good, so it will simply not be scanned again.
+            // Spent between the scan and now. Not an error: the ref is gone for good, so it will
+            // simply not be scanned again.
             //
             // Task 2: the recorded detail already had the two booleans; the log line names the ACTUAL
             // refs, because "spent since the scan" is only actionable if an operator can look the ref
@@ -1060,8 +1045,8 @@ public class LiquidationExecutor {
                             // `nominate()`'s ada-only branch, which filters to nominable at source. The
                             // reference-script hazard is closed structurally, not by this call site
                             // remembering to filter.
-                            orderLovelace -> nominate(walletUtxos, feeCeiling, null, orderLovelace,
-                                    loanUtxoRef),
+                            orderLovelace -> remember(nominated, nominate(walletUtxos, feeCeiling, null,
+                                    orderLovelace, loanUtxoRef)),
                             oraclesByUnit,
                             account.baseAddress(), validFromMillis, validToMillis);
                 } catch (ConvertLiquidationRouter.NoPoolException e) {
@@ -1078,14 +1063,14 @@ public class LiquidationExecutor {
                             e.getMessage());
                     return;
                 } catch (ConvertOrderPlan.RefusedException e) {
-                    // ⛔ A VERDICT ABOUT THE CANDIDATE, NOT A FAULT — so it is recorded and NOT held.
+                    // ⛔ A VERDICT ABOUT THE CANDIDATE, NOT A FAULT — so it is recorded at INFO.
                     //
                     // The five ConvertOrderPlan refusals (the bond forbids conversion, equity is in the
                     // principal currency, the pool is for a different pair, nothing is left to swap,
                     // the pool is too thin) are all statements about this loan against this pool. Each
                     // is reproducible next cycle, each costs one plan and no transaction, and none of
-                    // them is evidence that anything is broken. Quarantining them for thirty minutes
-                    // would suppress a candidate that a single Minswap swap can make viable again.
+                    // them is evidence that anything is broken: they are eligibility filters, not
+                    // failures, and a single Minswap swap can make the candidate viable again.
                     //
                     // ⚑ This is the plain path's RefusedException treatment, arrived at for the same
                     // reason: before this catch existed EVERY one of these fell to the generic branch
@@ -1097,50 +1082,35 @@ public class LiquidationExecutor {
                     return;
                 } catch (MinswapPoolResolver.RefusedException e) {
                     // ⛔ THE POOL LOOKUP REFUSED — and WHICH refusal decides whether this is a verdict
-                    // or a transport problem. They are not the same fact and must not share a hold.
-                    //
-                    // Measured on mainnet 2026-09-09: ONE Blockfrost hiccup on the pool lookup put a
-                    // live loan into the 30-minute machinery quarantine — 39 QUARANTINED records on
-                    // loan 279499ff, from a single transport error. A provider that cannot be reached
-                    // says NOTHING about the candidate; holding it as though the bot were broken is
-                    // how one bad second becomes half an hour of not liquidating.
+                    // or a transport problem. They are not the same fact and must not read alike.
                     if (e.refusal() == MinswapPoolResolver.Refusal.LOOKUP_FAILED) {
-                        // ⚠ A SHORT hold, and it is deliberately neither of the other two.
-                        //   · the verdict path holds NOTHING — but a candidate retried every cycle
-                        //     against a provider that is down is exactly what the quarantine is for;
-                        //   · the machinery path holds THIRTY MINUTES — far too long for a transient
-                        //     that typically clears within one cycle.
-                        // Two cycles is enough for a blip to pass and short enough that a recovered
-                        // provider is noticed almost immediately. It is a code constant with its reason
-                        // beside it, not a knob: an operator asked to tune this would be being asked to
-                        // guess how long their provider stays down.
-                        long holdMillis = LOOKUP_FAILED_HOLD_CYCLES * configuration.getDelaySeconds()
-                                * 1000L;
-                        quarantineUntil(loanUtxoRef, now + holdMillis);
+                        // A TRANSPORT failure on an eligible candidate: retried on the very next cycle
+                        // and logged at ERROR on every cycle it happens (FAB-134 NQ). It used to be held
+                        // for two cycles at WARN — and before that, measured on mainnet 2026-09-09, for
+                        // thirty minutes — and a candidate the bot should liquidate but cannot is a
+                        // fault to be seen and fixed, not waited out.
                         decisionLog.record(decision(assessment, now,
                                 LiquidationDecision.Outcome.REFUSED, e.refusal().name(),
-                                e.getMessage() + " \u21d2 held for " + LOOKUP_FAILED_HOLD_CYCLES
-                                        + " cycles (" + holdMillis / 1000L + "s). This is a TRANSPORT "
-                                        + "failure, not a verdict: it says nothing about whether a "
-                                        + "pool exists, which is what NO_MINSWAP_POOL reports."));
-                        log.warn("the pool lookup for {} failed in transport ({}); held for {} cycles "
-                                        + "({}s) rather than the {}-minute machinery quarantine — the "
-                                        + "candidate itself was never assessed",
-                                loanUtxoRef, e.getMessage(), LOOKUP_FAILED_HOLD_CYCLES,
-                                holdMillis / 1000L, configuration.getQuarantineMinutes());
+                                e.getMessage() + ". This is a TRANSPORT failure, not a verdict: it says "
+                                        + "nothing about whether a pool exists, which is what "
+                                        + "NO_MINSWAP_POOL reports."));
+                        log.error("the pool lookup for {} failed in transport: {} — the candidate itself "
+                                        + "was never assessed; retried next cycle",
+                                loanUtxoRef, causeChain(e), e);
+                        walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
                         return;
                     }
                     // AMBIGUOUS_POOL and POOL_DATUM_UNREADABLE are facts about the CHAIN, reproducible
-                    // next cycle and unaffected by waiting — a verdict, held no longer than any other.
+                    // next cycle and unaffected by waiting — a verdict, reconsidered like any other.
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             e.refusal().name(), e.getMessage()));
                     log.info("the convert liquidation of {} was refused as {}: {}",
                             loanUtxoRef, e.refusal(), e.getMessage());
                     return;
                 } catch (ConvertLiquidationRouter.WalletInputTooSmallException e) {
-                    // A fact about the WALLET, not the candidate — and the operator can top it up
-                    // between cycles, so holding it would keep refusing a convert that had become
-                    // fundable. Same treatment the pay-in-advance path already gives its own.
+                    // A fact about the WALLET, not the candidate — an eligibility filter, reconsidered
+                    // every cycle, and cured by a top-up. Same treatment the pay-in-advance path gives
+                    // its own.
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             "WALLET_INPUT_TOO_SMALL", e.getMessage()));
                     log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef,
@@ -1150,12 +1120,12 @@ public class LiquidationExecutor {
                     // ⚠ WHAT IS LEFT HERE IS A GENUINE MACHINERY FAULT, and that is the point of the
                     // four catches above: this branch used to swallow every verdict on the convert
                     // route as well, so "the pool cannot fill the debt" and "the bot is broken" reached
-                    // the operator identically, both at ERROR, both held for thirty minutes.
-                    quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
+                    // the operator identically. Rebuilt next cycle, and loud on every one (FAB-134 NQ).
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             rootReason(e), causeChain(e)));
                     log.error("building the convert liquidation of {} failed: {}", loanUtxoRef,
                             causeChain(e), e);
+                    walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
                     return;
                 }
                 // Falls through to the shared record-and-maybe-submit path below, deliberately: the
@@ -1203,8 +1173,8 @@ public class LiquidationExecutor {
                         // fee ceiling, and neither has to learn the other's job. It computes the
                         // exact amount it must repay and asks for the SMALLEST input that covers that
                         // plus the fee.
-                        lenderPayout -> nominate(walletUtxos, feeCeiling, payInAdvancePrincipal,
-                                lenderPayout, loanUtxoRef),
+                        lenderPayout -> remember(nominated, nominate(walletUtxos, feeCeiling,
+                                payInAdvancePrincipal, lenderPayout, loanUtxoRef)),
                         validFromMillis,
                         validToMillis);
                 // ⛔ THE AMOUNT — "PAYS the lender 1,033,850,000 c48cbb3d…0014df105553444d and
@@ -1219,8 +1189,8 @@ public class LiquidationExecutor {
                 // the wallet and the parameters. Neither can state every gate alone, so the message is
                 // completed here rather than left naming one of several.
                 // T-052. Same treatment as "not modelled": a clean statement about this candidate
-                // against this wallet. NOT quarantined — the wallet can be topped up between cycles,
-                // and quarantining would keep refusing a candidate that had become buildable.
+                // against this wallet — an eligibility filter, reconsidered every cycle, and cured by
+                // a top-up between cycles.
                 String convertDetail = e.getMessage() + " " + collateralGate(walletUtxos, params);
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         "WALLET_INPUT_TOO_SMALL", convertDetail));
@@ -1255,26 +1225,27 @@ public class LiquidationExecutor {
                 // The 2026-09-09 remedy-wording ruling distinguished routability from profitability;
                 // FAB-126 removes the remedy because no remaining construction site is cured by it.
                 String principalUnit = assessment.loan().datum().principalAsset().toUnit();
-                log.info("the pay-in-advance liquidation of {} (principal {}) was refused: {} — not "
-                                + "quarantined, reconsidered every cycle",
+                log.info("the pay-in-advance liquidation of {} (principal {}) was refused: {} — "
+                                + "reconsidered every cycle",
                         loanUtxoRef, principalUnit, e.getMessage());
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         e.getMessage(), e.getMessage()));
                 return;
             } catch (Exception e) {
-                // A genuine builder failure. Quarantined exactly as the plain path's machinery-failure
-                // branch does, so a systematically broken candidate does not burn a build attempt every
-                // cycle, but only for a while. The refusal MUST say why: the builder wraps the real
+                // A genuine builder failure, treated exactly as the plain path's machinery-failure
+                // branch: rebuilt next cycle and logged at ERROR on every cycle (FAB-134 NQ — a
+                // candidate the bot should liquidate but cannot is a bug, and a bug that goes quiet
+                // is a bug nobody fixes). The refusal MUST say why: the builder wraps the real
                 // fault as IllegalStateException("cannot build the pay-in-advance transaction", cause),
                 // so recording only e.getMessage() drops the cause and leaves the operator debugging
                 // blind. The detail carries the whole cause chain and the exception is logged in full at
                 // ERROR (never DEBUG, which an INFO-level node never prints) — a build failure whose
                 // cause never reaches the log hides the next one too.
-                quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         rootReason(e), causeChain(e)));
                 log.error("building the pay-in-advance liquidation of {} failed: {}",
                         loanUtxoRef, causeChain(e), e);
+                walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
                 return;
             }
             }
@@ -1286,11 +1257,11 @@ public class LiquidationExecutor {
             // the largest wallet utxo (what this did until now) is not wrong, it is wasteful in a way
             // that compounds — the biggest input gets consumed by whichever candidate runs first, so
             // a fee-only liquidation can spend the one input a principal-repaying candidate needed.
-            Optional<Utxo> plainWalletUtxo =
-                    nominate(walletUtxos, feeCeiling, null, BigInteger.ZERO, loanUtxoRef);
+            Optional<Utxo> plainWalletUtxo = remember(nominated,
+                    nominate(walletUtxos, feeCeiling, null, BigInteger.ZERO, loanUtxoRef));
             if (plainWalletUtxo.isEmpty()) {
                 // A refusal, not a failure: true of this candidate against this wallet, reproducible
-                // next cycle, and cured by a top-up. Never quarantined.
+                // next cycle, and cured by a top-up. An eligibility filter.
                 // feeCeiling is necessarily present here: with it absent, nominate() falls back to
                 // largest-nominable, and the cycle gate above already established that at least one
                 // nominable utxo exists — so the empty branch is unreachable without a ceiling.
@@ -1323,7 +1294,7 @@ public class LiquidationExecutor {
                 transaction = builder.build(request);
             } catch (LiquidateTransactionBuilder.RefusedException e) {
                 // A refusal is the builder working: it is a statement about this candidate, reproducible
-                // next cycle, and costs nothing. Not quarantined for that reason.
+                // next cycle, and costs nothing.
                 //
                 // T-040, fifth site. TWO of the builder's fifty refusals wrap a real fault —
                 // SCRIPT_COST_EVALUATION_FAILED and TRANSACTION_NOT_BUILDABLE, both raised from the
@@ -1337,6 +1308,10 @@ public class LiquidationExecutor {
                 if (e.getCause() != null) {
                     log.error("the liquidation of {} was refused as {} by a failure underneath: {}",
                             loanUtxoRef, e.getReason(), causeChain(e.getCause()), e);
+                    // SCRIPT_COST_EVALUATION_FAILED is where Blockfrost's empty-failures evaluation
+                    // surfaces on this route — the shape a spent input takes (CCL trap 13).
+                    walletEffects.accept(spentInputEffect(nominated[0], causeChain(e.getCause())));
+                    return;
                 } else {
                     // Task 7 (ADDENDA). The remedy is a LEVEL, not a flood: the forty-eight causeless
                     // refusals are a verdict on the candidate, not a fault, so ERROR would bury the two
@@ -1348,19 +1323,33 @@ public class LiquidationExecutor {
                 return;
             } catch (Exception e) {
                 // Anything else is a failure of the machinery rather than a verdict on the candidate —
-                // a Blockfrost timeout fetching protocol params, say. Quarantined so a systematically
-                // broken candidate does not burn a build attempt every cycle, but only for a while. Same
-                // rule as the convert branch: surface the whole cause chain in the detail and log the
-                // exception in full at ERROR, never at DEBUG where an INFO-level operator never sees it.
-                quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
+                // a Blockfrost timeout fetching protocol params, say. Rebuilt next cycle and logged at
+                // ERROR on every cycle (FAB-134 NQ). Same rule as the convert branch: surface the whole
+                // cause chain in the detail and log the exception in full at ERROR, never at DEBUG
+                // where an INFO-level operator never sees it.
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         rootReason(e), causeChain(e)));
                 log.error("building the liquidation of {} failed: {}", loanUtxoRef, causeChain(e), e);
+                walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
                 return;
             }
         }
 
-        record(assessment, now, transaction, oraclesByUnit);
+        Optional<Verdict> verdict = record(assessment, now, transaction, oraclesByUnit);
+        if (verdict.isEmpty()) {
+            return;
+        }
+        if (verdict.get().transmitted()) {
+            // SUBMITTED, or the submission threw after the bytes may have gone out: either way every
+            // input of this body may already be spent, and the index cannot know it yet.
+            Set<String> inputs = new LinkedHashSet<>();
+            transaction.getBody().getInputs()
+                    .forEach(in -> inputs.add(in.getTransactionId() + "#" + in.getIndex()));
+            walletEffects.accept(new WalletEffect(inputs,
+                    "an input of transmitted liquidation " + TransactionUtil.getTxHash(transaction), false));
+            return;
+        }
+        walletEffects.accept(spentInputEffect(nominated[0], verdict.get().rejection()));
     }
 
     // ---- failure surfacing ------------------------------------------------------------------------
@@ -1465,7 +1454,7 @@ public class LiquidationExecutor {
      * not realisable ADA. This ticket keeps today's fee computation and only adds the min-ada term; O-2
      * may later restrict the floor to realisable ADA, which is not decided here.
      */
-    private void record(LiquidationAssessment assessment, long now, Transaction transaction,
+    private Optional<Verdict> record(LiquidationAssessment assessment, long now, Transaction transaction,
                         Map<String, OracleEntry> oraclesByUnit) {
         OraclePriceFeed collateralFeed = collateralFeed(assessment, oraclesByUnit);
         BigInteger expectedFee = LoanFinance
@@ -1520,7 +1509,7 @@ public class LiquidationExecutor {
                             "PRICE_UNAVAILABLE", priceDetail));
                     log.info("the pay-in-advance liquidation of {} was refused: {}",
                             assessment.loan().utxoRef(), priceDetail);
-                    return;
+                    return Optional.empty();
                 }
                 PricingService pricingService = new PricingService(client);
                 // ⛔ FAB-111: both legs off the oracles THIS loan's datum names — the ones its
@@ -1539,7 +1528,7 @@ public class LiquidationExecutor {
                             "PRICE_UNAVAILABLE", priceDetail));
                     log.info("the pay-in-advance liquidation of {} was refused: {}",
                             assessment.loan().utxoRef(), priceDetail);
-                    return;
+                    return Optional.empty();
                 }
                 PricingService.Priced pricedOutlay = pricingService.toLovelaceForLeg(payInAdvancePrincipal,
                         payInAdvanceDatum.principalOracleAsset(), payout, now);
@@ -1553,7 +1542,7 @@ public class LiquidationExecutor {
                             "PRICE_UNAVAILABLE", priceDetail));
                     log.info("the pay-in-advance liquidation of {} was refused: {}",
                             assessment.loan().utxoRef(), priceDetail);
-                    return;
+                    return Optional.empty();
                 }
                 BigInteger acquiredLovelace = pricedAcquired.lovelace();
                 BigInteger tokenOutlayLovelace = outlayCeilBiased(pricedOutlay.lovelace());
@@ -1599,7 +1588,7 @@ public class LiquidationExecutor {
                     : LiquidationDecision.Outcome.UNPROFITABLE;
             decisionLog.record(decision(assessment, now, unmeasured, unmeasured.name(), detail,
                     SubmitVeto.TX_TOO_LARGE));
-            return;
+            return Optional.empty();
         }
 
         Verdict verdict = verdict(assessment, now, transaction, oraclesByUnit, floorProfit,
@@ -1634,16 +1623,38 @@ public class LiquidationExecutor {
                         : transaction.getWitnessSet().getRedeemers().size(),
                 verdict.veto() == null ? null : verdict.veto().name()));
 
-        log.info("liquidation of {}: {} ({}), {} ({} bytes)", assessment.loan().utxoRef(),
-                verdict.outcome(), verdict.veto(), verdict.detail(), size);
+        if (verdict.outcome() == LiquidationDecision.Outcome.SUBMIT_VETOED && verdict.veto() != null) {
+            // S4–S7 on an armed node: a candidate the bot has priced as worth doing and is NOT
+            // submitting. Not configuration (S1/S2) and not economics (S3) — so it is a failure, and
+            // a failure is loud on every cycle it happens (FAB-134 NQ).
+            log.error("liquidation of {}: {} ({}), {} ({} bytes)", assessment.loan().utxoRef(),
+                    verdict.outcome(), verdict.veto(), verdict.detail(), size);
+        } else {
+            log.info("liquidation of {}: {} ({}), {} ({} bytes)", assessment.loan().utxoRef(),
+                    verdict.outcome(), verdict.veto(), verdict.detail(), size);
+        }
 
         dumpShadowTransaction(assessment, verdict, transaction, cborHex, size, detail);
+        return Optional.of(verdict);
     }
 
     // ---- the submit vetoes --------------------------------------------------------------------
 
-    /** What this candidate's row says, and which veto — if any — produced it. */
-    private record Verdict(LiquidationDecision.Outcome outcome, SubmitVeto veto, String detail) {
+    /**
+     * What this candidate's row says, and which veto — if any — produced it.
+     *
+     * @param transmitted whether the signed bytes may have reached the network: true on SUBMITTED and
+     *                    on a submission that threw, false on everything else, a definite rejection
+     *                    included. It is what tells the cycle the body's inputs may already be spent
+     * @param rejection   the backend's response to a definite rejection, scanned for a spent-input
+     *                    marker; null otherwise
+     */
+    private record Verdict(LiquidationDecision.Outcome outcome, SubmitVeto veto, String detail,
+                           boolean transmitted, String rejection) {
+
+        Verdict(LiquidationDecision.Outcome outcome, SubmitVeto veto, String detail) {
+            this(outcome, veto, detail, false, null);
+        }
     }
 
     /**
@@ -1927,16 +1938,14 @@ public class LiquidationExecutor {
      * {@code Liquidate} needs. Nothing is rebuilt, re-balanced or re-priced here; there is no
      * builder on this class to do it with.
      * <p>
-     * The loan UTxO is quarantined either way. That is what stops the next cycle re-deriving the
-     * same candidate from an index that has not yet seen the spend and submitting a second time: the
-     * quarantine is keyed on the loan UTxO ref, so it holds for that <em>output</em> until either
-     * the quarantine lapses or the output is genuinely gone from the index — at which point the
-     * scanner stops producing it anyway.
+     * Nothing is held afterwards, whatever the outcome (FAB-134 NQ). The next cycle re-derives the
+     * candidate for as long as the index still lists its loan UTxO; if this transaction landed, that
+     * resubmission fails in phase 1 — free — and is logged at ERROR like any other failure. Every
+     * failure here, a definite rejection included, is logged at ERROR.
      */
     private Verdict submit(LiquidationAssessment assessment, long now, Transaction transaction,
                            String detail) {
         String loanUtxoRef = assessment.loan().utxoRef();
-        quarantineUntil(loanUtxoRef, now + configuration.getQuarantineMinutes() * 60_000L);
 
         byte[] signed;
         try {
@@ -1955,18 +1964,17 @@ public class LiquidationExecutor {
             if (result != null && result.isSuccessful()) {
                 log.info("SUBMITTED liquidation of {}: tx {}", loanUtxoRef, result.getValue());
                 return new Verdict(LiquidationDecision.Outcome.SUBMITTED, null,
-                        detail + "; submitted as " + result.getValue());
+                        detail + "; submitted as " + result.getValue(), true, null);
             }
             String response = result == null ? "no response" : result.getResponse();
-            log.warn("submitting the liquidation of {} was rejected: {}", loanUtxoRef, response);
+            log.error("submitting the liquidation of {} was rejected: {}", loanUtxoRef, response);
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
-                    detail + "; backend rejected it: " + response);
+                    detail + "; backend rejected it: " + response, false, response);
         } catch (Exception e) {
-            // Transmitted or not — we do not know, which is exactly why the quarantine above was
-            // taken before the attempt rather than after it.
+            // Transmitted or not — we do not know, so the cycle treats its inputs as spent.
             log.error("submitting the liquidation of {} threw: {}", loanUtxoRef, causeChain(e), e);
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
-                    detail + "; submission threw: " + causeChain(e));
+                    detail + "; submission threw: " + causeChain(e), true, null);
         }
     }
 
@@ -2228,8 +2236,8 @@ public class LiquidationExecutor {
      * {@code WALLET_UTXO_NOT_ADA_ONLY} rejects a datum-carrying wallet UTxO, and a single-asset ada
      * UTxO with an inline datum is entirely routine in a bot wallet (a DEX order refund, an airdrop
      * claim). Selecting one here would refuse <em>every</em> candidate of <em>every</em> cycle for as
-     * long as it sat in the wallet — and a refusal is not quarantined, so nothing would ever break
-     * the loop out of it. Filtering it out here costs one clause; not filtering it costs the slice
+     * long as it sat in the wallet — and a refusal is reconsidered every cycle, so nothing would ever
+     * break the loop out of it. Filtering it out here costs one clause; not filtering it costs the slice
      * its entire output, with no symptom louder than a repeated refusal reason.
      * <p>
      * ⛔ <b>THIS IS A GATE, NOT A SELECTION LIST — its RETURN VALUE must never be threaded through the
@@ -2520,65 +2528,71 @@ public class LiquidationExecutor {
         return histogram;
     }
 
-    // ---- quarantine ---------------------------------------------------------------------------
+    // ---- the cycle's wallet list ----------------------------------------------------------------
 
-    private boolean isQuarantined(String loanUtxoRef, long now) {
-        Long until = quarantine.get(loanUtxoRef);
-        if (until == null) {
-            return false;
-        }
-        if (until <= now) {
-            quarantine.remove(loanUtxoRef, until);
-            return false;
-        }
-        return true;
+    /** Ledger rejection: an input of the transaction does not exist (already spent). */
+    static final String BAD_INPUTS_MARKER = "BadInputsUTxO";
+
+    /**
+     * Blockfrost's evaluation answer when it could not evaluate the transaction at all — most often
+     * because an input is already spent (CCL trap 13). Matched with whitespace removed.
+     */
+    static final String EMPTY_SCRIPT_FAILURES_MARKER = "\"ScriptFailures\":{}";
+
+    /**
+     * What one candidate's consideration did to the cycle's wallet list: the {@code txHash#index}
+     * refs to drop from it for the rest of the cycle, and why. Handed out of {@code consider()} as a
+     * value once the candidate is finished, so its decisions stay exactly what they were and only the
+     * cycle loop's {@link #dropFromCycle} edits the list.
+     */
+    private record WalletEffect(Set<String> spentWalletRefs, String why, boolean warn) {
+
+        static final WalletEffect NONE = new WalletEffect(Set.of(), null, false);
     }
 
-    private void expireQuarantine(long now) {
-        quarantine.entrySet().removeIf(entry -> entry.getValue() <= now);
+    /** Records the utxo a selector chose, so a later failure can name it. */
+    private static Optional<Utxo> remember(Utxo[] slot, Optional<Utxo> chosen) {
+        chosen.ifPresent(utxo -> slot[0] = utxo);
+        return chosen;
     }
 
     /**
-     * How many scheduling cycles a TRANSPORT failure on the Minswap pool lookup is held for.
-     *
-     * <p>⛔ <b>Neither of the other two holds, deliberately.</b> A {@code LOOKUP_FAILED} is not a
-     * verdict (those are recorded and reconsidered immediately) and not a machinery fault (those get
-     * {@code quarantine-minutes}, thirty by default). Measured on mainnet 2026-09-09: one Blockfrost
-     * hiccup on the pool lookup produced <b>39 {@code QUARANTINED} records</b> on a single live loan,
-     * because a transport error was being priced as though the bot were broken.
-     *
-     * <p>⚠ A code constant and not a configuration key: the hold exists so a candidate does not retry
-     * every cycle against a provider that is down, and an operator asked to tune it would be being
-     * asked to guess how long their own provider stays down.
+     * The candidate's nominated wallet utxo, when its failure says an input is already spent —
+     * {@code BadInputsUTxO}, or the empty-failures evaluation. Neither names a wallet utxo reliably
+     * (the loan utxo may be the spent one), and dropping one utxo for the rest of one cycle costs
+     * nothing, while nominating a spent one again fails the next candidate too.
      */
-    private static final long LOOKUP_FAILED_HOLD_CYCLES = 2L;
-
-    /**
-     * Quarantines one <b>loan UTxO ref</b> — {@code txHash#index}, never a loan id. The distinction
-     * is load-bearing: a loan id outlives the UTxO that carries it (it is minted once and burned at
-     * the end), so keying on it would exclude a borrower's loan across every re-creation of its
-     * UTxO, while keying on the ref means a quarantine dies naturally the moment the output is
-     * spent by anyone.
-     * <p>
-     * Package-private so the eviction and expiry rules can be driven directly from a test; nothing
-     * outside this package quarantines anything.
-     */
-    void quarantineUntil(String loanUtxoRef, long until) {
-        if (quarantine.size() >= MAX_QUARANTINED && !quarantine.containsKey(loanUtxoRef)) {
-            List<Map.Entry<String, Long>> soonest = new ArrayList<>(quarantine.entrySet());
-            soonest.sort(Comparator.comparing(Map.Entry::getValue));
-            quarantine.remove(soonest.getFirst().getKey());
+    private static WalletEffect spentInputEffect(Utxo nominated, String failure) {
+        if (nominated == null || failure == null) {
+            return WalletEffect.NONE;
         }
-        quarantine.put(loanUtxoRef, until);
+        String compact = failure.replaceAll("\\s", "");
+        String marker = compact.contains(BAD_INPUTS_MARKER) ? BAD_INPUTS_MARKER
+                : compact.contains(EMPTY_SCRIPT_FAILURES_MARKER) ? EMPTY_SCRIPT_FAILURES_MARKER
+                : null;
+        if (marker == null) {
+            return WalletEffect.NONE;
+        }
+        return new WalletEffect(Set.of(nominated.getTxHash() + "#" + nominated.getOutputIndex()),
+                marker, true);
     }
 
-    /** How many loan UTxOs are currently quarantined. */
-    int quarantinedCount() {
-        return quarantine.size();
-    }
-
-    /** Which loan UTxO refs are currently quarantined — the eviction rule's observable half. */
-    Set<String> quarantinedRefs() {
-        return Set.copyOf(quarantine.keySet());
+    /** Applies one candidate's {@link WalletEffect} to the cycle's wallet list. */
+    private static void dropFromCycle(List<Utxo> walletUtxos, WalletEffect effect) {
+        if (effect.spentWalletRefs().isEmpty()) {
+            return;
+        }
+        walletUtxos.removeIf(utxo -> {
+            String ref = utxo.getTxHash() + "#" + utxo.getOutputIndex();
+            if (!effect.spentWalletRefs().contains(ref)) {
+                return false;
+            }
+            if (effect.warn()) {
+                log.warn("dropped wallet utxo {} from this cycle: {}", ref, effect.why());
+            } else {
+                log.info("dropped wallet utxo {} from this cycle: {}", ref, effect.why());
+            }
+            return true;
+        });
     }
 }

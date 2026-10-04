@@ -54,6 +54,8 @@ import java.util.function.Function;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -66,7 +68,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * <h2>Reviewer's orientation — what this class proves, and what it does not</h2>
  * <b>Proves:</b> the executor's decision LOGIC — which candidates it routes where, what it records,
- * what it quarantines, which of the seven submit-vetoes fires, and that shadow mode never reaches the
+ * what it logs at ERROR, which of the seven submit-vetoes fires, and that shadow mode never reaches the
  * wire (every wiring here gets a submitter that fails the test on contact).
  * <b>Does NOT prove:</b> anything about the chain. Its collaborators are hand-built fakes and its
  * evaluator is either the offline PlutusV3 rig or absent entirely. A green run here says the loop
@@ -440,7 +442,7 @@ class LiquidationExecutorTest {
      * {@link LiquidationExecutor} routes on. Every other field is identical, so the difference between
      * this and {@code scenario} is exactly the routing decision. Used by the executor-level convert
      * tests that exercise the {@code PayInAdvanceNotModelledException → REFUSED} and
-     * {@code genuine-exception → quarantine} mappings without needing the full oracle universe the
+     * {@code genuine-exception → machinery failure} mappings without needing the full oracle universe the
      * buildable-convert path requires.
      */
     private static Scenario convertScenario(BigInteger feePerMille) {
@@ -1230,8 +1232,6 @@ class LiquidationExecutorTest {
         assertNull(decision.expectedProfitLovelace());
         // The assessment's own numbers survive into the record, so the row is still diagnosable.
         assertEquals(BigInteger.valueOf(50_000_000), decision.liquidationFee());
-        assertEquals(0, wiring.executor().quarantinedCount(),
-                "a spent utxo is not a malfunction: the ref is gone for good and will not be rescanned");
     }
 
     /**
@@ -1241,7 +1241,7 @@ class LiquidationExecutorTest {
      * Worth its own test because the two clauses fail differently. Drop {@code bondUtxo.isEmpty()}
      * and the loan clause still passes, so nothing short-circuits: {@code bondUtxo.get()} throws
      * {@code NoSuchElementException}, which lands in the generic branch and records the wrong reason
-     * <em>and</em> quarantines a perfectly healthy loan for half an hour. Both halves are asserted.
+     * for a perfectly healthy loan.
      */
     @Test
     void aBondUtxoSpentWhileTheLoanRemainsIsAlsoRecordedAsNoUtxo() {
@@ -1258,8 +1258,6 @@ class LiquidationExecutorTest {
                 "a spent bond is a missing utxo, not an unexplained exception");
         assertEquals(LiquidationDecision.Outcome.NO_UTXO.name(), decision.reason());
         assertNull(decision.txHash());
-        assertEquals(0, wiring.executor().quarantinedCount(),
-                "and it must not quarantine a loan whose only problem is that its bond moved");
     }
 
     /**
@@ -1679,7 +1677,7 @@ class LiquidationExecutorTest {
      * A datum-carrying ada-only UTxO sits <b>first</b> in the wallet, which is where {@code findFirst}
      * would take it from.
      * <p>
-     * The builder rejects such a UTxO outright, and a refusal is not quarantined — so selecting it
+     * The builder rejects such a UTxO outright, and a refusal is reconsidered every cycle — so selecting it
      * would refuse every candidate of every cycle, for as long as it sat in the wallet, with no
      * symptom louder than a repeated reason string. This is not a hypothetical shape: a DEX order
      * refund or an airdrop claim arrives exactly like this.
@@ -1805,7 +1803,7 @@ class LiquidationExecutorTest {
     }
 
     // ======================================================================================
-    // quarantine
+    // no quarantine: an eligible candidate is attempted every cycle, and every failure is loud
     // ======================================================================================
 
     /**
@@ -1821,157 +1819,187 @@ class LiquidationExecutorTest {
                 null, null, false, null));
     }
 
-    @Test
-    void aFailedBuildQuarantinesTheLoanAndTheNextCycleSkipsIt() {
-        Wiring wiring = wiring(shadow(SMALL_MARGIN), unbuildableScenario(), false);
-
-        wiring.executor().cycle(NOW);
-
-        LiquidationDecision first = onlyDecision(wiring);
-        assertEquals(LiquidationDecision.Outcome.REFUSED, first.outcome());
-        assertEquals("NullPointerException", first.reason(),
-                "a thrown failure is recorded under the exception, not under a Refusal name");
-        // This fixture's NPE has NO cause, so nothing here can tell causeChain(e) from e.toString():
-        // one is a substring of the other. The simple-vs-qualified name is the only discrimination
-        // available at this fixture, and the load-bearing proof for this site is the wrapped-cause
-        // test below. Leaving this comment off is how the same hole was dug twice.
-        assertTrue(first.detail().startsWith("NullPointerException"),
-                "causeChain uses the SIMPLE name; e.toString() qualifies it: " + first.detail());
-        assertEquals(1, wiring.executor().quarantinedCount());
-        assertEquals(Set.of(TX_LOAN + "#0"), wiring.executor().quarantinedRefs());
-
-        // A minute later, well inside the 30-minute quarantine.
-        wiring.executor().cycle(NOW + 60_000L);
-
-        // The skip now RECORDS (Outcome.QUARANTINED) instead of returning silently, so the proof of
-        // "not built again" is the second decision naming the hold — which is strictly stronger than
-        // the old count of one. A count of one was equally consistent with the loan having dropped
-        // out of the scan altogether; the record says which.
-        assertEquals(2, wiring.log().size(),
-                "the second cycle must leave a record of WHY it did nothing");
-        LiquidationDecision second = wiring.log().newestFirst(10).getFirst();
-        assertEquals(LiquidationDecision.Outcome.QUARANTINED, second.outcome(),
-                "the quarantined loan must not be built again while its quarantine holds");
-        assertEquals(first.loanUtxoRef(), second.loanUtxoRef(), "and it must be about the same loan");
-        assertEquals(1, wiring.log().lastRun().bondsScanned(),
-                "it is still scanned and still counted — only the build attempt is skipped");
-    }
-
-    /**
-     * The divergence from {@code ScheduledTransactionService}, which quarantines forever. One
-     * transient failure must not exclude a borrower's loan for the lifetime of the process.
-     */
-    @Test
-    void aQuarantineExpiresAndTheLoanIsReconsidered() {
-        Wiring wiring = wiring(shadow(SMALL_MARGIN), unbuildableScenario(), false);
-
-        wiring.executor().cycle(NOW);
-        assertEquals(1, wiring.log().size());
-
-        // 31 minutes later: past the configured 30.
-        wiring.executor().cycle(NOW + 31L * 60_000L);
-
-        assertEquals(2, wiring.log().size(), "the quarantine must lapse, not persist");
-        assertEquals(1, wiring.executor().quarantinedCount(), "and be taken again on the new failure");
-    }
-
-    /**
-     * The key is the loan <b>UTxO ref</b>, not the loan id, and the difference is not cosmetic: a
-     * loan id outlives the UTxO carrying it, so keying on it would exclude a borrower across every
-     * re-creation of their loan output, while a ref-keyed quarantine dies the moment the output is
-     * spent by anyone.
-     */
-    @Test
-    void theQuarantineKeyIsTheLoanUtxoRefAndNotTheLoanId() {
-        Scenario scenario = scenario(FAT_FEE_PER_MILLE);
-        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario, false);
-
-        wiring.executor().quarantineUntil(LOAN_ID, NOW + 3_600_000L);
-        wiring.executor().cycle(NOW);
-
-        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, onlyDecision(wiring).outcome(),
-                "a quarantine under the loan id must not suppress the loan's utxo");
-
-        // The ref, by contrast, does suppress it.
-        Wiring byRef = wiring(shadow(SMALL_MARGIN), scenario, false);
-        byRef.executor().quarantineUntil(TX_LOAN + "#0", NOW + 3_600_000L);
-        byRef.executor().cycle(NOW);
-
-        assertEquals(LiquidationDecision.Outcome.QUARANTINED, onlyDecision(byRef).outcome(),
-                "the ref-keyed quarantine must suppress the BUILD and say so — an unrecorded skip is "
-                        + "indistinguishable from a loan that was never a candidate");
-        assertEquals(1, byRef.log().lastRun().bondsScanned(),
-                "still scanned and still counted, just not built");
-    }
-
-    /**
-     * The map is bounded, so a pathological cycle — every loan failing to build — cannot grow it
-     * without limit. The entry evicted is the one closest to expiry, because its exclusion was about
-     * to end anyway.
-     */
-    @Test
-    void theQuarantineIsBoundedAndEvictsTheSoonestToExpire() {
-        LiquidationExecutor executor = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false)
-                .executor();
-
-        // Expiries strictly increasing, so "soonest to expire" is unambiguous.
-        for (int i = 0; i < LiquidationExecutor.MAX_QUARANTINED; i++) {
-            executor.quarantineUntil("ref#" + i, NOW + 3_600_000L + i);
-        }
-        assertEquals(LiquidationExecutor.MAX_QUARANTINED, executor.quarantinedCount());
-
-        executor.quarantineUntil("ref#overflow", NOW + 7_200_000L);
-
-        assertEquals(LiquidationExecutor.MAX_QUARANTINED, executor.quarantinedCount(),
-                "the bound must hold");
-        assertTrue(executor.quarantinedRefs().contains("ref#overflow"), "the newcomer is admitted");
-        assertFalse(executor.quarantinedRefs().contains("ref#0"),
-                "the entry closest to expiry is the one dropped");
-        assertTrue(executor.quarantinedRefs().contains("ref#1"),
-                "and only that one — nothing else is evicted to make room");
-    }
-
-    /**
-     * Slice 1, task 1. The quarantine skip used to log at DEBUG only — invisible on an INFO-level
-     * node — and said nothing about WHY the hold exists or whether it survives a restart. Promoted to
-     * INFO, and the log line must carry the SAME detail string the decision record does (reused, not
-     * re-derived) plus the in-memory / restart fact the {@code ConcurrentHashMap} quarantine map
-     * implies but does not say on its own.
-     */
-    @Test
-    void aQuarantinedLoanLogsAtInfoNamingTheHoldAndItsInMemoryNature() {
-        Scenario scenario = scenario(FAT_FEE_PER_MILLE);
-        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario, false);
-        wiring.executor().quarantineUntil(TX_LOAN + "#0", NOW + 3_600_000L);
-
+    /** Runs {@code cycles} cycles a minute apart and returns every event the executor logged. */
+    private static List<ILoggingEvent> cyclesLogged(Wiring wiring, int cycles) {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
         logger.addAppender(appender);
         try {
-            wiring.executor().cycle(NOW);
+            for (int cycle = 0; cycle < cycles; cycle++) {
+                wiring.executor().cycle(NOW + cycle * 60_000L);
+            }
         } finally {
             logger.detachAppender(appender);
         }
+        return appender.list;
+    }
 
-        LiquidationDecision decision = onlyDecision(wiring);
-        assertEquals(LiquidationDecision.Outcome.QUARANTINED, decision.outcome());
-
-        List<ILoggingEvent> infos = appender.list.stream()
-                .filter(event -> event.getLevel() == Level.INFO)
-                .filter(event -> event.getFormattedMessage().contains("quarantined"))
+    private static List<ILoggingEvent> errorsContaining(List<ILoggingEvent> events, String text) {
+        return events.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .filter(event -> event.getFormattedMessage().contains(text))
                 .toList();
-        assertEquals(1, infos.size(), "expected exactly one INFO line for the quarantine hold: "
-                + appender.list);
-        String message = infos.getFirst().getFormattedMessage();
-        assertTrue(message.contains(TX_LOAN + "#0"), "must name the loan utxo ref: " + message);
-        assertTrue(message.contains(decision.detail()),
-                "the log line must carry the SAME detail the record does, reused not re-derived: "
-                        + message);
-        assertTrue(message.toUpperCase().contains("IN-MEMORY"),
-                "must say the hold does not survive a restart: " + message);
-        assertTrue(message.toLowerCase().contains("restart"),
-                "must name the restart remedy an operator would reach for: " + message);
+    }
+
+    /**
+     * FAB-134 NQ (Giovanni, 2026-10-03): "once in theory we are allowed and funded to liquidate a loan
+     * we should always try to liquidate. no quarantine." A failed build used to hold the loan for
+     * thirty minutes and record {@code QUARANTINED} on the cycles in between; it is now rebuilt on the
+     * very next cycle and the failure is logged at ERROR on BOTH — the second cycle's ERROR is what a
+     * suppression of repeats would remove.
+     */
+    @Test
+    void aMachineryFailureIsRebuiltOnTheVeryNextCycleAndLoggedAtErrorOnBoth() {
+        RuntimeException boom = new IllegalStateException("cannot fetch protocol parameters",
+                new java.net.SocketTimeoutException(BLOCKFROST_TIMEOUT));
+        LiquidateTransactionBuilder brokenBuilder = mock(LiquidateTransactionBuilder.class);
+        when(brokenBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenThrow(boom);
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), List.of(WALLET_UTXO), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, brokenBuilder, metrics());
+
+        List<ILoggingEvent> events = cyclesLogged(wiring, 2);
+
+        verify(brokenBuilder, times(2)).build(any(LiquidateTransactionBuilder.Request.class));
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(2, decisions.size(), "one decision per cycle — the second cycle is not a skip");
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+            assertEquals("SocketTimeoutException", decision.reason(), decision.detail());
+            assertFalse(decision.detail().toLowerCase().contains("held"),
+                    "no detail may mention a hold: " + decision.detail());
+        }
+        List<ILoggingEvent> errors = errorsContaining(events, "building the liquidation of");
+        assertEquals(2, errors.size(), "the failure must be loud on EVERY cycle, not just the first: "
+                + events);
+        for (ILoggingEvent error : errors) {
+            assertTrue(error.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
+                    "each ERROR carries the root cause: " + error.getFormattedMessage());
+            assertNotNull(error.getThrowableProxy(), "and the exception itself");
+        }
+    }
+
+    /**
+     * The same property through the real builder, with the fixture whose build dies on a null. The
+     * NPE has NO cause, so nothing here can tell causeChain(e) from e.toString() — the simple-vs-
+     * qualified name is the only discrimination available, and the wrapped-cause tests below are the
+     * load-bearing proof for that. Leaving this comment off is how the same hole was dug twice.
+     */
+    @Test
+    void aFailedBuildIsRecordedUnderItsExceptionOnEveryCycle() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), unbuildableScenario(), false);
+
+        List<ILoggingEvent> events = cyclesLogged(wiring, 3);
+
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(3, decisions.size(), "built and refused on each of the three cycles");
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+            assertEquals("NullPointerException", decision.reason(),
+                    "a thrown failure is recorded under the exception, not under a Refusal name");
+            assertTrue(decision.detail().startsWith("NullPointerException"),
+                    "causeChain uses the SIMPLE name; e.toString() qualifies it: " + decision.detail());
+            assertEquals(TX_LOAN + "#0", decision.loanUtxoRef());
+        }
+        assertEquals(3, errorsContaining(events, "building the liquidation of").size(),
+                "one ERROR per cycle: " + events);
+        assertEquals(1, wiring.log().lastRun().bondsScanned(),
+                "still scanned and counted — the loan never dropped out of the scan");
+    }
+
+    // ---- the cycle's wallet list --------------------------------------------------------------
+
+    private static final String TX_LOAN_2 = "ab".repeat(32);
+    private static final String TX_BOND_2 = "de".repeat(32);
+    private static final String LOAN_ID_2 = "b1b2c3d4e5f6a1b2";
+    private static final String TX_WALLET_SMALL = "e3".repeat(32);
+
+    /** A wallet utxo the fee-only selector prefers to {@link #WALLET_UTXO}: smaller, still ample. */
+    private static final Utxo WALLET_UTXO_SMALL = LoanFixtures.adaUtxo(TX_WALLET_SMALL, 0,
+            ACCOUNT.baseAddress(), 20_000_000L);
+
+    /** A second ada/ada loan, identical to {@link #scenario(BigInteger)} but for its refs and id. */
+    private static Scenario secondScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000),
+                BigInteger.valueOf(1000), LoanFixtures.adaCollateral(), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN_2, 0, LOAN_ID_2, datum,
+                COLLATERAL_LOVELACE, List.of());
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND_2, 0, LOAN_ID_2,
+                LoanFixtures.bondDatum(FAT_FEE_PER_MILLE, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY),
+                        AssetType.ada()),
+                2_000_000L);
+        return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.unit(), OraclePriceFeed.unit(), VALID_FROM));
+    }
+
+    /**
+     * Two candidates in one cycle; the first one's build fails with {@code failure}. Returns the
+     * wallet utxo each build was handed, in order, and the events logged.
+     */
+    private static Map.Entry<List<Utxo>, List<ILoggingEvent>> twoCandidatesFirstFailing(
+            RuntimeException failure) {
+        List<Utxo> nominated = new ArrayList<>();
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
+        when(builder.build(any(LiquidateTransactionBuilder.Request.class))).thenAnswer(invocation -> {
+            nominated.add(invocation.<LiquidateTransactionBuilder.Request>getArgument(0).walletUtxo());
+            throw nominated.size() == 1 ? failure : new IllegalStateException("second build, irrelevant");
+        });
+        Scenario first = scenario(FAT_FEE_PER_MILLE);
+        Scenario second = secondScenario();
+        List<Scenario> both = List.of(first, second);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(first.assessment(), second.assessment()),
+                both, allUnspent(both), List.of(WALLET_UTXO, WALLET_UTXO_SMALL), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, builder, metrics());
+        List<ILoggingEvent> events = cyclesLogged(wiring, 1);
+        assertEquals(2, nominated.size(), "both candidates were built: " + events);
+        return Map.entry(nominated, events);
+    }
+
+    /**
+     * FAB-134 NQ task 4. A {@code BadInputsUTxO} says an input the bot nominated no longer exists,
+     * while the index — which answers "unspent" from {@code tx_input} — still lists it. The nominated
+     * wallet utxo leaves the cycle's list, so the next candidate nominates another rather than failing
+     * on the same spent input.
+     */
+    @Test
+    void aBadInputsFailureDropsTheNominatedWalletUtxoAndTheNextCandidateNominatesAnother() {
+        var result = twoCandidatesFirstFailing(new IllegalStateException("submit-time evaluation failed",
+                new RuntimeException("ConwayUtxoFailure (BadInputsUTxO (fromList [TxIn ...]))")));
+        List<Utxo> nominated = result.getKey();
+
+        assertEquals(WALLET_UTXO_SMALL, nominated.get(0), "the fee-only selector prefers the smaller");
+        assertEquals(WALLET_UTXO, nominated.get(1),
+                "the second candidate nominated the wallet utxo the first one's failure named as spent");
+        List<ILoggingEvent> warns = result.getValue().stream()
+                .filter(event -> event.getLevel() == Level.WARN)
+                .filter(event -> event.getFormattedMessage().equals("dropped wallet utxo "
+                        + TX_WALLET_SMALL + "#0 from this cycle: BadInputsUTxO"))
+                .toList();
+        assertEquals(1, warns.size(), "the drop is logged once, naming the utxo and the marker: "
+                + result.getValue());
+    }
+
+    /** The same drop for Blockfrost's empty-failures evaluation — CCL trap 13's spent-input shape. */
+    @Test
+    void anEmptyScriptFailuresEvaluationAlsoDropsTheNominatedWalletUtxo() {
+        var result = twoCandidatesFirstFailing(new IllegalStateException("evaluation failed",
+                new RuntimeException("{\"ScriptFailures\": {}}")));
+
+        assertEquals(WALLET_UTXO, result.getKey().get(1),
+                "the second candidate must not nominate the utxo the first one's evaluation named spent");
+    }
+
+    /** And an ordinary failure drops nothing: the second candidate may reuse the same input. */
+    @Test
+    void anOrdinaryFailureLeavesTheWalletListAlone() {
+        var result = twoCandidatesFirstFailing(new IllegalStateException("cannot fetch protocol parameters",
+                new java.net.SocketTimeoutException(BLOCKFROST_TIMEOUT)));
+
+        assertEquals(WALLET_UTXO_SMALL, result.getKey().get(1),
+                "nothing said the input was spent, so it is still the best nomination");
     }
 
     // ======================================================================================
@@ -1981,10 +2009,10 @@ class LiquidationExecutorTest {
     // The A2 auditor found the executor's convert branch undefended: forcing it to `if (false)`
     // left the whole suite green, because no executor-level test fed a CONVERT assessment through
     // consider()/record(). These three tests close that — they exercise the routing selection, the
-    // PayInAdvanceNotModelledException -> REFUSED mapping, and the genuine-exception -> quarantine
+    // PayInAdvanceNotModelledException -> REFUSED mapping, and the genuine-exception -> machinery-failure
     // mapping at the executor layer, and every one of them goes RED under the `if (false)` mutation
     // (a convert assessment then reaches the plain builder, whose V7 guard refuses it as
-    // CONVERSION_TO_PRINCIPAL_REQUIRED instead of routing / refusing-cleanly / quarantining).
+    // CONVERSION_TO_PRINCIPAL_REQUIRED instead of routing / refusing-cleanly / failing).
 
     /**
      * (a) A <b>buildable</b> convert assessment — the real f855 shape — reaches the router, which
@@ -2024,7 +2052,6 @@ class LiquidationExecutorTest {
         assertTrue(decision.referenceInputs() >= 5,
                 "the convert body reads both configs and the three oracle reference inputs, got "
                         + decision.referenceInputs());
-        assertEquals(0, wiring.executor().quarantinedCount(), "a clean build is not quarantined");
     }
 
     /**
@@ -2034,7 +2061,7 @@ class LiquidationExecutorTest {
      * seam must build it, not refuse it (see {@code equityZeroNowBuildsAndIsRecordedRatherThanRefused}
      * below, which is what this test used to disprove).
      * <p>
-     * What is STILL refused cleanly (never quarantined) is a genuinely NEGATIVE equity — unreachable
+     * What is STILL refused cleanly (a verdict, not a machinery failure) is a genuinely NEGATIVE equity — unreachable
      * through a real assessment ({@code LoanFinance.redeemerEquity} floors it to zero), so this
      * overrides the assessment's equity field directly via {@link Scenario#withAssessment}, defence in
      * depth for the router's own precondition rather than a scenario the loan/oracle data produces.
@@ -2059,8 +2086,6 @@ class LiquidationExecutorTest {
         assertEquals("pay-in-advance not yet modelled for a negative equity", decision.reason());
         assertNull(decision.txHash(), "a clean not-modelled refusal builds no transaction");
         assertNull(decision.txCborHex());
-        assertEquals(0, wiring.executor().quarantinedCount(),
-                "a shape the seam cannot model is a REFUSED row, never a quarantine");
     }
 
     /**
@@ -2087,7 +2112,6 @@ class LiquidationExecutorTest {
         assertTrue(decision.outcome() == LiquidationDecision.Outcome.WOULD_SUBMIT
                         || decision.outcome() == LiquidationDecision.Outcome.UNPROFITABLE,
                 "an equity-0 convert tx is priced, not refused: " + decision.outcome() + " " + decision.detail());
-        assertEquals(0, wiring.executor().quarantinedCount(), "a clean build is not quarantined (equityZero)");
     }
 
     // ======================================================================================
@@ -2273,8 +2297,6 @@ class LiquidationExecutorTest {
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
         assertTrue(decision.reason().contains("oracle feed window"), decision.reason());
         assertNull(decision.txHash(), "a not-modelled refusal must not build a transaction");
-        assertEquals(0, wiring.executor().quarantinedCount(),
-                "a per-cycle feed-window refusal is reconsidered immediately");
 
         List<String> refusalInfos = appender.list.stream()
                 .filter(event -> event.getLevel() == Level.INFO)
@@ -2369,7 +2391,6 @@ class LiquidationExecutorTest {
                         + "number: " + detail);
         assertEquals(LiquidationDecision.Outcome.UNPROFITABLE, decision.outcome(),
                 "pinned alongside the floor above — a routed convert tx is priced, not refused: " + detail);
-        assertEquals(0, wiring.executor().quarantinedCount(), "a clean build is not quarantined: " + detail);
     }
 
     /**
@@ -2405,7 +2426,7 @@ class LiquidationExecutorTest {
      * operator's next question is always "which loan, which token". The message is carried verbatim
      * because it is what tells the triggers apart: the router's negative equity, or one of the builder's
      * oracle-feed refusals. (Since FAB-117 a missing principal oracle is NOT one of them -- it is an
-     * IllegalStateException and quarantined.) (F0, round 2: the equity trigger is now a genuinely negative equity,
+     * IllegalStateException and a machinery failure.) (F0, round 2: the equity trigger is now a genuinely negative equity,
      * not "non-positive" — equity 0 is buildable.)
      */
     @Test
@@ -2463,11 +2484,11 @@ class LiquidationExecutorTest {
      * its token) is absent from the snapshot used to be a not-modelled refusal answered with "set this
      * market's action to CONVERT". That advice was wrong for this trigger: the convert router needs the
      * SAME principal oracle ({@code ConvertLiquidationRouter.feedOf} throws on it), so an operator taking it
-     * would re-route a whole market and get the same refusal. It is now a machinery refusal: quarantined,
-     * and the CONVERT advice must NOT appear.
+     * would re-route a whole market and get the same refusal. It is now a machinery refusal, logged at
+     * ERROR (FAB-134 NQ: on every cycle, with no hold), and the CONVERT advice must NOT appear.
      */
     @Test
-    void aMissingPrincipalOracleIsQuarantinedAndNeverAdvisesConvert() {
+    void aMissingPrincipalOracleIsAMachineryFailureLoggedAtErrorAndNeverAdvisesConvert() {
         // Token collateral (its oracle present) and a USDM principal whose datum-named oracle is ABSENT --
         // only the principal leg can be what refuses. (The ada-collateral scenario this test used before
         // FAB-117 is now refused for its collateral first, by name.)
@@ -2484,11 +2505,10 @@ class LiquidationExecutorTest {
             logger.detachAppender(appender);
         }
 
-        assertEquals(1, wiring.executor().quarantinedCount(),
-                "a missing principal oracle is a machinery refusal, quarantined: " + appender.list);
-        assertTrue(appender.list.stream().anyMatch(e -> e.getFormattedMessage()
-                        .contains("no oracle entry for principal oracle asset")),
-                "the refusal must name the trigger: " + appender.list);
+        assertTrue(appender.list.stream().anyMatch(e -> e.getLevel() == Level.ERROR
+                        && e.getFormattedMessage().contains("no oracle entry for principal oracle asset")),
+                "a missing principal oracle is a machinery refusal, at ERROR, naming the trigger: "
+                        + appender.list);
         assertFalse(appender.list.stream().anyMatch(e -> e.getFormattedMessage().contains("action to CONVERT")),
                 "CONVERT needs the same principal oracle; advising it re-routes a whole market for nothing: "
                         + appender.list);
@@ -2496,15 +2516,15 @@ class LiquidationExecutorTest {
 
 
     /**
-     * (c) A pay-in-advance assessment the router refuses as a MACHINERY failure is mapped to the QUARANTINE
-     * path, exactly like the plain path's machinery-failure branch. Here the positive-equity loan has ADA
+     * (c) A pay-in-advance assessment the router refuses as a MACHINERY failure is mapped to the machinery-
+     * failure path, exactly like the plain path's: recorded, logged at ERROR, and rebuilt next cycle. Here the positive-equity loan has ADA
      * collateral, which the router refuses by name ({@code IllegalStateException}, FAB-117 -- before, it died
      * as a message-less {@code NullPointerException} dereferencing a null collateral oracle). A failure
      * thrown by the BUILDER itself is pinned by {@code aConvertBuildFailureSurfacesTheRootCauseBehindTheProductionWrapper},
      * and the message-less cause chain by {@code causeChainIsNeverNullForAMessagelessException}.
      */
     @Test
-    void aConvertAssessmentWhoseBuildThrowsIsQuarantined() {
+    void aConvertAssessmentWhoseBuildThrowsIsRefusedAndRebuiltNextCycle() {
         Scenario convert = convertScenario(FAT_FEE_PER_MILLE);
         // Force a strictly positive equity so the router clears both preconditions (ada principal +
         // positive equity) and actually calls the promoted builder, which then throws.
@@ -2519,14 +2539,11 @@ class LiquidationExecutorTest {
         LiquidationDecision decision = onlyDecision(wiring);
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
         assertNull(decision.txHash(), "the build threw, so nothing was routed");
-        assertEquals(1, wiring.executor().quarantinedCount(),
-                "a genuine build failure quarantines, unlike a clean not-modelled refusal");
-        assertEquals(Set.of(TX_LOAN + "#0"), wiring.executor().quarantinedRefs());
         // The refusal must SAY WHY. The old code recorded e.getMessage(), which is null for this
         // message-less NPE, leaving the operator debugging blind — the exact defect Giovanni hit. The
         // detail now carries the cause chain, so it is non-null and names the fault even with no message.
         // FAB-117: the ada-collateral loan used to die as a message-less NullPointerException here; it is
-        // now refused BY NAME, with the same quarantine. The message-less case is defended by
+        // now refused BY NAME, down the same branch. The message-less case is defended by
         // causeChainIsNeverNullForAMessagelessException.
         assertEquals("IllegalStateException", decision.reason(),
                 "the refusal names the root-cause class");
@@ -2538,6 +2555,13 @@ class LiquidationExecutorTest {
         // simple-vs-qualified name, and the wrapped-cause test below is what really defends this site.
         assertTrue(decision.detail().startsWith("IllegalStateException"),
                 "causeChain uses the SIMPLE name; e.toString() qualifies it: " + decision.detail());
+
+        // FAB-134 NQ: nothing holds it — the next cycle builds it again and refuses it again.
+        wiring.executor().cycle(NOW + 60_000L);
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(2, decisions.size(), "the next cycle attempted the candidate again");
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decisions.getFirst().outcome());
+        assertEquals("IllegalStateException", decisions.getFirst().reason());
     }
 
     // ======================================================================================
@@ -2811,8 +2835,6 @@ class LiquidationExecutorTest {
         LiquidationDecision decision = onlyDecision(wiring);
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
         assertNull(decision.txHash(), "the build threw, so nothing was routed");
-        assertEquals(1, wiring.executor().quarantinedCount(),
-                "a genuine build failure quarantines — unchanged by the surfacing fix");
 
         // The production wrapper really is in the chain: this is the string that used to be the WHOLE
         // detail, and keeping it is what makes the next assertion a statement about walking the chain
@@ -2873,8 +2895,6 @@ class LiquidationExecutorTest {
 
         LiquidationDecision decision = onlyDecision(wiring);
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
-        assertEquals(1, wiring.executor().quarantinedCount(),
-                "a machinery failure quarantines — unchanged by the surfacing fix");
 
         // THE DISCRIMINATOR, as above: unreachable from toString() on the outermost exception.
         assertTrue(decision.detail().contains(BLOCKFROST_TIMEOUT),
@@ -2974,8 +2994,6 @@ class LiquidationExecutorTest {
         assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
         assertEquals(LiquidateTransactionBuilder.Refusal.TRANSACTION_NOT_BUILDABLE.name(),
                 decision.reason(), "recorded under the builder's own Refusal name, unchanged");
-        assertEquals(0, wiring.executor().quarantinedCount(),
-                "a refusal is not a machinery failure and is still not quarantined");
         // THE DISCRIMINATOR: the refusal's own message stops at the wrapper.
         assertTrue(decision.detail().contains(BLOCKFROST_TIMEOUT),
                 "the detail must carry the cause underneath the refusal: " + decision.detail());
@@ -3615,7 +3633,7 @@ class LiquidationExecutorTest {
                         + "60 ADA; the nomination must be sized to the order, not to list position");
     }
 
-    // ===== a VERDICT on the convert route is recorded, never quarantined as machinery =====
+    // ===== a VERDICT on the convert route is recorded at INFO, never logged as machinery =====
 
     /** Throws whatever it is given, and counts how often the executor actually reached it. */
     private static final class ThrowingConvertRouter extends ConvertLiquidationRouter {
@@ -3674,13 +3692,13 @@ class LiquidationExecutorTest {
      * recorded under its own name and NOT held.
      *
      * <p>Before this slice every one of these fell to the executor's generic {@code catch (Exception)}
-     * and was quarantined for thirty minutes at ERROR, indistinguishable from a broken bot.
+     * and was held for thirty minutes at ERROR, indistinguishable from a broken bot.
      *
      * <p>Mutant: remove the {@code ConvertOrderPlan.RefusedException} catch so it falls through again —
-     * the reason becomes the exception class and the quarantine count becomes 1.
+     * the reason becomes the exception class.
      */
     @Test
-    void aConvertPlanRefusalIsRecordedUnderItsOwnNameAndNeverQuarantined() {
+    void aConvertPlanRefusalIsRecordedUnderItsOwnName() {
         ConvertWiring wiring = convertWiringThrowing(new ConvertOrderPlan.RefusedException(
                 ConvertOrderPlan.Refusal.POOL_TOO_THIN,
                 "swapping 22003200000 would return about 824348402, but minimum_receive is 980001429"));
@@ -3693,8 +3711,6 @@ class LiquidationExecutorTest {
                 "the refusal's own name, not the exception class the generic catch would have used");
         assertTrue(decision.detail().contains("824348402"),
                 "the operator needs the numbers, not just the verdict: " + decision.detail());
-        assertEquals(0, wiring.executor().quarantinedCount(),
-                "a verdict about the candidate must not be held as though the bot were broken");
 
         // …and it is genuinely reconsidered on the very next cycle, which is what "not held" means.
         wiring.executor().cycle(NOW + 1_000L);
@@ -3703,64 +3719,67 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * ⛔ <b>A TRANSPORT FAILURE GETS A SHORT HOLD — NOT NOTHING, AND NOT THIRTY MINUTES.</b>
+     * ⛔ <b>A TRANSPORT FAILURE ON THE POOL LOOKUP IS RETRIED NEXT CYCLE AND LOUD ON EVERY ONE.</b>
      *
      * <p>Measured on mainnet 2026-09-09: one Blockfrost hiccup on the pool lookup produced <b>39
      * {@code QUARANTINED} records</b> on a single live loan, because {@code LOOKUP_FAILED} was reaching
-     * the machinery quarantine. A provider that cannot be reached says nothing about the candidate —
-     * but retrying every cycle against a provider that is down is what the quarantine exists for, so
-     * the answer is a SHORT hold: two cycles.
-     *
-     * <p>Both bounds are asserted, because each is a different mutant. Inside one cycle it must still
-     * be held (removing the hold entirely fails here); past two cycles it must be reconsidered (setting
-     * the hold to {@code quarantine-minutes} fails there).
+     * the thirty-minute machinery quarantine; it was then given a two-cycle hold at WARN. FAB-134 NQ
+     * removes the hold: the candidate is eligible, so it is attempted every cycle, and a failure to
+     * reach the provider is logged at ERROR every time it happens.
      */
     @Test
-    void aTransportFailureOnThePoolLookupIsHeldForTwoCyclesNotTheThirtyMinuteQuarantine() {
+    void aTransportFailureOnThePoolLookupIsRetriedNextCycleAndLoggedAtErrorEachTime() {
         ConvertWiring wiring = convertWiringThrowing(new MinswapPoolResolver.RefusedException(
                 MinswapPoolResolver.Refusal.LOOKUP_FAILED, "the pool lookup failed: java.net.SocketTimeoutException"));
 
-        wiring.executor().cycle(NOW);
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+            wiring.executor().cycle(NOW + 60_000L);
+        } finally {
+            logger.detachAppender(appender);
+        }
 
-        LiquidationDecision decision = wiring.log().newestFirst(10).getFirst();
-        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
-        assertEquals("LOOKUP_FAILED", decision.reason(),
-                "a transport failure must be distinguishable from NO_MINSWAP_POOL, which is a verdict");
-        assertEquals(1, wiring.executor().quarantinedCount(),
-                "SOME hold is required: a candidate retried every cycle against a provider that is "
-                        + "down is exactly what the quarantine was built for");
-        assertEquals(1, wiring.router().calls);
-
-        // One cycle later (60s), still inside the two-cycle hold.
-        wiring.executor().cycle(NOW + 60_000L);
-        assertEquals(1, wiring.router().calls, "still held after one cycle");
-        assertEquals(LiquidationDecision.Outcome.QUARANTINED,
-                wiring.log().newestFirst(10).getFirst().outcome());
-
-        // Past two cycles (121s) it must be reconsidered — the whole point of not using 30 minutes.
-        wiring.executor().cycle(NOW + 121_000L);
-        assertEquals(2, wiring.router().calls,
-                "a transport blip must clear in two cycles, not in the 30-minute machinery quarantine");
+        assertEquals(2, wiring.router().calls, "retried on the very next cycle, not held");
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(2, decisions.size());
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+            assertEquals("LOOKUP_FAILED", decision.reason(),
+                    "a transport failure must be distinguishable from NO_MINSWAP_POOL, which is a verdict");
+            assertFalse(decision.detail().contains("held for"), "no hold: " + decision.detail());
+        }
+        List<ILoggingEvent> errors = appender.list.stream()
+                .filter(event -> event.getLevel() == Level.ERROR)
+                .filter(event -> event.getFormattedMessage().contains("failed in transport"))
+                .toList();
+        assertEquals(2, errors.size(), "ERROR on each cycle, never WARN: " + appender.list);
+        assertTrue(errors.getFirst().getFormattedMessage().contains("SocketTimeoutException"),
+                errors.getFirst().getFormattedMessage());
+        assertNotNull(errors.getFirst().getThrowableProxy(), "the exception itself is attached");
     }
 
     /**
      * ⛔ <b>F1 — A WALLET TOO SMALL IS A VERDICT ABOUT THE WALLET, NOT A BROKEN BOT.</b>
      *
      * <p>Round-1 audit: mutant M12 — neuter this catch so the exception falls to the generic
-     * {@code catch (Exception)} and its 30-minute machinery quarantine — killed <b>0 of 1062</b>
+     * {@code catch (Exception)} and its (then) 30-minute machinery quarantine — killed <b>0 of 1062</b>
      * tests. The catch existed, behaved correctly, and nothing held it there; reordering the ladder
      * (the refactor r1 flags as "tempting, separate slice") would have silently restored pre-slice
      * behaviour.
      *
-     * <p>⚠ The operator can top the wallet up between cycles, so holding this for thirty minutes
-     * keeps refusing a convert that has already become fundable. Same treatment the pay-in-advance
+     * <p>⚠ The operator can top the wallet up between cycles; it is an eligibility filter, recorded
+     * under its own name at its own level, not a machinery fault. Same treatment the pay-in-advance
      * path gives its own {@code WalletInputTooSmallException}.
      *
      * <p>The THROW side is pinned separately, in {@code ConvertLiquidationRouterTest} — a fake router
      * can prove what the executor does with the exception and nothing about whether it is ever raised.
      */
     @Test
-    void aWalletTooSmallForTheConvertOrderIsRecordedAndNeverQuarantined() {
+    void aWalletTooSmallForTheConvertOrderIsRecordedAndReconsideredEveryCycle() {
         ConvertWiring wiring = convertWiringThrowing(
                 new ConvertLiquidationRouter.WalletInputTooSmallException(
                         "no nominable wallet utxo can fund this convert: the Minswap order carries "
@@ -3774,15 +3793,11 @@ class LiquidationExecutorTest {
                 "recorded under its own name, not under the exception class the generic catch uses");
         assertTrue(decision.detail().contains("4000000"),
                 "the operator needs the figure to fund against: " + decision.detail());
-        assertEquals(0, wiring.executor().quarantinedCount(),
-                "a wallet the operator can top up between cycles must not be held for 30 minutes");
-        assertTrue(wiring.executor().quarantinedRefs().isEmpty(),
-                "and the quarantine map must be untouched, not merely small");
 
         // Reconsidered on the very next cycle — which is what "not held" has to mean to be worth it.
         wiring.executor().cycle(NOW + 1_000L);
         assertEquals(2, wiring.router().calls,
-                "a topped-up wallet must be retried immediately, not after a machinery quarantine");
+                "a topped-up wallet must be retried immediately");
     }
 
     /**
@@ -3798,7 +3813,5 @@ class LiquidationExecutorTest {
         wiring.executor().cycle(NOW);
 
         assertEquals("AMBIGUOUS_POOL", wiring.log().newestFirst(10).getFirst().reason());
-        assertEquals(0, wiring.executor().quarantinedCount(),
-                "waiting cannot change how many pool UTxOs hold the LP asset");
     }
 }

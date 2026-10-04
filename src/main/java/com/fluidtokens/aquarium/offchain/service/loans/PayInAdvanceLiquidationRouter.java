@@ -44,7 +44,7 @@ import java.util.Map;
  * expected path. Since FAB-117 the oracle preconditions -- ada collateral (no collateral oracle leg),
  * or a leg whose own oracle (the NFT its datum names, pricing its token) is missing -- are checked
  * <em>before</em> the builder is called and refused with {@code IllegalStateException}, which the
- * executor QUARANTINES with no CONVERT advice: the convert route needs the same oracle, so advising it
+ * executor records as a machinery failure at ERROR, every cycle, with no CONVERT advice: the convert route needs the same oracle, so advising it
  * would re-route a whole market for nothing. {@link PayInAdvanceNotModelledException} stays for
  * triggers this path cannot build right now: the router's negative-equity precondition, and the
  * builder's own oracle-feed refusals (feed window not covering the transaction, too little margin left,
@@ -89,7 +89,7 @@ public class PayInAdvanceLiquidationRouter {
      * No nominable wallet UTxO can fund this convert liquidation's lender payout. A <b>refusal</b>,
      * not a machinery failure: it is a true statement about this candidate against this wallet, it is
      * reproducible next cycle, and it becomes buildable the moment the wallet is topped up — so it is
-     * neither quarantined nor logged as an error.
+     * not logged as an error.
      */
     public static class WalletInputTooSmallException extends RuntimeException {
         public WalletInputTooSmallException(String message) {
@@ -136,7 +136,7 @@ public class PayInAdvanceLiquidationRouter {
      *                                          payout this liquidation must fund
      * @throws IllegalStateException            when the loan has ada collateral, or a leg's own oracle
      *                                          (the NFT its datum names, pricing that leg's token) is
-     *                                          missing -- a machinery refusal the executor QUARANTINES
+     *                                          missing -- a machinery refusal the executor logs at ERROR
      *                                          with no CONVERT advice, since convert needs the same
      *                                          oracle (FAB-117). No transaction built.
      * @throws PayInAdvanceNotModelledException for a negative equity (this router), or an oracle feed the
@@ -177,10 +177,10 @@ public class PayInAdvanceLiquidationRouter {
         // ⚠ IllegalStateException, NOT PayInAdvanceNotModelledException: the executor used to answer
         // that one with "set this market's action to CONVERT" (removed, FAB-126), and convert refuses
         // this loan for the same reason (ConvertLiquidationRouter throws the same) — the advice would
-        // re-route a whole market for nothing. Quarantined like the convert router's refusal and like
-        // the NPE it replaces.
+        // re-route a whole market for nothing. A machinery failure, like the convert router's refusal and
+        // like the NPE it replaces.
         // ⛔ Ada collateral is refused by name too (FAB-117): numbers() prices the collateral through this
-        // entry and ada has none, so it used to die as an NPE there. Same quarantine, now saying why.
+        // entry and ada has none, so it used to die as an NPE there. Same failure branch, now saying why.
         if (datum.collateral().isAda()) {
             throw new IllegalStateException("ada collateral: this node builds no pay-in-advance liquidation for it");
         }
@@ -204,8 +204,8 @@ public class PayInAdvanceLiquidationRouter {
             // collateral leg above: the executor used to answer a not-modelled refusal of a non-ada
             // principal with "set this market's action to CONVERT" (removed, FAB-126), and the convert
             // router needs this same oracle (ConvertLiquidationRouter.feedOf throws on it) -- the advice
-            // would re-route a whole market for nothing. Quarantined instead, like the convert router's
-            // identical refusal.
+            // would re-route a whole market for nothing. A machinery failure instead, like the convert
+            // router's identical refusal.
             if (principalOracle == null) {
                 throw new IllegalStateException("no oracle entry for principal oracle asset "
                         + datum.principalOracleAsset().toUnit() + " pricing " + datum.principalAsset().toUnit());
