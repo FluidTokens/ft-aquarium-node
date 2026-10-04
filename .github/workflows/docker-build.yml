@@ -229,7 +229,7 @@ jobs:
       # because WalletSweepServiceTest and WalletReadinessGateTest were deleted on purpose with the sweep.
       #
       # FAB-135/FAB-139 (index pins: StorageFilterSoundnessTest, SyncStartPinTest) re-measured cold on
-      # feat/blockfrost-budget: 190 files / 1653 tests / 0 failures / 0 errors / 50 skipped, 0 orphans.
+      # feat/blockfrost-budget: 190 files / 1656 tests / 0 failures / 0 errors / 50 skipped, 0 orphans.
       # Floor 190.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
