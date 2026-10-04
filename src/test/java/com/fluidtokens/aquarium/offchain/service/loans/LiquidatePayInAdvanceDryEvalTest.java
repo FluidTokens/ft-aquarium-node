@@ -49,6 +49,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -627,13 +628,16 @@ class LiquidatePayInAdvanceDryEvalTest {
     // HashCheckedScriptSupplier) and the offline PlutusV3 evaluator. Mirrors
     // LiquidateProductionWiringTest, the plain sibling's (FAB-134 B3b-1).
     //
-    // The request publishes five loans-v4 validators by reference (the pay-in-advance action stays
-    // witness-attached: EvalFixtures#scriptSupplier does not carry it), and the oracle's script is a
-    // third party's, reachable only through its reference input. That mix is exactly the 2026-08-24
-    // shape: a PARTIAL withReferenceScripts list un-prices the oracle (FeeTooSmallUTxO, CCL trap 9).
+    // The request is the MAINNET shape: six loans-v4 validators by reference — the pay-in-advance
+    // action included, as application.yaml publishes it on mainnet — and the oracle's script, a third
+    // party's, reachable only through its reference input. The rig's script supplier carries the action
+    // as an extra (EvalFixtures#scriptSupplier does not). That mix is exactly the 2026-08-24 shape: a
+    // PARTIAL withReferenceScripts list un-prices the oracle (FeeTooSmallUTxO, CCL trap 9). And
+    // loan.loan, which ScriptTx.mintAsset always witness-attaches, is referenced too, so the strip
+    // seam must remove that copy (ExtraneousScriptWitnessesUTXOW otherwise).
     // ======================================================================================
 
-    /** Five synthetic coordinates whose UTxOs carry the derived loans-v4 hashes — see {@link #productionUniverse}. */
+    /** Six synthetic coordinates whose UTxOs carry the derived loans-v4 hashes — see {@link #productionUniverse}. */
     private static final LiquidateTransactionBuilder.ReferenceScripts PRODUCTION_REFERENCE_SCRIPTS =
             new LiquidateTransactionBuilder.ReferenceScripts(
                     new TransactionInput("b1".repeat(32), 0),
@@ -642,12 +646,15 @@ class LiquidatePayInAdvanceDryEvalTest {
                     new TransactionInput("b4".repeat(32), 0),
                     new TransactionInput("b5".repeat(32), 0),
                     null,
+                    null,
+                    new TransactionInput("b6".repeat(32), 0),
                     null);
 
-    /** The five validators in {@link #PRODUCTION_REFERENCE_SCRIPTS}' order. */
+    /** The six validators in {@link #PRODUCTION_REFERENCE_SCRIPTS}' order. */
     private static List<PlutusScript> productionReferencedScripts() {
         return List.of(REGISTRY.getLoanScript(), REGISTRY.getLoanSpendScript(), REGISTRY.getLenderManagerScript(),
-                REGISTRY.getLenderManagerSpendScript(), REGISTRY.getLoanClaimActionScript());
+                REGISTRY.getLenderManagerSpendScript(), REGISTRY.getLoanClaimActionScript(),
+                REGISTRY.getLmLiquidateAndPayInAdvanceActionScript());
     }
 
     /** CCL's placeholder mem (CCL trap 8): a redeemer still carrying it was never costed. */
@@ -675,6 +682,27 @@ class LiquidatePayInAdvanceDryEvalTest {
             assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
                     key + " carries CCL's 10000-mem placeholder: the evaluator was not load-bearing");
         }
+
+        // No script both witnessed and referenced (ExtraneousScriptWitnessesUTXOW): loan.loan is
+        // witness-attached by ScriptTx.mintAsset AND referenced, so only the preBalanceTx strip seam
+        // keeps this empty. Read off the deserialised transaction.
+        java.util.Map<TransactionInput, Utxo> byRef = new java.util.HashMap<>();
+        universe.forEach(u -> byRef.put(new TransactionInput(u.getTxHash(), u.getOutputIndex()), u));
+        Set<String> referenced = new HashSet<>();
+        for (TransactionInput input : reread.getBody().getReferenceInputs()) {
+            Utxo utxo = byRef.get(input);
+            if (utxo != null && utxo.getReferenceScriptHash() != null) {
+                referenced.add(utxo.getReferenceScriptHash());
+            }
+        }
+        assertTrue(referenced.contains(ORACLE_SCRIPT_HASH), "the oracle script travels by reference");
+        assertTrue(referenced.contains(REGISTRY.getLmLiquidateAndPayInAdvanceActionScriptHash()),
+                "the pay-in-advance action travels by reference, as mainnet publishes it");
+        assertEquals(7, referenced.size(), "six loans-v4 validators and the oracle, all by reference");
+        Set<String> witnessed = witnessedScriptHashes(reread);
+        witnessed.retainAll(referenced);
+        assertTrue(witnessed.isEmpty(),
+                "scripts both witnessed and referenced (ExtraneousScriptWitnessesUTXOW): " + witnessed);
     }
 
     /**
@@ -700,16 +728,19 @@ class LiquidatePayInAdvanceDryEvalTest {
         }
         long oracleBytes = oracleScript().scriptRefBytes().length;
         BigDecimal perByte = EvalFixtures.protocolParams().getProtocolParams().getMinFeeRefScriptCostPerByte();
-        BigInteger flatFloor = perByte.multiply(BigDecimal.valueOf(registryBytes + oracleBytes))
-                .setScale(0, RoundingMode.CEILING).toBigIntegerExact();
-        BigInteger oracleShare = perByte.multiply(BigDecimal.valueOf(oracleBytes))
-                .setScale(0, RoundingMode.CEILING).toBigIntegerExact();
+        long totalBytes = registryBytes + oracleBytes;
+        // The mainnet shape crosses the Conway tier boundary (25,600 B), so the floor is the TIERED fee,
+        // not a flat rate. The oracle's share is what the ladder charges for its bytes on TOP of the
+        // others — the marginal cost of pricing it, i.e. exactly what an unpriced oracle would lose.
+        BigInteger tieredFloor = tieredRefScriptFee(perByte, totalBytes);
+        BigInteger oracleShare = tieredFloor.subtract(tieredRefScriptFee(perByte, registryBytes));
 
         BigInteger delta = priced.getBody().getFee().subtract(unpriced.getBody().getFee());
         log.info("FAB-134 B3b-2 pay-in-advance ref-script fee: priced {} unpriced {} delta {} | registry {} B "
-                        + "+ oracle {} B = {} B x {} = flat floor {} (oracle share {})",
+                        + "+ oracle {} B = {} B at {}/B tiered = floor {} (oracle share {})",
                 priced.getBody().getFee(), unpriced.getBody().getFee(), delta, registryBytes, oracleBytes,
-                registryBytes + oracleBytes, perByte, flatFloor, oracleShare);
+                totalBytes, perByte, tieredFloor, oracleShare);
+        assertTrue(totalBytes > 25_600L, "the mainnet shape must exercise the tier ladder: " + totalBytes + " B");
 
         // Tolerance: the two bodies differ ONLY in the fee field and the change output's coin, and the
         // size fee moves by minFeeA (44) per byte. Both fees and both change coins sit in the same CBOR
@@ -718,9 +749,9 @@ class LiquidatePayInAdvanceDryEvalTest {
         // the oracle's share, or this assertion could not tell "the oracle was priced" from "it was not".
         BigInteger tolerance = BigInteger.valueOf(2 * 44);
         assertTrue(tolerance.compareTo(oracleShare) < 0, "the tolerance would hide the oracle's fee");
-        assertTrue(delta.compareTo(flatFloor.subtract(tolerance)) >= 0,
-                "the reference-script fee charged (" + delta + ") is below the flat floor for all six "
-                        + "referenced scripts (" + flatFloor + ", the oracle's share " + oracleShare
+        assertTrue(delta.compareTo(tieredFloor.subtract(tolerance)) >= 0,
+                "the reference-script fee charged (" + delta + ") is below the tiered floor for all seven "
+                        + "referenced scripts (" + tieredFloor + ", the oracle's share " + oracleShare
                         + "): a referenced script went unpriced, which the ledger rejects as FeeTooSmallUTxO");
     }
 
@@ -741,7 +772,7 @@ class LiquidatePayInAdvanceDryEvalTest {
 
     /**
      * (iv) CCL trap 9b, the SELECTOR seam, through the production constructor. The bot address holds the
-     * five published loans-v4 reference scripts (ada-only, 20 ADA each) and ONE wallet utxo swept from
+     * six published loans-v4 reference scripts (ada-only, 20 ADA each) and ONE wallet utxo swept from
      * short to ample. When the wallet cannot cover the build, cardano-client-lib's ChangeOutputAdjustments
      * tops the change up through the context's UtxoSelector (no reference-script check) — so without the
      * selector installed in {@code preBalanceTx} it consumes a published script. For every wallet value
@@ -760,7 +791,7 @@ class LiquidatePayInAdvanceDryEvalTest {
             Set<TransactionInput> published = new HashSet<>();
             universe.stream().filter(u -> u.getReferenceScriptHash() != null)
                     .forEach(u -> published.add(new TransactionInput(u.getTxHash(), u.getOutputIndex())));
-            assertEquals(6, published.size(), "five loans-v4 reference scripts and the oracle's");
+            assertEquals(7, published.size(), "six loans-v4 reference scripts and the oracle's");
 
             Transaction transaction;
             try {
@@ -804,9 +835,41 @@ class LiquidatePayInAdvanceDryEvalTest {
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), scripts, evaluator);
     }
 
-    /** The provider leaf: the registry's applied scripts plus the deployed oracle, served by hash. */
+    /**
+     * The provider leaf: the registry's applied scripts plus the deployed oracle and the pay-in-advance
+     * action (which {@link EvalFixtures#scriptSupplier} does not carry), served by hash.
+     */
     private static ScriptSupplier rigScripts() {
-        return EvalFixtures.scriptSupplier(REGISTRY, List.of(oracleScript()));
+        return EvalFixtures.scriptSupplier(REGISTRY,
+                List.of(oracleScript(), REGISTRY.getLmLiquidateAndPayInAdvanceActionScript()));
+    }
+
+    /**
+     * The Conway reference-script fee ladder: {@code perByte} for each byte of the first 25,600, then the
+     * rate multiplied by 1.2 for each further 25,600-byte tier; rounded up (a lovelace over is accepted,
+     * one under is a rejection). 26,337 B at 15/B = 25,600 x 15 + 737 x 18 = 397,266.
+     */
+    private static BigInteger tieredRefScriptFee(BigDecimal perByte, long bytes) {
+        BigDecimal total = BigDecimal.ZERO;
+        BigDecimal rate = perByte;
+        long remaining = bytes;
+        while (remaining > 0) {
+            long tier = Math.min(25_600L, remaining);
+            total = total.add(rate.multiply(BigDecimal.valueOf(tier)));
+            rate = rate.multiply(new BigDecimal("1.2"));
+            remaining -= tier;
+        }
+        return total.setScale(0, RoundingMode.CEILING).toBigIntegerExact();
+    }
+
+    private static Set<String> witnessedScriptHashes(Transaction tx) {
+        Set<String> hashes = new HashSet<>();
+        Stream.of(tx.getWitnessSet().getPlutusV1Scripts(), tx.getWitnessSet().getPlutusV2Scripts(),
+                        tx.getWitnessSet().getPlutusV3Scripts())
+                .filter(java.util.Objects::nonNull)
+                .flatMap(List::stream)
+                .forEach(script -> hashes.add(hashOf(script)));
+        return hashes;
     }
 
     private static AikenTransactionEvaluator aiken(List<Utxo> universe) {
@@ -815,7 +878,7 @@ class LiquidatePayInAdvanceDryEvalTest {
     }
 
     /**
-     * The fixture universe with {@code wallet} in place of the funded wallet utxo, plus the five
+     * The fixture universe with {@code wallet} in place of the funded wallet utxo, plus the six
      * published loans-v4 reference-script UTxOs carrying the derived hashes (a Blockfrost Utxo never
      * carries the bytes).
      *
@@ -829,7 +892,8 @@ class LiquidatePayInAdvanceDryEvalTest {
         universe.add(wallet);
         List<TransactionInput> coordinates = List.of(PRODUCTION_REFERENCE_SCRIPTS.loan(),
                 PRODUCTION_REFERENCE_SCRIPTS.loanSpend(), PRODUCTION_REFERENCE_SCRIPTS.lenderManager(),
-                PRODUCTION_REFERENCE_SCRIPTS.lenderManagerSpend(), PRODUCTION_REFERENCE_SCRIPTS.loanClaimAction());
+                PRODUCTION_REFERENCE_SCRIPTS.lenderManagerSpend(), PRODUCTION_REFERENCE_SCRIPTS.loanClaimAction(),
+                PRODUCTION_REFERENCE_SCRIPTS.lmLiquidateAndPayInAdvanceAction());
         List<PlutusScript> scripts = productionReferencedScripts();
         for (int i = 0; i < coordinates.size(); i++) {
             String hash = hashOf(scripts.get(i));
