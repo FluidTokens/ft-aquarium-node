@@ -2,10 +2,12 @@ package com.fluidtokens.aquarium.offchain.config;
 
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.backend.api.BackendService;
 import com.bloxbean.cardano.client.backend.api.UtxoService;
 import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
@@ -36,8 +38,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -80,6 +84,7 @@ class YaciConfigWiringTest {
                 LoanFixtures.converters(),
                 LoanFixtures.utxoSupplier(List.of()),
                 LoanFixtures.protocolParams(),
+                hash -> Optional.empty(),
                 new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
 
         Field field = LiquidateTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
@@ -160,6 +165,7 @@ class YaciConfigWiringTest {
                 LoanFixtures.converters(),
                 LoanFixtures.utxoSupplier(List.of()),
                 LoanFixtures.protocolParams(),
+                hash -> Optional.empty(),
                 new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
 
         Field field = LiquidateTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
@@ -282,6 +288,55 @@ class YaciConfigWiringTest {
 
         assertEquals("blockfrost", bean.getTxOutput(missTx, 4).orElseThrow().getAddress());
         verify(utxoService, times(1)).getTxOutput(missTx, 4);
+    }
+
+    /**
+     * ⛔ FAB-134 B3b: the liquidation builder bean holds the SAME supplier instances the container
+     * injected — the index-first {@code UtxoSupplier}, the per-epoch {@code ProtocolParamsSupplier} and
+     * the byte-serving {@code ScriptSupplier} — and no {@code BackendService} at all. A builder that
+     * built its own Blockfrost suppliers would put every coin selection and every params read back on
+     * Blockfrost; one that held a backend would hold a submission path.
+     */
+    @Test
+    void theLiquidateBuilderBeanHoldsTheInjectedSuppliersAndNoBackend() throws Exception {
+        UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(List.of());
+        ProtocolParamsSupplier protocolParamsSupplier = LoanFixtures.protocolParams();
+        ScriptSupplier scriptSupplier = hash -> Optional.empty();
+
+        LiquidateTransactionBuilder builder = new YaciConfig().liquidateTransactionBuilder(
+                LoanFixtures.registry(), previewNetwork(), LoanFixtures.converters(),
+                utxoSupplier, protocolParamsSupplier, scriptSupplier,
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+
+        assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
+                "the builder does not hold the injected (index-first) UtxoSupplier");
+        assertSame(protocolParamsSupplier, fieldOf(builder, "protocolParamsSupplier"),
+                "the builder does not hold the injected (per-epoch) ProtocolParamsSupplier");
+        assertSame(scriptSupplier, fieldOf(builder, "scriptSupplier"),
+                "the builder does not hold the injected ScriptSupplier");
+        for (Field field : LiquidateTransactionBuilder.class.getDeclaredFields()) {
+            assertFalse(BackendService.class.isAssignableFrom(field.getType()),
+                    "the liquidation builder declares a BackendService field (" + field.getName()
+                            + "): a submission path, and a route back to Blockfrost for every read");
+        }
+    }
+
+    /** The script supplier bean is the hash-checked, fail-closed one — not the raw Blockfrost supplier. */
+    @Test
+    void theScriptSupplierBeanIsHashChecked() {
+        BFBackendService bf = mock(BFBackendService.class);
+        ScriptSupplier bean = new YaciConfig().scriptSupplier(bf);
+
+        assertInstanceOf(HashCheckedScriptSupplier.class, bean,
+                "YaciConfig's ScriptSupplier bean is a " + bean.getClass().getName()
+                        + ": an empty answer would price a reference script at zero (CCL trap 9), and "
+                        + "unverified bytes would be served");
+    }
+
+    private static Object fieldOf(Object target, String name) throws Exception {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(target);
     }
 
     /**

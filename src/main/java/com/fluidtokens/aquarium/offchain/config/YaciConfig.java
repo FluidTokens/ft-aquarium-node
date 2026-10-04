@@ -1,9 +1,11 @@
 package com.fluidtokens.aquarium.offchain.config;
 
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
+import com.bloxbean.cardano.client.backend.api.DefaultScriptSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
@@ -74,21 +76,46 @@ public class YaciConfig {
     }
 
     /**
-     * The production builder, with a real script-cost evaluator.
+     * The script bytes a reference input publishes, by hash — fetched from Blockfrost ONCE per hash,
+     * checked to hash to what was asked for, and served from memory after that (see
+     * {@link HashCheckedScriptSupplier} for why a by-hash memo is not a cache of chain state).
      * <p>
-     * Without one, cardano-client-lib leaves every redeemer holding placeholder ex-units — 10000 mem
-     * against a measured 2.26M for one ada/ada liquidation — and a transaction that under-declares is
-     * not rejected by the mempool: it lands and then fails on chain, forfeiting the collateral. So the
+     * cardano-client-lib needs the bytes, not just the {@code referenceScriptHash} a UTxO carries, to
+     * charge the Conway reference-script fee; without them it charges zero and the ledger rejects the
+     * transaction at phase 1 (CCL trap 9). This supplier never answers empty for a real hash.
+     */
+    @Bean
+    public ScriptSupplier scriptSupplier(BFBackendService bfBackendService) {
+        return new HashCheckedScriptSupplier(new DefaultScriptSupplier(bfBackendService.getScriptService()));
+    }
+
+    /**
+     * The production liquidation builder (FAB-134 B3b): built from the three injected suppliers and a
+     * real script-cost evaluator, and holding nothing else.
+     * <ul>
+     *   <li>{@link UtxoSupplier} — the index-first bean above: coin selection, collateral and every
+     *       indexed reference input come from the local index; only out-refs the index cannot hold
+     *       reach Blockfrost.</li>
+     *   <li>{@link ProtocolParamsSupplier} — the per-epoch bean above, not a fetch per build.</li>
+     *   <li>{@link ScriptSupplier} — the bean above, so every referenced script is priced, the
+     *       oracle's included.</li>
+     * </ul>
+     * <p>
+     * Without an evaluator, cardano-client-lib leaves every redeemer holding placeholder ex-units — 10000
+     * mem against a measured 2.26M for one ada/ada liquidation — and a transaction that under-declares
+     * is not rejected by the mempool: it lands and then fails on chain, forfeiting the collateral. So the
      * armed path has to be given an evaluator, and Blockfrost's {@code /utils/txs/evaluate} is the one
      * to give it: it evaluates against the chain's own protocol parameters and cost models, so the
      * question "is our pinned cost model still the chain's?" cannot arise, and it resolves the
-     * transaction's inputs itself because in production they are real on-chain UTxOs.
+     * transaction's inputs itself because in production they are real on-chain UTxOs. It is the one
+     * Blockfrost call a build still makes (with {@code getTxOutput} for reference inputs the index does
+     * not hold).
      * <p>
      * The lambda is the narrowing, exactly as {@code LiquidationExecutor}'s {@code TransactionSubmitter}
      * is: {@link TransactionEvaluator} declares one operation and no submit method, so what the builder
-     * holds can price a transaction and nothing else. Handing it the {@code BFBackendService}, or the
-     * {@code DefaultTransactionProcessor} that also implements this interface, would hand it a
-     * submission path through the back door.
+     * holds can price a transaction and nothing else. The builder is handed no {@code BFBackendService}
+     * and no {@code DefaultTransactionProcessor} — either would hand it a submission path through the
+     * back door.
      */
     @Bean
     public LiquidateTransactionBuilder liquidateTransactionBuilder(LoansContractRegistry registry,
@@ -96,15 +123,15 @@ public class YaciConfig {
                                                                    CardanoConverters cardanoConverters,
                                                                    UtxoSupplier utxoSupplier,
                                                                    ProtocolParamsSupplier protocolParamsSupplier,
+                                                                   ScriptSupplier scriptSupplier,
                                                                    BFBackendService bfBackendService) {
         TransactionEvaluator scriptCostEvaluator =
                 (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
-        // The whole BackendService, as the library documents: QuickTxBuilder wires its utxo
-        // supplier, protocol params, script supplier and transaction processor from it in one
-        // constructor. The script supplier is the part that matters now — a validator travelling
-        // as a reference script has to be fetchable by hash for the transaction to be priced.
+        // The three injected suppliers and the evaluator lambda — never the BackendService itself. The
+        // builder constructs QuickTxBuilder from the suppliers with a null processor, so it can price a
+        // transaction (evaluator + script bytes) and has nothing that could submit one.
         return new LiquidateTransactionBuilder(registry, network.getCardanoNetwork(), cardanoConverters,
-                bfBackendService, scriptCostEvaluator);
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator);
     }
 
     /**

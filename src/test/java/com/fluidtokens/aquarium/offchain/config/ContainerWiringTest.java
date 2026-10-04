@@ -74,6 +74,7 @@ class ContainerWiringTest {
                 QuickTxBuilder.class,
                 UtxoSupplier.class,
                 ProtocolParamsSupplier.class,
+                com.bloxbean.cardano.client.api.ScriptSupplier.class,
                 LiquidateTransactionBuilder.class,
                 CompoundTransactionBuilder.class,
                 MinswapPoolResolver.class,
