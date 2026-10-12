@@ -496,4 +496,5 @@ The line names each field at fault (derived vs chain). Fix the coordinates and r
 about is `REFERENCE_SCRIPT_UNVERIFIED` (used as configured), and a compound validator nothing supplies is
 `REFERENCE_SCRIPT_MISSING` (inline; the compound list is checked only with `loans.compound.enabled=true`).
 The readiness page shows them in a **REFERENCE SCRIPTS** banner. Only
-`loans.verify-config.fail-on-unreachable=true` stops the boot over them.
+`loans.verify-config.fail-on-unreachable=true` stops the boot, and only over an UNVERIFIED named
+`loans.liquidation.reference-scripts.*` key; an UNVERIFIED compound-list entry never does.

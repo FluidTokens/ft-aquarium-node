@@ -237,7 +237,8 @@ react differently:
   `REFERENCE_SCRIPT_UNVERIFIED` (the provider could not be asked): used as configured.
   `REFERENCE_SCRIPT_MISSING` (compound only, and only with `loans.compound.enabled=true`): a compound
   validator no usable coordinate supplies, which travels inline. Only
-  `loans.verify-config.fail-on-unreachable=true` still stops the boot, on an UNVERIFIED coordinate.
+  `loans.verify-config.fail-on-unreachable=true` still stops the boot, and only on an UNVERIFIED named
+`loans.liquidation.reference-scripts.*` key; an UNVERIFIED compound-list entry never does.
 
 ⚠ **A healthy `/healthcheck` does not mean lending may build** — the gate is reported, not part of the
 verdict, because the scheduled payments it guards keep running. Read the gate before re-arming:
