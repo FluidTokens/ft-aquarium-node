@@ -16,6 +16,7 @@ import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
 import com.bloxbean.cardano.client.util.HexUtil;
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
@@ -307,6 +308,103 @@ class LiquidateProductionWiringTest {
         assertTrue(built > 0, "no wallet value built at all, so the sweep proves nothing: " + outcomes);
     }
 
+    /**
+     * (vii) ⛔ FAB-108, end to end through the PRODUCTION constructor: a {@code loan-spend} coordinate
+     * that publishes ANOTHER validator (the asset manager's — a foreign fixture, not one the mechanism
+     * under test made) is dropped at boot by the real verifier, and the narrowed scripts then build: the
+     * loan-spend validator travels inline, costed by the Aiken evaluator, and is never also referenced.
+     * The "must not" is step 4 — the same build with the un-narrowed scripts is refused, not shipped.
+     */
+    @Test
+    void aCoordinatePublishingAnotherValidatorIsDroppedAtBootAndItsValidatorTravelsInline() throws Exception {
+        TransactionInput foreignCoordinate = new TransactionInput("a9".repeat(32), 0);
+        String foreignHash = hashOf(REGISTRY.getAssetManagerScript());
+        String loanSpendHash = hashOf(REGISTRY.getLoanSpendScript());
+        List<Utxo> universe = new ArrayList<>(universe());
+        universe.add(Utxo.builder().txHash(foreignCoordinate.getTransactionId())
+                .outputIndex(foreignCoordinate.getIndex()).address(LoanFixtures.entAddress(foreignHash))
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                .referenceScriptHash(foreignHash).build());
+        com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutputLookup chain =
+                (tx, ix) -> universe.stream()
+                        .filter(u -> u.getTxHash().equals(tx) && u.getOutputIndex() == ix)
+                        .findFirst()
+                        .map(u -> Result.<com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput>success("ok")
+                                .withValue(new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput(
+                                        u.getReferenceScriptHash(),
+                                        com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.Liveness.UNSPENT,
+                                        null))
+                                .code(200))
+                        .orElseGet(() -> Result.<com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput>error("HTTP 404").code(404));
+
+        // Step 1, the control: the unmodified coordinates verify and nothing is dropped.
+        var control = liquidationConfiguration(REFERENCE_SCRIPTS);
+        var controlVerifier = new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier(
+                REGISTRY, control, chain, false);
+        controlVerifier.verify();
+        assertEquals(REFERENCE_SCRIPTS, control.getReferenceScripts(), "the honest coordinates must all be kept");
+        assertTrue(controlVerifier.degradations().isEmpty(), controlVerifier.degradations().toString());
+
+        // Step 2, the drop: loan-spend at the foreign coordinate is nulled, and only that slot.
+        LiquidateTransactionBuilder.ReferenceScripts foreign = new LiquidateTransactionBuilder.ReferenceScripts(
+                REFERENCE_SCRIPTS.loan(), foreignCoordinate, REFERENCE_SCRIPTS.lenderManager(),
+                REFERENCE_SCRIPTS.lenderManagerSpend(), REFERENCE_SCRIPTS.loanClaimAction(),
+                REFERENCE_SCRIPTS.lmLiquidateAction(), null);
+        var configuration = liquidationConfiguration(foreign);
+        new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier(
+                REGISTRY, configuration, chain, false).verify();
+        LiquidateTransactionBuilder.ReferenceScripts narrowed = configuration.getReferenceScripts();
+        assertEquals(new LiquidateTransactionBuilder.ReferenceScripts(REFERENCE_SCRIPTS.loan(), null,
+                        REFERENCE_SCRIPTS.lenderManager(), REFERENCE_SCRIPTS.lenderManagerSpend(),
+                        REFERENCE_SCRIPTS.loanClaimAction(), REFERENCE_SCRIPTS.lmLiquidateAction(), null),
+                narrowed, "only loan-spend may be dropped");
+
+        // Step 3, the narrowed build through the production constructor.
+        Recording evaluator = new Recording(aiken(universe));
+        Transaction built = production(universe, new HashCheckedScriptSupplier(rigScripts()), evaluator)
+                .build(request(WALLET_UTXO, narrowed));
+        assertEquals(1, evaluator.calls.get(), "exactly one evaluation per build");
+        Transaction reread = Transaction.deserialize(built.serialize());
+        for (Redeemer redeemer : reread.getWitnessSet().getRedeemers()) {
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    redeemer.getTag() + "#" + redeemer.getIndex() + " carries CCL's placeholder mem");
+        }
+        Set<String> witnessed = witnessedScriptHashes(reread.getWitnessSet());
+        assertTrue(witnessed.contains(loanSpendHash), "the dropped validator travels inline: " + witnessed);
+        assertTrue(!reread.getBody().getReferenceInputs().contains(foreignCoordinate),
+                "the dropped coordinate must not be a reference input");
+        Map<TransactionInput, Utxo> byRef = new java.util.HashMap<>();
+        universe.forEach(u -> byRef.put(new TransactionInput(u.getTxHash(), u.getOutputIndex()), u));
+        Set<String> referenced = new HashSet<>();
+        for (TransactionInput input : reread.getBody().getReferenceInputs()) {
+            Utxo utxo = byRef.get(input);
+            if (utxo != null && utxo.getReferenceScriptHash() != null) {
+                referenced.add(utxo.getReferenceScriptHash());
+            }
+        }
+        Set<String> both = new HashSet<>(witnessed);
+        both.retainAll(referenced);
+        assertTrue(both.isEmpty(), "scripts both witnessed and referenced (ExtraneousScriptWitnessesUTXOW): " + both);
+
+        // Step 4, the "must not": the un-narrowed scripts are refused before anything is shipped.
+        LiquidateTransactionBuilder.RefusedException refused = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> production(universe, new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(universe)))
+                        .build(request(WALLET_UTXO, foreign)));
+        log.info("FAB-108 un-narrowed build refused: reason={} message={}", refused.getReason(), refused.getMessage());
+        // VH-12: refused for the stated reason — the loan-spend validator is referenced at a coordinate that
+        // does not carry it, so evaluation finds it missing (measured: RequiredRedeemersMismatch, missing
+        // the loan-spend hash, extra the asset manager's).
+        assertEquals(LiquidateTransactionBuilder.Refusal.SCRIPT_COST_EVALUATION_FAILED, refused.getReason());
+        assertTrue(refused.getMessage().contains(loanSpendHash), refused.getMessage());
+    }
+
+    private static AppConfig.LiquidationConfiguration liquidationConfiguration(
+            LiquidateTransactionBuilder.ReferenceScripts scripts) {
+        return new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
+                BigInteger.ZERO, 200, scripts);
+    }
+
     /** (vi) The production constructor has no null-evaluator form (CCL trap 8). */
     @Test
     void theProductionConstructorRefusesANullEvaluator() {
@@ -369,6 +467,11 @@ class LiquidateProductionWiringTest {
     }
 
     private static LiquidateTransactionBuilder.Request request(Utxo wallet) {
+        return request(wallet, REFERENCE_SCRIPTS);
+    }
+
+    private static LiquidateTransactionBuilder.Request request(Utxo wallet,
+                                                               LiquidateTransactionBuilder.ReferenceScripts scripts) {
         LoanDatum datum = new LoanDatumConverter().deserialize(LOAN_DATUM_HEX);
         LenderManagerDatum bondDatum = new LenderManagerDatumConverter().deserialize(BOND_DATUM_HEX);
         Loan loan = new Loan(LOAN_TX, LOAN_OUTPUT_INDEX, LOAN_ADDRESS, LOAN_ID,
@@ -382,7 +485,7 @@ class LiquidateProductionWiringTest {
         return new LiquidateTransactionBuilder.Request(
                 List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loanUtxo(), bondUtxo())),
                 CONFIG_UTXO, LM_CONFIG_UTXO, Map.of(ORACLE_NFT.toUnit(), oracle), wallet,
-                LoanFixtures.botAddress(), VALID_FROM, VALID_TO, MARGIN, REFERENCE_SCRIPTS);
+                LoanFixtures.botAddress(), VALID_FROM, VALID_TO, MARGIN, scripts);
     }
 
     private static Utxo loanUtxo() {

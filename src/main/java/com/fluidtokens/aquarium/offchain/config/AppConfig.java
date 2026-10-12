@@ -300,9 +300,10 @@ public class AppConfig {
         /**
          * ⛔ <b>THIS CLASS IS NOT {@code @ConfigurationProperties}, AND MUST NOT BECOME ONE AGAIN.</b>
          *
-         * <p>It carries a dozen {@code @Value} fields and three <b>computed</b> ones — {@link #mode},
-         * {@link #referenceScripts} — that are written by {@link #init()} and by test constructors, and
-         * by nothing else. Lombok's {@code @Getter} gives every one of them a {@code getX()}, and
+         * <p>It carries a dozen {@code @Value} fields and <b>computed</b> ones — {@link #mode},
+         * {@link #referenceScripts}, {@link #configuredReferenceScripts} — that are written by
+         * {@link #init()} and by test constructors, and by nothing else except
+         * {@link #narrowReferenceScripts}, which may only drop a coordinate (FAB-108). Lombok's {@code @Getter} gives every one of them a {@code getX()}, and
          * <b>Spring's JavaBean binder treats a getter under the bound prefix as a bindable property and
          * demands a setter for it.</b>
          *
@@ -710,10 +711,24 @@ public class AppConfig {
         private String referenceScriptLmLiquidateAndConvertAction;
 
         /**
-         * The parsed form of the nine keys above, as {@link LiquidateTransactionBuilder} wants
-         * them: a {@code null} field per validator that is not published.
+         * The reference scripts every liquidation route builds from, as {@link LiquidateTransactionBuilder}
+         * wants them: a {@code null} field per validator that travels inline.
+         *
+         * <p>⛔ <b>Since FAB-108 this is the CONFIGURED set minus whatever the boot-time
+         * {@code LoansReferenceScriptVerifier} dropped</b> — a coordinate that is absent, spent, carries
+         * no reference script, or publishes a hash other than the one this node derives for its key.
+         * A dropped validator travels inline from the vendored blueprint. Volatile because the verifier
+         * narrows it once, after the parse, from its own {@code @PostConstruct}.
          */
-        private LiquidateTransactionBuilder.ReferenceScripts referenceScripts =
+        private volatile LiquidateTransactionBuilder.ReferenceScripts referenceScripts =
+                LiquidateTransactionBuilder.ReferenceScripts.none();
+
+        /**
+         * The parsed form of the nine keys above, exactly as configured, never narrowed. Only the
+         * verifier reads it — it is what the chain is checked against — and it is what
+         * {@link #narrowReferenceScripts} judges a narrowing by.
+         */
+        private LiquidateTransactionBuilder.ReferenceScripts configuredReferenceScripts =
                 LiquidateTransactionBuilder.ReferenceScripts.none();
 
         /**
@@ -776,6 +791,7 @@ public class AppConfig {
             this.checkProfitability = checkProfitability;
             this.minProfitAbsoluteLovelace = minProfitAbsoluteLovelace;
             this.referenceScripts = referenceScripts;
+            this.configuredReferenceScripts = referenceScripts;
         }
 
         /**
@@ -883,7 +899,48 @@ public class AppConfig {
                             referenceScriptLmLiquidateAndPayInAdvanceAction),
                     referenceInput("loans.liquidation.reference-scripts.lm-liquidate-and-convert-action",
                             referenceScriptLmLiquidateAndConvertAction));
+            configuredReferenceScripts = referenceScripts;
             log.info("INIT - liquidation reference scripts: {}", referenceScripts);
+        }
+
+        /**
+         * ⛔ <b>Replaces the live reference scripts with {@code usable}, which may only DROP a configured
+         * coordinate</b> — every slot of {@code usable} must be {@code null} or equal to the configured
+         * slot, or nothing changes and this throws. Called once, by {@code LoansReferenceScriptVerifier},
+         * to null the coordinates it found unusable at boot (FAB-108); a dropped validator then travels
+         * inline. Judged against the CONFIGURED set, never the current one, so a repeated pass gives the
+         * same answer.
+         *
+         * <p>⚠ Deliberately not named {@code setReferenceScripts}: a bean-style setter for a real
+         * {@code application.yaml} key is exactly what a binder would claim (see the class note above).
+         */
+        public void narrowReferenceScripts(LiquidateTransactionBuilder.ReferenceScripts usable) {
+            if (usable == null) {
+                throw new IllegalArgumentException("narrowing may only drop a coordinate; it cannot remove "
+                        + "the reference scripts themselves (pass ReferenceScripts.none() to drop every slot)");
+            }
+            LiquidateTransactionBuilder.ReferenceScripts configured = configuredReferenceScripts;
+            requireDropOnly("loan", configured.loan(), usable.loan());
+            requireDropOnly("loan-spend", configured.loanSpend(), usable.loanSpend());
+            requireDropOnly("lender-manager", configured.lenderManager(), usable.lenderManager());
+            requireDropOnly("lender-manager-spend", configured.lenderManagerSpend(), usable.lenderManagerSpend());
+            requireDropOnly("loan-claim-action", configured.loanClaimAction(), usable.loanClaimAction());
+            requireDropOnly("lm-liquidate-action", configured.lmLiquidateAction(), usable.lmLiquidateAction());
+            requireDropOnly("asset-manager", configured.assetManager(), usable.assetManager());
+            requireDropOnly("lm-liquidate-and-pay-in-advance-action",
+                    configured.lmLiquidateAndPayInAdvanceAction(), usable.lmLiquidateAndPayInAdvanceAction());
+            requireDropOnly("lm-liquidate-and-convert-action",
+                    configured.lmLiquidateAndConvertAction(), usable.lmLiquidateAndConvertAction());
+            referenceScripts = usable;
+            log.info("INIT - liquidation reference scripts in use: {}", usable);
+        }
+
+        private static void requireDropOnly(String slot, TransactionInput configured, TransactionInput usable) {
+            if (usable != null && !usable.equals(configured)) {
+                throw new IllegalArgumentException(("narrowing may only drop a coordinate, never add or "
+                        + "change one: loans.liquidation.reference-scripts.%s is configured as %s and was "
+                        + "narrowed to %s").formatted(slot, configured, usable));
+            }
         }
 
         /**

@@ -29,9 +29,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * survives: the builders were tested, the economics were tested, and the seam between them was not.
  *
  * <h2>Why the map is keyed by the REGISTRY's hashes</h2>
- * {@code LoansReferenceScriptVerifier} resolves every configured coordinate at startup and hard-fails
- * on a mismatch, so by the time this runs, "the slot named {@code loan-spend} publishes the loan-spend
- * script" is already proven. The compound path reads hashes off chain instead because its coordinates
+ * {@code LoansReferenceScriptVerifier} resolves every configured coordinate at startup and drops (nulls)
+ * any slot whose coordinate does not publish that slot's derived hash (FAB-108), so by the time this
+ * runs, a slot still present either publishes its own script or could not be verified (and is then
+ * refused at evaluation, before submission). The compound path reads hashes off chain instead because its coordinates
  * are an unnamed list, where a mislabelled entry would otherwise be inexpressible.
  */
 class ConvertReferenceScriptWiringTest {
@@ -224,6 +225,53 @@ class ConvertReferenceScriptWiringTest {
         assertEquals(5, refs.size(),
                 "the convert action's hash is null without the Minswap parameters, so its configured "
                         + "coordinate has nowhere to be filed: " + refs.keySet());
+    }
+
+    /**
+     * ⛔ FAB-108: keying by the REGISTRY's hash is sound because the boot-time verifier DROPS a slot whose
+     * coordinate does not publish that slot's derived hash. Here the convert slot's coordinate publishes
+     * somebody else's validator ({@code 1551bd4e…}); after the real verifier runs over this very
+     * configuration, the router must no longer reference it — the convert action travels inline — while
+     * the other five still map to their coordinates.
+     */
+    @Test
+    void aConvertCoordinateDroppedAtBootIsNotReferencedAndTheOtherFiveStillAre() {
+        LoansContractRegistry registry = registry();
+        AppConfig.LiquidationConfiguration configuration = allNineConfigured();
+        Map<String, String> publishedAt = Map.of(
+                at("1").getTransactionId(), registry.getLoanPolicyId(),
+                at("2").getTransactionId(), registry.getLoanSpendScriptHash(),
+                at("3").getTransactionId(), registry.getLenderManagerWithdrawScriptHash(),
+                at("4").getTransactionId(), registry.getLenderManagerSpendScriptHash(),
+                at("5").getTransactionId(), registry.getLoanClaimActionScriptHash(),
+                at("6").getTransactionId(), registry.getLmLiquidateActionScriptHash(),
+                at("7").getTransactionId(), registry.getAssetManagerWithdrawScriptHash(),
+                at("8").getTransactionId(), registry.getLmLiquidateAndPayInAdvanceActionScriptHash(),
+                at("9").getTransactionId(), "1551bd4efdef76f3184798331e1c74f6a1cef51955b0c96b8db18d1f");
+        new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier(registry, configuration,
+                (tx, ix) -> com.bloxbean.cardano.client.api.model.Result
+                        .<com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput>success("ok")
+                        .withValue(new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput(
+                                publishedAt.get(tx),
+                                com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.Liveness.UNSPENT,
+                                null))
+                        .code(200),
+                false).verify();
+
+        Map<String, TransactionInput> refs = router(configuration).referenceScripts();
+
+        assertFalse(refs.containsKey(registry.getLmLiquidateAndConvertActionScriptHash()),
+                "a convert coordinate publishing another validator was dropped at boot and must not be "
+                        + "referenced: " + refs);
+        assertEquals(Map.of(
+                        registry.getLoanPolicyId(), at("1"),
+                        registry.getLoanSpendScriptHash(), at("2"),
+                        registry.getLenderManagerWithdrawScriptHash(), at("3"),
+                        registry.getLenderManagerSpendScriptHash(), at("4"),
+                        registry.getLoanClaimActionScriptHash(), at("5")),
+                refs, "the other five must still be referenced, each at its own coordinate");
+        assertEquals(at("9"), configuration.getConfiguredReferenceScripts().lmLiquidateAndConvertAction(),
+                "the configured scripts still name it, for the record");
     }
 
     /**

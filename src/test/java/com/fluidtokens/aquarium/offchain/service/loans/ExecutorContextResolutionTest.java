@@ -132,22 +132,26 @@ class ExecutorContextResolutionTest {
     }
 
     /**
-     * ⛔ FAB-115 round-2 finding 3. The reference-script verifier must close the SHARED gate in a real
-     * container — a verifier that kept a private gate would log the refusal while the executors carried
-     * on against stale coordinates (a phase-2 failure, collateral forfeit).
+     * ⛔ FAB-108, IN A REAL CONTAINER. A reference-script coordinate publishing somebody else's validator
+     * no longer closes the shared lending gate (it did under FAB-115 round-2 finding 3): the verifier
+     * drops that ONE slot from the live configuration — its validator then travels inline — and records
+     * the degradation. The container starts, the gate stays open, and lending is not refused.
      */
     @Test
-    void aReferenceScriptMismatchClosesTheContainersSharedGate() {
+    void aReferenceScriptMismatchLeavesTheContainersSharedGateOpenAndDropsTheSlot() {
         var claimOnly = new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
                         new com.bloxbean.cardano.client.transaction.spec.TransactionInput("ab".repeat(32), 0),
                         null, null));
-        com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.TxOutputLookup foreign =
+        com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutputLookup foreign =
                 (tx, ix) -> com.bloxbean.cardano.client.api.model.Result
-                        .<com.bloxbean.cardano.client.api.model.Utxo>success("ok")
-                        .withValue(com.bloxbean.cardano.client.api.model.Utxo.builder().txHash(tx).outputIndex(ix)
-                                .referenceScriptHash("de".repeat(28)).build());
+                        .<com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput>success("ok")
+                        .withValue(new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput(
+                                "de".repeat(28),
+                                com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.Liveness.UNSPENT,
+                                null))
+                        .code(200);
 
         new ApplicationContextRunner()
                 .withBean(com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class)
@@ -158,10 +162,41 @@ class ExecutorContextResolutionTest {
                     assertTrue(context.getStartupFailure() == null,
                             "a reference-script mismatch must not fail the context: " + context.getStartupFailure());
                     var gate = context.getBean(com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class);
-                    assertTrue(context.getBean(com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.class)
-                            .gate() == gate, "the verifier must write the container's gate, not a private one");
-                    assertTrue(gate.isBlocked(), "and that shared gate must be closed");
+                    assertFalse(gate.isBlocked(), "a reference-script mismatch must not close the shared gate: "
+                            + gate.blockedReason());
+                    assertTrue(claimOnly.getReferenceScripts().loanClaimAction() == null,
+                            "the mismatched slot must be dropped from the live configuration");
+                    assertNotNull(claimOnly.getConfiguredReferenceScripts().loanClaimAction(),
+                            "while the configured scripts keep it, for the record");
+                    var degradations = context.getBean(
+                            com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.class).degradations();
+                    assertTrue(degradations.stream().anyMatch(d -> d.contains("loan-claim-action")),
+                            "the degradation must name the dropped key: " + degradations);
                 });
+    }
+
+    /**
+     * FAB-108: the reference-script verifier no longer holds the lending gate at all — it can neither
+     * close it nor be handed it. Matched on the declared members, with {@code LoansConfigVerifier} as
+     * the control that the reflection can see a gate where one is held.
+     */
+    @Test
+    void theReferenceScriptVerifierHoldsNoLendingGate() {
+        var gateType = com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class;
+        var verifier = com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.class;
+        for (var method : verifier.getDeclaredMethods()) {
+            assertFalse(method.getName().equals("setLendingConfigGate"),
+                    "LoansReferenceScriptVerifier still declares setLendingConfigGate");
+        }
+        for (var field : verifier.getDeclaredFields()) {
+            assertFalse(field.getType().equals(gateType),
+                    "LoansReferenceScriptVerifier." + field.getName() + " is still a LendingConfigGate");
+        }
+
+        var control = com.fluidtokens.aquarium.offchain.service.LoansConfigVerifier.class;
+        assertTrue(Arrays.stream(control.getDeclaredMethods()).anyMatch(m -> m.getName().equals("setLendingConfigGate")),
+                "control: the config verifier still holds the gate, so this reflection can see one");
+        assertTrue(Arrays.stream(control.getDeclaredFields()).anyMatch(f -> f.getType().equals(gateType)));
     }
 
     /**
@@ -182,7 +217,6 @@ class ExecutorContextResolutionTest {
 
         for (Class<?> type : List.of(
                 com.fluidtokens.aquarium.offchain.service.LoansConfigVerifier.class,
-                com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.class,
                 LiquidationExecutor.class,
                 CompoundExecutor.class,
                 com.fluidtokens.aquarium.offchain.controller.LiquidationReadinessController.class)) {

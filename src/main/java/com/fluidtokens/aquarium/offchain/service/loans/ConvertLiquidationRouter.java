@@ -168,12 +168,13 @@ public class ConvertLiquidationRouter {
      * other two routes.
      *
      * <p>⚠ <b>Keyed by the REGISTRY's hash for each named slot, not by a hash read off the chain.</b>
-     * That is sound only because {@code LoansReferenceScriptVerifier} resolves every configured
-     * coordinate at startup and <b>closes the lending gate on a mismatch</b> — and this router runs only
-     * inside {@code LiquidationExecutor.cycle}, after the gate check — so by the time this runs, the claim
-     * "the key named {@code loan-spend} publishes the loan-spend script" is already proven. The
-     * compound path reads the hash off chain instead because its coordinates are an unnamed list,
-     * where a mislabelled entry would otherwise be inexpressible.
+     * That is sound because {@code LoansReferenceScriptVerifier} resolves every configured coordinate
+     * at startup and <b>drops (nulls) any slot whose coordinate does not publish that slot's derived
+     * hash</b> (FAB-108) — absent, spent, no reference script, or somebody else's validator — and this
+     * reads the narrowed set, so a dropped validator travels inline. A slot the verifier could not check
+     * (UNVERIFIED) is kept as configured; if it is wrong, the build fails at evaluation, before
+     * submission. The compound path reads the hash off chain instead because its coordinates are an
+     * unnamed list, where a mislabelled entry would otherwise be inexpressible.
      *
      * <p>An unconfigured slot is simply absent: that validator travels inline, which is correct and
      * larger — never referenced-but-absent, which is {@code RequiredRedeemersMismatch} (CCL trap 13).
