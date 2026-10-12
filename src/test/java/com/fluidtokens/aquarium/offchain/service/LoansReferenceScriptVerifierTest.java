@@ -655,6 +655,126 @@ class LoansReferenceScriptVerifierTest {
         assertEquals(LiquidateTransactionBuilder.ReferenceScripts.none(), control.getReferenceScripts());
     }
 
+    /**
+     * FAB-108 F3: the memo is keyed by the whole OUT-REF, not the transaction. Two named slots at two
+     * outputs of ONE transaction, each publishing its own derived hash, are two questions — and both are
+     * kept. A memo keyed by tx hash alone would answer the second slot with the first one's output, and
+     * drop it for publishing the wrong validator.
+     */
+    @Test
+    void twoSlotsAtTwoOutputsOfOneTransactionAreTwoLookupsAndBothKept() {
+        TransactionInput first = new TransactionInput("ab".repeat(32), 0);
+        TransactionInput second = new TransactionInput("ab".repeat(32), 1);
+        var configured = scripts(first, null, null, null, second, null, null, null, null);
+        var configuration = configured(configured);
+        assertNotEquals(REGISTRY.getLoanPolicyId(), REGISTRY.getLoanClaimActionScriptHash(),
+                "precondition: the two slots publish different hashes");
+        Lookup lookup = new Lookup((tx, ix) -> published(
+                ix == 0 ? REGISTRY.getLoanPolicyId() : REGISTRY.getLoanClaimActionScriptHash(), Liveness.UNSPENT));
+        var verifier = verifier(REGISTRY, configuration, lookup, false);
+
+        verifyCapturing(verifier);
+
+        assertEquals(List.of(coordinate(first), coordinate(second)), lookup.asked,
+                "one transaction, two outputs: two lookups");
+        assertEquals(configured, configuration.getReferenceScripts(), "both slots publish their own hash and are kept");
+        assertTrue(verifier.degradations().isEmpty(), verifier.degradations().toString());
+    }
+
+    // ======================================================================================
+    // FAB-108 F1 — the Blockfrost key reaches no text, through the REAL lookup
+    // ======================================================================================
+
+    /** A key JDK 21 refuses as a header value; every part of it is searched for. */
+    private static final String KEY_HEAD = "previewSENTINELverifierkey0000000";
+    private static final String KEY_TAIL = "tailSENTINELverifierkey0000";
+    private static final String BROKEN_KEY = KEY_HEAD + "a\nb" + KEY_TAIL;
+    private static final List<String> KEY_FRAGMENTS = List.of(KEY_HEAD, KEY_TAIL, "a\nb");
+
+    /** A loopback port nothing listens on: nothing here may reach a real network. */
+    private static String unboundLoopbackUrl() throws java.io.IOException {
+        int port;
+        try (var socket = new java.net.ServerSocket(0, 0, java.net.InetAddress.getLoopbackAddress())) {
+            port = socket.getLocalPort();
+        }
+        return "http://127.0.0.1:" + port + "/api/v0";
+    }
+
+    private static void assertNoKeyIn(String where, String text) {
+        for (String fragment : KEY_FRAGMENTS) {
+            assertFalse(text != null && text.contains(fragment), "the Blockfrost key leaked into " + where + ": " + text);
+        }
+    }
+
+    private static void assertNoKeyIn(String where, Throwable thrown) {
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            assertNoKeyIn(where, t.getMessage());
+            assertNoKeyIn(where, String.valueOf(t));
+        }
+    }
+
+    private static void assertNoKeyIn(List<ILoggingEvent> events) {
+        for (ILoggingEvent event : events) {
+            assertNoKeyIn("a " + event.getLevel() + " log line", event.getFormattedMessage());
+            for (var proxy = event.getThrowableProxy(); proxy != null; proxy = proxy.getCause()) {
+                assertNoKeyIn("a logged exception", proxy.getMessage());
+            }
+        }
+    }
+
+    /**
+     * ⛔ FAB-108 F1. On JDK 21 a key with a line break inside it made {@code HttpRequest.Builder.header}
+     * throw {@code IllegalArgumentException("invalid header value: \"<key>\"")}, and the verifier put that
+     * message into the UNVERIFIED WARN, {@code degradations()} and the opt-in failure. Driven through the
+     * REAL {@link BlockfrostPublishedOutputLookup}: no log line at any level, no degradation and no thrown
+     * message may contain any part of the key — and the slot must still be KEPT, UNVERIFIED, with the
+     * reason saying the value was withheld.
+     */
+    @Test
+    void aBlockfrostKeyThatCannotBeAHeaderReachesNoLogNoDegradationAndNoThrownMessage() throws Exception {
+        String url = unboundLoopbackUrl();
+        String key = PREFIX + "loan-claim-action";
+
+        var configuration = configured(claimOnly(in(5)));
+        var verifier = new LoansReferenceScriptVerifier(REGISTRY, configuration,
+                new BlockfrostPublishedOutputLookup(url, BROKEN_KEY), false);
+        Logger logger = (Logger) LoggerFactory.getLogger(LoansReferenceScriptVerifier.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            assertDoesNotThrow(verifier::verify);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertNoKeyIn(appender.list);
+        verifier.degradations().forEach(d -> assertNoKeyIn("degradations()", d));
+        // must still: the coordinate could not be checked, so it is KEPT, with one UNVERIFIED line.
+        assertEquals(in(5), configuration.getReferenceScripts().loanClaimAction(), "an unverified slot is kept");
+        assertEquals(1, verifier.degradations().size(), verifier.degradations().toString());
+        String degradation = verifier.degradations().get(0);
+        assertTrue(degradation.startsWith(LoansReferenceScriptVerifier.UNVERIFIED) && degradation.contains(key)
+                && degradation.contains("value withheld"), degradation);
+
+        // with fail-on-unreachable, the thrown message (and its cause chain) carries no part of it either.
+        var failing = new LoansReferenceScriptVerifier(REGISTRY, configured(claimOnly(in(5))),
+                new BlockfrostPublishedOutputLookup(url, BROKEN_KEY), true);
+        ListAppender<ILoggingEvent> failingLogs = new ListAppender<>();
+        failingLogs.start();
+        logger.addAppender(failingLogs);
+        LoansReferenceScriptVerifier.OptInUnreachableFailure thrown;
+        try {
+            thrown = assertThrows(LoansReferenceScriptVerifier.OptInUnreachableFailure.class, failing::verify);
+        } finally {
+            logger.detachAppender(failingLogs);
+        }
+        assertNoKeyIn("the opt-in failure", thrown);
+        assertNoKeyIn(failingLogs.list);
+        assertTrue(thrown.getMessage().contains(key) && thrown.getMessage().contains("value withheld"),
+                "must still name the coordinate and why: " + thrown.getMessage());
+    }
+
     // ======================================================================================
     // (p) narrowing only drops
     // ======================================================================================

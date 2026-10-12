@@ -24,7 +24,13 @@ import java.time.Duration;
  * The same read {@code MainnetReferenceScriptsTest.assertUnspent} makes, without paging the address.
  *
  * <p>⛔ <b>The project id is a secret.</b> It travels only as the {@code project_id} header and appears
- * in no Result text, no exception message and no log line produced here.
+ * in no Result text, no exception message and no log line produced here. <b>That includes a key that is
+ * not a legal header value</b> (FAB-108 F1): on JDK 21, {@code HttpRequest.Builder.header} refuses a CR or
+ * LF by throwing {@code IllegalArgumentException("invalid header value: \"<value>\"")} — the key itself,
+ * in a message the verifier would log, list in {@code degradations()} and throw. So surrounding whitespace
+ * is stripped (a trailing newline from a k8s {@code --from-file} secret or a CRLF env file is the honest
+ * case, and stripping it makes the key work), and a key that still holds anything outside visible ASCII is
+ * never sent.
  */
 public class BlockfrostPublishedOutputLookup implements LoansReferenceScriptVerifier.PublishedOutputLookup {
 
@@ -33,8 +39,14 @@ public class BlockfrostPublishedOutputLookup implements LoansReferenceScriptVeri
     private static final int BODY_EXCERPT = 200;
     private static final ObjectMapper JSON = new ObjectMapper();
 
+    /** The refusal for a key no header can carry. Names the property, never the value. */
+    static final String KEY_NOT_A_HEADER_VALUE =
+            "blockfrost.key contains characters not allowed in an HTTP header (value withheld)";
+
     private final String baseUrl;
     private final String projectId;
+    /** Whether {@link #projectId} is visible ASCII only, and so can travel as a header value. */
+    private final boolean projectIdSendable;
     private final HttpClient http;
 
     public BlockfrostPublishedOutputLookup(String baseUrl, String projectId) {
@@ -43,23 +55,34 @@ public class BlockfrostPublishedOutputLookup implements LoansReferenceScriptVeri
             base = base.substring(0, base.length() - 1);
         }
         this.baseUrl = base;
-        this.projectId = projectId;
+        this.projectId = projectId == null ? null : projectId.strip();
+        this.projectIdSendable = this.projectId == null || isVisibleAscii(this.projectId);
         this.http = HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();
     }
 
     /**
      * The output at {@code txHash#outputIndex}: a success with a {@code null} value when the creating
      * transaction has no such (non-collateral) output, an error Result carrying the HTTP status for any
-     * other answer, and a throw when the provider could not be asked at all.
+     * other answer, and a throw when the provider could not be asked at all — including a key no header
+     * can carry — or answered in a shape this class does not recognise.
      */
     @Override
     public Result<PublishedOutput> lookup(String txHash, int outputIndex) throws IOException, InterruptedException {
+        if (!projectIdSendable) {
+            throw new IllegalStateException(KEY_NOT_A_HEADER_VALUE);
+        }
         String path = "txs/" + txHash + "/utxos";
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(baseUrl + "/" + path))
                 .timeout(REQUEST_TIMEOUT)
                 .GET();
         if (projectId != null && !projectId.isEmpty()) {
-            request.header("project_id", projectId);
+            try {
+                request.header("project_id", projectId);
+            } catch (IllegalArgumentException e) {
+                // Belt and braces behind the visible-ASCII guard: the JDK's message echoes the value, so
+                // neither it nor the exception (as a cause) may travel on.
+                throw new IllegalStateException(KEY_NOT_A_HEADER_VALUE);
+            }
         }
 
         HttpResponse<String> response;
@@ -88,15 +111,27 @@ public class BlockfrostPublishedOutputLookup implements LoansReferenceScriptVeri
                     .formatted(path, excerpt(body)));
         }
 
+        // ⚠ VH-73: a shape this class does not recognise is NOT an answer. Read as one, a missing field
+        // would DROP a good coordinate; thrown, it is UNVERIFIED and the coordinate is kept.
         for (JsonNode output : outputs) {
             JsonNode index = output.get("output_index");
-            if (index == null || !index.canConvertToInt() || index.asInt() != outputIndex) {
+            if (index == null || !index.canConvertToInt()) {
+                throw new IllegalStateException(("unexpected Blockfrost response shape: an output of %s has no "
+                        + "output_index").formatted(path));
+            }
+            if (index.asInt() != outputIndex) {
                 continue;
             }
             // A collateral-return output shares the output_index space; it is never a coordinate.
             JsonNode collateral = output.get("collateral");
             if (collateral != null && collateral.isBoolean() && collateral.asBoolean()) {
                 continue;
+            }
+            // Absent and JSON null are different statements: null says "no reference script" (an answer,
+            // DROPPED), absent says the provider no longer reports the field at all.
+            if (!output.has("reference_script_hash")) {
+                throw new IllegalStateException(("unexpected Blockfrost response shape: output %d of %s has no "
+                        + "reference_script_hash field").formatted(outputIndex, path));
             }
             String referenceScriptHash = output.hasNonNull("reference_script_hash")
                     ? output.get("reference_script_hash").asText() : null;
@@ -118,6 +153,17 @@ public class BlockfrostPublishedOutputLookup implements LoansReferenceScriptVeri
                     .code(200);
         }
         return Result.<PublishedOutput>success("ok").withValue(null).code(200);
+    }
+
+    /** Every character in 0x21–0x7E: a strict subset of what an HTTP header value may hold. */
+    private static boolean isVisibleAscii(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 0x21 || c > 0x7E) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String excerpt(String body) {

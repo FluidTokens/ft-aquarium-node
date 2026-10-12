@@ -248,6 +248,10 @@ class ConvertReferenceScriptWiringTest {
                 at("7").getTransactionId(), registry.getAssetManagerWithdrawScriptHash(),
                 at("8").getTransactionId(), registry.getLmLiquidateAndPayInAdvanceActionScriptHash(),
                 at("9").getTransactionId(), "1551bd4efdef76f3184798331e1c74f6a1cef51955b0c96b8db18d1f");
+        // ⚠ The router is built BEFORE the verifier narrows (FAB-108 F2), as in production, where the
+        // router bean may exist before the verifier's @PostConstruct has run. A router that cached the
+        // scripts at construction would still reference the dropped slot; only a call-time read does not.
+        ConvertLiquidationRouter router = router(configuration);
         new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier(registry, configuration,
                 (tx, ix) -> com.bloxbean.cardano.client.api.model.Result
                         .<com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput>success("ok")
@@ -258,7 +262,7 @@ class ConvertReferenceScriptWiringTest {
                         .code(200),
                 false).verify();
 
-        Map<String, TransactionInput> refs = router(configuration).referenceScripts();
+        Map<String, TransactionInput> refs = router.referenceScripts();
 
         assertFalse(refs.containsKey(registry.getLmLiquidateAndConvertActionScriptHash()),
                 "a convert coordinate publishing another validator was dropped at boot and must not be "
