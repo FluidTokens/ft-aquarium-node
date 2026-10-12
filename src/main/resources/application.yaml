@@ -108,8 +108,9 @@ loans:
   #
   # This is not a drill: when mode is live and all seven submit-vetoes pass, the
   # executor SIGNS AND SUBMITS the liquidation on preview (LiquidationExecutor wires the real
-  # backend submitTransaction). `shadow` builds and records the transaction but never submits -- the
-  # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely.
+  # backend submitTransaction). `shadow` builds and records the liquidation but never submits it -- the
+  # MODE_NOT_LIVE veto stops it; `disabled` (the default) skips the cycle entirely. ⚠ Wallet rebalances
+  # (`wallet.rebalance` below) ARE submitted in shadow too: they are housekeeping, not liquidations.
   # ⛔ THERE IS NO NETWORK GATE ANY MORE. `loans.submittable-network` existed until 2026-09-04 and
   # was removed on Giovanni's ruling: a node correctly targeted at mainnet, armed and profitable,
   # would still refuse to submit and say so only in a decision row — "arming that works everywhere
@@ -244,6 +245,15 @@ loans:
     token-registry:
       url: ${LOANS_UI_TOKEN_REGISTRY_URL:https://tokens.cardano.org}
       timeout-seconds: ${LOANS_UI_TOKEN_REGISTRY_TIMEOUT_SECONDS:5}
+
+  # The wallet rebalancer (FAB-131): on every block, while the node is not syncing, with
+  # `liquidation.mode` shadow or live and at least one `action: ANTICIPATE` market, it moves the bot
+  # wallet into the FAB-130 shape with one self-send -- SIGNED AND SUBMITTED in shadow too (wallet
+  # housekeeping, not a liquidation). A wallet too small to shape is logged at WARN on every block and
+  # never submitted. With mode disabled or no ANTICIPATE market it does nothing, whatever this says.
+  wallet:
+    rebalance:
+      enabled: ${AQUARIUM_WALLET_REBALANCE_ENABLED:true}
 
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}

@@ -1,9 +1,14 @@
 package com.fluidtokens.aquarium.offchain.config;
 
+import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.model.Result;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShapeTransactions;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -325,7 +330,9 @@ public class AppConfig {
          * node-level dial.</b>
          * <ul>
          *   <li>{@code DISABLED} — the loop returns before it scans anything.</li>
-         *   <li>{@code SHADOW} — scan, build, price and record; never sign, never submit.</li>
+         *   <li>{@code SHADOW} — scan, build, price and record; never signs or submits a LIQUIDATION.
+         *       Wallet rebalances ({@code WalletRebalancer}) ARE signed and submitted in shadow too: they
+         *       are wallet housekeeping, not liquidations.</li>
          *   <li>{@code LIVE} — sign and submit, subject to the market's own mode and the profit floors.</li>
          * </ul>
          *
@@ -928,6 +935,35 @@ public class AppConfig {
         };
         log.info("INIT Converters network: {}, network type: {}", network, networkType);
         return ClasspathConversionsFactory.createConverters(networkType);
+    }
+
+    /**
+     * The wallet-shape engine (FAB-130), wired for its first production caller, {@code WalletRebalancer}
+     * (FAB-131): the bot {@link Account}, the per-epoch {@link ProtocolParamsSupplier} bean and a Blockfrost
+     * submitter.
+     * <ul>
+     *   <li>The submitter is the narrowing {@code LiquidationExecutor} and {@code CompoundExecutor} use — bytes
+     *       in, verdict out, through {@code submitTransaction}, with the same FAB-134 B5a refresh of the
+     *       parameters on a rejection naming them. The engine is handed no {@code BFBackendService}.</li>
+     *   <li>No transaction evaluator: the engine builds a plain {@code Tx} with no script and refuses any built
+     *       body carrying one (see its javadoc), and its {@code QuickTxBuilder} reads only an in-memory supplier
+     *       over the inputs it is given.</li>
+     * </ul>
+     * <p>
+     * ⚠ Declared here rather than beside its siblings in {@code YaciConfig}: {@code ContainerWiringTest} pins
+     * {@code YaciConfig}'s exact bean set and builds it with no {@link Account} bean.
+     */
+    @Bean
+    public WalletShapeTransactions walletShapeTransactions(Account account,
+                                                           ProtocolParamsSupplier protocolParamsSupplier,
+                                                           BFBackendService bfBackendService) {
+        return new WalletShapeTransactions(account, protocolParamsSupplier, bytes -> {
+            // FAB-134 B5a: a rejection naming the parameters refreshes them; the result itself is returned
+            // untouched (nothing retried, no outcome changed).
+            Result<String> result = bfBackendService.getTransactionService().submitTransaction(bytes);
+            ProtocolParamsRejections.refreshIfParamsRejected(protocolParamsSupplier, result);
+            return result;
+        });
     }
 
     /**

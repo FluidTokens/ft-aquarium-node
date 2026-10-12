@@ -7,6 +7,8 @@ import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.event.EventListener;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Service;
 
 import java.time.Clock;
@@ -91,6 +93,7 @@ public class BlockEventListener {
     }
 
     @EventListener
+    @Order(Ordered.HIGHEST_PRECEDENCE)
     public void processBlock(CommitEvent<?> commitEvent) {
         try {
             long slot = commitEvent.getMetadata().getSlot();
