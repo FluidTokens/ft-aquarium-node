@@ -464,6 +464,36 @@ class WalletRebalancerWiringTest {
         });
     }
 
+    /**
+     * The per-market mode THROUGH THE CONTAINER: the bean must consult {@code LiquidationConfiguration.effectiveMode}
+     * as bound from configuration, not a rule of its own. A shadow node whose only ANTICIPATE market says
+     * {@code mode: DISABLED} reads nothing; the same market at {@code mode: SHADOW} is the positive control.
+     */
+    @Test
+    void aMarketsOwnDisabledModeKeepsAShadowNodeFromRebalancing() {
+        RecordingBlockfrost blockfrost = new RecordingBlockfrost();
+        AppUtxoService wallet = wallet();
+        runner(blockfrost, wallet, Map.of(), "shadow", new RecordingTransactionManager())
+                .withPropertyValues("loans.liquidation.markets[0].mode=DISABLED").run(context -> {
+                    assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+                    BlockEventListener listener = context.getBean(BlockEventListener.class);
+                    context.publishEvent(blockAt(context.getBean(CardanoConverters.class), Duration.ofMinutes(1)));
+                    assertFalse(listener.getIsSyncing().get(), "the block arrived and the node is not syncing");
+                    assertEquals(0, reads(wallet), "the only ANTICIPATE market is DISABLED: no wallet read");
+                    assertEquals(0, blockfrost.submitted.size(), "the only ANTICIPATE market is DISABLED: no submission");
+                });
+
+        RecordingBlockfrost armedBlockfrost = new RecordingBlockfrost();
+        AppUtxoService armedWallet = wallet();
+        runner(armedBlockfrost, armedWallet, Map.of(), "shadow", new RecordingTransactionManager())
+                .withPropertyValues("loans.liquidation.markets[0].mode=SHADOW").run(context -> {
+                    assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+                    context.publishEvent(blockAt(context.getBean(CardanoConverters.class), Duration.ofMinutes(1)));
+                    assertEquals(1, reads(armedWallet), "positive control: a SHADOW market reads the wallet");
+                    assertEquals(1, armedBlockfrost.submitted.size(), "positive control: and submits");
+                });
+    }
+
     @Test
     void theShippedFileEnablesTheRebalancerAndTheEnvVarDisablesIt() {
         runner(new RecordingBlockfrost(), wallet(), Map.of()).run(context ->
