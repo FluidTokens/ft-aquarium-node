@@ -20,8 +20,34 @@ error.
 | **FluidTokens redeployed the contracts** (new config NFTs) | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
 | FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01) | §4.8 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
+| Upgrading to the release that **indexes the Minswap V2 pools** (FAB-137) | §1.1 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
 
-The first four are ordinary. The last three are the subject of this guide (§4, §4.8, §3).
+The first four are ordinary. The others are the subject of this guide (§4, §4.8, §3, §1.1).
+
+### 1.1 ⛔ The Minswap pool release requires a database wipe (FAB-137)
+
+**Upgrading to this release requires wiping the database, INCLUDING the cursor, then re-syncing from
+`sync-start`.** This is not optional and there is no partial route.
+
+This release adds the Minswap V2 pool payment credential to the set of credentials the index keeps
+(the convert path needs to read a pool's state from the index). The index filters at write time: an
+output under a credential the running image did not watch was discarded when its block passed, and
+nothing records that it was. A node started on the new image over the old database resumes from its
+stored cursor, so it watches the pools **only from the upgrade onwards** — and convert reports a pool
+as "not indexed" until that pool happens to swap again. Re-indexing from `sync-start` is the only way
+to have every pool in the index.
+
+Do it with the same steps as a redeploy, without changing any coordinates:
+[§4.2 stop the node](#42-stop-the-node-leave-the-database-up) →
+[§4.3 back up if you want to](#43-back-up-if-you-want-to-be-able-to-go-back) →
+[§4.4 wipe](#44-wipe) (deleting the database deletes the cursor with it; a row-only wipe that keeps
+the cursor achieves nothing — §3) → [§4.6 start and let it catch up](#46-start-and-let-it-catch-up).
+**Keep the shipped `sync-start-*` values** (skip §4.5): starting later would hide the pools, the
+contracts and the wallet history the node needs.
+
+The same release turns on Yaci's UTxO pruning (`store.utxo.pruning-enabled: true`,
+`store.utxo.pruning-interval: 600`): every 10 minutes it deletes rows for outputs spent more than
+2160 blocks ago. Unspent outputs are never pruned. Nothing for you to set.
 
 ---
 
@@ -297,8 +323,9 @@ empty world. That is what the §4.3 dump is for.
 
 ## 6. Routine maintenance
 
-**Disk** grows with the chain. Watch the `./postgres` directory; the node does not prune, and it
-shares a disk with your logs.
+**Disk** grows with the chain. Watch the `./postgres` directory; it shares a disk with your logs.
+Since FAB-137 the node prunes **spent** UTxO rows (§1.1), but the rows of unspent outputs and every
+other table still grow.
 
 **Re-syncing to reclaim space** is legitimate — a later start point means a smaller database — and
 it is the same §4 sequence with the same one-way-door caveat.
@@ -332,6 +359,23 @@ seems to have no effect, confirm it reached the process and that the name still 
 ```bash
 docker compose exec aquarium-node env | grep AQUARIUM_
 ```
+
+### The startup wallet rebalance is gone (FAB-136)
+
+Older images listed the wallet at startup and, if any of its UTxOs predated the index, spent the
+whole wallet back to itself before letting anything run. **That no longer happens**, and with it
+**`/healthcheck`'s `wallet_sweep` field is gone** — if your monitoring reads that field, stop: it
+will not come back, and a missing field reads exactly like a check that never ran.
+
+What replaces it is a requirement on you, stated in [deploying.md §2](deploying.md#2-keys-and-secrets--read-this-before-creating-anything):
+**the wallet must hold no UTxO created before 2025-05-06** (mainnet slot `154984561`, where the
+node's index starts). The node reads its wallet only from that index, so an older UTxO is invisible
+to it. **If you are not sure, send the wallet's whole balance to the node's own address once — a
+single self-send — before restarting on the new image.**
+
+New, optional: `AQUARIUM_SYNCING_THRESHOLD_MINUTES` (default `10`). The node counts as syncing — no
+processing, `/healthcheck` answers `...syncing...` — while its last applied block is more than this
+many minutes old.
 
 ---
 

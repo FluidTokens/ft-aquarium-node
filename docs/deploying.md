@@ -61,6 +61,14 @@ willing to front *if* you enable `ANTICIPATE` markets (§9). **The 30,000 FLDT d
 it is delegated to this wallet from a separate wallet, which can be cold. That separation is the
 point: the hot wallet the node signs with never has to hold the stake.
 
+**⛔ The wallet must hold no UTxO created before 2025-05-06.** The node reads its wallet **only from
+its own index**, and that index starts at mainnet slot `154984561` (2025-05-06). A UTxO created
+before then was never seen by the index, so the node cannot see it: it is not counted, not spent,
+and not reported as missing — the wallet simply looks smaller than it is, or empty. A freshly
+generated wallet meets this automatically. **If you reuse a wallet, or are not sure, send its whole
+balance to the node's own address once — a single self-send — before starting the node.** Every
+UTxO then dates from after the sync start and the index sees all of them.
+
 **Where the secret lives:** `docker/.env`, as `WALLET_MNEMONIC` and `BLOCKFROST_KEY`.
 
 ```bash
@@ -201,6 +209,9 @@ curl -s http://localhost:8080/healthcheck | jq .
 { "db_ok": true, "parameters_ok": true, "parameters_ref_input_ok": true,
   "wallet_ok": true, "staking_ok": true }
 ```
+
+While the node's last applied block is more than `AQUARIUM_SYNCING_THRESHOLD_MINUTES` (default 10)
+minutes old, `/healthcheck` answers the plain text `...syncing...` and nothing is processed.
 
 Also grep the logs for `HEALTH` — the node reports a wallet with no usable UTxO, or no FLDT
 delegated, as non-fatal warnings rather than refusing to run.

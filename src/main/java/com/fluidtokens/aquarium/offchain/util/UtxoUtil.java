@@ -14,9 +14,14 @@ public class UtxoUtil {
      * <p>
      * Every caller in this codebase asks {@code referenceScriptHash == null}, i.e. "is this UTxO
      * free to spend", and for that question the honest answer is <b>no</b> even when we cannot name
-     * the script. The one caller that reads the value rather than its nullness
-     * ({@code LoansReferenceScriptVerifier}) resolves its UTxOs from Blockfrost and never through
-     * this mapper.
+     * the script. {@code LoansReferenceScriptVerifier} reads the value rather than its nullness, but
+     * resolves its UTxOs from Blockfrost and never through this mapper.
+     * <p>
+     * <b>cardano-client-lib DOES read the value</b> (FAB-134 B3b): a transaction builder learns a
+     * reference input's script from {@code getTxOutput(...).getReferenceScriptHash()} and asks its
+     * {@code ScriptSupplier} for those bytes. That read goes through {@code IndexFirstUtxoSupplier},
+     * which does not serve an index row whose hash is this marker and falls back to the provider for
+     * it — so the marker never reaches the script supplier as if it were a hash.
      */
     static final String UNRESOLVED_REFERENCE_SCRIPT = "reference-script-present-hash-unresolved";
 

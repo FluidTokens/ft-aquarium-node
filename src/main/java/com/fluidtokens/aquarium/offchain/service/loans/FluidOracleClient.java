@@ -371,6 +371,12 @@ public class FluidOracleClient {
 
             var charlieProviderReferenceInput = "c3".equals(preferred)
                     ? utxoRef(supported.path("referenceInput").asText("")) : null;
+            // FAB-138: the provider UTxO's NFT is the c3 policy + "OracleFeed" (4f7261636c6546656564;
+            // OracleEntry's javadoc says why the name is a constant). A blank policy is no NFT to probe
+            // for, never a policy-less unit.
+            var c3Policy = supported.path("policyId").asText("");
+            var charlieProviderNft = "c3".equals(preferred) && !c3Policy.isBlank()
+                    ? new AssetType(c3Policy, "4f7261636c6546656564") : null;
 
             return Optional.of(new OracleEntry(
                     asset,
@@ -387,7 +393,8 @@ public class FluidOracleClient {
                     // ⚠ FAB-112: 1 (Lending v3) or 2 (Lending v4) since 2026-09-30. ABSENT means
                     // unknown, never an error — a registry without the field is the one we parsed
                     // for months, and refusing it would blind every price over a label.
-                    entry.path("oracleVersion").isInt() ? entry.path("oracleVersion").asInt() : null));
+                    entry.path("oracleVersion").isInt() ? entry.path("oracleVersion").asInt() : null,
+                    charlieProviderNft));
         } catch (Exception e) {
             log.warn("could not parse a FluidTokens oracle entry: {}", e.toString());
             return Optional.empty();

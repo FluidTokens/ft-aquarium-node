@@ -73,7 +73,7 @@ class ConvertReferenceScriptWiringTest {
     private static AppConfig.LiquidationConfiguration allNineConfigured() {
         return new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                BigInteger.ZERO, 200, 30,
+                BigInteger.ZERO, 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(
                         at("1"), at("2"), at("3"), at("4"), at("5"), at("6"), at("7"), at("8"), at("9")));
     }
@@ -197,7 +197,7 @@ class ConvertReferenceScriptWiringTest {
     void anUnconfiguredSlotIsAbsentRatherThanNull() {
         AppConfig.LiquidationConfiguration none = new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                BigInteger.ZERO, 200, 30,
+                BigInteger.ZERO, 200,
                 LiquidateTransactionBuilder.ReferenceScripts.none());
 
         Map<String, TransactionInput> refs = router(none).referenceScripts();
@@ -235,7 +235,7 @@ class ConvertReferenceScriptWiringTest {
     void theConvertActionAloneBeingUnsetStillReferencesTheOtherFive() {
         AppConfig.LiquidationConfiguration partial = new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                BigInteger.ZERO, 200, 30,
+                BigInteger.ZERO, 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(
                         at("1"), at("2"), at("3"), at("4"), at("5"), at("6"), at("7"), at("8"), null));
 

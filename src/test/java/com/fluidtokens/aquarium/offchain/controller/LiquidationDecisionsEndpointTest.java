@@ -37,7 +37,7 @@ class LiquidationDecisionsEndpointTest {
     private static AppConfig.LiquidationConfiguration config(
             AppConfig.LiquidationConfiguration.Mode mode) {
         return new AppConfig.LiquidationConfiguration(mode, 60, 120, 30,
-                BigInteger.valueOf(1_500_000), 200, 30);
+                BigInteger.valueOf(1_500_000), 200);
     }
 
     /** A fully populated decision — every "null unless built" field carries a value. */

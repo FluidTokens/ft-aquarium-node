@@ -211,6 +211,6 @@ class MainnetConvertCandidateTest {
     /** The shared margin — {@code loans.liquidation.profit-margin-lovelace} — and nothing else. */
     private static AppConfig.LiquidationConfiguration liquidation(BigInteger margin) {
         return new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, margin, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, margin, 200);
     }
 }

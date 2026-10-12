@@ -23,6 +23,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -138,7 +139,7 @@ class ExecutorContextResolutionTest {
     @Test
     void aReferenceScriptMismatchClosesTheContainersSharedGate() {
         var claimOnly = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30,
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
                         new com.bloxbean.cardano.client.transaction.spec.TransactionInput("ab".repeat(32), 0),
                         null, null));
@@ -191,6 +192,30 @@ class ExecutorContextResolutionTest {
                     + "container would leave it holding no gate, so a closed gate would not stop it");
             assertTrue(autowired.required(), type.getSimpleName() + ".setLendingConfigGate must be "
                     + "REQUIRED: optional injection fails open when the gate bean is missing");
+        }
+    }
+
+    /**
+     * FAB-136: the startup wallet sweep and its readiness gate are gone. None of the former readers may
+     * still declare the setter or hold the field — a leftover setter would be dead injection, and a
+     * leftover field a gate nothing opens. Matched by NAME, because the type itself no longer exists.
+     */
+    @Test
+    void noFormerReaderStillDeclaresTheWalletReadinessSetterOrField() {
+        for (Class<?> type : List.of(
+                com.fluidtokens.aquarium.offchain.service.ScheduledTransactionService.class,
+                LiquidationExecutor.class,
+                CompoundExecutor.class,
+                com.fluidtokens.aquarium.offchain.controller.Healthcheck.class,
+                com.fluidtokens.aquarium.offchain.controller.LiquidationReadinessController.class)) {
+            for (var method : type.getDeclaredMethods()) {
+                assertFalse(method.getName().equals("setWalletReadiness"),
+                        type.getSimpleName() + " still declares setWalletReadiness");
+            }
+            for (var field : type.getDeclaredFields()) {
+                assertFalse(field.getType().getSimpleName().equals("WalletReadiness"),
+                        type.getSimpleName() + "." + field.getName() + " is still a WalletReadiness");
+            }
         }
     }
 
@@ -257,7 +282,7 @@ class ExecutorContextResolutionTest {
 
         @Bean
         AppUtxoService appUtxoService() {
-            return new AppUtxoService(null, null, null);
+            return new AppUtxoService(null, null);
         }
 
         @Bean
@@ -288,9 +313,9 @@ class ExecutorContextResolutionTest {
 
         @Bean
         CompoundTransactionBuilder builder(BFBackendService backendService) {
-            return new CompoundTransactionBuilder(REGISTRY, Networks.preview(), backendService,
+            return new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                     LoanFixtures.utxoSupplier(List.of()), LoanFixtures.protocolParams(),
-                    (cbor, utxos) -> null);
+                    scriptHash -> java.util.Optional.empty(), (cbor, utxos) -> null);
         }
 
         @Bean
@@ -306,6 +331,12 @@ class ExecutorContextResolutionTest {
         @Bean
         org.cardanofoundation.conversions.CardanoConverters converters() {
             return LoanFixtures.converters();
+        }
+
+        /** FAB-134 B5a: the Spring constructor takes the supplier a params rejection refreshes. */
+        @Bean
+        com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier() {
+            return LoanFixtures.protocolParams();
         }
 
         @Bean

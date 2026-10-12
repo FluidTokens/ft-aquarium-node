@@ -74,12 +74,14 @@ class ContainerWiringTest {
                 QuickTxBuilder.class,
                 UtxoSupplier.class,
                 ProtocolParamsSupplier.class,
+                com.bloxbean.cardano.client.api.ScriptSupplier.class,
                 LiquidateTransactionBuilder.class,
                 CompoundTransactionBuilder.class,
                 MinswapPoolResolver.class,
                 ConvertTransactionBuilder.class,
                 ConvertLiquidationRouter.class,
-                LiquidatePayInAdvanceTransactionBuilder.class);
+                LiquidatePayInAdvanceTransactionBuilder.class,
+                com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe.class);
     }
 
     /**
@@ -98,7 +100,7 @@ class ContainerWiringTest {
                         // source, so a synthetic context must state it as a node must.
                         "loans.liquidation.profit-margin-lovelace=5000000")
                 .withBean(BFBackendService.class,
-                        () -> new BFBackendService("https://cardano-preview.blockfrost.io/api/v0/", "test"))
+                        () -> new BFBackendService("https://example.invalid/api/v0/", "test"))
                 .withBean(AppConfig.Network.class, () -> network)
                 .withBean(LoansContractRegistry.class, ContainerWiringTest::previewRegistry)
                 .withBean(AppConfig.LoansConfiguration.class, AppConfig.LoansConfiguration::new)
@@ -109,7 +111,7 @@ class ContainerWiringTest {
                 .withBean(AppConfig.LiquidationConfiguration.class, () ->
                         new AppConfig.LiquidationConfiguration(
                                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                                java.math.BigInteger.ZERO, 200, 30))
+                                java.math.BigInteger.ZERO, 200))
                 // ⚑ 2026-09-09: ConvertEconomics now takes the LiquidationConfiguration too — the
                 // convert margin was merged into the shared loans.liquidation.profit-margin-lovelace.
                 // Same lesson as the line above: the constructor grew and this runner is what says so.
@@ -118,11 +120,33 @@ class ContainerWiringTest {
                                 new AppConfig.ConvertConfiguration(),
                                 new AppConfig.LiquidationConfiguration(
                                         AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                                        java.math.BigInteger.ZERO, 200, 30),
+                                        java.math.BigInteger.ZERO, 200),
                                 network))
                 .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
                         () -> org.cardanofoundation.conversions.ClasspathConversionsFactory
-                                .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW));
+                                .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW))
+                // ⚑ FAB-134 B3a: the UtxoSupplier bean now reads the local index first, so it takes the
+                // Yaci UtxoRepository and the TankUtxoStorage that owns the watched-credential set.
+                .withBean(com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class,
+                        ContainerWiringTest::indexRepository)
+                .withBean(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class,
+                        () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class))
+                // ⚑ FAB-134 B5b: and the static-reference-input set it may hold by out-ref — a @Component
+                // whose sources are all optional, so it is the real class, built by the container.
+                .withBean(com.fluidtokens.aquarium.offchain.service.StaticReferenceInputs.class);
+    }
+
+    /** A Yaci repository stub: the container only needs it to exist; nothing here queries it. */
+    private static com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository indexRepository() {
+        return (com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository)
+                java.lang.reflect.Proxy.newProxyInstance(ContainerWiringTest.class.getClassLoader(),
+                        new Class<?>[]{com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class},
+                        (proxy, method, args) -> switch (method.getName()) {
+                            case "toString" -> "stub UtxoRepository";
+                            case "hashCode" -> System.identityHashCode(proxy);
+                            case "equals" -> proxy == args[0];
+                            default -> throw new UnsupportedOperationException(method.getName());
+                        });
     }
 
     /** The fourth preview deployment, the one application.yaml ships. */
@@ -203,7 +227,7 @@ class ContainerWiringTest {
                 .withPropertyValues("loans.liquidation.profit-margin-lovelace=5000000")
                 .withUserConfiguration(YaciConfig.class)
                 .withBean(BFBackendService.class,
-                        () -> new BFBackendService("https://cardano-preview.blockfrost.io/api/v0/", "test"))
+                        () -> new BFBackendService("https://example.invalid/api/v0/", "test"))
                 .withBean(AppConfig.Network.class, () -> network)
                 // ⛔ THE BARE-INSTALL REGISTRY: built through the same path Spring uses, from a
                 // LoansConfiguration whose coordinates are all empty — which is exactly what a public
@@ -218,7 +242,7 @@ class ContainerWiringTest {
                 .withBean(AppConfig.LiquidationConfiguration.class, () ->
                         new AppConfig.LiquidationConfiguration(
                                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                                java.math.BigInteger.ZERO, 200, 30))
+                                java.math.BigInteger.ZERO, 200))
                 // ⚑ 2026-09-09: ConvertEconomics now takes the LiquidationConfiguration too — the
                 // convert margin was merged into the shared loans.liquidation.profit-margin-lovelace.
                 // Same lesson as the line above: the constructor grew and this runner is what says so.
@@ -227,11 +251,20 @@ class ContainerWiringTest {
                                 new AppConfig.ConvertConfiguration(),
                                 new AppConfig.LiquidationConfiguration(
                                         AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                                        java.math.BigInteger.ZERO, 200, 30),
+                                        java.math.BigInteger.ZERO, 200),
                                 network))
                 .withBean(org.cardanofoundation.conversions.CardanoConverters.class,
                         () -> org.cardanofoundation.conversions.ClasspathConversionsFactory
                                 .createConverters(org.cardanofoundation.conversions.domain.NetworkType.PREVIEW))
+                // ⚑ FAB-134 B3a: the UtxoSupplier bean now reads the local index first, so it takes the
+                // Yaci UtxoRepository and the TankUtxoStorage that owns the watched-credential set.
+                .withBean(com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class,
+                        ContainerWiringTest::indexRepository)
+                .withBean(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class,
+                        () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class))
+                // ⚑ FAB-134 B5b: and the static-reference-input set it may hold by out-ref — a @Component
+                // whose sources are all optional, so it is the real class, built by the container.
+                .withBean(com.fluidtokens.aquarium.offchain.service.StaticReferenceInputs.class)
                 .run(ctx -> {
                     assertNull(ctx.getStartupFailure(),
                             () -> "a bare install — no flag, no coordinates — must START. There is no "

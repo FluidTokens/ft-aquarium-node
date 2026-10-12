@@ -44,6 +44,14 @@ import java.util.List;
  *                        not a signature count, is what decides whether one is liquidatable.
  * @param oracleVersion   the registry's {@code oracleVersion}: 1 (Lending v3) or 2 (Lending v4) since
  *                        2026-09-30; null when the registry omits it (unknown, never an error).
+ * @param charlieProviderNft the NFT the Charli3 provider UTxO at {@link #charlieProviderReferenceInput}
+ *                        holds: the registry's {@code supportedOracle.c3.policyId} + {@code 4f7261636c6546656564}
+ *                        ("OracleFeed"). It is what {@code OracleReferenceInputProbe} asks Blockfrost for
+ *                        before a build, to tell a live provider out-ref from a spent one (FAB-138). The asset
+ *                        name is a constant, not the registry's {@code c3.assetName}, because that is the
+ *                        ruling (Giovanni, 2026-10-04): the provider's NFT is "OracleFeed" under the c3
+ *                        policy, and every c3 node in every committed registry agrees. Null for every
+ *                        non-c3 entry, and null for a c3 entry whose registry node omits the policy id.
  */
 public record OracleEntry(AssetType token,
                           AssetType oracleToken,
@@ -56,7 +64,8 @@ public record OracleEntry(AssetType token,
                           OraclePriceFeed feed,
                           List<OracleSignature> signatures,
                           TransactionInput charlieProviderReferenceInput,
-                          Integer oracleVersion) {
+                          Integer oracleVersion,
+                          AssetType charlieProviderNft) {
 
     /**
      * Without a version: what every entry was before FluidTokens added {@code oracleVersion} to the
@@ -68,7 +77,20 @@ public record OracleEntry(AssetType token,
                        OraclePriceFeed feed, List<OracleSignature> signatures,
                        TransactionInput charlieProviderReferenceInput) {
         this(token, oracleToken, rewardAddress, withdrawCredentialHash, referenceInput, referenceScript,
-                verificationKeys, threshold, feed, signatures, charlieProviderReferenceInput, null);
+                verificationKeys, threshold, feed, signatures, charlieProviderReferenceInput, null, null);
+    }
+
+    /**
+     * Without the Charli3 provider NFT: what every entry was before FAB-138, and what the fixtures that
+     * never meet the oracle probe still build. A probed build refuses a c3 entry built this way.
+     */
+    public OracleEntry(AssetType token, AssetType oracleToken, String rewardAddress,
+                       String withdrawCredentialHash, TransactionInput referenceInput,
+                       TransactionInput referenceScript, List<String> verificationKeys, int threshold,
+                       OraclePriceFeed feed, List<OracleSignature> signatures,
+                       TransactionInput charlieProviderReferenceInput, Integer oracleVersion) {
+        this(token, oracleToken, rewardAddress, withdrawCredentialHash, referenceInput, referenceScript,
+                verificationKeys, threshold, feed, signatures, charlieProviderReferenceInput, oracleVersion, null);
     }
 
     /**

@@ -1,11 +1,11 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
-import com.bloxbean.cardano.client.backend.api.BackendService;
 import com.bloxbean.cardano.client.common.model.Network;
 import com.bloxbean.cardano.client.function.TxBuilder;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
@@ -121,8 +121,9 @@ public class ConvertTransactionBuilder {
     }
 
     /**
-     * @param poolRefUtxo the Minswap pool UTxO, located BY ITS NFT at scan time — never a pinned
-     *                    coordinate, because a pool is respent on every swap
+     * @param poolRefUtxo the authentic Minswap pool UTxO from {@link MinswapPoolResolver}'s per-cycle
+     *                    index snapshot — never a pinned coordinate, because a pool is respent on
+     *                    every swap
      * @param collateralOracle the feed for the COLLATERAL leg. ⛔ Never {@code null} on this path:
      *                    a convert exchanges two distinct assets, so at least one leg is a token and
      *                    {@code retrieve_oracle_data} demands an oracle withdrawal for it. The
@@ -187,41 +188,87 @@ public class ConvertTransactionBuilder {
     private final Network network;
     private final UtxoSupplier utxoSupplier;
     private final ProtocolParamsSupplier protocolParamsSupplier;
-    private final BackendService backendService;
+    /**
+     * Where cardano-client-lib fetches the BYTES of a script that travels as a reference script, or
+     * {@code null} for the offline rigs (which declare every registry script explicitly). Production
+     * builds with {@code new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier, null)}:
+     * priced, because this supplier serves the bytes of EVERY referenced script — the collateral
+     * oracle's included, which no registry list can name (CCL trap 9) — and submit-incapable, because
+     * the processor slot is null and the evaluator arrives through {@code withTxEvaluator} (CCL trap 8).
+     * Mirrors the field of the same name in {@link LiquidateTransactionBuilder} and
+     * {@link LiquidatePayInAdvanceTransactionBuilder} (FAB-134 B3b).
+     */
+    private final ScriptSupplier scriptSupplier;
     private final TransactionEvaluator scriptCostEvaluator;
+    /**
+     * ⛔ FAB-138: asks Blockfrost, inside {@link #build} and before any evaluation, whether the collateral
+     * oracle's out-refs — its feed and, for a Charli3 feed, its provider — are still live; or {@code null}
+     * for the test-built builders, which are unprobed by design. Production's is {@code YaciConfig}'s bean,
+     * pinned by {@code YaciConfigWiringTest}. Without it a spent feed reaches Blockfrost's evaluation as an
+     * empty {@code ScriptFailures}, which the executor reads as a spent WALLET input
+     * ({@code ccl-transaction-building-traps} §13). Mirrors the field of the same name in
+     * {@link LiquidateTransactionBuilder} and {@link LiquidatePayInAdvanceTransactionBuilder}.
+     */
+    private final OracleReferenceInputProbe oracleReferenceInputProbe;
 
-    /** Offline: a rig supplies the scripts and evaluates for itself. */
+    /** Offline: a rig supplies the scripts and evaluates for itself. Unprobed: tests only. */
     public ConvertTransactionBuilder(LoansContractRegistry registry, Network network,
                                      UtxoSupplier utxoSupplier,
                                      ProtocolParamsSupplier protocolParamsSupplier,
                                      TransactionEvaluator scriptCostEvaluator) {
-        this(registry, network, utxoSupplier, protocolParamsSupplier, null, scriptCostEvaluator);
+        this(registry, network, (ScriptSupplier) null, utxoSupplier, protocolParamsSupplier,
+                scriptCostEvaluator, null);
     }
 
-    /** Production: one backend wires the utxo supplier, params and script supplier. */
+    /**
+     * The production constructor (FAB-134 B3b-3). Every collaborator is injected and none may be null —
+     * <b>the evaluator included</b>. {@code YaciConfig} hands over the index-first {@link UtxoSupplier},
+     * the per-epoch {@link ProtocolParamsSupplier}, a {@link ScriptSupplier} that serves verified script
+     * bytes, and Blockfrost's {@code /utils/txs/evaluate} narrowed to a {@link TransactionEvaluator}.
+     * Nothing here is a {@code BackendService}; see the {@link #scriptSupplier} field.
+     * Unprobed: tests only — production goes through the constructor that also takes the oracle probe.
+     */
     public ConvertTransactionBuilder(LoansContractRegistry registry, Network network,
-                                     BackendService backendService,
                                      UtxoSupplier utxoSupplier,
                                      ProtocolParamsSupplier protocolParamsSupplier,
+                                     ScriptSupplier scriptSupplier,
                                      TransactionEvaluator scriptCostEvaluator) {
-        this(registry, network, utxoSupplier, protocolParamsSupplier, backendService, scriptCostEvaluator);
+        this(registry, network, utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator, null);
     }
 
+    /**
+     * ⛔ The production constructor (FAB-138), the one {@code YaciConfig} calls: as the one above, plus the
+     * {@link OracleReferenceInputProbe} every {@link #build} runs before evaluation. The probe holds a
+     * read-only {@code UtxoService}, so this builder still holds nothing that could submit.
+     */
+    public ConvertTransactionBuilder(LoansContractRegistry registry, Network network,
+                                     UtxoSupplier utxoSupplier,
+                                     ProtocolParamsSupplier protocolParamsSupplier,
+                                     ScriptSupplier scriptSupplier,
+                                     TransactionEvaluator scriptCostEvaluator,
+                                     OracleReferenceInputProbe oracleReferenceInputProbe) {
+        this(registry, network, Objects.requireNonNull(scriptSupplier, "scriptSupplier"), utxoSupplier,
+                protocolParamsSupplier, scriptCostEvaluator, oracleReferenceInputProbe);
+    }
+
+    /** Every public constructor lands here; {@code scriptSupplier} is null only on the offline path. */
     private ConvertTransactionBuilder(LoansContractRegistry registry, Network network,
+                                      ScriptSupplier scriptSupplier,
                                       UtxoSupplier utxoSupplier,
                                       ProtocolParamsSupplier protocolParamsSupplier,
-                                      BackendService backendService,
-                                      TransactionEvaluator scriptCostEvaluator) {
+                                      TransactionEvaluator scriptCostEvaluator,
+                                      OracleReferenceInputProbe oracleReferenceInputProbe) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.network = Objects.requireNonNull(network, "network");
         this.utxoSupplier = Objects.requireNonNull(utxoSupplier, "utxoSupplier");
         this.protocolParamsSupplier =
                 Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
-        this.backendService = backendService;
-        // ⛔ NOT optional, and deliberately not defaulted. See the class javadoc.
+        this.scriptSupplier = scriptSupplier;
+        // ⛔ NOT optional, and deliberately not defaulted — on either path. See the class javadoc.
         this.scriptCostEvaluator = Objects.requireNonNull(scriptCostEvaluator,
                 "a convert builder without a TransactionEvaluator would ship placeholder ex-units and "
                         + "fail in phase 2 — CCL trap 8. There is no constructor without one.");
+        this.oracleReferenceInputProbe = oracleReferenceInputProbe;
     }
 
     // ---- the one entry point --------------------------------------------------------------------
@@ -247,6 +294,15 @@ public class ConvertTransactionBuilder {
                             + "receipt NFT in the equity output that this builder does not mint");
         }
 
+        // ⛔ FAB-138: the collateral oracle's out-refs (its feed and, for a Charli3 feed, its provider) must
+        // still be LIVE — asked once per build, here, after the refusals above and before either pass below:
+        // pass 1 (the layout probe) and pass 2 share this one answer. Spent, wrong NFT or a provider error
+        // throws OracleReferenceInputNotLiveException, which the executor records REFUSED and logs at ERROR
+        // every cycle. After evaluation it would be too late: a spent feed comes back from Blockfrost as an
+        // empty ScriptFailures, which the executor reads as a spent WALLET input (CCL trap 13).
+        if (oracleReferenceInputProbe != null) {
+            oracleReferenceInputProbe.requireLive(List.of(request.collateralOracle()));
+        }
         List<TransactionInput> refInputs = referenceInputs(request);
         long configRefIndex = indexOf(refInputs, inputOf(request.configUtxo()), "main config");
         // ⛔ The LM config, not the main one: lender_manager.withdraw resolves the ACTION script from
@@ -426,8 +482,14 @@ public class ConvertTransactionBuilder {
     private Transaction complete(Request request, List<TransactionInput> refInputs, ScriptTx tx,
                                  TxBuilder verify) {
         tx.readFrom(refInputs.toArray(TransactionInput[]::new));
-        QuickTxBuilder quickTxBuilder = backendService != null
-                ? new QuickTxBuilder(backendService)
+        // Production: the injected utxo supplier (the local index first), the per-epoch protocol params,
+        // and a SCRIPT SUPPLIER serving the bytes of every validator travelling as a reference script —
+        // without which cardano-client-lib prices that script's fee as zero (CCL trap 9). The processor
+        // slot is null and stays null: the evaluator arrives through withTxEvaluator below (CCL trap 8),
+        // so this builder can price a transaction and has nothing that could submit one. Offline: the
+        // three-argument form, because the rigs declare every registry script explicitly.
+        QuickTxBuilder quickTxBuilder = scriptSupplier != null
+                ? new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier, null)
                 : new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null);
 
         var context = quickTxBuilder.compose(tx)
@@ -474,19 +536,47 @@ public class ConvertTransactionBuilder {
                 // reference script, and ChangeOutputAdjustments falls through to its own selector.
                 .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
                 .preBalanceTx((ctx, txn) ->
-                        ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)));
+                        ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                // ⛔ CCL trap 9b, the THIRD seam: with no collateral inputs named, QuickTxBuilder's
+                // buildCollateralOutput picks collateral with its own unguarded
+                // DefaultUtxoSelectionStrategyImpl (a hardcoded 5 ADA target) — blind to both guards
+                // above. Measured (FAB-134 B3b-3 pin, ConvertProductionWiringTest): with the published
+                // scripts listed before the wallet — production's IndexFirstUtxoSupplier pages by tx id,
+                // so that order is as likely as any — every 9-50 ADA wallet pledged a 20 ADA reference
+                // script as its ONLY collateral, which a phase-2 failure consumes. So the collateral is
+                // chosen here from reference-script-free wallet UTxOs, sized from the protocol
+                // parameters — the liquidation builders' helper, shared rather than copied (as compound).
+                .withCollateralInputs(LiquidateTransactionBuilder.collateralInputsFor(utxoSupplier,
+                        protocolParamsSupplier, request.changeAddress(), request.walletUtxo()));
 
         if (verify != null) {
             context = context.postBalanceTx(verify);
         }
 
-        // CCL trap 9: the reference-script fee is charged only for bytes the library can OBTAIN.
+        // ⛔ CCL trap 9: the reference-script fee is charged only for bytes the library can OBTAIN — and a
+        // DECLARED list wins outright. When withReferenceScripts is non-empty, cardano-client-lib 0.7.2
+        // (FeeCalculators:125-145) prices exactly the declared scripts and never consults the supplier.
+        // referencedScripts() can only name REGISTRY scripts, while the reference inputs also carry the
+        // collateral oracle's published script: declared here in production, the oracle's bytes were
+        // charged zero (FAB-134 B3b-3, measured on ConvertProductionWiringTest: the fee did not move by
+        // one lovelace when the supplier stopped serving the oracle's 4,136 bytes) — the shape of the
+        // 2026-08-24 FeeTooSmallUTxO on the pay-in-advance path.
+        //
+        // ⇒ Production declares NOTHING and lets the byte-serving supplier price every referenced script,
+        // as both siblings do. Offline there is no supplier and no ledger to satisfy, so the declaration
+        // stays.
+        //
+        // removeDuplicateScriptWitnesses stays on BOTH paths: ScriptTx.mintAsset always attaches a
+        // witness copy of the loan policy, which also travels by reference here, and a script both
+        // witnessed and referenced is ExtraneousScriptWitnessesUTXOW (CCL trap 9, the witness half).
         List<PlutusScript> referenced = referencedScripts(request);
         if (!referenced.isEmpty()) {
-            context = context.withReferenceScripts(referenced.toArray(PlutusScript[]::new))
-                    .removeDuplicateScriptWitnesses(true);
+            if (scriptSupplier == null) {
+                context = context.withReferenceScripts(referenced.toArray(PlutusScript[]::new));
+            }
+            context = context.removeDuplicateScriptWitnesses(true);
         }
-        if (backendService == null) {
+        if (scriptSupplier == null) {
             // CCL trap 2: offline, ReferenceScriptResolver NPEs on a missing supplier.
             context = context.withScriptSupplier(scriptHash -> java.util.Optional.empty());
         }

@@ -44,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -193,14 +194,14 @@ public class LiquidationReadinessController {
     private final AppConfig.Network network;
 
     /**
-     * ⛔ CACHED, because reading it is a PROVIDER CALL. {@code AppUtxoService.listWalletUtxo()} asks
-     * Blockfrost first by design — an index-backed balance cannot tell an empty wallet from one whose
-     * history starts below the sync point — and this page re-renders every sixty seconds in every
-     * open tab. Per-render reads would multiply provider traffic by the number of people looking.
+     * ⚠ A RENDER-FREQUENCY THROTTLE ON A LOCAL READ, not a cache of chain data against a provider.
+     * {@code AppUtxoService.listWalletUtxo()} reads the local Yaci index by the wallet's payment
+     * credential (FAB-134 B2) — no Blockfrost call is involved — and this page re-renders every sixty
+     * seconds in every open tab, so the TTL only bounds how often one render path queries Postgres.
      *
-     * <p>⚠ And a cached number shown as live is the failure that replaces the one being avoided, so
-     * the reading's AGE is rendered beside it. Volatile rather than synchronized: a duplicate read
-     * under a race costs one provider call, and a lock on a render path costs a stall.
+     * <p>⚠ A throttled number shown as live is still a stale number, so the reading's AGE is rendered
+     * beside it. Volatile rather than synchronized: a duplicate read under a race costs one database
+     * query, and a lock on a render path costs a stall.
      */
     private static final long WALLET_TTL_MILLIS = 60_000L;
 
@@ -247,6 +248,18 @@ public class LiquidationReadinessController {
     @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
         this.lendingConfigGate = gate;
+    }
+
+    /**
+     * ⛔ FAB-134 B2 / FAB-136: the wallet panel is gated on {@code !isSyncing}, exactly as the processors
+     * are, because the local index is the only place the wallet is read from. Setter-injected and
+     * REQUIRED in the container; null only in a direct test construction, where it reads as open.
+     */
+    private com.fluidtokens.aquarium.offchain.service.BlockEventListener blockEventListener;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setBlockEventListener(com.fluidtokens.aquarium.offchain.service.BlockEventListener blockEventListener) {
+        this.blockEventListener = blockEventListener;
     }
 
     /**
@@ -305,6 +318,7 @@ public class LiquidationReadinessController {
         List<Row> all = rows(loans, scan, health, now);
         WalletBalance walletNow = wallet(now);
         model.addAttribute("wallet", walletNow);
+        model.addAttribute("walletNotReady", walletNotReadyReason());
         model.addAttribute("walletAgeSeconds", walletNow.ageSeconds(now));
         // ⚠ Scaled and tickered through the SAME AssetDisplay the table uses, so the balance cannot
         // render in different units from the loan figures it is meant to be compared against.
@@ -372,11 +386,25 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * The wallet, at most once per {@link #WALLET_TTL_MILLIS}. A failed read leaves the previous
-     * value standing rather than replacing a known balance with an unknown one — a transient
-     * provider blip should not make every affordability mark on the page go grey.
+     * The wallet, at most once per {@link #WALLET_TTL_MILLIS}, and only once the node has caught up.
+     *
+     * <h2>⛔ Gated exactly like the processors</h2>
+     * The read is the local index (FAB-134 B2), and the gate is {@code !isSyncing} only (FAB-136). While
+     * the node is syncing a balance read from it may be PARTIAL, and a partial balance understates
+     * silently ({@code officina:yaci-store-index-scoping} §5) — so while syncing the page shows NO
+     * balance ({@link WalletBalance#unknown()}) and {@link #walletNotReadyReason()} says why. The
+     * database is not even queried.
+     *
+     * <h2>An empty answer is authoritative</h2>
+     * With the gate open, an empty result is an empty wallet and is shown as one — it is no longer
+     * treated as "we learned nothing" and papered over with a previous balance. A read that THROWS
+     * (the database is unreachable) still leaves the previous value standing: that is a failed read,
+     * not an answer, and a transient database blip should not grey every affordability mark.
      */
     WalletBalance wallet(long now) {
+        if (walletNotReadyReason() != null) {
+            return WalletBalance.unknown();
+        }
         WalletBalance cached = cachedWallet;
         if (cached.known() && now - cached.asOfMillis() < WALLET_TTL_MILLIS) {
             return cached;
@@ -387,18 +415,23 @@ public class LiquidationReadinessController {
         }
         try {
             WalletBalance fresh = WalletBalance.of(service.listWalletUtxo(), now);
-            // ⚠ listWalletUtxo() logs and returns an EMPTY LIST when the provider cannot be reached,
-            // so an empty result is ambiguous. Keeping a previously known balance is the honest
-            // reading of "we learned nothing new", and it is also the safe one.
-            if (fresh.byUnit().isEmpty() && cached.known()) {
-                return cached;
-            }
             cachedWallet = fresh;
             return fresh;
         } catch (RuntimeException e) {
             log.warn("the wallet balance could not be read for the readiness page: {}", e.toString());
             return cached;
         }
+    }
+
+    /**
+     * Why the wallet cannot be shown yet, or {@code null} when it can. Null collaborators mean a
+     * direct test construction and read as open, like the processors' gates.
+     */
+    String walletNotReadyReason() {
+        if (blockEventListener != null && blockEventListener.getIsSyncing().get()) {
+            return "wallet not ready: the node is still syncing";
+        }
+        return null;
     }
 
     private List<Row> rows(LoanService loans, LiquidationCandidateScanner scan,
@@ -410,19 +443,21 @@ public class LiquidationReadinessController {
                         (first, duplicate) -> first));
 
         MarketGate gate = new MarketGate(liquidationConfiguration);
-        // ⛔ ONE render, ONE lookup per distinct pair. See resolvePool: this map lives exactly as long
-        // as this request and is never shared between renders, so nothing it holds can go stale.
+        // ⛔ ONE render, ONE index snapshot, ONE verdict per distinct pair. See resolvePool: the memo and
+        // the snapshot live exactly as long as this request and are never shared between renders, so
+        // nothing they hold can go stale.
         Map<String, PoolFetch> poolMemo = new HashMap<>();
+        Supplier<MinswapPoolResolver.Snapshot> poolSnapshot = poolSnapshotForOneRender();
         // Same reasoning as the pool memo one level down: an asset's ticker and scale are a property
         // of the ASSET, not of the row, and a table is mostly two or three distinct assets.
         Map<String, TokenMetadata> metadataMemo = new HashMap<>();
         List<Row> rows = new ArrayList<>();
-        // ⚠ ONCE per render, not once per row: it is a provider call behind a TTL, and twenty loans
+        // ⚠ ONCE per render, not once per row: it is a database read behind a TTL, and twenty loans
         // asking the same question twenty times would defeat the cache on the first miss.
         WalletBalance wallet = wallet(now);
         for (Loan loan : result.loanCensus().loans()) {
             LiquidationAssessment assessment = byLoanId.get(loan.loanId());
-            rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo,
+            rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo, poolSnapshot,
                     metadataMemo, wallet, now));
         }
         rows.sort(Comparator.comparingDouble(Row::sortKey));
@@ -431,6 +466,7 @@ public class LiquidationReadinessController {
 
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
                     MarketGate gate, Map<String, PoolFetch> poolMemo,
+                    Supplier<MinswapPoolResolver.Snapshot> poolSnapshot,
                     Map<String, TokenMetadata> metadataMemo, WalletBalance wallet, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
@@ -507,7 +543,7 @@ public class LiquidationReadinessController {
             var action = gate.actionFor(datum.principalAsset());
             // The FETCH is per pair and memoised; the VERDICT is per loan. Both come from the same
             // already-fetched pool datum, so asking the sharper question costs no extra call.
-            PoolFetch fetched = resolvePool(collateralAsset, datum.principalAsset(), poolMemo);
+            PoolFetch fetched = resolvePool(collateralAsset, datum.principalAsset(), poolMemo, poolSnapshot);
             usability = usabilityFor(fetched, loan, bond, collateralAsset, datum.principalAsset(), now);
 
             if (datum.collateral().isAda()) {
@@ -817,30 +853,60 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * ⛔ <b>The pool question is per PAIR; this page was asking it per ROW.</b>
+     * ⛔ <b>The pool question is per PAIR, and the index is read once per RENDER.</b>
      *
-     * <p>{@link MinswapPoolResolver#resolveEitherOrder} is a Blockfrost round trip — one call, or
-     * <b>two</b> when the first asset ordering 404s, which is always the case for a pair that has no
-     * pool at all ({@code compute_lp_asset_name} is order-sensitive). It holds no cache. So a table of
-     * N loans cost <b>N to 2N Blockfrost calls per render</b>, and every loan sharing a pair re-asked
-     * an identical question and received an identical answer.
+     * <p>Pools are read from the node's own index (FAB-137): {@link MinswapPoolResolver#snapshot} is ONE
+     * unpaged credential query that returns every authentic pool, and asking the snapshot about a pair
+     * issues no query at all. So a render takes at most one snapshot — lazily, only when some row needs
+     * a pool verdict, and never while syncing — and every pair on the page is answered from it. The
+     * memo then keeps one verdict per pair, so loans sharing a pair share the answer.
      *
-     * <p>This memo is <b>request-scoped</b>: created in {@link #rows}, discarded when the response is.
-     * Two loans on the same pair now produce one lookup instead of two, and the data rendered is
-     * byte-for-byte what the page would have shown anyway — <b>same request, same instant</b>.
+     * <p>Both are <b>request-scoped</b>: created in {@link #rows}, discarded when the response is. The
+     * data rendered is what the page would have shown asking each row separately — <b>same request,
+     * same instant</b>.
      *
      * <h2>⚠ Why this is a dedupe and deliberately NOT a TTL cache</h2>
-     * {@code resolveEitherOrder} returns the pool UTxO, and <b>a pool UTxO carries reserves</b>.
-     * Reserves held across renders are stale reserves, and the same resolver is injected into
+     * The snapshot holds pool UTxOs, and <b>a pool UTxO carries reserves</b>. Reserves held across
+     * renders are stale reserves on a page operators read to decide whether to front capital, and the
+     * same resolver is injected into
      * {@link com.fluidtokens.aquarium.offchain.service.loans.ConvertLiquidationRouter} on the convert
-     * <b>build</b> path — where stale reserves would price a real transaction. A per-request map
+     * <b>build</b> path — where stale reserves would price a real transaction. A per-request snapshot
      * cannot reach that path and cannot outlive the answer it belongs to; a TTL cache would be a
-     * different and money-shaped change. <b>Do not promote this to a field.</b>
+     * different and money-shaped change. <b>Do not promote the memo or the snapshot to a field.</b>
      */
     PoolFetch resolvePool(AssetType collateral, AssetType principal,
-                          Map<String, PoolFetch> poolMemo) {
+                          Map<String, PoolFetch> poolMemo, Supplier<MinswapPoolResolver.Snapshot> poolSnapshot) {
         return poolMemo.computeIfAbsent(pairKey(collateral, principal),
-                key -> lookupPool(collateral, principal));
+                key -> lookupPool(collateral, principal, poolSnapshot));
+    }
+
+    /**
+     * The render's one pool snapshot, taken on first use and then reused — including a FAILED read,
+     * which is rethrown rather than retried, so a database that cannot answer costs one query per
+     * render too. Call it once per request; the supplier it returns must never be kept in a field.
+     */
+    Supplier<MinswapPoolResolver.Snapshot> poolSnapshotForOneRender() {
+        return new Supplier<>() {
+            private boolean taken;
+            private MinswapPoolResolver.Snapshot snapshot;
+            private RuntimeException failure;
+
+            @Override
+            public MinswapPoolResolver.Snapshot get() {
+                if (!taken) {
+                    taken = true;
+                    try {
+                        snapshot = poolResolver.getObject().snapshot();
+                    } catch (RuntimeException e) {
+                        failure = e;
+                    }
+                }
+                if (failure != null) {
+                    throw failure;
+                }
+                return snapshot;
+            }
+        };
     }
 
     /**
@@ -854,27 +920,43 @@ public class LiquidationReadinessController {
         return a.compareTo(b) <= 0 ? a + "|" + b : b + "|" + a;
     }
 
-    // Package-private so the dedupe can be proven against a counting resolver without a Spring context.
-    PoolFetch lookupPool(AssetType collateral, AssetType principal) {
-        MinswapPoolResolver resolver = poolResolver.getIfAvailable();
-        if (resolver == null) {
+    /**
+     * One pair's pool verdict, read from the render's snapshot — a local index read, not a provider
+     * round trip.
+     *
+     * <p>⛔ <b>While syncing the index is partial</b>, and a partial index reads "no pool" for a pool it
+     * has not reached yet ({@code officina:yaci-store-index-scoping} §5) — the answer that tells an
+     * operator to front capital. So while syncing the verdict is CHECK_FAILED and the snapshot is never
+     * taken: the same {@code !isSyncing} gate as the wallet panel.
+     */
+    // Package-private so the dedupe can be proven against a counting index without a Spring context.
+    PoolFetch lookupPool(AssetType collateral, AssetType principal,
+                         Supplier<MinswapPoolResolver.Snapshot> poolSnapshot) {
+        if (poolResolver.getIfAvailable() == null) {
             return new PoolFetch(java.util.List.of(), PoolUsability.notConfigured());
         }
+        if (blockEventListener != null && blockEventListener.getIsSyncing().get()) {
+            return new PoolFetch(java.util.List.of(), PoolUsability.checkFailed("the node is still syncing"));
+        }
         try {
-            var pools = resolver.resolveAllEitherOrder(collateral, principal);
-            return pools.isEmpty()
-                    ? new PoolFetch(java.util.List.of(), PoolUsability.noPool())
-                    : new PoolFetch(pools.stream().map(MinswapPoolResolver.ResolvedPool::datum).toList(), null);
+            return poolSnapshot.get().resolveEitherOrder(collateral, principal)
+                    .map(pool -> new PoolFetch(java.util.List.of(pool.datum()), null))
+                    .orElseGet(() -> new PoolFetch(java.util.List.of(), PoolUsability.noPool()));
         } catch (RuntimeException e) {
             // ⛔ A failed lookup is NOT "no pool exists". One says hold capital for this loan from now
             // on; the other says try again shortly. Collapsing them was the defect this now avoids.
+            // A RefusedException is either the index unreadable (LOOKUP_FAILED) or two authentic pools
+            // for one pair (AMBIGUOUS_POOL, an index-integrity fault naming both out-refs) — its
+            // message is the verdict's detail, so the page names which.
             // ⛔ WARN, NOT DEBUG. This was log.debug, so on a node running at INFO the page told the
             // operator the lookup "did not complete ... worth re-checking" and the logs held NOTHING
             // to re-check. A UI that reports a fault must not be the only place the fault exists.
             log.warn("pool lookup failed for {}/{}: {} — the readiness page shows CHECK FAILED for "
                             + "every loan on this pair until it succeeds",
                     collateral.toUnit(), principal.toUnit(), e.toString(), e);
-            return new PoolFetch(java.util.List.of(), PoolUsability.checkFailed(e.getClass().getSimpleName()));
+            String why = e instanceof MinswapPoolResolver.RefusedException ? e.getMessage()
+                    : e.getClass().getSimpleName();
+            return new PoolFetch(java.util.List.of(), PoolUsability.checkFailed(why));
         }
     }
 

@@ -356,7 +356,7 @@ class LiquidationReadinessControllerTest {
         var controller = new LiquidationReadinessController(provide(null), provide(null), provide(null),
                 provide(null), provide(null), provide(null), provide(null), provide(null),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+                        60, 120, 30, BigInteger.ZERO, 200), network);
         var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
         controller.setLendingConfigGate(gate);
 
@@ -412,7 +412,7 @@ class LiquidationReadinessControllerTest {
         var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
                 provide(null), provide(null), provide(null), provide(LoanFixtures.registry()), provide(null),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+                        60, 120, 30, BigInteger.ZERO, 200), network);
         var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
         controller.setLendingConfigGate(gate);
 
@@ -500,7 +500,7 @@ class LiquidationReadinessControllerTest {
         var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
                 provide(client), provide(null), provide(null), provide(LoanFixtures.registry()), provide(null),
                 new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        60, 120, 30, BigInteger.ZERO, 200, 30), network);
+                        60, 120, 30, BigInteger.ZERO, 200), network);
         controller.setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
 
         var model = new org.springframework.ui.ConcurrentModel();
@@ -793,33 +793,109 @@ class LiquidationReadinessControllerTest {
     // The pool lookup is per PAIR, and this page was paying for it per ROW
     // ================================================================================================
 
-    /**
-     * A resolver that answers instantly and counts. The real one is a Blockfrost round trip — one call,
-     * or two when the first asset ordering 404s — and holds no cache of any kind.
-     */
-    private static final class CountingPoolResolver extends MinswapPoolResolver {
-        private int calls;
-        private final boolean poolExists;
+    // ---- the pool index: the REAL MinswapPoolResolver over a mocked UtxoRepository ----------------
+    // FAB-137 T2c: the pool is read from the node's own index, so the fakes are no longer resolvers
+    // that answer a question -- they are index rows the real resolver must authenticate. Counting
+    // REPOSITORY queries is what proves "one index read per render", whatever the resolver does.
 
-        private CountingPoolResolver(boolean poolExists) {
-            super(null, "addr_pool", "00".repeat(28));
-            this.poolExists = poolExists;
+    private static final String POOL_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+    private static final String POOL_CREDENTIAL = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+    private static final String POOL_ADDR = "addr1z84q0denmyep98ph3tmzwsmw0j7zau9ljmsqx6a4rvaau66j2c79gy9l76sdg0xwhd7r0c0kna0tycz4y5s6mlenh8pq777e2a";
+    private static final AssetType FLDT = new AssetType("11".repeat(28), "464c4454");
+
+    /** Minswap's {@code Asset { policy_id, asset_name }}; ada is empty/empty. */
+    private static com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData minswapAsset(AssetType asset) {
+        byte[] policy = asset.isAda() ? new byte[0]
+                : com.bloxbean.cardano.client.util.HexUtil.decodeHexString(asset.policyId());
+        byte[] name = asset.isAda() ? new byte[0]
+                : com.bloxbean.cardano.client.util.HexUtil.decodeHexString(asset.assetName());
+        return com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.of(0,
+                com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(policy),
+                com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(name));
+    }
+
+    /** The ten-field on-chain PoolDatum, positions as {@code MinswapPoolDatumConverter} reads them. */
+    private static String poolDatumHex(MinswapPoolDatum d) {
+        return com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.of(0,
+                com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.of(0), // batching credential: not read
+                minswapAsset(d.assetA()), minswapAsset(d.assetB()),
+                com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData.of(d.totalLiquidity()),
+                com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData.of(d.reserveA()),
+                com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData.of(d.reserveB()),
+                com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData.of(d.baseFeeANumerator()),
+                com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData.of(d.baseFeeBNumerator()),
+                com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.of(1), // fee sharing: None
+                com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.of(d.allowDynamicFee() ? 1 : 0))
+                .serializeToHex();
+    }
+
+    private static com.bloxbean.cardano.yaci.store.common.domain.Amt amt(String unit, long quantity) {
+        var amount = new com.bloxbean.cardano.yaci.store.common.domain.Amt();
+        amount.setUnit(unit);
+        amount.setQuantity(BigInteger.valueOf(quantity));
+        return amount;
+    }
+
+    /** An AUTHENTIC pool row: exactly one MSP, the datum, and the LP unit recomputed from its pair. */
+    private static com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity poolRow(
+            String txHash, MinswapPoolDatum datum) {
+        var entity = new com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity();
+        entity.setTxHash(txHash);
+        entity.setOutputIndex(1);
+        entity.setOwnerAddr(POOL_ADDR);
+        entity.setOwnerPaymentCredential(POOL_CREDENTIAL);
+        entity.setInlineDatum(poolDatumHex(datum));
+        entity.setAmounts(new ArrayList<>(List.of(amt("lovelace", 5_000_000L),
+                amt(POOL_POLICY + com.fluidtokens.aquarium.offchain.service.loans.ConvertTxEncoder.POOL_NFT_ASSET_NAME, 1),
+                amt(POOL_POLICY + com.fluidtokens.aquarium.offchain.service.loans.ConvertTxEncoder
+                        .computeLpAssetName(datum.assetA(), datum.assetB()), 1_000L))));
+        return entity;
+    }
+
+    /** The ada/FLDT pool the dedupe tests ask about. */
+    private static MinswapPoolDatum fldtPool() {
+        return new MinswapPoolDatum(AssetType.ada(), FLDT, BigInteger.TEN,
+                BigInteger.valueOf(1_000_000L), BigInteger.valueOf(2_000_000L),
+                BigInteger.valueOf(30), BigInteger.valueOf(30), false);
+    }
+
+    /** A mocked index holding the given pools, read through the real resolver; it counts every query. */
+    private static final class PoolIndex {
+        final com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository repository =
+                org.mockito.Mockito.mock(com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository.class);
+
+        static PoolIndex of(MinswapPoolDatum... pools) {
+            var rows = new ArrayList<com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity>();
+            for (int i = 0; i < pools.length; i++) {
+                rows.add(poolRow(Integer.toHexString(0xa0 + i).repeat(32), pools[i]));
+            }
+            return ofRows(rows);
         }
 
-        // ⛔ resolveAllEitherOrder is what the page calls now — it needs EVERY pool for the pair,
-        // because depth only orders candidates and the fill test decides between them. Counting the
-        // single-pool method instead would count zero and the dedupe assertions would pass vacuously.
-        @Override
-        public java.util.List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
-            calls++;
-            // A real datum: PoolFetch now carries it through the memo, which is what lets the
-            // per-loan verdict be computed without a second lookup.
-            return poolExists
-                    ? java.util.List.of(new ResolvedPool(null, new MinswapPoolDatum(AssetType.ada(),
-                            new AssetType("11".repeat(28), "464c4454"), BigInteger.TEN,
-                            BigInteger.valueOf(1_000_000L), BigInteger.valueOf(2_000_000L),
-                            BigInteger.valueOf(30), BigInteger.valueOf(30), false), "lp"))
-                    : java.util.List.of();
+        static PoolIndex ofRows(List<com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity> rows) {
+            PoolIndex index = new PoolIndex();
+            org.mockito.Mockito.when(index.repository.findUnspentByOwnerPaymentCredential(
+                            org.mockito.ArgumentMatchers.eq(POOL_CREDENTIAL),
+                            org.mockito.ArgumentMatchers.any(org.springframework.data.domain.Pageable.class)))
+                    .thenAnswer(inv -> Optional.of(rows));
+            return index;
+        }
+
+        /** An index that cannot be read, as a database that is down. */
+        static PoolIndex failing() {
+            PoolIndex index = new PoolIndex();
+            org.mockito.Mockito.when(index.repository.findUnspentByOwnerPaymentCredential(
+                            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                    .thenThrow(new IllegalStateException("fixture: database unreachable"));
+            return index;
+        }
+
+        MinswapPoolResolver resolver() {
+            return new MinswapPoolResolver(repository, POOL_CREDENTIAL, POOL_POLICY);
+        }
+
+        int queries() {
+            return org.mockito.Mockito.mockingDetails(repository).getInvocations().size();
         }
     }
 
@@ -835,27 +911,36 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
-     * ⛔ <b>THE CALL COUNT COLLAPSES.</b> Two loans on the same pair asked the chain the same question
-     * twice and got the same answer twice. Within one render they now ask once.
+     * A snapshot source that reads the index on EVERY ask, so the query count below measures the memo
+     * alone. (A render shares one snapshot -- see the FAB-137 T2c tests -- which would hide the memo.)
+     */
+    private static java.util.function.Supplier<MinswapPoolResolver.Snapshot> snapshotPerAsk(
+            MinswapPoolResolver resolver) {
+        return resolver::snapshot;
+    }
+
+    /**
+     * ⛔ <b>THE CALL COUNT COLLAPSES.</b> Two loans on the same pair asked the same question twice and
+     * got the same answer twice. Within one render they now ask once.
      *
-     * <p>Before this memo a table of N loans cost <b>N to 2N Blockfrost calls per render</b> — two
-     * whenever a pair has no pool, because {@code compute_lp_asset_name} is order-sensitive and both
-     * orderings must 404 before the answer is known.
+     * <p>Before this memo a table of N loans cost one lookup per ROW; the memo keeps one verdict per
+     * pair, and the pair, not the row, is what the pool question is about.
      */
     @Test
     void twoLoansOnOnePairProduceOneLookupRatherThanTwo() {
-        CountingPoolResolver resolver = new CountingPoolResolver(true);
+        PoolIndex index = PoolIndex.of(fldtPool());
+        MinswapPoolResolver resolver = index.resolver();
         LiquidationReadinessController controller = controllerWithPool(resolver);
         Map<String, LiquidationReadinessController.PoolFetch> memo = new HashMap<>();
 
         AssetType collateral = AssetType.ada();
         AssetType principal = new AssetType("11".repeat(28), "464c4454");
 
-        controller.resolvePool(collateral, principal, memo);
-        controller.resolvePool(collateral, principal, memo);
-        controller.resolvePool(collateral, principal, memo);
+        controller.resolvePool(collateral, principal, memo, snapshotPerAsk(resolver));
+        controller.resolvePool(collateral, principal, memo, snapshotPerAsk(resolver));
+        controller.resolvePool(collateral, principal, memo, snapshotPerAsk(resolver));
 
-        assertEquals(1, resolver.calls,
+        assertEquals(1, index.queries(),
                 "three rows on one pair must reach the resolver once, not three times");
     }
 
@@ -870,13 +955,14 @@ class LiquidationReadinessControllerTest {
         AssetType principal = new AssetType("11".repeat(28), "464c4454");
 
         for (boolean poolExists : new boolean[]{true, false}) {
-            CountingPoolResolver resolver = new CountingPoolResolver(poolExists);
-            LiquidationReadinessController controller = controllerWithPool(resolver);
+            PoolIndex index = poolExists ? PoolIndex.of(fldtPool()) : PoolIndex.of();
+            MinswapPoolResolver resolver = index.resolver();
+        LiquidationReadinessController controller = controllerWithPool(resolver);
 
-            LiquidationReadinessController.PoolFetch direct = controller.lookupPool(collateral, principal);
+            LiquidationReadinessController.PoolFetch direct = controller.lookupPool(collateral, principal, snapshotPerAsk(resolver));
             Map<String, LiquidationReadinessController.PoolFetch> memo = new HashMap<>();
-            LiquidationReadinessController.PoolFetch first = controller.resolvePool(collateral, principal, memo);
-            LiquidationReadinessController.PoolFetch second = controller.resolvePool(collateral, principal, memo);
+            LiquidationReadinessController.PoolFetch first = controller.resolvePool(collateral, principal, memo, snapshotPerAsk(resolver));
+            LiquidationReadinessController.PoolFetch second = controller.resolvePool(collateral, principal, memo, snapshotPerAsk(resolver));
 
             assertEquals(direct, first, "the memoised answer must equal an unmemoised one (pool=" + poolExists + ")");
             assertEquals(first, second, "the second read must equal the first (pool=" + poolExists + ")");
@@ -891,17 +977,18 @@ class LiquidationReadinessControllerTest {
      */
     @Test
     void theSamePairInTheOppositeOrderIsNotAskedTwice() {
-        CountingPoolResolver resolver = new CountingPoolResolver(true);
+        PoolIndex index = PoolIndex.of(fldtPool());
+        MinswapPoolResolver resolver = index.resolver();
         LiquidationReadinessController controller = controllerWithPool(resolver);
         Map<String, LiquidationReadinessController.PoolFetch> memo = new HashMap<>();
 
         AssetType ada = AssetType.ada();
         AssetType fldt = new AssetType("11".repeat(28), "464c4454");
 
-        controller.resolvePool(ada, fldt, memo);
-        controller.resolvePool(fldt, ada, memo);
+        controller.resolvePool(ada, fldt, memo, snapshotPerAsk(resolver));
+        controller.resolvePool(fldt, ada, memo, snapshotPerAsk(resolver));
 
-        assertEquals(1, resolver.calls, "one pair, either way round, is one question");
+        assertEquals(1, index.queries(), "one pair, either way round, is one question");
         assertEquals(LiquidationReadinessController.pairKey(ada, fldt),
                 LiquidationReadinessController.pairKey(fldt, ada), "the key must be order-independent");
     }
@@ -909,7 +996,8 @@ class LiquidationReadinessControllerTest {
     /** A genuinely different pair must still cost its own lookup — the memo must not over-collapse. */
     @Test
     void twoDifferentPairsStillCostTwoLookups() {
-        CountingPoolResolver resolver = new CountingPoolResolver(true);
+        PoolIndex index = PoolIndex.of(fldtPool());
+        MinswapPoolResolver resolver = index.resolver();
         LiquidationReadinessController controller = controllerWithPool(resolver);
         Map<String, LiquidationReadinessController.PoolFetch> memo = new HashMap<>();
 
@@ -917,10 +1005,212 @@ class LiquidationReadinessControllerTest {
         AssetType fldt = new AssetType("11".repeat(28), "464c4454");
         AssetType usdm = new AssetType("22".repeat(28), "5553444d");
 
-        controller.resolvePool(ada, fldt, memo);
-        controller.resolvePool(ada, usdm, memo);
+        controller.resolvePool(ada, fldt, memo, snapshotPerAsk(resolver));
+        controller.resolvePool(ada, usdm, memo, snapshotPerAsk(resolver));
 
-        assertEquals(2, resolver.calls, "distinct pairs are distinct questions");
+        assertEquals(2, index.queries(), "distinct pairs are distinct questions");
+    }
+
+    // ---- FAB-137 T2c: ONE index snapshot per render, none while syncing ----------------------------
+
+    /**
+     * A page of one liquidatable loan per collateral token, each on a convert bond with an ada principal,
+     * so every row asks the pool question for (collateral, ada). Repeating a token repeats a pair.
+     */
+    private static LiquidationReadinessController pageController(MinswapPoolResolver resolver,
+            com.fluidtokens.aquarium.offchain.service.BlockEventListener listenerOrNull,
+            AssetType... collaterals) {
+        long now = System.currentTimeMillis();
+        List<Loan> loanList = new ArrayList<>();
+        List<LiquidationAssessment> assessments = new ArrayList<>();
+        for (int i = 0; i < collaterals.length; i++) {
+            LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L),
+                    BigInteger.ZERO, LoanFixtures.tokenCollateral(collaterals[i], COLLATERAL_ORACLE_NFT), 0L,
+                    LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+            String loanId = "loanid%02d".formatted(i);
+            Loan loan = new Loan("f0".repeat(32), i, "addr_test1_placeholder", loanId,
+                    BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+            LenderBond bond = new LenderBond("f1".repeat(32), i, "addr_test1_placeholder", loanId, "",
+                    LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                            LoanFixtures.noStakeCredential(), AssetType.ada()));
+            loanList.add(loan);
+            assessments.add(LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(), OraclePriceFeed.unit(), now));
+        }
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(loanList,
+                loanList.size(), 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(assessments, census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null) {
+            @Override
+            public com.fluidtokens.aquarium.offchain.model.loans.LoanHealth health(Loan l, long at) {
+                return new com.fluidtokens.aquarium.offchain.model.loans.LoanHealth(
+                        BigInteger.valueOf(100_000_000L), true, null, BigInteger.ZERO, true, null);
+            }
+        };
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(new FakeOracleClient()), provide(resolver), provide(null), provide(LoanFixtures.registry()),
+                provide(null), liveConfiguration(), network);
+        controller.setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
+        if (listenerOrNull != null) {
+            controller.setBlockEventListener(listenerOrNull);
+        }
+        return controller;
+    }
+
+    /** One render of the page, through the real {@code readiness()} path. */
+    private static List<LiquidationReadinessController.Row> render(LiquidationReadinessController controller) {
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        return rows;
+    }
+
+    /** Four rows over three pairs: COLLATERAL twice, FLDT (pool indexed in the opposite order), PRINCIPAL (no pool). */
+    private static final List<AssetType> PAGE = List.of(COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+
+    private static PoolIndex pageIndex() {
+        return PoolIndex.of(
+                new MinswapPoolDatum(AssetType.ada(), PAGE.get(0), BigInteger.TEN,
+                        new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                        BigInteger.valueOf(30L), BigInteger.valueOf(30L), false),
+                // ⚠ indexed as (FLDT, ada): the render asks (FLDT, ada) / (ada, FLDT) and must find it either way
+                new MinswapPoolDatum(FLDT, AssetType.ada(), BigInteger.TEN,
+                        new BigInteger("10000000000000"), new BigInteger("20000000000000"),
+                        BigInteger.valueOf(30L), BigInteger.valueOf(30L), false));
+    }
+
+    /**
+     * ⛔ <b>ONE INDEX READ PER RENDER, HOWEVER MANY ROWS OR PAIRS.</b> Four rows over three pairs used to
+     * cost one snapshot per PAIR (three unpaged credential queries); it is now one. A second render is a
+     * second read: the snapshot belongs to the request and nothing carries it across renders, because
+     * reserves held across renders are stale reserves on a page operators front capital from.
+     */
+    @Test
+    void aPageOfManyRowsOverSeveralPairsReadsTheIndexOncePerRender() {
+        PoolIndex index = pageIndex();
+        var controller = pageController(index.resolver(), syncing(false),
+                PAGE.get(0), PAGE.get(0), PAGE.get(1), PAGE.get(2));
+
+        List<LiquidationReadinessController.Row> rows = render(controller);
+
+        assertEquals(4, rows.size(), "fixture premise: four rows");
+        assertEquals(1, index.queries(), "four rows over three pairs must be ONE index query per render");
+        for (var row : rows) {
+            assertNotEquals(PoolUsability.Verdict.CHECK_FAILED, row.poolUsability().verdict(),
+                    "fixture premise: every lookup completed: " + row.poolUsability());
+        }
+        // (A found pool reads UNKNOWN "cannot be priced" here: the page's oracle is empty, and the price
+        // check only runs once a fetch returned a pool -- so anything but NO_POOL / CHECK_FAILED is "found".)
+        long noPool = rows.stream().filter(r -> r.poolUsability().verdict() == PoolUsability.Verdict.NO_POOL).count();
+        assertEquals(1, noPool, "only the PRINCIPAL-token pair has no pool, so the one snapshot answered all three "
+                + "pairs, including the pool indexed in the opposite order: " + rows.stream()
+                .map(r -> r.loanId() + "=" + r.poolUsability().verdict()).toList());
+
+        render(controller);
+        assertEquals(2, index.queries(), "a second render is a second index read -- never a held snapshot");
+    }
+
+    /**
+     * ⛔ <b>WHILE SYNCING THE INDEX IS PARTIAL, AND A PARTIAL INDEX READS "NO POOL" FOR A POOL IT HAS NOT
+     * REACHED YET</b> ({@code officina:yaci-store-index-scoping} §5). So while syncing every pool verdict
+     * is CHECK_FAILED naming the reason, and the index is not queried at all -- the wallet panel's gate.
+     */
+    @Test
+    void whileSyncingEveryPoolVerdictIsCheckFailedAndTheIndexIsNotRead() {
+        PoolIndex index = pageIndex();
+        var controller = pageController(index.resolver(), syncing(true),
+                PAGE.get(0), PAGE.get(0), PAGE.get(1), PAGE.get(2));
+
+        List<LiquidationReadinessController.Row> rows = render(controller);
+
+        assertEquals(4, rows.size(), "fixture premise: four rows");
+        for (var row : rows) {
+            assertEquals(PoolUsability.Verdict.CHECK_FAILED, row.poolUsability().verdict(), row.poolUsability().toString());
+            assertTrue(row.poolUsability().detail().contains("the node is still syncing"), row.poolUsability().detail());
+        }
+        org.mockito.Mockito.verifyNoInteractions(index.repository);
+    }
+
+    /**
+     * ⛔ Two AUTHENTIC pools for one pair cannot both be live on chain, so the index is wrong. The page
+     * says so by name -- both out-refs -- and logs it at WARN; it never reads as "no pool".
+     */
+    @Test
+    void twoAuthenticPoolsForOnePairIsCheckFailedNamingBothOutRefsAndLogged() {
+        var pool = new MinswapPoolDatum(AssetType.ada(), PAGE.get(0), BigInteger.TEN,
+                new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+        PoolIndex index = PoolIndex.of(pool, pool);
+        var controller = pageController(index.resolver(), syncing(false), PAGE.get(0));
+
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(LiquidationReadinessController.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        List<LiquidationReadinessController.Row> rows;
+        try {
+            rows = render(controller);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        var usability = rows.getFirst().poolUsability();
+        assertEquals(PoolUsability.Verdict.CHECK_FAILED, usability.verdict(), usability.toString());
+        assertTrue(usability.detail().contains("a0".repeat(32) + "#1"), usability.detail());
+        assertTrue(usability.detail().contains("a1".repeat(32) + "#1"), usability.detail());
+        assertTrue(appender.list.stream().anyMatch(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN
+                        && e.getFormattedMessage().contains("a0".repeat(32) + "#1")),
+                "the integrity fault must be in the log, not only on the page: " + appender.list);
+    }
+
+    /** No pool indexed for the pair: NO_POOL, worded as a statement about the INDEX, not the chain. */
+    @Test
+    void noIndexedPoolReadsNoPoolWithTheIndexedWording() {
+        PoolIndex index = PoolIndex.of();
+        var controller = pageController(index.resolver(), syncing(false), PAGE.get(2));
+
+        var usability = render(controller).getFirst().poolUsability();
+
+        assertEquals(PoolUsability.Verdict.NO_POOL, usability.verdict(), usability.toString());
+        // The ruled text (slice task 3), verbatim: a statement about what the index holds, not the chain.
+        assertEquals("no Minswap pool for this pair is indexed (pools idle since 2025-05-06 are invisible)",
+                usability.detail());
+        assertEquals(1, index.queries());
+    }
+
+    /**
+     * A database that cannot answer is CHECK_FAILED for every pair -- and is asked ONCE per render, not
+     * once per pair: the failed snapshot is the render's answer.
+     */
+    @Test
+    void anIndexThatCannotBeReadIsCheckFailedAndAskedOncePerRender() {
+        PoolIndex index = PoolIndex.failing();
+        var controller = pageController(index.resolver(), syncing(false), PAGE.get(0), PAGE.get(1), PAGE.get(2));
+
+        List<LiquidationReadinessController.Row> rows = render(controller);
+
+        for (var row : rows) {
+            assertEquals(PoolUsability.Verdict.CHECK_FAILED, row.poolUsability().verdict(), row.poolUsability().toString());
+            assertFalse(row.poolUsability().detail().contains("no Minswap pool"), row.poolUsability().detail());
+        }
+        assertEquals(1, index.queries(), "three pairs over a failing index is still one read per render");
     }
 
     /**
@@ -1016,7 +1306,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void aPlainBondIgnoresAnAnticipateMarketAndItsCap() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200);
         configuration.setMarkets(List.of(anticipateMarket("lovelace", 1)));
 
         LiquidationReadinessController.Row row = renderLiquidatableRow(
@@ -1030,7 +1320,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void aPlainBondInShadowWouldLiquidateWithoutActing() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200);
 
         LiquidationReadinessController.Row row = renderLiquidatableRow(
                 LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()),
@@ -1043,7 +1333,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void aLoanWithNoBondNeverActsOnAnAnticipateMarket() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200);
         configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
 
         LiquidationReadinessController.Row row = renderLiquidatableRow(
@@ -1070,7 +1360,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void anAdaCollateralConvertBondHasNoExecutableRoute() {
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200);
         configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
 
         LiquidationReadinessController.Row row = renderLiquidatableRow(
@@ -1142,33 +1432,6 @@ class LiquidationReadinessControllerTest {
         assertTrue(row.routeDetail().contains("fronts no capital"), row.routeDetail());
     }
 
-    /** A resolver whose lookup fails, as a Blockfrost blip would. */
-    private static final class ThrowingPoolResolver extends MinswapPoolResolver {
-        private ThrowingPoolResolver() {
-            super(null, "addr_pool", "00".repeat(28));
-        }
-
-        @Override
-        public java.util.List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
-            throw new IllegalStateException("fixture: provider unavailable");
-        }
-    }
-
-    /** A resolver that answers with fixed pools for every pair. */
-    private static final class FixedPoolResolver extends MinswapPoolResolver {
-        private final java.util.List<MinswapPoolDatum> pools;
-
-        private FixedPoolResolver(MinswapPoolDatum... pools) {
-            super(null, "addr_pool", "00".repeat(28));
-            this.pools = List.of(pools);
-        }
-
-        @Override
-        public java.util.List<ResolvedPool> resolveAllEitherOrder(AssetType one, AssetType other) {
-            return pools.stream().map(p -> new ResolvedPool(null, p, "lp")).toList();
-        }
-    }
-
     private static LiquidationReadinessController.Row renderTokenConvertRow(
             AppConfig.LiquidationConfiguration configuration, FluidOracleClient oracleClient,
             MinswapPoolResolver resolver) {
@@ -1196,7 +1459,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void aFailedPoolLookupOnAConvertMarketNeverAdvisesAnticipate() {
         LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
-                new FakeOracleClient(), new ThrowingPoolResolver());
+                new FakeOracleClient(), PoolIndex.failing().resolver());
 
         assertEquals(PoolUsability.Verdict.CHECK_FAILED, row.poolUsability().verdict(),
                 "fixture premise: " + row.poolUsability());
@@ -1213,7 +1476,7 @@ class LiquidationReadinessControllerTest {
     @Test
     void aConvertMarketWithNoPoolForThePairAdvisesAnticipateWithACap() {
         LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
-                new FakeOracleClient(), new CountingPoolResolver(false));
+                new FakeOracleClient(), PoolIndex.of().resolver());
 
         assertEquals(PoolUsability.Verdict.NO_POOL, row.poolUsability().verdict(),
                 "fixture premise: " + row.poolUsability());
@@ -1236,7 +1499,7 @@ class LiquidationReadinessControllerTest {
                 new BigInteger("20000000000000"), new BigInteger("10000000000000"),
                 BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
         LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
-                pricedCollateralOracle(), new FixedPoolResolver(deep));
+                pricedCollateralOracle(), PoolIndex.of(deep).resolver());
 
         assertEquals(PoolUsability.Verdict.USABLE, row.poolUsability().verdict(),
                 "fixture premise: " + row.poolUsability());
@@ -1253,11 +1516,11 @@ class LiquidationReadinessControllerTest {
     @Test
     void theConvertNoPoolAdvanceEqualsTheAnticipateAdvanceForTheSameLoan() {
         LiquidationReadinessController.Row convert = renderTokenConvertRow(liveConfiguration(),
-                pricedCollateralOracle(), new CountingPoolResolver(false));
+                pricedCollateralOracle(), PoolIndex.of().resolver());
         var anticipateConfiguration = liveConfiguration();
         anticipateConfiguration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
         LiquidationReadinessController.Row anticipate = renderTokenConvertRow(anticipateConfiguration,
-                pricedCollateralOracle(), new CountingPoolResolver(false));
+                pricedCollateralOracle(), PoolIndex.of().resolver());
 
         assertEquals("CONVERT", convert.route(), convert.routeDetail());
         assertEquals("CAPITAL IN ADVANCE", anticipate.route(), anticipate.routeDetail());
@@ -1452,7 +1715,7 @@ class LiquidationReadinessControllerTest {
     private static AppConfig.LiquidationConfiguration liveConfiguration() {
         return new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.LIVE, 60, 120, 30,
-                BigInteger.ZERO, 200, 30);
+                BigInteger.ZERO, 200);
     }
 
     private static Rendered renderLiquidatable(
@@ -1556,5 +1819,165 @@ class LiquidationReadinessControllerTest {
         market.setAction(AppConfig.LiquidationConfiguration.Action.ANTICIPATE);
         market.setCap(BigInteger.valueOf(cap));
         return market;
+    }
+
+    // ---- FAB-134 B2 / FAB-136: the wallet panel reads the local index, gated on !isSyncing only ----
+
+    private static final long T0 = 1_800_000_000_000L;
+
+    private static com.bloxbean.cardano.client.api.model.Utxo walletUtxo(long lovelace) {
+        var utxo = new com.bloxbean.cardano.client.api.model.Utxo();
+        utxo.setTxHash("aa".repeat(32));
+        utxo.setOutputIndex(0);
+        utxo.setAmount(new ArrayList<>(List.of(com.bloxbean.cardano.client.api.model.Amount.builder()
+                .unit("lovelace").quantity(BigInteger.valueOf(lovelace)).build())));
+        return utxo;
+    }
+
+    private static LiquidationReadinessController walletController(
+            com.fluidtokens.aquarium.offchain.service.AppUtxoService utxos) {
+        return new LiquidationReadinessController(provide(null), provide(null), provide(null),
+                provide(null), provide(null), provide(null), provide(null), provide(utxos),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200), null);
+    }
+
+    private static com.fluidtokens.aquarium.offchain.service.BlockEventListener syncing(boolean syncing) {
+        var listener = new com.fluidtokens.aquarium.offchain.service.BlockEventListener(null);
+        listener.getIsSyncing().set(syncing);
+        return listener;
+    }
+
+    /**
+     * FAB-136: with the startup sweep gone, the only gate is {@code !isSyncing}. Not syncing, the wallet
+     * is read from the index — exactly once — and shown.
+     */
+    @Test
+    void whenNotSyncingTheWalletIsReadOnceAndShown() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
+        var controller = walletController(utxos);
+        controller.setBlockEventListener(syncing(false));
+
+        assertNull(controller.walletNotReadyReason());
+        WalletBalance wallet = controller.wallet(T0);
+
+        assertTrue(wallet.known());
+        assertEquals(BigInteger.valueOf(5_000_000L), wallet.of("lovelace"));
+        org.mockito.Mockito.verify(utxos, org.mockito.Mockito.times(1)).listWalletUtxo();
+    }
+
+    /** ⛔ While syncing the index may hold PART of the wallet: no balance, and the database is not queried. */
+    @Test
+    void whileTheNodeIsSyncingThePanelShowsNoBalanceAndDoesNotReadTheIndex() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
+        var controller = walletController(utxos);
+        controller.setBlockEventListener(syncing(true));
+
+        assertEquals("wallet not ready: the node is still syncing", controller.walletNotReadyReason());
+        WalletBalance wallet = controller.wallet(T0);
+
+        assertFalse(wallet.known(), "a balance read while syncing may be partial and must not be shown");
+        assertTrue(wallet.byUnit().isEmpty());
+        org.mockito.Mockito.verifyNoInteractions(utxos);
+    }
+
+    /**
+     * ⛔ An empty index answer is now AUTHORITATIVE. Keeping the previous balance over it would show
+     * money the wallet has since spent.
+     */
+    @Test
+    void anEmptyReadIsShownAsEmptyAndNeverPaperedOverWithTheCachedBalance() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo())
+                .thenReturn(List.of(walletUtxo(5_000_000L)))
+                .thenReturn(List.of());
+        var controller = walletController(utxos);
+
+        assertEquals(BigInteger.valueOf(5_000_000L), controller.wallet(T0).of("lovelace"));
+        WalletBalance later = controller.wallet(T0 + 61_000L);
+
+        assertTrue(later.known(), "an empty wallet is a known balance");
+        assertTrue(later.byUnit().isEmpty(),
+                "the index says the wallet is empty now; the earlier 5 ADA must not be shown");
+        assertEquals(T0 + 61_000L, later.asOfMillis());
+    }
+
+    /**
+     * ⛔ FAB-134 B2b (slice-4 audit residue): the REASON reaches the page through the real
+     * {@code readiness()} path — a test of {@code walletNotReadyReason()} alone could not see a
+     * controller that never put it on the model.
+     */
+    @Test
+    void theReadinessPageCarriesWhyTheWalletIsNotReadyWhileSyncingAndNothingOnceSynced() {
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(), 0, 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(List.of(), census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null);
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(5_000_000L)));
+        var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(null), provide(null), provide(null), provide(null), provide(utxos),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200), network);
+        var listener = syncing(true);
+        controller.setBlockEventListener(listener);
+
+        var notReady = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(notReady, null, null, null, null, null);
+        assertEquals("wallet not ready: the node is still syncing", notReady.getAttribute("walletNotReady"),
+                "while syncing the page must be told why");
+
+        listener.getIsSyncing().set(false);
+        var isReady = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(isReady, null, null, null, null, null);
+        assertNull(isReady.getAttribute("walletNotReady"), "once synced there is no reason to show");
+        assertTrue(((WalletBalance) isReady.getAttribute("wallet")).known());
+    }
+
+    /** FAB-136: there is no wallet-readiness gate to inject any more. */
+    @Test
+    void theControllerDeclaresNoWalletReadinessSetter() {
+        assertTrue(java.util.Arrays.stream(LiquidationReadinessController.class.getDeclaredMethods())
+                        .noneMatch(m -> m.getName().equals("setWalletReadiness")),
+                "LiquidationReadinessController still declares setWalletReadiness");
+    }
+
+    /**
+     * ⛔ A read that THROWS is a failed read, not an answer: the previous balance stays standing. Only an
+     * empty RESULT is authoritative (see the test above).
+     */
+    @Test
+    void aWalletReadThatThrowsKeepsThePreviousBalance() {
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo())
+                .thenReturn(List.of(walletUtxo(5_000_000L)))
+                .thenThrow(new IllegalStateException("fixture: database unreachable"));
+        var controller = walletController(utxos);
+
+        assertEquals(BigInteger.valueOf(5_000_000L), controller.wallet(T0).of("lovelace"));
+        WalletBalance later = controller.wallet(T0 + 61_000L);
+
+        org.mockito.Mockito.verify(utxos, org.mockito.Mockito.times(2)).listWalletUtxo();
+        assertTrue(later.known(), "a failed read must not blank a balance that was known");
+        assertEquals(BigInteger.valueOf(5_000_000L), later.of("lovelace"));
+        assertEquals(T0, later.asOfMillis(), "the balance shown is the earlier one, honestly dated");
     }
 }

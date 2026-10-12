@@ -48,7 +48,7 @@ class LoansReferenceScriptVerifierTest {
     private static AppConfig.LiquidationConfiguration oneCoordinate() {
         return new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                BigInteger.valueOf(1_500_000), 200, 30,
+                BigInteger.valueOf(1_500_000), 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(null, null, null, null,
                         new TransactionInput(TX, 0),
                         null, null));
@@ -58,7 +58,7 @@ class LoansReferenceScriptVerifierTest {
     private static AppConfig.LiquidationConfiguration sixCoordinates() {
         return new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                BigInteger.valueOf(1_500_000), 200, 30,
+                BigInteger.valueOf(1_500_000), 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(
                         new TransactionInput(TX, 0),
                         new TransactionInput(TX, 1),
@@ -73,7 +73,7 @@ class LoansReferenceScriptVerifierTest {
     private static AppConfig.LiquidationConfiguration noCoordinates() {
         return new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                BigInteger.valueOf(1_500_000), 200, 30,
+                BigInteger.valueOf(1_500_000), 200,
                 LiquidateTransactionBuilder.ReferenceScripts.none());
     }
 
@@ -352,7 +352,7 @@ class LoansReferenceScriptVerifierTest {
         assertTrue(noMinswap.getLmLiquidateAndConvertActionScriptHash() == null,
                 "precondition: without loans.minswap.* the convert action derives nothing");
         var convertOnly = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30,
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(
                         null, null, null, null, null, null, null, null, in(9)));
         var verifier = new LoansReferenceScriptVerifier(noMinswap, convertOnly,
@@ -366,7 +366,7 @@ class LoansReferenceScriptVerifierTest {
     private static java.util.Set<String> expectationKeys() {
         AppConfig.LiquidationConfiguration all = new AppConfig.LiquidationConfiguration(
                 AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30,
-                java.math.BigInteger.ZERO, 200, 30,
+                java.math.BigInteger.ZERO, 200,
                 new LiquidateTransactionBuilder.ReferenceScripts(
                         in(1), in(2), in(3), in(4), in(5), in(6), in(7), in(8), in(9)));
         return new LoansReferenceScriptVerifier(REGISTRY, all,

@@ -54,7 +54,7 @@ class FluidOracleTwoVersionsTest {
         var network = new AppConfig.Network();
         network.setNetworkForTest("mainnet");
         var configuration = new AppConfig.LiquidationConfiguration(
-                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200, 30);
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200);
         ObjectProvider<FluidOracleClient> provider = new ObjectProvider<>() {
             @Override public FluidOracleClient getObject() { return client; }
             @Override public FluidOracleClient getObject(Object... args) { return client; }

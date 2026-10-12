@@ -643,9 +643,6 @@ public class AppConfig {
         @Value("${loans.liquidation.decision-log-size:200}")
         private int decisionLogSize;
 
-        @Value("${loans.liquidation.quarantine-minutes:30}")
-        private long quarantineMinutes;
-
         // ---- published reference scripts -----------------------------------------------------
         //
         // One `txHash#index` per validator a Liquidate transaction invokes. Empty means "not
@@ -720,10 +717,9 @@ public class AppConfig {
          */
         public LiquidationConfiguration(Mode mode, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
-                                        BigInteger profitMarginLovelace, int decisionLogSize,
-                                        long quarantineMinutes) {
+                                        BigInteger profitMarginLovelace, int decisionLogSize) {
             this(mode, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
-                    profitMarginLovelace, decisionLogSize, quarantineMinutes,
+                    profitMarginLovelace, decisionLogSize,
                     LiquidateTransactionBuilder.ReferenceScripts.none());
         }
 
@@ -731,11 +727,10 @@ public class AppConfig {
         public LiquidationConfiguration(Mode mode, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
                                         BigInteger profitMarginLovelace, int decisionLogSize,
-                                        long quarantineMinutes,
                                         LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
             // The profitability floors default to the safe pair: checking on, absolute floor at 0.
             this(mode, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
-                    profitMarginLovelace, decisionLogSize, quarantineMinutes, true, BigInteger.ZERO,
+                    profitMarginLovelace, decisionLogSize, true, BigInteger.ZERO,
                     referenceScripts);
         }
 
@@ -743,11 +738,11 @@ public class AppConfig {
         public LiquidationConfiguration(Mode mode, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
                                         BigInteger profitMarginLovelace, int decisionLogSize,
-                                        long quarantineMinutes, boolean checkProfitability,
+                                        boolean checkProfitability,
                                         BigInteger minProfitAbsoluteLovelace,
                                         LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
             this(mode, delaySeconds, validityWindowSeconds, oracleWindowMarginSeconds,
-                    profitMarginLovelace, decisionLogSize, quarantineMinutes, checkProfitability,
+                    profitMarginLovelace, decisionLogSize, checkProfitability,
                     minProfitAbsoluteLovelace, BigInteger.ZERO, referenceScripts);
         }
 
@@ -759,7 +754,7 @@ public class AppConfig {
         public LiquidationConfiguration(Mode mode, long delaySeconds,
                                         long validityWindowSeconds, long oracleWindowMarginSeconds,
                                         BigInteger profitMarginLovelace, int decisionLogSize,
-                                        long quarantineMinutes, boolean checkProfitability,
+                                        boolean checkProfitability,
                                         BigInteger minProfitAbsoluteLovelace,
                                         BigInteger minExpectedProfitLovelace,
                                         LiquidateTransactionBuilder.ReferenceScripts referenceScripts) {
@@ -771,7 +766,6 @@ public class AppConfig {
             this.oracleWindowMarginSeconds = oracleWindowMarginSeconds;
             this.profitMarginLovelace = profitMarginLovelace;
             this.decisionLogSize = decisionLogSize;
-            this.quarantineMinutes = quarantineMinutes;
             this.checkProfitability = checkProfitability;
             this.minProfitAbsoluteLovelace = minProfitAbsoluteLovelace;
             this.referenceScripts = referenceScripts;

@@ -19,7 +19,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * silent exit</b> from {@code consider()} — five of its six paths recorded a decision and that one
  * returned with a debug line, so a held loan was indistinguishable from a loan that was never a
  * candidate. <b>Absence of a record is not a record of absence</b>, and that ambiguity is the same
- * one a quiet market has with a dead deployment.
+ * one a quiet market has with a dead deployment. (FAB-134 NQ removed the quarantine and its outcome
+ * with it — nothing eligible is skipped any more — but the defect shape this class guards is
+ * unchanged.)
  *
  * <p>An outcome that is declared and never recorded reproduces exactly that state while <em>looking
  * fixed</em>: the enum documents a case the operator will never be shown. Nothing else in the build
@@ -56,26 +58,5 @@ class EveryOutcomeIsReachableTest {
                 ("these outcomes are declared but never recorded, so an operator can never be shown "
                         + "them and the state they describe stays indistinguishable from silence: %s")
                         .formatted(unrecorded));
-    }
-
-    /**
-     * The quarantine outcome named explicitly, because it is the one this class was written for and a
-     * generic loop would stop mentioning it the moment someone removed the value.
-     */
-    @Test
-    void theQuarantineSkipRecordsRatherThanReturningSilently() throws IOException {
-        String source = Files.readString(EXECUTOR);
-        int skip = source.indexOf("if (isQuarantined(loanUtxoRef, now))");
-        assertTrue(skip > 0, "the quarantine skip is no longer where this test expects it");
-
-        String branch = source.substring(skip, Math.min(source.length(), skip + 1_400));
-        int record = branch.indexOf("decisionLog.record(");
-        int returned = branch.indexOf("return;");
-        assertTrue(record > 0 && record < returned,
-                "the quarantine branch returns without recording a decision — a held loan is once "
-                        + "again indistinguishable from one that was never considered");
-        assertTrue(branch.contains("Outcome.QUARANTINED"),
-                "the quarantine branch records some other outcome, which would misreport the bot's "
-                        + "own hold as a judgement about the loan");
     }
 }

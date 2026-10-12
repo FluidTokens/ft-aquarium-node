@@ -4,11 +4,11 @@ import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
-import com.bloxbean.cardano.client.backend.api.BackendService;
 import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
 import com.bloxbean.cardano.client.common.model.Network;
 import com.bloxbean.cardano.client.function.TxBuilder;
@@ -151,7 +151,17 @@ public class CompoundTransactionBuilder {
     private final Network network;
     private final UtxoSupplier utxoSupplier;
     private final ProtocolParamsSupplier protocolParamsSupplier;
-    private final BackendService backendService;
+    /**
+     * Where cardano-client-lib fetches the BYTES of a script that travels as a reference script, or
+     * {@code null} for the offline rigs. Production builds with
+     * {@code new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier, null)}:
+     * submit-incapable, because the processor slot is null and the evaluator arrives through
+     * {@code withTxEvaluator} (CCL trap 8) — and priced, because production declares no reference-script
+     * list and this supplier serves the bytes of EVERY referenced script, including a configured
+     * coordinate that publishes a script no registry validator names (CCL trap 9). Mirrors the field of
+     * the same name in its three siblings (FAB-134 B3b).
+     */
+    private final ScriptSupplier scriptSupplier;
     private final TransactionEvaluator scriptCostEvaluator;
 
     /**
@@ -172,28 +182,39 @@ public class CompoundTransactionBuilder {
                                       UtxoSupplier utxoSupplier,
                                       ProtocolParamsSupplier protocolParamsSupplier,
                                       TransactionEvaluator scriptCostEvaluator) {
-        this(registry, network, utxoSupplier, protocolParamsSupplier, null, scriptCostEvaluator);
+        this(registry, network, (ScriptSupplier) null, utxoSupplier, protocolParamsSupplier,
+                scriptCostEvaluator);
     }
 
-    /** Production: one backend wires utxo supplier, params, script supplier and processor. */
+    /**
+     * The production constructor (FAB-134 B3b-4). Every collaborator is injected and none may be null —
+     * <b>the evaluator included</b>. {@code YaciConfig} hands over the index-first {@link UtxoSupplier},
+     * the per-epoch {@link ProtocolParamsSupplier}, a {@link ScriptSupplier} that serves verified script
+     * bytes, and Blockfrost's {@code /utils/txs/evaluate} narrowed to a {@link TransactionEvaluator}.
+     * Nothing here is a {@code BackendService}; see the {@link #scriptSupplier} field.
+     */
     public CompoundTransactionBuilder(LoansContractRegistry registry, Network network,
-                                      BackendService backendService,
                                       UtxoSupplier utxoSupplier,
                                       ProtocolParamsSupplier protocolParamsSupplier,
+                                      ScriptSupplier scriptSupplier,
                                       TransactionEvaluator scriptCostEvaluator) {
-        this(registry, network, utxoSupplier, protocolParamsSupplier, backendService, scriptCostEvaluator);
+        this(registry, network, Objects.requireNonNull(scriptSupplier, "scriptSupplier"), utxoSupplier,
+                protocolParamsSupplier, Objects.requireNonNull(scriptCostEvaluator,
+                        "a production compound builder without a TransactionEvaluator would ship placeholder "
+                                + "ex-units and fail in phase 2, forfeiting collateral — CCL trap 8"));
     }
 
+    /** Both public constructors land here; {@code scriptSupplier} is null only on the offline path. */
     private CompoundTransactionBuilder(LoansContractRegistry registry, Network network,
+                                       ScriptSupplier scriptSupplier,
                                        UtxoSupplier utxoSupplier,
                                        ProtocolParamsSupplier protocolParamsSupplier,
-                                       BackendService backendService,
                                        TransactionEvaluator scriptCostEvaluator) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.network = Objects.requireNonNull(network, "network");
         this.utxoSupplier = Objects.requireNonNull(utxoSupplier, "utxoSupplier");
         this.protocolParamsSupplier = Objects.requireNonNull(protocolParamsSupplier, "protocolParamsSupplier");
-        this.backendService = backendService;
+        this.scriptSupplier = scriptSupplier;
         this.scriptCostEvaluator = scriptCostEvaluator;
     }
 
@@ -313,8 +334,13 @@ public class CompoundTransactionBuilder {
     private Transaction complete(Request request, List<TransactionInput> refInputs,
                                  ScriptTx tx, TxBuilder verify) {
         tx.readFrom(refInputs.toArray(TransactionInput[]::new));
-        QuickTxBuilder quickTxBuilder = backendService != null
-                ? new QuickTxBuilder(backendService)
+        // Production: the injected utxo supplier (the local index first), the per-epoch protocol params and
+        // a SCRIPT SUPPLIER serving verified script bytes. The processor slot is null and stays null: the
+        // evaluator arrives through withTxEvaluator below (CCL trap 8), so this builder can price a
+        // transaction and has nothing that could submit one. Offline: the three-argument form, because
+        // the rigs hand every script in explicitly.
+        QuickTxBuilder quickTxBuilder = scriptSupplier != null
+                ? new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier, null)
                 : new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, null);
 
         var context = quickTxBuilder.compose(tx)
@@ -332,19 +358,41 @@ public class CompoundTransactionBuilder {
                 .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
                 .preBalanceTx((ctx, txn) ->
                         ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                // ⛔ CCL trap 9b, the THIRD seam: with no collateral inputs named, QuickTxBuilder's
+                // buildCollateralOutput picks collateral with its own unguarded
+                // DefaultUtxoSelectionStrategyImpl (a hardcoded 5 ADA target) — blind to both guards
+                // above. Measured (FAB-134 B3b-4): a 3.0-4.5 ADA wallet beside published reference
+                // scripts pledged one of them as COLLATERAL, which a phase-2 failure consumes. So the
+                // collateral is chosen here from reference-script-free wallet UTxOs, sized from the
+                // protocol parameters — the liquidation builders' helper, shared rather than copied.
+                .withCollateralInputs(LiquidateTransactionBuilder.collateralInputsFor(utxoSupplier,
+                        protocolParamsSupplier, request.changeAddress(), request.walletUtxo()))
                 .postBalanceTx(verify);
 
         // CCL trap 9: the reference-script fee is only charged for bytes the library can OBTAIN.
         // Without this it charges ZERO and the transaction is short by 15 lovelace per byte —
         // FeeTooSmallUTxO at phase 1. removeDuplicateScriptWitnesses strips any copy a mint or
         // attach left behind, which is the other half of the same rejection.
+        //
+        // ⛔ But a DECLARED list wins outright: when withReferenceScripts is non-empty, cardano-client-lib
+        // 0.7.2 (FeeCalculators:125-145) prices exactly the declared scripts and never asks the supplier.
+        // referencedScripts() can only name REGISTRY validators, while CompoundExecutor references any
+        // configured coordinate that publishes a script — a superseded coordinate left in an operator's
+        // override after a redeploy is one. Declared, that script was charged zero (FAB-134 B3b-4,
+        // measured: 32,716 lovelace under the ledger floor, FeeTooSmallUTxO).
+        //
+        // ⇒ Production declares NOTHING and the byte-serving supplier prices every referenced script, as
+        // the three siblings do. Offline there is no supplier, so the declaration stays.
+        // removeDuplicateScriptWitnesses stays on both paths.
         List<PlutusScript> referenced = referencedScripts(request);
         if (!referenced.isEmpty()) {
-            context = context.withReferenceScripts(referenced.toArray(PlutusScript[]::new))
-                    .removeDuplicateScriptWitnesses(true);
+            if (scriptSupplier == null) {
+                context = context.withReferenceScripts(referenced.toArray(PlutusScript[]::new));
+            }
+            context = context.removeDuplicateScriptWitnesses(true);
         }
 
-        if (backendService == null) {
+        if (scriptSupplier == null) {
             // CCL trap 2: offline, ReferenceScriptResolver walks every reference input looking for a
             // script to fetch and NPEs on the missing supplier. The rigs hand scripts in explicitly.
             context = context.withScriptSupplier(scriptHash -> java.util.Optional.empty());

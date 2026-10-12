@@ -1348,9 +1348,14 @@ class RealLoanDryEvalTest {
         com.bloxbean.cardano.client.api.TransactionEvaluator evaluator =
                 (cbor, inputs) -> bf.getTransactionService().evaluateTx(cbor);
 
-        // Production's constructor: the whole BackendService, exactly as YaciConfig hands it over.
+        // Production's constructor, with Blockfrost-backed suppliers standing in for YaciConfig's
+        // index-first / per-epoch beans (test code), and the same hash-checked script supplier.
         LiquidateTransactionBuilder production = new LiquidateTransactionBuilder(
-                REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(), bf, evaluator);
+                REGISTRY, LoanFixtures.NETWORK, LoanFixtures.converters(), utxoSupplier,
+                new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(bf.getEpochService()),
+                new com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier(
+                        new com.bloxbean.cardano.client.backend.api.DefaultScriptSupplier(bf.getScriptService())),
+                evaluator);
 
         // Real chain state, fetched now rather than pinned: the loan, the bond, the two configs, a
         // fee/collateral utxo, and the live oracle feed. If any of these has moved this test says so.

@@ -18,11 +18,12 @@ import java.math.BigInteger;
  * in the middle of a {@code QuickTxBuilder} chain would mix decisions that can be checked against the
  * contract with decisions that can only be checked against a node.
  *
- * <h2>⛔ The pool is resolved by its NFT at RUN TIME, never by a pinned coordinate</h2>
+ * <h2>⛔ The pool is resolved at RUN TIME, never by a pinned coordinate</h2>
  * A Minswap pool UTxO is spent and re-created on <em>every swap</em>, so its output reference is stale
- * within minutes (findings §32.3). The caller must locate it by {@code minswapPoolPolicyId} +
- * {@link ConvertTxEncoder#POOL_NFT_ASSET_NAME}, and {@link Planner} takes the datum it found rather
- * than a reference it remembered.
+ * within minutes (findings §32.3). The caller passes the authentic pool from
+ * {@link MinswapPoolResolver}'s per-cycle index snapshot (authenticated by its
+ * {@link ConvertTxEncoder#POOL_NFT_ASSET_NAME} MSP), and {@link Planner} takes the datum it found
+ * rather than a reference it remembered.
  */
 public record ConvertOrderPlan(boolean aToBDirection,
                                String lpAssetName,
@@ -100,7 +101,8 @@ public record ConvertOrderPlan(boolean aToBDirection,
      * @param feePerMille       {@code liquidationFeePerMille} from the lender bond
      * @param bondAllowsConvert {@code shouldLiquidationConvertToPrincipal}
      * @param equityInPrincipalCurrency the loan-claim redeemer's flag; must be false here
-     * @param pool              the datum of the pool UTxO the caller located BY ITS NFT
+     * @param pool              the datum of the authentic pool from {@link MinswapPoolResolver}'s
+     *                          per-cycle index snapshot
      * @param minswapPoolPolicyId the policy the lp asset is minted under
      * @param lenderBond        the bond NFT that owns the escrow the proceeds land in
      * @param lenderAuth        the LENDER's authorisation — the order's canceller is theirs, not ours

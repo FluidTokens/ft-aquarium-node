@@ -12,25 +12,23 @@ import com.bloxbean.cardano.client.api.model.Utxo;
  * implied</b>.
  *
  * <h2>⛔ Why this carries its own age</h2>
- * {@code AppUtxoService.listWalletUtxo()} reads the PROVIDER first and falls back to the local index,
- * deliberately: an index-backed balance cannot distinguish "the wallet is empty" from "the wallet's
- * history begins below our sync point", and a silently partial balance poisons every affordability
- * decision downstream at once.
- *
- * <p>That makes it a network call, and the readiness page re-renders every sixty seconds in every
- * open tab. Reading it per render would multiply provider traffic by the number of people looking.
- * So it is <b>cached</b> — and a cached number displayed as though it were live is the failure that
- * replaces the one being avoided. {@link #ageSeconds()} is rendered beside it for that reason.
+ * {@code AppUtxoService.listWalletUtxo()} reads the LOCAL Yaci index by the wallet's payment
+ * credential — no provider is involved (FAB-134 B2). The readiness page re-renders every sixty seconds
+ * in every open tab, so it reads at most once per TTL, a render-frequency throttle on a local read —
+ * and a throttled number displayed as though it were live is still stale. {@link #ageSeconds()} is
+ * rendered beside it for that reason.
  *
  * <h2>⚠ What an empty map means, and what it does not</h2>
- * An empty {@code byUnit} means the read RETURNED NOTHING, which on this path can be a genuinely
- * empty wallet <b>or</b> a provider that could not be reached — {@code listWalletUtxo} logs and
- * returns an empty list rather than throwing. {@link #known()} separates the two, so the page can say
- * "unknown" instead of rendering a confident zero over money that may be there.
+ * A KNOWN empty {@code byUnit} is an empty INDEXED wallet: the read is made from the index once the
+ * node is not syncing (FAB-136), and its completeness rests on the operator requirement in
+ * {@code docs/deploying.md} §2 — the wallet holds no UTxO created before the index's sync start. Nothing
+ * here proves that requirement was met. {@link #known()} false means NO answer — the node is still
+ * syncing or the read failed — so the page can say so instead of rendering a confident zero over money
+ * that may be there.
  */
 public record WalletBalance(Map<String, BigInteger> byUnit, long asOfMillis, boolean known) {
 
-    /** Nothing has been read yet, or the read failed — NOT a zero balance. */
+    /** Nothing has been read yet, the read is gated closed, or it failed — NOT a zero balance. */
     public static WalletBalance unknown() {
         return new WalletBalance(Map.of(), 0L, false);
     }

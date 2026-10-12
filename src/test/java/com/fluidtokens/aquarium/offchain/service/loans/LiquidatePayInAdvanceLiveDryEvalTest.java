@@ -457,7 +457,11 @@ class LiquidatePayInAdvanceLiveDryEvalTest {
             }
         };
 
-        var builder = new LiquidatePayInAdvanceTransactionBuilder(registry, Networks.mainnet(), backend, evaluator);
+        var builder = new LiquidatePayInAdvanceTransactionBuilder(registry, Networks.mainnet(),
+                new com.bloxbean.cardano.client.backend.api.DefaultUtxoSupplier(backend.getUtxoService()),
+                new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(backend.getEpochService()),
+                new com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier(new com.bloxbean.cardano.client.backend.api.DefaultScriptSupplier(backend.getScriptService())),
+                evaluator);
 
         // The five numbers, off the SAME builder that will build — never re-derived independently, so
         // there is nothing here that could silently drift from what build() itself recomputes.
