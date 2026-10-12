@@ -157,6 +157,13 @@ loans:
     #
     # Deployment-specific and env-overridable. The verified mainnet set is the shipped default so
     # the public image is buildable; preview explicitly blanks it below.
+    #
+    # ⚠ CHECKED AT BOOT ONLY, AND ONLY WHILE compound.enabled IS TRUE (FAB-108). LoansReferenceScriptVerifier
+    # looks each coordinate up once and drops (REFERENCE_SCRIPT_DROPPED) a malformed, repeated, absent,
+    # spent or script-less one, one publishing none of the eleven compound validators, or one publishing a
+    # validator an earlier coordinate already supplies. One it could not ask is REFERENCE_SCRIPT_UNVERIFIED
+    # and used as configured. Each of the eleven no usable coordinate supplies is REFERENCE_SCRIPT_MISSING
+    # and travels inline. All are WARNs plus a readiness-page banner; lending is NOT refused.
     # ⛔ RE-POINTED at FluidTokens' 2026-09-17 redeploy, and again on 2026-10-01 (FTAI-001/002/102):
     # only lmCompoundAction moved (2a8faf65 -> 71515a89, 29f63a1e...#0); the other ten scripts are
     # unchanged. All ELEVEN verified: for each one, the hash this node DERIVES equals the
@@ -246,11 +253,13 @@ loans:
       url: ${LOANS_UI_TOKEN_REGISTRY_URL:https://tokens.cardano.org}
       timeout-seconds: ${LOANS_UI_TOKEN_REGISTRY_TIMEOUT_SECONDS:5}
 
-  # The wallet rebalancer (FAB-131): on every block, while the node is not syncing, with
-  # `liquidation.mode` shadow or live and at least one `action: ANTICIPATE` market, it moves the bot
+  # The wallet rebalancer (FAB-131): on every block, while the node is not syncing, it moves the bot
   # wallet into the FAB-130 shape with one self-send -- SIGNED AND SUBMITTED in shadow too (wallet
-  # housekeeping, not a liquidation). A wallet too small to shape is logged at WARN on every block and
-  # never submitted. With mode disabled or no ANTICIPATE market it does nothing, whatever this says.
+  # housekeeping, not a liquidation). It runs AFTER that block's database transaction commits, never
+  # inside it. It acts only when at least one `action: ANTICIPATE` market has an EFFECTIVE mode of
+  # shadow or live -- the market's own `mode`, capped by `liquidation.mode` -- so a node at `disabled`,
+  # or one whose every ANTICIPATE market is `disabled`, does nothing, whatever this says. A wallet too
+  # small to shape is logged at WARN on every block and never submitted.
   wallet:
     rebalance:
       enabled: ${AQUARIUM_WALLET_REBALANCE_ENABLED:true}
@@ -364,9 +373,9 @@ loans:
     # Published reference-script UTxOs, one `txHash#index` per validator a Liquidate invokes. Empty
     # means "not published" and that validator travels in the witness set instead.
     #
-    # Resolution rule, per validator: a coordinate configured here for a validator -- and verified
-    # resolvable on chain by LoansReferenceScriptVerifier at startup -- means that validator travels
-    # by reference; an unconfigured (empty) coordinate means it travels inline in the witness set.
+    # Resolution rule, per validator: a coordinate configured here for a validator -- and not dropped
+    # by LoansReferenceScriptVerifier at startup -- means that validator travels by reference; an
+    # unconfigured (empty) or dropped coordinate means it travels inline in the witness set.
     # At least one validator must be referenced: six inline validators total 18_584 bytes, over the
     # 16_384-byte maxTxSize, so "all inline" cannot build.
     #
@@ -377,8 +386,18 @@ loans:
     # minFeeRefScriptCostPerByte 15, all six cost ~0.28 ADA per liquidation, which
     # profit-margin-lovelace has to cover.
     #
-    # No coordinates on mainnet: lending is disabled there, and a stale coordinate is worse than an
-    # absent one — LoansReferenceScriptVerifier closes the lending gate on a hash that does not match.
+    # ⚠ A BAD COORDINATE NEVER CLOSES THE LENDING GATE (FAB-108). LoansReferenceScriptVerifier checks
+    # each one ONCE, at boot only -- a coordinate spent later is not re-checked until the next restart:
+    #   REFERENCE_SCRIPT_DROPPED    absent / rejected, spent, no reference script, or a hash other than
+    #                               the one this node derives for that key. The coordinate is not used:
+    #                               its validator travels inline (a larger transaction; one that no
+    #                               longer fits maxTxSize is refused as TX_TOO_LARGE).
+    #   REFERENCE_SCRIPT_UNVERIFIED the provider could not be asked. Used as configured; if it is wrong,
+    #                               evaluation refuses the transaction before anything is submitted.
+    # Each is one loud WARN naming the key, and a banner on the readiness page (loans.ui). Lending is
+    # NOT refused. Fix the coordinate and restart. Only loans.verify-config.fail-on-unreachable=true
+    # still stops the boot, and only for an UNVERIFIED one. A config-datum mismatch is a different
+    # check (LoansConfigVerifier, above): that one DOES close the gate, as LENDING_CONFIG_MISMATCH.
     convert:
       # ⚑ NO MARGIN KEY HERE since 2026-09-09. `profit-margin-lovelace` is GONE -- Giovanni's ruling:
       # "for me convert is a liquidation and profitMarginLovelace is literally the same as
@@ -460,8 +479,9 @@ loans:
       # the DERIVED one -- was not run: the coordinate was only confirmed to resolve and to carry
       # *a* script. Verified now: e4e47ab1...#0 publishes dc715410..., 5,516 bytes, unspent.
       #
-      # ⇒ And LoansReferenceScriptVerifier now covers this slot too, so a future staleness here
-      # closes the lending gate at boot naming the key, exactly like the other eight.
+      # ⇒ And LoansReferenceScriptVerifier now covers this slot too, so a future staleness here is
+      # REFERENCE_SCRIPT_DROPPED at boot naming the key, exactly like the other eight: the convert
+      # action then travels inline, and lending is NOT refused (FAB-108).
       #
       # ⭐ RE-POINTED 2026-10-01 (FTAI-001 redeploy): 745089d1…#0 carries cbf3e8c5…, 5,524 bytes,
       # unspent -- derived here and named by LMConfigDatum[5].
@@ -628,13 +648,14 @@ loans:
     mode: ${AQUARIUM_LIQUIDATION_MODE:shadow}
     # None of the nine is set on preview: every coordinate below is blank (see the BLANKED notes).
     # When one IS set, LoansReferenceScriptVerifier checks at every startup that its UTxO publishes
-    # a reference_script_hash equal to the hash this repo derives — a redeploy turns these into a
-    # CLOSED LENDING GATE (LENDING_CONFIG_MISMATCH: every Lending v4 transaction refused, scheduled
-    # payments untouched), which is an answer and not an outage.
+    # a reference_script_hash equal to the hash this repo derives — a redeploy turns these into
+    # REFERENCE_SCRIPT_DROPPED WARNs (and a readiness-page banner): each dropped validator travels
+    # inline, and lending is NOT refused (FAB-108; the base document's reference-scripts comment
+    # lists both outcomes).
     #
-    # Resolution rule, per validator: a coordinate configured here for a validator -- and verified
-    # resolvable on chain by LoansReferenceScriptVerifier at startup -- means that validator travels
-    # by reference; an unconfigured (empty) coordinate means it travels inline in the witness set.
+    # Resolution rule, per validator: a coordinate configured here for a validator -- and not dropped
+    # by LoansReferenceScriptVerifier at startup -- means that validator travels by reference; an
+    # unconfigured (empty) or dropped coordinate means it travels inline in the witness set.
     # At least one validator must be referenced: six inline validators total 18_584 bytes, over the
     # 16_384-byte maxTxSize, so "all inline" cannot build.
     #
@@ -650,9 +671,11 @@ loans:
     # script addresses, which means the old reference UTxOs hold scripts this deployment never uses.
     #
     # Left empty rather than wrong on purpose. LoansReferenceScriptVerifier compares each published
-    # coordinate's on-chain reference_script_hash against the freshly derived hash and closes the lending
-    # gate at boot on a mismatch -- so leaving the old values here would refuse every liquidation, whereas the
-    # empty case is a supported path that skips the check. The consequence is bounded and specific:
+    # coordinate's on-chain reference_script_hash against the freshly derived hash and DROPS it at boot on
+    # a mismatch (REFERENCE_SCRIPT_DROPPED; lending is not refused, FAB-108) -- so the old values here would
+    # only add six WARNs to every boot for the same inline result, whereas the empty case is a supported
+    # path that skips the check. (Until FAB-108 a mismatch closed the lending gate and refused every
+    # liquidation, which is why they were blanked rather than left.) The consequence is bounded and specific:
     # indexing, health, the scanner and shadow mode all work; SUBMISSION does not, because six
     # validators total ~18.6 KB against a 16,384-byte maxTxSize and cannot travel in the witness set.
     #
@@ -682,7 +705,8 @@ loans:
     # It sits at an ordinary key address we control and holds 38.359 ADA of min-ada, recoverable by
     # spending it back when the bot no longer needs it. LoansReferenceScriptVerifier checks its
     # on-chain reference_script_hash against the freshly derived hash at every boot, so the next
-    # redeploy closes the lending gate rather than building against a silent wrong script.
+    # redeploy drops it with a REFERENCE_SCRIPT_DROPPED WARN (the validator then travels inline)
+    # rather than building against a silent wrong script.
     reference-scripts:
       loan: ${AQUARIUM_LIQUIDATION_REF_LOAN:}
       loan-spend: ${AQUARIUM_LIQUIDATION_REF_LOAN_SPEND:}
@@ -692,7 +716,8 @@ loans:
       # predicted: the script hash is derived by applying the config NFT policy ids as parameters,
       # so new policy ids move this hash, and the published UTxO at 48c102c0...#0 holds a script
       # THIS deployment never uses. LoansReferenceScriptVerifier compares published against derived
-      # and closes the lending gate at boot on a mismatch, so leaving it here would refuse every liquidation.
+      # and drops it at boot on a mismatch (REFERENCE_SCRIPT_DROPPED, FAB-108); until FAB-108 that closed
+      # the lending gate and refused every liquidation, which is why it was blanked rather than left.
       # CONSEQUENCE, and it is not cosmetic: with every coordinate blank all six validators travel
       # inline, which does not fit under maxTxSize -- so liquidations cannot BUILD until this script
       # is republished under the fourth deployment. Scanning, health and pricing are unaffected.
@@ -709,7 +734,8 @@ loans:
       # ⛔ BLANKED EXPLICITLY, not omitted. The base document now BAKES mainnet coordinates as its
       # defaults, and a preview node inherits every base key it does not override. A mainnet
       # coordinate reaching a preview node is not inert: LoansReferenceScriptVerifier resolves it,
-      # finds a hash that is not what preview derives, and CLOSES THE LENDING GATE AT BOOT. These two were
+      # finds a hash that is not what preview derives, and DROPS IT AT BOOT with a REFERENCE_SCRIPT_DROPPED
+      # WARN (lending is not refused since FAB-108; before it, this closed the lending gate). These two were
       # previously absent here and harmless only because the base default was empty too.
       asset-manager: ${AQUARIUM_LIQUIDATION_REF_ASSET_MANAGER:}
       lm-liquidate-and-convert-action: ${LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION:}

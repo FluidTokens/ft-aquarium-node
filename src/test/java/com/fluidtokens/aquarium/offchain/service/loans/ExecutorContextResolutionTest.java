@@ -230,6 +230,25 @@ class ExecutorContextResolutionTest {
     }
 
     /**
+     * FAB-108: the readiness page's reference-scripts banner reads the verifier the container hands the
+     * controller. Injection is by setter and REQUIRED, like the gate's: optional injection would leave a
+     * container-built controller holding no verifier, and the banner would stay silent over a real problem.
+     */
+    @Test
+    void theReadinessControllerHasTheReferenceScriptVerifierInjectedAndRequired() throws Exception {
+        var verifierType = com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.class;
+        assertTrue(verifierType.isAnnotationPresent(Service.class),
+                "LoansReferenceScriptVerifier must be a scanned @Service, or a required setter fails the boot");
+        var setter = com.fluidtokens.aquarium.offchain.controller.LiquidationReadinessController.class
+                .getMethod("setLoansReferenceScriptVerifier", verifierType);
+        Autowired autowired = setter.getAnnotation(Autowired.class);
+        assertNotNull(autowired, "LiquidationReadinessController.setLoansReferenceScriptVerifier is not @Autowired — "
+                + "the container would leave it holding no verifier, and the banner would never show");
+        assertTrue(autowired.required(), "LiquidationReadinessController.setLoansReferenceScriptVerifier must be "
+                + "REQUIRED: optional injection fails silent when the verifier bean is missing");
+    }
+
+    /**
      * FAB-136: the startup wallet sweep and its readiness gate are gone. None of the former readers may
      * still declare the setter or hold the field — a leftover setter would be dead injection, and a
      * leftover field a gate nothing opens. Matched by NAME, because the type itself no longer exists.

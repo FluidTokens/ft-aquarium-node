@@ -88,9 +88,11 @@ import java.util.function.Supplier;
  * immediately, exactly as before.
  *
  * <h2>Never throws into Yaci</h2>
- * An exception from this listener would propagate into Yaci Store's publisher — after commit, out of the
- * transaction manager's commit call; with no transaction, mid-sync — so the whole body sits behind a catch-all
- * that logs at ERROR — the idiom {@link BlockEventListener} uses.
+ * On the transactional path an exception from this listener never reaches Yaci Store: it runs as an
+ * after-completion synchronization, and Spring's synchronization logs and swallows whatever such a callback
+ * throws. On the {@code fallbackExecution} path (no transaction, e.g. mid-sync) there is no synchronization in
+ * between, and it would propagate into Yaci Store's publisher. That second path is why the whole body still
+ * sits behind a catch-all that logs at ERROR — the idiom {@link BlockEventListener} uses.
  *
  * <h2>Ordering</h2>
  * The syncing flag this reads must be the one {@link BlockEventListener#processBlock} wrote for the SAME

@@ -942,6 +942,34 @@ class LoansReferenceScriptVerifierTest {
     }
 
     /**
+     * C1 with UNKNOWN liveness — the provider names each coordinate's published hash but not whether the
+     * output is still unspent. That is not a finding: every coordinate is KEPT, nothing is dropped and no
+     * validator is warned missing. The shared classifier keeps it on the named keys too (case (i)).
+     */
+    @Test
+    void elevenCompoundCoordinatesWithUnknownLivenessAreAllKept() {
+        List<TransactionInput> eleven = elevenCoordinates();
+        List<String> hashes = builderEleven(REGISTRY);
+        Map<String, Result<PublishedOutput>> chain = new HashMap<>();
+        for (int i = 0; i < eleven.size(); i++) {
+            chain.put(coordinate(eleven.get(i)), published(hashes.get(i), Liveness.UNKNOWN));
+        }
+        var compound = compound(true, joined(eleven));
+        Lookup lookup = chain(chain);
+        var verifier = compoundVerifier(REGISTRY, compound, lookup);
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        assertEquals(joined(eleven), compound.getReferenceScripts(),
+                "liveness unknown is kept: the narrowed list is the configured list");
+        assertTrue(missing(logs).isEmpty(), "every validator is supplied: " + missing(logs));
+        assertTrue(warnsContaining(logs, LoansReferenceScriptVerifier.DROPPED).isEmpty(),
+                "nothing is dropped: " + warnsContaining(logs, LoansReferenceScriptVerifier.DROPPED));
+        assertTrue(verifier.degradations().isEmpty(), verifier.degradations().toString());
+        assertEquals(11, lookup.asked.size(), "each coordinate was asked: " + lookup.asked);
+    }
+
+    /**
      * C2 — ⛔ the ruling's mutation control, on the compound list: lmCompoundAction's coordinate is
      * replaced by a real, unspent output that publishes the SUPERSEDED lm_compound_action. It is DROPPED
      * (not UNVERIFIED), its validator is warned MISSING and travels inline — and the other ten are KEPT.

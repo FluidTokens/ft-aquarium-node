@@ -324,7 +324,8 @@ class WalletRebalancerWiringTest {
             // A one-minute-old block: the listener clears the flag, and the rebalancer must see it cleared.
             context.publishEvent(blockAt(converters, Duration.ofMinutes(1)));
             assertFalse(listener.getIsSyncing().get());
-            assertEquals(1, reads(wallet), "the rebalancer read a stale 'syncing' flag: it ran before the listener");
+            assertEquals(1, reads(wallet), "expected one wallet read: either the rebalancer never ran on this "
+                    + "event, or it read a stale 'syncing' flag because it ran before the listener");
             assertEquals(1, blockfrost.submitted.size(), "SHADOW submits the rebalance");
 
             Transaction tx = Transaction.deserialize(blockfrost.submitted.get(0));

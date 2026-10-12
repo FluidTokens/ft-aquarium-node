@@ -222,10 +222,22 @@ curl -s http://localhost:8080/healthcheck | jq .
 curl -s http://localhost:8080/api/v1/loans | jq 'length'
 ```
 
-Startup verification is the real check, and it is strict — but since FAB-115 it no longer stops the
-node. If the config policy ids or the reference-script coordinates do not match what the node derives,
-it **closes the lending gate**: every Lending v4 transaction (liquidation in every mode, convert,
-compound) is refused for the life of the process, while scheduled payments keep running.
+Startup verification is the real check, and it runs **at boot only**. It has two halves, and they
+react differently:
+
+- **Config datums (`LoansConfigVerifier`) — strict.** Since FAB-115 a mismatch no longer stops the node.
+  If the config policy ids or `smart-tokens-spend-script-hash` do not match what the node derives, it
+  **closes the lending gate**: every Lending v4 transaction (liquidation in every mode, convert,
+  compound) is refused for the life of the process (`LENDING_CONFIG_MISMATCH`), while scheduled
+  payments keep running.
+- **Reference-script coordinates (`LoansReferenceScriptVerifier`) — warn and carry on.** Since FAB-108
+  a bad coordinate **never closes the gate**. `REFERENCE_SCRIPT_DROPPED` (absent, spent, no reference
+  script, or a hash other than the derived one): the coordinate is not used and its validator travels
+  inline — a larger transaction, refused as `TX_TOO_LARGE` if it no longer fits `maxTxSize`.
+  `REFERENCE_SCRIPT_UNVERIFIED` (the provider could not be asked): used as configured.
+  `REFERENCE_SCRIPT_MISSING` (compound only, and only with `loans.compound.enabled=true`): a compound
+  validator no usable coordinate supplies, which travels inline. Only
+  `loans.verify-config.fail-on-unreachable=true` still stops the boot, on an UNVERIFIED coordinate.
 
 ⚠ **A healthy `/healthcheck` does not mean lending may build** — the gate is reported, not part of the
 verdict, because the scheduled payments it guards keep running. Read the gate before re-arming:
@@ -240,14 +252,18 @@ curl -s http://localhost:8080/healthcheck | jq '{lending_gate, lending_gate_reas
 The startup log says the same, with every mismatched field:
 
 ```bash
-docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified"
+docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified|REFERENCE_SCRIPT_(DROPPED|UNVERIFIED|MISSING)"
 ```
 
 - `Lending v4 config verified against chain …` and `… reference scripts verified against chain …` — good.
 - Any `LENDING_CONFIG_MISMATCH` line — the gate is closed; the line names each field (derived vs chain).
   Fix the coordinates (`loans.config.policy-id`, `loans.lm-config.policy-id`,
-  `loans.smart-tokens-spend-script-hash`, `loans.liquidation.reference-scripts.*`) and restart.
-- With the readiness UI enabled, the page also shows a `LENDING_CONFIG_MISMATCH` banner.
+  `loans.smart-tokens-spend-script-hash`) and restart.
+- Any `REFERENCE_SCRIPT_DROPPED`, `REFERENCE_SCRIPT_UNVERIFIED` or `REFERENCE_SCRIPT_MISSING` line — the
+  gate stays open and lending goes on; the line names the key or the compound entry. Fix
+  `loans.liquidation.reference-scripts.*` / `loans.compound.reference-scripts` and restart.
+- With the readiness UI enabled, the page also shows a `LENDING_CONFIG_MISMATCH` banner for the first, and a
+  **REFERENCE SCRIPTS** banner (one line per problem, saying lending is NOT refused) for the second.
 
 **Then re-arm in stages** — `shadow` first, read the decisions, then `live`. Same sequence as a first
 deployment (deploying.md §8). A redeploy is a good moment to rehearse rather than assume.
@@ -282,10 +298,12 @@ the image you restart with:
   - `AQUARIUM_LIQUIDATION_REF_LOAN_CLAIM_ACTION`, `AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_ACTION`,
     `AQUARIUM_LIQUIDATION_REF_LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION`,
     `LOANS_LIQUIDATION_REFERENCE_SCRIPTS_LM_LIQUIDATE_AND_CONVERT_ACTION` — these are **verified at boot**:
-    a stale one closes the gate and the log names the key.
-  - `AQUARIUM_COMPOUND_REFERENCE_SCRIPTS` — **not verified at boot**. A stale entry is silently ignored as
-    a reference (the compound script then travels inline, and you still pay to reference the stale one).
-    Compare it with the shipped default by hand, or unset it.
+    a stale one is a `REFERENCE_SCRIPT_DROPPED` WARN naming the key, and its validator travels inline
+    (the gate stays open; FAB-108).
+  - `AQUARIUM_COMPOUND_REFERENCE_SCRIPTS` — **verified at boot only while `loans.compound.enabled=true`**
+    (FAB-108). A stale entry is then a `REFERENCE_SCRIPT_DROPPED` WARN and is not referenced, and the
+    script it should have supplied is a `REFERENCE_SCRIPT_MISSING` WARN and travels inline. With compound
+    off it is not checked: compare it with the shipped default by hand, or unset it.
 - **Verify exactly as §4.7.** Expect one WARN for `ConfigDatum[14]` (recast): FluidTokens point it at a
   pause hash by design, and the node never recasts. It does not close the gate.
 

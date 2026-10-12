@@ -217,6 +217,18 @@
     re-pinned and restarted. Scheduled payments are unaffected.
     <div style="font-weight:400" th:text="${lendingConfigBlocked}">why</div>
   </div>
+  <!-- ⚠ FAB-108: the boot-time reference-script check, which never closes the gate. Each line is a WARN
+       from the log and can quote a provider's answer, so it is th:text: escaped, never raw markup. -->
+  <div th:if="${referenceScriptDegradations != null and !#lists.isEmpty(referenceScriptDegradations)}"
+       class="note" style="color:var(--warn);font-weight:600">
+    &#9888; <span th:text="|REFERENCE SCRIPTS: ${#lists.size(referenceScriptDegradations)} problem(s) — lending is NOT refused.|">header</span>
+    <div style="font-weight:400">A dropped or missing validator travels inline in the witness set (a larger
+      transaction; one that no longer fits maxTxSize is refused as TX_TOO_LARGE), and an unverified one is used
+      as configured; fix the coordinates and restart.</div>
+    <ul style="font-weight:400">
+      <li th:each="d : ${referenceScriptDegradations}" th:text="${d}">problem</li>
+    </ul>
+  </div>
   <div th:if="${disabledReason}" class="note" th:text="${disabledReason}">disabled</div>
 
   <!-- ⛔ THE OPERATOR'S OWN WALLET. Amount and ticker; the policy id lives on hover, because a
