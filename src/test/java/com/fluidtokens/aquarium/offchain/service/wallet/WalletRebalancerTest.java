@@ -13,6 +13,7 @@ import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.yaci.store.events.EventMetadata;
 import com.bloxbean.cardano.yaci.store.events.internal.CommitEvent;
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
@@ -33,6 +34,7 @@ import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -53,6 +55,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class WalletRebalancerTest {
 
     private static final String NIGHT = "ee".repeat(28) + "4e49474854";
+    private static final String USDM = "cc".repeat(28) + "5553444d";
+    private static final String JUNK = "dd".repeat(28) + "4a554e4b";
     private static final BigInteger TEN_ADA = WalletShape.SHAPED_TOKEN_LOVELACE;
     private static final BigInteger C =
             WalletShape.collateralLovelace(LoanFixtures.protocolParams().getProtocolParams());
@@ -90,6 +94,13 @@ class WalletRebalancerTest {
     private final AtomicReference<Mode> mode = new AtomicReference<>(Mode.LIVE);
     private final AtomicReference<List<Market>> markets = new AtomicReference<>(List.of(anticipate(NIGHT)));
 
+    /**
+     * A market's effective mode by the REAL rule, {@code LiquidationConfiguration.effectiveMode} — the global mode
+     * is a ceiling over the market's own — evaluated against whatever {@link #mode} holds at the call.
+     */
+    private final Function<Market, Mode> effectiveMode = market -> new AppConfig.LiquidationConfiguration(
+            mode.get() == null ? Mode.DISABLED : mode.get(), 60, 120, 30, BigInteger.ZERO, 200).effectiveMode(market);
+
     private ListAppender<ILoggingEvent> logs;
     private Logger logger;
 
@@ -116,7 +127,7 @@ class WalletRebalancerTest {
                     }
                     return walletContents.get();
                 },
-                syncing::get, mode::get, markets::get, envEnabled);
+                syncing::get, mode::get, markets::get, effectiveMode, envEnabled);
     }
 
     private static Market market(String unit, Action action) {
@@ -131,6 +142,12 @@ class WalletRebalancerTest {
 
     private static Market anticipate(String unit) {
         return market(unit, Action.ANTICIPATE);
+    }
+
+    private static Market anticipate(String unit, Mode marketMode) {
+        Market m = anticipate(unit);
+        m.setMode(marketMode);
+        return m;
     }
 
     private Utxo utxo(long lovelace, Object... unitQuantityPairs) {
@@ -275,6 +292,64 @@ class WalletRebalancerTest {
                 at(Level.INFO).get(0).getFormattedMessage());
     }
 
+    // ---- the per-market mode (FAB-131 r2) -------------------------------------------------------------------
+
+    /**
+     * An ANTICIPATE market whose OWN mode is DISABLED can never liquidate ({@code effectiveMode} is DISABLED
+     * whatever the node's mode), so it must not open G4: nothing read, nothing submitted.
+     */
+    @Test
+    void anAnticipateMarketWhoseOwnModeIsDisabledDoesNotOpenTheGate() {
+        mode.set(Mode.SHADOW);
+        markets.set(List.of(anticipate(NIGHT, Mode.DISABLED), market(USDM, Action.CONVERT)));
+        assertBlocked(rebalancer(true), "the only ANTICIPATE market has mode: DISABLED");
+    }
+
+    /**
+     * ... and it must not tie up 10 ADA in an isolated UTxO either: with another ANTICIPATE market enabled, the
+     * DISABLED market's token is NOT relevant, so the built transaction leaves it in the non-relevant bundle
+     * (beside JUNK), while the enabled market's token gets its own exactly-10-ADA output.
+     */
+    @Test
+    void aDisabledAnticipateMarketsTokenStaysInTheNonRelevantBundle() throws Exception {
+        mode.set(Mode.SHADOW);
+        markets.set(List.of(anticipate(NIGHT, Mode.DISABLED), anticipate(USDM)));
+        walletContents.set(List.of(utxo(1_180_000, NIGHT, 15_000_000_000L), utxo(1_500_000, USDM, 1_000_000L),
+                utxo(1_300_000, JUNK, 5L), utxo(200_000_000)));
+
+        assertRebalancedOnce(rebalancer(true), "one enabled ANTICIPATE market beside a disabled one");
+        Transaction tx = Transaction.deserialize(submitted.get(0));
+        List<Map<String, BigInteger>> outputs = new ArrayList<>();
+        for (TransactionOutput output : tx.getBody().getOutputs()) {
+            outputs.add(WalletShapeTransactions.unitsOf(output.getValue()));
+        }
+        assertTrue(outputs.contains(Map.of("lovelace", TEN_ADA, USDM, BigInteger.valueOf(1_000_000L))),
+                "the enabled market's token is isolated on exactly 10 ADA: " + outputs);
+        assertTrue(outputs.contains(Map.of("lovelace", TEN_ADA, NIGHT, BigInteger.valueOf(15_000_000_000L),
+                JUNK, BigInteger.valueOf(5L))), "the DISABLED market's token stays in the non-relevant bundle: " + outputs);
+        assertTrue(at(Level.INFO).get(0).getFormattedMessage().contains("relevant [" + USDM + "]"),
+                at(Level.INFO).get(0).getFormattedMessage());
+    }
+
+    /** A market with no mode of its own inherits the node's, and counts. */
+    @ParameterizedTest
+    @EnumSource(value = Mode.class, names = {"SHADOW", "LIVE"})
+    void aMarketWithNoModeInheritsTheGlobalModeAndCounts(Mode global) {
+        mode.set(global);
+        markets.set(List.of(anticipate(NIGHT, null)));
+        assertRebalancedOnce(rebalancer(true), "market mode null under global " + global);
+        assertTrue(at(Level.INFO).get(0).getFormattedMessage().contains("relevant [" + NIGHT + "]"),
+                at(Level.INFO).get(0).getFormattedMessage());
+    }
+
+    /** A market MORE permissive than the node is capped at the node's mode (LIVE under SHADOW is SHADOW): it counts. */
+    @Test
+    void aLiveMarketUnderAShadowNodeCountsAsShadow() {
+        mode.set(Mode.SHADOW);
+        markets.set(List.of(anticipate(NIGHT, Mode.LIVE)));
+        assertRebalancedOnce(rebalancer(true), "market LIVE under global SHADOW");
+    }
+
     @Test
     void syncingBlocks() {
         syncing.set(true);
@@ -414,7 +489,7 @@ class WalletRebalancerTest {
         WalletRebalancer gateFailure = new WalletRebalancer(engine, walletContents::get, syncing::get, mode::get,
                 () -> {
                     throw new IllegalStateException("markets unreadable");
-                }, true);
+                }, effectiveMode, true);
         assertDoesNotThrow(() -> gateFailure.processCommit(event()));
         assertTrue(at(Level.ERROR).stream().anyMatch(e -> e.getFormattedMessage().contains("markets unreadable")),
                 String.valueOf(logs.list));

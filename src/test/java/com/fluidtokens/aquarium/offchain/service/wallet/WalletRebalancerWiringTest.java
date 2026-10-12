@@ -21,6 +21,8 @@ import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.autoconfigure.transaction.TransactionAutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -31,6 +33,12 @@ import org.springframework.core.env.PropertySource;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.env.SystemEnvironmentPropertySource;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.AbstractPlatformTransactionManager;
+import org.springframework.transaction.support.DefaultTransactionStatus;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -44,6 +52,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -68,10 +77,20 @@ import static org.mockito.Mockito.when;
  * Blockfrost backend (its epoch service answers {@code LoanFixtures} parameters and its transaction service
  * records what is submitted), the bot account, and the wallet read.
  *
- * <p>Ordering: the rebalancer is REGISTERED BEFORE {@link BlockEventListener} on purpose. Without the
- * {@code @Order} on {@code BlockEventListener.processBlock}, listeners of equal order run in registration
- * order, so the rebalancer would read the syncing flag one event stale — and the two ordering tests below
- * would go red in both directions.
+ * <p>⛔ FAB-131 r2: <b>the rebalancer runs AFTER the block's transaction commits.</b> At the chain tip Yaci
+ * publishes {@code CommitEvent} inside {@code @Transactional publishBlockEvents}; a wallet read, a build and a
+ * Blockfrost submit must not hold that transaction open, nor mark it rollback-only. The context therefore
+ * carries a real Spring transaction manager ({@link RecordingTransactionManager}: no DataSource, it only counts
+ * commits and rollbacks) and Boot's {@link TransactionAutoConfiguration} — the same route by which production
+ * gets the factory that makes {@code @TransactionalEventListener} transactional at all. Without that factory
+ * the annotation degrades to a plain {@code @EventListener}, which the in-transaction test below catches.
+ *
+ * <p>Ordering: the rebalancer is REGISTERED BEFORE {@link BlockEventListener} on purpose. Inside a transaction
+ * the phase orders them (the block listener runs in the transaction, the rebalancer after its commit). With no
+ * transaction — Yaci's parallel initial-sync path, where {@code fallbackExecution} runs the rebalancer inline —
+ * only the {@code @Order} on {@code BlockEventListener.processBlock} does: listeners of equal order run in
+ * registration order, so the rebalancer would read the syncing flag one event stale, and the ordering test
+ * below would go red in both directions.
  */
 class WalletRebalancerWiringTest {
 
@@ -110,6 +129,37 @@ class WalletRebalancerWiringTest {
                         case "toString" -> "recording TransactionService";
                         default -> throw new UnsupportedOperationException(method.getName());
                     });
+        }
+    }
+
+    /**
+     * A real {@link PlatformTransactionManager} with no resource behind it: Spring's own synchronization
+     * machinery runs (so {@code @TransactionalEventListener} sees a live transaction), and the test can tell
+     * whether the commit had already happened when the wallet was read.
+     */
+    static final class RecordingTransactionManager extends AbstractPlatformTransactionManager {
+
+        final AtomicInteger commits = new AtomicInteger();
+
+        final AtomicInteger rollbacks = new AtomicInteger();
+
+        @Override
+        protected Object doGetTransaction() {
+            return new Object();
+        }
+
+        @Override
+        protected void doBegin(Object transaction, TransactionDefinition definition) {
+        }
+
+        @Override
+        protected void doCommit(DefaultTransactionStatus status) {
+            commits.incrementAndGet();
+        }
+
+        @Override
+        protected void doRollback(DefaultTransactionStatus status) {
+            rollbacks.incrementAndGet();
         }
     }
 
@@ -154,13 +204,21 @@ class WalletRebalancerWiringTest {
         return List.of(utxo(1, 1_180_000, NIGHT, 15_000_000_000L), utxo(2, 200_000_000));
     }
 
+    /** The production-shaped context in {@code shadow}, with a transaction manager no test inspects. */
+    private static ApplicationContextRunner runner(RecordingBlockfrost blockfrost, AppUtxoService wallet,
+                                                   Map<String, Object> env) {
+        return runner(blockfrost, wallet, env, "shadow", new RecordingTransactionManager());
+    }
+
     /**
      * The production-shaped context. {@code env} is laid over the shipped file as the PROCESS ENVIRONMENT
      * would be; the developer's own environment and system properties are removed, so neither decides it.
+     * {@code mode} {@code null} leaves {@code loans.liquidation.mode} to the shipped file (and {@code env}).
      */
     private static ApplicationContextRunner runner(RecordingBlockfrost blockfrost, AppUtxoService wallet,
-                                                   Map<String, Object> env) {
-        return new ApplicationContextRunner()
+                                                   Map<String, Object> env, String mode,
+                                                   RecordingTransactionManager transactionManager) {
+        ApplicationContextRunner runner = new ApplicationContextRunner()
                 .withInitializer(context -> {
                     var sources = context.getEnvironment().getPropertySources();
                     sources.remove(StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME);
@@ -172,21 +230,34 @@ class WalletRebalancerWiringTest {
                     }
                 })
                 .withPropertyValues(
-                        "loans.liquidation.mode=shadow",
                         "loans.liquidation.markets[0].unit=" + NIGHT,
                         "loans.liquidation.markets[0].action=ANTICIPATE",
                         "loans.liquidation.markets[0].cap=1000000000000")
+                .withConfiguration(AutoConfigurations.of(TransactionAutoConfiguration.class))
+                .withBean(PlatformTransactionManager.class, () -> transactionManager)
                 .withBean(BFBackendService.class, () -> blockfrost)
                 .withBean(Account.class, () -> ACCOUNT)
                 .withBean(AppUtxoService.class, () -> wallet)
                 // ⚠ Registration order is part of the test: the rebalancer BEFORE the block listener.
                 .withUserConfiguration(Binder.class, AppConfig.class, ProductionProtocolParams.class,
                         WalletRebalancer.class, BlockEventListener.class);
+        return mode == null ? runner : runner.withPropertyValues("loans.liquidation.mode=" + mode);
     }
 
     private static AppUtxoService wallet() {
         AppUtxoService wallet = mock(AppUtxoService.class);
         when(wallet.listWalletUtxo()).thenReturn(nightWallet());
+        return wallet;
+    }
+
+    /** A wallet read that records how many commits the transaction manager had seen when it was made. */
+    private static AppUtxoService walletRecordingCommits(RecordingTransactionManager transactionManager,
+                                                         List<Integer> commitsAtRead) {
+        AppUtxoService wallet = mock(AppUtxoService.class);
+        when(wallet.listWalletUtxo()).thenAnswer(invocation -> {
+            commitsAtRead.add(transactionManager.commits.get());
+            return nightWallet();
+        });
         return wallet;
     }
 
@@ -236,7 +307,8 @@ class WalletRebalancerWiringTest {
     /**
      * ⛔ A CommitEvent reaches the rebalancer AFTER {@link BlockEventListener} has updated the syncing flag for
      * the SAME event, in both directions: a fresh block releases a fresh bean on that event, and an old block
-     * after a fresh one blocks on that event.
+     * after a fresh one blocks on that event. Published with NO transaction, so the transaction phase does not
+     * order the two listeners here and only {@code BlockEventListener}'s {@code @Order} does.
      */
     @Test
     void aCommitEventReachesTheRebalancerAfterTheSyncingFlagIsUpdated() {
@@ -247,6 +319,7 @@ class WalletRebalancerWiringTest {
             CardanoConverters converters = context.getBean(CardanoConverters.class);
             BlockEventListener listener = context.getBean(BlockEventListener.class);
             assertTrue(listener.getIsSyncing().get(), "a fresh node starts syncing");
+            assertFalse(TransactionSynchronizationManager.isSynchronizationActive(), "the no-transaction path");
 
             // A one-minute-old block: the listener clears the flag, and the rebalancer must see it cleared.
             context.publishEvent(blockAt(converters, Duration.ofMinutes(1)));
@@ -267,6 +340,127 @@ class WalletRebalancerWiringTest {
             assertTrue(listener.getIsSyncing().get());
             assertEquals(1, reads(wallet), "the rebalancer read a stale 'not syncing' flag: it ran before the listener");
             assertEquals(1, blockfrost.submitted.size());
+        });
+    }
+
+    /**
+     * ⛔ Audit finding 1: at the chain tip Yaci publishes {@code CommitEvent} INSIDE its block transaction
+     * ({@code ShelleyBlockEventPublisher.publishBlockEvents}, {@code @Transactional}). The rebalancer must not run
+     * there: nothing at the point {@code publishEvent} returns, exactly one read and one submit once the
+     * transaction commits — and the read made AFTER the commit, not during it (which is what a
+     * {@code BEFORE_COMMIT} listener would do).
+     */
+    @Test
+    void insideTheBlocksTransactionTheRebalancerWaitsForTheCommit() {
+        RecordingBlockfrost blockfrost = new RecordingBlockfrost();
+        RecordingTransactionManager transactionManager = new RecordingTransactionManager();
+        List<Integer> commitsAtRead = new ArrayList<>();
+        AppUtxoService wallet = walletRecordingCommits(transactionManager, commitsAtRead);
+        runner(blockfrost, wallet, Map.of(), "shadow", transactionManager).run(context -> {
+            assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+            assertSame(transactionManager, context.getBean(PlatformTransactionManager.class));
+            CardanoConverters converters = context.getBean(CardanoConverters.class);
+            BlockEventListener listener = context.getBean(BlockEventListener.class);
+
+            new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+                assertTrue(TransactionSynchronizationManager.isSynchronizationActive(),
+                        "the test must publish inside a live Spring transaction");
+                context.publishEvent(blockAt(converters, Duration.ofMinutes(1)));
+                assertFalse(listener.getIsSyncing().get(), "the block listener runs inside the transaction");
+                assertEquals(0, reads(wallet), "the rebalancer read the wallet INSIDE the block's transaction");
+                assertEquals(0, blockfrost.submitted.size(), "the rebalancer submitted INSIDE the block's transaction");
+            });
+
+            assertEquals(1, transactionManager.commits.get());
+            assertEquals(1, reads(wallet), "once the block's transaction commits, the rebalancer runs once");
+            assertEquals(List.of(1), commitsAtRead, "the wallet must be read AFTER the commit, not during it");
+            assertEquals(1, blockfrost.submitted.size(), "and submits once");
+        });
+    }
+
+    /** A block whose transaction rolls back never reaches the rebalancer: nothing read, nothing submitted. */
+    @Test
+    void aRolledBackBlockTransactionNeverReachesTheRebalancer() {
+        RecordingBlockfrost blockfrost = new RecordingBlockfrost();
+        RecordingTransactionManager transactionManager = new RecordingTransactionManager();
+        AppUtxoService wallet = wallet();
+        runner(blockfrost, wallet, Map.of(), "shadow", transactionManager).run(context -> {
+            assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+            CardanoConverters converters = context.getBean(CardanoConverters.class);
+            BlockEventListener listener = context.getBean(BlockEventListener.class);
+
+            new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+                context.publishEvent(blockAt(converters, Duration.ofMinutes(1)));
+                status.setRollbackOnly();
+            });
+
+            assertEquals(1, transactionManager.rollbacks.get());
+            assertEquals(0, transactionManager.commits.get());
+            assertFalse(listener.getIsSyncing().get(), "the event did reach the in-transaction block listener");
+            assertEquals(0, reads(wallet), "a rolled-back block must not reach the rebalancer");
+            assertEquals(0, blockfrost.submitted.size());
+        });
+    }
+
+    /**
+     * With NO transaction — Yaci's parallel initial-sync path publishes {@code CommitEvent} on an executor
+     * thread outside any transaction — the rebalancer still runs ({@code fallbackExecution = true}), inline.
+     */
+    @Test
+    void withNoTransactionTheRebalancerStillRunsInline() {
+        RecordingBlockfrost blockfrost = new RecordingBlockfrost();
+        RecordingTransactionManager transactionManager = new RecordingTransactionManager();
+        AppUtxoService wallet = wallet();
+        runner(blockfrost, wallet, Map.of(), "shadow", transactionManager).run(context -> {
+            assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+            assertFalse(TransactionSynchronizationManager.isSynchronizationActive(), "no transaction here");
+
+            context.publishEvent(blockAt(context.getBean(CardanoConverters.class), Duration.ofMinutes(1)));
+
+            assertEquals(1, reads(wallet), "with no transaction the rebalancer must still run");
+            assertEquals(1, blockfrost.submitted.size());
+            assertEquals(0, transactionManager.commits.get() + transactionManager.rollbacks.get(),
+                    "and nothing opened a transaction for it");
+        });
+    }
+
+    /**
+     * ⛔ Audit finding 3: the SHIPPED default, through the container. No {@code loans.liquidation.mode} override,
+     * so the shipped file's {@code disabled} decides; an ANTICIPATE market is configured and a fresh block
+     * arrives, inside a committed transaction and outside one. Nothing is read and nothing is submitted. The
+     * positive control is the same container with only {@code AQUARIUM_LIQUIDATION_MODE=shadow} added: it does
+     * rebalance, so the shipped mode is the one thing that held the first one back.
+     */
+    @Test
+    void theShippedDisabledModeKeepsAnAnticipateNodeFromRebalancing() {
+        RecordingBlockfrost blockfrost = new RecordingBlockfrost();
+        RecordingTransactionManager transactionManager = new RecordingTransactionManager();
+        AppUtxoService wallet = wallet();
+        runner(blockfrost, wallet, Map.of(), null, transactionManager).run(context -> {
+            assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+            assertEquals(AppConfig.LiquidationConfiguration.Mode.DISABLED,
+                    context.getBean(AppConfig.LiquidationConfiguration.class).getMode(), "the shipped default");
+            CardanoConverters converters = context.getBean(CardanoConverters.class);
+            BlockEventListener listener = context.getBean(BlockEventListener.class);
+
+            new TransactionTemplate(transactionManager).executeWithoutResult(status ->
+                    context.publishEvent(blockAt(converters, Duration.ofMinutes(1))));
+            context.publishEvent(blockAt(converters, Duration.ofMinutes(1)));
+
+            assertEquals(1, transactionManager.commits.get());
+            assertFalse(listener.getIsSyncing().get(), "the blocks arrived and the node is not syncing");
+            assertEquals(0, reads(wallet), "the shipped mode is DISABLED: no wallet read");
+            assertEquals(0, blockfrost.submitted.size(), "the shipped mode is DISABLED: no submission");
+        });
+
+        RecordingBlockfrost armedBlockfrost = new RecordingBlockfrost();
+        AppUtxoService armedWallet = wallet();
+        runner(armedBlockfrost, armedWallet, Map.of("AQUARIUM_LIQUIDATION_MODE", "shadow"), null,
+                new RecordingTransactionManager()).run(context -> {
+            assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+            context.publishEvent(blockAt(context.getBean(CardanoConverters.class), Duration.ofMinutes(1)));
+            assertEquals(1, reads(armedWallet), "positive control: the same container in shadow reads the wallet");
+            assertEquals(1, armedBlockfrost.submitted.size(), "positive control: and submits");
         });
     }
 
