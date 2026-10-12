@@ -9,19 +9,24 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.Liveness;
 import com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput;
+import com.fluidtokens.aquarium.offchain.service.loans.CompoundTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.slf4j.LoggerFactory;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -834,6 +839,404 @@ class LoansReferenceScriptVerifierTest {
         assertTrue(at(cleanLogs, Level.WARN).isEmpty(), "a clean pass has no WARN: " + at(cleanLogs, Level.WARN));
         assertTrue(at(cleanLogs, Level.INFO).stream().anyMatch(e -> e.getFormattedMessage().contains("1 verified")),
                 "and an INFO naming the verified count: " + at(cleanLogs, Level.INFO));
+    }
+
+    // ======================================================================================
+    // FAB-108-2 — the compound list, checked against the ELEVEN compound validators
+    // ======================================================================================
+
+    private static final String COMPOUND_KEY = "loans.compound.reference-scripts";
+
+    /** Index of {@code lmCompoundAction} among the builder's eleven (four spends, then the seven withdrawals). */
+    private static final int LM_COMPOUND = 6;
+
+    /**
+     * The eleven scripts a compound runs, as the BUILDER names them — its four {@code general_spend} spends
+     * plus {@link CompoundTransactionBuilder#withdrawCredentials} — never the verifier's own list, so a
+     * validator missing from the verifier's set shows up here as a drop (VH-90).
+     */
+    private static List<String> builderEleven(LoansContractRegistry registry) {
+        List<String> eleven = new ArrayList<>(List.of(registry.getAssetManagerSpendScriptHash(),
+                registry.getLenderManagerSpendScriptHash(), registry.getPoolSpendScriptHash(),
+                registry.getPoolManagerSpendScriptHash()));
+        eleven.addAll(CompoundTransactionBuilder.withdrawCredentials(registry));
+        return eleven;
+    }
+
+    /** Compound coordinate {@code i}: {@code c0c0…#0}, {@code c1c1…#0}, … — distinct from the named {@link #in}. */
+    private static TransactionInput compoundIn(int i) {
+        return new TransactionInput(String.format("%02x", 0xc0 + i).repeat(32), 0);
+    }
+
+    private static List<TransactionInput> elevenCoordinates() {
+        List<TransactionInput> eleven = new ArrayList<>();
+        for (int i = 0; i < 11; i++) {
+            eleven.add(compoundIn(i));
+        }
+        return eleven;
+    }
+
+    private static String joined(List<TransactionInput> coordinates) {
+        return coordinates.stream().map(LoansReferenceScriptVerifierTest::coordinate).collect(Collectors.joining(","));
+    }
+
+    /** Coordinate {@code i} of {@code coordinates} publishing the builder's {@code i}-th hash, UNSPENT. */
+    private static Map<String, Result<PublishedOutput>> honestCompound(List<TransactionInput> coordinates) {
+        List<String> eleven = builderEleven(REGISTRY);
+        Map<String, Result<PublishedOutput>> chain = new HashMap<>();
+        for (int i = 0; i < coordinates.size(); i++) {
+            chain.put(coordinate(coordinates.get(i)), published(eleven.get(i), Liveness.UNSPENT));
+        }
+        return chain;
+    }
+
+    /** An enabled-or-not compound configuration whose raw {@code @Value} list is {@code raw}. */
+    private static AppConfig.CompoundConfiguration compound(boolean enabled, String raw) {
+        var configuration = new AppConfig.CompoundConfiguration(enabled, 60L, BigInteger.ZERO);
+        ReflectionTestUtils.setField(configuration, "referenceScripts", raw);
+        return configuration;
+    }
+
+    private static LoansReferenceScriptVerifier compoundVerifier(LoansContractRegistry registry,
+                                                                 AppConfig.CompoundConfiguration compound,
+                                                                 Lookup lookup) {
+        return new LoansReferenceScriptVerifier(registry,
+                configured(LiquidateTransactionBuilder.ReferenceScripts.none()), compound, lookup, false);
+    }
+
+    private static List<String> warnsContaining(List<ILoggingEvent> events, String text) {
+        return at(events, Level.WARN).stream().map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains(text)).toList();
+    }
+
+    /** The {@code REFERENCE_SCRIPT_MISSING} WARNs. */
+    private static List<String> missing(List<ILoggingEvent> events) {
+        return warnsContaining(events, LoansReferenceScriptVerifier.MISSING);
+    }
+
+    private static List<String> compoundDegradations(LoansReferenceScriptVerifier verifier) {
+        return verifier.degradations().stream().filter(d -> d.contains(COMPOUND_KEY)).toList();
+    }
+
+    /**
+     * C1 — the control the compound tests rest on: eleven coordinates, each publishing one of the
+     * builder's eleven, all unspent. Nothing degraded, eleven lookups, and the narrowed list is the
+     * configured list.
+     */
+    @Test
+    void elevenCompoundCoordinatesPublishingTheElevenAreAllKept() {
+        List<TransactionInput> eleven = elevenCoordinates();
+        var compound = compound(true, joined(eleven));
+        Lookup lookup = chain(honestCompound(eleven));
+        var verifier = compoundVerifier(REGISTRY, compound, lookup);
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        assertTrue(compoundDegradations(verifier).isEmpty(), "nothing degraded: " + verifier.degradations());
+        assertTrue(verifier.degradations().isEmpty(), verifier.degradations().toString());
+        assertEquals(joined(eleven), compound.getReferenceScripts(), "the narrowed list is the configured list");
+        assertEquals(joined(eleven), compound.getConfiguredReferenceScripts());
+        assertEquals(eleven.stream().map(LoansReferenceScriptVerifierTest::coordinate).toList(), lookup.asked,
+                "one lookup per coordinate, in list order");
+        assertTrue(at(logs, Level.WARN).isEmpty(), "a clean pass warns about nothing: " + at(logs, Level.WARN));
+    }
+
+    /**
+     * C2 — ⛔ the ruling's mutation control, on the compound list: lmCompoundAction's coordinate is
+     * replaced by a real, unspent output that publishes the SUPERSEDED lm_compound_action. It is DROPPED
+     * (not UNVERIFIED), its validator is warned MISSING and travels inline — and the other ten are KEPT.
+     */
+    @Test
+    void aCompoundCoordinatePublishingASupersededValidatorIsDroppedAndItsValidatorIsMissing() {
+        List<TransactionInput> coordinates = new ArrayList<>(elevenCoordinates());
+        coordinates.set(LM_COMPOUND, RULING_COORDINATE);
+        Map<String, Result<PublishedOutput>> chain = honestCompound(elevenCoordinates());
+        chain.put(coordinate(RULING_COORDINATE), published(RULING_PUBLISHED, Liveness.UNSPENT));
+        assertFalse(builderEleven(REGISTRY).contains(RULING_PUBLISHED), "precondition: none of the eleven");
+        var compound = compound(true, joined(coordinates));
+        var verifier = compoundVerifier(REGISTRY, compound, chain(chain));
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        List<String> named = warnsContaining(logs, coordinate(RULING_COORDINATE));
+        assertEquals(1, named.size(), "exactly one WARN names the coordinate: " + named);
+        String dropped = named.get(0);
+        assertTrue(dropped.startsWith(LoansReferenceScriptVerifier.DROPPED), dropped);
+        assertTrue(dropped.contains(COMPOUND_KEY), dropped);
+        assertTrue(dropped.contains(RULING_PUBLISHED), "names the published hash: " + dropped);
+        assertFalse(dropped.contains(LoansReferenceScriptVerifier.UNVERIFIED), dropped);
+
+        String lmCompoundHash = REGISTRY.getLmCompoundActionScriptHash();
+        assertEquals(builderEleven(REGISTRY).get(LM_COMPOUND), lmCompoundHash, "precondition: index 6 is it");
+        List<String> missing = missing(logs);
+        assertEquals(1, missing.size(), "one validator is missing: " + missing);
+        assertTrue(missing.get(0).contains("lmCompoundAction") && missing.get(0).contains(lmCompoundHash)
+                && missing.get(0).contains("travels INLINE"), missing.get(0));
+
+        // must still: the other ten are kept, in the configured order.
+        List<TransactionInput> ten = new ArrayList<>(coordinates);
+        ten.remove(LM_COMPOUND);
+        assertEquals(joined(ten), compound.getReferenceScripts(), "the other ten are kept");
+        assertEquals(joined(coordinates), compound.getConfiguredReferenceScripts(), "the configured list never changes");
+        assertEquals(List.of(dropped, missing.get(0)), verifier.degradations());
+    }
+
+    /**
+     * C3 — the shared classifier, on the compound list: 404, SPENT and no-script are ANSWERS and drop;
+     * 402, 500 and a transport failure mean "could not ask", and the coordinate is kept. A validator a
+     * kept-but-unverified coordinate might supply is still warned MISSING, and the text says how many
+     * coordinates could not be checked.
+     */
+    @Test
+    void theCompoundListUsesTheSameStatusMappingAsTheNamedKeys() {
+        String lmCompoundHash = REGISTRY.getLmCompoundActionScriptHash();
+        TransactionInput target = compoundIn(LM_COMPOUND);
+        Map<String, Answer> answers = new LinkedHashMap<>();
+        answers.put("HTTP 404", (tx, ix) -> status(404));
+        answers.put("SPENT", (tx, ix) -> published(lmCompoundHash, Liveness.SPENT));
+        answers.put("no reference script", (tx, ix) -> published(null, Liveness.UNSPENT));
+        answers.put("HTTP 402", (tx, ix) -> status(402));
+        answers.put("HTTP 500", (tx, ix) -> status(500));
+        answers.put("transport", (tx, ix) -> {
+            throw new java.net.ConnectException("Connection refused");
+        });
+        Set<String> droppedCases = Set.of("HTTP 404", "SPENT", "no reference script");
+
+        for (Map.Entry<String, Answer> answer : answers.entrySet()) {
+            String label = answer.getKey();
+            Map<String, Result<PublishedOutput>> honest = honestCompound(elevenCoordinates());
+            Lookup lookup = new Lookup((tx, ix) -> (tx + "#" + ix).equals(coordinate(target))
+                    ? answer.getValue().apply(tx, ix) : honest.get(tx + "#" + ix));
+            var compound = compound(true, joined(elevenCoordinates()));
+            var verifier = compoundVerifier(REGISTRY, compound, lookup);
+
+            List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+            List<String> kept = Arrays.asList(compound.getReferenceScripts().split(","));
+            List<String> named = warnsContaining(logs, coordinate(target));
+            assertEquals(1, named.size(), label + ": " + named);
+            List<String> missing = missing(logs).stream().filter(m -> m.contains("lmCompoundAction")).toList();
+            assertEquals(1, missing.size(), label + ": lmCompoundAction is supplied by no checked coordinate: "
+                    + missing(logs));
+            if (droppedCases.contains(label)) {
+                assertFalse(kept.contains(coordinate(target)), label + " must drop: " + kept);
+                assertTrue(named.get(0).startsWith(LoansReferenceScriptVerifier.DROPPED), label + ": " + named);
+                assertFalse(missing.get(0).contains("could not be checked"), label + ": " + missing.get(0));
+            } else {
+                assertTrue(kept.contains(coordinate(target)), label + " must keep the coordinate: " + kept);
+                assertTrue(named.get(0).startsWith(LoansReferenceScriptVerifier.UNVERIFIED), label + ": " + named);
+                assertFalse(named.get(0).contains(LoansReferenceScriptVerifier.DROPPED), label + ": " + named);
+                // the breaker: after a transport failure the four coordinates behind it are not asked.
+                int unverified = label.equals("transport") ? 5 : 1;
+                assertTrue(missing.get(0).contains(unverified + " compound coordinate(s) could not be checked"),
+                        label + ": " + missing.get(0));
+                assertEquals(11, kept.size(), label + ": every unverified coordinate is kept: " + kept);
+            }
+        }
+    }
+
+    /**
+     * C4 — two coordinates publishing ONE validator: the first is kept, the second DROPPED naming the
+     * first. (CompoundExecutor keys by hash, so a kept duplicate would silently replace the first.)
+     */
+    @Test
+    void aSecondCoordinatePublishingTheSameValidatorIsDropped() {
+        List<TransactionInput> eleven = elevenCoordinates();
+        TransactionInput second = new TransactionInput("e1".repeat(32), 0);
+        List<TransactionInput> twelve = new ArrayList<>(eleven);
+        twelve.add(second);
+        Map<String, Result<PublishedOutput>> chain = honestCompound(eleven);
+        chain.put(coordinate(second), published(REGISTRY.getPoolSpendScriptHash(), Liveness.UNSPENT));
+        var compound = compound(true, joined(twelve));
+        var verifier = compoundVerifier(REGISTRY, compound, chain(chain));
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        assertEquals(joined(eleven), compound.getReferenceScripts(), "the first is kept, the second dropped");
+        List<String> named = warnsContaining(logs, coordinate(second));
+        assertEquals(1, named.size(), named.toString());
+        assertTrue(named.get(0).startsWith(LoansReferenceScriptVerifier.DROPPED), named.get(0));
+        assertTrue(named.get(0).contains(coordinate(eleven.get(2))), "names the coordinate that supplies it: "
+                + named.get(0));
+        assertTrue(missing(logs).isEmpty(), "nothing is missing: " + missing(logs));
+    }
+
+    /** C5 — the same coordinate listed twice: one lookup, and the second occurrence is dropped. */
+    @Test
+    void aCoordinateListedTwiceIsLookedUpOnceAndTheSecondOccurrenceDropped() {
+        List<TransactionInput> eleven = elevenCoordinates();
+        String raw = joined(eleven) + "," + coordinate(eleven.get(0));
+        Lookup lookup = chain(honestCompound(eleven));
+        var compound = compound(true, raw);
+        var verifier = compoundVerifier(REGISTRY, compound, lookup);
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        assertEquals(1, Collections.frequency(lookup.asked, coordinate(eleven.get(0))), lookup.asked.toString());
+        assertEquals(11, lookup.asked.size(), lookup.asked.toString());
+        List<String> twice = warnsContaining(logs, "listed twice");
+        assertEquals(1, twice.size(), at(logs, Level.WARN).toString());
+        assertTrue(twice.get(0).startsWith(LoansReferenceScriptVerifier.DROPPED)
+                && twice.get(0).contains(coordinate(eleven.get(0))), twice.get(0));
+        assertEquals(joined(eleven), compound.getReferenceScripts(), "must still keep the first occurrence");
+    }
+
+    /** C6 — a malformed entry is DROPPED without a lookup and without a throw; the well-formed ones are kept. */
+    @Test
+    void aMalformedCompoundEntryIsDroppedWithoutALookup() {
+        List<TransactionInput> eleven = elevenCoordinates();
+        List<String> malformed = List.of("nothex#0", "abc", "ab".repeat(32) + "#-1", "ab".repeat(32) + "#x",
+                "ab".repeat(31) + "#0", "ab".repeat(32) + "#0#1");
+        String raw = joined(eleven) + ", " + String.join(" , ", malformed) + ",,";
+        Lookup lookup = chain(honestCompound(eleven));
+        var compound = compound(true, raw);
+        var verifier = compoundVerifier(REGISTRY, compound, lookup);
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        assertEquals(eleven.stream().map(LoansReferenceScriptVerifierTest::coordinate).toList(), lookup.asked,
+                "a malformed entry is never looked up");
+        for (String entry : malformed) {
+            List<String> named = warnsContaining(logs, "'" + entry + "'");
+            assertEquals(1, named.size(), entry + ": " + at(logs, Level.WARN));
+            assertTrue(named.get(0).startsWith(LoansReferenceScriptVerifier.DROPPED)
+                    && named.get(0).contains("malformed"), named.get(0));
+        }
+        assertEquals(joined(eleven), compound.getReferenceScripts(), "must still keep the eleven");
+        assertTrue(missing(logs).isEmpty(), missing(logs).toString());
+    }
+
+    /**
+     * C7 — D4: compound disabled means the list is not checked at all: no lookup, no narrowing, no
+     * degradation. The "must still": the same list, enabled, IS looked up and narrowed.
+     */
+    @Test
+    void aDisabledCompoundPathIsNotChecked() {
+        List<TransactionInput> eleven = elevenCoordinates();
+        String raw = " " + String.join(" , ", eleven.stream().map(LoansReferenceScriptVerifierTest::coordinate).toList()) + " ";
+        Lookup lookup = chain(honestCompound(eleven));
+        var disabled = compound(false, raw);
+        var verifier = compoundVerifier(REGISTRY, disabled, lookup);
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        assertTrue(lookup.asked.isEmpty(), "a disabled compound path must not reach the chain: " + lookup.asked);
+        assertEquals(raw, disabled.getReferenceScripts(), "and must narrow nothing");
+        assertTrue(verifier.degradations().isEmpty(), verifier.degradations().toString());
+        assertTrue(missing(logs).isEmpty(), missing(logs).toString());
+
+        Lookup asked = chain(honestCompound(eleven));
+        var enabled = compound(true, raw);
+        verifyCapturing(compoundVerifier(REGISTRY, enabled, asked));
+        assertEquals(11, asked.asked.size(), "must still check the same list when enabled");
+        assertEquals(joined(eleven), enabled.getReferenceScripts(), "and narrow it to the canonical form");
+    }
+
+    /** C8 — enabled with nothing listed: every one of the eleven travels inline, and each says so. */
+    @Test
+    void anEnabledCompoundPathWithNoCoordinatesWarnsElevenMissing() {
+        Lookup lookup = new Lookup((tx, ix) -> {
+            throw new AssertionError("nothing is configured, so nothing may be looked up");
+        });
+        var compound = compound(true, "");
+        var verifier = compoundVerifier(REGISTRY, compound, lookup);
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        assertTrue(lookup.asked.isEmpty(), lookup.asked.toString());
+        List<String> missing = missing(logs);
+        assertEquals(11, missing.size(), missing.toString());
+        for (String hash : builderEleven(REGISTRY)) {
+            assertEquals(1, missing.stream().filter(m -> m.contains(hash)).count(), hash + " in " + missing);
+        }
+        assertEquals("", compound.getReferenceScripts());
+    }
+
+    /**
+     * C9 — a coordinate under a named key AND in the compound list is one question to the provider: the
+     * two passes share the out-ref memo. Each pass still judges it by its own rule, and both keep it.
+     */
+    @Test
+    void aCoordinateSharedByANamedKeyAndTheCompoundListIsLookedUpOnce() {
+        List<TransactionInput> eleven = elevenCoordinates();
+        TransactionInput shared = eleven.get(1);
+        assertEquals(REGISTRY.getLenderManagerSpendScriptHash(), builderEleven(REGISTRY).get(1),
+                "precondition: compound index 1 is lender-manager-spend");
+        var liquidation = configured(scripts(null, null, null, shared, null, null, null, null, null));
+        var compound = compound(true, joined(eleven));
+        Lookup lookup = chain(honestCompound(eleven));
+        var verifier = new LoansReferenceScriptVerifier(REGISTRY, liquidation, compound, lookup, false);
+
+        verifyCapturing(verifier);
+
+        assertEquals(1, Collections.frequency(lookup.asked, coordinate(shared)), lookup.asked.toString());
+        assertEquals(11, lookup.asked.size(), "eleven distinct out-refs, eleven lookups: " + lookup.asked);
+        assertEquals(shared, liquidation.getReferenceScripts().lenderManagerSpend(), "the named key is kept");
+        assertEquals(joined(eleven), compound.getReferenceScripts(), "and so is the compound entry");
+        assertTrue(verifier.degradations().isEmpty(), verifier.degradations().toString());
+    }
+
+    /**
+     * C10 — narrowing only drops, and its output is the format every other reader parses: comma-joined
+     * {@code txHash#index} (StaticReferenceInputs and CompoundExecutor split the same string; CCL trap 26a).
+     */
+    @Test
+    void compoundNarrowingOnlyDropsAndKeepsTheConfiguredFormat() {
+        TransactionInput a = compoundIn(0);
+        TransactionInput b = compoundIn(1);
+        String raw = " " + coordinate(a) + " , " + coordinate(b) + " ";
+        var compound = compound(true, raw);
+
+        IllegalArgumentException foreign = assertThrows(IllegalArgumentException.class,
+                () -> compound.narrowReferenceScripts(List.of(RULING_COORDINATE)));
+        assertTrue(foreign.getMessage().startsWith("narrowing may only drop a coordinate"), foreign.getMessage());
+        assertThrows(IllegalArgumentException.class, () -> compound.narrowReferenceScripts(null));
+        assertEquals(raw, compound.getReferenceScripts(), "a refused narrowing changes nothing");
+        assertEquals(raw, compound.getConfiguredReferenceScripts());
+
+        compound.narrowReferenceScripts(List.of(b));
+        assertEquals(coordinate(b), compound.getReferenceScripts());
+        compound.narrowReferenceScripts(List.of(b, new TransactionInput(a.getTransactionId(), a.getIndex())));
+        String narrowed = compound.getReferenceScripts();
+        assertEquals(coordinate(a) + "," + coordinate(b), narrowed, "in the configured order");
+        for (String part : narrowed.split(",")) {
+            assertTrue(part.matches("[0-9a-fA-F]{64}#[0-9]+"), "every part is txHash#index: '" + part + "'");
+        }
+        compound.narrowReferenceScripts(List.of());
+        assertEquals("", compound.getReferenceScripts(), "dropping everything leaves an empty list");
+        assertEquals(raw, compound.getConfiguredReferenceScripts(), "the configured list never changes");
+    }
+
+    /**
+     * C11 — a registry without {@code loans.smart-tokens-spend-script-hash} derives no pool-manager family,
+     * so four of the eleven are null and there is nothing to compare the list with: no lookup, no
+     * narrowing, ONE UNVERIFIED WARN naming them and the property, and no throw.
+     */
+    @Test
+    void aNullRequiredHashSkipsTheCompoundPassWithOneUnverifiedWarn() {
+        var noSmartTokens = new LoansContractRegistry(LoanFixtures.CONFIG_POLICY_ID, LoanFixtures.LM_CONFIG_POLICY_ID,
+                LoanFixtures.CONFIG_ASSET_NAME, null);
+        assertTrue(noSmartTokens.isConfigured(), "precondition: configured");
+        assertNull(noSmartTokens.getLmCompoundActionScriptHash(), "precondition: no lmCompoundAction");
+        List<TransactionInput> eleven = elevenCoordinates();
+        String raw = " " + joined(eleven) + " ";
+        var compound = compound(true, raw);
+        Lookup lookup = chain(honestCompound(eleven));
+        var verifier = compoundVerifier(noSmartTokens, compound, lookup);
+
+        List<ILoggingEvent> logs = verifyCapturing(verifier);
+
+        assertTrue(lookup.asked.isEmpty(), lookup.asked.toString());
+        List<String> unverified = warnsContaining(logs, LoansReferenceScriptVerifier.UNVERIFIED);
+        assertEquals(1, unverified.size(), unverified.toString());
+        assertTrue(unverified.get(0).contains("lmCompoundAction") && unverified.get(0).contains("poolManagerPolicy")
+                && unverified.get(0).contains("loans.smart-tokens-spend-script-hash"), unverified.get(0));
+        assertEquals(raw, compound.getReferenceScripts(), "nothing is narrowed");
+        assertTrue(missing(logs).isEmpty(), missing(logs).toString());
+
+        Lookup asked = chain(honestCompound(eleven));
+        verifyCapturing(compoundVerifier(REGISTRY, compound(true, joined(eleven)), asked));
+        assertEquals(11, asked.asked.size(), "must still check the list against a registry that derives all eleven");
     }
 
     // ======================================================================================

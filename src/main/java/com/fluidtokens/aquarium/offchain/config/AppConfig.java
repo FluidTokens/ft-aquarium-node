@@ -1100,11 +1100,90 @@ public class AppConfig {
         @Value("${loans.compound.reference-scripts:}")
         private String referenceScripts;
 
+        /**
+         * The list in use once {@code LoansReferenceScriptVerifier} has dropped what it found unusable at
+         * boot (FAB-108); {@code null} until then. Same format as the configured value — comma-joined
+         * {@code txHash#index} — because {@code CompoundExecutor} and {@code StaticReferenceInputs} both
+         * split this string, and a reader that cannot parse an entry silently skips it (CCL trap 26a).
+         */
+        @Getter(lombok.AccessLevel.NONE)
+        private volatile String narrowedReferenceScripts;
+
         /** Test seam: {@code @Value} owns these in production. */
         public CompoundConfiguration(boolean enabled, long delaySeconds, BigInteger profitMarginLovelace) {
             this.enabled = enabled;
             this.delaySeconds = delaySeconds;
             this.profitMarginLovelace = profitMarginLovelace;
+        }
+
+        /**
+         * The coordinates every compound reader uses: the boot-narrowed list once the verifier has run,
+         * else exactly what the operator configured. Written out so Lombok does not generate it.
+         */
+        public String getReferenceScripts() {
+            String narrowed = narrowedReferenceScripts;
+            return narrowed != null ? narrowed : referenceScripts;
+        }
+
+        /** What the operator configured, untouched by any narrowing. Only the verifier reads this. */
+        public String getConfiguredReferenceScripts() {
+            return referenceScripts;
+        }
+
+        /**
+         * ⛔ <b>Replaces the list in use with {@code usable}, which may only DROP configured coordinates</b>
+         * — every element must be one of the well-formed coordinates the operator listed, or nothing
+         * changes and this throws. Called once, by {@code LoansReferenceScriptVerifier}, at boot (FAB-108).
+         * Stored comma-joined, in the CONFIGURED order, each coordinate once. Judged against the
+         * configured list, never the current one, so a repeated pass gives the same answer.
+         *
+         * <p>⚠ Deliberately not named {@code setReferenceScripts}: a bean-style setter for a real
+         * {@code application.yaml} key is what a binder would claim.
+         */
+        public void narrowReferenceScripts(List<TransactionInput> usable) {
+            if (usable == null) {
+                throw new IllegalArgumentException("narrowing may only drop a coordinate; it cannot remove "
+                        + "the reference-script list itself (pass an empty list to drop every coordinate)");
+            }
+            List<TransactionInput> configured = configuredCoordinates(referenceScripts);
+            for (TransactionInput coordinate : usable) {
+                if (!configured.contains(coordinate)) {
+                    throw new IllegalArgumentException(("narrowing may only drop a coordinate, never add or "
+                            + "change one: %s is not among the coordinates loans.compound.reference-scripts "
+                            + "lists").formatted(coordinate));
+                }
+            }
+            List<String> kept = new ArrayList<>();
+            for (TransactionInput coordinate : configured) {
+                String text = coordinate.getTransactionId() + "#" + coordinate.getIndex();
+                if (usable.contains(coordinate) && !kept.contains(text)) {
+                    kept.add(text);
+                }
+            }
+            narrowedReferenceScripts = String.join(",", kept);
+            log.info("INIT - compound reference scripts in use: {}", narrowedReferenceScripts);
+        }
+
+        /** The well-formed {@code txHash#index} entries of {@code raw}, in order; anything else is skipped. */
+        private static List<TransactionInput> configuredCoordinates(String raw) {
+            List<TransactionInput> coordinates = new ArrayList<>();
+            if (raw == null) {
+                return coordinates;
+            }
+            for (String entry : raw.split(",")) {
+                String[] parts = entry.trim().split("#", -1);
+                if (parts.length != 2 || parts[0].length() != 64 || !parts[0].chars().allMatch(AppConfig::isHexDigit)
+                        || parts[1].isEmpty() || !parts[1].chars().allMatch(c -> c >= '0' && c <= '9')) {
+                    continue;
+                }
+                try {
+                    coordinates.add(TransactionInput.builder().transactionId(parts[0])
+                            .index(Integer.parseInt(parts[1])).build());
+                } catch (NumberFormatException tooLarge) {
+                    // not an output index; skipped like any other malformed entry
+                }
+            }
+            return coordinates;
         }
     }
 

@@ -11,6 +11,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -51,6 +52,15 @@ import java.util.Set;
  * kept as UNVERIFIED is still not a funds risk: submission requires a passing evaluation inside
  * {@code build()}, which needs both the published hash and the bytes (CCL trap 13), so it is refused
  * before anything is sent.
+ *
+ * <h2>The compound list (FAB-108-2)</h2>
+ * When {@code loans.compound.enabled=true} (D4), each {@code loans.compound.reference-scripts} coordinate is
+ * checked too, through the SAME lookup, out-ref memo, circuit-breaker and answer classifier. The list names
+ * no validator per coordinate, so the rule is membership: a usable coordinate publishes one of the eleven
+ * {@link #compoundValidators} hashes, and the first coordinate to publish a hash supplies it. Malformed,
+ * repeated, absent, spent, script-less, foreign and second-supplier coordinates are DROPPED; each of the
+ * eleven that no usable coordinate supplies gets one {@value #MISSING} WARN and travels inline. The live
+ * list is narrowed in place, so {@code CompoundExecutor} never resolves a dropped coordinate.
  */
 @Service
 @Slf4j
@@ -61,6 +71,11 @@ public class LoansReferenceScriptVerifier {
 
     /** The prefix of the WARN for a coordinate this pass could not check, kept as configured. */
     public static final String UNVERIFIED = "REFERENCE_SCRIPT_UNVERIFIED";
+
+    /** The prefix of the WARN for a compound validator no usable coordinate supplies: it travels inline. */
+    public static final String MISSING = "REFERENCE_SCRIPT_MISSING";
+
+    private static final String COMPOUND_KEY = "loans.compound.reference-scripts";
 
     /** Whether the provider says the output is still unspent. */
     public enum Liveness {
@@ -93,6 +108,8 @@ public class LoansReferenceScriptVerifier {
 
     private final LoansContractRegistry registry;
     private final AppConfig.LiquidationConfiguration configuration;
+    /** {@code null} when the compound list is not this verifier's concern (the four-argument test seam). */
+    private final AppConfig.CompoundConfiguration compound;
     private final PublishedOutputLookup lookup;
     private final boolean failOnUnreachable;
 
@@ -102,23 +119,58 @@ public class LoansReferenceScriptVerifier {
     @Autowired
     public LoansReferenceScriptVerifier(LoansContractRegistry registry,
                                         AppConfig.LiquidationConfiguration configuration,
+                                        AppConfig.CompoundConfiguration compound,
                                         @Value("${blockfrost.url}") String blockfrostUrl,
                                         @Value("${blockfrost.key}") String blockfrostKey,
                                         @Value("${loans.verify-config.fail-on-unreachable:false}")
                                         boolean failOnUnreachable) {
-        this(registry, configuration, new BlockfrostPublishedOutputLookup(blockfrostUrl, blockfrostKey),
+        this(registry, configuration, compound, new BlockfrostPublishedOutputLookup(blockfrostUrl, blockfrostKey),
                 failOnUnreachable);
+    }
+
+    /** The named keys only, with the lookup stated — the compound list is not checked. */
+    public LoansReferenceScriptVerifier(LoansContractRegistry registry,
+                                        AppConfig.LiquidationConfiguration configuration,
+                                        PublishedOutputLookup lookup,
+                                        boolean failOnUnreachable) {
+        this(registry, configuration, null, lookup, failOnUnreachable);
     }
 
     /** The same verifier with the lookup stated, so its outcome taxonomy can be driven from a test. */
     public LoansReferenceScriptVerifier(LoansContractRegistry registry,
                                         AppConfig.LiquidationConfiguration configuration,
+                                        AppConfig.CompoundConfiguration compound,
                                         PublishedOutputLookup lookup,
                                         boolean failOnUnreachable) {
         this.registry = registry;
         this.configuration = configuration;
+        this.compound = compound;
         this.lookup = lookup;
         this.failOnUnreachable = failOnUnreachable;
+    }
+
+    /**
+     * The eleven validators a compound runs — four {@code general_spend} spends and seven withdraw-0
+     * invocations — label → the hash this node derives, in {@code CompoundTransactionBuilder}'s order. A
+     * value is {@code null} when the registry cannot derive it (no {@code loans.smart-tokens-spend-script-hash}).
+     * <p>
+     * ⚠ VH-90: this is the set the compound list is judged against, and it must be the set the builder
+     * attaches. {@code CompoundProductionWiringTest} pins it to the scripts an all-inline compound witnesses.
+     */
+    public static Map<String, String> compoundValidators(LoansContractRegistry registry) {
+        Map<String, String> validators = new LinkedHashMap<>();
+        validators.put("assetManagerSpend", registry.getAssetManagerSpendScriptHash());
+        validators.put("lenderManagerSpend", registry.getLenderManagerSpendScriptHash());
+        validators.put("poolSpend", registry.getPoolSpendScriptHash());
+        validators.put("poolManagerSpend", registry.getPoolManagerSpendScriptHash());
+        validators.put("assetManagerWithdraw", registry.getAssetManagerWithdrawScriptHash());
+        validators.put("lenderManagerWithdraw", registry.getLenderManagerWithdrawScriptHash());
+        validators.put("lmCompoundAction", registry.getLmCompoundActionScriptHash());
+        validators.put("poolPolicy", registry.getPoolPolicyId());
+        validators.put("poolCompoundAction", registry.getPoolCompoundActionScriptHash());
+        validators.put("poolManagerPolicy", registry.getPoolManagerPolicyId());
+        validators.put("pmCompoundLiquidity", registry.getPmCompoundLiquidityScriptHash());
+        return Collections.unmodifiableMap(validators);
     }
 
     /** The one throw left, opt-in: an operator who set fail-on-unreachable asked for it. */
@@ -164,116 +216,302 @@ public class LoansReferenceScriptVerifier {
                     + "chain (a blank deployment derives nothing to compare them with)");
             return;
         }
-        Map<String, Expectation> expected = expectations();
-        if (expected.isEmpty()) {
-            degradations = List.of();
-            log.info("No liquidation reference scripts configured; every validator will travel in "
-                    + "the witness set, which is over maxTxSize for a Liquidate transaction");
-            return;
-        }
-
-        // ⚠ Memoised per out-ref: two keys at one coordinate are one question to the provider, though
-        // each is judged against its OWN derived hash.
-        Map<String, Answer> asked = new HashMap<>();
-        // D6: the first lookup that THROWS stops this pass asking. An HTTP status never trips it.
-        String unreachable = null;
-        Exception firstFailure = null;
-        Map<String, Outcome> outcomes = new LinkedHashMap<>();
-        for (Map.Entry<String, Expectation> entry : expected.entrySet()) {
-            String key = entry.getKey();
-            Expectation expectation = entry.getValue();
-            if (expectation.derivedScriptHash() == null) {
-                outcomes.put(key, Outcome.dropped("this node derives no script hash for this key (for the "
-                        + "convert action, loans.minswap.* is not configured), so there is nothing to check it "
-                        + "against"));
-                continue;
-            }
-            String outRef = outRef(expectation.input());
-            Answer answer = asked.get(outRef);
-            if (answer == null) {
-                if (unreachable != null) {
-                    outcomes.put(key, Outcome.unverified(("not asked: the provider was unreachable earlier in "
-                            + "this pass (%s)").formatted(unreachable)));
-                    continue;
-                }
-                try {
-                    answer = new Answer(lookup.lookup(expectation.input().getTransactionId(),
-                            expectation.input().getIndex()), null);
-                } catch (Exception e) {
-                    answer = new Answer(null, e);
-                    unreachable = e.getClass().getSimpleName() + ": " + e.getMessage();
-                    firstFailure = e;
-                }
-                asked.put(outRef, answer);
-            }
-            outcomes.put(key, classify(expectation, answer));
-        }
-
+        // ⚠ One memo and one circuit-breaker for BOTH lists: a coordinate under a named key and in the
+        // compound list is one question to the provider, and a provider that is down is down for both.
+        Pass pass = new Pass();
         List<String> texts = new ArrayList<>();
+
+        Map<String, Expectation> expected = expectations();
+        LiquidateTransactionBuilder.ReferenceScripts liquidationUsable = null;
         Set<String> dropped = new HashSet<>();
         int unverified = 0;
         int verified = 0;
         int livenessUnknown = 0;
-        for (Map.Entry<String, Outcome> entry : outcomes.entrySet()) {
-            String key = entry.getKey();
-            Outcome outcome = entry.getValue();
-            String where = "%s (%s)".formatted(key, describe(expected.get(key).input()));
-            switch (outcome.kind()) {
-                case DROPPED -> {
-                    String text = ("%s %s: %s. The coordinate is NOT used: that validator travels inline in the "
-                            + "witness set (a larger transaction; one over maxTxSize is refused before "
-                            + "submission). Fix the coordinate and restart.")
-                            .formatted(DROPPED, where, outcome.reason());
-                    log.warn("{}", text);
-                    texts.add(text);
-                    dropped.add(key);
+        if (expected.isEmpty()) {
+            log.info("No liquidation reference scripts configured; every validator will travel in "
+                    + "the witness set, which is over maxTxSize for a Liquidate transaction");
+        } else {
+            Map<String, Outcome> outcomes = new LinkedHashMap<>();
+            for (Map.Entry<String, Expectation> entry : expected.entrySet()) {
+                String key = entry.getKey();
+                Expectation expectation = entry.getValue();
+                if (expectation.derivedScriptHash() == null) {
+                    outcomes.put(key, Outcome.dropped("this node derives no script hash for this key (for the "
+                            + "convert action, loans.minswap.* is not configured), so there is nothing to check it "
+                            + "against"));
+                    continue;
                 }
-                case UNVERIFIED -> {
-                    String text = ("%s %s: could not be checked: %s. Kept as configured; if it is wrong, "
-                            + "evaluation refuses the transaction before submission.")
-                            .formatted(UNVERIFIED, where, outcome.reason());
-                    log.warn("{}", text);
-                    texts.add(text);
-                    unverified++;
+                Answer answer = pass.ask(expectation.input());
+                outcomes.put(key, answer == null ? pass.notAsked() : classify(expectation, answer));
+            }
+
+            for (Map.Entry<String, Outcome> entry : outcomes.entrySet()) {
+                String key = entry.getKey();
+                Outcome outcome = entry.getValue();
+                String where = "%s (%s)".formatted(key, describe(expected.get(key).input()));
+                switch (outcome.kind()) {
+                    case DROPPED -> {
+                        String text = ("%s %s: %s. The coordinate is NOT used: that validator travels inline in the "
+                                + "witness set (a larger transaction; one over maxTxSize is refused before "
+                                + "submission). Fix the coordinate and restart.")
+                                .formatted(DROPPED, where, outcome.reason());
+                        log.warn("{}", text);
+                        texts.add(text);
+                        dropped.add(key);
+                    }
+                    case UNVERIFIED -> {
+                        String text = ("%s %s: could not be checked: %s. Kept as configured; if it is wrong, "
+                                + "evaluation refuses the transaction before submission.")
+                                .formatted(UNVERIFIED, where, outcome.reason());
+                        log.warn("{}", text);
+                        texts.add(text);
+                        unverified++;
+                    }
+                    case USABLE_LIVENESS_UNKNOWN -> {
+                        log.info("{} publishes the derived script hash; the provider did not say whether it is "
+                                + "still unspent", where);
+                        verified++;
+                        livenessUnknown++;
+                    }
+                    case USABLE -> verified++;
                 }
-                case USABLE_LIVENESS_UNKNOWN -> {
-                    log.info("{} publishes the derived script hash; the provider did not say whether it is "
-                            + "still unspent", where);
-                    verified++;
-                    livenessUnknown++;
+            }
+
+            if (unverified > 0 && failOnUnreachable) {
+                throw new OptInUnreachableFailure("Cannot verify liquidation reference scripts "
+                        + "(loans.verify-config.fail-on-unreachable is set): " + String.join("; ", texts),
+                        pass.firstFailure);
+            }
+
+            LiquidateTransactionBuilder.ReferenceScripts configured = configuration.getConfiguredReferenceScripts();
+            liquidationUsable = new LiquidateTransactionBuilder.ReferenceScripts(
+                    keep(dropped, LOAN, configured.loan()),
+                    keep(dropped, LOAN_SPEND, configured.loanSpend()),
+                    keep(dropped, LENDER_MANAGER, configured.lenderManager()),
+                    keep(dropped, LENDER_MANAGER_SPEND, configured.lenderManagerSpend()),
+                    keep(dropped, LOAN_CLAIM_ACTION, configured.loanClaimAction()),
+                    keep(dropped, LM_LIQUIDATE_ACTION, configured.lmLiquidateAction()),
+                    keep(dropped, ASSET_MANAGER, configured.assetManager()),
+                    keep(dropped, LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION, configured.lmLiquidateAndPayInAdvanceAction()),
+                    keep(dropped, LM_LIQUIDATE_AND_CONVERT_ACTION, configured.lmLiquidateAndConvertAction()));
+        }
+
+        CompoundPass compoundPass = checkCompound(pass, texts);
+
+        if (liquidationUsable != null) {
+            configuration.narrowReferenceScripts(liquidationUsable);
+        }
+        if (compoundPass != null && compoundPass.usable() != null) {
+            compound.narrowReferenceScripts(compoundPass.usable());
+        }
+        degradations = List.copyOf(texts);
+
+        boolean compoundChecked = compoundPass != null && compoundPass.usable() != null;
+        if (expected.isEmpty() && compoundPass == null) {
+            return;
+        }
+        int droppedCount = dropped.size() + (compoundChecked ? compoundPass.dropped() : 0);
+        int unverifiedCount = unverified + (compoundChecked ? compoundPass.unverified() : 0);
+        int verifiedCount = verified + (compoundChecked ? compoundPass.verified() : 0);
+        int livenessUnknownCount = livenessUnknown + (compoundChecked ? compoundPass.livenessUnknown() : 0);
+        int configuredCount = expected.size() + (compoundChecked ? compoundPass.configured() : 0);
+        String compoundClause = compoundChecked
+                ? "; %d of the eleven compound validators missing (they travel inline)".formatted(compoundPass.missing())
+                : "";
+        if (!texts.isEmpty()) {
+            log.warn("⚠ Lending v4 reference scripts: {} dropped, {} unverified, {} verified ({} with liveness "
+                            + "unknown) of {} configured{} — lending is NOT refused. A dropped validator travels "
+                            + "inline; see the per-coordinate lines above.",
+                    droppedCount, unverifiedCount, verifiedCount, livenessUnknownCount, configuredCount,
+                    compoundClause);
+        } else {
+            log.info("Lending v4 reference scripts verified against chain: {} verified ({} with liveness "
+                    + "unknown) — every configured coordinate publishes its derived script hash", verifiedCount,
+                    livenessUnknownCount);
+        }
+    }
+
+    /**
+     * The compound pass. {@code null} when it does not run (D4: compound disabled); a result whose
+     * {@code usable} is {@code null} when it ran but must not narrow (a required hash is not derived).
+     */
+    private CompoundPass checkCompound(Pass pass, List<String> texts) {
+        if (compound == null || !compound.isEnabled()) {
+            return null;
+        }
+        Map<String, String> required = compoundValidators(registry);
+        List<String> underived = required.entrySet().stream().filter(e -> e.getValue() == null)
+                .map(Map.Entry::getKey).toList();
+        if (!underived.isEmpty()) {
+            String text = ("%s %s: not checked: this node derives no script hash for %s "
+                    + "(loans.smart-tokens-spend-script-hash is not set), so there is nothing to compare the list "
+                    + "with. Every coordinate kept as configured.").formatted(UNVERIFIED, COMPOUND_KEY,
+                    String.join(", ", underived));
+            log.warn("{}", text);
+            texts.add(text);
+            return new CompoundPass(null, 0, 0, 0, 0, 0, 0);
+        }
+        Map<String, String> labelByHash = new HashMap<>();
+        required.forEach((label, hash) -> labelByHash.put(hash.toLowerCase(Locale.ROOT), label));
+
+        String raw = compound.getConfiguredReferenceScripts();
+        List<String> entries = new ArrayList<>();
+        if (raw != null) {
+            for (String part : raw.split(",")) {
+                if (!part.trim().isEmpty()) {
+                    entries.add(part.trim());
                 }
-                case USABLE -> verified++;
             }
         }
 
-        if (unverified > 0 && failOnUnreachable) {
-            throw new OptInUnreachableFailure("Cannot verify liquidation reference scripts "
-                    + "(loans.verify-config.fail-on-unreachable is set): " + String.join("; ", texts),
-                    firstFailure);
+        Set<String> listed = new HashSet<>();
+        // lower-cased published hash → the entry that supplies it; first usable coordinate wins.
+        Map<String, String> suppliedBy = new HashMap<>();
+        List<TransactionInput> usable = new ArrayList<>();
+        int dropped = 0;
+        int unverified = 0;
+        int verified = 0;
+        int livenessUnknown = 0;
+        for (int i = 0; i < entries.size(); i++) {
+            String entry = entries.get(i);
+            String where = "%s entry %d (%s)".formatted(COMPOUND_KEY, i + 1, entry);
+            TransactionInput input = compoundCoordinate(entry);
+            Outcome outcome;
+            if (input == null) {
+                outcome = Outcome.dropped(("'%s' is malformed: the expected form is txHash#index, a 64-character "
+                        + "hex transaction hash and a non-negative output index").formatted(entry));
+            } else if (!listed.add(entry)) {
+                outcome = Outcome.dropped("listed twice; only the first occurrence is used");
+            } else {
+                Answer answer = pass.ask(input);
+                if (answer == null) {
+                    outcome = pass.notAsked();
+                } else {
+                    outcome = answerVerdict(answer);
+                    if (outcome == null) {
+                        PublishedOutput output = answer.result().getValue();
+                        String published = output.referenceScriptHash();
+                        String hash = published.toLowerCase(Locale.ROOT);
+                        String label = labelByHash.get(hash);
+                        if (label == null) {
+                            outcome = Outcome.dropped(("the output publishes %s, which is none of the eleven "
+                                    + "compound validators this node derives").formatted(published));
+                        } else if (suppliedBy.containsKey(hash)) {
+                            outcome = Outcome.dropped("the output publishes %s (%s), which %s already supplies"
+                                    .formatted(published, label, suppliedBy.get(hash)));
+                        } else {
+                            suppliedBy.put(hash, entry);
+                            outcome = usable(output);
+                        }
+                    }
+                }
+            }
+            switch (outcome.kind()) {
+                case DROPPED -> {
+                    String text = ("%s %s: %s. The coordinate is NOT used: a compound validator no other "
+                            + "coordinate supplies travels inline in the witness set. Fix the coordinate and "
+                            + "restart.").formatted(DROPPED, where, outcome.reason());
+                    log.warn("{}", text);
+                    texts.add(text);
+                    dropped++;
+                }
+                case UNVERIFIED -> {
+                    String text = ("%s %s: could not be checked: %s. Kept as configured; it is referenced "
+                            + "whatever it publishes.").formatted(UNVERIFIED, where, outcome.reason());
+                    log.warn("{}", text);
+                    texts.add(text);
+                    usable.add(input);
+                    unverified++;
+                }
+                case USABLE_LIVENESS_UNKNOWN -> {
+                    log.info("{} publishes a compound validator; the provider did not say whether it is still "
+                            + "unspent", where);
+                    usable.add(input);
+                    verified++;
+                    livenessUnknown++;
+                }
+                case USABLE -> {
+                    usable.add(input);
+                    verified++;
+                }
+            }
         }
 
-        LiquidateTransactionBuilder.ReferenceScripts configured = configuration.getConfiguredReferenceScripts();
-        configuration.narrowReferenceScripts(new LiquidateTransactionBuilder.ReferenceScripts(
-                keep(dropped, LOAN, configured.loan()),
-                keep(dropped, LOAN_SPEND, configured.loanSpend()),
-                keep(dropped, LENDER_MANAGER, configured.lenderManager()),
-                keep(dropped, LENDER_MANAGER_SPEND, configured.lenderManagerSpend()),
-                keep(dropped, LOAN_CLAIM_ACTION, configured.loanClaimAction()),
-                keep(dropped, LM_LIQUIDATE_ACTION, configured.lmLiquidateAction()),
-                keep(dropped, ASSET_MANAGER, configured.assetManager()),
-                keep(dropped, LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION, configured.lmLiquidateAndPayInAdvanceAction()),
-                keep(dropped, LM_LIQUIDATE_AND_CONVERT_ACTION, configured.lmLiquidateAndConvertAction())));
-        degradations = List.copyOf(texts);
+        int missing = 0;
+        for (Map.Entry<String, String> validator : required.entrySet()) {
+            if (suppliedBy.containsKey(validator.getValue().toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            String text = ("%s %s: no usable coordinate publishes %s (%s); it travels INLINE in the witness set "
+                    + "(a larger transaction; one over maxTxSize is refused before submission).%s")
+                    .formatted(MISSING, COMPOUND_KEY, validator.getKey(), validator.getValue(),
+                            unverified > 0 ? " %d compound coordinate(s) could not be checked and may supply it."
+                                    .formatted(unverified) : "");
+            log.warn("{}", text);
+            texts.add(text);
+            missing++;
+        }
+        return new CompoundPass(usable, dropped, unverified, verified, livenessUnknown, entries.size(), missing);
+    }
 
-        if (!texts.isEmpty()) {
-            log.warn("⚠ Lending v4 reference scripts: {} dropped, {} unverified, {} verified ({} with liveness "
-                            + "unknown) of {} configured — lending is NOT refused. A dropped validator travels "
-                            + "inline; see the per-coordinate lines above.",
-                    dropped.size(), unverified, verified, livenessUnknown, expected.size());
-        } else {
-            log.info("Lending v4 reference scripts verified against chain: {} verified ({} with liveness "
-                    + "unknown) — every configured coordinate publishes its derived script hash", verified,
-                    livenessUnknown);
+    /**
+     * {@code txHash#index} with a 64-hex hash and a non-negative decimal index, or {@code null} — the
+     * same well-formedness {@code CompoundConfiguration.narrowReferenceScripts} accepts.
+     */
+    private static TransactionInput compoundCoordinate(String entry) {
+        String[] parts = entry.split("#", -1);
+        if (parts.length != 2 || parts[0].length() != 64
+                || !parts[0].chars().allMatch(c -> Character.digit(c, 16) >= 0 && c < 128)
+                || parts[1].isEmpty() || !parts[1].chars().allMatch(c -> c >= '0' && c <= '9')) {
+            return null;
+        }
+        try {
+            return new TransactionInput(parts[0], Integer.parseInt(parts[1]));
+        } catch (NumberFormatException tooLarge) {
+            return null;
+        }
+    }
+
+    /** What the compound pass found, for the narrowing and the summary. */
+    private record CompoundPass(List<TransactionInput> usable, int dropped, int unverified, int verified,
+                                int livenessUnknown, int configured, int missing) {
+    }
+
+    /**
+     * The out-ref memo and the D6 circuit-breaker, shared by the named keys and the compound list for one
+     * pass. ⚠ Memoised per out-ref: two coordinates at one out-ref are one question to the provider, though
+     * each is judged by its own rule.
+     */
+    private final class Pass {
+        private final Map<String, Answer> asked = new HashMap<>();
+        /** D6: the first lookup that THROWS stops this pass asking. An HTTP status never trips it. */
+        private String unreachable;
+        private Exception firstFailure;
+
+        /** The provider's answer for {@code input}, or {@code null} when the breaker stopped this pass asking. */
+        Answer ask(TransactionInput input) {
+            String outRef = outRef(input);
+            Answer answer = asked.get(outRef);
+            if (answer != null) {
+                return answer;
+            }
+            if (unreachable != null) {
+                return null;
+            }
+            try {
+                answer = new Answer(lookup.lookup(input.getTransactionId(), input.getIndex()), null);
+            } catch (Exception e) {
+                answer = new Answer(null, e);
+                unreachable = e.getClass().getSimpleName() + ": " + e.getMessage();
+                firstFailure = e;
+            }
+            asked.put(outRef, answer);
+            return answer;
+        }
+
+        Outcome notAsked() {
+            return Outcome.unverified(("not asked: the provider was unreachable earlier in this pass (%s)")
+                    .formatted(unreachable));
         }
     }
 
@@ -282,10 +520,30 @@ public class LoansReferenceScriptVerifier {
     }
 
     /**
-     * One coordinate's verdict, from the provider's answer. ⚠ Only 400 and 404 are ANSWERS (D2): every
-     * other status, a missing Result and a throw mean "could not be asked", which keeps the slot.
+     * One named coordinate's verdict, from the provider's answer: the shared {@link #answerVerdict}, then
+     * the published hash against the hash this node derives for THAT key.
      */
     private static Outcome classify(Expectation expectation, Answer answer) {
+        Outcome verdict = answerVerdict(answer);
+        if (verdict != null) {
+            return verdict;
+        }
+        PublishedOutput output = answer.result().getValue();
+        String published = output.referenceScriptHash();
+        if (!expectation.derivedScriptHash().equalsIgnoreCase(published)) {
+            return Outcome.dropped("the output publishes %s, but this node derives %s for this key"
+                    .formatted(published, expectation.derivedScriptHash()));
+        }
+        return usable(output);
+    }
+
+    /**
+     * The verdict the ANSWER alone settles, shared by the named keys and the compound list — or
+     * {@code null} when the output exists, is not spent and publishes a script, whose hash the caller then
+     * judges. ⚠ Only 400 and 404 are ANSWERS (D2): every other status, a missing Result and a throw mean
+     * "could not be asked", which keeps the coordinate.
+     */
+    private static Outcome answerVerdict(Answer answer) {
         if (answer.thrown() != null) {
             return Outcome.unverified(answer.thrown().getClass().getSimpleName() + ": "
                     + answer.thrown().getMessage());
@@ -321,10 +579,10 @@ public class LoansReferenceScriptVerifier {
             return Outcome.dropped("the output was spent by %s (it published %s)"
                     .formatted(output.consumedBy(), published));
         }
-        if (!expectation.derivedScriptHash().equalsIgnoreCase(published)) {
-            return Outcome.dropped("the output publishes %s, but this node derives %s for this key"
-                    .formatted(published, expectation.derivedScriptHash()));
-        }
+        return null;
+    }
+
+    private static Outcome usable(PublishedOutput output) {
         return output.liveness() == Liveness.UNKNOWN ? Outcome.usableLivenessUnknown() : Outcome.usable();
     }
 
