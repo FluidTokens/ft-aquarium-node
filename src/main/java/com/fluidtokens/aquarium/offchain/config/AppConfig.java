@@ -1,9 +1,14 @@
 package com.fluidtokens.aquarium.offchain.config;
 
+import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.model.Result;
+import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShapeTransactions;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -295,9 +300,10 @@ public class AppConfig {
         /**
          * ⛔ <b>THIS CLASS IS NOT {@code @ConfigurationProperties}, AND MUST NOT BECOME ONE AGAIN.</b>
          *
-         * <p>It carries a dozen {@code @Value} fields and three <b>computed</b> ones — {@link #mode},
-         * {@link #referenceScripts} — that are written by {@link #init()} and by test constructors, and
-         * by nothing else. Lombok's {@code @Getter} gives every one of them a {@code getX()}, and
+         * <p>It carries a dozen {@code @Value} fields and <b>computed</b> ones — {@link #mode},
+         * {@link #referenceScripts}, {@link #configuredReferenceScripts} — that are written by
+         * {@link #init()} and by test constructors, and by nothing else except
+         * {@link #narrowReferenceScripts}, which may only drop a coordinate (FAB-108). Lombok's {@code @Getter} gives every one of them a {@code getX()}, and
          * <b>Spring's JavaBean binder treats a getter under the bound prefix as a bindable property and
          * demands a setter for it.</b>
          *
@@ -325,7 +331,9 @@ public class AppConfig {
          * node-level dial.</b>
          * <ul>
          *   <li>{@code DISABLED} — the loop returns before it scans anything.</li>
-         *   <li>{@code SHADOW} — scan, build, price and record; never sign, never submit.</li>
+         *   <li>{@code SHADOW} — scan, build, price and record; never signs or submits a LIQUIDATION.
+         *       Wallet rebalances ({@code WalletRebalancer}) ARE signed and submitted in shadow too: they
+         *       are wallet housekeeping, not liquidations.</li>
          *   <li>{@code LIVE} — sign and submit, subject to the market's own mode and the profit floors.</li>
          * </ul>
          *
@@ -703,10 +711,24 @@ public class AppConfig {
         private String referenceScriptLmLiquidateAndConvertAction;
 
         /**
-         * The parsed form of the nine keys above, as {@link LiquidateTransactionBuilder} wants
-         * them: a {@code null} field per validator that is not published.
+         * The reference scripts every liquidation route builds from, as {@link LiquidateTransactionBuilder}
+         * wants them: a {@code null} field per validator that travels inline.
+         *
+         * <p>⛔ <b>Since FAB-108 this is the CONFIGURED set minus whatever the boot-time
+         * {@code LoansReferenceScriptVerifier} dropped</b> — a coordinate that is absent, spent, carries
+         * no reference script, or publishes a hash other than the one this node derives for its key.
+         * A dropped validator travels inline from the vendored blueprint. Volatile because the verifier
+         * narrows it once, after the parse, from its own {@code @PostConstruct}.
          */
-        private LiquidateTransactionBuilder.ReferenceScripts referenceScripts =
+        private volatile LiquidateTransactionBuilder.ReferenceScripts referenceScripts =
+                LiquidateTransactionBuilder.ReferenceScripts.none();
+
+        /**
+         * The parsed form of the nine keys above, exactly as configured, never narrowed. Only the
+         * verifier reads it — it is what the chain is checked against — and it is what
+         * {@link #narrowReferenceScripts} judges a narrowing by.
+         */
+        private LiquidateTransactionBuilder.ReferenceScripts configuredReferenceScripts =
                 LiquidateTransactionBuilder.ReferenceScripts.none();
 
         /**
@@ -769,6 +791,7 @@ public class AppConfig {
             this.checkProfitability = checkProfitability;
             this.minProfitAbsoluteLovelace = minProfitAbsoluteLovelace;
             this.referenceScripts = referenceScripts;
+            this.configuredReferenceScripts = referenceScripts;
         }
 
         /**
@@ -876,7 +899,48 @@ public class AppConfig {
                             referenceScriptLmLiquidateAndPayInAdvanceAction),
                     referenceInput("loans.liquidation.reference-scripts.lm-liquidate-and-convert-action",
                             referenceScriptLmLiquidateAndConvertAction));
+            configuredReferenceScripts = referenceScripts;
             log.info("INIT - liquidation reference scripts: {}", referenceScripts);
+        }
+
+        /**
+         * ⛔ <b>Replaces the live reference scripts with {@code usable}, which may only DROP a configured
+         * coordinate</b> — every slot of {@code usable} must be {@code null} or equal to the configured
+         * slot, or nothing changes and this throws. Called once, by {@code LoansReferenceScriptVerifier},
+         * to null the coordinates it found unusable at boot (FAB-108); a dropped validator then travels
+         * inline. Judged against the CONFIGURED set, never the current one, so a repeated pass gives the
+         * same answer.
+         *
+         * <p>⚠ Deliberately not named {@code setReferenceScripts}: a bean-style setter for a real
+         * {@code application.yaml} key is exactly what a binder would claim (see the class note above).
+         */
+        public void narrowReferenceScripts(LiquidateTransactionBuilder.ReferenceScripts usable) {
+            if (usable == null) {
+                throw new IllegalArgumentException("narrowing may only drop a coordinate; it cannot remove "
+                        + "the reference scripts themselves (pass ReferenceScripts.none() to drop every slot)");
+            }
+            LiquidateTransactionBuilder.ReferenceScripts configured = configuredReferenceScripts;
+            requireDropOnly("loan", configured.loan(), usable.loan());
+            requireDropOnly("loan-spend", configured.loanSpend(), usable.loanSpend());
+            requireDropOnly("lender-manager", configured.lenderManager(), usable.lenderManager());
+            requireDropOnly("lender-manager-spend", configured.lenderManagerSpend(), usable.lenderManagerSpend());
+            requireDropOnly("loan-claim-action", configured.loanClaimAction(), usable.loanClaimAction());
+            requireDropOnly("lm-liquidate-action", configured.lmLiquidateAction(), usable.lmLiquidateAction());
+            requireDropOnly("asset-manager", configured.assetManager(), usable.assetManager());
+            requireDropOnly("lm-liquidate-and-pay-in-advance-action",
+                    configured.lmLiquidateAndPayInAdvanceAction(), usable.lmLiquidateAndPayInAdvanceAction());
+            requireDropOnly("lm-liquidate-and-convert-action",
+                    configured.lmLiquidateAndConvertAction(), usable.lmLiquidateAndConvertAction());
+            referenceScripts = usable;
+            log.info("INIT - liquidation reference scripts in use: {}", usable);
+        }
+
+        private static void requireDropOnly(String slot, TransactionInput configured, TransactionInput usable) {
+            if (usable != null && !usable.equals(configured)) {
+                throw new IllegalArgumentException(("narrowing may only drop a coordinate, never add or "
+                        + "change one: loans.liquidation.reference-scripts.%s is configured as %s and was "
+                        + "narrowed to %s").formatted(slot, configured, usable));
+            }
         }
 
         /**
@@ -928,6 +992,35 @@ public class AppConfig {
         };
         log.info("INIT Converters network: {}, network type: {}", network, networkType);
         return ClasspathConversionsFactory.createConverters(networkType);
+    }
+
+    /**
+     * The wallet-shape engine (FAB-130), wired for its first production caller, {@code WalletRebalancer}
+     * (FAB-131): the bot {@link Account}, the per-epoch {@link ProtocolParamsSupplier} bean and a Blockfrost
+     * submitter.
+     * <ul>
+     *   <li>The submitter is the narrowing {@code LiquidationExecutor} and {@code CompoundExecutor} use — bytes
+     *       in, verdict out, through {@code submitTransaction}, with the same FAB-134 B5a refresh of the
+     *       parameters on a rejection naming them. The engine is handed no {@code BFBackendService}.</li>
+     *   <li>No transaction evaluator: the engine builds a plain {@code Tx} with no script and refuses any built
+     *       body carrying one (see its javadoc), and its {@code QuickTxBuilder} reads only an in-memory supplier
+     *       over the inputs it is given.</li>
+     * </ul>
+     * <p>
+     * ⚠ Declared here rather than beside its siblings in {@code YaciConfig}: {@code ContainerWiringTest} pins
+     * {@code YaciConfig}'s exact bean set and builds it with no {@link Account} bean.
+     */
+    @Bean
+    public WalletShapeTransactions walletShapeTransactions(Account account,
+                                                           ProtocolParamsSupplier protocolParamsSupplier,
+                                                           BFBackendService bfBackendService) {
+        return new WalletShapeTransactions(account, protocolParamsSupplier, bytes -> {
+            // FAB-134 B5a: a rejection naming the parameters refreshes them; the result itself is returned
+            // untouched (nothing retried, no outcome changed).
+            Result<String> result = bfBackendService.getTransactionService().submitTransaction(bytes);
+            ProtocolParamsRejections.refreshIfParamsRejected(protocolParamsSupplier, result);
+            return result;
+        });
     }
 
     /**
@@ -1007,11 +1100,90 @@ public class AppConfig {
         @Value("${loans.compound.reference-scripts:}")
         private String referenceScripts;
 
+        /**
+         * The list in use once {@code LoansReferenceScriptVerifier} has dropped what it found unusable at
+         * boot (FAB-108); {@code null} until then. Same format as the configured value — comma-joined
+         * {@code txHash#index} — because {@code CompoundExecutor} and {@code StaticReferenceInputs} both
+         * split this string, and a reader that cannot parse an entry silently skips it (CCL trap 26a).
+         */
+        @Getter(lombok.AccessLevel.NONE)
+        private volatile String narrowedReferenceScripts;
+
         /** Test seam: {@code @Value} owns these in production. */
         public CompoundConfiguration(boolean enabled, long delaySeconds, BigInteger profitMarginLovelace) {
             this.enabled = enabled;
             this.delaySeconds = delaySeconds;
             this.profitMarginLovelace = profitMarginLovelace;
+        }
+
+        /**
+         * The coordinates every compound reader uses: the boot-narrowed list once the verifier has run,
+         * else exactly what the operator configured. Written out so Lombok does not generate it.
+         */
+        public String getReferenceScripts() {
+            String narrowed = narrowedReferenceScripts;
+            return narrowed != null ? narrowed : referenceScripts;
+        }
+
+        /** What the operator configured, untouched by any narrowing. Only the verifier reads this. */
+        public String getConfiguredReferenceScripts() {
+            return referenceScripts;
+        }
+
+        /**
+         * ⛔ <b>Replaces the list in use with {@code usable}, which may only DROP configured coordinates</b>
+         * — every element must be one of the well-formed coordinates the operator listed, or nothing
+         * changes and this throws. Called once, by {@code LoansReferenceScriptVerifier}, at boot (FAB-108).
+         * Stored comma-joined, in the CONFIGURED order, each coordinate once. Judged against the
+         * configured list, never the current one, so a repeated pass gives the same answer.
+         *
+         * <p>⚠ Deliberately not named {@code setReferenceScripts}: a bean-style setter for a real
+         * {@code application.yaml} key is what a binder would claim.
+         */
+        public void narrowReferenceScripts(List<TransactionInput> usable) {
+            if (usable == null) {
+                throw new IllegalArgumentException("narrowing may only drop a coordinate; it cannot remove "
+                        + "the reference-script list itself (pass an empty list to drop every coordinate)");
+            }
+            List<TransactionInput> configured = configuredCoordinates(referenceScripts);
+            for (TransactionInput coordinate : usable) {
+                if (!configured.contains(coordinate)) {
+                    throw new IllegalArgumentException(("narrowing may only drop a coordinate, never add or "
+                            + "change one: %s is not among the coordinates loans.compound.reference-scripts "
+                            + "lists").formatted(coordinate));
+                }
+            }
+            List<String> kept = new ArrayList<>();
+            for (TransactionInput coordinate : configured) {
+                String text = coordinate.getTransactionId() + "#" + coordinate.getIndex();
+                if (usable.contains(coordinate) && !kept.contains(text)) {
+                    kept.add(text);
+                }
+            }
+            narrowedReferenceScripts = String.join(",", kept);
+            log.info("INIT - compound reference scripts in use: {}", narrowedReferenceScripts);
+        }
+
+        /** The well-formed {@code txHash#index} entries of {@code raw}, in order; anything else is skipped. */
+        private static List<TransactionInput> configuredCoordinates(String raw) {
+            List<TransactionInput> coordinates = new ArrayList<>();
+            if (raw == null) {
+                return coordinates;
+            }
+            for (String entry : raw.split(",")) {
+                String[] parts = entry.trim().split("#", -1);
+                if (parts.length != 2 || parts[0].length() != 64 || !parts[0].chars().allMatch(AppConfig::isHexDigit)
+                        || parts[1].isEmpty() || !parts[1].chars().allMatch(c -> c >= '0' && c <= '9')) {
+                    continue;
+                }
+                try {
+                    coordinates.add(TransactionInput.builder().transactionId(parts[0])
+                            .index(Integer.parseInt(parts[1])).build());
+                } catch (NumberFormatException tooLarge) {
+                    // not an output index; skipped like any other malformed entry
+                }
+            }
+            return coordinates;
         }
     }
 

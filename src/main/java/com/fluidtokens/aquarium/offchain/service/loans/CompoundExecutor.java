@@ -346,11 +346,19 @@ public class CompoundExecutor {
     }
 
     /**
-     * Resolve the configured coordinates into scriptHash → UTxO, <b>reading the hash off the chain</b>
-     * rather than trusting the operator's ordering. A coordinate that publishes no reference script,
-     * or that cannot be resolved, is logged and skipped: the validator then travels inline, which is
-     * correct but larger — never silently referenced-but-absent, which is
-     * {@code RequiredRedeemersMismatch} (CCL trap 13).
+     * Resolve the <b>boot-narrowed</b> coordinates into scriptHash → UTxO, <b>reading the hash off the
+     * chain</b> rather than trusting the operator's ordering. {@code getReferenceScripts()} is the list
+     * {@code LoansReferenceScriptVerifier} left at boot (FAB-108): a malformed, repeated, absent, spent,
+     * script-less or foreign coordinate, or a second one publishing an already-supplied validator, was
+     * dropped there, and each compound validator no usable coordinate supplies travels inline. A
+     * coordinate that publishes no reference script, or that cannot be resolved, is still logged and
+     * skipped here: the validator then travels inline, which is correct but larger — never silently
+     * referenced-but-absent, which is {@code RequiredRedeemersMismatch} (CCL trap 13).
+     *
+     * <p>⚠ Residue: a coordinate the verifier could not check (UNVERIFIED — the provider could not be
+     * asked at boot) is kept, resolved on each call and referenced <b>whatever it publishes</b>. If that
+     * is a script no redeemer needs, it costs fee only and the ledger accepts it; an offline Aiken rig
+     * would reject it.
      */
     Map<String, TransactionInput> referenceScripts() {
         String configured = configuration.getReferenceScripts();

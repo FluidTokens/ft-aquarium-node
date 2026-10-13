@@ -257,6 +257,19 @@ public class LiquidationReadinessController {
      */
     private com.fluidtokens.aquarium.offchain.service.BlockEventListener blockEventListener;
 
+    /**
+     * FAB-108: what the boot-time reference-script check DROPPED, left UNVERIFIED or found MISSING, for the
+     * page's banner. None of it refuses lending, so it is a banner and never a row override. Setter-injected
+     * and REQUIRED in the container; null only in a direct test construction, where it reads as nothing.
+     */
+    private com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier loansReferenceScriptVerifier;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setLoansReferenceScriptVerifier(
+            com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier loansReferenceScriptVerifier) {
+        this.loansReferenceScriptVerifier = loansReferenceScriptVerifier;
+    }
+
     @org.springframework.beans.factory.annotation.Autowired(required = true)
     public void setBlockEventListener(com.fluidtokens.aquarium.offchain.service.BlockEventListener blockEventListener) {
         this.blockEventListener = blockEventListener;
@@ -282,6 +295,10 @@ public class LiquidationReadinessController {
         // refuse every one of them.
         model.addAttribute("lendingConfigBlocked", lendingConfigGate == null ? null
                 : lendingConfigGate.blockedReason().orElse(null));
+        // ⚠ Beside the gate's banner and for the same reason, but it says the opposite: a dropped or
+        // unverified reference script costs size, not lending, so the rows keep their own verdicts.
+        model.addAttribute("referenceScriptDegradations", loansReferenceScriptVerifier == null ? List.of()
+                : loansReferenceScriptVerifier.degradations());
         model.addAttribute("status", OperationalStatus.of(liquidationConfiguration,
                 convertEnabled, compoundEnabled, processorEnabled));
         model.addAttribute("sort", sort == null ? "health" : sort);

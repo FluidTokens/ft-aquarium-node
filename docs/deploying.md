@@ -467,8 +467,10 @@ mode has cost real debugging time.
 not as a quiet market — see [upgrading.md](upgrading.md).
 
 **Armed but never acts.** The three silent-idle causes in §8. The liquidations endpoint names the
-veto for every candidate. And check the **lending gate**: a contract-coordinate mismatch no longer
-stops the node, it refuses every Lending v4 transaction — see the next entry.
+veto for every candidate. And check the **lending gate**: a config-datum mismatch (`LoansConfigVerifier`)
+no longer stops the node, it refuses every Lending v4 transaction — see the next entry. A reference-script
+coordinate mismatch does **not** close the gate (FAB-108): it is a `REFERENCE_SCRIPT_DROPPED` WARN and that
+validator travels inline, so the symptom to look for is a `TX_TOO_LARGE` veto, not a refusal.
 
 **A setting seems to do nothing.** Confirm it actually reached the process:
 
@@ -478,14 +480,21 @@ docker compose exec aquarium-node env | grep AQUARIUM_
 
 **Lending refused, everything else running (`LENDING_CONFIG_MISMATCH`).** Startup verification is
 strict on purpose: it will not build against contract coordinates that do not match what it derives.
-Since FAB-115 a mismatch (config policy ids, `smart-tokens-spend-script-hash`, or
-`loans.liquidation.reference-scripts.*`) no longer stops the node — scheduled payments keep running —
-but every Lending v4 transaction (liquidation in every mode, convert, compound) is refused for the
-life of the process. A clean `/healthcheck` does not rule it out; check the log:
+Since FAB-115 a config-datum mismatch (config policy ids or `smart-tokens-spend-script-hash`) no longer
+stops the node — scheduled payments keep running — but every Lending v4 transaction (liquidation in every
+mode, convert, compound) is refused for the life of the process. A clean `/healthcheck` does not rule it
+out; check the log:
 
 ```bash
-docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified"
+docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified|REFERENCE_SCRIPT_(DROPPED|UNVERIFIED|MISSING)"
 ```
 
 The line names each field at fault (derived vs chain). Fix the coordinates and restart; see
-[upgrading.md §4.7](upgrading.md).
+[upgrading.md §4.7](upgrading.md). `loans.liquidation.reference-scripts.*` and
+`loans.compound.reference-scripts` are checked at boot too, but never close the gate (FAB-108): a bad one is
+`REFERENCE_SCRIPT_DROPPED` (not used; its validator travels inline), one the provider could not be asked
+about is `REFERENCE_SCRIPT_UNVERIFIED` (used as configured), and a compound validator nothing supplies is
+`REFERENCE_SCRIPT_MISSING` (inline; the compound list is checked only with `loans.compound.enabled=true`).
+The readiness page shows them in a **REFERENCE SCRIPTS** banner. Only
+`loans.verify-config.fail-on-unreachable=true` stops the boot, and only over an UNVERIFIED named
+`loans.liquidation.reference-scripts.*` key; an UNVERIFIED compound-list entry never does.

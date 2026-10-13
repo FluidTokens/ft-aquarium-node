@@ -18,12 +18,15 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.HashCheckedScriptSupplier;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.io.InputStream;
 import java.math.BigDecimal;
@@ -295,6 +298,124 @@ class CompoundProductionWiringTest {
                 + " (CCL trap 9: a declared list prices only what it declares)");
         assertTrue(slack.compareTo(foreignShare) < 0, "the slack " + slack + " would hide the stale script's "
                 + "share " + foreignShare);
+    }
+
+    /**
+     * ⛔ FAB-108-2, VH-90: the verifier's eleven are pinned to what the BUILDER attaches, not to a third
+     * hand-typed list. An all-inline compound (no reference map) built through the production constructor
+     * and Aiken witnesses exactly the scripts the builder needs — and that set is the verifier's.
+     */
+    @Test
+    void theVerifiersElevenAreTheValidatorsAnAllInlineCompoundAttaches() throws Exception {
+        Fixture f = fixture(wallet(60_000_000L), null);
+        var request = request(Map.of(), f.request().walletUtxo());
+        Recording evaluator = new Recording(aiken(f.universe()));
+        Transaction reread = Transaction.deserialize(production(f.universe(),
+                new HashCheckedScriptSupplier(rigScripts()), evaluator).build(request).serialize());
+
+        assertEquals(1, evaluator.calls.get(), "the all-inline build was evaluated");
+        for (Redeemer redeemer : reread.getWitnessSet().getRedeemers()) {
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    redeemer.getTag() + "#" + redeemer.getIndex() + " carries the placeholder mem");
+        }
+        assertTrue(referencedScriptHashes(reread, f.universe()).isEmpty(), "nothing travels by reference");
+
+        Map<String, String> verifiers = LoansReferenceScriptVerifier.compoundValidators(REGISTRY);
+        assertEquals(11, verifiers.size(), verifiers.toString());
+        Set<String> witnessed = witnessedScriptHashes(reread.getWitnessSet());
+        assertEquals(witnessed, Set.copyOf(verifiers.values()),
+                "the verifier's eleven must be exactly the scripts an all-inline compound attaches");
+        assertEquals(compoundHashes(), Set.copyOf(verifiers.values()));
+    }
+
+    /**
+     * ⛔ FAB-108-2 end to end: a compound coordinate that publishes a FOREIGN validator is dropped at boot
+     * by the verifier, so {@code CompoundExecutor.referenceScripts()} never sees it, and lmCompoundAction
+     * — whose coordinate it took the place of — travels inline. The narrowed build passes Aiken; the
+     * un-narrowed one does not (the "must not": Aiken rejects a reference script no redeemer needs).
+     */
+    @Test
+    void aForeignCompoundCoordinateIsDroppedAtBootAndItsValidatorTravelsInline() throws Exception {
+        PlutusScript foreign = REGISTRY.getLoanScript();
+        String foreignHash = hashOf(foreign);
+        String lmCompoundHash = hashOf(REGISTRY.getLmCompoundActionScript());
+        assertFalse(compoundHashes().contains(foreignHash), "the foreign script must not be a compound one");
+        Utxo wallet = wallet(60_000_000L);
+        Fixture eleven = fixture(wallet, null);
+        List<Utxo> universe = new ArrayList<>(eleven.universe());
+        TransactionInput foreignAt = new TransactionInput("f0".repeat(32), 0);
+        universe.add(Utxo.builder().txHash(foreignAt.getTransactionId()).outputIndex(0)
+                .address(LoanFixtures.entAddress(foreignHash))
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                .referenceScriptHash(foreignHash).build());
+
+        // The fixture's eleven coordinates, in builder order, with lmCompoundAction's replaced by the foreign one.
+        List<String> coordinates = new ArrayList<>();
+        for (PlutusScript script : COMPOUND_SCRIPTS) {
+            TransactionInput at = eleven.request().referenceScripts().get(hashOf(script));
+            coordinates.add(hashOf(script).equals(lmCompoundHash)
+                    ? foreignAt.getTransactionId() + "#0" : at.getTransactionId() + "#" + at.getIndex());
+        }
+        String raw = String.join(",", coordinates);
+
+        AppConfig.CompoundConfiguration narrowed = compoundConfiguration(raw);
+        LoansReferenceScriptVerifier.PublishedOutputLookup chain = (tx, ix) -> universe.stream()
+                .filter(u -> u.getTxHash().equals(tx) && u.getOutputIndex() == ix).findFirst()
+                .map(u -> Result.<LoansReferenceScriptVerifier.PublishedOutput>success("ok")
+                        .withValue(new LoansReferenceScriptVerifier.PublishedOutput(u.getReferenceScriptHash(),
+                                LoansReferenceScriptVerifier.Liveness.UNSPENT, null)).code(200))
+                .orElseGet(() -> Result.<LoansReferenceScriptVerifier.PublishedOutput>error("HTTP 404").code(404));
+        var verifier = new LoansReferenceScriptVerifier(REGISTRY, new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.valueOf(1_500_000), 200,
+                LiquidateTransactionBuilder.ReferenceScripts.none()), narrowed, chain, false);
+        verifier.verify();
+        assertTrue(verifier.degradations().stream().anyMatch(d -> d.startsWith(LoansReferenceScriptVerifier.DROPPED)
+                && d.contains(foreignAt.getTransactionId() + "#0")), verifier.degradations().toString());
+
+        Map<String, TransactionInput> refs = executor(narrowed, universe).referenceScripts();
+        Set<String> ten = new HashSet<>(compoundHashes());
+        ten.remove(lmCompoundHash);
+        assertEquals(ten, refs.keySet(), "the ten others by reference; neither lmCompoundAction nor the foreign hash");
+
+        Recording evaluator = new Recording(aiken(universe));
+        Transaction reread = Transaction.deserialize(production(universe, new HashCheckedScriptSupplier(rigScripts()),
+                evaluator).build(request(refs, wallet)).serialize());
+        for (Redeemer redeemer : reread.getWitnessSet().getRedeemers()) {
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    redeemer.getTag() + "#" + redeemer.getIndex() + " carries the placeholder mem");
+        }
+        Set<String> witnessed = witnessedScriptHashes(reread.getWitnessSet());
+        assertTrue(witnessed.contains(lmCompoundHash), "lmCompoundAction travels inline: " + witnessed);
+        assertFalse(reread.getBody().getReferenceInputs().contains(foreignAt), "the foreign coordinate is not referenced");
+        Set<String> referenced = referencedScriptHashes(reread, universe);
+        Set<String> both = new HashSet<>(witnessed);
+        both.retainAll(referenced);
+        assertTrue(both.isEmpty(), "scripts both witnessed and referenced (ExtraneousScriptWitnessesUTXOW): " + both);
+
+        // must not: the same list, NOT narrowed, references the foreign script, and Aiken refuses the build.
+        Map<String, TransactionInput> unnarrowed = executor(compoundConfiguration(raw), universe).referenceScripts();
+        assertTrue(unnarrowed.containsKey(foreignHash), "un-narrowed, the foreign coordinate is referenced: " + unnarrowed);
+        Exception refused = assertThrows(Exception.class, () -> production(universe,
+                new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(universe)))
+                .build(request(unnarrowed, wallet)));
+        String why = Stream.iterate((Throwable) refused, t -> t != null, Throwable::getCause)
+                .map(String::valueOf).collect(Collectors.joining(" <- "));
+        log.info("FAB-108-2 un-narrowed compound build refused: {}", why);
+        assertTrue(why.contains("RequiredRedeemersMismatch") && why.contains(foreignHash),
+                "refused for another reason than the foreign reference script: " + why);
+    }
+
+    /** An enabled compound configuration whose raw {@code @Value} list is {@code raw}. */
+    private static AppConfig.CompoundConfiguration compoundConfiguration(String raw) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.ZERO);
+        ReflectionTestUtils.setField(configuration, "referenceScripts", raw);
+        return configuration;
+    }
+
+    /** Only the configuration and the UTxO supplier: {@code referenceScripts()} reads nothing else. */
+    private static CompoundExecutor executor(AppConfig.CompoundConfiguration configuration, List<Utxo> universe) {
+        return new CompoundExecutor(configuration, null, null, null, null, null, null, null, null,
+                LoanFixtures.utxoSupplier(universe), null, null);
     }
 
     /** A failed evaluation on the production path refuses the build, never placeholder ex-units. */

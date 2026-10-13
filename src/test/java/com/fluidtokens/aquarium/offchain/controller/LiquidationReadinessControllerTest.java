@@ -371,6 +371,89 @@ class LiquidationReadinessControllerTest {
                 "the controller must hand the gate's reason to the page");
     }
 
+    /** A readiness controller with nothing to read, so every render takes the early-return path. */
+    private static LiquidationReadinessController bareController() {
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        return new LiquidationReadinessController(provide(null), provide(null), provide(null),
+                provide(null), provide(null), provide(null), provide(null), provide(null),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200), network);
+    }
+
+    /**
+     * A reference-script verifier that has run its boot pass and DROPPED {@code loan-claim-action}: the
+     * configured coordinate publishes a hash this node does not derive for that key.
+     */
+    private static com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier verifierThatDroppedTheClaimSlot() {
+        var claimOnly = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, BigInteger.ZERO, 200,
+                new com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder.ReferenceScripts(
+                        null, null, null, null, new TransactionInput("ab".repeat(32), 0), null, null));
+        var verifier = new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier(
+                LoanFixtures.registry(), claimOnly,
+                (tx, ix) -> com.bloxbean.cardano.client.api.model.Result
+                        .<com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput>success("ok")
+                        .withValue(new com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput(
+                                "de".repeat(28),
+                                com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.Liveness.UNSPENT,
+                                null))
+                        .code(200),
+                false);
+        verifier.verify();
+        return verifier;
+    }
+
+    /**
+     * ⛔ FAB-108: the reference-scripts banner reads what the CONTROLLER hands the page — the template test
+     * sets the variable itself and could not see a controller that never set it. Rendered through the
+     * early-return path (no lending beans), so the attribute must be set before it, as the gate's is.
+     */
+    @Test
+    void theReadinessPageCarriesTheReferenceScriptDegradationsIntoItsModel() {
+        var verifier = verifierThatDroppedTheClaimSlot();
+        List<String> degradations = verifier.degradations();
+        assertEquals(1, degradations.size(), "precondition: the verifier recorded one problem: " + degradations);
+        assertTrue(degradations.get(0).startsWith(
+                        com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.DROPPED)
+                && degradations.get(0).contains("loan-claim-action"), degradations.get(0));
+
+        var controller = bareController();
+        controller.setLoansReferenceScriptVerifier(verifier);
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        assertEquals(degradations, model.getAttribute("referenceScriptDegradations"),
+                "the controller must hand the verifier's degradations to the page, exactly");
+
+        // must still: with no verifier handed in (a direct construction) the attribute is an EMPTY list,
+        // never absent and never null.
+        var none = new org.springframework.ui.ConcurrentModel();
+        bareController().readiness(none, null, null, null, null, null);
+        assertEquals(List.of(), none.getAttribute("referenceScriptDegradations"),
+                "no verifier: an empty list, so the page shows no banner");
+    }
+
+    /** The two banners are independent: a closed gate does not hide reference-script problems, nor the reverse. */
+    @Test
+    void aClosedGateAndReferenceScriptDegradationsAreBothCarried() {
+        var verifier = verifierThatDroppedTheClaimSlot();
+        var controller = bareController();
+        var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+        controller.setLendingConfigGate(gate);
+        controller.setLoansReferenceScriptVerifier(verifier);
+        gate.block("ConfigDatum[11]: derived 63b26ff9, chain 64d9b13f");
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        assertEquals("ConfigDatum[11]: derived 63b26ff9, chain 64d9b13f", model.getAttribute("lendingConfigBlocked"));
+        assertEquals(verifier.degradations(), model.getAttribute("referenceScriptDegradations"));
+        assertFalse(verifier.degradations().isEmpty(), "precondition: there is something to carry");
+    }
+
     /**
      * ⛔ FAB-115 round-2 finding 4: the gate must reach the ROW through the real path —
      * readiness() → rows() → row() → gatedAction — not only the static helper. One loan, health

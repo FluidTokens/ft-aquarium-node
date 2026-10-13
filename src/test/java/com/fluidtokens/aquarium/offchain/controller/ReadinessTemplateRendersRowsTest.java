@@ -207,9 +207,16 @@ class ReadinessTemplateRendersRowsTest {
 
     private static String render(List<LiquidationReadinessController.Row> rows,
                                  OperationalStatus status, String lendingConfigBlocked, String walletNotReady) {
+        return render(rows, status, lendingConfigBlocked, walletNotReady, List.of());
+    }
+
+    private static String render(List<LiquidationReadinessController.Row> rows,
+                                 OperationalStatus status, String lendingConfigBlocked, String walletNotReady,
+                                 List<String> referenceScriptDegradations) {
         var context = new Context();
         context.setVariable("walletNotReady", walletNotReady);
         context.setVariable("lendingConfigBlocked", lendingConfigBlocked);
+        context.setVariable("referenceScriptDegradations", referenceScriptDegradations);
         context.setVariable("network", "preview");
         context.setVariable("generatedAt", "2026-09-04T13:00:00Z");
         context.setVariable("disabledReason", null);
@@ -280,6 +287,41 @@ class ReadinessTemplateRendersRowsTest {
 
         String open = render(List.of(fullRow()), monitoringOnly(), null);
         assertTrue(!open.contains("LENDING_CONFIG_MISMATCH"), "no banner while the gate is open");
+    }
+
+    /**
+     * ⛔ FAB-108: reference-script problems are bannered above the rows, one line each, and the banner says
+     * lending is NOT refused — the competing banner (a closed gate) must not appear for them. Each line is
+     * escaped: it carries provider answers (an UNVERIFIED reason quotes the HTTP error body). Absent, or an
+     * empty list, nothing is shown.
+     */
+    @Test
+    void referenceScriptProblemsAreBanneredAboveTheRowsEscapedAndAbsentOtherwise() {
+        String dropped = "REFERENCE_SCRIPT_DROPPED loans.liquidation.reference-scripts.loan-claim-action "
+                + "(954f8be5#0): the output publishes 1551bd4e, not the derived 6a6f2aec";
+        String unverified = "REFERENCE_SCRIPT_UNVERIFIED loans.liquidation.reference-scripts.loan "
+                + "(e724b9c7#0): could not be checked: HTTP 500";
+        String hostile = "REFERENCE_SCRIPT_UNVERIFIED loans.compound.reference-scripts entry 2 (c1c1#0): could not "
+                + "be checked: HTTP 502 for txs/c1c1/utxos: <script>alert(1)</script>";
+        String html = render(List.of(fullRow()), monitoringOnly(), null, null, List.of(dropped, unverified, hostile));
+
+        int banner = html.indexOf("REFERENCE SCRIPTS: 3 problem(s)");
+        assertTrue(banner >= 0, "the banner must count the problems");
+        assertTrue(html.contains("lending is NOT refused"), "the banner must say lending goes on");
+        assertTrue(banner < html.indexOf("<table"), "the banner must come before the table");
+        assertTrue(html.contains(dropped) && html.contains(unverified), "every entry is on the page");
+        assertTrue(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "the hostile entry is on the page, escaped");
+        assertFalse(html.contains("<script>alert(1)"), "a provider's text must never reach the page as markup");
+        assertFalse(html.contains("LENDING_CONFIG_MISMATCH"), "a reference-script problem does not close the gate");
+
+        String one = render(List.of(fullRow()), monitoringOnly(), null, null, List.of(dropped));
+        assertTrue(one.contains("REFERENCE SCRIPTS: 1 problem(s)") && !one.contains("REFERENCE SCRIPTS: 3"),
+                "the count is the list's, not a constant");
+
+        assertFalse(render(List.of(fullRow()), monitoringOnly(), null, null, List.of()).contains("REFERENCE SCRIPTS:"),
+                "no banner for an empty list");
+        assertFalse(render(List.of(fullRow()), monitoringOnly(), null, null, null).contains("REFERENCE SCRIPTS:"),
+                "no banner, and no failure, for a null attribute");
     }
 
     /** FAB-134 B2: before the wallet is ready the strip says why, not "could not be read". */
