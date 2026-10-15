@@ -46,7 +46,7 @@ git clone https://github.com/FluidTokens/ft-aquarium-node.git
 cd ft-aquarium-node/docker
 cp .env.example .env
 chmod 600 .env                  # it will hold a seed phrase
-# fill in the six values it contains, then:
+# fill in the six required values (WALLET_ACCOUNT_INDEX is optional), then:
 docker compose up -d
 docker compose logs -f aquarium
 ```
