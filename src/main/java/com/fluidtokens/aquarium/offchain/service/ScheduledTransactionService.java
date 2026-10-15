@@ -254,7 +254,7 @@ public class ScheduledTransactionService {
 
         var stakerRefInputOpt = service.findStakerRefInput();
         if (stakerRefInputOpt.isEmpty()) {
-            log.info("Cannot find stake for {}", account.baseAddress());
+            log.debug("Cannot find stake for {}", account.baseAddress());
             return;
         }
 

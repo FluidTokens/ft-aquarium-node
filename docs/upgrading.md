@@ -21,8 +21,9 @@ error.
 | FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01) | §4.8 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 | Upgrading to the release that **indexes the Minswap V2 pools** (FAB-137) | §1.1 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
+| You changed `WALLET_ACCOUNT_INDEX` | §9 — restart, then re-sync **or** one self-send | ⛔ **wiped, or a self-send** |
 
-The first four are ordinary. The others are the subject of this guide (§4, §4.8, §3, §1.1).
+The first four are ordinary. The others are the subject of this guide (§4, §4.8, §3, §1.1, §9).
 
 ### 1.1 ⛔ The Minswap pool release requires a database wipe (FAB-137)
 
@@ -493,3 +494,25 @@ spec:
 ### Why the image changed at all
 
 The node holds a funded wallet mnemonic in its process environment and makes outbound network calls. Root inside the container is one bug away from root on a mounted volume. The trade is a one-time deployment change against removing that class of escalation permanently.
+
+---
+
+## 9. Changing WALLET_ACCOUNT_INDEX on a node that has already synced
+
+`WALLET_ACCOUNT_INDEX` picks which account of the mnemonic the node uses, and **each account is a
+different wallet**: its own address and its own stake key. The node's index stores wallet UTxOs
+only for the wallet configured **at boot** — it filters them as it writes. So after a switch, coins
+that were **already sitting** at the new account are invisible to the node: never stored, not
+counted, not reported as missing. Only what arrives after the restart is seen.
+
+Nothing does this for you. Pick one:
+
+- **(a) Wipe the database and re-sync** from `sync-start` (the §4.2–§4.6 sequence, without the
+  coordinate change). The re-sync indexes the new account's whole history.
+- **(b) Switch, restart, then self-send.** Set the index, restart, check the startup line
+  `account index N, address …, stake address …` against your wallet app, then send the new
+  account's **whole balance to itself** from the wallet app. It lands in fresh UTxOs, which the node
+  indexes.
+
+**The new account has its own stake key.** Re-delegate the 30,000 FLDT to it, or tank processing is
+disabled — the node logs one WARN naming the stake address it is looking for.

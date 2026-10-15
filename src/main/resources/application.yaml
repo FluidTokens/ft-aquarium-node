@@ -40,6 +40,9 @@ network: mainnet
 
 wallet:
   mnemonic: ""
+  # CIP-1852 account index of the mnemonic (m/1852'/1815'/N'/0/0): its own address AND stake key.
+  # 0 / blank = the wallet every node used before this setting. See docs/deploying.md §4, docs/upgrading.md §9.
+  account-index: ${WALLET_ACCOUNT_INDEX:0}
 
 aquarium:
   # Genesis one-shot UTxO that parameterises the `parameters` validator.
@@ -575,6 +578,9 @@ network: preview
 
 wallet:
   mnemonic: ""
+  # CIP-1852 account index of the mnemonic (m/1852'/1815'/N'/0/0): its own address AND stake key.
+  # 0 / blank = the wallet every node used before this setting. See docs/deploying.md §4, docs/upgrading.md §9.
+  account-index: ${WALLET_ACCOUNT_INDEX:0}
 
 aquarium:
   genesis:
