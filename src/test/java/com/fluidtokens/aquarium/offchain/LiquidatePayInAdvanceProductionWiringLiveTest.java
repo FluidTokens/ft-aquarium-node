@@ -156,7 +156,7 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
         if (mnemonic == null || mnemonic.isBlank()) {
             skip("WALLET_MNEMONIC is not set — run with `set -a; . ./.env.preview; set +a`");
         }
-        return new AccountConfig().account(mnemonic, "preview");
+        return new AccountConfig().account(mnemonic, "preview", System.getenv("WALLET_ACCOUNT_INDEX"));
     }
 
     private static BFBackendService backend() {

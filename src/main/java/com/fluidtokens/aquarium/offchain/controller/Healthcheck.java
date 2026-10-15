@@ -110,7 +110,7 @@ public class Healthcheck {
         }
 
         if (!stakingFound) {
-            log.warn("[HEALTH] The current wallet does not have any FLDT delegated. Ensure you're staking FLDT to the Node's wallet.");
+            log.warn("[HEALTH] No FLDT stake found for this wallet — tank processing is disabled. Delegate the 30k FLDT stake to the Node's wallet.");
         }
 
         if (healthCheck) {
