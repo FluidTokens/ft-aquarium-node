@@ -164,8 +164,16 @@ class AccountConfigTest {
         return environment.resolvePlaceholders("${wallet.account-index:0}");
     }
 
+    /**
+     * Under the shipped yaml (the mainnet and the preview document), {@code WALLET_ACCOUNT_INDEX} — set, unset
+     * or empty — reaches {@code wallet.account-index} as the index the operator meant.
+     * <p>
+     * ⚠ This does NOT prove the yaml's {@code account-index: ${WALLET_ACCOUNT_INDEX:0}} lines are needed: it still
+     * passes with them deleted, because Spring's system-environment source maps {@code WALLET_ACCOUNT_INDEX} to
+     * {@code wallet.account-index} by itself. It checks only that the shipped yaml does not get in the way.
+     */
     @Test
-    void theEnvVarReachesThePropertyInBothProfiles() throws IOException {
+    void theEnvVarReachesThePropertyUnderTheShippedYaml() throws IOException {
         for (PropertySource<?> document : walletDocuments()) {
             assertEquals("3", resolve(document, Map.of("WALLET_ACCOUNT_INDEX", "3")), document.getName());
             assertEquals(0, AccountConfig.parseAccountIndex(resolve(document, Map.of())), document.getName());

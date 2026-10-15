@@ -21,8 +21,8 @@ docker compose up -d
 docker compose logs -f aquarium
 ```
 
-**Six values**: your relay host and port, a Blockfrost key, a dedicated wallet mnemonic, a database
-password, and the image version to pin. Everything else has a working default.
+**Six values**, plus one optional one: your relay host and port, a Blockfrost key, a dedicated wallet mnemonic,
+a database password, and the image version to pin. Everything else has a working default.
 
 **You never set a contract address, a script hash or a sync start point.** Those ship inside the
 image, verified against the chain before release. When FluidTokens redeploy, you bump
@@ -107,9 +107,10 @@ you would rather build it yourself, see §11.
 
 Two files, and the split is the point.
 
-### `docker/.env` — the six things that are yours
+### `docker/.env` — the six things that are yours, plus one optional
 
-Copied from `.env.example`, which contains **only** what you must set:
+Copied from `.env.example`, which contains **only** what you must set, plus the optional
+`WALLET_ACCOUNT_INDEX`:
 
 | variable | what it is |
 |---|---|

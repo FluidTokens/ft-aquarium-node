@@ -109,15 +109,11 @@ public class Healthcheck {
             log.warn("[HEALTH] No utxo found for wallet. Ensure you have at least one UTXO with only ada in it.");
         }
 
-        if (!stakingFound) {
-            log.warn("[HEALTH] No FLDT stake found for this wallet — tank processing is disabled. Delegate the 30k FLDT stake to the Node's wallet.");
-        }
-
         if (healthCheck) {
-            if (walletOk && stakingFound) {
+            if (walletOk) {
                 log.info("[HEALTH] Aquarium Node is healthy and ready to process transactions.");
             } else {
-                log.warn("[HEALTH] Aquarium Node is healthy but wallet or staking issues detected. Check logs above for details.");
+                log.warn("[HEALTH] Aquarium Node is healthy but the wallet has no usable UTxO. Check logs above for details.");
             }
             return ResponseEntity.ok(healthCheckStatus);
         } else {
