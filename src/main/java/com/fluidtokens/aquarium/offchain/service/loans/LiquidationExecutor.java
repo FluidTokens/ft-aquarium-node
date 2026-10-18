@@ -40,7 +40,9 @@ import java.math.BigInteger;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -49,6 +51,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * The liquidation loop: every cycle it scans every indexed lender bond, builds one real
@@ -915,7 +918,23 @@ public class LiquidationExecutor {
             return;
         }
 
-        for (LiquidationAssessment assessment : buildable) {
+        // FAB-144 — THE MOST PROFITABLE CANDIDATE FIRST. Only the ORDER changes: every buildable
+        // candidate is still walked exactly once, with the same arguments, and one that cannot be
+        // priced goes last rather than missing. The key is the readiness page's "Expected reward",
+        // through the very function the page calls (ExpectedLiquidationReward).
+        //
+        // ⚠ GUARDED like the market-coverage report above: ranking must never cost a liquidation, so
+        // a fault in it is reported and the cycle walks the scan's own order instead.
+        List<LiquidationAssessment> ordered = buildable;
+        if (buildable.size() >= 2) {
+            try {
+                ordered = mostProfitableFirstThisCycle(buildable, now);
+            } catch (RuntimeException e) {
+                log.warn("ranking this cycle's candidates failed ({}); they are walked in scan order",
+                        causeChain(e));
+            }
+        }
+        for (LiquidationAssessment assessment : ordered) {
             try {
                 consider(assessment, now, validFromMillis, validToMillis, walletUtxos, params,
                         configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit,
@@ -931,6 +950,103 @@ public class LiquidationExecutor {
                 log.error("could not consider bond {}: {}", assessment.bond().utxoRef(), causeChain(e), e);
             }
         }
+    }
+
+    // ---- the order a cycle walks its candidates in (FAB-144) ------------------------------------
+
+    /**
+     * {@code buildable} reordered by each candidate's expected reward, computed ONCE per candidate
+     * here, and the order logged at INFO. A missing oracle client, a feed lookup that throws, or
+     * anything else that defeats the estimate makes that candidate unpriced — it sorts last and is
+     * still walked.
+     *
+     * <p>⚠ The client is asked for here, after {@link #oracleSnapshot()} took the build's snapshot,
+     * and is used for nothing but the order: no build reads anything this method computes.
+     */
+    private List<LiquidationAssessment> mostProfitableFirstThisCycle(List<LiquidationAssessment> buildable,
+                                                                      long now) {
+        FluidOracleClient client;
+        try {
+            client = oracleClient.getIfAvailable();
+        } catch (RuntimeException e) {
+            log.warn("the oracle client is unavailable to rank this cycle's candidates ({}); every one "
+                    + "is unpriced and they are walked in ref order", causeChain(e));
+            client = null;
+        }
+        Map<LiquidationAssessment, Optional<BigInteger>> rewards = new IdentityHashMap<>();
+        for (LiquidationAssessment assessment : buildable) {
+            rewards.put(assessment, expectedReward(assessment, client, now));
+        }
+        List<LiquidationAssessment> ordered = mostProfitableFirst(buildable, rewards::get);
+        log.info("liquidation order (most profitable first): {}", ordered.stream()
+                .map(assessment -> orderLabel(assessment) + rewards.get(assessment)
+                        .map(reward -> " ≈" + reward + " lovelace").orElse(" unpriced"))
+                .collect(java.util.stream.Collectors.joining(", ")));
+        return ordered;
+    }
+
+    /**
+     * The readiness page's "Expected reward" for one candidate: its fee slice priced through the
+     * collateral oracle THIS loan names, at {@code now}. Empty, never thrown, on any failure.
+     */
+    private static Optional<BigInteger> expectedReward(LiquidationAssessment assessment,
+                                                       FluidOracleClient client, long now) {
+        if (client == null) {
+            return Optional.empty();
+        }
+        try {
+            LoanDatum datum = assessment.loan().datum();
+            return ExpectedLiquidationReward.estimate(assessment.loan(), assessment.bond(),
+                    client.findFeedForLeg(datum.collateral().assetType(),
+                            datum.collateral().oracleTokenAsset(), now));
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * A NEW list holding every element of {@code buildable}, each exactly once, in descending order of
+     * {@code reward}. A candidate whose reward is empty, null or throws sorts after every priced one;
+     * ties, and order among the unpriced, break on the loan's {@code utxoRef} ascending, so the order
+     * is deterministic. {@code reward} is applied once per element.
+     */
+    static List<LiquidationAssessment> mostProfitableFirst(
+            List<LiquidationAssessment> buildable,
+            Function<LiquidationAssessment, Optional<BigInteger>> reward) {
+        Map<LiquidationAssessment, BigInteger> keys = new IdentityHashMap<>();
+        for (LiquidationAssessment assessment : buildable) {
+            keys.put(assessment, rewardOrNull(reward, assessment));
+        }
+        List<LiquidationAssessment> ordered = new ArrayList<>(buildable);
+        ordered.sort(Comparator.comparing((LiquidationAssessment assessment) -> keys.get(assessment),
+                        Comparator.nullsLast(Comparator.<BigInteger>reverseOrder()))
+                .thenComparing(LiquidationExecutor::loanRefOrNull,
+                        Comparator.nullsLast(Comparator.<String>naturalOrder())));
+        return ordered;
+    }
+
+    private static BigInteger rewardOrNull(Function<LiquidationAssessment, Optional<BigInteger>> reward,
+                                           LiquidationAssessment assessment) {
+        try {
+            Optional<BigInteger> estimate = reward.apply(assessment);
+            return estimate == null ? null : estimate.orElse(null);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static String loanRefOrNull(LiquidationAssessment assessment) {
+        return assessment == null || assessment.loan() == null ? null : assessment.loan().utxoRef();
+    }
+
+    /** The loan's ref; the bond's, named as such, on an assessment that carries no loan. */
+    private static String orderLabel(LiquidationAssessment assessment) {
+        String loanRef = loanRefOrNull(assessment);
+        if (loanRef != null) {
+            return loanRef;
+        }
+        return assessment == null || assessment.bond() == null ? "<no ref>"
+                : "bond " + assessment.bond().utxoRef();
     }
 
     // ---- one candidate ------------------------------------------------------------------------

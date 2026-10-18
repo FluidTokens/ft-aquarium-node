@@ -19,6 +19,7 @@ import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient;
 import com.fluidtokens.aquarium.offchain.service.loans.AnticipateAndSell;
 import com.fluidtokens.aquarium.offchain.service.loans.ConvertEconomics;
+import com.fluidtokens.aquarium.offchain.service.loans.ExpectedLiquidationReward;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFinance;
@@ -742,14 +743,15 @@ public class LiquidationReadinessController {
         if (bond == null) {
             feeUnknown = "no lender bond is indexed for this loan, so its fee rate is unknown";
         } else {
-            feeTokens = ConvertEconomics.liquidationFee(loan.collateralAmount(),
-                    bond.datum().liquidationFeePerMille().longValueExact());
+            // FAB-144: the same function ranks the bot's liquidations, so this column and the order
+            // the bot tries loans in can never disagree.
+            feeTokens = ExpectedLiquidationReward.feeTokens(loan, bond);
             feeUnknown = null;
             if (feed.isEmpty()) {
                 feeUnknown = "no usable oracle feed for the collateral, so the slice cannot be valued";
             } else {
                 try {
-                    feeValue = LoanFinance.toLovelace(Rational.fromInt(feeTokens), feed.get()).floor();
+                    feeValue = ExpectedLiquidationReward.lovelace(feeTokens, feed.get());
                 } catch (RuntimeException e) {
                     feeUnknown = "the collateral feed cannot be priced (" + e.getClass().getSimpleName() + ")";
                 }
