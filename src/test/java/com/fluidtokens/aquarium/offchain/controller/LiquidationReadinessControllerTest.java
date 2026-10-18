@@ -2336,8 +2336,59 @@ class LiquidationReadinessControllerTest {
         assertNull(check.label(), check.toString());
     }
 
+    /** What the ROW renders the note's amounts with: the call site's own formatter, over the NIGHT display. */
+    private static java.util.function.Function<BigInteger, String> rowNight() {
+        return LiquidationReadinessController.noteAmounts(q -> AssetDisplay.of(q, NIGHT_METADATA));
+    }
+
+    /** The two figures either side of "short of" in an "Even counted" note, or a failure if there are none. */
+    private static List<String> shortOfFigures(String detail) {
+        var matcher = java.util.regex.Pattern.compile("Even counted, (.+?) would be short of the (.+?) required")
+                .matcher(detail);
+        assertTrue(matcher.find(), "no \"Even counted\" clause: " + detail);
+        return List.of(matcher.group(1), matcher.group(2));
+    }
+
     /**
-     * The CALL SITE, through readiness(): a token-principal ANTICIPATE row over the measured wallet shape
+     * ⛔ A REMEDY IS A CLAIM AND MUST BE SUFFICIENT. 25,000.4 NIGHT to front with 1 NIGHT behind the floor:
+     * the shortfall is 24,999.4, and the page's rounded text says 24,999 — an operator adding exactly that
+     * would still be refused. The row's note states every amount exactly.
+     */
+    @Test
+    void theRowsNoteNamesTheExactShortfallNeverARoundedOne() {
+        WalletBalance wallet = WalletBalance.of(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 1_180_000L, NIGHT, 1_000_000L)), T0);
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, NIGHT, FEE_CEILING, BigInteger.valueOf(25_000_400_000L), rowNight());
+
+        assertEquals("funds", check.label(), check.toString());
+        assertTrue(check.detail().contains("Even counted, 1 NIGHT would be short of the 25000.4 NIGHT required"),
+                check.detail());
+        assertTrue(check.detail().contains("add at least 24999.4 NIGHT;"), check.detail());
+        assertFalse(check.detail().contains("24,999 NIGHT"), "a rounded shortfall understates: " + check.detail());
+    }
+
+    /**
+     * ⛔ One base unit short: rounded, both sides of "short of" read 11,034 NIGHT, which is no reason at all.
+     * Exact, they differ by the one unit the note then says to add.
+     */
+    @Test
+    void theRowsNoteNeverSaysShortOfAnEqualLookingAmount() {
+        WalletBalance wallet = WalletBalance.of(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 1_180_000L, NIGHT, MEASURED_ADVANCE.longValueExact() - 1)), T0);
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, NIGHT, FEE_CEILING, MEASURED_ADVANCE, rowNight());
+
+        List<String> figures = shortOfFigures(check.detail());
+        assertNotEquals(figures.get(0), figures.get(1), check.detail());
+        assertEquals(List.of("11033.899999 NIGHT", "11033.9 NIGHT"), figures, check.detail());
+        assertTrue(check.detail().contains("add at least 0.000001 NIGHT;"), check.detail());
+    }
+
+    /**
+     * The CALL SITE, through readiness():a token-principal ANTICIPATE row over the measured wallet shape
      * carries the consolidate blocker, its note in the page's own amounts, at the fee ceiling the wired
      * protocol parameters yield.
      */

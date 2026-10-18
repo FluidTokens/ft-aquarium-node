@@ -867,6 +867,22 @@ public class LiquidationReadinessController {
         return new FundsCheck(holding.spendable(), label, note);
     }
 
+    /**
+     * ⛔ FAB-128: how the row renders the amounts in {@link #fundsCheck}'s note — <b>exact</b>, never the
+     * page's rounded text. The note is a remedy, and a remedy is a claim that must be sufficient: rounded,
+     * a 24,999.4 shortfall reads "add at least 24,999", and one base unit short reads "11,034 would be
+     * short of the 11,034 required". {@link AssetDisplay#exactText} is the same scaled figure at full
+     * precision.
+     *
+     * @param display the page's display of a quantity of the principal
+     */
+    static Function<BigInteger, String> noteAmounts(Function<BigInteger, AssetDisplay> display) {
+        return q -> {
+            AssetDisplay shown = display.apply(q);
+            return shown.exactText() + " " + shown.label();
+        };
+    }
+
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
                     MarketGate gate, Map<String, PoolFetch> poolMemo,
                     Supplier<MinswapPoolResolver.Snapshot> poolSnapshot,
@@ -1013,10 +1029,8 @@ public class LiquidationReadinessController {
         // FAB-128: a token principal is counted as the bot counts it, and a shortfall caused by the ada
         // floor says so — in the page's own scaled amounts.
         String principalUnit = datum.principalAsset().toUnit();
-        FundsCheck funds = fundsCheck(wallet, datum.principalAsset(), feeCeiling, advance, q -> {
-            AssetDisplay shown = display(principalUnit, q, metadataMemo);
-            return shown.amountText() + " " + shown.label();
-        });
+        FundsCheck funds = fundsCheck(wallet, datum.principalAsset(), feeCeiling, advance,
+                noteAmounts(q -> display(principalUnit, q, metadataMemo)));
         ProcessingBlocker blocker = ProcessingBlocker.of(
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                 gate.marketFor(datum.principalAsset()), convertEnabled, bondRoute,

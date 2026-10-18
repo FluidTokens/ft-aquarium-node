@@ -2701,6 +2701,92 @@ class LiquidationExecutorTest {
     }
 
     /**
+     * (f) The (a) wallet in a DISABLED market: MARKET_DISABLED, whose remedy is the market's mode — the
+     * ada-floor note belongs to INSUFFICIENT_BALANCE alone, whatever else the gate refuses for.
+     */
+    @Test
+    void aDisabledMarketRefusalCarriesNoAdaFloorNote() {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        AppConfig.LiquidationConfiguration.Market disabled = anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(),
+                1_500_000_000L);
+        disabled.setMode(AppConfig.LiquidationConfiguration.Mode.DISABLED);
+        configuration.setMarkets(List.of(disabled));
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(tokenBehindTheAdaFloorWallet(),
+                List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
+                        collateralOracle(), principalOracle()), configuration);
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertTrue(decision.reason().contains("is DISABLED"), decision.reason());
+        assertFalse(decision.detail().contains("in total"), decision.detail());
+        assertEquals(decision.reason(), decision.detail(), "a disabled-market refusal is recorded exactly as before");
+    }
+
+    /**
+     * (g) The (a) wallet in a cycle whose protocol parameters could not be fetched: the floor is the 2 ADA
+     * rider alone, and the note must say the real one is higher, or it states a floor the bot does not use.
+     */
+    @Test
+    void anAdaFloorNoteWithoutAFeeCeilingSaysTheRealFloorIsHigher() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiringWithExecutorParams(tokenBehindTheAdaFloorWallet(),
+                throwingParams());
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        String detail = decision.detail();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), detail);
+        assertTrue(decision.reason().startsWith("INSUFFICIENT_BALANCE"), decision.reason());
+        assertTrue(detail.contains("the wallet has 3000000 " + PRINCIPAL_TOKEN_2.toUnit() + " in total"),
+                detail);
+        assertTrue(detail.contains("less than 2000000 lovelace (2 ADA) each"), detail);
+        assertTrue(detail.contains("the fee ceiling was unavailable this cycle, so this floor leaves it out and "
+                + "the real one is higher"), detail);
+    }
+
+    /**
+     * {@link #tokenPrincipalConvertEconomicsWiring(List, List, AppConfig.LiquidationConfiguration)} with the
+     * EXECUTOR's protocol-parameter supplier made explicit (the builders keep the fixture's), so a cycle can
+     * run without a fee ceiling while the router still builds.
+     */
+    private static Wiring tokenPrincipalConvertEconomicsWiringWithExecutorParams(List<Utxo> walletUtxos,
+                                                                                 ProtocolParamsSupplier executorParams) {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_500_000_000L)));
+        List<OracleEntry> registry = List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
+                collateralOracle(), principalOracle());
+        Scenario convert = tokenPrincipalConvertEconomicsScenario();
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO,
+                convert.loan().utxo(), convert.bond().utxo()));
+        universe.addAll(walletUtxos);
+
+        LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+
+        FakeScanner scanner = new FakeScanner(List.of(convert.assessment()));
+        FakeResolver resolver = new FakeResolver(allUnspent(List.of(convert)));
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        CountingOracleProvider oracles = new CountingOracleProvider(
+                new FakeOracleClient(registry), new FakeOracleClient(registry));
+
+        PayInAdvanceLiquidationRouter router = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver,
+                plainBuilder, router, LoanFixtures.registry(), log, metrics(), oracles, previewNetwork(),
+                executorParams, LoanFixtures.converters(), EXPLODING_SUBMITTER);
+        return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
+    }
+
+    /**
      * Slice 1, task 3. Exit 7 recorded REFUSED and logged NOTHING. The router's own message is
      * generic ("… for a negative equity") and never says which asset — the log line must, because the
      * operator's next question is always "which loan, which token". The message is carried verbatim

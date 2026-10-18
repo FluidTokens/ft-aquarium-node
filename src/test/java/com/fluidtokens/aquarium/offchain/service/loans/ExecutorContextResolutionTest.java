@@ -268,6 +268,30 @@ class ExecutorContextResolutionTest {
     }
 
     /**
+     * FAB-128: the readiness page sizes the token-principal ada floor from the protocol parameters the container
+     * hands the controller. Injection is by setter and REQUIRED: optional injection would leave a container-built
+     * controller holding no supplier, so the floor would silently drop the fee ceiling and the page would count
+     * token the bot cannot spend.
+     */
+    @Test
+    void theReadinessControllerHasTheProtocolParamsSupplierInjectedAndRequired() throws Exception {
+        var supplierType = com.bloxbean.cardano.client.api.ProtocolParamsSupplier.class;
+        var bean = com.fluidtokens.aquarium.offchain.config.YaciConfig.class
+                .getMethod("protocolParamsSupplier", BFBackendService.class,
+                        org.cardanofoundation.conversions.CardanoConverters.class);
+        assertTrue(bean.isAnnotationPresent(Bean.class) && supplierType.equals(bean.getReturnType()),
+                "YaciConfig must declare the ProtocolParamsSupplier @Bean, or a required setter fails the boot");
+        var setter = com.fluidtokens.aquarium.offchain.controller.LiquidationReadinessController.class
+                .getMethod("setProtocolParamsSupplier", supplierType);
+        Autowired autowired = setter.getAnnotation(Autowired.class);
+        assertNotNull(autowired, "LiquidationReadinessController.setProtocolParamsSupplier is not @Autowired — "
+                + "the container would leave it holding no supplier, and the page's ada floor would leave out the "
+                + "fee ceiling");
+        assertTrue(autowired.required(), "LiquidationReadinessController.setProtocolParamsSupplier must be "
+                + "REQUIRED: optional injection fails silent when the supplier bean is missing");
+    }
+
+    /**
      * FAB-136: the startup wallet sweep and its readiness gate are gone. None of the former readers may
      * still declare the setter or hold the field — a leftover setter would be dead injection, and a
      * leftover field a gate nothing opens. Matched by NAME, because the type itself no longer exists.
