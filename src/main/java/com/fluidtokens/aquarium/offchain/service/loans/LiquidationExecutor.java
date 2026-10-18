@@ -1249,28 +1249,29 @@ public class LiquidationExecutor {
                     loanUtxoRef, payInAdvancePrincipal.isAda() ? "ada" : payInAdvancePrincipal.toUnit());
             // Convert loan: routed to the promoted, submit-incapable pay-in-advance builder. The same
             // window the plain path uses is handed to the router, which derives its own slots from it.
+            // FAB-128 — the token split behind principalBalance, kept for the market-gate catch below;
+            // null on the ada branch, whose count is untouched.
+            WalletInputSelection.TokenHolding principalHolding = null;
             try {
                 // Part 3 — the balance MarketGate's decide() checks: the sum of the principal asset
                 // across the wallet utxos a real selection could actually spend (nominate(), below) —
                 // never a utxo the selector would refuse, or the gate would allow what the build cannot
                 // fund (T-061's "a remedy is a claim" rule).
+                if (!payInAdvancePrincipal.isAda()) {
+                    // ⛔ F7 (round 2) — count ONLY utxos the selector could actually pick.
+                    // nominableForToken alone says "carries the token, no datum, no reference script" —
+                    // it says NOTHING about whether the utxo also carries enough ada to fund a build, so
+                    // a 2,000 USDM + 1.4 ADA utxo passed it and inflated the balance MarketGate saw by a
+                    // candidate the wallet could never actually fund (M13). tokenPrincipalRequiredAda
+                    // is nominate()'s own formula — the same figure the SELECTOR this balance is
+                    // supposed to describe is bound by — and spendable() applies it.
+                    principalHolding = WalletInputSelection.tokenHolding(walletUtxos, payInAdvancePrincipal,
+                            WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling));
+                }
                 BigInteger principalBalance = payInAdvancePrincipal.isAda()
                         ? walletUtxos.stream().filter(WalletInputSelection::nominable)
                                 .map(LedgerCeilings::lovelaceOf).reduce(BigInteger.ZERO, BigInteger::add)
-                        : walletUtxos.stream()
-                                .filter(u -> WalletInputSelection.nominableForToken(u, payInAdvancePrincipal))
-                                // ⛔ F7 (round 2) — count ONLY utxos the selector could actually pick.
-                                // nominableForToken alone says "carries the token, no datum, no
-                                // reference script" — it says NOTHING about whether the utxo also
-                                // carries enough ada to fund a build, so a 2,000 USDM + 1.4 ADA utxo
-                                // passed it and inflated the balance MarketGate saw by a candidate the
-                                // wallet could never actually fund (M13). requiredAda mirrors
-                                // nominate()'s own formula exactly — the same figure the SELECTOR this
-                                // balance is supposed to describe is bound by.
-                                .filter(u -> LedgerCeilings.lovelaceOf(u).compareTo(feeCeiling
-                                        .orElse(BigInteger.ZERO).add(TOKEN_PRINCIPAL_MIN_ADA_CEILING)) >= 0)
-                                .map(u -> WalletInputSelection.tokenQuantityOf(u, payInAdvancePrincipal))
-                                .reduce(BigInteger.ZERO, BigInteger::add);
+                        : principalHolding.spendable();
                 transaction = payInAdvanceRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
                         bondUtxo.get(), configUtxo, lmConfigUtxo, oraclesByUnit, principalBalance,
                         // T-052 — the router knows the lender payout, this knows the wallet and the
@@ -1304,10 +1305,25 @@ public class LiquidationExecutor {
                 // A POLICY refusal, not a capability gap: this market is disabled, or the principal
                 // the candidate would have us front exceeds the operator's stated cap. Recorded the
                 // same clean way, and deliberately a separate catch so the log says which it was.
+                //
+                // FAB-128 — "holds 0" is true of what is COUNTED, and stays the reason. When the wallet
+                // does hold the token, but only in UTxOs short of the ada floor, the DETAIL says so and
+                // names the remedy; the reason an operator groups refusals by does not change.
+                String detail = e.getMessage();
+                MarketGate.Decision refused = e.decision();
+                if (refused != null && refused.refusal() == MarketGate.Refusal.INSUFFICIENT_BALANCE
+                        && principalHolding != null) {
+                    String unit = payInAdvancePrincipal.toUnit();
+                    String note = principalHolding.adaFloorNote(q -> q + " " + unit, refused.required(),
+                            feeCeiling.isPresent());
+                    if (note != null) {
+                        detail = e.getMessage() + "; " + note;
+                    }
+                }
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        e.getMessage(), e.getMessage()));
+                        e.getMessage(), detail));
                 log.info("the convert liquidation of {} was refused by the market gate: {}",
-                        loanUtxoRef, e.getMessage());
+                        loanUtxoRef, detail);
                 return;
             } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
                 // All seven construction sites describe a candidate or oracle state this route cannot
@@ -2384,17 +2400,6 @@ public class LiquidationExecutor {
     }
 
     /**
-     * ⚠ A conservative CEILING for the min-ada rider a token-principal lender output needs, sized for
-     * wallet-selection headroom rather than computed from live protocol parameters — {@code
-     * LedgerCeilings} has no min-ada helper and this class does not derive one (out of this slice's
-     * file allowlist). Over-estimating is the safe direction here (this class's own javadoc, and
-     * {@link WalletInputSelection}'s): a single-asset min-ada output on {@code coinsPerUtxoSize} 4310
-     * measures well under 1.5 ada in every fixture seen so far, so 2 ada leaves real headroom rather
-     * than sitting on the edge.
-     */
-    private static final BigInteger TOKEN_PRINCIPAL_MIN_ADA_CEILING = BigInteger.valueOf(2_000_000L);
-
-    /**
      * T-052 — nominate the wallet input for ONE candidate: the smallest that covers the fee ceiling
      * plus whatever extra outlay this liquidation itself must pay out.
      * <p>
@@ -2438,7 +2443,7 @@ public class LiquidationExecutor {
                                 + "alongside the {} wallet utxo to be safe",
                         loanUtxoRef, adaOnlySpares, principal.toUnit());
             }
-            BigInteger requiredAda = feeCeiling.orElse(BigInteger.ZERO).add(TOKEN_PRINCIPAL_MIN_ADA_CEILING);
+            BigInteger requiredAda = WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling);
             Optional<Utxo> chosen = WalletInputSelection.smallestSufficientToken(
                     walletUtxos, principal, extraOutlay, requiredAda);
             chosen.ifPresent(utxo -> log.info("{} nominates wallet utxo {}#{} ({} {} + {} lovelace) for "
