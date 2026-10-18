@@ -2316,4 +2316,166 @@ class LiquidationReadinessControllerTest {
         assertEquals(BigInteger.valueOf(5_000_000L), later.of("lovelace"));
         assertEquals(T0, later.asOfMillis(), "the balance shown is the earlier one, honestly dated");
     }
+
+    // ---- FAB-132: wallet rebalancing on the page --------------------------------------------------------
+
+    private static final String ARMED_NOTE = "wallet rebalancing is ARMED — whenever the wallet drifts out of "
+            + "shape, the node signs and submits a self-send of its whole wallet, in shadow as well as live; "
+            + "it is housekeeping, never a liquidation";
+
+    /** A Mockito rebalancer whose {@code activity()} is exactly {@code activity}. */
+    static com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer rebalancerReading(
+            com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity) {
+        var rebalancer = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class);
+        org.mockito.Mockito.when(rebalancer.activity()).thenReturn(activity);
+        org.mockito.Mockito.when(rebalancer.state()).thenReturn(activity.state());
+        return rebalancer;
+    }
+
+    static com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity(
+            boolean env, boolean suspended, AppConfig.LiquidationConfiguration.Mode mode,
+            com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle idle) {
+        return new com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity(
+                new com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.State(env, suspended,
+                        env && !suspended),
+                mode, idle);
+    }
+
+    /**
+     * ⛔ Each of the rebalancer's states reaches the page as exactly one line, and the banner's ARMED note
+     * follows {@code armed()} — never the env default, never the mode alone. Driven through
+     * {@code readiness(...)} on a bare controller, so the attributes are the ones the controller really sets.
+     */
+    @Test
+    void readinessCarriesEachRebalancerStateAndArmsTheBannerOnlyWhenArmed() {
+        record Case(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity,
+                    LiquidationReadinessController.RebalanceView expected) {
+        }
+        List<Case> cases = List.of(
+                new Case(activity(false, false, AppConfig.LiquidationConfiguration.Mode.LIVE,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.ENV_DISABLED),
+                        new LiquidationReadinessController.RebalanceView(false, false, "OFF",
+                                "AQUARIUM_WALLET_REBALANCE_ENABLED is false, so this node never rebalances its "
+                                        + "wallet; this page cannot turn it on", false, false)),
+                new Case(activity(true, true, AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SUSPENDED),
+                        new LiquidationReadinessController.RebalanceView(true, true, "SUSPENDED",
+                                "from this page: nothing is rebalanced until you resume it here, or until the "
+                                        + "node restarts", false, true)),
+                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.DISABLED,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE),
+                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
+                                "the liquidation mode is DISABLED; rebalancing runs only in shadow or live",
+                                true, false)),
+                new Case(activity(true, false, null,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE),
+                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
+                                "the liquidation mode is not set; rebalancing runs only in shadow or live",
+                                true, false)),
+                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
+                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
+                                "no action: ANTICIPATE market has an effective mode of shadow or live, so there "
+                                        + "is no token to keep ready", true, false)),
+                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.LIVE,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SYNCING),
+                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
+                                "the node is syncing; rebalancing starts once it has caught up", true, false)),
+                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW, null),
+                        new LiquidationReadinessController.RebalanceView(true, false, "ARMED",
+                                "after each block, if the wallet has drifted out of shape, the node signs and "
+                                        + "submits one self-send of its whole wallet, in shadow as well as live",
+                                true, false)));
+
+        for (Case c : cases) {
+            var controller = bareController();
+            controller.setWalletRebalancer(rebalancerReading(c.activity()));
+            var model = new org.springframework.ui.ConcurrentModel();
+            controller.readiness(model, null, null, null, null, null);
+
+            assertEquals(c.expected(), model.getAttribute("rebalance"), "" + c.activity());
+            var status = (OperationalStatus) model.getAttribute("status");
+            assertEquals(c.activity().armed(), status.notes().contains(ARMED_NOTE),
+                    "the banner's ARMED note must follow armed() exactly: " + c.activity() + " " + status.notes());
+        }
+    }
+
+    /** A direct construction holds no rebalancer: no line on the page, and the banner is not armed. */
+    @Test
+    void withNoRebalancerThePageHasNoRebalanceLineAndTheBannerIsNotArmed() {
+        var model = new org.springframework.ui.ConcurrentModel();
+        bareController().readiness(model, null, null, null, null, null);
+        assertNull(model.getAttribute("rebalance"), "no rebalancer: no rebalancing line");
+        assertFalse(((OperationalStatus) model.getAttribute("status")).notes().contains(ARMED_NOTE));
+    }
+
+    private static org.springframework.test.web.servlet.MockMvc served(LiquidationReadinessController controller,
+                                                                      String apiPrefix) {
+        return org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(controller)
+                .addPlaceholderValue("apiPrefix", apiPrefix).build();
+    }
+
+    private static org.springframework.test.web.servlet.ResultActions post(
+            org.springframework.test.web.servlet.MockMvc mvc, String uri) throws Exception {
+        return mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post(uri));
+    }
+
+    private static void assertSeeOtherTo(org.springframework.test.web.servlet.ResultActions result, String location)
+            throws Exception {
+        result.andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isSeeOther())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                        .string("Location", location));
+        assertNull(result.andReturn().getModelAndView(), "a switch renders no view: " + location);
+    }
+
+    /**
+     * ⛔ POST then 303 See Other back to the GET page: the page's auto-refresh reloads the CURRENT URL, so
+     * after a 303 it re-GETs the page and can never re-POST the switch.
+     */
+    @Test
+    void suspendCallsSuspendOnceAndSeesOtherToThePage() throws Exception {
+        var rebalancer = rebalancerReading(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW, null));
+        var controller = bareController();
+        controller.setWalletRebalancer(rebalancer);
+
+        assertSeeOtherTo(post(served(controller, "/api/v1"), "/api/v1/loans/readiness/wallet-rebalance/suspend"),
+                "/api/v1/loans/readiness");
+        org.mockito.Mockito.verify(rebalancer, org.mockito.Mockito.times(1)).suspend();
+        org.mockito.Mockito.verify(rebalancer, org.mockito.Mockito.never()).resume();
+    }
+
+    @Test
+    void resumeCallsResumeOnceAndSeesOtherToThePage() throws Exception {
+        var rebalancer = rebalancerReading(activity(true, true, AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SUSPENDED));
+        var controller = bareController();
+        controller.setWalletRebalancer(rebalancer);
+
+        assertSeeOtherTo(post(served(controller, "/api/v1"), "/api/v1/loans/readiness/wallet-rebalance/resume"),
+                "/api/v1/loans/readiness");
+        org.mockito.Mockito.verify(rebalancer, org.mockito.Mockito.times(1)).resume();
+        org.mockito.Mockito.verify(rebalancer, org.mockito.Mockito.never()).suspend();
+    }
+
+    /** ⚠ The Location is derived from the request that was served, never hard-coded to the default prefix. */
+    @Test
+    void theRedirectFollowsTheApiPrefixAndTheContextPathThatServedThePost() throws Exception {
+        var controller = bareController();
+        controller.setWalletRebalancer(rebalancerReading(activity(true, false, AppConfig.LiquidationConfiguration.Mode.LIVE, null)));
+        var mvc = served(controller, "/x");
+
+        assertSeeOtherTo(post(mvc, "/x/loans/readiness/wallet-rebalance/suspend"), "/x/loans/readiness");
+        assertSeeOtherTo(post(mvc, "/x/loans/readiness/wallet-rebalance/resume"), "/x/loans/readiness");
+        assertSeeOtherTo(mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .post("/node/x/loans/readiness/wallet-rebalance/resume").contextPath("/node")),
+                "/node/x/loans/readiness");
+    }
+
+    /** A direct construction with no rebalancer still answers both routes with the same redirect. */
+    @Test
+    void withNoRebalancerBothRoutesStillSeeOtherToThePage() throws Exception {
+        var mvc = served(bareController(), "/api/v1");
+        assertSeeOtherTo(post(mvc, "/api/v1/loans/readiness/wallet-rebalance/suspend"), "/api/v1/loans/readiness");
+        assertSeeOtherTo(post(mvc, "/api/v1/loans/readiness/wallet-rebalance/resume"), "/api/v1/loans/readiness");
+    }
 }

@@ -519,4 +519,147 @@ class WalletRebalancerTest {
         }
         assertFalse(rebalancer(false).state().effective());
     }
+
+    // ---- the readiness page's reading of the gates (FAB-132) ---------------------------------------------
+
+    /** One gate scenario: what the rebalancer is configured with, and the first closed gate it must report. */
+    private record Scenario(String name, boolean env, boolean suspend, Mode mode, List<Market> configured,
+                            boolean isSyncing, WalletRebalancer.Idle expected) {
+    }
+
+    /**
+     * ⛔ The page and the bot read ONE evaluation. For every gate scenario above, {@code activity()} names the
+     * first closed gate, and {@code armed()} is true exactly when {@code onCommit()} goes on to read the wallet
+     * — so the page can never say ARMED over a bot that is idle, nor idle over a bot that is acting.
+     */
+    @Test
+    void activityAndOnCommitTakeTheSameGateDecisionInEveryScenario() {
+        List<Market> night = List.of(anticipate(NIGHT));
+        List<Market> onlyConvert = List.of(market(NIGHT, Action.CONVERT), market("lovelace", Action.CONVERT));
+        List<Scenario> scenarios = new ArrayList<>(List.of(
+                new Scenario("env off", false, false, Mode.LIVE, night, false, WalletRebalancer.Idle.ENV_DISABLED),
+                new Scenario("suspended", true, true, Mode.LIVE, night, false, WalletRebalancer.Idle.SUSPENDED),
+                new Scenario("mode DISABLED", true, false, Mode.DISABLED, night, false,
+                        WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE),
+                new Scenario("mode null", true, false, null, night, false,
+                        WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE),
+                new Scenario("only CONVERT markets", true, false, Mode.LIVE, onlyConvert, false,
+                        WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
+                new Scenario("no market", true, false, Mode.LIVE, List.of(), false,
+                        WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
+                new Scenario("an ANTICIPATE market whose own mode is DISABLED", true, false, Mode.SHADOW,
+                        List.of(anticipate(NIGHT, Mode.DISABLED), market(USDM, Action.CONVERT)), false,
+                        WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
+                new Scenario("a LIVE market under a SHADOW node", true, false, Mode.SHADOW,
+                        List.of(anticipate(NIGHT, Mode.LIVE)), false, null),
+                new Scenario("syncing", true, false, Mode.LIVE, night, true, WalletRebalancer.Idle.SYNCING),
+                new Scenario("all open", true, false, Mode.LIVE, night, false, null)));
+        // ⚠ A null market list is a gate input too: the page must read it as "no market", never throw.
+        scenarios.add(new Scenario("market list null", true, false, Mode.LIVE, null, false,
+                WalletRebalancer.Idle.NO_ANTICIPATE_MARKET));
+
+        for (Scenario s : scenarios) {
+            mode.set(s.mode());
+            markets.set(s.configured());
+            syncing.set(s.isSyncing());
+            reads.set(0);
+            signs.set(0);
+            submits.set(0);
+            WalletRebalancer rebalancer = rebalancer(s.env());
+            if (s.suspend()) {
+                rebalancer.suspend();
+            }
+
+            WalletRebalancer.Activity activity = assertDoesNotThrow(rebalancer::activity, s.name());
+            assertEquals(s.expected(), activity.idle(), s.name() + ": the first closed gate");
+            assertEquals(s.expected() == null, activity.armed(), s.name() + ": armed iff no gate is closed");
+            assertEquals(rebalancer.state(), activity.state(), s.name() + ": the state is state()'s");
+            assertEquals(s.mode(), activity.mode(), s.name() + ": the mode is the supplier's, null included");
+            assertEquals(0, reads.get(), s.name() + ": activity() reads no wallet");
+
+            rebalancer.onCommit();
+            assertEquals(activity.armed() ? 1 : 0, reads.get(),
+                    s.name() + ": armed() must be true exactly when onCommit() reads the wallet");
+            assertEquals(activity.armed() ? 1 : 0, submits.get(), s.name() + ": and submits");
+        }
+    }
+
+    /** The first closed gate wins: env off reads ENV_DISABLED whatever else holds, suspended beats syncing. */
+    @Test
+    void activityReportsTheFirstClosedGateInGateOrder() {
+        WalletRebalancer envOff = rebalancer(false);
+        envOff.suspend();
+        mode.set(Mode.DISABLED);
+        markets.set(List.of());
+        syncing.set(true);
+        assertEquals(WalletRebalancer.Idle.ENV_DISABLED, envOff.activity().idle(),
+                "env off is reported before the suspension and every later gate");
+
+        mode.set(Mode.LIVE);
+        markets.set(List.of(anticipate(NIGHT)));
+        WalletRebalancer suspended = rebalancer(true);
+        suspended.suspend();
+        assertEquals(WalletRebalancer.Idle.SUSPENDED, suspended.activity().idle(),
+                "suspended and syncing reads SUSPENDED: the suspension is the earlier gate");
+        assertFalse(suspended.activity().armed());
+    }
+
+    /** A readiness controller with nothing to read but this test's rebalancer, served the way MockMvc serves it. */
+    private org.springframework.test.web.servlet.MockMvc readinessPage(WalletRebalancer rebalancer) {
+        var beans = new org.springframework.beans.factory.support.DefaultListableBeanFactory();
+        var controller = new com.fluidtokens.aquarium.offchain.controller.LiquidationReadinessController(
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LoanService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.LoansContractRegistry.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class),
+                new AppConfig.LiquidationConfiguration(Mode.LIVE, 60, 120, 30, BigInteger.ZERO, 200), null);
+        controller.setWalletRebalancer(rebalancer);
+        return org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(controller)
+                .addPlaceholderValue("apiPrefix", "/api/v1").build();
+    }
+
+    private static void post(org.springframework.test.web.servlet.MockMvc page, String action) throws Exception {
+        page.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .post("/api/v1/loans/readiness/wallet-rebalance/" + action))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isSeeOther());
+    }
+
+    /**
+     * ⛔ Through the HTTP route, onto the REAL rebalancer: the page's Suspend stops the next block's rebalance
+     * outright (nothing read, signed or submitted), and its Resume lets the next block rebalance once.
+     */
+    @Test
+    void thePagesSuspendAndResumeRoutesStopAndRestartTheRealRebalancer() throws Exception {
+        WalletRebalancer rebalancer = rebalancer(true);
+        var page = readinessPage(rebalancer);
+
+        post(page, "suspend");
+        assertEquals(WalletRebalancer.Idle.SUSPENDED, rebalancer.activity().idle());
+        rebalancer.onCommit();
+        assertEquals(0, reads.get(), "suspended from the page: no wallet read");
+        assertEquals(0, signs.get(), "suspended from the page: nothing signed");
+        assertEquals(0, submits.get(), "suspended from the page: nothing submitted");
+
+        post(page, "resume");
+        assertTrue(rebalancer.activity().armed(), "resumed from the page: armed again");
+        assertRebalancedOnce(rebalancer, "resumed from the page");
+    }
+
+    /** ⛔ The page cannot turn on what the environment turned off. */
+    @Test
+    void thePagesResumeRouteCannotOverrideTheEnvironment() throws Exception {
+        WalletRebalancer rebalancer = rebalancer(false);
+        var page = readinessPage(rebalancer);
+
+        post(page, "resume");
+        rebalancer.onCommit();
+        assertEquals(0, reads.get(), "env off, resumed from the page: no wallet read");
+        assertEquals(0, submits.get(), "env off, resumed from the page: nothing submitted");
+        assertEquals(WalletRebalancer.Idle.ENV_DISABLED, rebalancer.activity().idle());
+        assertFalse(rebalancer.state().effective());
+    }
 }

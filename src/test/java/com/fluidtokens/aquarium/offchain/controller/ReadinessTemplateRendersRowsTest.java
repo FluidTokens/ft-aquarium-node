@@ -854,4 +854,176 @@ class ReadinessTemplateRendersRowsTest {
                 ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
                 null, null);
     }
+
+    // ---- FAB-132: the wallet-rebalancing line, rendered from the model the controller produced ---------------
+
+    /**
+     * A SHADOW controller with nothing to read but {@code activity}'s rebalancer, rendered through the real
+     * template. ⚠ Its model is the early-return one (no lending beans), and that model is what renders: the
+     * rebalance line and the banner are set before the early return, so they are on this path too.
+     */
+    private static String renderedWith(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity) {
+        var beans = new org.springframework.beans.factory.support.DefaultListableBeanFactory();
+        var controller = new LiquidationReadinessController(
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LoanService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.LoansContractRegistry.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class),
+                new com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration(
+                        com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200),
+                null);
+        controller.setWalletRebalancer(LiquidationReadinessControllerTest.rebalancerReading(activity));
+        var model = new org.springframework.ui.ConcurrentModel();
+        assertEquals("readiness", controller.readiness(model, null, null, null, null, null));
+        var context = new Context();
+        context.setVariables(model.asMap());
+        return engine().process("readiness", context);
+    }
+
+    private static com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity(
+            boolean env, boolean suspended, com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode mode,
+            com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle idle) {
+        return LiquidationReadinessControllerTest.activity(env, suspended, mode, idle);
+    }
+
+    /** The rebalance element alone, from its opening tag to the next {@code </div>} at its own depth. */
+    private static String rebalanceLine(String html) {
+        int start = html.indexOf("<div class=\"rebalance\"");
+        assertTrue(start >= 0, "the page must carry the wallet-rebalancing line");
+        int depth = 0;
+        Matcher m = Pattern.compile("<div\\b|</div>").matcher(html);
+        m.region(start, html.length());
+        while (m.find()) {
+            depth += m.group().equals("</div>") ? -1 : 1;
+            if (depth == 0) {
+                return html.substring(start, m.end());
+            }
+        }
+        throw new AssertionError("unclosed rebalance element");
+    }
+
+    /** The line's visible text: tags dropped, whitespace collapsed — what a reader of the page sees. */
+    private static String text(String fragment) {
+        return fragment.replaceAll("<[^>]+>", " ").replaceAll("\\s+", " ").trim();
+    }
+
+    /** Every {@code <form>}'s action and its button's text, in order. */
+    private static List<String[]> forms(String fragment) {
+        List<String[]> out = new ArrayList<>();
+        Matcher m = Pattern.compile("<form method=\"post\" action=\"([^\"]*)\">\\s*<button type=\"submit\">([^<]*)</button>")
+                .matcher(fragment);
+        while (m.find()) {
+            out.add(new String[] {m.group(1), m.group(2)});
+        }
+        return out;
+    }
+
+    /** The path a relative form action resolves to from the page URL a browser would be on. */
+    private static String resolvedPath(String action) {
+        return java.net.URI.create("http://h/api/v1/loans/readiness?sort=health").resolve(action).getPath();
+    }
+
+    private static final String SUSPEND_PATH = "/api/v1/loans/readiness/wallet-rebalance/suspend";
+    private static final String RESUME_PATH = "/api/v1/loans/readiness/wallet-rebalance/resume";
+
+    private static void assertOnlyForm(String line, String path, String button) {
+        List<String[]> forms = forms(line);
+        assertEquals(1, forms.size(), "exactly one form: " + line);
+        assertEquals(path, resolvedPath(forms.get(0)[0]), "the form must post to the switch under the page: " + line);
+        assertEquals(button, forms.get(0)[1].trim());
+        assertEquals(1, line.split("<form", -1).length - 1, "no other form: " + line);
+    }
+
+    @Test
+    void anEnvDisabledRebalancerReadsOffWithNoFormAtAll() {
+        String html = renderedWith(activity(false, false,
+                com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.ENV_DISABLED));
+        String line = rebalanceLine(html);
+
+        assertTrue(line.contains("Wallet rebalancing:"), line);
+        assertTrue(text(line).contains("Wallet rebalancing: OFF — AQUARIUM_WALLET_REBALANCE_ENABLED is false, so this node never rebalances "
+                + "its wallet; this page cannot turn it on"), line);
+        assertTrue(line.contains("env default: off"), line);
+        assertTrue(line.contains("suspended from this page: no"), line);
+        assertFalse(html.contains("<form"), "env off: nothing on the page can switch it — no form at all");
+        assertFalse(html.contains("Resume rebalancing"), html);
+        assertFalse(html.contains("Suspend rebalancing"), html);
+        assertFalse(line.contains("ARMED"), line);
+    }
+
+    @Test
+    void aSuspendedRebalancerOffersResumeOnly() {
+        String line = rebalanceLine(renderedWith(activity(true, true,
+                com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SUSPENDED)));
+
+        assertTrue(text(line).contains("Wallet rebalancing: SUSPENDED — from this page: nothing is rebalanced until you resume it here, or "
+                + "until the node restarts"), line);
+        assertTrue(line.contains("env default: on"), line);
+        assertTrue(line.contains("suspended from this page: yes"), line);
+        assertOnlyForm(line, RESUME_PATH, "Resume rebalancing");
+        assertFalse(line.contains("Suspend rebalancing"), line);
+        assertFalse(line.contains("ARMED"), line);
+    }
+
+    @Test
+    void anArmedRebalancerOffersSuspendOnlyAndTheBannerSaysItSubmits() {
+        String html = renderedWith(activity(true, false,
+                com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW, null));
+        String line = rebalanceLine(html);
+
+        assertTrue(text(line).contains("Wallet rebalancing: ARMED — after each block, if the wallet has drifted out of shape, the node signs "
+                + "and submits one self-send of its whole wallet, in shadow as well as live"), line);
+        assertTrue(line.contains("env default: on"), line);
+        assertTrue(line.contains("suspended from this page: no"), line);
+        assertOnlyForm(line, SUSPEND_PATH, "Suspend rebalancing");
+        assertFalse(line.contains("Resume rebalancing"), line);
+        assertFalse(line.contains("IDLE"), line);
+        assertTrue(html.contains("wallet rebalancing is ARMED"), "the banner's ARMED note is on the page");
+    }
+
+    @Test
+    void anIdleRebalancerSaysWhyAndOffersSuspendForEachReason() {
+        Map<com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle, String> details = new LinkedHashMap<>();
+        details.put(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE,
+                "the liquidation mode is DISABLED; rebalancing runs only in shadow or live");
+        details.put(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.NO_ANTICIPATE_MARKET,
+                "no action: ANTICIPATE market has an effective mode of shadow or live, so there is no token to keep ready");
+        details.put(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SYNCING,
+                "the node is syncing; rebalancing starts once it has caught up");
+        for (var e : details.entrySet()) {
+            var nodeMode = e.getKey() == com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE
+                    ? com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.DISABLED
+                    : com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW;
+            String html = renderedWith(activity(true, false, nodeMode, e.getKey()));
+            String line = rebalanceLine(html);
+
+            assertTrue(text(line).contains("Wallet rebalancing: IDLE — " + e.getValue()), e.getKey() + ": " + line);
+            for (var other : details.entrySet()) {
+                if (other.getKey() != e.getKey()) {
+                    assertFalse(line.contains(other.getValue()), e.getKey() + " must not show " + other.getKey());
+                }
+            }
+            assertOnlyForm(line, SUSPEND_PATH, "Suspend rebalancing");
+            assertFalse(line.contains("ARMED"), e.getKey() + ": idle never reads armed: " + line);
+            assertFalse(html.contains("wallet rebalancing is ARMED"), e.getKey() + ": nor does the banner");
+        }
+    }
+
+    /** ⛔ The shadow banner no longer says shadow submits nothing: it submits no liquidation. */
+    @Test
+    void theShadowBannerSaysItSubmitsNoLiquidationRatherThanNothing() {
+        String html = renderedWith(activity(true, false,
+                com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW, null));
+
+        assertTrue(html.contains("rehearsing liquidations, submitting none"), "the shadow headline");
+        assertFalse(html.contains("submitting nothing"), "the old headline claimed nothing is submitted");
+        assertTrue(html.contains("read-only except the wallet-rebalance switch"), "the header's meta line");
+    }
 }

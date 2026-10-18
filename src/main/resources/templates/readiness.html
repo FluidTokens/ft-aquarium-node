@@ -105,6 +105,16 @@
     .status-notes { margin:.5rem 0 0; padding-left:1.1rem; font-size:.76rem; color:var(--ink-2); }
     .status-notes li { margin:.15rem 0; }
 
+    /* ---- wallet rebalancing: the page's one switch ------------------------------------------- */
+    /* Not hidden on the phone view: whether the node is signing its own wallet is a glance fact. */
+    .rebalance { margin:-.4rem 0 1rem; padding:.5rem .7rem; border:1px solid var(--rule); border-radius:8px;
+                 background:var(--surface); font-size:.82rem; }
+    .rebalance-state { font-weight:700; letter-spacing:.02em; }
+    .rebalance .status-chips { margin-top:.35rem; align-items:center; }
+    .rebalance form { display:inline; margin:0; }
+    .rebalance button { font:inherit; font-size:.74rem; padding:.15rem .55rem; border-radius:4px; cursor:pointer;
+                        border:1px solid var(--rule); background:var(--surface-2); color:var(--ink); }
+
     /* ---- filters and sorting ---------------------------------------------------------------- */
     .filters { display:flex; flex-wrap:wrap; gap:.8rem; align-items:center; margin:0 0 .7rem;
                font-size:.76rem; color:var(--muted); }
@@ -190,7 +200,7 @@
     <h1>Liquidation readiness</h1>
     <div class="meta">
       <span th:text="'network ' + ${network}">network</span> &middot;
-      <span th:text="${generatedAt}">now</span> &middot; read-only
+      <span th:text="${generatedAt}">now</span> &middot; read-only except the wallet-rebalance switch
     </div>
   </div>
   <!-- Auto-refresh: one minute, on by default, and switchable off. The preference is remembered in
@@ -221,6 +231,28 @@
     <ul class="status-notes" th:if="${not #lists.isEmpty(status.notes)}">
       <li th:each="n : ${status.notes}" th:text="${n}">note</li>
     </ul>
+  </div>
+
+  <!-- ⛔ WALLET REBALANCING, as the rebalancer itself reads its gates — never "armed" while it is idle, and
+       always with the reason it is idle. The two forms are the only things on this page that change the
+       node, and they can only suspend or resume this one housekeeping job; the environment's "off" wins.
+       RELATIVE actions, like the sort links: from …/loans/readiness they resolve under whatever prefix
+       served the page. Each answers 303 back here, so the auto-refresh never re-posts. -->
+  <div class="rebalance" th:if="${rebalance != null}">
+    <span>Wallet rebalancing:</span>
+    <span class="rebalance-state" th:text="${rebalance.state}">OFF</span> — <span th:text="${rebalance.detail}">why</span>
+    <div class="status-chips">
+      <span class="chip" th:classappend="${rebalance.envEnabled} ? '' : 'off'"
+            th:text="${rebalance.envEnabled} ? 'env default: on' : 'env default: off'">env</span>
+      <span class="chip" th:classappend="${rebalance.suspended} ? '' : 'off'"
+            th:text="${rebalance.suspended} ? 'suspended from this page: yes' : 'suspended from this page: no'">suspended</span>
+      <form th:if="${rebalance.canSuspend}" method="post" action="readiness/wallet-rebalance/suspend">
+        <button type="submit">Suspend rebalancing</button>
+      </form>
+      <form th:if="${rebalance.canResume}" method="post" action="readiness/wallet-rebalance/resume">
+        <button type="submit">Resume rebalancing</button>
+      </form>
+    </div>
   </div>
 
   <!-- ⛔ FAB-115: a Lending v4 config mismatch no longer stops the node; it closes the lending gate.

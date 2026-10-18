@@ -249,6 +249,25 @@ class ExecutorContextResolutionTest {
     }
 
     /**
+     * FAB-132: the readiness page's wallet-rebalancing line and its Suspend/Resume buttons act on the rebalancer
+     * the container hands the controller. Injection is by setter and REQUIRED: optional injection would leave a
+     * container-built controller holding no rebalancer, so the line would vanish and the buttons would do nothing.
+     */
+    @Test
+    void theReadinessControllerHasTheWalletRebalancerInjectedAndRequired() throws Exception {
+        var rebalancerType = com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class;
+        assertTrue(rebalancerType.isAnnotationPresent(Service.class),
+                "WalletRebalancer must be a scanned @Service, or a required setter fails the boot");
+        var setter = com.fluidtokens.aquarium.offchain.controller.LiquidationReadinessController.class
+                .getMethod("setWalletRebalancer", rebalancerType);
+        Autowired autowired = setter.getAnnotation(Autowired.class);
+        assertNotNull(autowired, "LiquidationReadinessController.setWalletRebalancer is not @Autowired — "
+                + "the container would leave it holding no rebalancer, and the page could neither show nor suspend it");
+        assertTrue(autowired.required(), "LiquidationReadinessController.setWalletRebalancer must be "
+                + "REQUIRED: optional injection fails silent when the rebalancer bean is missing");
+    }
+
+    /**
      * FAB-136: the startup wallet sweep and its readiness gate are gone. None of the former readers may
      * still declare the setter or hold the field — a leftover setter would be dead injection, and a
      * leftover field a gate nothing opens. Matched by NAME, because the type itself no longer exists.

@@ -30,11 +30,16 @@ import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
 import lombok.extern.slf4j.Slf4j;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
@@ -88,6 +93,13 @@ import java.util.stream.Collectors;
  * constructed and no route is mapped. <b>There is no authentication and none is planned</b>: it is a
  * run-it-locally tool, it shows loan positions and the operator's own routing, and anything reachable
  * on a public port is reachable by anyone. Bind to loopback or put a reverse proxy in front.
+ *
+ * <p>⚠ <b>The page has exactly two state-changing routes</b> (FAB-132), {@code POST …/wallet-rebalance/suspend}
+ * and {@code POST …/wallet-rebalance/resume}, also unauthenticated and with no CSRF token (ruled). They can
+ * only suspend or resume wallet rebalancing — in memory, until the next restart — and nothing else; resume can
+ * never override the environment, so a node with {@code AQUARIUM_WALLET_REBALANCE_ENABLED=false} stays off
+ * whatever is posted. Each answers {@code 303 See Other} to this page, so the page's reload re-GETs it and
+ * never re-POSTs a switch.
  */
 @Controller
 @RequestMapping("${apiPrefix}/loans/readiness")
@@ -239,6 +251,45 @@ public class LiquidationReadinessController {
                            AssetDisplay valueDisplay, long unpricedLoans) {
     }
 
+    /**
+     * ⛔ FAB-132: the "Wallet rebalancing" line under the banner, one text per state, taken from the
+     * rebalancer's own {@code activity()} — the evaluation the bot acts on — so it never reads ARMED while
+     * the rebalancer is idle, and always says why it is idle.
+     *
+     * @param state      {@code OFF}, {@code SUSPENDED}, {@code IDLE} or {@code ARMED}
+     * @param canSuspend the page offers Suspend
+     * @param canResume  the page offers Resume; never with the environment off, which this page cannot override
+     */
+    public record RebalanceView(boolean envEnabled, boolean suspended, String state, String detail,
+                                boolean canSuspend, boolean canResume) {
+
+        static RebalanceView of(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity a) {
+            boolean env = a.state().envEnabled();
+            boolean suspended = a.state().suspended();
+            if (a.armed()) {
+                return new RebalanceView(env, suspended, "ARMED",
+                        "after each block, if the wallet has drifted out of shape, the node signs and submits "
+                                + "one self-send of its whole wallet, in shadow as well as live", true, false);
+            }
+            return switch (a.idle()) {
+                case ENV_DISABLED -> new RebalanceView(env, suspended, "OFF",
+                        "AQUARIUM_WALLET_REBALANCE_ENABLED is false, so this node never rebalances its wallet; "
+                                + "this page cannot turn it on", false, false);
+                case SUSPENDED -> new RebalanceView(env, suspended, "SUSPENDED",
+                        "from this page: nothing is rebalanced until you resume it here, or until the node "
+                                + "restarts", false, true);
+                case MODE_NOT_SHADOW_OR_LIVE -> new RebalanceView(env, suspended, "IDLE",
+                        "the liquidation mode is " + (a.mode() == null ? "not set" : a.mode().name())
+                                + "; rebalancing runs only in shadow or live", true, false);
+                case NO_ANTICIPATE_MARKET -> new RebalanceView(env, suspended, "IDLE",
+                        "no action: ANTICIPATE market has an effective mode of shadow or live, so there is no "
+                                + "token to keep ready", true, false);
+                case SYNCING -> new RebalanceView(env, suspended, "IDLE",
+                        "the node is syncing; rebalancing starts once it has caught up", true, false);
+            };
+        }
+    }
+
     private final ObjectProvider<LiquidationCandidateScanner> scanner;
     private final ObjectProvider<LoanService> loanService;
     private final ObjectProvider<LoanHealthService> loanHealthService;
@@ -312,6 +363,17 @@ public class LiquidationReadinessController {
     }
 
     /**
+     * FAB-132: the wallet rebalancer the page describes and can suspend or resume. Setter-injected and REQUIRED
+     * in the container; null only in a direct test construction, where the page shows no rebalancing line.
+     */
+    private com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer walletRebalancer;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setWalletRebalancer(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer walletRebalancer) {
+        this.walletRebalancer = walletRebalancer;
+    }
+
+    /**
      * ⛔ FAB-134 B2 / FAB-136: the wallet panel is gated on {@code !isSyncing}, exactly as the processors
      * are, because the local index is the only place the wallet is read from. Setter-injected and
      * REQUIRED in the container; null only in a direct test construction, where it reads as open.
@@ -360,8 +422,13 @@ public class LiquidationReadinessController {
         // unverified reference script costs size, not lending, so the rows keep their own verdicts.
         model.addAttribute("referenceScriptDegradations", loansReferenceScriptVerifier == null ? List.of()
                 : loansReferenceScriptVerifier.degradations());
+        // ⛔ ONE activity() read for the rebalancing line AND the banner's ARMED note, before the early
+        // return: the two can never disagree, and both show even when the lending beans are absent.
+        var rebalanceActivity = walletRebalancer == null ? null : walletRebalancer.activity();
+        model.addAttribute("rebalance", rebalanceActivity == null ? null : RebalanceView.of(rebalanceActivity));
         model.addAttribute("status", OperationalStatus.of(liquidationConfiguration,
-                convertEnabled, compoundEnabled, processorEnabled));
+                convertEnabled, compoundEnabled, processorEnabled,
+                rebalanceActivity != null && rebalanceActivity.armed()));
         model.addAttribute("sort", sort == null ? "health" : sort);
         model.addAttribute("dir", dir == null ? "asc" : dir);
         model.addAttribute("principalFilter", principal);
@@ -444,6 +511,37 @@ public class LiquidationReadinessController {
         model.addAttribute("pages", pages);
         model.addAttribute("rows", arranged.subList(from, Math.min(from + PAGE_SIZE, arranged.size())));
         return "readiness";
+    }
+
+    /**
+     * ⛔ FAB-132: suspend wallet rebalancing until resumed here or the node restarts. Reads no parameter and no
+     * body, renders no view, and answers {@code 303 See Other} to the GET page — derived from THIS request, so
+     * the context path and {@code apiPrefix} are whatever served the POST — so a reload never re-POSTs.
+     */
+    @PostMapping("/wallet-rebalance/suspend")
+    public ResponseEntity<Void> suspendWalletRebalance(HttpServletRequest request) {
+        if (walletRebalancer != null) {
+            walletRebalancer.suspend();
+        }
+        String uri = request.getRequestURI();
+        String suffix = "/wallet-rebalance/suspend";
+        String page = uri.endsWith(suffix) ? uri.substring(0, uri.length() - suffix.length()) : uri;
+        return ResponseEntity.status(HttpStatus.SEE_OTHER).header(HttpHeaders.LOCATION, page).build();
+    }
+
+    /**
+     * ⛔ FAB-132: lift a suspension. It can never turn on a rebalancer the environment turned off — the rebalancer
+     * itself refuses — and, like suspend, it answers {@code 303 See Other} to the GET page derived from the request.
+     */
+    @PostMapping("/wallet-rebalance/resume")
+    public ResponseEntity<Void> resumeWalletRebalance(HttpServletRequest request) {
+        if (walletRebalancer != null) {
+            walletRebalancer.resume();
+        }
+        String uri = request.getRequestURI();
+        String suffix = "/wallet-rebalance/resume";
+        String page = uri.endsWith(suffix) ? uri.substring(0, uri.length() - suffix.length()) : uri;
+        return ResponseEntity.status(HttpStatus.SEE_OTHER).header(HttpHeaders.LOCATION, page).build();
     }
 
     /**
