@@ -2457,6 +2457,109 @@ class LiquidationReadinessControllerTest {
         assertFalse(row.blocker().blocked(), row.blocker().toString());
     }
 
+    /**
+     * ⛔ The CALL SITE again, through readiness(), with the principal's metadata KNOWN (6 decimals) so the page
+     * scales it: one base unit short of the advance, the note must not read "short of" between two figures
+     * the page's rounding makes equal — whatever formatter the call site is handed.
+     */
+    @Test
+    void aScaledTokenPrincipalRowOneBaseUnitShortStatesBothFiguresExactly() {
+        TokenMetadata metadata = new TokenMetadata(PRINCIPAL_TOKEN.toUnit(), "PRIN", "Principal", 6,
+                TokenMetadata.Source.REGISTRY);
+        BigInteger advance = renderScaledTokenPrincipalRow(List.of(walletUtxo(50_000_000L)), metadata)
+                .advancePrincipalAmount();
+        assertNotNull(advance, "fixture premise: the loan must be priced");
+
+        LiquidationReadinessController.Row row = renderScaledTokenPrincipalRow(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 1_180_000L, PRINCIPAL_TOKEN, advance.longValueExact() - 1)), metadata);
+
+        assertEquals(advance, row.advancePrincipalAmount(), "fixture premise: the same advance both renders");
+        AssetDisplay rounded = AssetDisplay.of(advance, metadata);
+        assertEquals(rounded.amountText(), AssetDisplay.of(advance.subtract(BigInteger.ONE), metadata).amountText(),
+                "fixture premise: the page's rounding makes the two figures look equal");
+        assertEquals("funds", row.blocker().label(), row.blocker().toString());
+        List<String> figures = shortOfFigures(row.blocker().detail());
+        assertNotEquals(figures.get(0), figures.get(1), row.blocker().detail());
+        assertEquals(List.of(AssetDisplay.of(advance.subtract(BigInteger.ONE), metadata).exactText() + " PRIN",
+                rounded.exactText() + " PRIN"), figures, row.blocker().detail());
+        assertTrue(row.blocker().detail().contains("add at least 0.000001 PRIN;"), row.blocker().detail());
+    }
+
+    /**
+     * {@link #renderLiquidatable} for the token-principal ANTICIPATE row of
+     * {@link #aTokenPrincipalAnticipateRowOverTheMeasuredWalletSaysConsolidate}, with a token-metadata service
+     * that knows the principal — the one thing that harness cannot inject.
+     */
+    private static LiquidationReadinessController.Row renderScaledTokenPrincipalRow(
+            List<com.bloxbean.cardano.client.api.model.Utxo> walletUtxos, TokenMetadata principalMetadata) {
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN.toUnit(), 1_000_000_000_000L)));
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(walletUtxos);
+        FakeOracleClient oracle = new FakeOracleClient(LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("22"), input("33"), input("44")), LoanFixtures.charli3(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
+                        BigInteger.TWO, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("66"), input("77"), input("88")));
+        var metadata = new com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService(null, null, null) {
+            @Override
+            public TokenMetadata lookup(String unit) {
+                return PRINCIPAL_TOKEN.toUnit().equals(unit) ? principalMetadata
+                        : "lovelace".equals(unit) ? TokenMetadata.ada() : TokenMetadata.unknown(unit);
+            }
+        };
+
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L, LoanFixtures.liquidation(),
+                new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN));
+        long now = System.currentTimeMillis();
+        var assessments = List.of(LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(), OraclePriceFeed.unit(), now));
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(loan), 1, 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(assessments, census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null) {
+            @Override
+            public com.fluidtokens.aquarium.offchain.model.loans.LoanHealth health(Loan l, long at) {
+                return new com.fluidtokens.aquarium.offchain.model.loans.LoanHealth(
+                        BigInteger.valueOf(100_000_000L), true, null, BigInteger.ZERO, true, null);
+            }
+        };
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(oracle), provide(null), provide(metadata), provide(LoanFixtures.registry()),
+                provide(utxos), configuration, network);
+        controller.setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
+        controller.setProtocolParamsSupplier(LoanFixtures.protocolParams());
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        return rows.getFirst();
+    }
+
     // ---- FAB-134 B2 / FAB-136: the wallet panel reads the local index, gated on !isSyncing only ----
 
     private static final long T0 = 1_800_000_000_000L;
