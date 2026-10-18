@@ -61,6 +61,18 @@ willing to front *if* you enable `ANTICIPATE` markets (§9). **The 30,000 FLDT d
 it is delegated to this wallet from a separate wallet, which can be cold. That separation is the
 point: the hot wallet the node signs with never has to hold the stake.
 
+**An `ANTICIPATE` market adds a funding rule of its own.** Once the bot is in `shadow` or `live` with
+such a market, wallet rebalancing keeps the wallet in a fixed shape (§9, "Wallet rebalancing"), and
+that shape costs ada: **10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA beside the
+bundle of any other tokens, and a 5 ADA collateral UTxO** (5 ADA under current protocol
+parameters), plus a transaction fee and enough left over for a change output. A wallet with less
+than that is not reshaped, and the node logs a `[REBALANCE] REFUSED: …` warning on every block until
+you add ada.
+
+**⛔ Keep no reference-script or datum UTxO in this wallet.** A rebalance spends every UTxO the wallet
+holds, and its outputs carry no reference script and no datum — so a reference script or datum
+parked here is consumed and not recreated.
+
 **⛔ The wallet must hold no UTxO created before 2025-05-06.** The node reads its wallet **only from
 its own index**, and that index starts at mainnet slot `154984561` (2025-05-06). A UTxO created
 before then was never seen by the index, so the node cannot see it: it is not counted, not spent,
@@ -274,6 +286,40 @@ the default; set it empty and the summary shows "USD unavailable", with a reason
 `LOANS_UI_USD_REFERENCE_UNIT`. On preview it is blank, so the summary shows "USD unavailable" there too.
 It is listed, commented out, in `docker/.env.advanced.example`.
 
+### Wallet rebalancing on the page
+
+Under the status banner, a **`Wallet rebalancing:`** line shows what the rebalancer (§9, "Wallet
+rebalancing") will do on the next block, read from the same check the rebalancer itself runs — it
+never says `ARMED` while the rebalancer is idle, and it always says why it is idle:
+
+| state | what it means |
+|---|---|
+| `ARMED` | after each block, if the wallet has drifted out of shape, the node signs and submits one self-send of its whole wallet — in shadow as well as live |
+| `IDLE` | rebalancing is allowed but nothing arms it: the liquidation mode is not shadow or live, no `action: ANTICIPATE` market has an effective mode of shadow or live, or the node is syncing. The line names which |
+| `SUSPENDED` | suspended from this page; nothing is rebalanced until it is resumed here or the node restarts |
+| `OFF` | `AQUARIUM_WALLET_REBALANCE_ENABLED` is `false`; this page cannot turn it on |
+
+Two chips beside it show `env default: on`/`off` (the environment variable) and `suspended from this
+page: yes`/`no`. When rebalancing is `ARMED` the banner also carries a note saying so.
+
+**The page's only controls that change the node** are the **`Suspend rebalancing`** and **`Resume
+rebalancing`** buttons. Suspend before you move funds in or out of the wallet by hand, so the node
+does not reshape it under you, and resume when you are done. Neither does anything else:
+
+- **The suspension lives in memory.** A restart forgets it and rebalancing resumes.
+- **Resume cannot override the environment.** With `AQUARIUM_WALLET_REBALANCE_ENABLED=false` there is
+  no Resume button, and a posted resume leaves rebalancing off.
+- **There is no authentication and no CSRF protection on these buttons.** Anyone who can reach the
+  page — or get a browser that can reach it to post a form — can suspend or resume rebalancing. A
+  resume can lead to a self-send of the node's own wallet back to itself (a transaction fee), never
+  to a payment to anyone else. One more reason the port stays unpublished.
+
+**⚠ Behind a reverse proxy that strips a path prefix, the page you land on after pressing a button
+can be wrong.** Each button answers `303 See Other` with a `Location` that is an absolute path built
+from the request path as the node received it, and the node does not apply forwarded headers such
+as `X-Forwarded-Prefix` — so a prefix the proxy removed is missing from the redirect. The action itself has already happened;
+navigate back to the page and reload it.
+
 ### ⛔ `LOANS_UI_ENABLED=false` does NOT close port 8080
 
 It is easy to read the flag as an on/off switch for the whole surface. It is not. Only
@@ -287,7 +333,9 @@ endpoint is unconditional and stays up.** What an unauthenticated caller reaches
 | `GET /api/v1/loans/oracle` | **yes** | the oracle feeds it is using |
 | `GET /healthcheck` | **yes** | five booleans |
 | `GET /actuator/health`, `/actuator/info`, `/actuator/prometheus` | **yes** | build commit, dirty flag, and runtime metrics |
-| `GET /api/v1/loans/readiness` | no — this is the only thing the flag removes | the HTML operator page |
+| `GET /api/v1/loans/readiness` | no — the flag removes this page and the two routes below | the HTML operator page |
+| `POST /api/v1/loans/readiness/wallet-rebalance/suspend` | no | nothing — it **suspends wallet rebalancing** (in memory, until resumed or restarted) |
+| `POST /api/v1/loans/readiness/wallet-rebalance/resume` | no | nothing — it **resumes wallet rebalancing**, unless `AQUARIUM_WALLET_REBALANCE_ENABLED=false` |
 
 **⇒ Turning the UI off narrows the disclosure; it does not end it.** The exposure decision above is
 about the *port*, not about the flag. Tunnel it or keep it on a private network either way.
@@ -303,8 +351,11 @@ skipping.
 loan list looks like the chain.
 
 **Step 2 — `shadow`.** Set `AQUARIUM_LIQUIDATION_MODE=shadow` and restart. The bot now scans,
-prices, builds and size-checks real transactions, and **refuses to submit every one of them.** This
-is a rehearsal against real loans at no risk. Read the result:
+prices, builds and size-checks real liquidations, and **refuses to submit every one of them.** This
+is a rehearsal against real loans at no risk to the loans. **⚠ It is not a node that submits
+nothing:** with an `action: ANTICIPATE` market configured (with an effective mode of shadow or live),
+wallet rebalancing signs and submits self-sends of the node's own wallet in shadow too, each costing
+a transaction fee — see §9, "Wallet rebalancing". Read the result:
 
 ```bash
 curl -s http://localhost:8080/api/v1/loans/liquidations | jq .
@@ -416,6 +467,76 @@ duplicate `unit`, `ANTICIPATE` with no `cap`, or a negative `cap` on an `ANTICIP
 deliberate — a typo that quietly disabled one market would look exactly like a market with no
 liquidations in it.
 
+### Wallet rebalancing — the shape an ANTICIPATE market keeps your wallet in
+
+**Wallet rebalancing is on by default** (`AQUARIUM_WALLET_REBALANCE_ENABLED=true`), and on a node as
+shipped it does nothing: it is armed only by the settings below. Once armed, **it signs and submits
+transactions from your wallet, in `shadow` as well as `live`** — they are self-sends, wallet
+housekeeping, not liquidations.
+
+**When it acts.** All of these must hold, checked in this order:
+
+1. `AQUARIUM_WALLET_REBALANCE_ENABLED` is `true` (the default);
+2. it is not suspended from the readiness page (§7);
+3. `AQUARIUM_LIQUIDATION_MODE` is `shadow` or `live`;
+4. at least one market is `action: ANTICIPATE` with an **effective** mode of shadow or live — its own
+   `mode`, capped by the node's (§9 above); an ADA-principal (`lovelace`) `ANTICIPATE` market counts;
+5. the node is not syncing (§6).
+
+Then, after every block the node commits, it reads the wallet from its index and, **if the wallet is
+out of shape, builds, signs and submits one self-send** that puts it back in shape. A node in
+`disabled` mode, or with no such market, never rebalances.
+
+**The shape.**
+
+- **One UTxO per token of those `ANTICIPATE` markets**, holding all of that token and exactly 10 ADA;
+- **one UTxO holding every other token**, with exactly 10 ADA — only if the wallet holds any;
+- **one ada-only collateral UTxO of exactly C**, where C is the larger of the ledger's maximum
+  collateral for a transaction and 5 ADA — 5 ADA under current protocol parameters;
+- **every remaining lovelace in one ada-only UTxO.**
+
+Why: the bot fronts an `ANTICIPATE` principal from **one** UTxO, which must carry the token *and*
+the ada the transaction needs beside it (the fee ceiling plus 2 ADA), so each such token gets its own
+funded UTxO instead of being scattered or bundled with others. C is never below the 5 ADA the
+transaction builder selects as collateral, nor below the most collateral the ledger can require, so
+a collateral UTxO of the right size is kept ready for the bot's script transactions. And one change
+UTxO keeps your ada in one piece rather than fragmented. An ADA-principal market is fronted from that change,
+so it adds no UTxO of its own. **A token of an `ANTICIPATE` market whose mode is `DISABLED` is not
+kept ready**: it goes in the "every other token" UTxO.
+
+**The funds it needs.** The wallet's ada must cover 10 ADA for each `ANTICIPATE` token it holds,
+10 ADA if it holds any other token, and C, **plus** the transaction fee and enough left over for the
+change output — roughly 10 ADA × each `ANTICIPATE` token, + 10 ADA if there are other tokens, + 5
+ADA, + the fee. Otherwise the self-send is not built, the
+node logs a warning **on every block**:
+
+```
+[REBALANCE] REFUSED: … — the wallet is out of shape …; nothing signed or submitted
+```
+
+and **nothing is signed or submitted, so a refusal costs no fee.** The same warning appears when the
+transaction cannot be built to the exact shape — for example a bundle of other tokens so large that
+its minimum ada exceeds 10 ADA — or when it would exceed the ledger's size limits. Add ada, or remove
+the tokens that cannot be shaped, and the warnings stop.
+
+**⛔ It spends the whole wallet.** Every UTxO under the wallet's payment key is an input — whatever
+its stake part — with no exception for reference scripts or datums, and every output goes to the
+wallet's base address carrying neither. **A reference-script or datum UTxO in the bot wallet is
+consumed, and its script or datum is not recreated.** Keep them elsewhere (§2).
+
+**A duplicate submission is expected.** There is no pending-transaction guard: if the next block
+still shows the old wallet, the same self-send is built and submitted again. The duplicate is
+rejected and logged at ERROR as `[REBALANCE] submission rejected` — harmless, because the same
+transaction can only be applied once.
+
+**Turning it off, or pausing it.**
+
+- **Off:** `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. Nothing on the readiness page can
+  turn it back on.
+- **Paused:** **`Suspend rebalancing`** on the readiness page (§7) — do this before you move funds
+  in or out of the wallet by hand, then **`Resume rebalancing`**. The suspension is held in memory, so
+  a restart resumes rebalancing.
+
 ---
 
 ## 10. Security checklist
@@ -425,7 +546,10 @@ liquidations in it.
 - [ ] The 30,000 FLDT is delegated **from a separate wallet**, ideally cold
 - [ ] No `ports:` mapping on `aquarium-node` — UI reached by tunnel or private network (§7)
 - [ ] You have not published 8080 on the strength of `LOANS_UI_ENABLED=false` — that flag
-      removes the HTML page only, and `/api/v1/loans` still serves your positions (§7)
+      removes the HTML page and its two buttons only, and `/api/v1/loans` still serves your
+      positions (§7)
+- [ ] With `LOANS_UI_ENABLED=true`, only people you trust can reach the page — anyone who can
+      reach it can suspend or resume wallet rebalancing (§7)
 - [ ] Postgres is on `127.0.0.1` (the shipped file does this; check if you edited it)
 - [ ] A real `DB_PASSWORD`
 - [ ] The image version is **pinned**, not `latest`
@@ -434,9 +558,11 @@ liquidations in it.
 - [ ] Log rotation is on (the shipped file sets it) — logs are verbose and the disk is shared with
       your database
 
-**What the node never does:** it does not accept inbound commands, has no admin endpoint, and
-nothing it serves can move funds. The exposure risk from the UI is **disclosure** — your positions
-and posture — not remote control.
+**What the node never does:** nothing it serves can pay funds to anyone. It accepts exactly two
+inbound commands, and only with `LOANS_UI_ENABLED=true`: the readiness page's routes that suspend or
+resume wallet rebalancing (§7). The worst a resume can lead to is a self-send of the node's own
+wallet back to itself — a transaction fee — never a payment to anyone else. The exposure risk from
+the UI is therefore mostly **disclosure** — your positions and posture — plus that one switch.
 
 ---
 

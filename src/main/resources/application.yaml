@@ -606,8 +606,10 @@ loans:
     # Blank: the mainnet USDM unit means nothing here, so the readiness page shows USD as unavailable.
     usd-reference-unit: ""
   # Preview is where the bot is exercised, so the loop runs by default here — in shadow, which
-  # scans, builds, prices and records without ever signing or submitting. Every other liquidation
-  # key keeps its base-document value.
+  # scans, builds, prices and records and never submits a liquidation. ⚠ With an `action: ANTICIPATE`
+  # market configured (one not set to `mode: DISABLED`), the wallet rebalancer (`wallet.rebalance` in
+  # the base document) signs and submits self-sends of the bot wallet in shadow too. Every other
+  # liquidation key keeps its base-document value.
   # Preview is the only place the compound path is exercised, and it STAYS DISARMED HERE.
   #
   # This file ships inside the public operator image: anyone running it with the preview profile gets

@@ -397,6 +397,33 @@ New, optional: `AQUARIUM_SYNCING_THRESHOLD_MINUTES` (default `10`). The node cou
 processing, `/healthcheck` answers `...syncing...` — while its last applied block is more than this
 many minutes old.
 
+### Wallet rebalancing is on by default
+
+**This is a different mechanism from the startup rebalance above, and it is continuous.** The removed
+one ran once at boot; this one watches the wallet on every block. `AQUARIUM_WALLET_REBALANCE_ENABLED`
+defaults to `true`, and it acts when the node is in `shadow` or `live` **and** at least one market is
+`action: ANTICIPATE` with an effective mode of shadow or live — see
+[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-an-anticipate-market-keeps-your-wallet-in).
+A node in `disabled` mode, or with no such market, is unaffected.
+
+**If your node meets that condition, expect a transaction right after upgrading.** On the first block
+once the node is synced, if the wallet is not already in the target shape, the node **signs and
+submits one self-send of its whole wallet — in `shadow` too** — and it does so again whenever the
+wallet drifts out of shape. Each one costs a transaction fee.
+
+- **Funds.** Shaping needs 10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA beside the
+  bundle of any other tokens, and a 5 ADA collateral UTxO (under current protocol parameters), plus
+  the fee and a change output. A wallet with less is not touched: the node logs
+  `[REBALANCE] REFUSED: …` at WARN on every block and submits nothing, so a refusal costs no fee.
+- **⛔ Move reference scripts and datum UTxOs out of the bot wallet BEFORE upgrading.** The self-send
+  spends every wallet UTxO and recreates no reference script and no datum.
+- **Moving funds by hand?** Press **`Suspend rebalancing`** on the readiness page first
+  (`LOANS_UI_ENABLED=true`, [deploying.md §7](deploying.md#wallet-rebalancing-on-the-page)), and
+  **`Resume rebalancing`** when you are done, so the node does not reshape the wallet under you. The
+  suspension is held in memory: a restart resumes rebalancing.
+- **To opt out**, set `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. The readiness page
+  cannot turn it back on.
+
 ---
 
 ## 8. ⛔ The image runs as a non-root user — if you mount secrets as FILES, read this first
