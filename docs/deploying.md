@@ -252,6 +252,25 @@ otherwise have to. Add this under `aquarium-node`, and bind it to the interface 
 just moves the open door. If you want browser access from outside, terminate TLS *and* require auth
 (mTLS, an identity proxy, basic auth over TLS at minimum).
 
+### The summary at the top of the page
+
+On a desktop-width screen the page opens with a summary of the loans it lists:
+
+- **Counts** — how many loans, how many are liquidatable now, and how many the bot could not process.
+- **Collateral locked (TVL)** — the collateral sitting in live loans, per token. It is *not* the debt.
+  Each loan's collateral is valued in ADA at that loan's own collateral oracle.
+- **A loan whose collateral has no usable oracle price** stays in its token's amount, is left out of the
+  ADA and USD totals, and is counted on an "excluded" line — so a gap is said, never hidden as a zero.
+- **The USD figure is an ESTIMATE, not a quote.** It is the ADA total converted at the USDM oracle price,
+  counting 1 USDM as $1. USDM can trade off its peg and the oracle can lag; the page labels the figure
+  "estimated" and names the method on the line beside it.
+- **The summary follows the filters, not the page.** Narrow the list with the filters and it re-counts
+  what is left, across every page; paging through the list does not change it.
+
+The USD figure is driven by `LOANS_UI_USD_REFERENCE_UNIT`, the token whose oracle price converts ADA to
+dollars. It defaults to USDM on mainnet; set it empty to hide USD. On preview it is blank and the summary
+shows USD as unavailable. It is listed, commented out, in `docker/.env.advanced.example`.
+
 ### ⛔ `LOANS_UI_ENABLED=false` does NOT close port 8080
 
 It is easy to read the flag as an on/off switch for the whole surface. It is not. Only

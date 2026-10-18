@@ -285,8 +285,10 @@
 
   <!-- ⛔ FAB-145: THE BOOK, on the desktop view only (the phone has the glance above). Computed from the
        FILTERED list, never the page. TVL is the COLLATERAL locked in live loans, not debt, valued at each
-       loan's own collateral oracle; USD goes through the USDM oracle feed alone. A loan whose collateral
-       has no usable price stays in its token's amount, is left out of every value, and is counted. -->
+       loan's own collateral oracle. USD is an ESTIMATE, never a quote: the ADA total converted at the USDM
+       oracle price, counting 1 USDM as $1 — and the figure and the line beside it say so in words. A loan
+       whose collateral has no usable price stays in its token's amount, is left out of every value, and is
+       counted. -->
   <div class="book" th:if="${book != null}">
     <div class="book-head">
       <span class="book-label">The book</span>
@@ -316,10 +318,11 @@
       <span th:if="${book.totalAdaDisplay != null}" th:title="|exact: ${book.totalAdaDisplay.exactText} ADA|"
             th:text="|≈ ${book.totalAdaDisplay.amountText} ADA|">≈ 0 ADA</span>
       <span th:if="${book.totalAdaDisplay == null}" class="unknown">ADA total unknown</span>
-      <span th:if="${book.usdDisplay != null}" th:title="|exact: ${book.usdDisplay.exactText} USDM|"
-            th:text="'≈ $' + ${book.usdDisplay.amountText}">≈ $0</span>
+      <span th:if="${book.usdDisplay != null}"
+            th:title="|exact: ${book.usdDisplay.exactText} USDM. An estimate, not a quote: the ADA total converted at the USDM oracle price.|"
+            th:text="'≈ $' + ${book.usdDisplay.amountText} + ' (estimated)'">≈ $0 (estimated)</span>
       <span th:if="${book.adaUsdRateDisplay != null}" class="reason"
-            th:text="'1 ADA ≈ $' + ${book.adaUsdRateDisplay.amountText} + ' (USDM oracle)'">1 ADA ≈ $0 (USDM oracle)</span>
+            th:text="'estimated from ADA → USDM at the USDM oracle price (1 ADA ≈ $' + ${book.adaUsdRateDisplay.amountText} + '), counting 1 USDM as $1'">estimated from ADA → USDM at the USDM oracle price (1 ADA ≈ $0), counting 1 USDM as $1</span>
       <span th:if="${book.usdDisplay == null}" class="reason"
             th:text="|USD unavailable: ${book.usdUnavailableReason}|">USD unavailable</span>
     </div>

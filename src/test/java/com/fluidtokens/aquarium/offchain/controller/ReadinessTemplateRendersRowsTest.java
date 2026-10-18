@@ -432,6 +432,23 @@ class ReadinessTemplateRendersRowsTest {
         return html.substring(start, html.indexOf("class=\"filters\"", start));
     }
 
+    /** One {@code <span>} of the book: its attributes and its text. */
+    private record Span(String attributes, String text) {
+        String title() {
+            Matcher m = Pattern.compile("title=\"([^\"]*)\"").matcher(attributes);
+            return m.find() ? m.group(1) : null;
+        }
+    }
+
+    /**
+     * The first {@code <span>} in {@code book} whose text starts with {@code textPrefix} — the ELEMENT, not a
+     * substring of the block, so a word asserted on it is in the same element as the figure. Null when none.
+     */
+    private static Span span(String book, String textPrefix) {
+        Matcher m = Pattern.compile("<span([^>]*)>(" + Pattern.quote(textPrefix) + "[^<]*)</span>").matcher(book);
+        return m.find() ? new Span(m.group(1), m.group(2)) : null;
+    }
+
     /**
      * A book of seven loans with FLDT as the one token line (3 loans, 1 unpriced), 128 ADA in total, and
      * either $85.33 at 1 ADA ≈ $0.666666 or USD unavailable for {@code usdReason}.
@@ -468,8 +485,6 @@ class ReadinessTemplateRendersRowsTest {
         assertTrue(book.contains(">FLDT<"), "the token line carries its label: " + book);
         assertTrue(book.contains(">4.50<"), "and its locked amount, scaled: " + book);
         assertTrue(book.contains("≈ 128.00 ADA"), "the ada estimate: " + book);
-        assertTrue(book.contains("≈ $85.33"), "the dollar estimate: " + book);
-        assertTrue(book.contains("1 ADA ≈ $0.666666 (USDM oracle)"), "the implied rate and its source: " + book);
         assertTrue(book.contains("1 loan(s) excluded: their collateral has no usable oracle price"),
                 "the exclusions are said, not hidden: " + book);
         assertFalse(book.contains("USD unavailable"), "no unavailable text beside a dollar figure: " + book);
@@ -477,6 +492,34 @@ class ReadinessTemplateRendersRowsTest {
                 "the whole block is labelled an estimate that follows the filters");
         assertTrue(html.indexOf("class=\"book\"") < html.indexOf("class=\"filters\""), "the book sits above the filters");
         assertTrue(html.contains(".wallet-age, .book { display:none; }"), "and is hidden under the phone breakpoint");
+    }
+
+    /**
+     * ⛔ FAB-145 T3: the dollar figure is an ESTIMATE — the ADA total converted at the USDM oracle price, 1 USDM
+     * counted as $1 — and says so in words, in the figure's own element and on the line beside it. A reader who
+     * sees only those two cannot take it for a quote or for a USD oracle.
+     */
+    @Test
+    void theDollarFigureSaysItIsAnEstimateFromAdaToUsdm() {
+        String book = book(render(List.of(fullRow()), ctx -> ctx.setVariable("book", bookSummary("FLDT", null))));
+        assertNotNull(book);
+
+        Span usd = span(book, "≈ $");
+        assertNotNull(usd, "the dollar figure renders as its own element: " + book);
+        assertEquals("≈ $85.33 (estimated)", usd.text(), "the word 'estimated' is in the figure's own element");
+        assertNotNull(usd.title(), "the dollar figure carries a tooltip: " + usd);
+        assertTrue(usd.title().contains("85.333333 USDM"), "the tooltip keeps the exact USDM amount: " + usd.title());
+        assertTrue(usd.title().contains("estimate"), "the tooltip says it is an estimate: " + usd.title());
+        assertTrue(usd.title().contains("not a quote"), "and not a quote: " + usd.title());
+
+        Span rate = span(book, "estimated from ");
+        assertNotNull(rate, "the rate line renders as its own element and names the method: " + book);
+        String line = rate.text();
+        assertTrue(line.contains("estimated"), "the rate line says estimated: " + line);
+        assertTrue(line.contains("ADA → USDM"), "the conversion's direction: " + line);
+        assertTrue(line.contains("USDM oracle"), "the price it uses: " + line);
+        assertTrue(line.contains("1 ADA ≈ $0.666666"), "the implied rate: " + line);
+        assertTrue(line.contains("counting 1 USDM as $1"), "the assumption that makes USDM dollars: " + line);
     }
 
     /** USD unavailable: the reason takes the figure's place, and no dollar figure renders at all. */
@@ -488,6 +531,7 @@ class ReadinessTemplateRendersRowsTest {
         assertNotNull(book);
         assertTrue(book.contains("USD unavailable: " + reason), "the reason renders: " + book);
         assertFalse(book.contains("≈ $"), "no dollar figure renders: " + book);
+        assertFalse(book.contains("estimated from ADA"), "and no rate line, which would read as a figure: " + book);
         assertTrue(book.contains("≈ 128.00 ADA"), "the ada estimate is unaffected");
     }
 
