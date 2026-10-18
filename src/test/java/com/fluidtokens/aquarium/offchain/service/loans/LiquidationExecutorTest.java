@@ -4175,4 +4175,117 @@ class LiquidationExecutorTest {
         return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
                 OraclePriceFeed.unit(), collateralFeed(), VALID_FROM));
     }
+
+    /**
+     * The client the ranking asks for (the provider's SECOND answer): ada legs price 1:1 as in
+     * production, and a lookup for {@code throwingFor} THROWS — counted, so a test can show the throw
+     * really happened rather than the candidate merely going unpriced some other way.
+     */
+    private static final class ThrowingLegOracleClient extends FluidOracleClient {
+
+        private final AssetType throwingFor;
+
+        private int throwsSoFar;
+
+        ThrowingLegOracleClient(AssetType throwingFor) {
+            super("http://unused.invalid");
+            this.throwingFor = throwingFor;
+        }
+
+        @Override
+        public Optional<OraclePriceFeed> findFeedForLeg(AssetType asset, AssetType oracleToken, long atMillis) {
+            if (throwingFor.equals(asset)) {
+                throwsSoFar++;
+                throw new IllegalStateException("ranking probe: this leg's feed lookup throws");
+            }
+            return super.findFeedForLeg(asset, oracleToken, atMillis);
+        }
+    }
+
+    /**
+     * FAB-144: ONE candidate's feed lookup throwing costs that candidate its price, not the cycle its
+     * ranking. Scanned throwing-first, then the 10-ada slice, then the 50-ada one: the cycle must walk
+     * the 50-ada slice, the 10-ada slice, and the throwing candidate LAST — not the scan's order, which
+     * is what the cycle-wide fallback would walk — and must not report the ranking as failed.
+     */
+    @Test
+    void aFeedLookupThrowingForOneCandidateRanksItLastAndTheOthersByRewardNotTheWholeCycleInScanOrder() {
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
+        when(builder.build(any(LiquidateTransactionBuilder.Request.class)))
+                .thenThrow(new IllegalStateException("ordering probe: the build itself is not under test"));
+        Scenario throwing = tokenScenarioAt("a0".repeat(32), "c1d2e3f4a5b6c7d8");
+        Scenario cheap = scenario(BigInteger.valueOf(100));
+        Scenario rich = secondScenario();
+        List<Scenario> all = List.of(throwing, cheap, rich);
+        ThrowingLegOracleClient rankingClient = new ThrowingLegOracleClient(COLLATERAL_TOKEN);
+        CountingOracleProvider oracles = new CountingOracleProvider(new FakeOracleClient(List.of()), rankingClient);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN),
+                List.of(throwing.assessment(), cheap.assessment(), rich.assessment()),
+                all, allUnspent(all), List.of(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
+                LoanFixtures.protocolParams(), null, builder, metrics());
+
+        List<ILoggingEvent> events = cyclesLogged(wiring, 1);
+
+        assertEquals(1, rankingClient.throwsSoFar,
+                "the instrument: the throwing candidate's lookup was asked, once, and threw: " + events);
+        List<String> oldestFirst = new ArrayList<>(wiring.log().newestFirst(10).stream()
+                .map(LiquidationDecision::loanUtxoRef).toList());
+        java.util.Collections.reverse(oldestFirst);
+        assertEquals(List.of(TX_LOAN_2 + "#0", TX_LOAN + "#0", "a0".repeat(32) + "#0"), oldestFirst,
+                "the two priced by reward descending, the throwing one LAST — not scan order: " + events);
+        assertTrue(events.stream().map(ILoggingEvent::getFormattedMessage)
+                        .anyMatch(message -> message.equals("liquidation order (most profitable first): "
+                                + TX_LOAN_2 + "#0 ≈50000000 lovelace, " + TX_LOAN + "#0 ≈10000000 lovelace, "
+                                + "a0".repeat(32) + "#0 unpriced")),
+                "the order line names the throwing candidate as unpriced: " + events);
+        assertEquals(List.of(), events.stream()
+                        .filter(event -> event.getLevel() == Level.WARN)
+                        .map(ILoggingEvent::getFormattedMessage)
+                        .filter(message -> message.startsWith("ranking this cycle's candidates failed"))
+                        .toList(),
+                "one candidate's throw is contained per candidate, never a cycle-wide ranking failure");
+    }
+
+    /** The {@code liquidation order} INFO lines one cycle logged. */
+    private static List<String> liquidationOrderLines(List<ILoggingEvent> events) {
+        return events.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(message -> message.startsWith("liquidation order (most profitable first): "))
+                .toList();
+    }
+
+    /**
+     * FAB-144: the order is logged only when there was a choice to make. A cycle with exactly ONE
+     * buildable candidate logs no {@code liquidation order} line — and still considers it — while a
+     * cycle with TWO logs exactly one.
+     */
+    @Test
+    void theLiquidationOrderIsNotLoggedForOneCandidateAndLoggedExactlyOnceForTwo() {
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
+        when(builder.build(any(LiquidateTransactionBuilder.Request.class)))
+                .thenThrow(new IllegalStateException("ordering probe: the build itself is not under test"));
+        Scenario cheap = scenario(BigInteger.valueOf(100));
+        Scenario rich = secondScenario();
+
+        List<Scenario> one = List.of(cheap);
+        Wiring single = wiring(shadow(SMALL_MARGIN), List.of(cheap.assessment()), one, allUnspent(one),
+                List.of(WALLET_UTXO, WALLET_UTXO_SMALL),
+                new CountingOracleProvider(new FakeOracleClient(List.of()), new FakeOracleClient(List.of())),
+                false, false, LoanFixtures.protocolParams(), null, builder, metrics());
+        List<ILoggingEvent> singleEvents = cyclesLogged(single, 1);
+        assertEquals(1, single.log().newestFirst(10).size(), "the one candidate is still considered: "
+                + singleEvents);
+        assertEquals(List.of(), liquidationOrderLines(singleEvents),
+                "one candidate: no choice was made, so no order is logged");
+
+        List<Scenario> two = List.of(cheap, rich);
+        Wiring pair = wiring(shadow(SMALL_MARGIN), List.of(cheap.assessment(), rich.assessment()), two,
+                allUnspent(two), List.of(WALLET_UTXO, WALLET_UTXO_SMALL),
+                new CountingOracleProvider(new FakeOracleClient(List.of()), new FakeOracleClient(List.of())),
+                false, false, LoanFixtures.protocolParams(), null, builder, metrics());
+        List<ILoggingEvent> pairEvents = cyclesLogged(pair, 1);
+        assertEquals(1, liquidationOrderLines(pairEvents).size(),
+                "two candidates: exactly one order line: " + pairEvents);
+    }
 }

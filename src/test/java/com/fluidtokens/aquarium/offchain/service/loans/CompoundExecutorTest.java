@@ -29,6 +29,8 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -575,6 +577,54 @@ class CompoundExecutorTest {
                 });
 
         assertEquals(List.of(ten, twenty), ordered);
+    }
+
+    /**
+     * {@link #readyAt} carrying an exclusion: structurally UNREADY, yet with everything else a price
+     * needs — an {@code addedLiquidity}, a bond and an ada principal — so only readiness can refuse it.
+     */
+    private static CompoundCandidate unreadyButPriceableAt(String escrowTxHash) {
+        CompoundCandidate base = readyAt(escrowTxHash, 20L);
+        return new CompoundCandidate(base.loanId(), base.escrow(), base.escrowDatum(), base.addedLiquidity(),
+                base.bond(), base.poolId(), base.pool(), base.poolManager(), base.feePerMille(),
+                base.principalIsAda(), CompoundExclusion.POOL_NOT_LIVE, "the pool NFT is burned");
+    }
+
+    /**
+     * FAB-144: a structurally unready candidate is unpriced BECAUSE it is unready. {@link #refused()}
+     * cannot show that — it has no amount and no bond, so it is empty for those reasons too; this one
+     * has both and an ada principal, and would be priced at 582,185 lovelace were readiness not checked.
+     */
+    @Test
+    void aStructurallyUnreadyCompoundIsUnpricedEvenWithAnAmountABondAndAnAdaPrincipal() {
+        CompoundCandidate unready = unreadyButPriceableAt("06".repeat(32));
+        assertFalse(unready.structurallyReady(), "the fixture is unready");
+        assertNotNull(unready.addedLiquidity(), "the fixture carries an amount");
+        assertNotNull(unready.bond(), "the fixture carries a bond");
+        assertTrue(unready.bond().datum().principalAsset().isAda(), "the fixture's principal is ada");
+
+        assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(unready),
+                "unready: unpriced, whatever else it carries");
+    }
+
+    /**
+     * FAB-144: the order is logged only when there was a choice to make. A cycle with exactly ONE
+     * candidate logs no {@code compound order} line — and still reports it — while a cycle with TWO
+     * logs exactly one.
+     */
+    @Test
+    void theCompoundOrderIsNotLoggedForOneCandidateAndLoggedExactlyOnceForTwo() {
+        CompoundCandidate only = readyAt("01".repeat(32), 10L);
+        List<String> single = infoLinesOfOneCycle(wiring(List.of(only), false, 0L));
+        assertEquals(1, single.stream().filter(line -> line.startsWith("compound READY but NOT ARMED")).count(),
+                "the one candidate is still reported: " + single);
+        assertEquals(List.of(), single.stream().filter(line -> line.startsWith("compound order")).toList(),
+                "one candidate: no choice was made, so no order is logged");
+
+        List<String> pair = infoLinesOfOneCycle(wiring(
+                List.of(readyAt("01".repeat(32), 10L), readyAt("02".repeat(32), 20L)), false, 0L));
+        assertEquals(1, pair.stream().filter(line -> line.startsWith("compound order")).count(),
+                "two candidates: exactly one order line: " + pair);
     }
 
     // ---- fakes -------------------------------------------------------------------------------
