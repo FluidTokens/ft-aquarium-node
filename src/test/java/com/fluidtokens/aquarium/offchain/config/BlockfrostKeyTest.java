@@ -90,7 +90,7 @@ class BlockfrostKeyTest {
     @Test
     void surroundingWhitespaceIsStripped() {
         for (String key : List.of(SENTINEL, SENTINEL + "\n", SENTINEL + "\r\n", " " + SENTINEL + "\t",
-                " " + SENTINEL + " ")) {
+                "\u2003" + SENTINEL + "\u2003")) {
             assertEquals(SENTINEL, BlockfrostKey.of(key).value(), "key " + shown(key));
         }
     }
@@ -119,6 +119,28 @@ class BlockfrostKeyTest {
             assertNoFragment(refused.getMessage(), "the refusal's message");
             assertNoFragment(refused.toString(), "the refusal's toString");
         }
+    }
+
+    /**
+     * Visible ASCII is 0x21–0x7E exactly: {@code !} and {@code ~}, its two edges, are accepted, and DEL (0x7F),
+     * the first character past the top, is refused — OkHttp refuses 0x7F too and echoes the value with it.
+     */
+    @Test
+    void theVisibleAsciiEdgesAreExactBangAndTildeAcceptedDelRefused() {
+        assertEquals("!" + SENTINEL + "~", BlockfrostKey.of("!" + SENTINEL + "~").value(),
+                "0x21 and 0x7E are visible ASCII");
+
+        IllegalStateException refused = null;
+        try {
+            BlockfrostKey.of(SENTINEL + "\u007f");
+        } catch (IllegalStateException e) {
+            refused = e;
+        }
+        assertNotNull(refused, "a key ending in DEL (0x7F) must be refused");
+        assertEquals(BlockfrostKey.NOT_A_HEADER_VALUE, refused.getMessage(), "a key ending in DEL");
+        assertNull(refused.getCause(), "a cause could carry the value: a key ending in DEL");
+        assertNoFragment(refused.getMessage(), "the refusal's message");
+        assertNoFragment(refused.toString(), "the refusal's toString");
     }
 
     /** A record's {@code toString} would print the key; this one never does, set or unset. */
