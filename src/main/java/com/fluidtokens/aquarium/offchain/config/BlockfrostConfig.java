@@ -13,13 +13,16 @@ public class BlockfrostConfig {
     @Value("${blockfrost.url}")
     private String blockfrostUrl;
 
-    @Value("${blockfrost.key}")
-    private String blockfrostKey;
+    /** ⛔ The only read of {@code blockfrost.key} in the node (FAB-141): every consumer is handed this bean. */
+    @Bean
+    public BlockfrostKey blockfrostKey(@Value("${blockfrost.key}") String raw) {
+        return BlockfrostKey.of(raw);
+    }
 
     @Bean
-    public BFBackendService bfBackendService() {
+    public BFBackendService bfBackendService(BlockfrostKey blockfrostKey) {
         log.info("INIT - Using BF url: {}", blockfrostUrl);
-        return new BFBackendService(blockfrostUrl, blockfrostKey);
+        return new BFBackendService(blockfrostUrl, blockfrostKey.value());
     }
 
 }

@@ -434,6 +434,69 @@ class CompoundExecutorTest {
         }
     }
 
+    /**
+     * ⛔ FAB-108 OWN-B: the executor reads the compound reference scripts when it BUILDS, not when it is
+     * constructed. The executor bean may exist before {@code LoansReferenceScriptVerifier}'s
+     * {@code @PostConstruct} narrows the list, so the narrowing here happens AFTER construction, as it does
+     * there. Both coordinates publish a script in the universe the executor resolves against, so a
+     * construction-time read would still reference B; only a call-time read references A alone.
+     */
+    @Test
+    void theBuilderIsHandedTheReferenceScriptsAsNarrowedAfterTheExecutorWasBuilt() {
+        String txA = "5a".repeat(32);
+        String txB = "5b".repeat(32);
+        String hashA = "a5".repeat(28);
+        String hashB = "b5".repeat(28);
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        org.springframework.test.util.ReflectionTestUtils.setField(configuration, "referenceScripts",
+                txA + "#0," + txB + "#0");
+        java.util.concurrent.atomic.AtomicReference<CompoundTransactionBuilder.Request> handed =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        CompoundTransactionBuilder recording = org.mockito.Mockito.mock(CompoundTransactionBuilder.class);
+        org.mockito.Mockito.when(recording.build(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class)))
+                .thenAnswer(invocation -> {
+                    handed.set(invocation.getArgument(0));
+                    throw new IllegalStateException("recorded; the transaction itself is not under test here");
+                });
+        List<Utxo> universe = new ArrayList<>(universe());
+        universe.add(referenceScriptAt(txA, hashA));
+        universe.add(referenceScriptAt(txB, hashB));
+        CompoundExecutor executor = executorWithBuilder(configuration, recording, universe);
+
+        configuration.narrowReferenceScripts(List.of(
+                new com.bloxbean.cardano.client.transaction.spec.TransactionInput(txA, 0)));
+        executor.cycle();
+
+        assertNotNull(handed.get(), "the cycle never reached the builder, so this test says nothing");
+        assertEquals(java.util.Map.of(hashA, new com.bloxbean.cardano.client.transaction.spec.TransactionInput(txA, 0)),
+                handed.get().referenceScripts(),
+                "the builder must be handed only the coordinate the boot narrowing kept, not the list the "
+                        + "executor saw when it was constructed");
+    }
+
+    /** An output at {@code txHash#0} that publishes the reference script {@code scriptHash}. */
+    private static Utxo referenceScriptAt(String txHash, String scriptHash) {
+        return Utxo.builder().txHash(txHash).outputIndex(0).address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                .referenceScriptHash(scriptHash).build();
+    }
+
+    /** The {@code wiring(...)} executor, with the builder stated and the universe the executor resolves against. */
+    private static CompoundExecutor executorWithBuilder(AppConfig.CompoundConfiguration configuration,
+                                                        CompoundTransactionBuilder builder, List<Utxo> universe) {
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        CompoundExecutor.TransactionSubmitter submitter = bytes -> {
+            throw new AssertionError("nothing is built, so nothing may be submitted");
+        };
+        return new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet())), ACCOUNT,
+                new FakeScanner(List.of(ready(0L))), new CompoundEconomics(configuration, network, pricingService()),
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
+    }
+
     // ---- FAB-144: the most profitable compound first ------------------------------------------
 
     /** {@link #ready(long)} at its own escrow ref, so two ready candidates can be told apart. */

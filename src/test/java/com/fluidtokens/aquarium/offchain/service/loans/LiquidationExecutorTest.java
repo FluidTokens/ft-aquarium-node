@@ -1441,6 +1441,55 @@ class LiquidationExecutorTest {
                         + "measurement has to be redone before slice 3").formatted(size));
     }
 
+    /**
+     * ⛔ FAB-108 OWN-B: the executor reads the reference scripts when it BUILDS, not when it is
+     * constructed. In production the executor bean may exist before {@code LoansReferenceScriptVerifier}'s
+     * {@code @PostConstruct} narrows the configuration, so the narrowing here happens AFTER construction,
+     * as it does there. An executor that cached the scripts at construction would still hand the builder
+     * the dropped {@code loanSpend} coordinate; only a call-time read hands it the narrowed record.
+     */
+    @Test
+    void theBuilderIsHandedTheReferenceScriptsAsNarrowedAfterTheExecutorWasBuilt() {
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60, 120, 30, SMALL_MARGIN, 200,
+                nineDistinctReferenceScripts());
+        configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000_000L)));
+        java.util.concurrent.atomic.AtomicReference<LiquidateTransactionBuilder.Request> handed =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        LiquidateTransactionBuilder recording = mock(LiquidateTransactionBuilder.class);
+        when(recording.build(any(LiquidateTransactionBuilder.Request.class))).thenAnswer(invocation -> {
+            handed.set(invocation.getArgument(0));
+            throw new IllegalStateException("recorded; the transaction itself is not under test here");
+        });
+        Scenario scenario = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(configuration, List.of(scenario.assessment()), List.of(scenario),
+                allUnspent(List.of(scenario)), List.of(WALLET_UTXO), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, recording, metrics());
+
+        LiquidateTransactionBuilder.ReferenceScripts all = configuration.getConfiguredReferenceScripts();
+        LiquidateTransactionBuilder.ReferenceScripts narrowed = new LiquidateTransactionBuilder.ReferenceScripts(
+                all.loan(), null, all.lenderManager(), all.lenderManagerSpend(), all.loanClaimAction(),
+                all.lmLiquidateAction(), all.assetManager(), all.lmLiquidateAndPayInAdvanceAction(),
+                all.lmLiquidateAndConvertAction());
+        configuration.narrowReferenceScripts(narrowed);
+        wiring.executor().cycle(NOW);
+
+        assertNotNull(handed.get(), "the cycle never reached the builder, so this test says nothing");
+        assertEquals(narrowed, handed.get().referenceScripts(),
+                "the builder must be handed the scripts as narrowed at boot — loan-spend dropped — not the "
+                        + "set the executor saw when it was constructed");
+    }
+
+    /** All nine slots at distinct fake coordinates, none of them a tx hash any other fixture here uses. */
+    private static LiquidateTransactionBuilder.ReferenceScripts nineDistinctReferenceScripts() {
+        return new LiquidateTransactionBuilder.ReferenceScripts(
+                LoanFixtures.input("61".repeat(32), 0), LoanFixtures.input("62".repeat(32), 0),
+                LoanFixtures.input("63".repeat(32), 0), LoanFixtures.input("64".repeat(32), 0),
+                LoanFixtures.input("65".repeat(32), 0), LoanFixtures.input("66".repeat(32), 0),
+                LoanFixtures.input("67".repeat(32), 0), LoanFixtures.input("68".repeat(32), 0),
+                LoanFixtures.input("69".repeat(32), 0));
+    }
+
     // ======================================================================================
     // market coverage: the slice that OBSERVES, and must not decide
     // ======================================================================================
