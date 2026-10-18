@@ -225,6 +225,109 @@ class LiquidationReadinessControllerTest {
         assertEquals(2, LiquidationReadinessController.arrange(rows, "health", "asc", null, "tok").size());
     }
 
+    // ---- FAB-145: what the filter dropdowns READ -------------------------------------------------
+
+    private static final String USDM_A = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad" + "5553444d";
+    private static final String USDM_B = "aa".repeat(28) + "5553444d";
+
+    /** The label the table would show with no metadata service: what an unknown token falls back to. */
+    private static String unknownLabel(String unit) {
+        return AssetDisplay.of(BigInteger.ZERO, TokenMetadata.unknown(unit)).label();
+    }
+
+    /** Ordered by label, case-insensitively — not by the unit's hex, which is what the old list sorted on. */
+    @Test
+    void optionLabelsAreOrderedByLabelCaseInsensitively() {
+        Map<String, String> labels = Map.of("01".repeat(28), "zeta", "02".repeat(28), "Alpha",
+                "03".repeat(28), "beta");
+        var options = LiquidationReadinessController.optionLabels(
+                List.of("01".repeat(28), "02".repeat(28), "03".repeat(28)), labels::get);
+        assertEquals(List.of("Alpha", "beta", "zeta"), List.copyOf(options.values()));
+        assertEquals(List.of("02".repeat(28), "03".repeat(28), "01".repeat(28)), List.copyOf(options.keySet()),
+                "each label stays keyed by its own unit");
+    }
+
+    /** Ada is {@code ADA} whatever the lookup says, and each unit appears once however often it is listed. */
+    @Test
+    void lovelaceReadsAdaAndAUnitAppearsOnce() {
+        var options = LiquidationReadinessController.optionLabels(
+                List.of("lovelace", "lovelace"), unit -> "not consulted for ada");
+        assertEquals(Map.of("lovelace", "ADA"), options);
+    }
+
+    /**
+     * ⛔ <b>Two options must never read the same.</b> Two tokens can share a ticker, and two identical
+     * options are a filter that can select the wrong asset — so a shared label gains the policy id.
+     */
+    @Test
+    void duplicateLabelsAreDisambiguatedByPolicyIdAndAreDistinct() {
+        var options = LiquidationReadinessController.optionLabels(
+                List.of(USDM_A, USDM_B, "lovelace"), unit -> "USDM");
+
+        assertEquals("ADA", options.get("lovelace"), "a label nobody shares is left alone");
+        assertEquals("USDM (c48cbb3d…)", options.get(USDM_A));
+        assertEquals("USDM (aaaaaaaa…)", options.get(USDM_B));
+        assertEquals(List.of("lovelace", USDM_B, USDM_A), List.copyOf(options.keySet()),
+                "label order first, then the unit breaks the tie");
+    }
+
+    /** Two units under ONE policy with one label: the policy id cannot tell them apart, the unit can. */
+    @Test
+    void duplicateLabelsUnderOnePolicyFallBackToTheFullUnit() {
+        String first = "aa".repeat(28) + "01";
+        String second = "aa".repeat(28) + "02";
+        var options = LiquidationReadinessController.optionLabels(List.of(first, second), unit -> "X");
+
+        assertEquals("X (" + first + ")", options.get(first));
+        assertEquals("X (" + second + ")", options.get(second));
+        assertEquals(2, new java.util.HashSet<>(options.values()).size(), "no two options read the same");
+    }
+
+    /** A token claiming the ticker ADA does not get to look like ada. */
+    @Test
+    void aTokenTickeredAdaIsToldApartFromAda() {
+        var options = LiquidationReadinessController.optionLabels(List.of("lovelace", USDM_A), unit -> "ADA");
+        assertEquals("ADA (lovelace)", options.get("lovelace"));
+        assertEquals("ADA (c48cbb3d…)", options.get(USDM_A));
+    }
+
+    /** No metadata: the label the table falls back to — the decoded name, else the shortened policy id. */
+    @Test
+    void unknownMetadataFallsBackToTheShortenedPolicyId() {
+        String unprintable = "ab".repeat(28) + "00ff";
+        var options = LiquidationReadinessController.optionLabels(List.of(unprintable),
+                LiquidationReadinessControllerTest::unknownLabel);
+        assertEquals("abababab…", options.get(unprintable));
+    }
+
+    /**
+     * ⛔ Through the real {@code readiness()} path: the option maps reach the model, and each option
+     * reads exactly the label the table shows for that asset — the same lookup, not a second one.
+     */
+    @Test
+    void theReadinessModelCarriesOptionsThatReadTheTablesLabels() {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+
+        @SuppressWarnings("unchecked")
+        var collateralOptions = (Map<String, String>) model.getAttribute("collateralOptions");
+        @SuppressWarnings("unchecked")
+        var principalOptions = (Map<String, String>) model.getAttribute("principalOptions");
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+
+        assertEquals(Map.of("lovelace", "ADA"), principalOptions);
+        assertEquals(List.of("COLL", "FLDT", "USDM"), List.copyOf(collateralOptions.values()));
+        for (var row : rows) {
+            assertEquals(row.collateralDisplay().label(), collateralOptions.get(row.collateralUnit()),
+                    "an option must read the table's label for the same asset");
+        }
+        assertEquals(List.of(COLLATERAL_TOKEN.toUnit(), FLDT.toUnit(), PRINCIPAL_TOKEN.toUnit()),
+                List.copyOf(collateralOptions.keySet()), "the value stays the unit");
+    }
+
     /**
      * ⛔ <b>Closest to liquidation first, and UNKNOWN LAST.</b>
      *

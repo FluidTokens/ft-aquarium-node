@@ -14,12 +14,19 @@ import org.thymeleaf.spring6.SpringTemplateEngine;
 import org.thymeleaf.spring6.templateresolver.SpringResourceTemplateResolver;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -213,6 +220,17 @@ class ReadinessTemplateRendersRowsTest {
     private static String render(List<LiquidationReadinessController.Row> rows,
                                  OperationalStatus status, String lendingConfigBlocked, String walletNotReady,
                                  List<String> referenceScriptDegradations) {
+        return render(rows, status, lendingConfigBlocked, walletNotReady, referenceScriptDegradations, ctx -> { });
+    }
+
+    /** The defaults below, then {@code adjust} — for the pager and option cases that need other values. */
+    private static String render(List<LiquidationReadinessController.Row> rows, Consumer<Context> adjust) {
+        return render(rows, monitoringOnly(), null, null, List.of(), adjust);
+    }
+
+    private static String render(List<LiquidationReadinessController.Row> rows,
+                                 OperationalStatus status, String lendingConfigBlocked, String walletNotReady,
+                                 List<String> referenceScriptDegradations, Consumer<Context> adjust) {
         var context = new Context();
         context.setVariable("walletNotReady", walletNotReady);
         context.setVariable("lendingConfigBlocked", lendingConfigBlocked);
@@ -243,8 +261,146 @@ class ReadinessTemplateRendersRowsTest {
         context.setVariable("pages", 1);
         context.setVariable("principals", List.of("lovelace"));
         context.setVariable("collaterals", List.of(FLDT_UNIT));
+        // FAB-145: the dropdowns' text, unit → label, already ordered — what the controller now sets.
+        context.setVariable("principalOptions", orderedMap("lovelace", "ADA"));
+        context.setVariable("collateralOptions", orderedMap(FLDT_UNIT, "FLDT"));
         context.setVariable("rows", rows);
+        adjust.accept(context);
         return engine().process("readiness", context);
+    }
+
+    private static Map<String, String> orderedMap(String... unitThenLabel) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (int i = 0; i < unitThenLabel.length; i += 2) {
+            out.put(unitThenLabel[i], unitThenLabel[i + 1]);
+        }
+        return out;
+    }
+
+    // ---- FAB-145: the pager, and the dropdowns' text ---------------------------------------------
+
+    /** The pager element alone — never the CSS in {@code <style>}, which also says "pager". */
+    private static String pager(String html) {
+        int start = html.indexOf("class=\"pager\"");
+        if (start < 0) {
+            return null;
+        }
+        return html.substring(start, html.indexOf("</nav>", start));
+    }
+
+    /** Every href in {@code fragment}, with the HTML escaping of {@code &} undone. */
+    private static List<String> hrefs(String fragment) {
+        List<String> out = new ArrayList<>();
+        Matcher m = Pattern.compile("href=\"([^\"]*)\"").matcher(fragment);
+        while (m.find()) {
+            out.add(m.group(1).replace("&amp;", "&"));
+        }
+        return out;
+    }
+
+    /** The {@code page} query parameter of a pager link. */
+    private static String pageOf(String href) {
+        Matcher m = Pattern.compile("[?&]page=([^&]*)").matcher(href);
+        assertTrue(m.find(), "a pager link must carry page=: " + href);
+        return m.group(1);
+    }
+
+    private static Consumer<Context> onPage(int page, int pages) {
+        return ctx -> {
+            ctx.setVariable("page", page);
+            ctx.setVariable("pages", pages);
+            ctx.setVariable("sort", "age");
+            ctx.setVariable("dir", "desc");
+            ctx.setVariable("principalFilter", FLDT_UNIT);
+            ctx.setVariable("filterQuery", "&principal=" + FLDT_UNIT);
+        };
+    }
+
+    /**
+     * ⛔ FAB-145: PR #44 paged the list server-side and wrote the pager's CSS, but never its markup, so
+     * page 2 was reachable only by typing {@code ?page=2}. And every pager link must carry the sort and
+     * the active filter: a "next" that silently cleared the filter would read as the filter failing.
+     */
+    @Test
+    void aMultiPageListRendersAPagerWhoseLinksCarryTheSortAndTheFilter() {
+        String html = render(List.of(fullRow()), onPage(2, 3));
+
+        String pager = pager(html);
+        assertNotNull(pager, "a list of three pages must render an element with class=\"pager\"");
+        assertTrue(pager.contains("page 2 of 3"), "the pager must say where the reader is: " + pager);
+        List<String> links = hrefs(pager);
+        assertEquals(List.of("1", "3"), links.stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 2 of 3 links back to page 1 and on to page 3: " + links);
+        for (String link : links) {
+            assertTrue(link.contains("sort=age"), "a pager link must keep the sort: " + link);
+            assertTrue(link.contains("dir=desc"), "a pager link must keep the direction: " + link);
+            assertTrue(link.contains("principal=" + FLDT_UNIT), "a pager link must keep the filter: " + link);
+        }
+        assertTrue(html.indexOf("class=\"pager\"") > html.indexOf("</table>"), "the pager sits below the table");
+    }
+
+    /** The first page has nowhere to go back to, and the last nowhere to go on to. */
+    @Test
+    void theFirstPageHasNoPreviousLinkAndTheLastNoNextLink() {
+        List<String> first = hrefs(pager(render(List.of(fullRow()), onPage(1, 3))));
+        assertEquals(List.of("2"), first.stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 1 of 3 links only forward: " + first);
+
+        List<String> last = hrefs(pager(render(List.of(fullRow()), onPage(3, 3))));
+        assertEquals(List.of("2"), last.stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 3 of 3 links only back: " + last);
+    }
+
+    /** One page needs no pager. ⚠ Asserted on the MARKUP: the stylesheet itself contains "pager". */
+    @Test
+    void aSinglePageRendersNoPager() {
+        String html = render(List.of(fullRow()), onPage(1, 1));
+        assertFalse(html.contains("class=\"pager\""), "a single page must not render a pager element");
+        assertTrue(html.contains(".pager"), "fixture premise: the stylesheet does mention the pager");
+    }
+
+    /**
+     * ⛔ FAB-145: the filter dropdowns showed {@code #strings.abbreviate(unit, 18)} — policy-id hex no
+     * operator can read. The TEXT is now the label the table uses; the VALUE stays the full unit, because
+     * {@code ?collateral=<unit>} is the URL contract a bookmark depends on.
+     */
+    @Test
+    void aFilterOptionReadsTheTokensLabelWhileItsValueStaysTheUnit() {
+        String html = render(List.of(fullRow()), ctx -> ctx.setVariable("collateralFilter", FLDT_UNIT));
+
+        Matcher option = Pattern.compile("<option value=\"" + FLDT_UNIT + "\"([^>]*)>([^<]*)</option>").matcher(html);
+        assertTrue(option.find(), "the collateral option's value must be the full unit");
+        assertEquals("FLDT", option.group(2), "the option must read the token's label, not its policy id");
+        assertTrue(option.group(1).contains("selected"), "the active filter is still matched by unit");
+        assertFalse(html.contains(">" + abbreviated(FLDT_UNIT) + "</option>"),
+                "the abbreviated hex must no longer be an option's text");
+        assertTrue(html.matches("(?s).*<option value=\"lovelace\"[^>]*>ADA</option>.*"), "ada reads ADA");
+    }
+
+    /** ⛔ A label is externally sourced (a token registry), so it reaches the page escaped, never as markup. */
+    @Test
+    void anOptionLabelIsEscaped() {
+        String html = render(List.of(fullRow()),
+                ctx -> ctx.setVariable("collateralOptions", orderedMap(FLDT_UNIT, "<b>FLDT</b>")));
+        assertTrue(html.contains("&lt;b&gt;FLDT&lt;/b&gt;</option>"), "the label must be escaped");
+        assertFalse(html.contains("<b>FLDT</b>"), "a registry's text must never reach the page as markup");
+    }
+
+    /** A context that never set the option maps still renders, with the abbreviated unit as before. */
+    @Test
+    void withoutTheOptionMapsTheDropdownsFallBackToTheAbbreviatedUnit() {
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.removeVariable("principalOptions");
+            ctx.removeVariable("collateralOptions");
+        });
+        assertTrue(html.contains("<option value=\"" + FLDT_UNIT + "\">" + abbreviated(FLDT_UNIT) + "</option>"),
+                "the fallback is the abbreviated unit, as before FAB-145");
+        assertTrue(html.matches("(?s).*<option value=\"lovelace\"[^>]*>ADA</option>.*"), "ada still reads ADA");
+    }
+
+    /** What {@code #strings.abbreviate(unit, 18)} renders. */
+    private static String abbreviated(String unit) {
+        return unit.substring(0, 15) + "...";
     }
 
     /** {@code r} with its collateral oracle version set — the record has no wither. */

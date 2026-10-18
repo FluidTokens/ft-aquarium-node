@@ -38,8 +38,10 @@ import org.springframework.web.bind.annotation.RequestParam;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -332,7 +334,11 @@ public class LiquidationReadinessController {
 
         long now = System.currentTimeMillis();
         model.addAttribute("disabledReason", null);
-        List<Row> all = rows(loans, scan, health, now);
+        // ⚠ ONE memo for the rows AND the filter dropdowns (FAB-145): every unit an option names is a
+        // unit some row already resolved, so the dropdowns' labels cost no lookup of their own — and
+        // cannot disagree with the label the table shows for the same asset.
+        Map<String, TokenMetadata> metadataMemo = new HashMap<>();
+        List<Row> all = rows(loans, scan, health, now, metadataMemo);
         WalletBalance walletNow = wallet(now);
         model.addAttribute("wallet", walletNow);
         model.addAttribute("walletNotReady", walletNotReadyReason());
@@ -348,6 +354,13 @@ public class LiquidationReadinessController {
         // option that matches nothing is a filter an operator can set and then wonder about.
         model.addAttribute("principals", all.stream().map(Row::principalUnit).distinct().sorted().toList());
         model.addAttribute("collaterals", all.stream().map(Row::collateralUnit).distinct().sorted().toList());
+        // FAB-145: what each option READS — the table's label for that asset, not its policy-id hex.
+        // The option's VALUE stays the unit, so ?principal=<unit> bookmarks keep working.
+        Function<String, String> labelOf = unit -> display(unit, BigInteger.ZERO, metadataMemo).label();
+        model.addAttribute("principalOptions",
+                optionLabels(all.stream().map(Row::principalUnit).toList(), labelOf));
+        model.addAttribute("collateralOptions",
+                optionLabels(all.stream().map(Row::collateralUnit).toList(), labelOf));
         List<Row> arranged = arrange(all, sort, dir, principal, collateral);
 
         // ⛔ THE COUNTS ARE TOTALS, NEVER THE PAGE'S. "2 liquidatable" meaning "on this page" is the
@@ -403,6 +416,45 @@ public class LiquidationReadinessController {
     }
 
     /**
+     * ⛔ FAB-145: the filter dropdowns' TEXT, unit → label, already in display order. Only what the
+     * operator reads changes; the option's value stays the unit, which is the URL contract.
+     *
+     * <p>Ordered by label, case-insensitively, ties by unit. ⚠ <b>No two options read the same.</b> A
+     * registry can give two tokens one ticker — or a token the ticker {@code ADA} — and two identical
+     * options are a filter that can quietly select the wrong asset. So every unit whose label is shared
+     * is suffixed with its shortened policy id, and with its full unit if even that is shared.
+     *
+     * <p>Package-private and static so it can be tested without a Spring context.
+     */
+    static Map<String, String> optionLabels(Collection<String> units, Function<String, String> labelOf) {
+        Map<String, String> labels = new HashMap<>();
+        for (String unit : units) {
+            labels.computeIfAbsent(unit, u -> {
+                String label = "lovelace".equals(u) ? "ADA" : labelOf.apply(u);
+                return label == null || label.isBlank() ? u : label;
+            });
+        }
+        Map<String, String> text = new HashMap<>(labels);
+        disambiguate(text, u -> labels.get(u) + " ("
+                + ("lovelace".equals(u) ? u : TokenMetadata.unknown(u).shortPolicyId()) + ")");
+        disambiguate(text, u -> labels.get(u) + " (" + u + ")");
+
+        Map<String, String> ordered = new LinkedHashMap<>();
+        labels.keySet().stream()
+                .sorted(Comparator.<String, String>comparing(labels::get, String.CASE_INSENSITIVE_ORDER)
+                        .thenComparing(Function.identity()))
+                .forEach(u -> ordered.put(u, text.get(u)));
+        return ordered;
+    }
+
+    /** Re-labels with {@code longer} every unit whose current text another unit shares. */
+    private static void disambiguate(Map<String, String> text, Function<String, String> longer) {
+        Map<String, Long> uses = text.values().stream()
+                .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
+        text.replaceAll((unit, current) -> uses.get(current) > 1 ? longer.apply(unit) : current);
+    }
+
+    /**
      * The wallet, at most once per {@link #WALLET_TTL_MILLIS}, and only once the node has caught up.
      *
      * <h2>⛔ Gated exactly like the processors</h2>
@@ -452,7 +504,7 @@ public class LiquidationReadinessController {
     }
 
     private List<Row> rows(LoanService loans, LiquidationCandidateScanner scan,
-                           LoanHealthService healthService, long now) {
+                           LoanHealthService healthService, long now, Map<String, TokenMetadata> metadataMemo) {
         LiquidationCandidateScanner.Scan result = scan.scan(now);
 
         Map<String, LiquidationAssessment> byLoanId = result.assessments().stream()
@@ -466,8 +518,8 @@ public class LiquidationReadinessController {
         Map<String, PoolFetch> poolMemo = new HashMap<>();
         Supplier<MinswapPoolResolver.Snapshot> poolSnapshot = poolSnapshotForOneRender();
         // Same reasoning as the pool memo one level down: an asset's ticker and scale are a property
-        // of the ASSET, not of the row, and a table is mostly two or three distinct assets.
-        Map<String, TokenMetadata> metadataMemo = new HashMap<>();
+        // of the ASSET, not of the row, and a table is mostly two or three distinct assets. The memo is
+        // the caller's (FAB-145), so the filter dropdowns read the same lookups.
         List<Row> rows = new ArrayList<>();
         // ⚠ ONCE per render, not once per row: it is a database read behind a TTL, and twenty loans
         // asking the same question twenty times would defeat the cache on the first miss.

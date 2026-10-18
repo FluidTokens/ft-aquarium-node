@@ -275,18 +275,32 @@
   <form class="filters" method="get" th:unless="${disabledReason}">
     <input type="hidden" name="sort" th:value="${sort}">
     <input type="hidden" name="dir" th:value="${dir}">
+    <!-- FAB-145: the option READS the table's label for the asset (unit → text, already ordered); its
+         VALUE stays the unit, the URL contract. Without the maps, the abbreviated unit, as before. -->
     <label>principal
       <select name="principal" onchange="this.form.submit()">
         <option value="">any</option>
-        <option th:each="p : ${principals}" th:value="${p}" th:text="${p == 'lovelace' ? 'ADA' : #strings.abbreviate(p, 18)}"
-                th:selected="${p == principalFilter}">unit</option>
+        <th:block th:if="${principalOptions != null}">
+          <option th:each="o : ${principalOptions}" th:value="${o.key}" th:text="${o.value}"
+                  th:selected="${o.key == principalFilter}">unit</option>
+        </th:block>
+        <th:block th:if="${principalOptions == null}">
+          <option th:each="p : ${principals}" th:value="${p}" th:text="${p == 'lovelace' ? 'ADA' : #strings.abbreviate(p, 18)}"
+                  th:selected="${p == principalFilter}">unit</option>
+        </th:block>
       </select>
     </label>
     <label>collateral
       <select name="collateral" onchange="this.form.submit()">
         <option value="">any</option>
-        <option th:each="c : ${collaterals}" th:value="${c}" th:text="${c == 'lovelace' ? 'ADA' : #strings.abbreviate(c, 18)}"
-                th:selected="${c == collateralFilter}">unit</option>
+        <th:block th:if="${collateralOptions != null}">
+          <option th:each="o : ${collateralOptions}" th:value="${o.key}" th:text="${o.value}"
+                  th:selected="${o.key == collateralFilter}">unit</option>
+        </th:block>
+        <th:block th:if="${collateralOptions == null}">
+          <option th:each="c : ${collaterals}" th:value="${c}" th:text="${c == 'lovelace' ? 'ADA' : #strings.abbreviate(c, 18)}"
+                  th:selected="${c == collateralFilter}">unit</option>
+        </th:block>
       </select>
     </label>
     <a class="clear" th:if="${principalFilter != null or collateralFilter != null}"
@@ -499,6 +513,16 @@
       </tbody>
     </table>
   </div>
+
+  <!-- ⛔ FAB-145: the pager. Paging is server-side (?page=, clamped), and until this markup existed page 2
+       was reachable only by typing the parameter. Every link carries the sort and the active filters,
+       built like the sort links: a "next" that dropped the filter would read as the filter failing.
+       Hidden under 700px with the table, which the phone view replaces. -->
+  <nav class="pager" aria-label="pages" th:if="${pages != null and pages > 1}">
+    <a th:if="${page > 1}" th:href="|?sort=${sort}&amp;dir=${dir}${filterQuery}&amp;page=${page - 1}|">&larr; previous</a>
+    <span th:text="|page ${page} of ${pages}|">page 1 of 1</span>
+    <a th:if="${page < pages}" th:href="|?sort=${sort}&amp;dir=${dir}${filterQuery}&amp;page=${page + 1}|">next &rarr;</a>
+  </nav>
 </main>
 
 <!-- Auto-refresh. One minute, on by default, switchable off; the choice is remembered per browser.
