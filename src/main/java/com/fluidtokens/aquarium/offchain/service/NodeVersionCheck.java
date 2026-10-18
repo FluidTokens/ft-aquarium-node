@@ -12,7 +12,6 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
-import java.net.ProtocolException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -73,7 +72,6 @@ public class NodeVersionCheck {
     private static final Set<String> ON = Set.of("true", "on", "yes", "1");
     private static final Set<String> OFF = Set.of("false", "off", "no", "0");
     private static final int FLAG_ECHO = 40;
-    private static final int REASON_LIMIT = 200;
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /** The seam: one compare request for one commit. Package-private so a test can answer it. */
@@ -294,16 +292,14 @@ public class NodeVersionCheck {
     }
 
     /**
-     * The exception's simple name and message, control characters stripped and truncated. ⚠ Except a
-     * {@link ProtocolException}: the JDK's HTTP/1.1 parser raises one for a malformed status line or header
-     * and QUOTES the offending response text in its message, so for that one the name alone is logged.
+     * The exception's simple class name, and ⛔ NEVER its message. The JDK quotes response text in the
+     * messages of the HTTP exchange's exceptions: its HTTP/1.1 parser puts a malformed status line or header
+     * into a {@code ProtocolException}, and its redirect handling puts an illegal {@code Location} header into
+     * an {@code IllegalArgumentException} from {@code URI.create}. No response text may reach a log line.
      */
     private static String transportFailure(Exception e) {
         String name = e.getClass().getSimpleName();
-        if (e instanceof ProtocolException || e.getMessage() == null || e.getMessage().isBlank()) {
-            return name;
-        }
-        return clean(name + ": " + e.getMessage(), REASON_LIMIT);
+        return name.isEmpty() ? e.getClass().getName() : name;
     }
 
     private static Outcome unavailable(String reason) {

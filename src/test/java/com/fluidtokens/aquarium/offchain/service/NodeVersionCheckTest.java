@@ -8,6 +8,7 @@ import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -21,6 +22,7 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -216,6 +218,10 @@ class NodeVersionCheckTest {
 
         assertUnavailable(line);
         assertTrue(line.getFormattedMessage().contains("unknown to GitHub"), line.getFormattedMessage());
+        for (String bodyText : new String[]{"Not Found", "documentation_url", "docs.github.com"}) {
+            assertFalse(line.getFormattedMessage().contains(bodyText),
+                    "the 404 body reached the log line: " + line.getFormattedMessage());
+        }
     }
 
     @Test
@@ -440,6 +446,7 @@ class NodeVersionCheckTest {
 
     /** GitHub can take as long as it likes: {@code start()} returns first, and the run is on its own thread. */
     @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     void startReturnsWhileGitHubIsStillThinking() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
@@ -548,6 +555,7 @@ class NodeVersionCheckTest {
 
     /** A server that accepts the connection and never answers: the total deadline ends the run. */
     @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     void theAdapterGivesUpAtItsDeadline() throws Exception {
         try (ServerSocket silent = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
             NodeVersionCheck.GitHubCompareSource adapter = new NodeVersionCheck.GitHubCompareSource(
@@ -562,6 +570,89 @@ class NodeVersionCheckTest {
             assertUnavailable(line);
             assertTrue(line.getFormattedMessage().contains("did not answer"), line.getFormattedMessage());
             assertTrue(elapsedMillis < 5_000, "the deadline did not bound the run: " + elapsedMillis + " ms");
+        }
+    }
+
+    /**
+     * Headers arrive at once, then the body trickles one byte every 200 ms — 100 bytes, ~20 s. The request
+     * timeout alone does not bound reading a body (measured: 65 s against a 1 s {@code HttpRequest.timeout});
+     * only the adapter's own total deadline on the future ends this run.
+     */
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void aBodyThatTricklesIsCutOffAtTheTotalDeadline() throws Exception {
+        try (ServerSocket trickle = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
+            Thread server = new Thread(() -> {
+                try (Socket socket = trickle.accept()) {
+                    InputStream in = socket.getInputStream();
+                    int last4 = 0;
+                    while (last4 != 0x0d0a0d0a) {
+                        int b = in.read();
+                        if (b < 0) {
+                            return;
+                        }
+                        last4 = (last4 << 8) | b;
+                    }
+                    OutputStream out = socket.getOutputStream();
+                    out.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n")
+                            .getBytes(StandardCharsets.US_ASCII));
+                    out.flush();
+                    for (int i = 0; i < 100; i++) {
+                        Thread.sleep(200);
+                        out.write(' ');
+                        out.flush();
+                    }
+                } catch (IOException | InterruptedException ignored) {
+                    // the client gave up, or the test is over
+                }
+            }, "trickle-server");
+            server.setDaemon(true);
+            server.start();
+            try {
+                NodeVersionCheck.GitHubCompareSource adapter = new NodeVersionCheck.GitHubCompareSource(
+                        "http://127.0.0.1:" + trickle.getLocalPort(), Duration.ofSeconds(1));
+                NodeVersionCheck check = new NodeVersionCheck("true", SHA, "false", adapter,
+                        Duration.ofHours(24), Duration.ofSeconds(1));
+
+                long started = System.nanoTime();
+                ILoggingEvent line = onlyLineOf(check);
+                long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+                assertUnavailable(line);
+                assertTrue(line.getFormattedMessage().contains("did not answer within 1s"), line.getFormattedMessage());
+                assertTrue(elapsedMillis < 5_000, "a trickled body held the run for " + elapsedMillis + " ms");
+            } finally {
+                server.interrupt();
+            }
+        }
+    }
+
+    /**
+     * A redirect whose {@code Location} is not a legal URI: the JDK's redirect handling throws an exception
+     * QUOTING that header. A transport failure is logged by its class name only, so no part of it appears.
+     */
+    @Test
+    void aMalformedRedirectIsLoggedWithoutTheHeaderText() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+        server.createContext("/", exchange -> {
+            exchange.getResponseHeaders().set("Location", "http://exa mple/HEADER-TEXT-SENTINEL");
+            exchange.sendResponseHeaders(301, -1);
+            exchange.close();
+        });
+        server.start();
+        try {
+            NodeVersionCheck.GitHubCompareSource adapter = new NodeVersionCheck.GitHubCompareSource(
+                    "http://127.0.0.1:" + server.getAddress().getPort(), Duration.ofSeconds(5));
+
+            ILoggingEvent line = onlyLineOf(check(adapter));
+
+            assertUnavailable(line);
+            for (String fragment : new String[]{"HEADER-TEXT-SENTINEL", "SENTINEL", "exa mple", "http://exa"}) {
+                assertFalse(line.getFormattedMessage().contains(fragment),
+                        "response header text reached the log line: " + line.getFormattedMessage());
+            }
+        } finally {
+            server.stop(0);
         }
     }
 
