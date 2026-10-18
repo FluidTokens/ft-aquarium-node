@@ -29,6 +29,8 @@ import com.fluidtokens.aquarium.offchain.service.loans.MarketGate;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
+import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import lombok.extern.slf4j.Slf4j;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
@@ -391,6 +393,19 @@ public class LiquidationReadinessController {
     public void setLoansReferenceScriptVerifier(
             com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier loansReferenceScriptVerifier) {
         this.loansReferenceScriptVerifier = loansReferenceScriptVerifier;
+    }
+
+    /**
+     * FAB-128: the protocol parameters the token-principal ada floor is sized from — the per-epoch cached
+     * bean the bot already uses ({@code EpochProtocolParamsSupplier}), so a render normally makes no provider
+     * call. Setter-injected and REQUIRED in the container; null only in a direct test construction, where the
+     * floor is computed without a fee ceiling and the note says so.
+     */
+    private com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setProtocolParamsSupplier(com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier) {
+        this.protocolParamsSupplier = protocolParamsSupplier;
     }
 
     @org.springframework.beans.factory.annotation.Autowired(required = true)
@@ -782,19 +797,81 @@ public class LiquidationReadinessController {
         // ⚠ ONCE per render, not once per row: it is a database read behind a TTL, and twenty loans
         // asking the same question twenty times would defeat the cache on the first miss.
         WalletBalance wallet = wallet(now);
+        // FAB-128: the fee ceiling a token-principal funding UTxO must carry beside the token, ONCE per
+        // render like the wallet. Empty when it cannot be had — the floor then leaves it out, and the
+        // note says so — never a reason for the page to fail.
+        Optional<BigInteger> feeCeiling = feeCeiling();
         for (Loan loan : result.loanCensus().loans()) {
             LiquidationAssessment assessment = byLoanId.get(loan.loanId());
             rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo, poolSnapshot,
-                    metadataMemo, wallet, now));
+                    metadataMemo, wallet, feeCeiling, now));
         }
         rows.sort(Comparator.comparingDouble(Row::sortKey));
         return rows;
     }
 
+    /** {@code maxPossibleFee} of the wired parameters, or empty when there are none or they are unusable. */
+    private Optional<BigInteger> feeCeiling() {
+        if (protocolParamsSupplier == null) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(LedgerCeilings.maxPossibleFee(protocolParamsSupplier.getProtocolParams()));
+        } catch (Exception e) {
+            log.debug("no fee ceiling for the readiness page's token floor: {}", e.toString());
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * What the blocker compares an advance against, and what it says when that falls short.
+     *
+     * @param balance the principal the bot would count
+     * @param label   the badge instead of {@code funds}, or null for the generic text
+     * @param detail  the tooltip that goes with {@code label}, or null
+     */
+    record FundsCheck(BigInteger balance, String label, String detail) { }
+
+    /**
+     * ⛔ FAB-128: <b>the page counts a token principal the way the bot does</b>, by the bot's own helpers —
+     * never a re-derivation here. The bot shows its market gate only the token in UTxOs with no datum or
+     * reference script that carry at least the fee ceiling plus the min-ada rider
+     * ({@link WalletInputSelection#tokenHolding}); counting the wallet's TOTAL marked nothing while the bot
+     * refused every cycle (measured: 15,000 NIGHT in a 1.18-ADA UTxO against an 11,033.9 NIGHT advance).
+     *
+     * <p>When the spendable count is short and token sits behind the floor, the note is the bot's own
+     * ({@link WalletInputSelection.TokenHolding#adaFloorNote}); the label is {@code consolidate} when
+     * consolidating alone would cover the advance, else {@code funds}.
+     *
+     * <p>An ADA principal and an unknown wallet are today's behaviour exactly: the wallet's total for the unit,
+     * and no override.
+     *
+     * @param amount renders a quantity of the principal, unit included — the page's scaled amounts
+     */
+    static FundsCheck fundsCheck(WalletBalance wallet, AssetType principal, Optional<BigInteger> feeCeiling,
+                                 BigInteger advance, Function<BigInteger, String> amount) {
+        if (principal.isAda() || !wallet.known()) {
+            return new FundsCheck(wallet.of(principal.toUnit()), null, null);
+        }
+        WalletInputSelection.TokenHolding holding = WalletInputSelection.tokenHolding(wallet.utxos(), principal,
+                WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling));
+        if (advance == null) {
+            return new FundsCheck(holding.spendable(), null, null);
+        }
+        String note = holding.adaFloorNote(amount, advance, feeCeiling.isPresent());
+        if (note == null) {
+            return new FundsCheck(holding.spendable(), null, null);
+        }
+        String label = holding.spendable().add(holding.belowAdaFloor()).compareTo(advance) >= 0
+                ? "consolidate" : "funds";
+        return new FundsCheck(holding.spendable(), label, note);
+    }
+
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
                     MarketGate gate, Map<String, PoolFetch> poolMemo,
                     Supplier<MinswapPoolResolver.Snapshot> poolSnapshot,
-                    Map<String, TokenMetadata> metadataMemo, WalletBalance wallet, long now) {
+                    Map<String, TokenMetadata> metadataMemo, WalletBalance wallet,
+                    Optional<BigInteger> feeCeiling, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
 
@@ -933,12 +1010,18 @@ public class LiquidationReadinessController {
         // ⚠ The FORWARD question, asked whatever this loan's health is today: if it crossed the
         // threshold in the next hour, could the bot handle it? A mark that only appeared once a loan
         // was already liquidatable would arrive too late to move capital.
-        BigInteger principalBalance = wallet.of(datum.principalAsset().toUnit());
+        // FAB-128: a token principal is counted as the bot counts it, and a shortfall caused by the ada
+        // floor says so — in the page's own scaled amounts.
+        String principalUnit = datum.principalAsset().toUnit();
+        FundsCheck funds = fundsCheck(wallet, datum.principalAsset(), feeCeiling, advance, q -> {
+            AssetDisplay shown = display(principalUnit, q, metadataMemo);
+            return shown.amountText() + " " + shown.label();
+        });
         ProcessingBlocker blocker = ProcessingBlocker.of(
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                 gate.marketFor(datum.principalAsset()), convertEnabled, bondRoute,
                 new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
-                advance, principalBalance, wallet.known());
+                advance, funds.balance(), wallet.known(), funds.label(), funds.detail());
 
         ActionNow actionNow = gatedAction(lendingConfigGate,
                 excludedAction(honestAction(health.liquidatable(), datum.collateral().isAda(),

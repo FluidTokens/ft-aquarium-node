@@ -584,6 +584,42 @@ class ReadinessTemplateRendersRowsTest {
                 r.utxoExplorerUrl(), version);
     }
 
+    /** {@code r} with its blocker replaced — the record has no wither. */
+    private static LiquidationReadinessController.Row withBlocker(LiquidationReadinessController.Row r,
+                                                                ProcessingBlocker blocker) {
+        return new LiquidationReadinessController.Row(r.loanId(), r.utxoRef(), r.principalUnit(),
+                r.principalAmount(), r.remainingDebt(), r.collateralUnit(), r.collateralAmount(),
+                r.healthFactor(), r.currentLtvPercent(), r.liquidatable(), r.healthUnknownReason(),
+                r.feeInCollateral(), r.feeValueLovelace(), r.feeUnknownReason(), r.route(), r.routeDetail(),
+                r.advancePrincipalAmount(), r.age(), r.principalDisplay(), r.collateralDisplay(),
+                r.poolUsability(), r.feeDisplay(), r.feeValueDisplay(), r.advanceDisplay(), r.debtDisplay(),
+                r.anticipateAndSell(), r.anticipateDisplay(), r.actionNow(), blocker, r.loanExplorerUrl(),
+                r.utxoExplorerUrl(), r.collateralOracleVersion());
+    }
+
+    /**
+     * FAB-128: a {@code consolidate} blocker renders its label on the badge and the whole note in the badge's
+     * {@code title}, escaped. The note is built from token amounts and asset labels, so a hostile label must
+     * arrive as text, never as markup.
+     */
+    @Test
+    void aConsolidateBlockerRendersItsLabelAndItsNoteInTheTitleEscaped() {
+        String note = "the wallet has 15,000 NIGHT in total, but 15,000 NIGHT of it sits in UTxOs carrying less "
+                + "than 4405077 lovelace (4.405077 ADA) each — the ada a build needs beside the token; "
+                + "a label like <b>\"x\" & 'y'</b> must stay text.";
+        String html = render(List.of(withBlocker(fullRow(), new ProcessingBlocker("consolidate", note))));
+
+        Matcher badge = Pattern.compile("<span class=\"warn-badge\"\\s+title=\"([^\"]*)\">[^<]*"
+                + "<span>([^<]*)</span>").matcher(html);
+        assertTrue(badge.find(), "the blocker badge must render");
+        assertEquals("consolidate", badge.group(2), "the badge reads consolidate");
+        assertEquals(note, org.unbescape.html.HtmlEscape.unescapeHtml(badge.group(1)),
+                "the whole note is the badge's tooltip");
+        assertTrue(badge.group(1).contains("&lt;b&gt;") && badge.group(1).contains("&amp;")
+                        && badge.group(1).contains("&quot;x&quot;"), "and it is escaped: " + badge.group(1));
+        assertFalse(html.contains("<b>\"x\""), "a note must never reach the page as markup");
+    }
+
     /** FAB-112: the oracle version a loan's datum names is shown next to its health; absent, nothing. */
     @Test
     void theOracleVersionALoanUsesIsShownNextToItsHealth() {

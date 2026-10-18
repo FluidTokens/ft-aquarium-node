@@ -156,6 +156,106 @@ class ProcessingBlockerTest {
         assertEquals(null, blocker.label());
     }
 
+    // ---- FAB-128: the funds override (the token is there, behind the ada floor) -------------------
+
+    private static final String FUNDS_TEXT = "the wallet holds less of this loan's principal than the advance "
+            + "would need — move capital before this one goes sour, not after";
+
+    private static ProcessingBlocker anticipate(BigInteger cap, BigInteger advance, BigInteger balance,
+                                                boolean balanceKnown, String fundsLabel, String fundsDetail) {
+        return ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE, market(null, cap), true, BondRoute.CONVERT,
+                GOOD_POOL, advance, balance, balanceKnown, fundsLabel, fundsDetail);
+    }
+
+    /** Short of the advance, with an override: the override is the badge and its tooltip. */
+    @Test
+    void aShortAnticipateLoanCarriesTheOverrideWhenOneIsGiven() {
+        ProcessingBlocker blocker = anticipate(BigInteger.valueOf(10_000L), BigInteger.valueOf(5_000L),
+                BigInteger.ZERO, true, "consolidate", "the token sits behind the ada floor");
+
+        assertEquals("consolidate", blocker.label());
+        assertEquals("the token sits behind the ada floor", blocker.detail());
+    }
+
+    /** ⛔ Affordable is clean whatever the override says: the page never marks a row the bot would fund. */
+    @Test
+    void anAffordableAnticipateLoanIgnoresTheOverride() {
+        ProcessingBlocker blocker = anticipate(BigInteger.valueOf(10_000L), BigInteger.valueOf(5_000L),
+                BigInteger.valueOf(5_000L), true, "consolidate", "note");
+
+        assertFalse(blocker.blocked(), blocker.toString());
+        assertEquals(ProcessingBlocker.NONE, blocker);
+    }
+
+    /** Every earlier answer is reached before the balance, so the override cannot reach it. */
+    @Test
+    void theOverrideIsIgnoredOnEveryPathBeforeTheBalance() {
+        assertEquals("cap", anticipate(BigInteger.valueOf(100L), BigInteger.valueOf(5_000L),
+                BigInteger.ZERO, true, "consolidate", "note").label());
+        ProcessingBlocker unknownWallet = anticipate(BigInteger.valueOf(10_000L), BigInteger.valueOf(5_000L),
+                BigInteger.ZERO, false, "consolidate", "note");
+        assertEquals("unknown", unknownWallet.label());
+        assertTrue(unknownWallet.detail().contains("not the same as being short"), unknownWallet.detail());
+        ProcessingBlocker unpriced = anticipate(BigInteger.valueOf(10_000L), null,
+                BigInteger.ZERO, true, "consolidate", "note");
+        assertEquals("unknown", unpriced.label());
+        assertTrue(unpriced.detail().contains("could not be priced"), unpriced.detail());
+        assertEquals("bot off", ProcessingBlocker.of(Mode.DISABLED, Action.ANTICIPATE,
+                market(null, BigInteger.valueOf(10_000L)), true, BondRoute.CONVERT, GOOD_POOL,
+                BigInteger.valueOf(5_000L), BigInteger.ZERO, true, "consolidate", "note").label());
+        assertEquals("convert off", ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null),
+                false, BondRoute.CONVERT, GOOD_POOL, BigInteger.valueOf(5_000L), BigInteger.ZERO, true,
+                "consolidate", "note").label());
+        assertFalse(ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE, market(null, BigInteger.ONE), true,
+                BondRoute.PLAIN, GOOD_POOL, BigInteger.valueOf(5_000L), BigInteger.ZERO, true,
+                "consolidate", "note").blocked());
+        assertFalse(ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE, market(null, BigInteger.ONE), true,
+                BondRoute.NO_BOND, GOOD_POOL, BigInteger.valueOf(5_000L), BigInteger.ZERO, true,
+                "consolidate", "note").blocked());
+    }
+
+    /** Half an override is no override: today's {@code funds} text, exactly. */
+    @Test
+    void anIncompleteOverrideFallsBackToTodaysFundsText() {
+        for (String[] half : new String[][] {{"consolidate", null}, {null, "note"}, {null, null}}) {
+            ProcessingBlocker blocker = anticipate(BigInteger.valueOf(10_000L), BigInteger.valueOf(5_000L),
+                    BigInteger.valueOf(900L), true, half[0], half[1]);
+            assertEquals(new ProcessingBlocker("funds", FUNDS_TEXT), blocker, java.util.Arrays.toString(half));
+        }
+    }
+
+    /** ⛔ The nine-argument overload's texts are unchanged — pinned in full, not by fragment. */
+    @Test
+    void theNineArgumentOverloadsTextsAreUnchanged() {
+        assertEquals(new ProcessingBlocker("funds", FUNDS_TEXT), ProcessingBlocker.of(Mode.LIVE,
+                Action.ANTICIPATE, market(null, BigInteger.valueOf(10_000L)), true, BondRoute.CONVERT, GOOD_POOL,
+                BigInteger.valueOf(5_000L), BigInteger.valueOf(900L), true));
+        assertEquals(new ProcessingBlocker("cap", "this market's cap is below what this loan would need fronted"),
+                ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE, market(null, BigInteger.valueOf(100L)), true,
+                        BondRoute.CONVERT, GOOD_POOL, BigInteger.valueOf(5_000L), BigInteger.ZERO, true));
+        assertEquals(new ProcessingBlocker("unknown", "the wallet balance could not be read, so affordability "
+                        + "is not known — this is not the same as being short"),
+                ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE, market(null, BigInteger.valueOf(10_000L)),
+                        true, BondRoute.CONVERT, GOOD_POOL, BigInteger.valueOf(5_000L), BigInteger.ZERO, false));
+        assertEquals(new ProcessingBlocker("unknown", "this loan's advance could not be priced, so whether it "
+                        + "is affordable is not known either"),
+                ProcessingBlocker.of(Mode.LIVE, Action.ANTICIPATE, market(null, BigInteger.valueOf(10_000L)),
+                        true, BondRoute.CONVERT, GOOD_POOL, null, BigInteger.ZERO, true));
+        assertEquals(new ProcessingBlocker("bot off", "liquidation is disabled on this node"),
+                ProcessingBlocker.of(Mode.DISABLED, Action.CONVERT, market(null, null), true, BondRoute.CONVERT,
+                        GOOD_POOL, null, BigInteger.ZERO, true));
+        assertEquals(new ProcessingBlocker("bot off", "this market is set to DISABLED"),
+                ProcessingBlocker.of(Mode.DISABLED, Action.CONVERT, market(Mode.DISABLED, null), true,
+                        BondRoute.CONVERT, GOOD_POOL, null, BigInteger.ZERO, true));
+        assertEquals(new ProcessingBlocker("convert off", "this market routes to CONVERT and convert is disabled "
+                        + "node-wide, so no DEX order would be created"),
+                ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null), false, BondRoute.CONVERT,
+                        GOOD_POOL, null, BigInteger.ZERO, true));
+        assertEquals(new ProcessingBlocker("no pool", "the pool would return less than the debt"),
+                ProcessingBlocker.of(Mode.LIVE, Action.CONVERT, market(null, null), true, BondRoute.CONVERT,
+                        THIN_POOL, null, BigInteger.ZERO, true));
+    }
+
     @Test
     void aDisabledNodeIsReportedBeforeAMissingBond() {
         ProcessingBlocker blocker = ProcessingBlocker.of(Mode.DISABLED, Action.CONVERT, market(null, null),
