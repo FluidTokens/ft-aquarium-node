@@ -67,6 +67,11 @@ aquarium:
   # when a block arrives — ⚠ a stalled relay leaves its last value (accepted residue, no watchdog).
   # Must be a positive whole number of minutes.
   syncing-threshold-minutes: ${AQUARIUM_SYNCING_THRESHOLD_MINUTES:10}
+  # At startup and then once a day the node asks GitHub's API (no account, no key) whether the commit
+  # it was built from is behind `main`, and logs one line: WARN only when it is behind. It sends that
+  # commit id and nothing else, and never changes, downloads or restarts anything. Opt out with false.
+  version-check:
+    enabled: ${AQUARIUM_VERSION_CHECK_ENABLED:true}
 
 # FluidTokens Lending v4.
 #

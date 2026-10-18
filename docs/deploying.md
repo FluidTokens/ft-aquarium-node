@@ -430,7 +430,8 @@ liquidations in it.
 - [ ] A real `DB_PASSWORD`
 - [ ] The image version is **pinned**, not `latest`
 - [ ] Host firewall allows only what you intend — the node makes **outbound** connections to your
-      relay and Blockfrost; it needs no inbound at all
+      relay, Blockfrost and `api.github.com` (the daily version check, which you can turn off — §11);
+      it needs no inbound at all
 - [ ] Log rotation is on (the shipped file sets it) — logs are verbose and the disk is shared with
       your database
 
@@ -480,6 +481,34 @@ curl -s -H "project_id: $BLOCKFROST_KEY" \
 (`Derived Lending v4 contract hashes: ...`). A coordinate that resolves, is unspent, and publishes
 *a* script can still be the wrong script; only comparing the hashes catches it, and that failure
 mode has cost real debugging time.
+
+### The version check
+
+At startup, and then every 24 hours, the node asks GitHub whether the commit it was built from is
+behind `main`:
+
+```
+GET https://api.github.com/repos/FluidTokens/ft-aquarium-node/compare/<the build's commit>...main?per_page=1
+```
+
+No account and no key are involved. **What GitHub learns** is your host's IP address and the
+commit your image was built from — nothing else is sent. It is informational only: the node never
+changes, downloads, pulls or restarts anything because of the answer.
+
+Each check writes exactly one line to the log:
+
+| You see | Meaning |
+|---|---|
+| `INFO version check: up to date — …` | the build is the head of `main` |
+| `WARN version check: this node is N commits behind main … Changes since this build: <link>` | `main` has moved on; the link lists exactly the commits your build lacks. It does not mean an image for `main`'s head exists yet — CI builds it after the commit lands |
+| `INFO version check: this build (…) is N commits ahead of main — not a build of main` | a build from a branch, not from `main` |
+| `INFO version check unavailable: …` | no answer could be decided: a fork or a local build GitHub does not know, a build that does not record its commit, GitHub's limit of 60 unauthenticated requests per hour per IP, a timeout (10 s), or GitHub unreachable |
+
+A build from a dirty tree is still checked against its recorded commit, and the line adds that the
+build carries uncommitted changes on top of it.
+
+To turn it off, set `AQUARIUM_VERSION_CHECK_ENABLED=false` in `docker/.env`. The node then logs one
+line at startup saying the check is off and never contacts GitHub.
 
 ---
 
