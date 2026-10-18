@@ -14,12 +14,19 @@ import org.thymeleaf.spring6.SpringTemplateEngine;
 import org.thymeleaf.spring6.templateresolver.SpringResourceTemplateResolver;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -213,6 +220,17 @@ class ReadinessTemplateRendersRowsTest {
     private static String render(List<LiquidationReadinessController.Row> rows,
                                  OperationalStatus status, String lendingConfigBlocked, String walletNotReady,
                                  List<String> referenceScriptDegradations) {
+        return render(rows, status, lendingConfigBlocked, walletNotReady, referenceScriptDegradations, ctx -> { });
+    }
+
+    /** The defaults below, then {@code adjust} — for the pager and option cases that need other values. */
+    private static String render(List<LiquidationReadinessController.Row> rows, Consumer<Context> adjust) {
+        return render(rows, monitoringOnly(), null, null, List.of(), adjust);
+    }
+
+    private static String render(List<LiquidationReadinessController.Row> rows,
+                                 OperationalStatus status, String lendingConfigBlocked, String walletNotReady,
+                                 List<String> referenceScriptDegradations, Consumer<Context> adjust) {
         var context = new Context();
         context.setVariable("walletNotReady", walletNotReady);
         context.setVariable("lendingConfigBlocked", lendingConfigBlocked);
@@ -243,8 +261,314 @@ class ReadinessTemplateRendersRowsTest {
         context.setVariable("pages", 1);
         context.setVariable("principals", List.of("lovelace"));
         context.setVariable("collaterals", List.of(FLDT_UNIT));
+        // FAB-145: the dropdowns' text, unit → label, already ordered — what the controller now sets.
+        context.setVariable("principalOptions", orderedMap("lovelace", "ADA"));
+        context.setVariable("collateralOptions", orderedMap(FLDT_UNIT, "FLDT"));
         context.setVariable("rows", rows);
+        adjust.accept(context);
         return engine().process("readiness", context);
+    }
+
+    private static Map<String, String> orderedMap(String... unitThenLabel) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (int i = 0; i < unitThenLabel.length; i += 2) {
+            out.put(unitThenLabel[i], unitThenLabel[i + 1]);
+        }
+        return out;
+    }
+
+    // ---- FAB-145: the pager, and the dropdowns' text ---------------------------------------------
+
+    /** The pager element alone — never the CSS in {@code <style>}, which also says "pager". */
+    private static String pager(String html) {
+        int start = html.indexOf("class=\"pager\"");
+        if (start < 0) {
+            return null;
+        }
+        return html.substring(start, html.indexOf("</nav>", start));
+    }
+
+    /** Every href in {@code fragment}, with the HTML escaping of {@code &} undone. */
+    private static List<String> hrefs(String fragment) {
+        List<String> out = new ArrayList<>();
+        Matcher m = Pattern.compile("href=\"([^\"]*)\"").matcher(fragment);
+        while (m.find()) {
+            out.add(m.group(1).replace("&amp;", "&"));
+        }
+        return out;
+    }
+
+    /** The {@code page} query parameter of a pager link. */
+    private static String pageOf(String href) {
+        Matcher m = Pattern.compile("[?&]page=([^&]*)").matcher(href);
+        assertTrue(m.find(), "a pager link must carry page=: " + href);
+        return m.group(1);
+    }
+
+    private static Consumer<Context> onPage(int page, int pages) {
+        return ctx -> {
+            ctx.setVariable("page", page);
+            ctx.setVariable("pages", pages);
+            ctx.setVariable("sort", "age");
+            ctx.setVariable("dir", "desc");
+            ctx.setVariable("principalFilter", FLDT_UNIT);
+            ctx.setVariable("filterQuery", "&principal=" + FLDT_UNIT);
+        };
+    }
+
+    /**
+     * ⛔ FAB-145: PR #44 paged the list server-side and wrote the pager's CSS, but never its markup, so
+     * page 2 was reachable only by typing {@code ?page=2}. And every pager link must carry the sort and
+     * the active filter: a "next" that silently cleared the filter would read as the filter failing.
+     */
+    @Test
+    void aMultiPageListRendersAPagerWhoseLinksCarryTheSortAndTheFilter() {
+        String html = render(List.of(fullRow()), onPage(2, 3));
+
+        String pager = pager(html);
+        assertNotNull(pager, "a list of three pages must render an element with class=\"pager\"");
+        assertTrue(pager.contains("page 2 of 3"), "the pager must say where the reader is: " + pager);
+        List<String> links = hrefs(pager);
+        assertEquals(List.of("1", "3"), links.stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 2 of 3 links back to page 1 and on to page 3: " + links);
+        for (String link : links) {
+            assertTrue(link.contains("sort=age"), "a pager link must keep the sort: " + link);
+            assertTrue(link.contains("dir=desc"), "a pager link must keep the direction: " + link);
+            assertTrue(link.contains("principal=" + FLDT_UNIT), "a pager link must keep the filter: " + link);
+        }
+        assertTrue(html.indexOf("class=\"pager\"") > html.indexOf("</table>"), "the pager sits below the table");
+    }
+
+    /** The first page has nowhere to go back to, and the last nowhere to go on to. */
+    @Test
+    void theFirstPageHasNoPreviousLinkAndTheLastNoNextLink() {
+        List<String> first = hrefs(pager(render(List.of(fullRow()), onPage(1, 3))));
+        assertEquals(List.of("2"), first.stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 1 of 3 links only forward: " + first);
+
+        List<String> last = hrefs(pager(render(List.of(fullRow()), onPage(3, 3))));
+        assertEquals(List.of("2"), last.stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 3 of 3 links only back: " + last);
+    }
+
+    /**
+     * ⚠ FAB-145 T1 audit residue: the exact two-page boundary. Three pages could not tell {@code pages > 1}
+     * from {@code pages > 2}; two can — page 1 of 2 links only on, page 2 of 2 only back.
+     */
+    @Test
+    void aTwoPageListRendersAPagerOnEitherPage() {
+        String first = pager(render(List.of(fullRow()), onPage(1, 2)));
+        assertNotNull(first, "two pages must render a pager on page 1");
+        assertTrue(first.contains("page 1 of 2"), first);
+        assertEquals(List.of("2"), hrefs(first).stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 1 of 2 links only to page 2");
+        assertTrue(first.contains("next") && !first.contains("previous"), "page 1 of 2 has only a next link");
+
+        String second = pager(render(List.of(fullRow()), onPage(2, 2)));
+        assertNotNull(second, "two pages must render a pager on page 2");
+        assertTrue(second.contains("page 2 of 2"), second);
+        assertEquals(List.of("1"), hrefs(second).stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 2 of 2 links only to page 1");
+        assertTrue(second.contains("previous") && !second.contains("next"), "page 2 of 2 has only a previous link");
+    }
+
+    /** One page needs no pager. ⚠ Asserted on the MARKUP: the stylesheet itself contains "pager". */
+    @Test
+    void aSinglePageRendersNoPager() {
+        String html = render(List.of(fullRow()), onPage(1, 1));
+        assertFalse(html.contains("class=\"pager\""), "a single page must not render a pager element");
+        assertTrue(html.contains(".pager"), "fixture premise: the stylesheet does mention the pager");
+    }
+
+    /**
+     * ⛔ FAB-145: the filter dropdowns showed {@code #strings.abbreviate(unit, 18)} — policy-id hex no
+     * operator can read. The TEXT is now the label the table uses; the VALUE stays the full unit, because
+     * {@code ?collateral=<unit>} is the URL contract a bookmark depends on.
+     */
+    @Test
+    void aFilterOptionReadsTheTokensLabelWhileItsValueStaysTheUnit() {
+        String html = render(List.of(fullRow()), ctx -> ctx.setVariable("collateralFilter", FLDT_UNIT));
+
+        Matcher option = Pattern.compile("<option value=\"" + FLDT_UNIT + "\"([^>]*)>([^<]*)</option>").matcher(html);
+        assertTrue(option.find(), "the collateral option's value must be the full unit");
+        assertEquals("FLDT", option.group(2), "the option must read the token's label, not its policy id");
+        assertTrue(option.group(1).contains("selected"), "the active filter is still matched by unit");
+        assertFalse(html.contains(">" + abbreviated(FLDT_UNIT) + "</option>"),
+                "the abbreviated hex must no longer be an option's text");
+        assertTrue(html.matches("(?s).*<option value=\"lovelace\"[^>]*>ADA</option>.*"), "ada reads ADA");
+    }
+
+    /** ⛔ A label is externally sourced (a token registry), so it reaches the page escaped, never as markup. */
+    @Test
+    void anOptionLabelIsEscaped() {
+        String html = render(List.of(fullRow()),
+                ctx -> ctx.setVariable("collateralOptions", orderedMap(FLDT_UNIT, "<b>FLDT</b>")));
+        assertTrue(html.contains("&lt;b&gt;FLDT&lt;/b&gt;</option>"), "the label must be escaped");
+        assertFalse(html.contains("<b>FLDT</b>"), "a registry's text must never reach the page as markup");
+    }
+
+    /** A context that never set the option maps still renders, with the abbreviated unit as before. */
+    @Test
+    void withoutTheOptionMapsTheDropdownsFallBackToTheAbbreviatedUnit() {
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.removeVariable("principalOptions");
+            ctx.removeVariable("collateralOptions");
+        });
+        assertTrue(html.contains("<option value=\"" + FLDT_UNIT + "\">" + abbreviated(FLDT_UNIT) + "</option>"),
+                "the fallback is the abbreviated unit, as before FAB-145");
+        assertTrue(html.matches("(?s).*<option value=\"lovelace\"[^>]*>ADA</option>.*"), "ada still reads ADA");
+    }
+
+    // ---- FAB-145 T2: the book above the filters ----------------------------------------------------
+
+    private static final String USDM_UNIT = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d";
+
+    /** The book element alone — never the CSS in {@code <style>}, which also says "book". */
+    private static String book(String html) {
+        int start = html.indexOf("class=\"book\"");
+        if (start < 0) {
+            return null;
+        }
+        return html.substring(start, html.indexOf("class=\"filters\"", start));
+    }
+
+    /** One {@code <span>} of the book: its attributes and its text. */
+    private record Span(String attributes, String text) {
+        String title() {
+            Matcher m = Pattern.compile("title=\"([^\"]*)\"").matcher(attributes);
+            return m.find() ? m.group(1) : null;
+        }
+    }
+
+    /**
+     * The first {@code <span>} in {@code book} whose text starts with {@code textPrefix} — the ELEMENT, not a
+     * substring of the block, so a word asserted on it is in the same element as the figure. Null when none.
+     */
+    private static Span span(String book, String textPrefix) {
+        Matcher m = Pattern.compile("<span([^>]*)>(" + Pattern.quote(textPrefix) + "[^<]*)</span>").matcher(book);
+        return m.find() ? new Span(m.group(1), m.group(2)) : null;
+    }
+
+    /**
+     * A book of seven loans with FLDT as the one token line (3 loans, 1 unpriced), 128 ADA in total, and
+     * either $85.33 at 1 ADA ≈ $0.666666 or USD unavailable for {@code usdReason}.
+     */
+    private static LiquidationReadinessController.BookSummary bookSummary(String tokenLabel, String usdReason) {
+        var fldt = new TokenMetadata(FLDT_UNIT, tokenLabel, "FluidTokens", 6, TokenMetadata.Source.REGISTRY);
+        var usdm = new TokenMetadata(USDM_UNIT, "USDM", "USDM", 6, TokenMetadata.Source.REGISTRY);
+        var line = new LiquidationReadinessController.TokenTvl(FLDT_UNIT, 3,
+                AssetDisplay.of(BigInteger.valueOf(4_500_000L), fldt), BigInteger.valueOf(128_000_000L),
+                AssetDisplay.of(BigInteger.valueOf(128_000_000L), TokenMetadata.ada()), 1);
+        boolean usd = usdReason == null;
+        return new LiquidationReadinessController.BookSummary(7, 2, 1, List.of(line),
+                BigInteger.valueOf(128_000_000L), 1,
+                AssetDisplay.of(BigInteger.valueOf(128_000_000L), TokenMetadata.ada()),
+                usd ? AssetDisplay.of(BigInteger.valueOf(85_333_333L), usdm) : null,
+                usd ? AssetDisplay.of(BigInteger.valueOf(666_666L), usdm) : null,
+                usdReason);
+    }
+
+    /**
+     * ⛔ FAB-145 T2: the desktop view shows the book — loan counts, collateral locked per token, ≈ ADA and
+     * ≈ USD — above the filters, labelled an estimate that follows them, and hidden on a phone.
+     */
+    @Test
+    void theBookRendersItsCountsTokenLinesAndTotalsAboveTheFilters() {
+        String html = render(List.of(fullRow()),
+                ctx -> ctx.setVariable("book", bookSummary("FLDT", null)));
+
+        String book = book(html);
+        assertNotNull(book, "a context with a book must render class=\"book\"");
+        assertTrue(book.contains("<b>7</b> loan(s)"), "the loan count: " + book);
+        assertTrue(book.contains("<b>2</b> liquidatable now"), "the liquidatable count: " + book);
+        assertTrue(book.contains("Collateral locked (TVL)"), "the TVL is named as collateral locked");
+        assertTrue(book.contains(">FLDT<"), "the token line carries its label: " + book);
+        assertTrue(book.contains(">4.50<"), "and its locked amount, scaled: " + book);
+        assertTrue(book.contains("≈ 128.00 ADA"), "the ada estimate: " + book);
+        assertTrue(book.contains("1 loan(s) excluded: their collateral has no usable oracle price"),
+                "the exclusions are said, not hidden: " + book);
+        assertFalse(book.contains("USD unavailable"), "no unavailable text beside a dollar figure: " + book);
+        assertTrue(book.contains("estimate at oracle prices") && book.contains("following the filters"),
+                "the whole block is labelled an estimate that follows the filters");
+        assertTrue(html.indexOf("class=\"book\"") < html.indexOf("class=\"filters\""), "the book sits above the filters");
+        assertTrue(html.contains(".wallet-age, .book { display:none; }"), "and is hidden under the phone breakpoint");
+    }
+
+    /**
+     * ⛔ FAB-145 T3: the dollar figure is an ESTIMATE — the ADA total converted at the USDM oracle price, 1 USDM
+     * counted as $1 — and says so in words, in the figure's own element and on the line beside it. A reader who
+     * sees only those two cannot take it for a quote or for a USD oracle.
+     */
+    @Test
+    void theDollarFigureSaysItIsAnEstimateFromAdaToUsdm() {
+        String book = book(render(List.of(fullRow()), ctx -> ctx.setVariable("book", bookSummary("FLDT", null))));
+        assertNotNull(book);
+
+        Span usd = span(book, "≈ $");
+        assertNotNull(usd, "the dollar figure renders as its own element: " + book);
+        assertEquals("≈ $85.33 (estimated)", usd.text(), "the word 'estimated' is in the figure's own element");
+        assertNotNull(usd.title(), "the dollar figure carries a tooltip: " + usd);
+        assertTrue(usd.title().contains("85.333333 USDM"), "the tooltip keeps the exact USDM amount: " + usd.title());
+        assertTrue(usd.title().contains("estimate"), "the tooltip says it is an estimate: " + usd.title());
+        assertTrue(usd.title().contains("not a quote"), "and not a quote: " + usd.title());
+
+        Span rate = span(book, "estimated from ");
+        assertNotNull(rate, "the rate line renders as its own element and names the method: " + book);
+        String line = rate.text();
+        assertTrue(line.contains("estimated"), "the rate line says estimated: " + line);
+        assertTrue(line.contains("ADA → USDM"), "the conversion's direction: " + line);
+        assertTrue(line.contains("USDM oracle"), "the price it uses: " + line);
+        assertTrue(line.contains("1 ADA ≈ $0.666666"), "the implied rate: " + line);
+        assertTrue(line.contains("counting 1 USDM as $1"), "the assumption that makes USDM dollars: " + line);
+    }
+
+    /** USD unavailable: the reason takes the figure's place, and no dollar figure renders at all. */
+    @Test
+    void anUnavailableUsdShowsItsReasonAndNoDollarFigure() {
+        String reason = "no usable USDM oracle price right now";
+        String book = book(render(List.of(fullRow()), ctx -> ctx.setVariable("book", bookSummary("FLDT", reason))));
+
+        assertNotNull(book);
+        assertTrue(book.contains("USD unavailable: " + reason), "the reason renders: " + book);
+        assertFalse(book.contains("≈ $"), "no dollar figure renders: " + book);
+        assertFalse(book.contains("estimated from ADA"), "and no rate line, which would read as a figure: " + book);
+        assertTrue(book.contains("≈ 128.00 ADA"), "the ada estimate is unaffected");
+    }
+
+    /** With every loan priced there is nothing excluded, and the book does not say otherwise. */
+    @Test
+    void aBookWithNoUnpricedLoanSaysNothingWasExcluded() {
+        var b = bookSummary("FLDT", null);
+        var allPriced = new LiquidationReadinessController.BookSummary(b.loans(), b.liquidatable(), b.blocked(),
+                b.tokens(), b.totalLovelace(), 0, b.totalAdaDisplay(), b.usdDisplay(), b.adaUsdRateDisplay(),
+                b.usdUnavailableReason());
+        String book = book(render(List.of(fullRow()), ctx -> ctx.setVariable("book", allPriced)));
+
+        assertNotNull(book);
+        assertFalse(book.contains("loan(s) excluded"), "no exclusion line when nothing was excluded: " + book);
+    }
+
+    /** ⛔ A token label is registry-sourced, so in the book too it reaches the page escaped. */
+    @Test
+    void aTokenLabelInTheBookIsEscaped() {
+        String html = render(List.of(fullRow()),
+                ctx -> ctx.setVariable("book", bookSummary("<b>FLDT</b>", null)));
+        assertTrue(book(html).contains("&lt;b&gt;FLDT&lt;/b&gt;"), "the label must be escaped");
+        assertFalse(html.contains("<b>FLDT</b>"), "a registry's text must never reach the page as markup");
+    }
+
+    /** A context without a book renders exactly as before. ⚠ On the MARKUP: the stylesheet says "book". */
+    @Test
+    void withoutABookThePageRendersAndTheBlockIsAbsent() {
+        String html = render(List.of(fullRow()));
+        assertTrue(html.contains("CAPITAL IN ADVANCE"), "the page still renders its rows");
+        assertFalse(html.contains("class=\"book\""), "no book element without a book");
+        assertTrue(html.contains(".book"), "fixture premise: the stylesheet does mention the book");
+    }
+
+    /** What {@code #strings.abbreviate(unit, 18)} renders. */
+    private static String abbreviated(String unit) {
+        return unit.substring(0, 15) + "...";
     }
 
     /** {@code r} with its collateral oracle version set — the record has no wither. */

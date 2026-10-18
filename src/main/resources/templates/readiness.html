@@ -138,7 +138,7 @@
        one-line count is all that remains. */
     .glance { display:none; }
     @media (max-width: 700px) {
-      .tw, .filters, thead, .pager, .wallet-age { display:none; }
+      .tw, .filters, thead, .pager, .wallet-age, .book { display:none; }
       .glance { display:block; font-size:.9rem; margin-top:.4rem; }
       .glance .big { font-size:1.6rem; font-weight:700; }
       .glance .go  { margin-top:.6rem; font-weight:600; color:var(--crit); }
@@ -152,6 +152,19 @@
     .wallet-label { font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
     .wallet .bal { font-variant-numeric:tabular-nums; }
     .wallet-age { margin-left:auto; font-size:.7rem; color:var(--muted); }
+
+    /* ---- the book: counts and collateral locked, above the filters ---------------------------- */
+    .book { margin:0 0 .9rem; padding:.6rem .8rem; border:1px solid var(--rule); border-radius:8px;
+            background:var(--surface); font-size:.82rem; }
+    .book-head { display:flex; flex-wrap:wrap; align-items:baseline; gap:.3rem .9rem; }
+    .book-label { font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+    .book-caveat { font-size:.72rem; color:var(--muted); }
+    .book-counts { display:flex; flex-wrap:wrap; gap:.3rem 1.2rem; margin:.35rem 0 .5rem; }
+    .book-counts b { font-variant-numeric:tabular-nums; font-size:.95rem; }
+    .book-tokens { list-style:none; margin:.25rem 0 .4rem; padding:0; }
+    .book-tokens li { margin:.12rem 0; font-variant-numeric:tabular-nums; }
+    .book-total { display:flex; flex-wrap:wrap; gap:.3rem 1.2rem; font-weight:600; }
+    .book-tokens .reason, .book-total .reason { display:inline; margin:0 0 0 .3rem; font-weight:400; }
 
     /* ---- the exception mark ------------------------------------------------------------------ */
     /* ⚠ Deliberately the only warning colour in the table body, so it cannot be lost among chips. */
@@ -270,23 +283,84 @@
          style="color:var(--muted);font-weight:400">Nothing needs you right now.</div>
   </div>
 
+  <!-- ⛔ FAB-145: THE BOOK, on the desktop view only (the phone has the glance above). Computed from the
+       FILTERED list, never the page. TVL is the COLLATERAL locked in live loans, not debt, valued at each
+       loan's own collateral oracle. USD is an ESTIMATE, never a quote: the ADA total converted at the USDM
+       oracle price, counting 1 USDM as $1 — and the figure and the line beside it say so in words. A loan
+       whose collateral has no usable price stays in its token's amount, is left out of every value, and is
+       counted. -->
+  <div class="book" th:if="${book != null}">
+    <div class="book-head">
+      <span class="book-label">The book</span>
+      <span class="book-caveat">an estimate at oracle prices, following the filters</span>
+    </div>
+    <div class="book-counts">
+      <span><b th:text="${book.loans}">0</b> loan(s)</span>
+      <span><b th:text="${book.liquidatable}">0</b> liquidatable now</span>
+      <span><b th:text="${book.blocked}">0</b> the bot could not process</span>
+    </div>
+    <div class="book-label">Collateral locked (TVL)</div>
+    <ul class="book-tokens">
+      <li th:each="t : ${book.tokens}">
+        <span th:title="|exact: ${t.amount.exactText} ${t.amount.label}|" th:text="${t.amount.amountText}">0</span>
+        <span class="ticker" th:text="${t.amount.label}" th:title="${t.amount.policyId}">TKR</span>
+        <span th:if="${t.amount.metadataUnknown}" class="nometa"
+              th:title="|no metadata found for ${t.amount.unit} — raw, unscaled base units|">&#10071;</span>
+        <span th:if="${t.valueDisplay != null}" th:title="|exact: ${t.valueDisplay.exactText} ADA|"
+              th:text="|≈ ${t.valueDisplay.amountText} ADA|">≈ 0 ADA</span>
+        <span th:if="${t.valueDisplay == null}" class="unknown">no usable oracle price</span>
+        <span class="reason" th:text="|· ${t.loans} loan(s)|">· 1 loan(s)</span>
+        <span class="reason" th:if="${t.valueDisplay != null and t.unpricedLoans > 0}"
+              th:text="|· ${t.unpricedLoans} not priced|">· 1 not priced</span>
+      </li>
+    </ul>
+    <div class="book-total">
+      <span th:if="${book.totalAdaDisplay != null}" th:title="|exact: ${book.totalAdaDisplay.exactText} ADA|"
+            th:text="|≈ ${book.totalAdaDisplay.amountText} ADA|">≈ 0 ADA</span>
+      <span th:if="${book.totalAdaDisplay == null}" class="unknown">ADA total unknown</span>
+      <span th:if="${book.usdDisplay != null}"
+            th:title="|exact: ${book.usdDisplay.exactText} USDM. An estimate, not a quote: the ADA total converted at the USDM oracle price.|"
+            th:text="'≈ $' + ${book.usdDisplay.amountText} + ' (estimated)'">≈ $0 (estimated)</span>
+      <span th:if="${book.adaUsdRateDisplay != null}" class="reason"
+            th:text="'estimated from ADA → USDM at the USDM oracle price (1 ADA ≈ $' + ${book.adaUsdRateDisplay.amountText} + '), counting 1 USDM as $1'">estimated from ADA → USDM at the USDM oracle price (1 ADA ≈ $0), counting 1 USDM as $1</span>
+      <span th:if="${book.usdDisplay == null}" class="reason"
+            th:text="|USD unavailable: ${book.usdUnavailableReason}|">USD unavailable</span>
+    </div>
+    <div class="reason" th:if="${book.unpricedLoans > 0}"
+         th:text="|${book.unpricedLoans} loan(s) excluded: their collateral has no usable oracle price|">excluded</div>
+  </div>
+
   <!-- ⚠ Query parameters, not JavaScript: the page re-GETs its own URL every minute, so client-side
        state would be undone on every tick — and would be invisible to the template tests. -->
   <form class="filters" method="get" th:unless="${disabledReason}">
     <input type="hidden" name="sort" th:value="${sort}">
     <input type="hidden" name="dir" th:value="${dir}">
+    <!-- FAB-145: the option READS the table's label for the asset (unit → text, already ordered); its
+         VALUE stays the unit, the URL contract. Without the maps, the abbreviated unit, as before. -->
     <label>principal
       <select name="principal" onchange="this.form.submit()">
         <option value="">any</option>
-        <option th:each="p : ${principals}" th:value="${p}" th:text="${p == 'lovelace' ? 'ADA' : #strings.abbreviate(p, 18)}"
-                th:selected="${p == principalFilter}">unit</option>
+        <th:block th:if="${principalOptions != null}">
+          <option th:each="o : ${principalOptions}" th:value="${o.key}" th:text="${o.value}"
+                  th:selected="${o.key == principalFilter}">unit</option>
+        </th:block>
+        <th:block th:if="${principalOptions == null}">
+          <option th:each="p : ${principals}" th:value="${p}" th:text="${p == 'lovelace' ? 'ADA' : #strings.abbreviate(p, 18)}"
+                  th:selected="${p == principalFilter}">unit</option>
+        </th:block>
       </select>
     </label>
     <label>collateral
       <select name="collateral" onchange="this.form.submit()">
         <option value="">any</option>
-        <option th:each="c : ${collaterals}" th:value="${c}" th:text="${c == 'lovelace' ? 'ADA' : #strings.abbreviate(c, 18)}"
-                th:selected="${c == collateralFilter}">unit</option>
+        <th:block th:if="${collateralOptions != null}">
+          <option th:each="o : ${collateralOptions}" th:value="${o.key}" th:text="${o.value}"
+                  th:selected="${o.key == collateralFilter}">unit</option>
+        </th:block>
+        <th:block th:if="${collateralOptions == null}">
+          <option th:each="c : ${collaterals}" th:value="${c}" th:text="${c == 'lovelace' ? 'ADA' : #strings.abbreviate(c, 18)}"
+                  th:selected="${c == collateralFilter}">unit</option>
+        </th:block>
       </select>
     </label>
     <a class="clear" th:if="${principalFilter != null or collateralFilter != null}"
@@ -499,6 +573,16 @@
       </tbody>
     </table>
   </div>
+
+  <!-- ⛔ FAB-145: the pager. Paging is server-side (?page=, clamped), and until this markup existed page 2
+       was reachable only by typing the parameter. Every link carries the sort and the active filters,
+       built like the sort links: a "next" that dropped the filter would read as the filter failing.
+       Hidden under 700px with the table, which the phone view replaces. -->
+  <nav class="pager" aria-label="pages" th:if="${pages != null and pages > 1}">
+    <a th:if="${page > 1}" th:href="|?sort=${sort}&amp;dir=${dir}${filterQuery}&amp;page=${page - 1}|">&larr; previous</a>
+    <span th:text="|page ${page} of ${pages}|">page 1 of 1</span>
+    <a th:if="${page < pages}" th:href="|?sort=${sort}&amp;dir=${dir}${filterQuery}&amp;page=${page + 1}|">next &rarr;</a>
+  </nav>
 </main>
 
 <!-- Auto-refresh. One minute, on by default, switchable off; the choice is remembered per browser.

@@ -255,6 +255,8 @@ loans:
     token-registry:
       url: ${LOANS_UI_TOKEN_REGISTRY_URL:https://tokens.cardano.org}
       timeout-seconds: ${LOANS_UI_TOKEN_REGISTRY_TIMEOUT_SECONDS:5}
+    # FAB-145: the readiness page's USD is an ESTIMATE — ADA converted at this unit's (USDM) oracle price, 1 unit counted as $1. USDM only, never another token. Empty shows "USD unavailable".
+    usd-reference-unit: ${LOANS_UI_USD_REFERENCE_UNIT:c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d}
 
   # The wallet rebalancer (FAB-131): on every block, while the node is not syncing, it moves the bot
   # wallet into the FAB-130 shape with one self-send -- SIGNED AND SUBMITTED in shadow too (wallet
@@ -600,6 +602,9 @@ loans:
   # collateral on the loans we index — so health is fully computable here.
   oracle:
     url: ${LOANS_ORACLE_URL:https://testapi.fluidtokens.com/get-oracle-tokens}
+  ui:
+    # Blank: the mainnet USDM unit means nothing here, so the readiness page shows USD as unavailable.
+    usd-reference-unit: ""
   # Preview is where the bot is exercised, so the loop runs by default here — in shadow, which
   # scans, builds, prices and records without ever signing or submitting. Every other liquidation
   # key keeps its base-document value.

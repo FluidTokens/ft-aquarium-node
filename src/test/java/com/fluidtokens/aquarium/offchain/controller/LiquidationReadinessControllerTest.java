@@ -225,6 +225,220 @@ class LiquidationReadinessControllerTest {
         assertEquals(2, LiquidationReadinessController.arrange(rows, "health", "asc", null, "tok").size());
     }
 
+    // ---- FAB-145: what the filter dropdowns READ -------------------------------------------------
+
+    private static final String USDM_A = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad" + "5553444d";
+    private static final String USDM_B = "aa".repeat(28) + "5553444d";
+
+    /** The label the table would show with no metadata service: what an unknown token falls back to. */
+    private static String unknownLabel(String unit) {
+        return AssetDisplay.of(BigInteger.ZERO, TokenMetadata.unknown(unit)).label();
+    }
+
+    /**
+     * Ordered by label, case-insensitively — not by the unit's hex, which is what the old list sorted on.
+     * ⚠ The fixture only passes CASE-INSENSITIVELY: natural ordering puts every capital first and would
+     * read Alpha, Zeta, beta (FAB-145 T1 audit residue — the old fixture passed either way).
+     */
+    @Test
+    void optionLabelsAreOrderedByLabelCaseInsensitively() {
+        Map<String, String> labels = Map.of("01".repeat(28), "beta", "02".repeat(28), "Zeta",
+                "03".repeat(28), "Alpha");
+        var options = LiquidationReadinessController.optionLabels(
+                List.of("01".repeat(28), "02".repeat(28), "03".repeat(28)), labels::get);
+        assertEquals(List.of("Alpha", "beta", "Zeta"), List.copyOf(options.values()));
+        assertEquals(List.of("03".repeat(28), "01".repeat(28), "02".repeat(28)), List.copyOf(options.keySet()),
+                "each label stays keyed by its own unit");
+    }
+
+    /** Ada is {@code ADA} whatever the lookup says, and each unit appears once however often it is listed. */
+    @Test
+    void lovelaceReadsAdaAndAUnitAppearsOnce() {
+        var options = LiquidationReadinessController.optionLabels(
+                List.of("lovelace", "lovelace"), unit -> "not consulted for ada");
+        assertEquals(Map.of("lovelace", "ADA"), options);
+    }
+
+    /**
+     * ⛔ <b>Two options must never read the same.</b> Two tokens can share a ticker, and two identical
+     * options are a filter that can select the wrong asset — so a shared label gains the policy id.
+     */
+    @Test
+    void duplicateLabelsAreDisambiguatedByPolicyIdAndAreDistinct() {
+        var options = LiquidationReadinessController.optionLabels(
+                List.of(USDM_A, USDM_B, "lovelace"), unit -> "USDM");
+
+        assertEquals("ADA", options.get("lovelace"), "a label nobody shares is left alone");
+        assertEquals("USDM (c48cbb3d…)", options.get(USDM_A));
+        assertEquals("USDM (aaaaaaaa…)", options.get(USDM_B));
+        assertEquals(List.of("lovelace", USDM_B, USDM_A), List.copyOf(options.keySet()),
+                "label order first, then the unit breaks the tie");
+    }
+
+    /** Two units under ONE policy with one label: the policy id cannot tell them apart, the unit can. */
+    @Test
+    void duplicateLabelsUnderOnePolicyFallBackToTheFullUnit() {
+        String first = "aa".repeat(28) + "01";
+        String second = "aa".repeat(28) + "02";
+        var options = LiquidationReadinessController.optionLabels(List.of(first, second), unit -> "X");
+
+        assertEquals("X (" + first + ")", options.get(first));
+        assertEquals("X (" + second + ")", options.get(second));
+        assertEquals(2, new java.util.HashSet<>(options.values()).size(), "no two options read the same");
+    }
+
+    /** A token claiming the ticker ADA does not get to look like ada. */
+    @Test
+    void aTokenTickeredAdaIsToldApartFromAda() {
+        var options = LiquidationReadinessController.optionLabels(List.of("lovelace", USDM_A), unit -> "ADA");
+        assertEquals("ADA (lovelace)", options.get("lovelace"));
+        assertEquals("ADA (c48cbb3d…)", options.get(USDM_A));
+    }
+
+    /** No metadata: the label the table falls back to — the decoded name, else the shortened policy id. */
+    @Test
+    void unknownMetadataFallsBackToTheShortenedPolicyId() {
+        String unprintable = "ab".repeat(28) + "00ff";
+        var options = LiquidationReadinessController.optionLabels(List.of(unprintable),
+                LiquidationReadinessControllerTest::unknownLabel);
+        assertEquals("abababab…", options.get(unprintable));
+    }
+
+    /**
+     * ⛔ Through the real {@code readiness()} path: the option maps reach the model, and each option
+     * reads exactly the label the table shows for that asset — the same lookup, not a second one.
+     */
+    @Test
+    void theReadinessModelCarriesOptionsThatReadTheTablesLabels() {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+
+        @SuppressWarnings("unchecked")
+        var collateralOptions = (Map<String, String>) model.getAttribute("collateralOptions");
+        @SuppressWarnings("unchecked")
+        var principalOptions = (Map<String, String>) model.getAttribute("principalOptions");
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+
+        assertEquals(Map.of("lovelace", "ADA"), principalOptions);
+        assertEquals(List.of("COLL", "FLDT", "USDM"), List.copyOf(collateralOptions.values()));
+        for (var row : rows) {
+            assertEquals(row.collateralDisplay().label(), collateralOptions.get(row.collateralUnit()),
+                    "an option must read the table's label for the same asset");
+        }
+        assertEquals(List.of(COLLATERAL_TOKEN.toUnit(), FLDT.toUnit(), PRINCIPAL_TOKEN.toUnit()),
+                List.copyOf(collateralOptions.keySet()), "the value stays the unit");
+    }
+
+    /**
+     * ⛔ FAB-145 T2, through the real {@code readiness()} path: the book is computed from the FILTERED list,
+     * not from every row. Four loans, two on COLLATERAL_TOKEN; filtered to it, the book holds those two.
+     */
+    @Test
+    void theBookFollowsTheCollateralFilter() {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+
+        var all = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(all, null, null, null, null, null);
+        var unfiltered = (LiquidationReadinessController.BookSummary) all.getAttribute("book");
+        assertNotNull(unfiltered, "the model must carry the book");
+        assertEquals(4, unfiltered.loans(), "unfiltered, the book holds every loan");
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, COLLATERAL_TOKEN.toUnit(), null);
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+
+        assertEquals(2, rows.size(), "fixture premise: the filter leaves two rows");
+        assertEquals(rows.size(), book.loans(), "the book counts the filtered rows, not all of them");
+        assertEquals(List.of(COLLATERAL_TOKEN.toUnit()),
+                book.tokens().stream().map(LiquidationReadinessController.TokenTvl::unit).toList(),
+                "and holds only the filtered collateral");
+        assertEquals(model.getAttribute("liquidatableCount"), book.liquidatable(),
+                "its counts are the page's own totals");
+    }
+
+    /**
+     * ⛔ FAB-145 T2, through the real {@code readiness()} path: a token collateral with no feed is UNPRICED —
+     * null, never zero — and the book counts it; ada collateral is valued at its own amount. The fixture's
+     * FakeOracleClient holds no entries, so every token collateral here has no usable feed.
+     */
+    @Test
+    void anUnpricedCollateralIsNullOnTheRowAndCountedByTheBookWhileAdaIsItsOwnValue() {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, AssetType.ada());
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+
+        var tokenRows = rows.stream().filter(r -> !"lovelace".equals(r.collateralUnit())).toList();
+        assertEquals(2, tokenRows.size(), "fixture premise: two token-collateral rows");
+        for (var r : tokenRows) {
+            assertNull(r.collateralValueLovelace(),
+                    "a token collateral with no feed is unpriced, never valued at zero: " + r.collateralUnit());
+        }
+        var adaRow = rows.stream().filter(r -> "lovelace".equals(r.collateralUnit())).findFirst().orElseThrow();
+        assertEquals(BigInteger.valueOf(300_000_000L), adaRow.collateralValueLovelace(),
+                "ada collateral is valued at its own amount");
+
+        assertEquals(tokenRows.size(), book.unpricedLoans(), "every unpriced loan is counted by the book");
+        assertEquals(BigInteger.valueOf(300_000_000L), book.totalLovelace(),
+                "the total is the priced ada alone, with nothing added for the unpriced tokens");
+    }
+
+    /**
+     * ⛔ FAB-145 T2: a USD failure leaves the rest of the page intact. A malformed reference unit makes
+     * {@code AssetType.fromUnit} throw; the page must still render its rows and say why USD is unavailable.
+     */
+    @Test
+    void aMalformedUsdReferenceUnitLeavesThePageIntact() {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "usdReferenceUnit", "abc");
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+
+        assertEquals(3, rows.size(), "the rows still render");
+        assertNotNull(book, "the book still renders");
+        assertEquals(3, book.loans());
+        assertNull(book.usdDisplay(), "no dollar figure from a unit that cannot be read");
+        assertNotNull(book.usdUnavailableReason(), "and the book says USD is unavailable");
+    }
+
+    /**
+     * ⛔ FAB-145 T2: paging does not affect the book. Thirty loans, twenty-eight on COLLATERAL_TOKEN; filtered
+     * to it and rendered at page 2 (three rows), the book still holds all twenty-eight.
+     */
+    @Test
+    void theBookIsTheFilteredTotalOnEveryPageNotThePage() {
+        AssetType[] collaterals = new AssetType[30];
+        java.util.Arrays.fill(collaterals, COLLATERAL_TOKEN);
+        collaterals[0] = FLDT;
+        collaterals[1] = FLDT;
+        var controller = pageController(pageIndex().resolver(), syncing(false), collaterals);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, COLLATERAL_TOKEN.toUnit(), 2);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+
+        assertEquals(2, model.getAttribute("page"), "fixture premise: page 2 is rendered");
+        assertEquals(28 - LiquidationReadinessController.PAGE_SIZE, rows.size(), "fixture premise: page 2 holds the rest");
+        assertEquals(28, book.loans(), "the book is the filtered total, not the page");
+        assertEquals(28, book.tokens().getFirst().loans());
+    }
+
     /**
      * ⛔ <b>Closest to liquidation first, and UNKNOWN LAST.</b>
      *
@@ -594,6 +808,9 @@ class LiquidationReadinessControllerTest {
         assertNotNull(row.feeInCollateral(), "the fixture must produce a fee slice: " + row.feeUnknownReason());
         assertEquals(row.feeInCollateral(), row.feeValueLovelace(),
                 "the fee is valued at the NAMED collateral oracle's price (1), not the other version's (4)");
+        // FAB-145: the book's collateral value comes from that SAME feed — 300,000,000 × 1, not × 4.
+        assertEquals(BigInteger.valueOf(300_000_000L), row.collateralValueLovelace(),
+                "the collateral is valued at the named oracle's price, like the fee");
         assertEquals(Integer.valueOf(1), row.collateralOracleVersion(),
                 "the label must show the version of the oracle the datum names, not the token's other one");
     }

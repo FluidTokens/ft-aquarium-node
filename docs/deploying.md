@@ -252,6 +252,28 @@ otherwise have to. Add this under `aquarium-node`, and bind it to the interface 
 just moves the open door. If you want browser access from outside, terminate TLS *and* require auth
 (mTLS, an identity proxy, basic auth over TLS at minimum).
 
+### The summary at the top of the page
+
+Above the filters, a desktop-width screen shows a summary of the loans it lists:
+
+- **Counts** — how many loans, how many are liquidatable now, and how many the bot could not process.
+- **Collateral locked (TVL)** — the collateral sitting in live loans, per token. It is *not* the debt.
+  Each loan's collateral is valued in ADA at that loan's own collateral oracle.
+- **A loan whose collateral has no usable oracle price** stays in its token's amount, is left out of the
+  ADA and USD totals, and is counted on an "excluded" line — so a gap is said, never hidden as a zero.
+- **The USD figure is an ESTIMATE, not a quote.** It is the ADA total converted at the USDM oracle price,
+  counting 1 USDM as $1. USDM can trade off its peg and the oracle can lag; the page labels the figure
+  "estimated" and names the method on the line beside it.
+- **The summary follows the filters, not the page.** Narrow the list with the filters and it re-counts
+  what is left, across every page; paging through the list does not change it.
+
+`LOANS_UI_USD_REFERENCE_UNIT` is the USDM token's unit; it defaults to mainnet's. **Only USDM is
+supported** — the page labels the figure as USDM-based, so another token's unit would be mislabelled,
+not converted. The setting exists to correct the USDM unit or to turn USD off: leave it unset to keep
+the default; set it empty and the summary shows "USD unavailable", with a reason naming
+`LOANS_UI_USD_REFERENCE_UNIT`. On preview it is blank, so the summary shows "USD unavailable" there too.
+It is listed, commented out, in `docker/.env.advanced.example`.
+
 ### ⛔ `LOANS_UI_ENABLED=false` does NOT close port 8080
 
 It is easy to read the flag as an on/off switch for the whole surface. It is not. Only
