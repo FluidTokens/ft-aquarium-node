@@ -363,6 +363,83 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
+     * ⛔ FAB-145 T2, through the real {@code readiness()} path: a token collateral with no feed is UNPRICED —
+     * null, never zero — and the book counts it; ada collateral is valued at its own amount. The fixture's
+     * FakeOracleClient holds no entries, so every token collateral here has no usable feed.
+     */
+    @Test
+    void anUnpricedCollateralIsNullOnTheRowAndCountedByTheBookWhileAdaIsItsOwnValue() {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, AssetType.ada());
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+
+        var tokenRows = rows.stream().filter(r -> !"lovelace".equals(r.collateralUnit())).toList();
+        assertEquals(2, tokenRows.size(), "fixture premise: two token-collateral rows");
+        for (var r : tokenRows) {
+            assertNull(r.collateralValueLovelace(),
+                    "a token collateral with no feed is unpriced, never valued at zero: " + r.collateralUnit());
+        }
+        var adaRow = rows.stream().filter(r -> "lovelace".equals(r.collateralUnit())).findFirst().orElseThrow();
+        assertEquals(BigInteger.valueOf(300_000_000L), adaRow.collateralValueLovelace(),
+                "ada collateral is valued at its own amount");
+
+        assertEquals(tokenRows.size(), book.unpricedLoans(), "every unpriced loan is counted by the book");
+        assertEquals(BigInteger.valueOf(300_000_000L), book.totalLovelace(),
+                "the total is the priced ada alone, with nothing added for the unpriced tokens");
+    }
+
+    /**
+     * ⛔ FAB-145 T2: a USD failure leaves the rest of the page intact. A malformed reference unit makes
+     * {@code AssetType.fromUnit} throw; the page must still render its rows and say why USD is unavailable.
+     */
+    @Test
+    void aMalformedUsdReferenceUnitLeavesThePageIntact() {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "usdReferenceUnit", "abc");
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+
+        assertEquals(3, rows.size(), "the rows still render");
+        assertNotNull(book, "the book still renders");
+        assertEquals(3, book.loans());
+        assertNull(book.usdDisplay(), "no dollar figure from a unit that cannot be read");
+        assertNotNull(book.usdUnavailableReason(), "and the book says USD is unavailable");
+    }
+
+    /**
+     * ⛔ FAB-145 T2: paging does not affect the book. Thirty loans, twenty-eight on COLLATERAL_TOKEN; filtered
+     * to it and rendered at page 2 (three rows), the book still holds all twenty-eight.
+     */
+    @Test
+    void theBookIsTheFilteredTotalOnEveryPageNotThePage() {
+        AssetType[] collaterals = new AssetType[30];
+        java.util.Arrays.fill(collaterals, COLLATERAL_TOKEN);
+        collaterals[0] = FLDT;
+        collaterals[1] = FLDT;
+        var controller = pageController(pageIndex().resolver(), syncing(false), collaterals);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, COLLATERAL_TOKEN.toUnit(), 2);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+
+        assertEquals(2, model.getAttribute("page"), "fixture premise: page 2 is rendered");
+        assertEquals(28 - LiquidationReadinessController.PAGE_SIZE, rows.size(), "fixture premise: page 2 holds the rest");
+        assertEquals(28, book.loans(), "the book is the filtered total, not the page");
+        assertEquals(28, book.tokens().getFirst().loans());
+    }
+
+    /**
      * ⛔ <b>Closest to liquidation first, and UNKNOWN LAST.</b>
      *
      * <p>The ordering is the whole product: an operator reads the top of this list to decide what to

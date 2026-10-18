@@ -472,6 +472,7 @@ class ReadinessTemplateRendersRowsTest {
         assertTrue(book.contains("1 ADA ≈ $0.666666 (USDM oracle)"), "the implied rate and its source: " + book);
         assertTrue(book.contains("1 loan(s) excluded: their collateral has no usable oracle price"),
                 "the exclusions are said, not hidden: " + book);
+        assertFalse(book.contains("USD unavailable"), "no unavailable text beside a dollar figure: " + book);
         assertTrue(book.contains("estimate at oracle prices") && book.contains("following the filters"),
                 "the whole block is labelled an estimate that follows the filters");
         assertTrue(html.indexOf("class=\"book\"") < html.indexOf("class=\"filters\""), "the book sits above the filters");
@@ -488,6 +489,19 @@ class ReadinessTemplateRendersRowsTest {
         assertTrue(book.contains("USD unavailable: " + reason), "the reason renders: " + book);
         assertFalse(book.contains("≈ $"), "no dollar figure renders: " + book);
         assertTrue(book.contains("≈ 128.00 ADA"), "the ada estimate is unaffected");
+    }
+
+    /** With every loan priced there is nothing excluded, and the book does not say otherwise. */
+    @Test
+    void aBookWithNoUnpricedLoanSaysNothingWasExcluded() {
+        var b = bookSummary("FLDT", null);
+        var allPriced = new LiquidationReadinessController.BookSummary(b.loans(), b.liquidatable(), b.blocked(),
+                b.tokens(), b.totalLovelace(), 0, b.totalAdaDisplay(), b.usdDisplay(), b.adaUsdRateDisplay(),
+                b.usdUnavailableReason());
+        String book = book(render(List.of(fullRow()), ctx -> ctx.setVariable("book", allPriced)));
+
+        assertNotNull(book);
+        assertFalse(book.contains("loan(s) excluded"), "no exclusion line when nothing was excluded: " + book);
     }
 
     /** ⛔ A token label is registry-sourced, so in the book too it reaches the page escaped. */
