@@ -22,11 +22,16 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * The compound loop: scan for repayment escrows, price them, build, and submit.
@@ -194,9 +199,23 @@ public class CompoundExecutor {
             return;
         }
 
+        // FAB-144 — THE MOST PROFITABLE ESCROW FIRST. Only the ORDER changes: every candidate is still
+        // walked exactly once, and one whose fee cannot be estimated — refused, non-ada, no amount —
+        // goes last rather than missing. Guarded: ranking must never cost a compound, so a fault in it
+        // is reported and the scan's own order is walked instead.
+        List<CompoundCandidate> ordered = scan.candidates();
+        if (ordered.size() >= 2) {
+            try {
+                ordered = mostProfitableFirstThisCycle(scan.candidates());
+            } catch (RuntimeException e) {
+                log.warn("compound: ranking this cycle's candidates failed ({}); they are walked in "
+                        + "scan order", e.toString());
+            }
+        }
+
         // Every escrow is reported, refused or not: "nothing to do" and "eight things all blocked"
         // must not look alike to an operator.
-        for (CompoundCandidate candidate : scan.candidates()) {
+        for (CompoundCandidate candidate : ordered) {
             if (!candidate.structurallyReady()) {
                 log.info("compound REFUSED {} escrow {}: {} — {}", candidate.loanId(),
                         candidate.escrowRef(), candidate.exclusion(), candidate.detail());
@@ -204,6 +223,67 @@ public class CompoundExecutor {
             }
             consider(candidate);
         }
+    }
+
+    // ---- the order a cycle walks its candidates in (FAB-144) ------------------------------------
+
+    /** {@code candidates} reordered by expected fee, each computed once, and the order logged at INFO. */
+    private List<CompoundCandidate> mostProfitableFirstThisCycle(List<CompoundCandidate> candidates) {
+        Map<CompoundCandidate, Optional<BigInteger>> rewards = new IdentityHashMap<>();
+        for (CompoundCandidate candidate : candidates) {
+            rewards.put(candidate, expectedFeeLovelace(candidate));
+        }
+        List<CompoundCandidate> ordered = mostProfitableFirst(candidates, rewards::get);
+        log.info("compound order (most profitable first): {}", ordered.stream()
+                .map(candidate -> candidate.escrowRef() + rewards.get(candidate)
+                        .map(fee -> " ≈" + fee + " lovelace").orElse(" unpriced"))
+                .collect(Collectors.joining(", ")));
+        return ordered;
+    }
+
+    /**
+     * The ranking key: {@link CompoundEconomics#expectedFee}, which is already lovelace because only an
+     * ada principal is admitted ({@code CompoundCandidateScanner}'s {@code PRINCIPAL_NOT_ADA} gate).
+     * Empty — never thrown — for a structurally unready candidate, a non-ada principal or a null amount.
+     */
+    static Optional<BigInteger> expectedFeeLovelace(CompoundCandidate candidate) {
+        try {
+            if (candidate == null || !candidate.structurallyReady() || candidate.addedLiquidity() == null
+                    || !candidate.bond().datum().principalAsset().isAda()) {
+                return Optional.empty();
+            }
+            return Optional.of(CompoundEconomics.expectedFee(candidate.addedLiquidity(),
+                    candidate.feePerMille()));
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * A NEW list holding every element of {@code candidates}, each exactly once, in descending order of
+     * {@code reward}. A candidate whose reward is empty, null or throws sorts after every priced one;
+     * ties, and order among the unpriced, break on {@code escrowRef()} ascending. {@code reward} is
+     * applied once per element.
+     */
+    static List<CompoundCandidate> mostProfitableFirst(List<CompoundCandidate> candidates,
+                                                       Function<CompoundCandidate, Optional<BigInteger>> reward) {
+        Map<CompoundCandidate, BigInteger> keys = new IdentityHashMap<>();
+        for (CompoundCandidate candidate : candidates) {
+            BigInteger key;
+            try {
+                Optional<BigInteger> estimate = reward.apply(candidate);
+                key = estimate == null ? null : estimate.orElse(null);
+            } catch (RuntimeException e) {
+                key = null;
+            }
+            keys.put(candidate, key);
+        }
+        List<CompoundCandidate> ordered = new ArrayList<>(candidates);
+        ordered.sort(Comparator.comparing((CompoundCandidate candidate) -> keys.get(candidate),
+                        Comparator.nullsLast(Comparator.<BigInteger>reverseOrder()))
+                .thenComparing(candidate -> candidate == null ? null : candidate.escrowRef(),
+                        Comparator.nullsLast(Comparator.<String>naturalOrder())));
+        return ordered;
     }
 
     private void consider(CompoundCandidate candidate) {

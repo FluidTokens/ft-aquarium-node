@@ -816,6 +816,42 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
+     * FAB-144 parity: the page's "Expected reward" and the bot's liquidation ranking key are ONE
+     * function. For the same loan, bond and named collateral feed, the rendered row's
+     * {@code feeValueLovelace} equals {@code ExpectedLiquidationReward.estimate}: 300,000,000 TOK at
+     * 50/1000 is 15,000,000 TOK, and at 2/7 lovelace each that is 4,285,714.28…, floored to 4,285,714.
+     */
+    @Test
+    void aRowsExpectedRewardIsTheVeryEstimateTheBotRanksLiquidationsBy() {
+        long now = System.currentTimeMillis();
+        OraclePriceFeed feed = OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.TWO,
+                BigInteger.valueOf(7), now - 60_000L, now + 600_000L);
+        FakeOracleClient client = new FakeOracleClient(LoanFixtures.charli3(COLLATERAL_TOKEN,
+                COLLATERAL_ORACLE_NFT, "11".repeat(28), feed, input("22"), input("33"), input("44")));
+        Loan[] rendered = new Loan[1];
+        LenderBond[] renderedBond = new LenderBond[1];
+
+        LiquidationReadinessController.Row row = renderLiquidatable(
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), liveConfiguration(),
+                (bond, loan, at) -> {
+                    renderedBond[0] = bond;
+                    rendered[0] = loan;
+                    return LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(), OraclePriceFeed.unit(), at);
+                },
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), true, client, null).row();
+
+        assertEquals(BigInteger.valueOf(4_285_714L), row.feeValueLovelace(),
+                "hand-computed: " + row.feeUnknownReason());
+        var datum = rendered[0].datum();
+        Optional<BigInteger> botKey = com.fluidtokens.aquarium.offchain.service.loans.ExpectedLiquidationReward
+                .estimate(rendered[0], renderedBond[0], client.findFeedForLeg(datum.collateral().assetType(),
+                        datum.collateral().oracleTokenAsset(), System.currentTimeMillis()));
+        assertEquals(botKey, Optional.ofNullable(row.feeValueLovelace()),
+                "the page's figure and the bot's ranking key must be the same number");
+    }
+
+    /**
      * A closed gate overrides a row's action: never "would act", and it says why. An open gate leaves
      * the row's own answer untouched.
      */

@@ -4017,4 +4017,162 @@ class LiquidationExecutorTest {
         executor.cycle(NOW + 120_000L);
         assertEquals(3, router.beginCycles, "exactly one per cycle");
     }
+
+    // ======================================================================================
+    // FAB-144 — each cycle tries the most profitable liquidation first
+    // ======================================================================================
+
+    /**
+     * FAB-144, cycle level. Two buildable ada/ada candidates, scanned CHEAPEST first: {@code aa…#0}
+     * at 100/1000 of 100 ada (a 10-ada slice) and {@code ab…#0} at 500/1000 (a 50-ada slice). Ada
+     * collateral prices 1:1 through the unit feed the oracle client returns for ada, so both are
+     * priced. The cycle must reach the builder richest first — scan order would put {@code aa…} first
+     * — and log the order it chose once, at INFO.
+     */
+    @Test
+    void twoBuildableCandidatesReachTheBuilderMostProfitableFirstNotInScanOrder() {
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
+        when(builder.build(any(LiquidateTransactionBuilder.Request.class)))
+                .thenThrow(new IllegalStateException("ordering probe: the build itself is not under test"));
+        Scenario cheap = scenario(BigInteger.valueOf(100));
+        Scenario rich = secondScenario();
+        List<Scenario> both = List.of(cheap, rich);
+        CountingOracleProvider oracles = new CountingOracleProvider(
+                new FakeOracleClient(List.of()), new FakeOracleClient(List.of()));
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(cheap.assessment(), rich.assessment()),
+                both, allUnspent(both), List.of(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
+                LoanFixtures.protocolParams(), null, builder, metrics());
+
+        List<ILoggingEvent> events = cyclesLogged(wiring, 1);
+
+        List<LiquidationDecision> newestFirst = wiring.log().newestFirst(10);
+        assertEquals(2, newestFirst.size(), "both candidates are still considered: " + events);
+        assertEquals(TX_LOAN_2 + "#0", newestFirst.get(1).loanUtxoRef(),
+                "the 50-ada slice must be tried FIRST, ahead of the scan's own order");
+        assertEquals(TX_LOAN + "#0", newestFirst.get(0).loanUtxoRef(),
+                "and the 10-ada slice after it — reordered, never dropped");
+        List<String> orderLines = events.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(message -> message.startsWith("liquidation order (most profitable first): "))
+                .toList();
+        assertEquals(List.of("liquidation order (most profitable first): "
+                        + TX_LOAN_2 + "#0 ≈50000000 lovelace, " + TX_LOAN + "#0 ≈10000000 lovelace"),
+                orderLines, "one INFO line naming the order with each estimate: " + events);
+    }
+
+    /** A buildable assessment whose loan lives at {@code txHash#0}; only its ref matters to the order. */
+    private static LiquidationAssessment rankedAt(String txHash) {
+        Loan loan = new Loan(txHash, 0, "addr_test1_placeholder", "ordering", BigInteger.TEN,
+                BigInteger.ONE, null);
+        LenderBond bond = new LenderBond(txHash, 1, "addr_test1_placeholder", "ordering", "", null);
+        return LiquidationAssessment.buildable(bond, loan, "ordering fixture", null, null, false, null);
+    }
+
+    private static List<String> loanRefs(List<LiquidationAssessment> assessments) {
+        return assessments.stream().map(assessment -> assessment.loan().utxoRef()).toList();
+    }
+
+    /**
+     * FAB-144: descending by reward; a tie breaks on the loan ref ascending; every unpriced candidate —
+     * an empty reward, a null one, one whose estimate throws — goes after every priced one, ordered by
+     * ref among themselves. The result is a permutation of the input: same size, same instances.
+     */
+    @Test
+    void mostProfitableFirstOrdersByRewardWithTiesAndTheUnpricedByLoanRef() {
+        LiquidationAssessment unpricedC = rankedAt("cc".repeat(32));
+        LiquidationAssessment fiveA = rankedAt("aa".repeat(32));
+        LiquidationAssessment nine = rankedAt("dd".repeat(32));
+        LiquidationAssessment fiveB = rankedAt("bb".repeat(32));
+        LiquidationAssessment nullReward = rankedAt("ee".repeat(32));
+        LiquidationAssessment throwing = rankedAt("0f".repeat(32));
+        List<LiquidationAssessment> scanned = List.of(unpricedC, fiveA, nine, fiveB, nullReward, throwing);
+        Map<LiquidationAssessment, Optional<BigInteger>> rewards = new java.util.IdentityHashMap<>();
+        rewards.put(unpricedC, Optional.empty());
+        rewards.put(fiveA, Optional.of(BigInteger.valueOf(5)));
+        rewards.put(nine, Optional.of(BigInteger.valueOf(9)));
+        rewards.put(fiveB, Optional.of(BigInteger.valueOf(5)));
+        rewards.put(nullReward, null);
+        List<LiquidationAssessment> asked = new ArrayList<>();
+
+        List<LiquidationAssessment> ordered = LiquidationExecutor.mostProfitableFirst(scanned, assessment -> {
+            asked.add(assessment);
+            if (assessment == throwing) {
+                throw new IllegalStateException("a feed that cannot be priced");
+            }
+            return rewards.get(assessment);
+        });
+
+        assertEquals(List.of("dd".repeat(32) + "#0", "aa".repeat(32) + "#0", "bb".repeat(32) + "#0",
+                        "0f".repeat(32) + "#0", "cc".repeat(32) + "#0", "ee".repeat(32) + "#0"),
+                loanRefs(ordered), "9, then the 5s by ref, then every unpriced one by ref");
+        assertEquals(scanned.size(), ordered.size(), "nothing dropped, nothing duplicated");
+        for (LiquidationAssessment assessment : scanned) {
+            assertEquals(1, ordered.stream().filter(o -> o == assessment).count(),
+                    "each candidate exactly once: " + assessment.loan().utxoRef());
+        }
+        assertEquals(scanned.size(), asked.size(), "the reward is computed once per candidate");
+        assertEquals(List.of(unpricedC, fiveA, nine, fiveB, nullReward, throwing), scanned,
+                "a NEW list: the scan's own list is left as it was");
+    }
+
+    /** All unpriced — no oracle client — is the scan reordered by ref alone, and still complete. */
+    @Test
+    void mostProfitableFirstWithNothingPricedIsRefOrderAndComplete() {
+        List<LiquidationAssessment> scanned = List.of(rankedAt("bb".repeat(32)), rankedAt("aa".repeat(32)));
+
+        List<LiquidationAssessment> ordered = LiquidationExecutor.mostProfitableFirst(scanned,
+                assessment -> Optional.empty());
+
+        assertEquals(List.of("aa".repeat(32) + "#0", "bb".repeat(32) + "#0"), loanRefs(ordered));
+        assertTrue(LiquidationExecutor.mostProfitableFirst(List.of(), assessment -> Optional.empty()).isEmpty());
+    }
+
+    /**
+     * FAB-144: a candidate that cannot be priced is walked LAST, not dropped. A token-collateral loan
+     * whose oracle the client does not know sits between two priced ada/ada ones in the scan; the cycle
+     * reaches all three, the unpriced one after both, and the INFO line says {@code unpriced}.
+     */
+    @Test
+    void anUnpricedCandidateIsWalkedLastAndNeverDropped() {
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
+        when(builder.build(any(LiquidateTransactionBuilder.Request.class)))
+                .thenThrow(new IllegalStateException("ordering probe: the build itself is not under test"));
+        Scenario cheap = scenario(BigInteger.valueOf(100));
+        Scenario rich = secondScenario();
+        Scenario unpriced = tokenScenarioAt("a0".repeat(32), "c1d2e3f4a5b6c7d8");
+        List<Scenario> all = List.of(cheap, unpriced, rich);
+        CountingOracleProvider oracles = new CountingOracleProvider(
+                new FakeOracleClient(List.of()), new FakeOracleClient(List.of()));
+        Wiring wiring = wiring(shadow(SMALL_MARGIN),
+                List.of(cheap.assessment(), unpriced.assessment(), rich.assessment()),
+                all, allUnspent(all), List.of(WALLET_UTXO, WALLET_UTXO_SMALL), oracles, false, false,
+                LoanFixtures.protocolParams(), null, builder, metrics());
+
+        List<ILoggingEvent> events = cyclesLogged(wiring, 1);
+
+        List<String> oldestFirst = new ArrayList<>(wiring.log().newestFirst(10).stream()
+                .map(LiquidationDecision::loanUtxoRef).toList());
+        java.util.Collections.reverse(oldestFirst);
+        assertEquals(List.of(TX_LOAN_2 + "#0", TX_LOAN + "#0", "a0".repeat(32) + "#0"), oldestFirst,
+                "priced richest first, the unpriced one last — and all three considered: " + events);
+        assertTrue(events.stream().map(ILoggingEvent::getFormattedMessage)
+                        .anyMatch(message -> message.equals("liquidation order (most profitable first): "
+                                + TX_LOAN_2 + "#0 ≈50000000 lovelace, " + TX_LOAN + "#0 ≈10000000 lovelace, "
+                                + "a0".repeat(32) + "#0 unpriced")),
+                "the order line names the unpriced candidate as such: " + events);
+    }
+
+    /** {@link #tokenScenario()} at its own refs, so it can sit beside the ada/ada scenarios. */
+    private static Scenario tokenScenarioAt(String txHash, String loanId) {
+        Scenario token = tokenScenario();
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(txHash, 0, loanId, token.loan().loan().datum(),
+                2_000_000L, List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(txHash, 1, loanId,
+                LoanFixtures.bondDatum(FAT_FEE_PER_MILLE, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY),
+                        AssetType.ada()),
+                2_000_000L);
+        return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.unit(), collateralFeed(), VALID_FROM));
+    }
 }

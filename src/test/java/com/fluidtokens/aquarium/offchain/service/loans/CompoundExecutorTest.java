@@ -1,5 +1,9 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Result;
@@ -15,6 +19,7 @@ import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import java.io.InputStream;
 import java.math.BigInteger;
@@ -425,6 +430,151 @@ class CompoundExecutorTest {
                             + "on this path — ruled sufficient because compound is low-risk — so it "
                             + "had better hold");
         }
+    }
+
+    // ---- FAB-144: the most profitable compound first ------------------------------------------
+
+    /** {@link #ready(long)} at its own escrow ref, so two ready candidates can be told apart. */
+    private static CompoundCandidate readyAt(String escrowTxHash, long feePerMille) {
+        CompoundCandidate base = ready(feePerMille);
+        Utxo escrow = utxo("escrow");
+        escrow.setTxHash(escrowTxHash);
+        return new CompoundCandidate(base.loanId(), escrow, base.escrowDatum(), base.addedLiquidity(),
+                base.bond(), base.poolId(), base.pool(), base.poolManager(), base.feePerMille(),
+                base.principalIsAda(), base.exclusion(), base.detail());
+    }
+
+    /** One disarmed cycle's INFO lines, in the order the executor logged them. */
+    private static List<String> infoLinesOfOneCycle(Wiring w) {
+        var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            w.executor().cycle();
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .map(ILoggingEvent::getFormattedMessage)
+                .toList();
+    }
+
+    /**
+     * FAB-144, cycle level. Scanned refused-first, then the 10/1000 escrow, then the 20/1000 one: the
+     * cycle must walk the 20/1000 escrow first (582,185 lovelace on 29,109,268), then the 10/1000
+     * (291,092), and the structurally refused one last — still reported, never dropped. Disarmed, so
+     * each ready candidate says READY BUT NOT ARMED and nothing is built.
+     */
+    @Test
+    void aCycleWalksTheMostProfitableCompoundFirstAndARefusedOneLast() {
+        CompoundCandidate tenPerMille = readyAt("01".repeat(32), 10L);
+        CompoundCandidate twentyPerMille = readyAt("02".repeat(32), 20L);
+        String cheap = tenPerMille.escrowRef();
+        String rich = twentyPerMille.escrowRef();
+        Wiring w = wiring(List.of(refused(), tenPerMille, twentyPerMille), false, 0L);
+
+        List<String> info = infoLinesOfOneCycle(w);
+
+        List<String> walked = info.stream()
+                .filter(line -> line.startsWith("compound READY but NOT ARMED")
+                        || line.startsWith("compound REFUSED"))
+                .toList();
+        assertEquals(3, walked.size(), "every candidate is reported, each once: " + info);
+        assertTrue(walked.get(0).contains(rich), "the 20/1000 escrow first: " + walked);
+        assertTrue(walked.get(1).contains(cheap), "the 10/1000 escrow second: " + walked);
+        assertTrue(walked.get(2).startsWith("compound REFUSED"), "the refused one last: " + walked);
+        assertEquals(List.of("compound order (most profitable first): " + rich + " ≈582185 lovelace, "
+                        + cheap + " ≈291092 lovelace, " + refused().escrowRef() + " unpriced"),
+                info.stream().filter(line -> line.startsWith("compound order")).toList(),
+                "one INFO line naming the order: " + info);
+        assertTrue(w.submitted().isEmpty(), "a disarmed loop transmits nothing");
+    }
+
+    /** {@link #readyAt} with no {@code addedLiquidity} — ready on paper, but nothing to price. */
+    private static CompoundCandidate readyWithoutAmountAt(String escrowTxHash) {
+        CompoundCandidate base = readyAt(escrowTxHash, 20L);
+        return new CompoundCandidate(base.loanId(), base.escrow(), base.escrowDatum(), null, base.bond(),
+                base.poolId(), base.pool(), base.poolManager(), base.feePerMille(), base.principalIsAda(),
+                null, base.detail());
+    }
+
+    /** {@link #readyAt} whose bond names a non-ada principal — the scanner refuses these today. */
+    private static CompoundCandidate tokenPrincipalAt(String escrowTxHash) {
+        CompoundCandidate base = readyAt(escrowTxHash, 20L);
+        var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
+        LenderBond bond = new LenderBond(base.bond().txHash(), base.bond().outputIndex(), base.bond().address(),
+                base.bond().loanId(), base.bond().inlineDatum(),
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), token));
+        return new CompoundCandidate(base.loanId(), base.escrow(), base.escrowDatum(), base.addedLiquidity(),
+                bond, base.poolId(), base.pool(), base.poolManager(), base.feePerMille(), false, null,
+                base.detail());
+    }
+
+    /**
+     * FAB-144: the compound ranking key is {@code expectedFee} — 29,109,268 × 20 / 1000 = 582,185.36,
+     * truncated to 582,185 lovelace — and empty, never thrown, for whatever cannot be priced.
+     */
+    @Test
+    void theCompoundRankingKeyIsTheExpectedFeeAndEmptyForWhatCannotBePriced() {
+        assertEquals(Optional.of(BigInteger.valueOf(582_185L)),
+                CompoundExecutor.expectedFeeLovelace(readyAt("02".repeat(32), 20L)));
+        assertEquals(Optional.of(BigInteger.ZERO), CompoundExecutor.expectedFeeLovelace(ready(0L)),
+                "a zero-fee pool is priced at zero, not unpriced");
+        assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(refused()),
+                "structurally unready");
+        assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(readyWithoutAmountAt("03".repeat(32))),
+                "no addedLiquidity");
+        assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(tokenPrincipalAt("05".repeat(32))),
+                "a non-ada principal: expectedFee is not lovelace there");
+        assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(null));
+    }
+
+    /**
+     * FAB-144: descending by expected fee; a tie breaks on {@code escrowRef} ascending; the structurally
+     * unready, the amount-less and the non-ada candidates all go after every priced one, by escrow ref.
+     * A permutation of the input, never a filter.
+     */
+    @Test
+    void mostProfitableFirstOrdersCompoundsWithTheUnpricedLastByEscrowRef() {
+        CompoundCandidate refused = refused();                          // fb48…#2, unpriced
+        CompoundCandidate noAmount = readyWithoutAmountAt("03".repeat(32)); // unpriced
+        CompoundCandidate nonAda = tokenPrincipalAt("05".repeat(32));     // unpriced
+        CompoundCandidate ten = readyAt("01".repeat(32), 10L);            // 291,092
+        CompoundCandidate twentyB = readyAt("04".repeat(32), 20L);        // 582,185
+        CompoundCandidate twentyA = readyAt("02".repeat(32), 20L);        // 582,185
+        List<CompoundCandidate> scanned = List.of(refused, noAmount, nonAda, ten, twentyB, twentyA);
+
+        List<CompoundCandidate> ordered = CompoundExecutor.mostProfitableFirst(scanned,
+                CompoundExecutor::expectedFeeLovelace);
+
+        assertEquals(List.of(twentyA.escrowRef(), twentyB.escrowRef(), ten.escrowRef(),
+                        noAmount.escrowRef(), nonAda.escrowRef(), refused.escrowRef()),
+                ordered.stream().map(CompoundCandidate::escrowRef).toList());
+        assertEquals(scanned.size(), ordered.size(), "nothing dropped, nothing duplicated");
+        for (CompoundCandidate candidate : scanned) {
+            assertEquals(1, ordered.stream().filter(o -> o == candidate).count(), candidate.escrowRef());
+        }
+        assertEquals(List.of(refused, noAmount, nonAda, ten, twentyB, twentyA), scanned,
+                "a NEW list: the scan's own list is left as it was");
+    }
+
+    /** A key function that throws makes that candidate unpriced — it is never lost. */
+    @Test
+    void aThrowingCompoundKeyMakesThatCandidateUnpricedNotLost() {
+        CompoundCandidate ten = readyAt("01".repeat(32), 10L);
+        CompoundCandidate twenty = readyAt("02".repeat(32), 20L);
+
+        List<CompoundCandidate> ordered = CompoundExecutor.mostProfitableFirst(List.of(twenty, ten),
+                candidate -> {
+                    if (candidate == twenty) {
+                        throw new IllegalStateException("boom");
+                    }
+                    return CompoundExecutor.expectedFeeLovelace(candidate);
+                });
+
+        assertEquals(List.of(ten, twenty), ordered);
     }
 
     // ---- fakes -------------------------------------------------------------------------------
