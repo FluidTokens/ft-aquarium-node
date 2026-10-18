@@ -255,7 +255,7 @@ loans:
     token-registry:
       url: ${LOANS_UI_TOKEN_REGISTRY_URL:https://tokens.cardano.org}
       timeout-seconds: ${LOANS_UI_TOKEN_REGISTRY_TIMEOUT_SECONDS:5}
-    # FAB-145: the readiness page's USD is an ESTIMATE — ADA converted at this unit's (USDM) oracle price, 1 unit counted as $1. Empty hides USD.
+    # FAB-145: the readiness page's USD is an ESTIMATE — ADA converted at this unit's (USDM) oracle price, 1 unit counted as $1. USDM only, never another token. Empty shows "USD unavailable".
     usd-reference-unit: ${LOANS_UI_USD_REFERENCE_UNIT:c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d}
 
   # The wallet rebalancer (FAB-131): on every block, while the node is not syncing, it moves the bot

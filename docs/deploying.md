@@ -254,7 +254,7 @@ just moves the open door. If you want browser access from outside, terminate TLS
 
 ### The summary at the top of the page
 
-On a desktop-width screen the page opens with a summary of the loans it lists:
+Above the filters, a desktop-width screen shows a summary of the loans it lists:
 
 - **Counts** — how many loans, how many are liquidatable now, and how many the bot could not process.
 - **Collateral locked (TVL)** — the collateral sitting in live loans, per token. It is *not* the debt.
@@ -267,9 +267,12 @@ On a desktop-width screen the page opens with a summary of the loans it lists:
 - **The summary follows the filters, not the page.** Narrow the list with the filters and it re-counts
   what is left, across every page; paging through the list does not change it.
 
-The USD figure is driven by `LOANS_UI_USD_REFERENCE_UNIT`, the token whose oracle price converts ADA to
-dollars. It defaults to USDM on mainnet; set it empty to hide USD. On preview it is blank and the summary
-shows USD as unavailable. It is listed, commented out, in `docker/.env.advanced.example`.
+`LOANS_UI_USD_REFERENCE_UNIT` is the USDM token's unit; it defaults to mainnet's. **Only USDM is
+supported** — the page labels the figure as USDM-based, so another token's unit would be mislabelled,
+not converted. The setting exists to correct the USDM unit or to turn USD off: leave it unset to keep
+the default; set it empty and the summary shows "USD unavailable", with a reason naming
+`LOANS_UI_USD_REFERENCE_UNIT`. On preview it is blank, so the summary shows "USD unavailable" there too.
+It is listed, commented out, in `docker/.env.advanced.example`.
 
 ### ⛔ `LOANS_UI_ENABLED=false` does NOT close port 8080
 

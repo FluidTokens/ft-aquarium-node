@@ -201,8 +201,8 @@ class ReadinessBookSummaryTest {
             assertNull(summary.usdDisplay(), "no reference unit, no dollar figure");
             assertNull(summary.adaUsdRateDisplay());
             assertNotNull(summary.usdUnavailableReason());
-            assertTrue(summary.usdUnavailableReason().contains("usd-reference-unit"),
-                    "the reason names the setting: " + summary.usdUnavailableReason());
+            assertTrue(summary.usdUnavailableReason().contains("LOANS_UI_USD_REFERENCE_UNIT"),
+                    "the reason names the env var an operator sets: " + summary.usdUnavailableReason());
             assertEquals(BigInteger.valueOf(128_000_000L), summary.totalLovelace(), "ada is unaffected");
         }
     }

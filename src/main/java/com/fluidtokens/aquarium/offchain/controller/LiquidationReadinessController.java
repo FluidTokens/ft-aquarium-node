@@ -556,7 +556,7 @@ public class LiquidationReadinessController {
         AssetDisplay rate = null;
         String usdUnavailable;
         if (usdUnit == null || usdUnit.isBlank()) {
-            usdUnavailable = "no USD reference is configured (loans.ui.usd-reference-unit)";
+            usdUnavailable = "turned off: no USDM unit is set (LOANS_UI_USD_REFERENCE_UNIT is empty, or unset on preview)";
         } else if (usdFeed.isEmpty()) {
             usdUnavailable = "no usable USDM oracle price right now";
         } else if (totalLovelace == null) {
