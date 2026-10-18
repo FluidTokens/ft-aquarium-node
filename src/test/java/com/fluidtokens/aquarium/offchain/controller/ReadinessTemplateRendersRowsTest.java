@@ -351,6 +351,27 @@ class ReadinessTemplateRendersRowsTest {
                 "page 3 of 3 links only back: " + last);
     }
 
+    /**
+     * ⚠ FAB-145 T1 audit residue: the exact two-page boundary. Three pages could not tell {@code pages > 1}
+     * from {@code pages > 2}; two can — page 1 of 2 links only on, page 2 of 2 only back.
+     */
+    @Test
+    void aTwoPageListRendersAPagerOnEitherPage() {
+        String first = pager(render(List.of(fullRow()), onPage(1, 2)));
+        assertNotNull(first, "two pages must render a pager on page 1");
+        assertTrue(first.contains("page 1 of 2"), first);
+        assertEquals(List.of("2"), hrefs(first).stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 1 of 2 links only to page 2");
+        assertTrue(first.contains("next") && !first.contains("previous"), "page 1 of 2 has only a next link");
+
+        String second = pager(render(List.of(fullRow()), onPage(2, 2)));
+        assertNotNull(second, "two pages must render a pager on page 2");
+        assertTrue(second.contains("page 2 of 2"), second);
+        assertEquals(List.of("1"), hrefs(second).stream().map(ReadinessTemplateRendersRowsTest::pageOf).toList(),
+                "page 2 of 2 links only to page 1");
+        assertTrue(second.contains("previous") && !second.contains("next"), "page 2 of 2 has only a previous link");
+    }
+
     /** One page needs no pager. ⚠ Asserted on the MARKUP: the stylesheet itself contains "pager". */
     @Test
     void aSinglePageRendersNoPager() {
@@ -396,6 +417,95 @@ class ReadinessTemplateRendersRowsTest {
         assertTrue(html.contains("<option value=\"" + FLDT_UNIT + "\">" + abbreviated(FLDT_UNIT) + "</option>"),
                 "the fallback is the abbreviated unit, as before FAB-145");
         assertTrue(html.matches("(?s).*<option value=\"lovelace\"[^>]*>ADA</option>.*"), "ada still reads ADA");
+    }
+
+    // ---- FAB-145 T2: the book above the filters ----------------------------------------------------
+
+    private static final String USDM_UNIT = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d";
+
+    /** The book element alone — never the CSS in {@code <style>}, which also says "book". */
+    private static String book(String html) {
+        int start = html.indexOf("class=\"book\"");
+        if (start < 0) {
+            return null;
+        }
+        return html.substring(start, html.indexOf("class=\"filters\"", start));
+    }
+
+    /**
+     * A book of seven loans with FLDT as the one token line (3 loans, 1 unpriced), 128 ADA in total, and
+     * either $85.33 at 1 ADA ≈ $0.666666 or USD unavailable for {@code usdReason}.
+     */
+    private static LiquidationReadinessController.BookSummary bookSummary(String tokenLabel, String usdReason) {
+        var fldt = new TokenMetadata(FLDT_UNIT, tokenLabel, "FluidTokens", 6, TokenMetadata.Source.REGISTRY);
+        var usdm = new TokenMetadata(USDM_UNIT, "USDM", "USDM", 6, TokenMetadata.Source.REGISTRY);
+        var line = new LiquidationReadinessController.TokenTvl(FLDT_UNIT, 3,
+                AssetDisplay.of(BigInteger.valueOf(4_500_000L), fldt), BigInteger.valueOf(128_000_000L),
+                AssetDisplay.of(BigInteger.valueOf(128_000_000L), TokenMetadata.ada()), 1);
+        boolean usd = usdReason == null;
+        return new LiquidationReadinessController.BookSummary(7, 2, 1, List.of(line),
+                BigInteger.valueOf(128_000_000L), 1,
+                AssetDisplay.of(BigInteger.valueOf(128_000_000L), TokenMetadata.ada()),
+                usd ? AssetDisplay.of(BigInteger.valueOf(85_333_333L), usdm) : null,
+                usd ? AssetDisplay.of(BigInteger.valueOf(666_666L), usdm) : null,
+                usdReason);
+    }
+
+    /**
+     * ⛔ FAB-145 T2: the desktop view shows the book — loan counts, collateral locked per token, ≈ ADA and
+     * ≈ USD — above the filters, labelled an estimate that follows them, and hidden on a phone.
+     */
+    @Test
+    void theBookRendersItsCountsTokenLinesAndTotalsAboveTheFilters() {
+        String html = render(List.of(fullRow()),
+                ctx -> ctx.setVariable("book", bookSummary("FLDT", null)));
+
+        String book = book(html);
+        assertNotNull(book, "a context with a book must render class=\"book\"");
+        assertTrue(book.contains("<b>7</b> loan(s)"), "the loan count: " + book);
+        assertTrue(book.contains("<b>2</b> liquidatable now"), "the liquidatable count: " + book);
+        assertTrue(book.contains("Collateral locked (TVL)"), "the TVL is named as collateral locked");
+        assertTrue(book.contains(">FLDT<"), "the token line carries its label: " + book);
+        assertTrue(book.contains(">4.50<"), "and its locked amount, scaled: " + book);
+        assertTrue(book.contains("≈ 128.00 ADA"), "the ada estimate: " + book);
+        assertTrue(book.contains("≈ $85.33"), "the dollar estimate: " + book);
+        assertTrue(book.contains("1 ADA ≈ $0.666666 (USDM oracle)"), "the implied rate and its source: " + book);
+        assertTrue(book.contains("1 loan(s) excluded: their collateral has no usable oracle price"),
+                "the exclusions are said, not hidden: " + book);
+        assertTrue(book.contains("estimate at oracle prices") && book.contains("following the filters"),
+                "the whole block is labelled an estimate that follows the filters");
+        assertTrue(html.indexOf("class=\"book\"") < html.indexOf("class=\"filters\""), "the book sits above the filters");
+        assertTrue(html.contains(".wallet-age, .book { display:none; }"), "and is hidden under the phone breakpoint");
+    }
+
+    /** USD unavailable: the reason takes the figure's place, and no dollar figure renders at all. */
+    @Test
+    void anUnavailableUsdShowsItsReasonAndNoDollarFigure() {
+        String reason = "no usable USDM oracle price right now";
+        String book = book(render(List.of(fullRow()), ctx -> ctx.setVariable("book", bookSummary("FLDT", reason))));
+
+        assertNotNull(book);
+        assertTrue(book.contains("USD unavailable: " + reason), "the reason renders: " + book);
+        assertFalse(book.contains("≈ $"), "no dollar figure renders: " + book);
+        assertTrue(book.contains("≈ 128.00 ADA"), "the ada estimate is unaffected");
+    }
+
+    /** ⛔ A token label is registry-sourced, so in the book too it reaches the page escaped. */
+    @Test
+    void aTokenLabelInTheBookIsEscaped() {
+        String html = render(List.of(fullRow()),
+                ctx -> ctx.setVariable("book", bookSummary("<b>FLDT</b>", null)));
+        assertTrue(book(html).contains("&lt;b&gt;FLDT&lt;/b&gt;"), "the label must be escaped");
+        assertFalse(html.contains("<b>FLDT</b>"), "a registry's text must never reach the page as markup");
+    }
+
+    /** A context without a book renders exactly as before. ⚠ On the MARKUP: the stylesheet says "book". */
+    @Test
+    void withoutABookThePageRendersAndTheBlockIsAbsent() {
+        String html = render(List.of(fullRow()));
+        assertTrue(html.contains("CAPITAL IN ADVANCE"), "the page still renders its rows");
+        assertFalse(html.contains("class=\"book\""), "no book element without a book");
+        assertTrue(html.contains(".book"), "fixture premise: the stylesheet does mention the book");
     }
 
     /** What {@code #strings.abbreviate(unit, 18)} renders. */

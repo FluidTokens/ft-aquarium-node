@@ -235,15 +235,19 @@ class LiquidationReadinessControllerTest {
         return AssetDisplay.of(BigInteger.ZERO, TokenMetadata.unknown(unit)).label();
     }
 
-    /** Ordered by label, case-insensitively — not by the unit's hex, which is what the old list sorted on. */
+    /**
+     * Ordered by label, case-insensitively — not by the unit's hex, which is what the old list sorted on.
+     * ⚠ The fixture only passes CASE-INSENSITIVELY: natural ordering puts every capital first and would
+     * read Alpha, Zeta, beta (FAB-145 T1 audit residue — the old fixture passed either way).
+     */
     @Test
     void optionLabelsAreOrderedByLabelCaseInsensitively() {
-        Map<String, String> labels = Map.of("01".repeat(28), "zeta", "02".repeat(28), "Alpha",
-                "03".repeat(28), "beta");
+        Map<String, String> labels = Map.of("01".repeat(28), "beta", "02".repeat(28), "Zeta",
+                "03".repeat(28), "Alpha");
         var options = LiquidationReadinessController.optionLabels(
                 List.of("01".repeat(28), "02".repeat(28), "03".repeat(28)), labels::get);
-        assertEquals(List.of("Alpha", "beta", "zeta"), List.copyOf(options.values()));
-        assertEquals(List.of("02".repeat(28), "03".repeat(28), "01".repeat(28)), List.copyOf(options.keySet()),
+        assertEquals(List.of("Alpha", "beta", "Zeta"), List.copyOf(options.values()));
+        assertEquals(List.of("03".repeat(28), "01".repeat(28), "02".repeat(28)), List.copyOf(options.keySet()),
                 "each label stays keyed by its own unit");
     }
 
@@ -326,6 +330,36 @@ class LiquidationReadinessControllerTest {
         }
         assertEquals(List.of(COLLATERAL_TOKEN.toUnit(), FLDT.toUnit(), PRINCIPAL_TOKEN.toUnit()),
                 List.copyOf(collateralOptions.keySet()), "the value stays the unit");
+    }
+
+    /**
+     * ⛔ FAB-145 T2, through the real {@code readiness()} path: the book is computed from the FILTERED list,
+     * not from every row. Four loans, two on COLLATERAL_TOKEN; filtered to it, the book holds those two.
+     */
+    @Test
+    void theBookFollowsTheCollateralFilter() {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+
+        var all = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(all, null, null, null, null, null);
+        var unfiltered = (LiquidationReadinessController.BookSummary) all.getAttribute("book");
+        assertNotNull(unfiltered, "the model must carry the book");
+        assertEquals(4, unfiltered.loans(), "unfiltered, the book holds every loan");
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, COLLATERAL_TOKEN.toUnit(), null);
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+
+        assertEquals(2, rows.size(), "fixture premise: the filter leaves two rows");
+        assertEquals(rows.size(), book.loans(), "the book counts the filtered rows, not all of them");
+        assertEquals(List.of(COLLATERAL_TOKEN.toUnit()),
+                book.tokens().stream().map(LiquidationReadinessController.TokenTvl::unit).toList(),
+                "and holds only the filtered collateral");
+        assertEquals(model.getAttribute("liquidatableCount"), book.liquidatable(),
+                "its counts are the page's own totals");
     }
 
     /**
@@ -697,6 +731,9 @@ class LiquidationReadinessControllerTest {
         assertNotNull(row.feeInCollateral(), "the fixture must produce a fee slice: " + row.feeUnknownReason());
         assertEquals(row.feeInCollateral(), row.feeValueLovelace(),
                 "the fee is valued at the NAMED collateral oracle's price (1), not the other version's (4)");
+        // FAB-145: the book's collateral value comes from that SAME feed — 300,000,000 × 1, not × 4.
+        assertEquals(BigInteger.valueOf(300_000_000L), row.collateralValueLovelace(),
+                "the collateral is valued at the named oracle's price, like the fee");
         assertEquals(Integer.valueOf(1), row.collateralOracleVersion(),
                 "the label must show the version of the oracle the datum names, not the token's other one");
     }

@@ -12,6 +12,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.Loan;
 import com.fluidtokens.aquarium.offchain.model.loans.LoanHealth;
 import com.fluidtokens.aquarium.offchain.model.loans.MinswapPoolDatum;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
@@ -45,6 +46,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -157,7 +159,33 @@ public class LiquidationReadinessController {
                       String utxoExplorerUrl,
                       // FAB-112: the oracleVersion of the collateral oracle THIS loan's datum names
                       // (1 = Lending v3's, 2 = Lending v4's), null when unknown or no oracle.
-                      Integer collateralOracleVersion) {
+                      Integer collateralOracleVersion,
+                      // FAB-145: the WHOLE collateral priced in lovelace at the same feed the fee slice
+                      // is valued at. Null when it could not be priced — never zero, because the book
+                      // above the table must exclude such a loan from its totals rather than count it
+                      // as worthless.
+                      BigInteger collateralValueLovelace) {
+
+        /** Without a collateral value — every construction that predates FAB-145. */
+        public Row(String loanId, String utxoRef, String principalUnit, BigInteger principalAmount,
+                   BigInteger remainingDebt, String collateralUnit, BigInteger collateralAmount,
+                   Double healthFactor, Double currentLtvPercent, Boolean liquidatable,
+                   String healthUnknownReason, BigInteger feeInCollateral, BigInteger feeValueLovelace,
+                   String feeUnknownReason, String route, String routeDetail,
+                   BigInteger advancePrincipalAmount, LoanAge age, AssetDisplay principalDisplay,
+                   AssetDisplay collateralDisplay, PoolUsability poolUsability, AssetDisplay feeDisplay,
+                   AssetDisplay feeValueDisplay, AssetDisplay advanceDisplay, AssetDisplay debtDisplay,
+                   AnticipateAndSell anticipateAndSell, AssetDisplay anticipateDisplay, ActionNow actionNow,
+                   ProcessingBlocker blocker, String loanExplorerUrl, String utxoExplorerUrl,
+                   Integer collateralOracleVersion) {
+            this(loanId, utxoRef, principalUnit, principalAmount, remainingDebt, collateralUnit,
+                    collateralAmount, healthFactor, currentLtvPercent, liquidatable, healthUnknownReason,
+                    feeInCollateral, feeValueLovelace, feeUnknownReason, route, routeDetail,
+                    advancePrincipalAmount, age, principalDisplay, collateralDisplay, poolUsability,
+                    feeDisplay, feeValueDisplay, advanceDisplay, debtDisplay, anticipateAndSell,
+                    anticipateDisplay, actionNow, blocker, loanExplorerUrl, utxoExplorerUrl,
+                    collateralOracleVersion, null);
+        }
 
         /** Without an oracle version — every construction that predates FAB-112. */
         public Row(String loanId, String utxoRef, String principalUnit, BigInteger principalAmount,
@@ -175,13 +203,39 @@ public class LiquidationReadinessController {
                     feeInCollateral, feeValueLovelace, feeUnknownReason, route, routeDetail,
                     advancePrincipalAmount, age, principalDisplay, collateralDisplay, poolUsability,
                     feeDisplay, feeValueDisplay, advanceDisplay, debtDisplay, anticipateAndSell,
-                    anticipateDisplay, actionNow, blocker, loanExplorerUrl, utxoExplorerUrl, null);
+                    anticipateDisplay, actionNow, blocker, loanExplorerUrl, utxoExplorerUrl, null, null);
         }
 
         /** Sorting key: lower is closer to liquidation. Unknown health sorts last, never first. */
         public double sortKey() {
             return healthFactor == null ? Double.MAX_VALUE : healthFactor;
         }
+    }
+
+    /**
+     * ⛔ FAB-145: the book above the table — the FILTERED list's counts and the collateral it locks (TVL),
+     * an ESTIMATE at oracle prices. Giovanni's rulings (2026-10-18): TVL is collateral only, never debt;
+     * USD comes from the USDM oracle feed alone; and the summary follows the active filters.
+     *
+     * @param totalLovelace         the PRICED loans' collateral in lovelace; null when there are loans and
+     *                              none could be priced — unknown, never zero
+     * @param unpricedLoans         loans excluded from every total because their collateral has no price
+     * @param usdDisplay            {@code totalLovelace} in USDM, scaled; null when USD is unavailable
+     * @param usdUnavailableReason  why {@code usdDisplay} is null; null when it is not
+     */
+    public record BookSummary(long loans, long liquidatable, long blocked, List<TokenTvl> tokens,
+                              BigInteger totalLovelace, long unpricedLoans, AssetDisplay totalAdaDisplay,
+                              AssetDisplay usdDisplay, AssetDisplay adaUsdRateDisplay,
+                              String usdUnavailableReason) {
+    }
+
+    /**
+     * One collateral token's line of the book. ⚠ {@code amount} is EVERY loan's collateral, priced or not;
+     * {@code valueLovelace} only the priced ones', and null when none was — so an unpriced loan is never
+     * dropped from what is locked and never valued at zero.
+     */
+    public record TokenTvl(String unit, long loans, AssetDisplay amount, BigInteger valueLovelace,
+                           AssetDisplay valueDisplay, long unpricedLoans) {
     }
 
     private final ObjectProvider<LiquidationCandidateScanner> scanner;
@@ -221,6 +275,10 @@ public class LiquidationReadinessController {
     private boolean compoundEnabled;
     @org.springframework.beans.factory.annotation.Value("${scheduling.transaction-processor.enabled:false}")
     private boolean processorEnabled;
+    // FAB-145: the stablecoin the book's USD estimate is priced through. Display only, like the three
+    // above; blank means USD is shown as unavailable, never guessed.
+    @org.springframework.beans.factory.annotation.Value("${loans.ui.usd-reference-unit:}")
+    private String usdReferenceUnit = "";
 
     public LiquidationReadinessController(ObjectProvider<LiquidationCandidateScanner> scanner,
                                           ObjectProvider<LoanService> loanService,
@@ -370,6 +428,10 @@ public class LiquidationReadinessController {
                 arranged.stream().filter(r -> Boolean.TRUE.equals(r.liquidatable())).count());
         model.addAttribute("blockedCount",
                 arranged.stream().filter(r -> r.blocker() != null && r.blocker().blocked()).count());
+        // ⛔ FAB-145: the book, from the FILTERED list and never the page, like the counts above. The USD
+        // feed is resolved once per render; labels go through the same memo as the table's.
+        model.addAttribute("book", summarise(arranged, (unit, amount) -> display(unit, amount, metadataMemo),
+                usdFeed(now), usdReferenceUnit));
 
         int pages = Math.max(1, (arranged.size() + PAGE_SIZE - 1) / PAGE_SIZE);
         // ⚠ CLAMPED, not trusted. A stale ?page= from a bookmark, or one left behind when a filter
@@ -445,6 +507,103 @@ public class LiquidationReadinessController {
                         .thenComparing(Function.identity()))
                 .forEach(u -> ordered.put(u, text.get(u)));
         return ordered;
+    }
+
+    /**
+     * ⛔ FAB-145: the book — counts, collateral locked per token and its value — over {@code rows}, which the
+     * caller passes FILTERED and unpaged. Package-private and static so it can be tested without Spring.
+     *
+     * <p>Grouped by collateral unit. A loan whose collateral could not be priced is in its token's amount
+     * and loan count, and OUT of every value and total; {@link BookSummary#unpricedLoans} says how many.
+     * Token lines are ordered by value descending, valueless tokens last, ties by unit.
+     *
+     * <p>⚠ USD is {@code totalLovelace} through the USDM feed, and it is UNAVAILABLE — with the reason, in
+     * place of the figure — rather than wrong: no reference unit configured, no usable feed, a conversion
+     * that throws, or a USDM display with no published decimals (an unscaled figure is not dollars). None
+     * of that touches the ADA figures.
+     */
+    static BookSummary summarise(List<Row> rows, BiFunction<String, BigInteger, AssetDisplay> display,
+                                 Optional<OraclePriceFeed> usdFeed, String usdUnit) {
+        Map<String, List<Row>> byUnit = rows.stream()
+                .collect(Collectors.groupingBy(Row::collateralUnit, LinkedHashMap::new, Collectors.toList()));
+        List<TokenTvl> tokens = new ArrayList<>();
+        BigInteger total = BigInteger.ZERO;
+        long unpriced = 0;
+        for (Map.Entry<String, List<Row>> entry : byUnit.entrySet()) {
+            BigInteger amount = BigInteger.ZERO;
+            BigInteger value = null;
+            long tokenUnpriced = 0;
+            for (Row r : entry.getValue()) {
+                amount = amount.add(r.collateralAmount() == null ? BigInteger.ZERO : r.collateralAmount());
+                if (r.collateralValueLovelace() == null) {
+                    tokenUnpriced++;
+                } else {
+                    value = (value == null ? BigInteger.ZERO : value).add(r.collateralValueLovelace());
+                }
+            }
+            tokens.add(new TokenTvl(entry.getKey(), entry.getValue().size(), display.apply(entry.getKey(), amount),
+                    value, value == null ? null : display.apply("lovelace", value), tokenUnpriced));
+            total = value == null ? total : total.add(value);
+            unpriced += tokenUnpriced;
+        }
+        tokens.sort(Comparator.comparing(TokenTvl::valueLovelace,
+                        Comparator.nullsLast(Comparator.<BigInteger>reverseOrder()))
+                .thenComparing(TokenTvl::unit));
+        // Loans, and not one of them priced: the total is unknown, not zero.
+        BigInteger totalLovelace = !rows.isEmpty() && unpriced == rows.size() ? null : total;
+
+        AssetDisplay usd = null;
+        AssetDisplay rate = null;
+        String usdUnavailable;
+        if (usdUnit == null || usdUnit.isBlank()) {
+            usdUnavailable = "no USD reference is configured (loans.ui.usd-reference-unit)";
+        } else if (usdFeed.isEmpty()) {
+            usdUnavailable = "no usable USDM oracle price right now";
+        } else if (totalLovelace == null) {
+            usdUnavailable = "no loan's collateral could be priced, so there is nothing to convert";
+        } else {
+            usdUnavailable = null;
+            try {
+                usd = display.apply(usdUnit,
+                        LoanFinance.fromLovelace(Rational.fromInt(totalLovelace), usdFeed.get()).floor());
+                rate = display.apply(usdUnit,
+                        LoanFinance.fromLovelace(Rational.fromInt(1_000_000L), usdFeed.get()).floor());
+            } catch (RuntimeException e) {
+                usdUnavailable = "the USDM price could not be converted (" + e.getClass().getSimpleName() + ")";
+            }
+            if (usdUnavailable == null && (usd.metadataUnknown() || rate.metadataUnknown())) {
+                usdUnavailable = "USDM has no published decimals here, so a dollar figure cannot be scaled";
+            }
+            if (usdUnavailable != null) {
+                usd = null;
+                rate = null;
+            }
+        }
+
+        return new BookSummary(rows.size(),
+                rows.stream().filter(r -> Boolean.TRUE.equals(r.liquidatable())).count(),
+                rows.stream().filter(r -> r.blocker() != null && r.blocker().blocked()).count(),
+                List.copyOf(tokens), totalLovelace, unpriced,
+                totalLovelace == null ? null : display.apply("lovelace", totalLovelace),
+                usd, rate, usdUnavailable);
+    }
+
+    /**
+     * The USDM feed for the book, loan-free at the highest usable version; empty when no reference unit
+     * is configured, no oracle client is present, or the unit cannot be read. Never throws: a USD failure
+     * must not take the page down.
+     */
+    private Optional<OraclePriceFeed> usdFeed(long now) {
+        FluidOracleClient client = oracleClient.getIfAvailable();
+        if (client == null || usdReferenceUnit == null || usdReferenceUnit.isBlank()) {
+            return Optional.empty();
+        }
+        try {
+            return client.findFeed(AssetType.fromUnit(usdReferenceUnit.trim()), now);
+        } catch (RuntimeException e) {
+            log.debug("the USD reference unit {} could not be priced: {}", usdReferenceUnit, e.toString());
+            return Optional.empty();
+        }
     }
 
     /** Re-labels with {@code longer} every unit whose current text another unit shares. */
@@ -557,6 +716,23 @@ public class LiquidationReadinessController {
             healthUnknown = "this loan's mode carries no LTV threshold";
         }
 
+        // ---- the collateral's price: ONE lookup, shared by the fee slice and the book (FAB-145) -----
+        var client = oracleClient.getIfAvailable();
+        // ⛔ FAB-111: the collateral oracle THIS loan names, not the token's preferred version. Ada
+        // collateral gets the 1:1 unit feed from the client, so it is valued at its own amount.
+        Optional<OraclePriceFeed> feed = client == null ? Optional.empty()
+                : client.findFeedForLeg(collateralAsset, datum.collateral().oracleTokenAsset(), now);
+        // Null when it cannot be priced: the book excludes the loan from its totals and says so.
+        BigInteger collateralValue = null;
+        if (feed.isPresent()) {
+            try {
+                collateralValue = LoanFinance.toLovelace(Rational.fromInt(loan.collateralAmount()), feed.get())
+                        .floor();
+            } catch (RuntimeException e) {
+                log.debug("could not value the collateral of {}: {}", loan.utxoRef(), e.toString());
+            }
+        }
+
         // ---- the fee slice: the gate's own function, never a re-derivation ------------------------
         BigInteger feeTokens = null;
         BigInteger feeValue = null;
@@ -569,11 +745,6 @@ public class LiquidationReadinessController {
             feeTokens = ConvertEconomics.liquidationFee(loan.collateralAmount(),
                     bond.datum().liquidationFeePerMille().longValueExact());
             feeUnknown = null;
-            var client = oracleClient.getIfAvailable();
-            // ⛔ FAB-111: the collateral oracle THIS loan names, not the token's preferred version.
-            var feed = client == null ? Optional.<com.fluidtokens.aquarium.offchain.model.loans
-                    .OraclePriceFeed>empty()
-                    : client.findFeedForLeg(collateralAsset, datum.collateral().oracleTokenAsset(), now);
             if (feed.isEmpty()) {
                 feeUnknown = "no usable oracle feed for the collateral, so the slice cannot be valued";
             } else {
@@ -701,7 +872,7 @@ public class LiquidationReadinessController {
                         : display(datum.principalAsset().toUnit(), anticipate.netInPrincipal(), metadataMemo),
                 actionNow, blocker,
                 loanAssetUrl(loan.loanId()), txUrl(loan.utxoRef()),
-                collateralOracleVersion(datum));
+                collateralOracleVersion(datum), collateralValue);
     }
 
     /**
