@@ -65,13 +65,16 @@ point: the hot wallet the node signs with never has to hold the stake.
 such a market, wallet rebalancing keeps the wallet in a fixed shape (§9, "Wallet rebalancing"), and
 that shape costs ada: **10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA beside the
 bundle of any other tokens, and a 5 ADA collateral UTxO** (5 ADA under current protocol
-parameters), plus a transaction fee and enough left over for a change output. A wallet with less
-than that is not reshaped, and the node logs a `[REBALANCE] REFUSED: …` warning on every block until
-you add ada.
+parameters), **plus a change output larger than the largest of those** — more than another 10 ADA
+when the wallet holds any token — plus the transaction fee. Under current parameters a wallet holding one
+`ANTICIPATE` token therefore needs **a bit over 25 ADA**, not 15. A wallet with less than that is
+not reshaped, and the node logs a `[REBALANCE] REFUSED: …` warning on every block until you add ada
+(an empty wallet logs `[REBALANCE] NOTHING_TO_DO: no input UTxOs…` instead).
 
 **⛔ Keep no reference-script or datum UTxO in this wallet.** A rebalance spends every UTxO the wallet
-holds, and its outputs carry no reference script and no datum — so a reference script or datum
-parked here is consumed and not recreated.
+holds, and its outputs carry no reference script and no datum — so a datum UTxO parked here is
+consumed and its datum is not recreated. A reference-script UTxO is expected to make **every**
+rebalance fail at submission instead (logged at ERROR on every block), so the wallet is never shaped.
 
 **⛔ The wallet must hold no UTxO created before 2025-05-06.** The node reads its wallet **only from
 its own index**, and that index starts at mainnet slot `154984561` (2025-05-06). A UTxO created
@@ -504,11 +507,19 @@ UTxO keeps your ada in one piece rather than fragmented. An ADA-principal market
 so it adds no UTxO of its own. **A token of an `ANTICIPATE` market whose mode is `DISABLED` is not
 kept ready**: it goes in the "every other token" UTxO.
 
-**The funds it needs.** The wallet's ada must cover 10 ADA for each `ANTICIPATE` token it holds,
-10 ADA if it holds any other token, and C, **plus** the transaction fee and enough left over for the
-change output — roughly 10 ADA × each `ANTICIPATE` token, + 10 ADA if there are other tokens, + 5
-ADA, + the fee. Otherwise the self-send is not built, the
-node logs a warning **on every block**:
+**The funds it needs.** The wallet's ada must cover:
+
+1. the planned outputs — 10 ADA for each `ANTICIPATE` token it holds, 10 ADA if it holds any other
+   token, and C;
+2. **plus a change output larger than the largest of those planned outputs** — so another ~10 ADA
+   when the wallet holds any token, ~5 ADA (C) when it is ada-only. The fee is taken from the largest
+   output at the wallet's address, and the node refuses a transaction whose fee would come out of a
+   shaped output rather than shrink it, so the change must be that largest output;
+3. **plus** the transaction fee.
+
+Under current parameters, a wallet holding **one `ANTICIPATE` token needs a bit over 25 ADA** (10 +
+5 planned, a change above 10, and the fee) — not 15 — and an ada-only wallet a bit over 10 ADA.
+Otherwise the self-send is not built, and the node logs a warning **on every block**:
 
 ```
 [REBALANCE] REFUSED: … — the wallet is out of shape …; nothing signed or submitted
@@ -517,17 +528,24 @@ node logs a warning **on every block**:
 and **nothing is signed or submitted, so a refusal costs no fee.** The same warning appears when the
 transaction cannot be built to the exact shape — for example a bundle of other tokens so large that
 its minimum ada exceeds 10 ADA — or when it would exceed the ledger's size limits. Add ada, or remove
-the tokens that cannot be shaped, and the warnings stop.
+the tokens that cannot be shaped, and the warnings stop. A wallet that is **empty** logs
+`[REBALANCE] NOTHING_TO_DO: no input UTxOs…` at WARN on every block instead, also submitting nothing.
 
 **⛔ It spends the whole wallet.** Every UTxO under the wallet's payment key is an input — whatever
 its stake part — with no exception for reference scripts or datums, and every output goes to the
-wallet's base address carrying neither. **A reference-script or datum UTxO in the bot wallet is
-consumed, and its script or datum is not recreated.** Keep them elsewhere (§2).
+wallet's base address carrying neither. **A datum UTxO in the bot wallet is consumed, and its datum
+is not recreated.** **A reference-script UTxO is expected to make every rebalance fail:** it is
+taken as an input, but the self-send is priced without the script's size, so the ledger is expected
+to reject it as underpriced — on every block, at ERROR — and the wallet never gets shaped. Keep both
+kinds elsewhere (§2).
 
-**A duplicate submission is expected.** There is no pending-transaction guard: if the next block
-still shows the old wallet, the same self-send is built and submitted again. The duplicate is
-rejected and logged at ERROR as `[REBALANCE] submission rejected` — harmless, because the same
-transaction can only be applied once.
+**One rejected duplicate is expected; a rejection on every block is not.** There is no
+pending-transaction guard: if the next block still shows the old wallet, the same self-send is built
+and submitted again, and that duplicate is rejected and logged at ERROR as
+`[REBALANCE] submission rejected`. **A single such ERROR right after a successful rebalance is
+expected and harmless** — the same transaction can only be applied once. **The same ERROR on every
+block means something in the wallet is making the self-send fail** — a reference-script UTxO, for
+example — and needs your attention: suspend rebalancing, fix the wallet, resume.
 
 **Turning it off, or pausing it.**
 

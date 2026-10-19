@@ -412,11 +412,16 @@ submits one self-send of its whole wallet — in `shadow` too** — and it does 
 wallet drifts out of shape. Each one costs a transaction fee.
 
 - **Funds.** Shaping needs 10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA beside the
-  bundle of any other tokens, and a 5 ADA collateral UTxO (under current protocol parameters), plus
-  the fee and a change output. A wallet with less is not touched: the node logs
-  `[REBALANCE] REFUSED: …` at WARN on every block and submits nothing, so a refusal costs no fee.
+  bundle of any other tokens, and a 5 ADA collateral UTxO (under current protocol parameters),
+  **plus a change output larger than the largest of those** (another ~10 ADA when the wallet holds
+  any token), plus the fee — so one `ANTICIPATE` token needs a bit over 25 ADA, not 15. A wallet with
+  less is not touched: the node logs `[REBALANCE] REFUSED: …` at WARN on every block (an empty wallet:
+  `[REBALANCE] NOTHING_TO_DO: no input UTxOs…`) and submits nothing, so a refusal costs no fee.
 - **⛔ Move reference scripts and datum UTxOs out of the bot wallet BEFORE upgrading.** The self-send
-  spends every wallet UTxO and recreates no reference script and no datum.
+  spends every wallet UTxO and recreates no datum, so a datum UTxO is consumed. A reference-script
+  UTxO is expected to make every self-send fail at submission — `[REBALANCE] submission rejected` at
+  ERROR on every block — so the wallet is never shaped. (One such ERROR right after a successful
+  rebalance is only its duplicate being refused, and is harmless.)
 - **Moving funds by hand?** Press **`Suspend rebalancing`** on the readiness page first
   (`LOANS_UI_ENABLED=true`, [deploying.md §7](deploying.md#wallet-rebalancing-on-the-page)), and
   **`Resume rebalancing`** when you are done, so the node does not reshape the wallet under you. The
