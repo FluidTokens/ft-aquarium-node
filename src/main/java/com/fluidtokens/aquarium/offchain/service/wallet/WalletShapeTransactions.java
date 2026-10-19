@@ -5,6 +5,7 @@ import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.address.CredentialType;
+import com.bloxbean.cardano.client.api.MinAdaCalculator;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.common.OrderEnum;
@@ -14,6 +15,8 @@ import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.api.TransactionProcessor;
 import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
+import com.bloxbean.cardano.client.function.TxBuilder;
+import com.bloxbean.cardano.client.function.TxBuilderContext;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.Tx;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
@@ -23,6 +26,7 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
 import com.bloxbean.cardano.client.transaction.spec.Value;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.Arrays;
 import java.util.Collection;
@@ -62,7 +66,17 @@ import static com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.norma
  *       silently stops being a 10-ADA output;</li>
  *   <li><b>take the fee from the largest change-address output</b> ({@code FeeCalculators:153-172}).
  *       Every output here is at the wallet, so when the change is not the largest output, the fee comes
- *       out of a SHAPED output and it silently shrinks.</li>
+ *       out of a SHAPED output and it silently shrinks. It still does; {@link #buildShaped} then moves the
+ *       fee onto the change in a {@code postBalanceTx} step ({@link FeeFromChange}, FAB-147): each planned
+ *       output short of its plan gets back exactly what it lacks, and the change gives up the same total.
+ *       That is safe because nothing else moves: the fee field is untouched, the transaction stays
+ *       balanced (lovelace only passes between outputs at the same address), and only coin values change,
+ *       so the body could grow only if one crossed a CBOR integer-width boundary — {@code buildShaped}
+ *       measures it anyway and refuses if it grew, because the fee was priced for the body as balanced.
+ *       What the move CAN do is leave the change below its own min-ADA, which cardano-client-lib checked
+ *       before the move and will not check again, so {@code buildShaped} checks it and refuses, naming how
+ *       much ADA the wallet is short. A wallet therefore needs its planned outputs plus the fee plus the
+ *       change's min-ADA, not the planned outputs plus the largest of them.</li>
  * </ul>
  * None of those raises an error. So {@link #buildShaped} decodes the serialised body and refuses
  * unless it is exactly the plan; it never returns a transaction that fails those checks.
@@ -202,16 +216,24 @@ public final class WalletShapeTransactions {
         }
         tx.withChangeAddress(walletAddress);
 
+        FeeFromChange feeFromChange = new FeeFromChange(plan);
         Transaction built;
         try {
-            built = compose(inputs, tx);
+            built = compose(inputs, tx, feeFromChange);
         } catch (Exception e) {
             return Outcome.refused(plan, "build failed: " + e.getMessage());
         }
 
+        ProtocolParams params = protocolParamsSupplier.getProtocolParams();
         String deviation = shapeDeviation(built, inputs, plan, walletAddress);
         if (deviation == null) {
-            deviation = sizeDeviation(built, protocolParamsSupplier.getProtocolParams());
+            deviation = feeFromChange.deviation(built);
+        }
+        if (deviation == null) {
+            deviation = changeMinAdaDeviation(built, plan, params);
+        }
+        if (deviation == null) {
+            deviation = sizeDeviation(built, params);
         }
         if (deviation != null) {
             return Outcome.refused(plan, deviation);
@@ -281,13 +303,97 @@ public final class WalletShapeTransactions {
     }
 
     private Transaction compose(List<Utxo> inputs, Tx tx) {
-        return new QuickTxBuilder(inMemorySupplierOf(inputs), protocolParamsSupplier, (TransactionProcessor) null)
+        return compose(inputs, tx, null);
+    }
+
+    /** @param postBalance run once cardano-client-lib has balanced and set the fee; null for none */
+    private Transaction compose(List<Utxo> inputs, Tx tx, TxBuilder postBalance) {
+        QuickTxBuilder.TxContext context = new QuickTxBuilder(inMemorySupplierOf(inputs), protocolParamsSupplier,
+                (TransactionProcessor) null)
                 .compose(tx)
                 // ⛔ The default merges every output to the same address into one — and here they all
                 // share the wallet address, so the shape would collapse (officina CCL trap 21).
                 .mergeOutputs(false)
-                .feePayer(walletAddress)
-                .build();
+                .feePayer(walletAddress);
+        if (postBalance != null) {
+            // A SETTER, like preBalanceTx: a second call would silently replace this one.
+            context = context.postBalanceTx(postBalance);
+        }
+        return context.build();
+    }
+
+    /**
+     * The {@code postBalanceTx} step of a shaped build: cardano-client-lib has balanced the transaction
+     * and taken the fee from the largest output at the wallet, which may be a planned one. Every planned
+     * output short of its planned lovelace is restored to exactly that, and the total restored is taken
+     * from the change (the output after the planned ones). The fee field is never touched, so the
+     * transaction stays balanced and priced as cardano-client-lib priced it (officina CCL trap 9a: take
+     * the amount from the change, keep the body balanced). An output ABOVE its plan — a min-ADA top-up
+     * (trap 6) — is left alone for {@link #shapeDeviation} to refuse; so is a body without exactly one
+     * output after the planned ones.
+     *
+     * <p>Records the fee and serialised size it found, so {@link #deviation} can prove on the final body
+     * that the fee was not lowered and the body did not grow past what the fee was priced for.
+     */
+    static final class FeeFromChange implements TxBuilder {
+
+        private final List<BigInteger> plannedLovelace;
+        private BigInteger feeAsBalanced;
+        private int sizeAsBalanced = -1;
+
+        FeeFromChange(WalletShape.Plan plan) {
+            this.plannedLovelace = plan.outputs().stream().map(WalletShape.PlannedOutput::lovelace).toList();
+        }
+
+        @Override
+        public void apply(TxBuilderContext context, Transaction transaction) {
+            feeAsBalanced = transaction.getBody().getFee();
+            try {
+                sizeAsBalanced = transaction.serialize().length;
+            } catch (Exception e) {
+                throw new IllegalStateException("the balanced transaction does not serialise: " + e.getMessage(), e);
+            }
+            List<TransactionOutput> outputs = transaction.getBody().getOutputs();
+            if (outputs.size() != plannedLovelace.size() + 1) {
+                return;
+            }
+            BigInteger restored = BigInteger.ZERO;
+            for (int i = 0; i < plannedLovelace.size(); i++) {
+                Value value = outputs.get(i).getValue();
+                BigInteger shortOfPlan = plannedLovelace.get(i).subtract(value.getCoin());
+                if (shortOfPlan.signum() > 0) {
+                    value.setCoin(plannedLovelace.get(i));
+                    restored = restored.add(shortOfPlan);
+                }
+            }
+            Value change = outputs.get(plannedLovelace.size()).getValue();
+            change.setCoin(change.getCoin().subtract(restored));
+        }
+
+        /**
+         * Why the final body is not covered by the fee cardano-client-lib computed, or null: the fee field
+         * must be exactly what balancing set, and the serialised size no larger than the balanced body's.
+         */
+        String deviation(Transaction built) {
+            if (sizeAsBalanced < 0) {
+                return "the fee move never ran: refusing a body whose fee placement is unverified";
+            }
+            BigInteger fee = built.getBody().getFee();
+            if (fee == null || !fee.equals(feeAsBalanced)) {
+                return "the fee changed after balancing: " + feeAsBalanced + " lovelace balanced, " + fee + " built";
+            }
+            int finalSize;
+            try {
+                finalSize = built.serialize().length;
+            } catch (Exception e) {
+                return "built transaction does not serialise: " + e.getMessage();
+            }
+            if (finalSize > sizeAsBalanced) {
+                return "moving the fee to the change grew the transaction from " + sizeAsBalanced + " to " + finalSize
+                        + " bytes; the fee was computed for " + sizeAsBalanced;
+            }
+            return null;
+        }
     }
 
     /**
@@ -395,6 +501,37 @@ public final class WalletShapeTransactions {
             return "change output " + planned.size() + " holds no lovelace: " + change.getValue().getCoin();
         }
         return null;
+    }
+
+    /**
+     * Why the change output of a shaped build is below its own min-ADA, or null. Computed as
+     * cardano-client-lib computes it ({@link MinAdaCalculator}, against the current protocol parameters),
+     * on the DESERIALISED body. Run after {@link #shapeDeviation}, so the change is known to be the one
+     * ADA-only output after the planned ones. cardano-client-lib checked the change before the fee was
+     * moved onto it and does not check it again, so this is the authoritative funding threshold: the
+     * shortfall it names is exactly what the wallet must gain for this shape to build.
+     */
+    static String changeMinAdaDeviation(Transaction built, WalletShape.Plan plan, ProtocolParams params) {
+        Transaction tx;
+        try {
+            tx = Transaction.deserialize(built.serialize());
+        } catch (Exception e) {
+            return "built transaction does not round-trip: " + e.getMessage();
+        }
+        if (params == null || params.getCoinsPerUtxoSize() == null || params.getCoinsPerUtxoSize().isBlank()) {
+            return "protocol parameters carry no coinsPerUtxoSize: refusing to guess the change's min-ADA";
+        }
+        int changeIndex = plan.outputs().size();
+        TransactionOutput change = tx.getBody().getOutputs().get(changeIndex);
+        BigInteger minAda = new MinAdaCalculator(params).calculateMinAda(change);
+        BigInteger shortfall = minAda.subtract(change.getValue().getCoin());
+        if (shortfall.signum() <= 0) {
+            return null;
+        }
+        return "change output " + changeIndex + " would hold " + change.getValue().getCoin()
+                + " lovelace once it pays the fee, below its min-ADA " + minAda + ": the wallet is short by "
+                + shortfall + " lovelace (" + new BigDecimal(shortfall).movePointLeft(6).toPlainString()
+                + " ADA) for this shape; add at least that much";
     }
 
     /**

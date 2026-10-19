@@ -420,10 +420,12 @@ wallet drifts out of shape. Each one costs a transaction fee.
 
 - **Funds.** Shaping needs 10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA beside the
   bundle of any other tokens, and a 5 ADA collateral UTxO (under current protocol parameters),
-  **plus a change output larger than the largest of those** (another ~10 ADA when the wallet holds
-  any token), plus the fee — so one `ANTICIPATE` token needs a bit over 25 ADA, not 15. A wallet with
-  less is not touched: the node logs `[REBALANCE] REFUSED: …` at WARN on every block (an empty wallet:
-  `[REBALANCE] NOTHING_TO_DO: no input UTxOs…`) and submits nothing, so a refusal costs no fee.
+  plus the fee, **plus a change output that still holds its own minimum ada after paying that fee**
+  (about 1 ADA) — so one `ANTICIPATE` token needs about 16.2 ADA and an ada-only wallet about 6.2 ADA
+  (approximate: the figures move with the protocol parameters and the number of wallet UTxOs). A
+  wallet with less is not touched: the node logs `[REBALANCE] REFUSED: …` at WARN on every block
+  (an empty wallet: `[REBALANCE] NOTHING_TO_DO: no input UTxOs…`) and submits nothing, so a refusal
+  costs no fee.
 - **⛔ Move reference scripts and datum UTxOs out of the bot wallet BEFORE upgrading.** The self-send
   spends every wallet UTxO and recreates no datum, so a datum UTxO is consumed. A reference-script
   UTxO is expected to make every self-send fail at submission — `[REBALANCE] submission rejected` at

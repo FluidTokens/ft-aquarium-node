@@ -65,10 +65,12 @@ point: the hot wallet the node signs with never has to hold the stake.
 such a market, wallet rebalancing keeps the wallet in a fixed shape (§9, "Wallet rebalancing"), and
 that shape costs ada: **10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA beside the
 bundle of any other tokens, and a 5 ADA collateral UTxO** (5 ADA under current protocol
-parameters), **plus a change output larger than the largest of those** — more than another 10 ADA
-when the wallet holds any token — plus the transaction fee. Under current parameters a wallet holding one
-`ANTICIPATE` token therefore needs **a bit over 25 ADA**, not 15. A wallet with less than that is
-not reshaped, and the node logs a `[REBALANCE] REFUSED: …` warning on every block until you add ada
+parameters), **plus the transaction fee, plus a change output that still holds its own minimum ada
+once it has paid that fee** (about 1 ADA). Under current parameters a wallet holding one
+`ANTICIPATE` token therefore needs **about 16.2 ADA**, and an ada-only wallet about 6.2 ADA; the exact
+figures move with the protocol parameters and with how many UTxOs the wallet holds (each one adds a
+little to the fee). A wallet carrying a very large bundle of other tokens can need more (§9). A wallet with less than that is not reshaped, and the node logs a
+`[REBALANCE] REFUSED: …` warning on every block until you add ada
 (an empty wallet logs `[REBALANCE] NOTHING_TO_DO: no input UTxOs…` instead).
 
 **⛔ Keep no reference-script or datum UTxO in this wallet.** A rebalance spends every UTxO the wallet
@@ -511,15 +513,20 @@ kept ready**: it goes in the "every other token" UTxO.
 
 1. the planned outputs — 10 ADA for each `ANTICIPATE` token it holds, 10 ADA if it holds any other
    token, and C;
-2. **plus a change output larger than the largest of those planned outputs** — so another ~10 ADA
-   when the wallet holds any token, ~5 ADA (C) when it is ada-only. The fee is taken from the largest
-   output at the wallet's address, and the node refuses a transaction whose fee would come out of a
-   shaped output rather than shrink it, so the change must be that largest output;
-3. **plus** the transaction fee.
+2. **plus** the transaction fee, which is always paid out of the change output — never out of a
+   planned output, which keeps exactly its planned value;
+3. **plus** the change output's own minimum ada, which it must still hold after paying that fee
+   (about 1 ADA under current parameters).
 
-Under current parameters, a wallet holding **one `ANTICIPATE` token needs a bit over 25 ADA** (10 +
-5 planned, a change above 10, and the fee) — not 15 — and an ada-only wallet a bit over 10 ADA.
-Otherwise the self-send is not built, and the node logs a warning **on every block**:
+Under current parameters, a wallet holding **one `ANTICIPATE` token needs about 16.2 ADA** (10 + 5
+planned, roughly 0.2 of fee and about 1 of change), and an ada-only wallet about 6.2 ADA. These are
+approximate: they move with the protocol parameters, and each extra UTxO in the wallet adds a little
+to the fee. ⚠ One exception: if the bundle of *other* tokens (the non-`ANTICIPATE` ones) is so large that
+its own minimum ada is close to 10 ADA (around 30 spam tokens with long names), cardano-client-lib
+refuses the build itself (`build failed: Not enough funds …`) until the change is larger than 10 ADA,
+so such a wallet still needs the old figure: the planned outputs plus a change above 10 ADA. When the wallet is short only of the change's minimum, the refusal names the exact
+shortfall (`… the wallet is short by N lovelace (N.NNNNNN ADA) for this shape; add at least that
+much`). Otherwise the self-send is not built, and the node logs a warning **on every block**:
 
 ```
 [REBALANCE] REFUSED: … — the wallet is out of shape …; nothing signed or submitted
