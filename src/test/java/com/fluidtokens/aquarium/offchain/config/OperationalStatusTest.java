@@ -8,6 +8,8 @@ import com.fluidtokens.aquarium.offchain.controller.OperationalStatus;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -64,13 +66,72 @@ class OperationalStatusTest {
         assertFalse(status.monitoringOnly());
     }
 
+    /**
+     * ⚠ SHADOW submits no LIQUIDATION — and only that. Since wallet rebalancing (FAB-131) a shadow node
+     * signs and submits wallet self-sends, so "submitting nothing" stopped being true; the wording is
+     * narrowed to what it can still promise.
+     */
     @Test
-    void shadowSaysItBuildsEverythingAndSubmitsNothing() {
+    void shadowSaysItBuildsEveryLiquidationAndSubmitsNoLiquidation() {
         var status = OperationalStatus.of(config(AppConfig.LiquidationConfiguration.Mode.SHADOW),
                 true, false, false);
 
-        assertTrue(status.headline().startsWith("SHADOW"));
-        assertTrue(status.notes().stream().anyMatch(n -> n.contains("NONE is submitted")), "" + status.notes());
+        assertEquals("SHADOW — rehearsing liquidations, submitting none", status.headline());
+        assertTrue(status.notes().contains("liquidation is in SHADOW — every liquidation is built and "
+                + "size-checked, and NONE is submitted"), "" + status.notes());
+        assertFalse(status.notes().stream().anyMatch(n -> n.contains("every transaction")),
+                "the old note claimed every transaction, which a rebalance contradicts: " + status.notes());
+    }
+
+    private static final String ARMED_NOTE = "wallet rebalancing is ARMED — whenever the wallet drifts out of "
+            + "shape, the node signs and submits a self-send of its whole wallet, in shadow as well as live; "
+            + "it is housekeeping, never a liquidation";
+
+    /** ⛔ A shadow node with the rebalancer armed DOES submit, and the banner must say so. */
+    @Test
+    void shadowWithRebalancingArmedSaysTheNodeSubmitsWalletSelfSends() {
+        var status = OperationalStatus.of(config(AppConfig.LiquidationConfiguration.Mode.SHADOW),
+                true, false, false, true);
+
+        assertEquals("SHADOW — rehearsing liquidations, submitting none", status.headline());
+        assertTrue(status.notes().contains(ARMED_NOTE), "" + status.notes());
+    }
+
+    @Test
+    void shadowWithRebalancingIdleCarriesNoArmedNote() {
+        var status = OperationalStatus.of(config(AppConfig.LiquidationConfiguration.Mode.SHADOW),
+                true, false, false, false);
+
+        assertFalse(status.notes().stream().anyMatch(n -> n.contains("rebalancing")), "" + status.notes());
+        assertEquals(OperationalStatus.of(config(AppConfig.LiquidationConfiguration.Mode.SHADOW),
+                true, false, false), status, "the four-argument of() is the overload with armed = false");
+    }
+
+    @Test
+    void liveWithRebalancingArmedCarriesTheArmedNote() {
+        var status = OperationalStatus.of(config(AppConfig.LiquidationConfiguration.Mode.LIVE),
+                true, true, true, true);
+
+        assertEquals("LIVE — this node can submit", status.headline());
+        assertTrue(status.notes().contains(ARMED_NOTE), "" + status.notes());
+    }
+
+    /** The other headlines are untouched by the overload, armed or not. */
+    @Test
+    void theOtherHeadlinesAreUnchangedByTheOverload() {
+        for (boolean armed : new boolean[] {false, true}) {
+            assertEquals("MONITORING ONLY", OperationalStatus.of(
+                    config(AppConfig.LiquidationConfiguration.Mode.DISABLED), true, false, false, armed).headline());
+            assertEquals("PROCESSOR ONLY — no liquidation", OperationalStatus.of(
+                    config(AppConfig.LiquidationConfiguration.Mode.DISABLED), true, false, true, armed).headline());
+            assertEquals("LIVE — this node can submit", OperationalStatus.of(
+                    config(AppConfig.LiquidationConfiguration.Mode.LIVE), true, false, false, armed).headline());
+        }
+        assertEquals(List.of("liquidation is DISABLED — the figures below are a simulation, not an intention",
+                        "the scheduled-transaction processor is off — this is the half you stake FLDT for, and it "
+                                + "is unrelated to liquidation"),
+                OperationalStatus.of(config(AppConfig.LiquidationConfiguration.Mode.DISABLED), true, false, false,
+                        false).notes(), "the DISABLED notes are unchanged");
     }
 
     @Test

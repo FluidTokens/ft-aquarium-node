@@ -2601,6 +2601,240 @@ class LiquidationExecutorTest {
                         + "whether it carries enough ada to ever be selected: " + decision.detail());
     }
 
+    // ---- FAB-128 — an INSUFFICIENT_BALANCE refusal says when the token IS there, behind the ada floor --
+
+    /**
+     * The token's ada floor this wiring's executor applies, derived by hand from
+     * {@code LoanFixtures.protocolParams()} — the supplier {@link #tokenPrincipalConvertEconomicsWiring}
+     * hands the executor — through {@code LedgerCeilings.maxPossibleFee}:
+     * minFeeA × maxTxSize = 44 × 16,384 = 720,896; + minFeeB 155,381 = 876,277;
+     * + ⌈priceMem × maxTxExMem⌉ = ⌈0.0577 × 14,000,000⌉ = 807,800 → 1,684,077;
+     * + ⌈priceStep × maxTxExSteps⌉ = ⌈0.0000721 × 10,000,000,000⌉ = 721,000 → fee ceiling 2,405,077;
+     * + the 2,000,000 min-ada rider = <b>4,405,077 lovelace (4.405077 ADA)</b>.
+     */
+    private static final String FIXTURE_TOKEN_ADA_FLOOR = "less than 4405077 lovelace (4.405077 ADA) each";
+
+    /**
+     * The 2026-10-01 mainnet shape in miniature: plenty of ada-only funds, and MORE than enough of the
+     * principal (3,000,000 against a ~1,600,000 requirement) — but in a UTxO carrying 1.18 ADA, below the
+     * 4,405,077 lovelace floor, so the balance the gate sees is still zero.
+     */
+    private static List<Utxo> tokenBehindTheAdaFloorWallet() {
+        Utxo thin = LoanFixtures.utxo("d8".repeat(32), 0, ACCOUNT.baseAddress(), List.of(
+                Amount.lovelace(BigInteger.valueOf(1_180_000L)),
+                Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(3_000_000L))), null);
+        return List.of(WALLET_UTXO, thin);
+    }
+
+    private static List<String> marketGateRefusalInfos(Wiring wiring) {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(message -> message.contains("was refused by the market gate"))
+                .toList();
+    }
+
+    /**
+     * (a) What is counted is unchanged — the gate still sees "holds 0" — but the refusal now says the
+     * token is there, how much sits behind the floor, the exact floor, and that consolidation cures it
+     * (3,000,000 ≥ the requirement, so variant A, never B). The INFO line carries the same text.
+     */
+    @Test
+    void aTokenBehindTheAdaFloorIsNamedInTheRefusalWithConsolidationAsTheRemedy() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(tokenBehindTheAdaFloorWallet());
+
+        List<String> infos = marketGateRefusalInfos(wiring);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        String detail = decision.detail();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), detail);
+        assertTrue(decision.reason().startsWith("INSUFFICIENT_BALANCE"), decision.reason());
+        assertTrue(detail.contains("holds 0 "), "what is counted must not change: " + detail);
+        assertTrue(detail.contains("the wallet has 3000000 " + PRINCIPAL_TOKEN_2.toUnit() + " in total"),
+                detail);
+        assertTrue(detail.contains(FIXTURE_TOKEN_ADA_FLOOR), detail);
+        assertTrue(detail.contains("Consolidate the token into one UTxO carrying at least 4405077 lovelace"),
+                detail);
+        assertFalse(detail.contains("Even counted"),
+                "3,000,000 covers the requirement, so the remedy is consolidation alone: " + detail);
+        assertEquals(1, infos.size(), "expected exactly one market-gate refusal INFO line: " + infos);
+        assertTrue(infos.getFirst().endsWith(detail),
+                "the INFO line must carry the same explanation as the recorded detail: " + infos.getFirst());
+    }
+
+    /**
+     * (b) The M13 fixture: 2,000 behind a 1.4 ADA floor against a ~1,600,000 requirement. Consolidating
+     * would still leave it short, so the remedy must say so and name what to add (variant B).
+     */
+    @Test
+    void aTokenBehindTheAdaFloorThatWouldNotCoverAnywayNamesTheShortfall() {
+        Utxo tooLittleAda = LoanFixtures.utxo("d7".repeat(32), 0, ACCOUNT.baseAddress(), List.of(
+                Amount.lovelace(BigInteger.valueOf(1_400_000L)),
+                Amount.asset(LoanFixtures.unit(PRINCIPAL_TOKEN_2), BigInteger.valueOf(2_000L))), null);
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO, tooLittleAda));
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        String detail = decision.detail();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), detail);
+        assertTrue(detail.contains("holds 0 "), detail);
+        assertTrue(detail.contains("the wallet has 2000 " + PRINCIPAL_TOKEN_2.toUnit() + " in total"), detail);
+        assertTrue(detail.contains(FIXTURE_TOKEN_ADA_FLOOR), detail);
+        assertTrue(detail.contains("Even counted, 2000 " + PRINCIPAL_TOKEN_2.toUnit() + " would be short of the "),
+                detail);
+        assertTrue(detail.contains("but it cannot add funds"), detail);
+        assertFalse(detail.contains("Consolidate the token into one UTxO carrying at least"),
+                "the remedy must never claim consolidation suffices when it does not: " + detail);
+    }
+
+    /**
+     * (c) THE CONTROL — green on the base as well. No token anywhere: the refusal reads exactly as it
+     * always did, "holds 0" and nothing about a total.
+     */
+    @Test
+    void aWalletWithNoTokenAtAllStillSaysHoldsZeroAndNothingMore() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(List.of(WALLET_UTXO));
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertTrue(decision.detail().contains("holds 0 "), decision.detail());
+        assertFalse(decision.detail().contains("in total"), decision.detail());
+        assertEquals(decision.reason(), decision.detail(), "a refusal with no note is recorded as before");
+    }
+
+    /**
+     * (d) The same wallet under a cap below the requirement: ABOVE_MARKET_CAP, whose remedy is "raise
+     * the cap" — the ada-floor note belongs to INSUFFICIENT_BALANCE alone.
+     */
+    @Test
+    void anAboveMarketCapRefusalCarriesNoAdaFloorNote() {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_000_000L)));
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(tokenBehindTheAdaFloorWallet(),
+                List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
+                        collateralOracle(), principalOracle()), configuration);
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertTrue(decision.reason().startsWith("ABOVE_MARKET_CAP"), decision.reason());
+        assertFalse(decision.detail().contains("in total"), decision.detail());
+        assertEquals(decision.reason(), decision.detail(), "a cap refusal is recorded exactly as before");
+    }
+
+    /** (e) The note is DETAIL only: the reason an operator groups refusals by does not change. */
+    @Test
+    void theAdaFloorNoteNeverReachesTheDecisionReason() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(tokenBehindTheAdaFloorWallet());
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertFalse(decision.reason().contains("in total"), decision.reason());
+        assertFalse(decision.reason().contains("Consolidate"), decision.reason());
+        assertTrue(decision.detail().startsWith(decision.reason() + "; the wallet has "),
+                "the detail is the unchanged reason plus the note: " + decision.detail());
+    }
+
+    /**
+     * (f) The (a) wallet in a DISABLED market: MARKET_DISABLED, whose remedy is the market's mode — the
+     * ada-floor note belongs to INSUFFICIENT_BALANCE alone, whatever else the gate refuses for.
+     */
+    @Test
+    void aDisabledMarketRefusalCarriesNoAdaFloorNote() {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        AppConfig.LiquidationConfiguration.Market disabled = anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(),
+                1_500_000_000L);
+        disabled.setMode(AppConfig.LiquidationConfiguration.Mode.DISABLED);
+        configuration.setMarkets(List.of(disabled));
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(tokenBehindTheAdaFloorWallet(),
+                List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
+                        collateralOracle(), principalOracle()), configuration);
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertTrue(decision.reason().contains("is DISABLED"), decision.reason());
+        assertFalse(decision.detail().contains("in total"), decision.detail());
+        assertEquals(decision.reason(), decision.detail(), "a disabled-market refusal is recorded exactly as before");
+    }
+
+    /**
+     * (g) The (a) wallet in a cycle whose protocol parameters could not be fetched: the floor is the 2 ADA
+     * rider alone, and the note must say the real one is higher, or it states a floor the bot does not use.
+     */
+    @Test
+    void anAdaFloorNoteWithoutAFeeCeilingSaysTheRealFloorIsHigher() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiringWithExecutorParams(tokenBehindTheAdaFloorWallet(),
+                throwingParams());
+
+        wiring.executor().cycle(NOW);
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        String detail = decision.detail();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), detail);
+        assertTrue(decision.reason().startsWith("INSUFFICIENT_BALANCE"), decision.reason());
+        assertTrue(detail.contains("the wallet has 3000000 " + PRINCIPAL_TOKEN_2.toUnit() + " in total"),
+                detail);
+        assertTrue(detail.contains("less than 2000000 lovelace (2 ADA) each"), detail);
+        assertTrue(detail.contains("the fee ceiling was unavailable this cycle, so this floor leaves it out and "
+                + "the real one is higher"), detail);
+    }
+
+    /**
+     * {@link #tokenPrincipalConvertEconomicsWiring(List, List, AppConfig.LiquidationConfiguration)} with the
+     * EXECUTOR's protocol-parameter supplier made explicit (the builders keep the fixture's), so a cycle can
+     * run without a fee ceiling while the router still builds.
+     */
+    private static Wiring tokenPrincipalConvertEconomicsWiringWithExecutorParams(List<Utxo> walletUtxos,
+                                                                                 ProtocolParamsSupplier executorParams) {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(), 1_500_000_000L)));
+        List<OracleEntry> registry = List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
+                collateralOracle(), principalOracle());
+        Scenario convert = tokenPrincipalConvertEconomicsScenario();
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO,
+                convert.loan().utxo(), convert.bond().utxo()));
+        universe.addAll(walletUtxos);
+
+        LiquidateTransactionBuilder plainBuilder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
+                LoanFixtures.NETWORK, LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.protocolParams(), null);
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+
+        FakeScanner scanner = new FakeScanner(List.of(convert.assessment()));
+        FakeResolver resolver = new FakeResolver(allUnspent(List.of(convert)));
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        CountingOracleProvider oracles = new CountingOracleProvider(
+                new FakeOracleClient(registry), new FakeOracleClient(registry));
+
+        PayInAdvanceLiquidationRouter router = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver,
+                plainBuilder, router, LoanFixtures.registry(), log, metrics(), oracles, previewNetwork(),
+                executorParams, LoanFixtures.converters(), EXPLODING_SUBMITTER);
+        return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
+    }
+
     /**
      * Slice 1, task 3. Exit 7 recorded REFUSED and logged NOTHING. The router's own message is
      * generic ("… for a negative equity") and never says which asset — the log line must, because the

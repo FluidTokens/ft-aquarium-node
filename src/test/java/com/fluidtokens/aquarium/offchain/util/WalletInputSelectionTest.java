@@ -8,9 +8,11 @@ import org.junit.jupiter.api.Test;
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -206,5 +208,137 @@ class WalletInputSelectionTest {
         Utxo usdmAndAda = token("usdm1", 0, 1_100_000_000L, 1_400_000L);
         assertEquals(BigInteger.valueOf(1_100_000_000L), WalletInputSelection.tokenQuantityOf(usdmAndAda, USDM));
         assertEquals(BigInteger.ZERO, WalletInputSelection.tokenQuantityOf(ada("aa", 0, 5_000_000L), USDM));
+    }
+
+    // ---- FAB-128 — the token the balance gate does NOT count, and why ------------------------------
+
+    private static final Function<BigInteger, String> IN_USDM = q -> q + " USDM";
+
+    private static final String VARIANT_A_WORDING = "Consolidate the token into one UTxO carrying at least";
+    private static final String VARIANT_B_WORDING = "Even counted,";
+
+    /**
+     * Each field against hand-summed values, over one UTxO of every shape the rule distinguishes. A
+     * floor of 4,000,000 lovelace: {@code spendable} counts the 5 ADA one and the one EXACTLY at 4 ADA
+     * (the comparison is {@code >=}, the same one {@code smallestSufficientToken} applies), {@code
+     * belowAdaFloor} the 1.18 ADA one, and the datum-carrying one is in {@code total} alone — it is not
+     * {@code nominableForToken}, so it is neither spendable nor "short of ada".
+     */
+    @Test
+    void tokenHoldingSplitsTheTokenByWhetherItsUtxoCouldBeSpent() {
+        Utxo spendable = token("sp", 0, 100L, 5_000_000L);
+        Utxo atTheFloor = token("at", 0, 20L, 4_000_000L);
+        Utxo belowTheFloor = token("lo", 0, 3L, 1_180_000L);
+        Utxo withDatum = token("dt", 0, 7_000L, 9_000_000L);
+        withDatum.setInlineDatum("d87980");
+        Utxo noToken = ada("aa", 0, 50_000_000L);
+
+        WalletInputSelection.TokenHolding holding = WalletInputSelection.tokenHolding(
+                List.of(spendable, atTheFloor, belowTheFloor, withDatum, noToken), USDM,
+                BigInteger.valueOf(4_000_000L));
+
+        assertEquals(BigInteger.valueOf(100L + 20L + 3L + 7_000L), holding.total(),
+                "total is every unit of the token in the wallet, datum-carrying UTxO included");
+        assertEquals(BigInteger.valueOf(100L + 20L), holding.spendable(),
+                "spendable is nominable-for-token AND at least the floor — exactly at it counts");
+        assertEquals(BigInteger.valueOf(3L), holding.belowAdaFloor(),
+                "belowAdaFloor is nominable-for-token and short of the floor — never the datum one");
+        assertEquals(BigInteger.valueOf(4_000_000L), holding.requiredAda());
+    }
+
+    /** The executor's own formula, moved here: fee ceiling plus the 2 ADA min-ada rider. */
+    @Test
+    void tokenPrincipalRequiredAdaIsTheFeeCeilingPlusTheMinAdaRider() {
+        assertEquals(BigInteger.valueOf(2_000_000L), WalletInputSelection.TOKEN_PRINCIPAL_MIN_ADA_CEILING);
+        assertEquals(BigInteger.valueOf(2_405_077L + 2_000_000L),
+                WalletInputSelection.tokenPrincipalRequiredAda(Optional.of(BigInteger.valueOf(2_405_077L))));
+        assertEquals(BigInteger.valueOf(2_000_000L),
+                WalletInputSelection.tokenPrincipalRequiredAda(Optional.empty()),
+                "an unavailable fee ceiling leaves only the rider — the formula the executor always used");
+    }
+
+    @Test
+    void noNoteWhenNothingIsExcludedByTheAdaFloor() {
+        var holding = new WalletInputSelection.TokenHolding(BigInteger.valueOf(500L), BigInteger.valueOf(500L),
+                BigInteger.ZERO, BigInteger.valueOf(4_405_077L));
+        assertNull(holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_000L), true),
+                "with no token stuck behind the floor there is nothing to explain — \"holds X\" says it all");
+    }
+
+    @Test
+    void noNoteWhenTheSpendableBalanceAlreadyCovers() {
+        var holding = new WalletInputSelection.TokenHolding(BigInteger.valueOf(1_003L), BigInteger.valueOf(1_000L),
+                BigInteger.valueOf(3L), BigInteger.valueOf(4_405_077L));
+        assertNull(holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_000L), true),
+                "the excluded token is not why anything was refused when the spendable balance covers");
+    }
+
+    /** Variant A — consolidation alone would cure it, so the remedy says only that. */
+    @Test
+    void consolidationIsTheRemedyWhenTheExcludedTokenWouldCover() {
+        var holding = new WalletInputSelection.TokenHolding(BigInteger.valueOf(3_000_000L), BigInteger.ZERO,
+                BigInteger.valueOf(3_000_000L), BigInteger.valueOf(4_405_077L));
+        String note = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_600_000L), true);
+        assertEquals("the wallet has 3000000 USDM in total, but 3000000 USDM of it sits in UTxOs carrying "
+                + "less than 4405077 lovelace (4.405077 ADA) each — the ada a build needs beside the token, "
+                + "the fee ceiling plus a 2 ADA min-ada rider — so the bot cannot spend it and does not count "
+                + "it. Consolidate the token into one UTxO carrying at least 4405077 lovelace; the wallet "
+                + "rebalancer does this automatically when it is enabled and this market is action: "
+                + "ANTICIPATE.", note);
+        assertFalse(note.contains(VARIANT_B_WORDING), note);
+    }
+
+    /** Variant A's boundary: spendable + excluded exactly equal to the requirement does cover it. */
+    @Test
+    void consolidationIsTheRemedyWhenTheExcludedTokenCoversExactly() {
+        var holding = new WalletInputSelection.TokenHolding(BigInteger.valueOf(1_600L), BigInteger.valueOf(600L),
+                BigInteger.valueOf(1_000L), BigInteger.valueOf(4_405_077L));
+        String note = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_600L), true);
+        assertTrue(note.contains(VARIANT_A_WORDING), note);
+        assertFalse(note.contains(VARIANT_B_WORDING), note);
+    }
+
+    /**
+     * Variant B — consolidating would still leave it short, so the remedy must not claim it suffices:
+     * it says how much must be ADDED, and that the rebalancer cannot do that part.
+     */
+    @Test
+    void theRemedyNamesTheShortfallWhenEvenTheExcludedTokenWouldNotCover() {
+        var holding = new WalletInputSelection.TokenHolding(BigInteger.valueOf(2_500L), BigInteger.valueOf(1_000L),
+                BigInteger.valueOf(500L), BigInteger.valueOf(4_000_000L));
+        String note = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(2_000L), true);
+        assertEquals("the wallet has 2500 USDM in total, but 500 USDM of it sits in UTxOs carrying less "
+                + "than 4000000 lovelace (4 ADA) each — the ada a build needs beside the token, the fee "
+                + "ceiling plus a 2 ADA min-ada rider — so the bot cannot spend it and does not count it. "
+                + "Even counted, 1500 USDM would be short of the 2000 USDM required: consolidate the token "
+                + "into one UTxO carrying at least 4000000 lovelace and add at least 500 USDM; the wallet "
+                + "rebalancer consolidates automatically when it is enabled and this market is action: "
+                + "ANTICIPATE, but it cannot add funds.", note);
+        assertFalse(note.contains(VARIANT_A_WORDING), note);
+    }
+
+    /** Without a fee ceiling the floor stated is a lower bound, and the note must say so. */
+    @Test
+    void anUnavailableFeeCeilingIsDeclaredInTheNote() {
+        var holding = new WalletInputSelection.TokenHolding(BigInteger.valueOf(3_000L), BigInteger.ZERO,
+                BigInteger.valueOf(3_000L), BigInteger.valueOf(2_000_000L));
+        String unknown = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_000L), false);
+        assertTrue(unknown.contains("carrying less than 2000000 lovelace (2 ADA) each — the ada a build needs "
+                + "beside the token, the fee ceiling plus a 2 ADA min-ada rider (the fee ceiling was "
+                + "unavailable this cycle, so this floor leaves it out and the real one is higher) — so the "
+                + "bot cannot spend it"), unknown);
+        String known = holding.adaFloorNote(IN_USDM, BigInteger.valueOf(1_000L), true);
+        assertFalse(known.contains("unavailable"), known);
+    }
+
+    /** N_ADA is a plain decimal with trailing zeros stripped — never "1E+1" and never "2.500000". */
+    @Test
+    void theAdaFloorIsStatedAsAPlainDecimal() {
+        var ten = new WalletInputSelection.TokenHolding(BigInteger.TEN, BigInteger.ZERO, BigInteger.TEN,
+                BigInteger.valueOf(10_000_000L));
+        assertTrue(ten.adaFloorNote(IN_USDM, BigInteger.ONE, true).contains("(10 ADA)"));
+        var twoAndAHalf = new WalletInputSelection.TokenHolding(BigInteger.TEN, BigInteger.ZERO, BigInteger.TEN,
+                BigInteger.valueOf(2_500_000L));
+        assertTrue(twoAndAHalf.adaFloorNote(IN_USDM, BigInteger.ONE, true).contains("(2.5 ADA)"));
     }
 }

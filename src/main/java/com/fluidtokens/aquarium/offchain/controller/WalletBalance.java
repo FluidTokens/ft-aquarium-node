@@ -1,6 +1,8 @@
 package com.fluidtokens.aquarium.offchain.controller;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,8 +27,19 @@ import com.bloxbean.cardano.client.api.model.Utxo;
  * here proves that requirement was met. {@link #known()} false means NO answer — the node is still
  * syncing or the read failed — so the page can say so instead of rendering a confident zero over money
  * that may be there.
+ *
+ * <h2>Why the UTxOs ride along</h2>
+ * FAB-128: a total is not what the bot counts for a token principal — it counts only the token in UTxOs a
+ * selection could spend ({@code WalletInputSelection.tokenHolding}). {@link #utxos()} keeps the UTxOs the
+ * totals were made from, so the page can ask that same question of the same read. Empty for
+ * {@link #unknown()}.
  */
-public record WalletBalance(Map<String, BigInteger> byUnit, long asOfMillis, boolean known) {
+public record WalletBalance(Map<String, BigInteger> byUnit, long asOfMillis, boolean known, List<Utxo> utxos) {
+
+    /** Totals with no UTxOs behind them — every construction that predates {@link #utxos()}. */
+    public WalletBalance(Map<String, BigInteger> byUnit, long asOfMillis, boolean known) {
+        this(byUnit, asOfMillis, known, List.of());
+    }
 
     /** Nothing has been read yet, the read is gated closed, or it failed — NOT a zero balance. */
     public static WalletBalance unknown() {
@@ -46,7 +59,7 @@ public record WalletBalance(Map<String, BigInteger> byUnit, long asOfMillis, boo
                     amount.getQuantity() == null ? BigInteger.ZERO : amount.getQuantity(),
                     BigInteger::add));
         }
-        return new WalletBalance(totals, nowMillis, true);
+        return new WalletBalance(totals, nowMillis, true, Collections.unmodifiableList(new ArrayList<>(utxos)));
     }
 
     /**

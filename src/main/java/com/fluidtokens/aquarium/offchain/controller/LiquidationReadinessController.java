@@ -29,12 +29,19 @@ import com.fluidtokens.aquarium.offchain.service.loans.MarketGate;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 import com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
+import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import lombok.extern.slf4j.Slf4j;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
@@ -88,6 +95,13 @@ import java.util.stream.Collectors;
  * constructed and no route is mapped. <b>There is no authentication and none is planned</b>: it is a
  * run-it-locally tool, it shows loan positions and the operator's own routing, and anything reachable
  * on a public port is reachable by anyone. Bind to loopback or put a reverse proxy in front.
+ *
+ * <p>⚠ <b>The page has exactly two state-changing routes</b> (FAB-132), {@code POST …/wallet-rebalance/suspend}
+ * and {@code POST …/wallet-rebalance/resume}, also unauthenticated and with no CSRF token (ruled). They can
+ * only suspend or resume wallet rebalancing — in memory, until the next restart — and nothing else; resume can
+ * never override the environment, so a node with {@code AQUARIUM_WALLET_REBALANCE_ENABLED=false} stays off
+ * whatever is posted. Each answers {@code 303 See Other} to this page, so the page's reload re-GETs it and
+ * never re-POSTs a switch.
  */
 @Controller
 @RequestMapping("${apiPrefix}/loans/readiness")
@@ -239,6 +253,45 @@ public class LiquidationReadinessController {
                            AssetDisplay valueDisplay, long unpricedLoans) {
     }
 
+    /**
+     * ⛔ FAB-132: the "Wallet rebalancing" line under the banner, one text per state, taken from the
+     * rebalancer's own {@code activity()} — the evaluation the bot acts on — so it never reads ARMED while
+     * the rebalancer is idle, and always says why it is idle.
+     *
+     * @param state      {@code OFF}, {@code SUSPENDED}, {@code IDLE} or {@code ARMED}
+     * @param canSuspend the page offers Suspend
+     * @param canResume  the page offers Resume; never with the environment off, which this page cannot override
+     */
+    public record RebalanceView(boolean envEnabled, boolean suspended, String state, String detail,
+                                boolean canSuspend, boolean canResume) {
+
+        static RebalanceView of(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity a) {
+            boolean env = a.state().envEnabled();
+            boolean suspended = a.state().suspended();
+            if (a.armed()) {
+                return new RebalanceView(env, suspended, "ARMED",
+                        "after each block, if the wallet has drifted out of shape, the node signs and submits "
+                                + "one self-send of its whole wallet, in shadow as well as live", true, false);
+            }
+            return switch (a.idle()) {
+                case ENV_DISABLED -> new RebalanceView(env, suspended, "OFF",
+                        "AQUARIUM_WALLET_REBALANCE_ENABLED is false, so this node never rebalances its wallet; "
+                                + "this page cannot turn it on", false, false);
+                case SUSPENDED -> new RebalanceView(env, suspended, "SUSPENDED",
+                        "from this page: nothing is rebalanced until you resume it here, or until the node "
+                                + "restarts", false, true);
+                case MODE_NOT_SHADOW_OR_LIVE -> new RebalanceView(env, suspended, "IDLE",
+                        "the liquidation mode is " + (a.mode() == null ? "not set" : a.mode().name())
+                                + "; rebalancing runs only in shadow or live", true, false);
+                case NO_ANTICIPATE_MARKET -> new RebalanceView(env, suspended, "IDLE",
+                        "no action: ANTICIPATE market has an effective mode of shadow or live, so there is no "
+                                + "token to keep ready", true, false);
+                case SYNCING -> new RebalanceView(env, suspended, "IDLE",
+                        "the node is syncing; rebalancing starts once it has caught up", true, false);
+            };
+        }
+    }
+
     private final ObjectProvider<LiquidationCandidateScanner> scanner;
     private final ObjectProvider<LoanService> loanService;
     private final ObjectProvider<LoanHealthService> loanHealthService;
@@ -312,6 +365,17 @@ public class LiquidationReadinessController {
     }
 
     /**
+     * FAB-132: the wallet rebalancer the page describes and can suspend or resume. Setter-injected and REQUIRED
+     * in the container; null only in a direct test construction, where the page shows no rebalancing line.
+     */
+    private com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer walletRebalancer;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setWalletRebalancer(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer walletRebalancer) {
+        this.walletRebalancer = walletRebalancer;
+    }
+
+    /**
      * ⛔ FAB-134 B2 / FAB-136: the wallet panel is gated on {@code !isSyncing}, exactly as the processors
      * are, because the local index is the only place the wallet is read from. Setter-injected and
      * REQUIRED in the container; null only in a direct test construction, where it reads as open.
@@ -329,6 +393,19 @@ public class LiquidationReadinessController {
     public void setLoansReferenceScriptVerifier(
             com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier loansReferenceScriptVerifier) {
         this.loansReferenceScriptVerifier = loansReferenceScriptVerifier;
+    }
+
+    /**
+     * FAB-128: the protocol parameters the token-principal ada floor is sized from — the per-epoch cached
+     * bean the bot already uses ({@code EpochProtocolParamsSupplier}), so a render normally makes no provider
+     * call. Setter-injected and REQUIRED in the container; null only in a direct test construction, where the
+     * floor is computed without a fee ceiling and the note says so.
+     */
+    private com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setProtocolParamsSupplier(com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier) {
+        this.protocolParamsSupplier = protocolParamsSupplier;
     }
 
     @org.springframework.beans.factory.annotation.Autowired(required = true)
@@ -373,8 +450,13 @@ public class LiquidationReadinessController {
         // unverified reference script costs size, not lending, so the rows keep their own verdicts.
         model.addAttribute("referenceScriptDegradations", loansReferenceScriptVerifier == null ? List.of()
                 : loansReferenceScriptVerifier.degradations());
+        // ⛔ ONE activity() read for the rebalancing line AND the banner's ARMED note, before the early
+        // return: the two can never disagree, and both show even when the lending beans are absent.
+        var rebalanceActivity = walletRebalancer == null ? null : walletRebalancer.activity();
+        model.addAttribute("rebalance", rebalanceActivity == null ? null : RebalanceView.of(rebalanceActivity));
         model.addAttribute("status", OperationalStatus.of(liquidationConfiguration,
-                convertEnabled, compoundEnabled, processorEnabled));
+                convertEnabled, compoundEnabled, processorEnabled,
+                rebalanceActivity != null && rebalanceActivity.armed()));
         model.addAttribute("sort", sort == null ? "health" : sort);
         model.addAttribute("dir", dir == null ? "asc" : dir);
         model.addAttribute("principalFilter", principal);
@@ -457,6 +539,37 @@ public class LiquidationReadinessController {
         model.addAttribute("pages", pages);
         model.addAttribute("rows", arranged.subList(from, Math.min(from + PAGE_SIZE, arranged.size())));
         return "readiness";
+    }
+
+    /**
+     * ⛔ FAB-132: suspend wallet rebalancing until resumed here or the node restarts. Reads no parameter and no
+     * body, renders no view, and answers {@code 303 See Other} to the GET page — derived from THIS request, so
+     * the context path and {@code apiPrefix} are whatever served the POST — so a reload never re-POSTs.
+     */
+    @PostMapping("/wallet-rebalance/suspend")
+    public ResponseEntity<Void> suspendWalletRebalance(HttpServletRequest request) {
+        if (walletRebalancer != null) {
+            walletRebalancer.suspend();
+        }
+        String uri = request.getRequestURI();
+        String suffix = "/wallet-rebalance/suspend";
+        String page = uri.endsWith(suffix) ? uri.substring(0, uri.length() - suffix.length()) : uri;
+        return ResponseEntity.status(HttpStatus.SEE_OTHER).header(HttpHeaders.LOCATION, page).build();
+    }
+
+    /**
+     * ⛔ FAB-132: lift a suspension. It can never turn on a rebalancer the environment turned off — the rebalancer
+     * itself refuses — and, like suspend, it answers {@code 303 See Other} to the GET page derived from the request.
+     */
+    @PostMapping("/wallet-rebalance/resume")
+    public ResponseEntity<Void> resumeWalletRebalance(HttpServletRequest request) {
+        if (walletRebalancer != null) {
+            walletRebalancer.resume();
+        }
+        String uri = request.getRequestURI();
+        String suffix = "/wallet-rebalance/resume";
+        String page = uri.endsWith(suffix) ? uri.substring(0, uri.length() - suffix.length()) : uri;
+        return ResponseEntity.status(HttpStatus.SEE_OTHER).header(HttpHeaders.LOCATION, page).build();
     }
 
     /**
@@ -697,19 +810,97 @@ public class LiquidationReadinessController {
         // ⚠ ONCE per render, not once per row: it is a database read behind a TTL, and twenty loans
         // asking the same question twenty times would defeat the cache on the first miss.
         WalletBalance wallet = wallet(now);
+        // FAB-128: the fee ceiling a token-principal funding UTxO must carry beside the token, ONCE per
+        // render like the wallet. Empty when it cannot be had — the floor then leaves it out, and the
+        // note says so — never a reason for the page to fail.
+        Optional<BigInteger> feeCeiling = feeCeiling();
         for (Loan loan : result.loanCensus().loans()) {
             LiquidationAssessment assessment = byLoanId.get(loan.loanId());
             rows.add(row(loan, assessment, healthService.health(loan, now), gate, poolMemo, poolSnapshot,
-                    metadataMemo, wallet, now));
+                    metadataMemo, wallet, feeCeiling, now));
         }
         rows.sort(Comparator.comparingDouble(Row::sortKey));
         return rows;
     }
 
+    /** {@code maxPossibleFee} of the wired parameters, or empty when there are none or they are unusable. */
+    private Optional<BigInteger> feeCeiling() {
+        if (protocolParamsSupplier == null) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(LedgerCeilings.maxPossibleFee(protocolParamsSupplier.getProtocolParams()));
+        } catch (Exception e) {
+            log.debug("no fee ceiling for the readiness page's token floor: {}", e.toString());
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * What the blocker compares an advance against, and what it says when that falls short.
+     *
+     * @param balance the principal the bot would count
+     * @param label   the badge instead of {@code funds}, or null for the generic text
+     * @param detail  the tooltip that goes with {@code label}, or null
+     */
+    record FundsCheck(BigInteger balance, String label, String detail) { }
+
+    /**
+     * ⛔ FAB-128: <b>the page counts a token principal the way the bot does</b>, by the bot's own helpers —
+     * never a re-derivation here. The bot shows its market gate only the token in UTxOs with no datum or
+     * reference script that carry at least the fee ceiling plus the min-ada rider
+     * ({@link WalletInputSelection#tokenHolding}); counting the wallet's TOTAL marked nothing while the bot
+     * refused every cycle (measured: 15,000 NIGHT in a 1.18-ADA UTxO against an 11,033.9 NIGHT advance).
+     *
+     * <p>When the spendable count is short and token sits behind the floor, the note is the bot's own
+     * ({@link WalletInputSelection.TokenHolding#adaFloorNote}); the label is {@code consolidate} when
+     * consolidating alone would cover the advance, else {@code funds}.
+     *
+     * <p>An ADA principal and an unknown wallet are today's behaviour exactly: the wallet's total for the unit,
+     * and no override.
+     *
+     * @param amount renders a quantity of the principal, unit included — the page's scaled amounts
+     */
+    static FundsCheck fundsCheck(WalletBalance wallet, AssetType principal, Optional<BigInteger> feeCeiling,
+                                 BigInteger advance, Function<BigInteger, String> amount) {
+        if (principal.isAda() || !wallet.known()) {
+            return new FundsCheck(wallet.of(principal.toUnit()), null, null);
+        }
+        WalletInputSelection.TokenHolding holding = WalletInputSelection.tokenHolding(wallet.utxos(), principal,
+                WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling));
+        if (advance == null) {
+            return new FundsCheck(holding.spendable(), null, null);
+        }
+        String note = holding.adaFloorNote(amount, advance, feeCeiling.isPresent());
+        if (note == null) {
+            return new FundsCheck(holding.spendable(), null, null);
+        }
+        String label = holding.spendable().add(holding.belowAdaFloor()).compareTo(advance) >= 0
+                ? "consolidate" : "funds";
+        return new FundsCheck(holding.spendable(), label, note);
+    }
+
+    /**
+     * ⛔ FAB-128: how the row renders the amounts in {@link #fundsCheck}'s note — <b>exact</b>, never the
+     * page's rounded text. The note is a remedy, and a remedy is a claim that must be sufficient: rounded,
+     * a 24,999.4 shortfall reads "add at least 24,999", and one base unit short reads "11,034 would be
+     * short of the 11,034 required". {@link AssetDisplay#exactText} is the same scaled figure at full
+     * precision.
+     *
+     * @param display the page's display of a quantity of the principal
+     */
+    static Function<BigInteger, String> noteAmounts(Function<BigInteger, AssetDisplay> display) {
+        return q -> {
+            AssetDisplay shown = display.apply(q);
+            return shown.exactText() + " " + shown.label();
+        };
+    }
+
     private Row row(Loan loan, LiquidationAssessment assessment, LoanHealth health,
                     MarketGate gate, Map<String, PoolFetch> poolMemo,
                     Supplier<MinswapPoolResolver.Snapshot> poolSnapshot,
-                    Map<String, TokenMetadata> metadataMemo, WalletBalance wallet, long now) {
+                    Map<String, TokenMetadata> metadataMemo, WalletBalance wallet,
+                    Optional<BigInteger> feeCeiling, long now) {
         var datum = loan.datum();
         AssetType collateralAsset = datum.collateral().assetType();
 
@@ -848,12 +1039,16 @@ public class LiquidationReadinessController {
         // ⚠ The FORWARD question, asked whatever this loan's health is today: if it crossed the
         // threshold in the next hour, could the bot handle it? A mark that only appeared once a loan
         // was already liquidatable would arrive too late to move capital.
-        BigInteger principalBalance = wallet.of(datum.principalAsset().toUnit());
+        // FAB-128: a token principal is counted as the bot counts it, and a shortfall caused by the ada
+        // floor says so — in the page's own scaled amounts.
+        String principalUnit = datum.principalAsset().toUnit();
+        FundsCheck funds = fundsCheck(wallet, datum.principalAsset(), feeCeiling, advance,
+                noteAmounts(q -> display(principalUnit, q, metadataMemo)));
         ProcessingBlocker blocker = ProcessingBlocker.of(
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                 gate.marketFor(datum.principalAsset()), convertEnabled, bondRoute,
                 new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
-                advance, principalBalance, wallet.known());
+                advance, funds.balance(), wallet.known(), funds.label(), funds.detail());
 
         ActionNow actionNow = gatedAction(lendingConfigGate,
                 excludedAction(honestAction(health.liquidatable(), datum.collateral().isAda(),

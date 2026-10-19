@@ -73,8 +73,19 @@ public class PayInAdvanceLiquidationRouter {
      */
     public static final class MarketGateRefusedException extends RuntimeException {
 
-        MarketGateRefusedException(String message) {
+        private final transient MarketGate.Decision decision;
+
+        MarketGateRefusedException(String message, MarketGate.Decision decision) {
             super(message);
+            this.decision = decision;
+        }
+
+        /**
+         * The gate's own decision — FAB-128: the executor reads its refusal and {@code required()} to
+         * explain an INSUFFICIENT_BALANCE whose token sits behind the ada floor.
+         */
+        public MarketGate.Decision decision() {
+            return decision;
         }
     }
 
@@ -257,7 +268,8 @@ public class PayInAdvanceLiquidationRouter {
         if (!market.allowed()) {
             throw new MarketGateRefusedException(
                     "%s: %s (anticipatable %s of a required %s)".formatted(
-                            market.refusal(), market.detail(), market.anticipatable(), market.required()));
+                            market.refusal(), market.detail(), market.anticipatable(), market.required()),
+                    market);
         }
         boolean adaPrincipal = datum.principalAsset().isAda();
         String principalUnit = adaPrincipal ? "ada" : datum.principalAsset().toUnit();

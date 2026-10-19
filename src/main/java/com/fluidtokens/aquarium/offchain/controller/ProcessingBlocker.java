@@ -61,6 +61,26 @@ public record ProcessingBlocker(String label, String detail) {
                                        boolean convertEnabled, BondRoute route,
                                        PoolUsabilityView pool, BigInteger advance,
                                        BigInteger balance, boolean balanceKnown) {
+        return of(effectiveMode, action, market, convertEnabled, route, pool, advance, balance, balanceKnown,
+                null, null);
+    }
+
+    /**
+     * As above, with what to say INSTEAD of the generic {@code funds} text when the balance is short.
+     *
+     * <p>FAB-128: a token principal can be in the wallet and still not count, because it sits in UTxOs
+     * carrying less ada than a build needs beside it. The caller knows that and this does not, so the
+     * caller supplies the label and the note. Only the balance check reads them, and only when BOTH are
+     * given — every earlier answer (bot off, convert, plain, no bond, unknown, cap) ignores them.
+     *
+     * @param fundsLabel  the badge when short, e.g. {@code consolidate}; null for {@code funds}
+     * @param fundsDetail the tooltip when short; null for the generic {@code funds} text
+     */
+    public static ProcessingBlocker of(Mode effectiveMode, Action action, Market market,
+                                       boolean convertEnabled, BondRoute route,
+                                       PoolUsabilityView pool, BigInteger advance,
+                                       BigInteger balance, boolean balanceKnown,
+                                       String fundsLabel, String fundsDetail) {
         if (effectiveMode == Mode.DISABLED) {
             return of("bot off", market != null && market.getMode() == Mode.DISABLED
                     ? "this market is set to DISABLED"
@@ -107,6 +127,9 @@ public record ProcessingBlocker(String label, String detail) {
         // ⚠ min(balance, cap) is MarketGate.decide's rule; the cap half is checked above, so what is
         // left here is the balance half. Stated once, in the same shape, so the two cannot disagree.
         if (balance.compareTo(advance) < 0) {
+            if (fundsLabel != null && fundsDetail != null) {
+                return of(fundsLabel, fundsDetail);
+            }
             return of("funds", "the wallet holds less of this loan's principal than the advance "
                     + "would need — move capital before this one goes sour, not after");
         }

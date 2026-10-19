@@ -4,10 +4,12 @@ import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * <b>Which wallet UTxO to nominate as a transaction's own input — smallest that suffices.</b>
@@ -159,6 +161,106 @@ public final class WalletInputSelection {
                 .filter(u -> tokenQuantityOf(u, principal).compareTo(requiredPrincipal) >= 0)
                 .filter(u -> LedgerCeilings.lovelaceOf(u).compareTo(requiredAda) >= 0)
                 .min(Comparator.comparing(u -> tokenQuantityOf(u, principal)));
+    }
+
+    /**
+     * ⚠ A conservative CEILING for the min-ada rider a token-principal lender output needs, sized for
+     * wallet-selection headroom rather than computed from live protocol parameters — {@code
+     * LedgerCeilings} has no min-ada helper and this class does not derive one (out of this slice's
+     * file allowlist). Over-estimating is the safe direction here ({@code LiquidationExecutor}'s own
+     * javadoc, and this class's): a single-asset min-ada output on {@code coinsPerUtxoSize} 4310
+     * measures well under 1.5 ada in every fixture seen so far, so 2 ada leaves real headroom rather
+     * than sitting on the edge.
+     */
+    public static final BigInteger TOKEN_PRINCIPAL_MIN_ADA_CEILING = BigInteger.valueOf(2_000_000L);
+
+    /**
+     * The ada a token-principal funding UTxO must carry beside the token: the fee ceiling plus
+     * {@link #TOKEN_PRINCIPAL_MIN_ADA_CEILING}. One formula for the selector ({@code nominate()}) and
+     * for the balance the market gate is shown, so the two can never describe different wallets. An
+     * unavailable fee ceiling contributes zero — the floor then understates, which
+     * {@link TokenHolding#adaFloorNote} says out loud.
+     */
+    public static BigInteger tokenPrincipalRequiredAda(Optional<BigInteger> feeCeiling) {
+        return feeCeiling.orElse(BigInteger.ZERO).add(TOKEN_PRINCIPAL_MIN_ADA_CEILING);
+    }
+
+    /**
+     * FAB-128 — how much of a token the wallet holds, split by whether a token-principal selection
+     * could actually spend it.
+     *
+     * @param total         every unit of the token in the wallet, whatever UTxO it sits in
+     * @param spendable     in {@link #nominableForToken} UTxOs carrying at least {@code requiredAda} —
+     *                      the only figure the market gate may be shown
+     * @param belowAdaFloor in {@link #nominableForToken} UTxOs carrying less than {@code requiredAda}:
+     *                      the token a consolidation would make spendable. A datum- or
+     *                      reference-script-carrying UTxO is in neither, only in {@code total}.
+     * @param requiredAda   the floor the split was made at
+     */
+    public record TokenHolding(BigInteger total, BigInteger spendable, BigInteger belowAdaFloor,
+                               BigInteger requiredAda) {
+
+        /**
+         * Why a refusal that says "holds 0" is not the whole story — or {@code null} when it is: when
+         * no token sits behind the ada floor, or the spendable balance already covers {@code required}.
+         * The remedy is a claim and must be sufficient: consolidation is offered alone only when the
+         * excluded token would cover the requirement, and otherwise the note names what to add.
+         *
+         * @param amount          renders a quantity of the token, unit included
+         * @param required        what must be fronted, in the token's base units
+         * @param feeCeilingKnown false when {@code requiredAda} was computed without a fee ceiling
+         */
+        public String adaFloorNote(Function<BigInteger, String> amount, BigInteger required,
+                                   boolean feeCeilingKnown) {
+            if (belowAdaFloor.signum() == 0 || spendable.compareTo(required) >= 0) {
+                return null;
+            }
+            String adaFloorInAda = new BigDecimal(requiredAda).movePointLeft(6).stripTrailingZeros()
+                    .toPlainString();
+            String why = ("the wallet has %s in total, but %s of it sits in UTxOs carrying less than %s "
+                    + "lovelace (%s ADA) each — the ada a build needs beside the token, the fee ceiling plus "
+                    + "a 2 ADA min-ada rider%s — so the bot cannot spend it and does not count it.").formatted(
+                    amount.apply(total), amount.apply(belowAdaFloor), requiredAda, adaFloorInAda,
+                    feeCeilingKnown ? "" : " (the fee ceiling was unavailable this cycle, so this floor "
+                            + "leaves it out and the real one is higher)");
+            BigInteger counted = spendable.add(belowAdaFloor);
+            if (counted.compareTo(required) >= 0) {
+                return why + (" Consolidate the token into one UTxO carrying at least %s lovelace; the "
+                        + "wallet rebalancer does this automatically when it is enabled and this market is "
+                        + "action: ANTICIPATE.").formatted(requiredAda);
+            }
+            return why + (" Even counted, %s would be short of the %s required: consolidate the token "
+                    + "into one UTxO carrying at least %s lovelace and add at least %s; the wallet "
+                    + "rebalancer consolidates automatically when it is enabled and this market is action: "
+                    + "ANTICIPATE, but it cannot add funds.").formatted(amount.apply(counted),
+                    amount.apply(required), requiredAda, amount.apply(required.subtract(counted)));
+        }
+    }
+
+    /**
+     * Split the wallet's holding of {@code token} at {@code requiredAda}. {@code spendable} is
+     * byte-for-byte the balance the executor showed the market gate before FAB-128: {@link
+     * #nominableForToken} AND {@code lovelaceOf >= requiredAda} — count ONLY UTxOs the selector could
+     * actually pick (F7, round 2: a 2,000 USDM + 1.4 ADA UTxO passes {@code nominableForToken} alone
+     * and would inflate the balance by a candidate the wallet could never fund — M13).
+     */
+    public static TokenHolding tokenHolding(List<Utxo> utxos, AssetType token, BigInteger requiredAda) {
+        BigInteger total = BigInteger.ZERO;
+        BigInteger spendable = BigInteger.ZERO;
+        BigInteger belowAdaFloor = BigInteger.ZERO;
+        for (Utxo utxo : utxos) {
+            BigInteger quantity = tokenQuantityOf(utxo, token);
+            total = total.add(quantity);
+            if (!nominableForToken(utxo, token)) {
+                continue;
+            }
+            if (LedgerCeilings.lovelaceOf(utxo).compareTo(requiredAda) >= 0) {
+                spendable = spendable.add(quantity);
+            } else {
+                belowAdaFloor = belowAdaFloor.add(quantity);
+            }
+        }
+        return new TokenHolding(total, spendable, belowAdaFloor, requiredAda);
     }
 
     /** The largest nominable-for-token holding of {@code principal}, for diagnostics. */

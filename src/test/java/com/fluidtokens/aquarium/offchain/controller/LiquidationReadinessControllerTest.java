@@ -2189,8 +2189,31 @@ class LiquidationReadinessControllerTest {
             Boolean liquidatable,
             FluidOracleClient oracleClient,
             MinswapPoolResolver poolResolverOrNull) {
-        LoanDatum datum = LoanFixtures.loanDatum(AssetType.ada(), BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
-                collateral, 0L, LoanFixtures.liquidation(),
+        return renderLiquidatable(bondDatumOrNull, collateral, configuration, assessmentFactory,
+                lendingConfigGate, liquidatable, oracleClient, poolResolverOrNull,
+                AssetType.ada(), AssetType.ada(), null, null);
+    }
+
+    /**
+     * FAB-128: the principal leg, the wallet and the protocol parameters are injectable too, so a render
+     * can reach a TOKEN-principal ANTICIPATE row against a known wallet. A null {@code walletUtxos} is the
+     * harness's historical "no wallet service" (an unknown balance); a null supplier means no fee ceiling.
+     */
+    private static Rendered renderLiquidatable(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatumOrNull,
+            com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral,
+            AppConfig.LiquidationConfiguration configuration,
+            AssessmentFactory assessmentFactory,
+            com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate,
+            Boolean liquidatable,
+            FluidOracleClient oracleClient,
+            MinswapPoolResolver poolResolverOrNull,
+            AssetType principal,
+            AssetType principalOracleAsset,
+            com.fluidtokens.aquarium.offchain.service.AppUtxoService walletUtxos,
+            com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier) {
+        LoanDatum datum = LoanFixtures.loanDatum(principal, principalOracleAsset, BigInteger.valueOf(100_000_000L),
+                BigInteger.ZERO, collateral, 0L, LoanFixtures.liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
         Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
                 BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
@@ -2230,8 +2253,9 @@ class LiquidationReadinessControllerTest {
         };
         var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
                 provide(oracleClient), provide(poolResolverOrNull), provide(null), provide(LoanFixtures.registry()),
-                provide(null), configuration, network);
+                provide(walletUtxos), configuration, network);
         controller.setLendingConfigGate(lendingConfigGate);
+        controller.setProtocolParamsSupplier(protocolParamsSupplier);
         var model = new org.springframework.ui.ConcurrentModel();
         controller.readiness(model, null, null, null, null, null);
         @SuppressWarnings("unchecked")
@@ -2254,6 +2278,385 @@ class LiquidationReadinessControllerTest {
         market.setAction(AppConfig.LiquidationConfiguration.Action.ANTICIPATE);
         market.setCap(BigInteger.valueOf(cap));
         return market;
+    }
+
+    // ---- FAB-128: the page counts a token principal the way the bot does ----------------------------
+
+    /** A stand-in for the measured mainnet token: 6 decimals, so the note's amounts are scaled. */
+    private static final AssetType NIGHT = new AssetType("0691b2fe".repeat(7), "4e49474854");
+
+    private static final TokenMetadata NIGHT_METADATA =
+            new TokenMetadata(NIGHT.toUnit(), "NIGHT", "Night", 6, TokenMetadata.Source.REGISTRY);
+
+    /** What the page renders a quantity with: the asset's scaled text and its label. */
+    private static String night(BigInteger quantity) {
+        AssetDisplay display = AssetDisplay.of(quantity, NIGHT_METADATA);
+        return display.amountText() + " " + display.label();
+    }
+
+    /** The fee ceiling {@code LoanFixtures.protocolParams()} yields, so N = 2,405,077 + 2,000,000. */
+    private static final Optional<BigInteger> FEE_CEILING = Optional.of(BigInteger.valueOf(2_405_077L));
+
+    /** 11,033.9 NIGHT: the measured advance. */
+    private static final BigInteger MEASURED_ADVANCE = BigInteger.valueOf(11_033_900_000L);
+
+    private static com.bloxbean.cardano.client.api.model.Utxo tokenUtxo(String txPrefix, long lovelace,
+                                                                         AssetType token, long quantity) {
+        var utxo = new com.bloxbean.cardano.client.api.model.Utxo();
+        utxo.setTxHash(txPrefix.repeat(32));
+        utxo.setOutputIndex(0);
+        utxo.setAmount(new ArrayList<>(List.of(
+                com.bloxbean.cardano.client.api.model.Amount.builder()
+                        .unit("lovelace").quantity(BigInteger.valueOf(lovelace)).build(),
+                com.bloxbean.cardano.client.api.model.Amount.builder()
+                        .unit(token.toUnit()).quantity(BigInteger.valueOf(quantity)).build())));
+        return utxo;
+    }
+
+    /** The measured mainnet shape: 15,000 NIGHT in a 1.18-ADA UTxO, beside 50 ADA of ada-only change. */
+    private static WalletBalance measuredWallet() {
+        return WalletBalance.of(List.of(walletUtxo(50_000_000L), tokenUtxo("ab", 1_180_000L, NIGHT,
+                15_000_000_000L)), T0);
+    }
+
+    /**
+     * ⛔ THE MEASURED SHAPE. The wallet holds more NIGHT than the advance, all of it behind the ada floor:
+     * the bot counts 0 and refuses, so the page must count 0 too — and say consolidating would cover it.
+     */
+    @Test
+    void fundsCheckCountsTheMeasuredShapeAsZeroAndSaysConsolidate() {
+        WalletBalance wallet = measuredWallet();
+        assertEquals(BigInteger.valueOf(15_000_000_000L), wallet.of(NIGHT.toUnit()),
+                "fixture premise: the wallet's TOTAL covers the advance");
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, NIGHT, FEE_CEILING, MEASURED_ADVANCE, LiquidationReadinessControllerTest::night);
+
+        assertEquals(BigInteger.ZERO, check.balance(), "the bot counts nothing behind the ada floor");
+        assertEquals("consolidate", check.label(), check.toString());
+        assertNotNull(check.detail(), check.toString());
+        assertTrue(check.detail().contains("the wallet has 15,000 NIGHT in total, but 15,000 NIGHT of it sits "
+                + "in UTxOs carrying less than 4405077 lovelace (4.405077 ADA) each"), check.detail());
+        assertTrue(check.detail().contains("at least 4405077 lovelace"), check.detail());
+        assertFalse(check.detail().contains("unavailable"), "a fee ceiling was given: " + check.detail());
+    }
+
+    /** Consolidating would NOT cover it: the label is funds, and the note names what to add. */
+    @Test
+    void fundsCheckSaysFundsWhenEvenTheExcludedTokenWouldNotCoverTheAdvance() {
+        WalletBalance wallet = WalletBalance.of(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 1_180_000L, NIGHT, 5_000_000_000L),
+                tokenUtxo("cd", 10_000_000L, NIGHT, 2_000_000_000L)), T0);
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, NIGHT, FEE_CEILING, MEASURED_ADVANCE, LiquidationReadinessControllerTest::night);
+
+        assertEquals(BigInteger.valueOf(2_000_000_000L), check.balance(), "the 10-ADA UTxO's token counts");
+        assertEquals("funds", check.label(), check.toString());
+        assertTrue(check.detail().contains("Even counted, 7,000.00 NIGHT would be short of the 11,034 NIGHT"),
+                check.detail());
+    }
+
+    /** ⛔ A token in a UTxO at or above the floor still counts, and nothing is marked. */
+    @Test
+    void fundsCheckCountsATokenInATenAdaUtxoAndOverridesNothing() {
+        WalletBalance wallet = WalletBalance.of(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 10_000_000L, NIGHT, 15_000_000_000L)), T0);
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, NIGHT, FEE_CEILING, MEASURED_ADVANCE, LiquidationReadinessControllerTest::night);
+
+        assertEquals(BigInteger.valueOf(15_000_000_000L), check.balance());
+        assertNull(check.label(), check.toString());
+        assertNull(check.detail(), check.toString());
+    }
+
+    /** No token at all: nothing to consolidate, so today's funds text applies. */
+    @Test
+    void fundsCheckWithNoTokenIsZeroWithNoOverride() {
+        WalletBalance wallet = WalletBalance.of(List.of(walletUtxo(50_000_000L)), T0);
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, NIGHT, FEE_CEILING, MEASURED_ADVANCE, LiquidationReadinessControllerTest::night);
+
+        assertEquals(BigInteger.ZERO, check.balance());
+        assertNull(check.label(), check.toString());
+        assertNull(check.detail(), check.toString());
+    }
+
+    /** ⛔ An ada principal is today's behaviour exactly: the wallet's total, no override. */
+    @Test
+    void fundsCheckOnAnAdaPrincipalIsTheWalletsTotal() {
+        WalletBalance wallet = measuredWallet();
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, AssetType.ada(), FEE_CEILING, BigInteger.valueOf(100_000_000L),
+                LiquidationReadinessControllerTest::night);
+
+        assertEquals(wallet.of("lovelace"), check.balance());
+        assertEquals(BigInteger.valueOf(51_180_000L), check.balance(), "the total, not the nominable part");
+        assertNull(check.label(), check.toString());
+        assertNull(check.detail(), check.toString());
+    }
+
+    /** ⛔ An unknown wallet is today's behaviour exactly: no override, so the blocker says unknown. */
+    @Test
+    void fundsCheckOnAnUnknownWalletOverridesNothing() {
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                WalletBalance.unknown(), NIGHT, FEE_CEILING, MEASURED_ADVANCE,
+                LiquidationReadinessControllerTest::night);
+
+        assertEquals(BigInteger.ZERO, check.balance());
+        assertNull(check.label(), check.toString());
+        assertNull(check.detail(), check.toString());
+    }
+
+    /** No fee ceiling: the floor is the 2 ADA rider alone, and the note says the real one is higher. */
+    @Test
+    void fundsCheckWithoutAFeeCeilingSaysTheFloorLeavesItOut() {
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                measuredWallet(), NIGHT, Optional.empty(), MEASURED_ADVANCE,
+                LiquidationReadinessControllerTest::night);
+
+        assertEquals(BigInteger.ZERO, check.balance());
+        assertEquals("consolidate", check.label(), check.toString());
+        assertTrue(check.detail().contains("less than 2000000 lovelace (2 ADA) each"), check.detail());
+        assertTrue(check.detail().contains("the fee ceiling was unavailable this cycle, so this floor leaves "
+                + "it out and the real one is higher"), check.detail());
+    }
+
+    /** An unpriced advance has nothing to compare against: the spendable count, no override. */
+    @Test
+    void fundsCheckWithAnUnpricedAdvanceOverridesNothing() {
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                measuredWallet(), NIGHT, FEE_CEILING, null, LiquidationReadinessControllerTest::night);
+
+        assertEquals(BigInteger.ZERO, check.balance());
+        assertNull(check.label(), check.toString());
+    }
+
+    /** What the ROW renders the note's amounts with: the call site's own formatter, over the NIGHT display. */
+    private static java.util.function.Function<BigInteger, String> rowNight() {
+        return LiquidationReadinessController.noteAmounts(q -> AssetDisplay.of(q, NIGHT_METADATA));
+    }
+
+    /** The two figures either side of "short of" in an "Even counted" note, or a failure if there are none. */
+    private static List<String> shortOfFigures(String detail) {
+        var matcher = java.util.regex.Pattern.compile("Even counted, (.+?) would be short of the (.+?) required")
+                .matcher(detail);
+        assertTrue(matcher.find(), "no \"Even counted\" clause: " + detail);
+        return List.of(matcher.group(1), matcher.group(2));
+    }
+
+    /**
+     * ⛔ A REMEDY IS A CLAIM AND MUST BE SUFFICIENT. 25,000.4 NIGHT to front with 1 NIGHT behind the floor:
+     * the shortfall is 24,999.4, and the page's rounded text says 24,999 — an operator adding exactly that
+     * would still be refused. The row's note states every amount exactly.
+     */
+    @Test
+    void theRowsNoteNamesTheExactShortfallNeverARoundedOne() {
+        WalletBalance wallet = WalletBalance.of(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 1_180_000L, NIGHT, 1_000_000L)), T0);
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, NIGHT, FEE_CEILING, BigInteger.valueOf(25_000_400_000L), rowNight());
+
+        assertEquals("funds", check.label(), check.toString());
+        assertTrue(check.detail().contains("Even counted, 1 NIGHT would be short of the 25000.4 NIGHT required"),
+                check.detail());
+        assertTrue(check.detail().contains("add at least 24999.4 NIGHT;"), check.detail());
+        assertFalse(check.detail().contains("24,999 NIGHT"), "a rounded shortfall understates: " + check.detail());
+    }
+
+    /**
+     * ⛔ One base unit short: rounded, both sides of "short of" read 11,034 NIGHT, which is no reason at all.
+     * Exact, they differ by the one unit the note then says to add.
+     */
+    @Test
+    void theRowsNoteNeverSaysShortOfAnEqualLookingAmount() {
+        WalletBalance wallet = WalletBalance.of(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 1_180_000L, NIGHT, MEASURED_ADVANCE.longValueExact() - 1)), T0);
+
+        LiquidationReadinessController.FundsCheck check = LiquidationReadinessController.fundsCheck(
+                wallet, NIGHT, FEE_CEILING, MEASURED_ADVANCE, rowNight());
+
+        List<String> figures = shortOfFigures(check.detail());
+        assertNotEquals(figures.get(0), figures.get(1), check.detail());
+        assertEquals(List.of("11033.899999 NIGHT", "11033.9 NIGHT"), figures, check.detail());
+        assertTrue(check.detail().contains("add at least 0.000001 NIGHT;"), check.detail());
+    }
+
+    /**
+     * The CALL SITE, through readiness():a token-principal ANTICIPATE row over the measured wallet shape
+     * carries the consolidate blocker, its note in the page's own amounts, at the fee ceiling the wired
+     * protocol parameters yield.
+     */
+    @Test
+    void aTokenPrincipalAnticipateRowOverTheMeasuredWalletSaysConsolidate() {
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN.toUnit(), 1_000_000_000_000L)));
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 1_180_000L, PRINCIPAL_TOKEN, 150_000_000L)));
+        var params = LoanFixtures.protocolParams();
+        BigInteger floor = com.fluidtokens.aquarium.offchain.util.LedgerCeilings
+                .maxPossibleFee(params.getProtocolParams()).add(BigInteger.valueOf(2_000_000L));
+        OracleEntry principalOracle = LoanFixtures.charli3(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
+                        BigInteger.TWO, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("66"), input("77"), input("88"));
+        FakeOracleClient oracle = new FakeOracleClient(LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("22"), input("33"), input("44")), principalOracle);
+
+        LiquidationReadinessController.Row row = renderLiquidatable(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), configuration, null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), true, oracle, null,
+                PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT, utxos, params).row();
+
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertNotNull(row.advancePrincipalAmount(), "fixture premise: the loan must be priced");
+        assertTrue(row.advancePrincipalAmount().compareTo(BigInteger.valueOf(150_000_000L)) < 0,
+                "fixture premise: the wallet's total covers the advance: " + row.advancePrincipalAmount());
+        assertEquals("consolidate", row.blocker().label(), row.blocker().toString());
+        assertTrue(row.blocker().detail().contains("in total, but"), row.blocker().detail());
+        assertTrue(row.blocker().detail().contains("less than " + floor + " lovelace"), row.blocker().detail());
+        assertTrue(row.blocker().detail().contains("150000000 " + row.principalDisplay().label()),
+                "the note's amounts are the page's own: " + row.blocker().detail());
+    }
+
+    /** The same row with the token in a 10-ADA UTxO is clean: the page never marks what the bot funds. */
+    @Test
+    void theSameRowWithTheTokenInATenAdaUtxoIsClean() {
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN.toUnit(), 1_000_000_000_000L)));
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 10_000_000L, PRINCIPAL_TOKEN, 150_000_000L)));
+        FakeOracleClient oracle = new FakeOracleClient(LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("22"), input("33"), input("44")), LoanFixtures.charli3(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
+                        BigInteger.TWO, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("66"), input("77"), input("88")));
+
+        LiquidationReadinessController.Row row = renderLiquidatable(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), configuration, null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), true, oracle, null,
+                PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT, utxos, LoanFixtures.protocolParams()).row();
+
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertNotNull(row.advancePrincipalAmount(), "fixture premise: the loan must be priced");
+        assertFalse(row.blocker().blocked(), row.blocker().toString());
+    }
+
+    /**
+     * ⛔ The CALL SITE again, through readiness(), with the principal's metadata KNOWN (6 decimals) so the page
+     * scales it: one base unit short of the advance, the note must not read "short of" between two figures
+     * the page's rounding makes equal — whatever formatter the call site is handed.
+     */
+    @Test
+    void aScaledTokenPrincipalRowOneBaseUnitShortStatesBothFiguresExactly() {
+        TokenMetadata metadata = new TokenMetadata(PRINCIPAL_TOKEN.toUnit(), "PRIN", "Principal", 6,
+                TokenMetadata.Source.REGISTRY);
+        BigInteger advance = renderScaledTokenPrincipalRow(List.of(walletUtxo(50_000_000L)), metadata)
+                .advancePrincipalAmount();
+        assertNotNull(advance, "fixture premise: the loan must be priced");
+
+        LiquidationReadinessController.Row row = renderScaledTokenPrincipalRow(List.of(walletUtxo(50_000_000L),
+                tokenUtxo("ab", 1_180_000L, PRINCIPAL_TOKEN, advance.longValueExact() - 1)), metadata);
+
+        assertEquals(advance, row.advancePrincipalAmount(), "fixture premise: the same advance both renders");
+        AssetDisplay rounded = AssetDisplay.of(advance, metadata);
+        assertEquals(rounded.amountText(), AssetDisplay.of(advance.subtract(BigInteger.ONE), metadata).amountText(),
+                "fixture premise: the page's rounding makes the two figures look equal");
+        assertEquals("funds", row.blocker().label(), row.blocker().toString());
+        List<String> figures = shortOfFigures(row.blocker().detail());
+        assertNotEquals(figures.get(0), figures.get(1), row.blocker().detail());
+        assertEquals(List.of(AssetDisplay.of(advance.subtract(BigInteger.ONE), metadata).exactText() + " PRIN",
+                rounded.exactText() + " PRIN"), figures, row.blocker().detail());
+        assertTrue(row.blocker().detail().contains("add at least 0.000001 PRIN;"), row.blocker().detail());
+    }
+
+    /**
+     * {@link #renderLiquidatable} for the token-principal ANTICIPATE row of
+     * {@link #aTokenPrincipalAnticipateRowOverTheMeasuredWalletSaysConsolidate}, with a token-metadata service
+     * that knows the principal — the one thing that harness cannot inject.
+     */
+    private static LiquidationReadinessController.Row renderScaledTokenPrincipalRow(
+            List<com.bloxbean.cardano.client.api.model.Utxo> walletUtxos, TokenMetadata principalMetadata) {
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(anticipateMarket(PRINCIPAL_TOKEN.toUnit(), 1_000_000_000_000L)));
+        var utxos = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class);
+        org.mockito.Mockito.when(utxos.listWalletUtxo()).thenReturn(walletUtxos);
+        FakeOracleClient oracle = new FakeOracleClient(LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT,
+                "11".repeat(28), OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN,
+                        BigInteger.ONE, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("22"), input("33"), input("44")), LoanFixtures.charli3(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                "55".repeat(28), OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN,
+                        BigInteger.TWO, BigInteger.ONE, 0L, 4_102_444_800_000L),
+                input("66"), input("77"), input("88")));
+        var metadata = new com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService(null, null, null) {
+            @Override
+            public TokenMetadata lookup(String unit) {
+                return PRINCIPAL_TOKEN.toUnit().equals(unit) ? principalMetadata
+                        : "lovelace".equals(unit) ? TokenMetadata.ada() : TokenMetadata.unknown(unit);
+            }
+        };
+
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L, LoanFixtures.liquidation(),
+                new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("f0".repeat(32), 1, "addr_test1_placeholder", "loanid00", "",
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(),
+                        PRINCIPAL_TOKEN));
+        long now = System.currentTimeMillis();
+        var assessments = List.of(LoanFixtures.assess(bond, loan, OraclePriceFeed.unit(), OraclePriceFeed.unit(), now));
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(loan), 1, 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(assessments, census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null) {
+            @Override
+            public com.fluidtokens.aquarium.offchain.model.loans.LoanHealth health(Loan l, long at) {
+                return new com.fluidtokens.aquarium.offchain.model.loans.LoanHealth(
+                        BigInteger.valueOf(100_000_000L), true, null, BigInteger.ZERO, true, null);
+            }
+        };
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        var controller = new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(oracle), provide(null), provide(metadata), provide(LoanFixtures.registry()),
+                provide(utxos), configuration, network);
+        controller.setLendingConfigGate(new com.fluidtokens.aquarium.offchain.service.LendingConfigGate());
+        controller.setProtocolParamsSupplier(LoanFixtures.protocolParams());
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        return rows.getFirst();
     }
 
     // ---- FAB-134 B2 / FAB-136: the wallet panel reads the local index, gated on !isSyncing only ----
@@ -2414,5 +2817,167 @@ class LiquidationReadinessControllerTest {
         assertTrue(later.known(), "a failed read must not blank a balance that was known");
         assertEquals(BigInteger.valueOf(5_000_000L), later.of("lovelace"));
         assertEquals(T0, later.asOfMillis(), "the balance shown is the earlier one, honestly dated");
+    }
+
+    // ---- FAB-132: wallet rebalancing on the page --------------------------------------------------------
+
+    private static final String ARMED_NOTE = "wallet rebalancing is ARMED — whenever the wallet drifts out of "
+            + "shape, the node signs and submits a self-send of its whole wallet, in shadow as well as live; "
+            + "it is housekeeping, never a liquidation";
+
+    /** A Mockito rebalancer whose {@code activity()} is exactly {@code activity}. */
+    static com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer rebalancerReading(
+            com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity) {
+        var rebalancer = org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class);
+        org.mockito.Mockito.when(rebalancer.activity()).thenReturn(activity);
+        org.mockito.Mockito.when(rebalancer.state()).thenReturn(activity.state());
+        return rebalancer;
+    }
+
+    static com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity(
+            boolean env, boolean suspended, AppConfig.LiquidationConfiguration.Mode mode,
+            com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle idle) {
+        return new com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity(
+                new com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.State(env, suspended,
+                        env && !suspended),
+                mode, idle);
+    }
+
+    /**
+     * ⛔ Each of the rebalancer's states reaches the page as exactly one line, and the banner's ARMED note
+     * follows {@code armed()} — never the env default, never the mode alone. Driven through
+     * {@code readiness(...)} on a bare controller, so the attributes are the ones the controller really sets.
+     */
+    @Test
+    void readinessCarriesEachRebalancerStateAndArmsTheBannerOnlyWhenArmed() {
+        record Case(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity,
+                    LiquidationReadinessController.RebalanceView expected) {
+        }
+        List<Case> cases = List.of(
+                new Case(activity(false, false, AppConfig.LiquidationConfiguration.Mode.LIVE,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.ENV_DISABLED),
+                        new LiquidationReadinessController.RebalanceView(false, false, "OFF",
+                                "AQUARIUM_WALLET_REBALANCE_ENABLED is false, so this node never rebalances its "
+                                        + "wallet; this page cannot turn it on", false, false)),
+                new Case(activity(true, true, AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SUSPENDED),
+                        new LiquidationReadinessController.RebalanceView(true, true, "SUSPENDED",
+                                "from this page: nothing is rebalanced until you resume it here, or until the "
+                                        + "node restarts", false, true)),
+                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.DISABLED,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE),
+                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
+                                "the liquidation mode is DISABLED; rebalancing runs only in shadow or live",
+                                true, false)),
+                new Case(activity(true, false, null,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE),
+                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
+                                "the liquidation mode is not set; rebalancing runs only in shadow or live",
+                                true, false)),
+                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
+                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
+                                "no action: ANTICIPATE market has an effective mode of shadow or live, so there "
+                                        + "is no token to keep ready", true, false)),
+                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.LIVE,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SYNCING),
+                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
+                                "the node is syncing; rebalancing starts once it has caught up", true, false)),
+                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW, null),
+                        new LiquidationReadinessController.RebalanceView(true, false, "ARMED",
+                                "after each block, if the wallet has drifted out of shape, the node signs and "
+                                        + "submits one self-send of its whole wallet, in shadow as well as live",
+                                true, false)));
+
+        for (Case c : cases) {
+            var controller = bareController();
+            controller.setWalletRebalancer(rebalancerReading(c.activity()));
+            var model = new org.springframework.ui.ConcurrentModel();
+            controller.readiness(model, null, null, null, null, null);
+
+            assertEquals(c.expected(), model.getAttribute("rebalance"), "" + c.activity());
+            var status = (OperationalStatus) model.getAttribute("status");
+            assertEquals(c.activity().armed(), status.notes().contains(ARMED_NOTE),
+                    "the banner's ARMED note must follow armed() exactly: " + c.activity() + " " + status.notes());
+        }
+    }
+
+    /** A direct construction holds no rebalancer: no line on the page, and the banner is not armed. */
+    @Test
+    void withNoRebalancerThePageHasNoRebalanceLineAndTheBannerIsNotArmed() {
+        var model = new org.springframework.ui.ConcurrentModel();
+        bareController().readiness(model, null, null, null, null, null);
+        assertNull(model.getAttribute("rebalance"), "no rebalancer: no rebalancing line");
+        assertFalse(((OperationalStatus) model.getAttribute("status")).notes().contains(ARMED_NOTE));
+    }
+
+    private static org.springframework.test.web.servlet.MockMvc served(LiquidationReadinessController controller,
+                                                                      String apiPrefix) {
+        return org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(controller)
+                .addPlaceholderValue("apiPrefix", apiPrefix).build();
+    }
+
+    private static org.springframework.test.web.servlet.ResultActions post(
+            org.springframework.test.web.servlet.MockMvc mvc, String uri) throws Exception {
+        return mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post(uri));
+    }
+
+    private static void assertSeeOtherTo(org.springframework.test.web.servlet.ResultActions result, String location)
+            throws Exception {
+        result.andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isSeeOther())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                        .string("Location", location));
+        assertNull(result.andReturn().getModelAndView(), "a switch renders no view: " + location);
+    }
+
+    /**
+     * ⛔ POST then 303 See Other back to the GET page: the page's auto-refresh reloads the CURRENT URL, so
+     * after a 303 it re-GETs the page and can never re-POST the switch.
+     */
+    @Test
+    void suspendCallsSuspendOnceAndSeesOtherToThePage() throws Exception {
+        var rebalancer = rebalancerReading(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW, null));
+        var controller = bareController();
+        controller.setWalletRebalancer(rebalancer);
+
+        assertSeeOtherTo(post(served(controller, "/api/v1"), "/api/v1/loans/readiness/wallet-rebalance/suspend"),
+                "/api/v1/loans/readiness");
+        org.mockito.Mockito.verify(rebalancer, org.mockito.Mockito.times(1)).suspend();
+        org.mockito.Mockito.verify(rebalancer, org.mockito.Mockito.never()).resume();
+    }
+
+    @Test
+    void resumeCallsResumeOnceAndSeesOtherToThePage() throws Exception {
+        var rebalancer = rebalancerReading(activity(true, true, AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SUSPENDED));
+        var controller = bareController();
+        controller.setWalletRebalancer(rebalancer);
+
+        assertSeeOtherTo(post(served(controller, "/api/v1"), "/api/v1/loans/readiness/wallet-rebalance/resume"),
+                "/api/v1/loans/readiness");
+        org.mockito.Mockito.verify(rebalancer, org.mockito.Mockito.times(1)).resume();
+        org.mockito.Mockito.verify(rebalancer, org.mockito.Mockito.never()).suspend();
+    }
+
+    /** ⚠ The Location is derived from the request that was served, never hard-coded to the default prefix. */
+    @Test
+    void theRedirectFollowsTheApiPrefixAndTheContextPathThatServedThePost() throws Exception {
+        var controller = bareController();
+        controller.setWalletRebalancer(rebalancerReading(activity(true, false, AppConfig.LiquidationConfiguration.Mode.LIVE, null)));
+        var mvc = served(controller, "/x");
+
+        assertSeeOtherTo(post(mvc, "/x/loans/readiness/wallet-rebalance/suspend"), "/x/loans/readiness");
+        assertSeeOtherTo(post(mvc, "/x/loans/readiness/wallet-rebalance/resume"), "/x/loans/readiness");
+        assertSeeOtherTo(mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .post("/node/x/loans/readiness/wallet-rebalance/resume").contextPath("/node")),
+                "/node/x/loans/readiness");
+    }
+
+    /** A direct construction with no rebalancer still answers both routes with the same redirect. */
+    @Test
+    void withNoRebalancerBothRoutesStillSeeOtherToThePage() throws Exception {
+        var mvc = served(bareController(), "/api/v1");
+        assertSeeOtherTo(post(mvc, "/api/v1/loans/readiness/wallet-rebalance/suspend"), "/api/v1/loans/readiness");
+        assertSeeOtherTo(post(mvc, "/api/v1/loans/readiness/wallet-rebalance/resume"), "/api/v1/loans/readiness");
     }
 }

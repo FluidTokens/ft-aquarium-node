@@ -51,6 +51,11 @@ import java.util.function.Supplier;
  * A closed gate reads nothing and logs at DEBUG only: a node in the shipped {@code DISABLED} mode, or with no
  * {@code ANTICIPATE} market, behaves exactly as it did before this class existed.
  *
+ * <p>The readiness page reads {@link #activity()} (FAB-132), and that is the SAME private evaluation of these
+ * five gates that each {@code CommitEvent} acts on: {@link Activity#armed()} is true exactly when the event
+ * would go on to read the wallet, and otherwise {@link Activity#idle()} names the first closed gate. The page
+ * therefore cannot say "armed" over an idle rebalancer, nor give a reason the bot does not share.
+ *
  * <h2>Once the gates are open</h2>
  * <ul>
  *   <li>The wallet is read from the local index ({@link AppUtxoService#listWalletUtxo()}). A read failure is an
@@ -112,6 +117,28 @@ public class WalletRebalancer {
      * @param effective  {@code envEnabled && !suspended}
      */
     public record State(boolean envEnabled, boolean suspended, boolean effective) {
+    }
+
+    /** Why the rebalancer is idle: its first closed gate, in gate order (G1 to G5). */
+    public enum Idle { ENV_DISABLED, SUSPENDED, MODE_NOT_SHADOW_OR_LIVE, NO_ANTICIPATE_MARKET, SYNCING }
+
+    /**
+     * What the rebalancer would do on the next {@code CommitEvent}, as the gates read now.
+     *
+     * @param state exactly what {@link #state()} returns
+     * @param mode  {@code loans.liquidation.mode} as the mode supplier gives it; may be null
+     * @param idle  the first closed gate, or null when every gate is open
+     */
+    public record Activity(State state, Mode mode, Idle idle) {
+
+        /** Every gate is open: the next event reads the wallet and rebalances it if it is out of shape. */
+        public boolean armed() {
+            return idle == null;
+        }
+    }
+
+    /** One evaluation of the gates: the first closed one, or — every gate open — the markets that opened G4. */
+    private record Gates(State state, Mode mode, Idle idle, List<Market> anticipating) {
     }
 
     private final WalletShapeTransactions engine;
@@ -176,6 +203,12 @@ public class WalletRebalancer {
         return new State(envEnabled, isSuspended, envEnabled && !isSuspended);
     }
 
+    /** The gates as they read now, for the readiness page. Reads no wallet; never throws on a null mode or market list. */
+    public Activity activity() {
+        Gates gates = gates();
+        return new Activity(gates.state(), gates.mode(), gates.idle());
+    }
+
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
     public void processCommit(CommitEvent<?> commitEvent) {
         onCommit();
@@ -191,29 +224,47 @@ public class WalletRebalancer {
         }
     }
 
-    private void rebalanceIfNeeded() throws Exception {
-        if (!envEnabled) {
-            log.debug("[REBALANCE] skipped: loans.wallet.rebalance.enabled is false");
-            return;
-        }
-        if (suspended.get()) {
-            log.debug("[REBALANCE] skipped: suspended");
-            return;
-        }
+    /**
+     * The five gates, cheapest first, stopping at the first closed one — the ONE evaluation both
+     * {@link #activity()} and {@link #rebalanceIfNeeded()} take their decision from.
+     */
+    private Gates gates() {
+        State state = state();
         Mode current = mode.get();
+        if (!state.envEnabled()) {
+            return new Gates(state, current, Idle.ENV_DISABLED, List.of());
+        }
+        if (state.suspended()) {
+            return new Gates(state, current, Idle.SUSPENDED, List.of());
+        }
         if (current != Mode.SHADOW && current != Mode.LIVE) {
-            log.debug("[REBALANCE] skipped: loans.liquidation.mode is {}", current);
-            return;
+            return new Gates(state, current, Idle.MODE_NOT_SHADOW_OR_LIVE, List.of());
         }
         List<Market> anticipating = anticipatingMarkets(markets.get());
         if (anticipating.isEmpty()) {
-            log.debug("[REBALANCE] skipped: no action: ANTICIPATE market whose effective mode is shadow or live");
-            return;
+            return new Gates(state, current, Idle.NO_ANTICIPATE_MARKET, List.of());
         }
         if (syncing.getAsBoolean()) {
-            log.debug("[REBALANCE] skipped: the node is syncing");
+            return new Gates(state, current, Idle.SYNCING, List.of());
+        }
+        return new Gates(state, current, null, anticipating);
+    }
+
+    private void rebalanceIfNeeded() throws Exception {
+        Gates gates = gates();
+        if (gates.idle() != null) {
+            switch (gates.idle()) {
+                case ENV_DISABLED -> log.debug("[REBALANCE] skipped: loans.wallet.rebalance.enabled is false");
+                case SUSPENDED -> log.debug("[REBALANCE] skipped: suspended");
+                case MODE_NOT_SHADOW_OR_LIVE -> log.debug("[REBALANCE] skipped: loans.liquidation.mode is {}",
+                        gates.mode());
+                case NO_ANTICIPATE_MARKET -> log.debug(
+                        "[REBALANCE] skipped: no action: ANTICIPATE market whose effective mode is shadow or live");
+                case SYNCING -> log.debug("[REBALANCE] skipped: the node is syncing");
+            }
             return;
         }
+        List<Market> anticipating = gates.anticipating();
 
         Set<String> relevant = WalletShape.relevantUnits(anticipating);
         List<Utxo> wallet;

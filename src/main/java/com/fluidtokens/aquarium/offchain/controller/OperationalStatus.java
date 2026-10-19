@@ -39,10 +39,27 @@ public record OperationalStatus(String headline,
         return "MONITORING ONLY".equals(headline);
     }
 
+    /**
+     * The banner with wallet rebalancing NOT armed: exactly
+     * {@link #of(AppConfig.LiquidationConfiguration, boolean, boolean, boolean, boolean) of(…, false)}.
+     */
     public static OperationalStatus of(AppConfig.LiquidationConfiguration liquidation,
                                        boolean convertEnabled,
                                        boolean compoundEnabled,
                                        boolean processorEnabled) {
+        return of(liquidation, convertEnabled, compoundEnabled, processorEnabled, false);
+    }
+
+    /**
+     * @param walletRebalanceArmed the rebalancer's {@code activity().armed()} (FAB-132). ⚠ When true the node
+     *                             signs and submits wallet self-sends in SHADOW as well as LIVE, so the banner
+     *                             says so in a note of its own — a shadow node is not a node that submits nothing.
+     */
+    public static OperationalStatus of(AppConfig.LiquidationConfiguration liquidation,
+                                       boolean convertEnabled,
+                                       boolean compoundEnabled,
+                                       boolean processorEnabled,
+                                       boolean walletRebalanceArmed) {
         AppConfig.LiquidationConfiguration.Mode mode =
                 liquidation == null || liquidation.getMode() == null
                         ? AppConfig.LiquidationConfiguration.Mode.DISABLED
@@ -64,7 +81,7 @@ public record OperationalStatus(String headline,
         if (mode == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
             notes.add("liquidation is DISABLED — the figures below are a simulation, not an intention");
         } else if (mode == AppConfig.LiquidationConfiguration.Mode.SHADOW) {
-            notes.add("liquidation is in SHADOW — every transaction is built and size-checked, and "
+            notes.add("liquidation is in SHADOW — every liquidation is built and size-checked, and "
                     + "NONE is submitted");
         }
         if (!convertEnabled) {
@@ -79,6 +96,11 @@ public record OperationalStatus(String headline,
             notes.add("the scheduled-transaction processor is off — this is the half you stake FLDT "
                     + "for, and it is unrelated to liquidation");
         }
+        if (walletRebalanceArmed) {
+            notes.add("wallet rebalancing is ARMED — whenever the wallet drifts out of shape, the node signs "
+                    + "and submits a self-send of its whole wallet, in shadow as well as live; it is "
+                    + "housekeeping, never a liquidation");
+        }
 
         // ⛔ LIVE is claimed only when something can actually reach the chain. A node in `live` with
         // convert off and every market disabled submits nothing, and must not announce otherwise.
@@ -86,7 +108,7 @@ public record OperationalStatus(String headline,
         if (mode == AppConfig.LiquidationConfiguration.Mode.LIVE) {
             headline = "LIVE — this node can submit";
         } else if (mode == AppConfig.LiquidationConfiguration.Mode.SHADOW) {
-            headline = "SHADOW — rehearsing, submitting nothing";
+            headline = "SHADOW — rehearsing liquidations, submitting none";
         } else if (processorEnabled) {
             headline = "PROCESSOR ONLY — no liquidation";
         } else {
