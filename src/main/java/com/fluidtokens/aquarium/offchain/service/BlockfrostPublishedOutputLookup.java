@@ -4,6 +4,7 @@ import com.bloxbean.cardano.client.api.model.Result;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fluidtokens.aquarium.offchain.config.BlockfrostKey;
 import com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.Liveness;
 import com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier.PublishedOutput;
 
@@ -40,8 +41,7 @@ public class BlockfrostPublishedOutputLookup implements LoansReferenceScriptVeri
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /** The refusal for a key no header can carry. Names the property, never the value. */
-    static final String KEY_NOT_A_HEADER_VALUE =
-            "blockfrost.key contains characters not allowed in an HTTP header (value withheld)";
+    static final String KEY_NOT_A_HEADER_VALUE = BlockfrostKey.NOT_A_HEADER_VALUE;
 
     private final String baseUrl;
     private final String projectId;
