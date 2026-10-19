@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.service.wallet;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
+import com.bloxbean.cardano.client.api.MinAdaCalculator;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.TransactionProcessor;
@@ -335,15 +336,23 @@ class WalletShapeTransactionsTest {
     }
 
     @Test
-    void smallWalletWhoseChangeIsNotTheLargestOutputIsRefusedButConsolidates() throws Exception {
+    void smallWalletWhoseChangeIsNotTheLargestOutputBuildsAndConsolidates() throws Exception {
         // Planned: A + 10 ADA, junk + 10 ADA, collateral 5 ADA. Change ≈ 2.5 ADA minus fee: smaller than the
-        // 10-ADA token output, so CCL takes the fee out of THAT (FeeCalculators:153-172) and the shape breaks.
+        // 10-ADA token output, so CCL takes the fee out of THAT (FeeCalculators:153-172) — and the engine
+        // moves it back onto the change, so every planned output is still exactly its plan (FAB-147).
         List<Utxo> inputs = List.of(utxo(1_500_000, UNIT_A, 300L, JUNK_1, 5L), utxo(26_000_000));
 
         Outcome shaped = engine.buildShaped(inputs, RELEVANT);
-        assertEquals(Status.REFUSED, shaped.status());
-        assertNull(shaped.transaction());
-        assertTrue(shaped.detail().startsWith("output 0 (RELEVANT_TOKEN)"), shaped.detail());
+        assertEquals(Status.BUILT, shaped.status(), shaped.detail());
+        Transaction shapedTx = decoded(shaped);
+        assertConserved(inputs, shapedTx);
+        List<TransactionOutput> shapedOutputs = shapedTx.getBody().getOutputs();
+        assertEquals(4, shapedOutputs.size());
+        assertEquals(Map.of("lovelace", TEN_ADA, UNIT_A, BigInteger.valueOf(300)), units(shapedOutputs.get(0)));
+        assertEquals(Map.of("lovelace", TEN_ADA, JUNK_1, BigInteger.valueOf(5)), units(shapedOutputs.get(1)));
+        assertEquals(Map.of("lovelace", C), units(shapedOutputs.get(2)));
+        assertEquals(Map.of("lovelace", BigInteger.valueOf(27_500_000).subtract(TEN_ADA.multiply(BigInteger.TWO))
+                .subtract(C).subtract(shapedTx.getBody().getFee())), units(shapedOutputs.get(3)));
 
         Outcome consolidation = engine.buildConsolidation(inputs);
         assertEquals(Status.BUILT, consolidation.status(), consolidation.detail());
@@ -354,6 +363,154 @@ class WalletShapeTransactionsTest {
         assertEquals(BigInteger.valueOf(300), assetOutput.get(UNIT_A));
         assertEquals(BigInteger.valueOf(5), assetOutput.get(JUNK_1));
         assertEquals(Set.of("lovelace"), units(tx.getBody().getOutputs().get(1)).keySet());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The fee comes from the change (FAB-147). cardano-client-lib takes it from the LARGEST output at the
+    // wallet; when that is a planned output, the engine restores it and takes the fee from the change, so
+    // a wallet needs only planned + fee + the change's own min-ADA — not planned + the largest output.
+    // ---------------------------------------------------------------------------------------------
+
+    /** The min-ADA of an output, computed the way cardano-client-lib computes it. */
+    private static BigInteger minAdaOf(TransactionOutput output) {
+        return new MinAdaCalculator(LoanFixtures.protocolParams().getProtocolParams()).calculateMinAda(output);
+    }
+
+    /**
+     * The smallest X in (lo, hi] for which {@code walletOf(X)} builds, given that {@code lo} does not build
+     * and {@code hi} does. Building is monotone in the wallet's lovelace; the caller re-proves the boundary.
+     */
+    private long smallestThatBuilds(long lo, long hi, java.util.function.LongFunction<List<Utxo>> walletOf) {
+        assertEquals(Status.REFUSED, engine.buildShaped(walletOf.apply(lo), RELEVANT).status(), "lo must refuse");
+        Outcome atHi = engine.buildShaped(walletOf.apply(hi), RELEVANT);
+        assertEquals(Status.BUILT, atHi.status(), "hi must build: " + atHi.detail());
+        while (hi - lo > 1) {
+            long mid = lo + (hi - lo) / 2;
+            if (engine.buildShaped(walletOf.apply(mid), RELEVANT).isBuilt()) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        return hi;
+    }
+
+    /**
+     * X builds with a change of exactly its min-ADA (it is the smallest that builds, and the fee does not
+     * depend on the input amount), and X − 1 is refused naming a 1-lovelace shortfall.
+     */
+    private void assertThreshold(long x, java.util.function.LongFunction<List<Utxo>> walletOf, int plannedOutputs)
+            throws Exception {
+        List<Utxo> inputs = walletOf.apply(x);
+        Outcome built = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, built.status(), built.detail());
+        Transaction tx = decoded(built);
+        assertConserved(inputs, tx);
+        assertEquals(plannedOutputs + 1, tx.getBody().getOutputs().size());
+        TransactionOutput change = changeOf(tx);
+        assertEquals(minAdaOf(change), change.getValue().getCoin(),
+                "at the threshold the change is exactly its min-ADA");
+
+        Outcome refused = engine.buildShaped(walletOf.apply(x - 1), RELEVANT);
+        assertEquals(Status.REFUSED, refused.status(), refused.detail());
+        assertNull(refused.transaction());
+        assertTrue(refused.detail().contains("short by 1 lovelace (0.000001 ADA)"), refused.detail());
+        assertTrue(refused.detail().contains("add at least that much"), refused.detail());
+        assertEquals(0, submissions.get(), "a builder must never submit");
+    }
+
+    @Test
+    void adaOnlyWalletThresholdIsPlannedPlusFeePlusTheChangesMinAda() throws Exception {
+        // Planned: collateral C only. Before FAB-147 this wallet was refused at 10.0 ADA and built at 10.2.
+        java.util.function.LongFunction<List<Utxo>> walletOf = lovelace -> List.of(utxo(lovelace));
+        long x = smallestThatBuilds(C.longValueExact(), 10_000_000L, walletOf);
+        System.out.println("FAB-147 threshold, ADA-only wallet: X = " + x + " lovelace");
+        assertTrue(x < 10_000_000L, "X = " + x);
+        assertThreshold(x, walletOf, 1);
+    }
+
+    @Test
+    void oneRelevantTokenWalletThresholdIsPlannedPlusFeePlusTheChangesMinAda() throws Exception {
+        // Planned: A + 10 ADA, then C. Before FAB-147 this wallet was refused at 25.0 ADA and built at 25.2.
+        long tokenLovelace = 1_500_000L;
+        java.util.function.LongFunction<List<Utxo>> walletOf = lovelace -> List.of(
+                utxo(tokenLovelace, UNIT_A, 300L), utxo(lovelace - tokenLovelace));
+        long x = smallestThatBuilds(TEN_ADA.add(C).longValueExact(), 25_000_000L, walletOf);
+        System.out.println("FAB-147 threshold, one-relevant-token wallet: X = " + x + " lovelace");
+        assertTrue(x < 25_000_000L, "X = " + x);
+        assertThreshold(x, walletOf, 2);
+    }
+
+    @Test
+    void theFeeComesFromAChangeSmallerThanATenAdaPlannedOutput() throws Exception {
+        List<Utxo> inputs = List.of(utxo(1_500_000, UNIT_A, 300L), utxo(18_000_000));
+        Outcome outcome = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        List<TransactionOutput> outputs = tx.getBody().getOutputs();
+        assertEquals(3, outputs.size());
+        List<WalletShape.PlannedOutput> planned = outcome.plan().outputs();
+        for (int i = 0; i < planned.size(); i++) {
+            assertEquals(planned.get(i).units(), units(outputs.get(i)), "planned output " + i);
+        }
+        BigInteger fee = tx.getBody().getFee();
+        TransactionOutput change = changeOf(tx);
+        assertTrue(change.getValue().getCoin().compareTo(TEN_ADA) < 0, "the change must be the smaller one here");
+        assertEquals(BigInteger.valueOf(19_500_000).subtract(outcome.plan().plannedLovelace()).subtract(fee),
+                change.getValue().getCoin(), "change == inputs − planned − fee");
+        assertTrue(change.getValue().getCoin().compareTo(minAdaOf(change)) >= 0, "change ≥ its min-ADA");
+        assertEquals(Set.of("lovelace"), units(change).keySet());
+        assertConserved(inputs, tx);
+    }
+
+    @Test
+    void aWalletWhoseChangeWasAlreadyTheLargestBuildsTheSameBodyAsBefore() throws Exception {
+        // The base code's build, verbatim: no post-balance step. Its change (~98 ADA) is the largest output, so
+        // cardano-client-lib already took the fee from it and there is nothing to move.
+        List<Utxo> inputs = messyWallet();
+        WalletShape.Plan plan = WalletShape.plan(inputs, RELEVANT, engine.collateralLovelace());
+        Tx tx = new Tx().from(WALLET).collectFrom(inputs);
+        plan.outputs().forEach(output -> tx.payToAddress(WALLET, output.amounts()));
+        tx.withChangeAddress(WALLET);
+        Transaction base = new QuickTxBuilder(WalletShapeTransactions.inMemorySupplierOf(inputs),
+                LoanFixtures.protocolParams(), (TransactionProcessor) null)
+                .compose(tx).mergeOutputs(false).feePayer(WALLET).build();
+
+        Outcome outcome = engine.buildShaped(inputs, RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        assertEquals(base.getBody().getFee(), outcome.transaction().getBody().getFee());
+        assertArrayEquals(base.serialize(), outcome.transaction().serialize());
+    }
+
+    @Test
+    void aBodyThatGrewOrAFeeThatChangedAfterTheFeeMoveIsRefused() throws Exception {
+        Outcome outcome = engine.buildShaped(messyWallet(), RELEVANT);
+        assertEquals(Status.BUILT, outcome.status(), outcome.detail());
+        Transaction tx = decoded(outcome);
+
+        WalletShapeTransactions.FeeFromChange notRun = new WalletShapeTransactions.FeeFromChange(outcome.plan());
+        assertTrue(notRun.deviation(tx).startsWith("the fee move never ran"), notRun.deviation(tx));
+
+        WalletShapeTransactions.FeeFromChange move = new WalletShapeTransactions.FeeFromChange(outcome.plan());
+        move.apply(null, tx);
+        assertNull(move.deviation(tx), "nothing to move on a wallet whose change already paid the fee");
+        int size = tx.serialize().length;
+
+        // Past 2^32 lovelace the change's coin needs 8 CBOR bytes instead of 4: same fee, a larger body.
+        TransactionOutput change = changeOf(tx);
+        BigInteger coin = change.getValue().getCoin();
+        change.getValue().setCoin(BigInteger.valueOf(5_000_000_000L));
+        String grew = move.deviation(tx);
+        assertNotNull(grew);
+        assertTrue(grew.equals("moving the fee to the change grew the transaction from " + size + " to "
+                + tx.serialize().length + " bytes; the fee was computed for " + size), grew);
+        change.getValue().setCoin(coin);
+
+        tx.getBody().setFee(tx.getBody().getFee().subtract(BigInteger.ONE));
+        String lowered = move.deviation(tx);
+        assertNotNull(lowered);
+        assertTrue(lowered.startsWith("the fee changed after balancing"), lowered);
     }
 
     @Test
