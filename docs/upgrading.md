@@ -377,6 +377,7 @@ in silence, which reads exactly like them working.
 | `AQUARIUM_LIQUIDATION_ENABLED` | redundant with `AQUARIUM_LIQUIDATION_MODE` |
 | `LOANS_ENABLED` | lending-v4 indexing is unconditional now |
 | `AQUARIUM_X_SUBMIT` / `loans.submittable-network` | a barrier that silently blocked submission while everything else was armed is a bug, not a safeguard |
+| `SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL` | a diagnostic for the 2026-09-22 tank decode failure (FAB-149). Still set, it is ignored and the tank is evaluated through Blockfrost, as on every node that never set it — see §2 |
 
 **The general shape is worth keeping in mind beyond this list:** an unknown environment variable is
 not an error anywhere in this stack. It is read by nothing and reported by nothing. When a setting
