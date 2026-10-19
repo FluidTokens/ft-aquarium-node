@@ -186,9 +186,10 @@ class TxContextDeclarationTest {
                 // not the same as one you do not need.
                 //
                 // ⚠ CONDITIONAL, and it ships OFF: set only when
-                // scheduling.transaction-processor.ogmios-url is configured. Unset, the behaviour is
-                // exactly as declared before. This is a DIAGNOSTIC for that failure, not the fix --
-                // requiring operators to run Ogmios would undo this node's "no Kupo/Ogmios" design.
+                // scheduling.transaction-processor.dump-cbor is true, and then only to WRAP the same
+                // backend evaluator so the bytes it is handed reach the log -- the answer is the
+                // backend's, untouched, and that mode builds and never submits. Unset, the tank is
+                // evaluated by the bean's DefaultTransactionProcessor (YaciConfig.quickTxBuilder).
                 TANK, Entry.set())));
 
         // ---- signing: the liquidation builders must NOT be able to submit ---------------------

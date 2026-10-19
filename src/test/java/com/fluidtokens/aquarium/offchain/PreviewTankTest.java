@@ -271,7 +271,6 @@ public class PreviewTankTest {
 //                    .feePayer(adminAccount.baseAddress())
 //                    .collateralPayer(adminAccount.baseAddress())
 //                    .mergeOutputs(false)
-//                    .withTxEvaluator(ogmiosTE())
 //                    .completeAndWait();
 //
 //

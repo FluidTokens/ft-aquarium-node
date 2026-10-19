@@ -89,6 +89,12 @@ not uniquely identify an image the way a current one does.
 **⚠ Pin versions.** With `latest`, a restart months from now silently changes what you run, and
 there is no record of what it used to be.
 
+**`SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL` has been removed (FAB-149).** It was a diagnostic
+for the 2026-09-22 tank decode failure and only ever changed anything when it was set: it sent the
+tank's script-cost evaluation to an Ogmios instance instead of Blockfrost. If your configuration
+still sets it, the node ignores it and evaluates through Blockfrost, exactly as a node that never
+set it always has. You can delete the line.
+
 ---
 
 ## 3. ⛔ The rule that surprises people
