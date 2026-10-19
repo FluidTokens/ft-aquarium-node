@@ -69,7 +69,7 @@ parameters), **plus the transaction fee, plus a change output that still holds i
 once it has paid that fee** (about 1 ADA). Under current parameters a wallet holding one
 `ANTICIPATE` token therefore needs **about 16.2 ADA**, and an ada-only wallet about 6.2 ADA; the exact
 figures move with the protocol parameters and with how many UTxOs the wallet holds (each one adds a
-little to the fee). A wallet with less than that is not reshaped, and the node logs a
+little to the fee). A wallet carrying a very large bundle of other tokens can need more (§9). A wallet with less than that is not reshaped, and the node logs a
 `[REBALANCE] REFUSED: …` warning on every block until you add ada
 (an empty wallet logs `[REBALANCE] NOTHING_TO_DO: no input UTxOs…` instead).
 
@@ -521,7 +521,10 @@ kept ready**: it goes in the "every other token" UTxO.
 Under current parameters, a wallet holding **one `ANTICIPATE` token needs about 16.2 ADA** (10 + 5
 planned, roughly 0.2 of fee and about 1 of change), and an ada-only wallet about 6.2 ADA. These are
 approximate: they move with the protocol parameters, and each extra UTxO in the wallet adds a little
-to the fee. When the wallet is short only of the change's minimum, the refusal names the exact
+to the fee. ⚠ One exception: if the bundle of *other* tokens (the non-`ANTICIPATE` ones) is so large that
+its own minimum ada is close to 10 ADA (around 30 spam tokens with long names), cardano-client-lib
+refuses the build itself (`build failed: Not enough funds …`) until the change is larger than 10 ADA,
+so such a wallet still needs the old figure: the planned outputs plus a change above 10 ADA. When the wallet is short only of the change's minimum, the refusal names the exact
 shortfall (`… the wallet is short by N lovelace (N.NNNNNN ADA) for this shape; add at least that
 much`). Otherwise the self-send is not built, and the node logs a warning **on every block**:
 
