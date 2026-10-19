@@ -72,7 +72,9 @@ private network — [docs/deploying.md](docs/deploying.md) §7.
 ## How it works
 
 The node needs two things beside itself: a **Cardano relay** for the chain feed, and a **Postgres**
-database it owns. Transactions are submitted through **Blockfrost**.
+database it owns. Transactions are submitted through **Blockfrost**. Once a day, and at startup, it
+also asks **GitHub** whether the build it runs is behind `main` and says so in its log;
+`AQUARIUM_VERSION_CHECK_ENABLED=false` turns that off.
 
 ```mermaid
 flowchart TB
@@ -80,6 +82,7 @@ flowchart TB
     oracle["FluidTokens<br/>oracle API"]
     bf["Blockfrost<br/><i>submission</i>"]
     minswap["Minswap V2"]
+    gh["GitHub API<br/><i>daily version check</i>"]
 
     subgraph aq["your deployment — docker compose"]
         yaci["Yaci Store<br/>indexer"]
@@ -97,6 +100,7 @@ flowchart TB
     sched & liq -- "sign" --> wallet
     wallet -- "submit" --> bf
     liq -. "CONVERT order" .-> minswap
+    aq -. "is this build behind main?" .-> gh
 ```
 
 **What gets indexed:** Aquarium Scheduled Transaction UTxOs, the Aquarium Parameters UTxO, Aquarium

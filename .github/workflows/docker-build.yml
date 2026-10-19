@@ -236,11 +236,14 @@ jobs:
       # re-measured cold on feat/wallet-rebalance at 1a53052: 193 files / 1731 tests / 0 failures / 0 errors /
       # 50 skipped, 0 orphans. Floor 193.
       #
+      # GH-55 (NodeVersionCheckTest) on top of FAB-141 (BlockfrostKeyTest), re-measured cold on feat/gh-55-version-check
+      # after merging main at f17d153: 200 files / 1862 tests / 0 failures / 0 errors / 50 skipped, 0 orphans. Floor 200.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '199'
+          RESULT_FILE_FLOOR: '200'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

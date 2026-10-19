@@ -729,6 +729,105 @@ class LiquidationReadinessControllerTest {
                 "with the lending gate closed, every row must say the bot refuses it");
     }
 
+    // ---- GH-55: the version check's last answer -------------------------------------------------------
+
+    /** A version check that answers a fixed status, so the test can tell it was carried and not rebuilt. */
+    private static com.fluidtokens.aquarium.offchain.service.NodeVersionCheck versionCheckAnswering(
+            com.fluidtokens.aquarium.offchain.service.NodeVersionCheck.Status status) {
+        return new com.fluidtokens.aquarium.offchain.service.NodeVersionCheck("false") {
+            @Override
+            public Status status() {
+                return status;
+            }
+        };
+    }
+
+    /** A controller with one loan to read, so a render takes the enabled path past the early return. */
+    private static LiquidationReadinessController oneLoanController() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_NFT,
+                BigInteger.valueOf(100_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), 0L,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        Loan loan = new Loan("f0".repeat(32), 0, "addr_test1_placeholder", "loanid00",
+                BigInteger.valueOf(300_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        var census = new com.fluidtokens.aquarium.offchain.service.loans.LoanService.Census(List.of(loan), 1, 0, 0);
+        var scanner = new com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner(null, null, null) {
+            @Override
+            public Scan scan(long atTimeMillis) {
+                return new Scan(List.of(), census);
+            }
+        };
+        var loans = new com.fluidtokens.aquarium.offchain.service.loans.LoanService(null, null) {
+            @Override
+            public Census census() {
+                return census;
+            }
+        };
+        var health = new com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService(null) {
+            @Override
+            public com.fluidtokens.aquarium.offchain.model.loans.LoanHealth health(Loan l, long at) {
+                return com.fluidtokens.aquarium.offchain.model.loans.LoanHealth.debtOnly(BigInteger.ZERO, false, "stub");
+            }
+        };
+        AppConfig.Network network = new AppConfig.Network() {
+            @Override
+            public com.bloxbean.cardano.client.common.model.Network getCardanoNetwork() {
+                return Networks.testnet();
+            }
+        };
+        return new LiquidationReadinessController(provide(scanner), provide(loans), provide(health),
+                provide(null), provide(null), provide(null), provide(LoanFixtures.registry()), provide(null),
+                new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200), network);
+    }
+
+    /**
+     * GH-55: the header's version is what the CONTROLLER reads off the injected check — the template test
+     * sets the variable itself and could not see a controller that never set it. Carried on BOTH paths: a
+     * page whose lending beans are missing still says which build it is.
+     */
+    @Test
+    void theReadinessPageCarriesTheVersionCheckStatusOnBothPaths() {
+        var status = new com.fluidtokens.aquarium.offchain.service.NodeVersionCheck.Status(
+                com.fluidtokens.aquarium.offchain.service.NodeVersionCheck.State.BEHIND, "64d43150c047", 3, 0,
+                "https://github.com/FluidTokens/ft-aquarium-node/compare/"
+                        + "64d43150c047d5d909dd20f58e9f9bd61c82e707...main", null, false);
+
+        var disabled = bareController();
+        disabled.setNodeVersionCheck(versionCheckAnswering(status));
+        var disabledModel = new org.springframework.ui.ConcurrentModel();
+        disabled.readiness(disabledModel, null, null, null, null, null);
+        assertNotNull(disabledModel.getAttribute("disabledReason"), "precondition: the early-return path");
+        assertSame(status, disabledModel.getAttribute("version"), "the disabled path must carry the version");
+
+        var enabled = oneLoanController();
+        enabled.setNodeVersionCheck(versionCheckAnswering(status));
+        var enabledModel = new org.springframework.ui.ConcurrentModel();
+        enabled.readiness(enabledModel, null, null, null, null, null);
+        assertNull(enabledModel.getAttribute("disabledReason"), "precondition: the enabled path");
+        assertEquals(1, ((List<?>) enabledModel.getAttribute("rows")).size(), "precondition: the loan rendered");
+        assertSame(status, enabledModel.getAttribute("version"), "the enabled path must carry the version");
+    }
+
+    /** The real check, never started: the model carries its CHECKING snapshot, not a copy. */
+    @Test
+    void theVersionIsTheChecksOwnSnapshotAndNullWithoutACheck() {
+        var check = new com.fluidtokens.aquarium.offchain.service.NodeVersionCheck("false");
+        var controller = bareController();
+        controller.setNodeVersionCheck(check);
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        assertSame(check.status(), model.getAttribute("version"));
+        assertEquals(com.fluidtokens.aquarium.offchain.service.NodeVersionCheck.State.CHECKING,
+                check.status().state());
+
+        for (LiquidationReadinessController none : List.of(bareController(), oneLoanController())) {
+            var noCheck = new org.springframework.ui.ConcurrentModel();
+            none.readiness(noCheck, null, null, null, null, null);
+            assertNull(noCheck.getAttribute("version"), "no check injected: no version");
+        }
+    }
+
     /** {@code entry} carrying an oracleVersion — fixtures are built without one. */
     private static OracleEntry versioned(OracleEntry e, int version) {
         return new OracleEntry(e.token(), e.oracleToken(), e.rewardAddress(), e.withdrawCredentialHash(),
