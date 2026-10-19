@@ -41,6 +41,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -654,6 +655,180 @@ class NodeVersionCheckTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    // ======================================================================================
+    // The readiness page's snapshot: status()
+    // ======================================================================================
+
+    private static final String SENTINEL = "GITHUB-BODY-SENTINEL";
+
+    /** Runs once and returns the status that run published, after checking it logged exactly one line. */
+    private NodeVersionCheck.Status statusAfterOneRun(NodeVersionCheck check) {
+        onlyLineOf(check);
+        return check.status();
+    }
+
+    private static void assertStatus(NodeVersionCheck.Status status, NodeVersionCheck.State state,
+                                     String shortCommit, int behindMain, int notOnMain, String compareUrl,
+                                     String detail, boolean dirty) {
+        assertEquals(new NodeVersionCheck.Status(state, shortCommit, behindMain, notOnMain, compareUrl, detail, dirty),
+                status);
+    }
+
+    @Test
+    void beforeTheFirstRunTheStatusIsCheckingAndNamesNoCommit() {
+        NodeVersionCheck check = check(serving(200, answer("\"identical\"", "0", "0")));
+
+        assertStatus(check.status(), NodeVersionCheck.State.CHECKING, null, 0, 0, null, null, false);
+    }
+
+    @Test
+    void theFourAnswersPublishTheirStatesAndCounts() {
+        assertStatus(statusAfterOneRun(check(serving(200, answer("\"identical\"", "0", "0")))),
+                NodeVersionCheck.State.UP_TO_DATE, SHORT, 0, 0, null, null, false);
+        assertStatus(statusAfterOneRun(check(serving(200, answer("\"ahead\"", "1", "0")))),
+                NodeVersionCheck.State.BEHIND, SHORT, 1, 0, COMPARE_LINK, null, false);
+        assertStatus(statusAfterOneRun(check(serving(200, answer("\"ahead\"", "3", "0")))),
+                NodeVersionCheck.State.BEHIND, SHORT, 3, 0, COMPARE_LINK, null, false);
+        assertStatus(statusAfterOneRun(check(serving(200, answer("\"diverged\"", "74", "9")))),
+                NodeVersionCheck.State.BEHIND, SHORT, 74, 9, COMPARE_LINK, null, false);
+        assertStatus(statusAfterOneRun(check(serving(200, answer("\"behind\"", "0", "9")))),
+                NodeVersionCheck.State.AHEAD, SHORT, 0, 9, null, null, false);
+    }
+
+    /** The page's link and the log's link are one link: the one built from the node's own full commit. */
+    @Test
+    void theCompareUrlIsTheLoggedLinkAndOnlyBehindCarriesIt() {
+        for (String body : new String[]{answer("\"ahead\"", "3", "0"), answer("\"diverged\"", "74", "9")}) {
+            NodeVersionCheck check = check(serving(200, body));
+            ILoggingEvent line = onlyLineOf(check);
+            NodeVersionCheck.Status status = check.status();
+
+            assertEquals(NodeVersionCheck.State.BEHIND, status.state());
+            assertTrue(line.getFormattedMessage().endsWith(" " + status.compareUrl()), line.getFormattedMessage());
+            assertEquals(COMPARE_LINK, status.compareUrl());
+        }
+        for (NodeVersionCheck.CompareSource source : List.of(serving(200, answer("\"identical\"", "0", "0")),
+                serving(200, answer("\"behind\"", "0", "9")), serving(404, NOT_FOUND_BODY),
+                serving(500, answer("\"ahead\"", "3", "0")))) {
+            NodeVersionCheck.Status status = statusAfterOneRun(check(source));
+            assertNotEquals(NodeVersionCheck.State.BEHIND, status.state());
+            assertNull(status.compareUrl(), "only BEHIND carries a compare link: " + status);
+        }
+    }
+
+    /** Every unavailable outcome is UNKNOWN, and its detail is the logged reason exactly, without the prefix. */
+    @Test
+    void anUnavailableRunIsUnknownWithTheLoggedReason() {
+        record Case(NodeVersionCheck check, String shortCommit, String detail) {
+        }
+        List<Case> cases = List.of(
+                new Case(check(serving(404, NOT_FOUND_BODY)), SHORT,
+                        "commit " + SHORT + " is unknown to GitHub — a fork or a local build"),
+                new Case(check(serving(403, "{\"message\":\"API rate limit exceeded\"}")), SHORT,
+                        "GitHub refused the request (HTTP 403) — usually its limit of 60 unauthenticated requests "
+                                + "per hour per IP"),
+                new Case(check(commit -> {
+                    throw new TimeoutException();
+                }), SHORT, "GitHub did not answer within 10s"),
+                new Case(check(serving(200, "<html>not json</html>")), SHORT, "unrecognised answer from GitHub"),
+                new Case(check(commit -> {
+                    throw new IllegalStateException("boom");
+                }), SHORT, "could not reach GitHub — IllegalStateException"),
+                new Case(check("true", "unknown", "false", serving(200, answer("\"identical\"", "0", "0"))), null,
+                        "this build does not record the commit it was built from"),
+                new Case(check("true", "64d43150c047", "false", serving(200, answer("\"identical\"", "0", "0"))),
+                        null, "this build's recorded commit is not a full 40-character commit id"));
+        for (Case c : cases) {
+            ILoggingEvent line = onlyLineOf(c.check());
+            NodeVersionCheck.Status status = c.check().status();
+
+            assertStatus(status, NodeVersionCheck.State.UNKNOWN, c.shortCommit(), 0, 0, null, c.detail(), false);
+            assertEquals("version check unavailable: " + status.detail(), line.getFormattedMessage());
+        }
+    }
+
+    @Test
+    void offAndNotUnderstoodPublishOffWithTheLoggedLine() throws Exception {
+        awaitNoVersionCheckThread();
+        for (String value : new String[]{"false", "banana\n"}) {
+            NodeVersionCheck check = check(value, SHA, "false", serving(200, answer("\"identical\"", "0", "0")));
+            int before = lines().size();
+            try {
+                check.start();
+
+                List<ILoggingEvent> produced = lines().subList(before, lines().size());
+                assertEquals(1, produced.size(), produced.toString());
+                NodeVersionCheck.Status status = check.status();
+                assertStatus(status, NodeVersionCheck.State.OFF, null, 0, 0, null,
+                        produced.getFirst().getFormattedMessage().substring("version check: ".length()), false);
+                assertTrue(status.detail().startsWith("off"), status.detail());
+                assertFalse(versionCheckThreadAlive(), "flag '" + value + "' created a thread");
+            } finally {
+                check.stop();
+            }
+        }
+    }
+
+    @Test
+    void dirtyIsExactlyTheRecordedTrueWhateverTheState() throws Exception {
+        assertTrue(statusAfterOneRun(check("true", SHA, "true", serving(200, answer("\"identical\"", "0", "0"))))
+                .dirty());
+        assertTrue(statusAfterOneRun(check("true", SHA, "true", serving(200, answer("\"ahead\"", "3", "0"))))
+                .dirty());
+        assertTrue(statusAfterOneRun(check("true", SHA, "true", serving(404, NOT_FOUND_BODY))).dirty());
+        for (String notDirty : new String[]{"false", "unknown", "TRUE", "", "null"}) {
+            assertFalse(statusAfterOneRun(check("true", SHA, notDirty, serving(200, answer("\"ahead\"", "3", "0"))))
+                    .dirty(), "dirty='" + notDirty + "'");
+        }
+
+        NodeVersionCheck off = check("false", SHA, "true", serving(200, answer("\"identical\"", "0", "0")));
+        try {
+            off.start();
+            assertEquals(NodeVersionCheck.State.OFF, off.status().state());
+            assertTrue(off.status().dirty(), "an off node that is dirty still says so");
+        } finally {
+            off.stop();
+        }
+    }
+
+    /** Only the two parsed integers come from GitHub; no text of any response reaches the status. */
+    @Test
+    void noGitHubTextReachesTheStatus() {
+        String extra = ",\"message\":\"" + SENTINEL + "\",\"html_url\":\"https://evil.example/" + SENTINEL + "\"}";
+        List<NodeVersionCheck.CompareSource> sources = List.of(
+                serving(200, answer("\"ahead\"", "3", "0").replaceFirst("}$", extra)),
+                serving(200, answer("\"diverged\"", "74", "9").replaceFirst("}$", extra)),
+                serving(200, answer("\"identical\"", "0", "0").replaceFirst("}$", extra)),
+                serving(200, answer("\"behind\"", "0", "9").replaceFirst("}$", extra)),
+                serving(404, NOT_FOUND_BODY.replaceFirst("}$", extra)),
+                serving(403, "{\"message\":\"" + SENTINEL + "\"}"),
+                serving(200, "{\"status\":\"" + SENTINEL + "\",\"ahead_by\":3,\"behind_by\":0}"),
+                commit -> {
+                    throw new java.net.ProtocolException("Invalid status line: \"" + SENTINEL + "\"");
+                });
+        for (NodeVersionCheck.CompareSource source : sources) {
+            NodeVersionCheck.Status status = statusAfterOneRun(check(source));
+
+            assertFalse(status.toString().contains(SENTINEL), "GitHub's text reached the status: " + status);
+            assertFalse(status.toString().contains("evil.example"), status.toString());
+            assertFalse(status.toString().contains("Not Found"), status.toString());
+        }
+    }
+
+    /** Each run replaces the last: a later unavailable run clears the earlier compare link. */
+    @Test
+    void eachRunPublishesItsOwnStatus() {
+        AtomicInteger calls = new AtomicInteger();
+        NodeVersionCheck check = check(commit -> calls.incrementAndGet() == 1
+                ? new NodeVersionCheck.Answer(200, answer("\"ahead\"", "3", "0"))
+                : new NodeVersionCheck.Answer(404, NOT_FOUND_BODY));
+
+        assertEquals(NodeVersionCheck.State.BEHIND, statusAfterOneRun(check).state());
+        NodeVersionCheck.Status second = statusAfterOneRun(check);
+        assertEquals(NodeVersionCheck.State.UNKNOWN, second.state());
+        assertNull(second.compareUrl());
     }
 
     // ======================================================================================

@@ -86,8 +86,35 @@ public class NodeVersionCheck {
 
     enum Severity { INFO, WARN }
 
-    /** One run's single line. */
-    record Outcome(Severity severity, String message) {
+    /**
+     * One run's single line, and what the readiness page is told about it: the state, the two counts parsed
+     * from GitHub's answer, the compare link (BEHIND only) and, for UNKNOWN, the logged reason.
+     */
+    record Outcome(Severity severity, String message, State state, int behindMain, int notOnMain,
+                   String compareUrl, String detail) {
+    }
+
+    /** What the readiness page shows. ⚠ {@link #BEHIND} is this node behind main — GitHub's {@code ahead}. */
+    public enum State { CHECKING, UP_TO_DATE, BEHIND, AHEAD, UNKNOWN, OFF }
+
+    /**
+     * GH-55: the last outcome, for the readiness page's header — immutable, published through a
+     * {@code volatile} field, so any thread may read it at any time. It never triggers a check: the page reads
+     * what the daily run stored.
+     *
+     * <p>⛔ No text from any GitHub response is in here: only the two counts parsed from its answer, and the
+     * node's own strings. {@code compareUrl} is built from the node's own full commit, for {@link State#BEHIND}
+     * only; {@code detail} is the UNKNOWN reason or the OFF line, without their log prefix.
+     *
+     * @param shortCommit the first 12 characters of the build's commit, null when it records no full commit
+     *                    (and before the first run, and when the check is off)
+     * @param behindMain  commits on main this build lacks (GitHub's {@code ahead_by}); BEHIND only
+     * @param notOnMain   commits this build carries that main does not (GitHub's {@code behind_by})
+     * @param dirty       the build records {@code aquarium.build.dirty=true}; false before the first run,
+     *                    when nothing has been read yet
+     */
+    public record Status(State state, String shortCommit, int behindMain, int notOnMain, String compareUrl,
+                         String detail, boolean dirty) {
     }
 
     private final String enabled;
@@ -97,6 +124,7 @@ public class NodeVersionCheck {
     private final Duration deadline;
 
     private volatile Map<String, Object> build;
+    private volatile Status status = new Status(State.CHECKING, null, 0, 0, null, null, false);
     private ScheduledExecutorService executor;
 
     /**
@@ -138,6 +166,7 @@ public class NodeVersionCheck {
     public synchronized void start() {
         String off = offLine();
         if (off != null) {
+            status = new Status(State.OFF, null, 0, 0, null, off.substring(PREFIX.length()), dirty());
             log.info(off);
             return;
         }
@@ -150,6 +179,11 @@ public class NodeVersionCheck {
             return thread;
         });
         executor.scheduleWithFixedDelay(this::runOnce, 0, interval.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    /** The last run's outcome for the readiness page; {@link State#CHECKING} until the first run. Never blocks. */
+    public Status status() {
+        return status;
     }
 
     @PreDestroy
@@ -176,7 +210,7 @@ public class NodeVersionCheck {
     // One run
     // ======================================================================================
 
-    /** One check, one line. Never throws. */
+    /** One check, one line, and the status the page reads — published before the line. Never throws. */
     void runOnce() {
         Outcome outcome;
         try {
@@ -184,6 +218,8 @@ public class NodeVersionCheck {
         } catch (Throwable unexpected) {
             outcome = unavailable("unexpected " + unexpected.getClass().getSimpleName());
         }
+        status = new Status(outcome.state(), shortCommit(), outcome.behindMain(), outcome.notOnMain(),
+                outcome.compareUrl(), outcome.detail(), dirty());
         String message = outcome.message() + dirtySuffix();
         if (outcome.severity() == Severity.WARN) {
             log.warn(message);
@@ -237,15 +273,19 @@ public class NodeVersionCheck {
         String link = "https://github.com/" + REPOSITORY + "/compare/" + commit + "...main";
         return switch (comparison.status()) {
             case "identical" -> new Outcome(Severity.INFO,
-                    PREFIX + "up to date — this build (" + shortSha + ") is the head of main");
+                    PREFIX + "up to date — this build (" + shortSha + ") is the head of main",
+                    State.UP_TO_DATE, 0, 0, null, null);
             case "ahead" -> new Outcome(Severity.WARN, PREFIX + "this node is " + commits(comparison.aheadBy())
-                    + " behind main (built from " + shortSha + "). Changes since this build: " + link);
+                    + " behind main (built from " + shortSha + "). Changes since this build: " + link,
+                    State.BEHIND, comparison.aheadBy(), 0, link, null);
             case "diverged" -> new Outcome(Severity.WARN, PREFIX + "this node is " + commits(comparison.aheadBy())
                     + " behind main and carries " + commits(comparison.behindBy())
                     + (comparison.behindBy() == 1 ? " that is" : " that are") + " not on main (built from "
-                    + shortSha + "). Changes: " + link);
+                    + shortSha + "). Changes: " + link,
+                    State.BEHIND, comparison.aheadBy(), comparison.behindBy(), link, null);
             case "behind" -> new Outcome(Severity.INFO, PREFIX + "this build (" + shortSha + ") is "
-                    + commits(comparison.behindBy()) + " ahead of main — not a build of main");
+                    + commits(comparison.behindBy()) + " ahead of main — not a build of main",
+                    State.AHEAD, 0, comparison.behindBy(), null, null);
             default -> unavailable("unrecognised answer from GitHub");
         };
     }
@@ -303,17 +343,31 @@ public class NodeVersionCheck {
     }
 
     private static Outcome unavailable(String reason) {
-        return new Outcome(Severity.INFO, UNAVAILABLE + reason);
+        return new Outcome(Severity.INFO, UNAVAILABLE + reason, State.UNKNOWN, 0, 0, null, reason);
     }
 
     private String dirtySuffix() {
-        String dirty;
+        return dirty() ? " — this build also carries uncommitted changes on top of that commit" : "";
+    }
+
+    /** The build records {@code aquarium.build.dirty} as exactly {@code true}; false when it cannot be read. */
+    private boolean dirty() {
         try {
-            dirty = buildValue("aquarium.build.dirty");
+            return "true".equals(buildValue("aquarium.build.dirty"));
         } catch (RuntimeException e) {
-            return "";
+            return false;
         }
-        return "true".equals(dirty) ? " — this build also carries uncommitted changes on top of that commit" : "";
+    }
+
+    /** The build's commit to 12 characters, or null when it records no full commit or cannot be read. */
+    private String shortCommit() {
+        String commit;
+        try {
+            commit = buildValue("aquarium.build.commit");
+        } catch (RuntimeException e) {
+            return null;
+        }
+        return commit != null && FULL_SHA.matcher(commit).matches() ? commit.substring(0, 12) : null;
     }
 
     private String buildValue(String key) {

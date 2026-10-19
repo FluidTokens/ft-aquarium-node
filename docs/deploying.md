@@ -507,6 +507,13 @@ Each check writes exactly one line to the log:
 A build from a dirty tree is still checked against its recorded commit, and the line adds that the
 build carries uncommitted changes on top of it.
 
+If you run the readiness page (§7), its header shows the same answer next to the build commit, in the
+same small grey line as the network and the time — for example `build 64d43150c047 · up to date`. When
+the build is behind `main` it reads `⚠ N commits behind main` in amber, as a link to the same compare
+view the log line names. When no answer could be decided it reads `version unknown`; hover it for the
+reason. The page only shows the result of the last daily check and never contacts GitHub itself, so a
+new answer appears on the page after the next check, not when you reload it.
+
 To turn it off, set `AQUARIUM_VERSION_CHECK_ENABLED=false` in `docker/.env`. The node then logs one
 line at startup saying the check is off and never contacts GitHub.
 

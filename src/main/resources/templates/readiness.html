@@ -28,6 +28,9 @@
     header { border-bottom:1px solid var(--rule); background:var(--surface); padding:1.1rem 1.4rem; }
     h1 { margin:0 0 .3rem; font-size:1.15rem; letter-spacing:-.02em; }
     .meta { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.72rem; color:var(--muted); }
+    /* GH-55: the version in the meta line — amber only for the behind-main link, never bold. */
+    .meta .behind { color:var(--warn); font-weight:400; }
+    .meta .version-why { cursor:help; }
     main { padding:1.2rem 1.4rem 3rem; }
     .lede { max-width:70ch; color:var(--ink-2); margin:0 0 1.1rem; }
     .lede strong { color:var(--ink); }
@@ -191,6 +194,29 @@
     <div class="meta">
       <span th:text="'network ' + ${network}">network</span> &middot;
       <span th:text="${generatedAt}">now</span> &middot; read-only
+      <!--/* GH-55: the version check's last answer, read from the daily run; the page never checks itself.
+             Quiet by design: muted, amber only for the link when the build lags main, never in the banner. */-->
+      <th:block th:if="${version != null}">
+        <th:block th:if="${version.shortCommit != null}">&middot;
+          <span th:text="'build ' + ${version.shortCommit}">build</span></th:block>
+        <th:block th:switch="${version.state.name()}">
+          <th:block th:case="'CHECKING'">&middot; <span>checking version…</span></th:block>
+          <th:block th:case="'UP_TO_DATE'">&middot; <span>up to date</span></th:block>
+          <th:block th:case="'AHEAD'">&middot;
+            <span th:text="${version.notOnMain} + ' ahead of main'">ahead of main</span></th:block>
+          <th:block th:case="'BEHIND'">&middot;
+            <a class="behind" th:href="${version.compareUrl}" target="_blank" rel="noopener noreferrer"
+               th:text="'⚠ ' + ${version.behindMain} + (${version.behindMain == 1} ? ' commit' : ' commits')
+                        + ' behind main'">behind main</a>
+            <th:block th:if="${version.notOnMain > 0}">&middot;
+              <span th:text="${version.notOnMain} + ' not on main'">not on main</span></th:block></th:block>
+          <th:block th:case="'UNKNOWN'">&middot;
+            <span class="version-why" th:title="${version.detail}">version unknown</span></th:block>
+          <th:block th:case="'OFF'">&middot;
+            <span class="version-why" th:title="${version.detail}">version check off</span></th:block>
+        </th:block>
+        <th:block th:if="${version.dirty}">&middot; <span>modified build</span></th:block>
+      </th:block>
     </div>
   </div>
   <!-- Auto-refresh: one minute, on by default, and switchable off. The preference is remembered in
