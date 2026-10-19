@@ -273,7 +273,6 @@ public class MainnetTankTest {
 //                    .feePayer(adminAccount.baseAddress())
 //                    .collateralPayer(adminAccount.baseAddress())
 //                    .mergeOutputs(false)
-//                    .withTxEvaluator(ogmiosTE())
 //                    .completeAndWait();
 //
 //

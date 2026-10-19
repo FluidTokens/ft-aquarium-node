@@ -89,6 +89,12 @@ not uniquely identify an image the way a current one does.
 **⚠ Pin versions.** With `latest`, a restart months from now silently changes what you run, and
 there is no record of what it used to be.
 
+**`SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL` has been removed (FAB-149).** It was a diagnostic
+for the 2026-09-22 tank decode failure and only ever changed anything when it was set: it sent the
+tank's script-cost evaluation to an Ogmios instance instead of Blockfrost. If your configuration
+still sets it, the node ignores it and evaluates through Blockfrost, exactly as a node that never
+set it always has. You can delete the line.
+
 ---
 
 ## 3. ⛔ The rule that surprises people
@@ -371,6 +377,7 @@ in silence, which reads exactly like them working.
 | `AQUARIUM_LIQUIDATION_ENABLED` | redundant with `AQUARIUM_LIQUIDATION_MODE` |
 | `LOANS_ENABLED` | lending-v4 indexing is unconditional now |
 | `AQUARIUM_X_SUBMIT` / `loans.submittable-network` | a barrier that silently blocked submission while everything else was armed is a bug, not a safeguard |
+| `SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL` | a diagnostic for the 2026-09-22 tank decode failure (FAB-149). Still set, it is ignored and the tank is evaluated through Blockfrost, as on every node that never set it — see §2 |
 
 **The general shape is worth keeping in mind beyond this list:** an unknown environment variable is
 not an error anywhere in this stack. It is read by nothing and reported by nothing. When a setting

@@ -3,7 +3,6 @@ package com.fluidtokens.aquarium.offchain;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
-import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.util.ValueUtil;
 import com.bloxbean.cardano.client.backend.blockfrost.common.Constants;
@@ -13,7 +12,6 @@ import com.bloxbean.cardano.client.function.helper.SignerProviders;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
-import com.bloxbean.cardano.client.supplier.ogmios.OgmiosTransactionEvaluator;
 import com.bloxbean.cardano.client.transaction.spec.Asset;
 import com.bloxbean.cardano.client.transaction.spec.MultiAsset;
 import com.bloxbean.cardano.client.transaction.spec.Value;
@@ -110,11 +108,6 @@ public class PreviewParametersTest {
 
         log.info("transaction: {}", OBJECT_MAPPER.writeValueAsString(transaction));
 
-    }
-
-
-    private TransactionEvaluator ogmiosTE() {
-        return new OgmiosTransactionEvaluator("http://ryzen:31357");
     }
 
 
