@@ -414,6 +414,18 @@ public class LiquidationReadinessController {
     }
 
     /**
+     * GH-55: the version check's last answer, for the header's meta line. The page only READS what the daily
+     * run stored and never triggers a check. Setter-injected and REQUIRED in the container; null only in a
+     * direct test construction, where the header shows no version.
+     */
+    private com.fluidtokens.aquarium.offchain.service.NodeVersionCheck nodeVersionCheck;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setNodeVersionCheck(com.fluidtokens.aquarium.offchain.service.NodeVersionCheck nodeVersionCheck) {
+        this.nodeVersionCheck = nodeVersionCheck;
+    }
+
+    /**
      * ⚠ SORT AND FILTER ARE QUERY PARAMETERS, NOT JAVASCRIPT, and the auto-refresh is why. The page
      * re-GETs its own URL every minute, so client-side state would be silently undone on each tick —
      * and it would be invisible to the template tests, which render server-side. Params survive the
@@ -428,6 +440,7 @@ public class LiquidationReadinessController {
                             @RequestParam(name = "page", required = false) Integer page) {
         model.addAttribute("network", network == null ? "unknown" : network.getNetwork());
         model.addAttribute("generatedAt", java.time.Instant.now().toString());
+        model.addAttribute("version", nodeVersionCheck == null ? null : nodeVersionCheck.status());
         // ⛔ Shown ABOVE everything and independent of the rows: the loan view still works while the
         // gate is closed, and a page full of healthy-looking loans must not hide that the bot will
         // refuse every one of them.

@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.controller;
 import com.fluidtokens.aquarium.offchain.model.AssetDisplay;
 import com.fluidtokens.aquarium.offchain.model.LoanAge;
 import com.fluidtokens.aquarium.offchain.model.TokenMetadata;
+import com.fluidtokens.aquarium.offchain.service.NodeVersionCheck;
 import com.fluidtokens.aquarium.offchain.service.loans.AnticipateAndSell;
 import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 
@@ -874,6 +875,147 @@ class ReadinessTemplateRendersRowsTest {
 
         assertTrue(html.contains("USABLE"),
                 "a usable pool must still be reported on a market that fronts capital by configuration");
+    }
+
+    // ---- GH-55: the version check's last answer, in the header's meta line --------------------------
+
+    private static final String SHA = "64d43150c047d5d909dd20f58e9f9bd61c82e707";
+    private static final String SHORT = "64d43150c047";
+    private static final String COMPARE_LINK =
+            "https://github.com/FluidTokens/ft-aquarium-node/compare/" + SHA + "...main";
+    private static final String META_BASE = "network preview · 2026-09-04T13:00:00Z · read-only except the wallet-rebalance switch";
+
+    private static NodeVersionCheck.Status version(NodeVersionCheck.State state, String shortCommit, int behindMain,
+                                                   int notOnMain, String compareUrl, String detail, boolean dirty) {
+        return new NodeVersionCheck.Status(state, shortCommit, behindMain, notOnMain, compareUrl, detail, dirty);
+    }
+
+    private static String renderWithVersion(NodeVersionCheck.Status version) {
+        return render(List.of(fullRow()), ctx -> ctx.setVariable("version", version));
+    }
+
+    /** The header's meta div, markup included. */
+    private static String meta(String html) {
+        int start = html.indexOf("<div class=\"meta\">");
+        assertTrue(start >= 0, "the header has no meta line");
+        return html.substring(start, html.indexOf("</div>", start));
+    }
+
+    /** What the meta line READS: tags dropped, the middot entity resolved, whitespace collapsed. */
+    private static String metaText(String html) {
+        return meta(html).replaceAll("<[^>]*>", "").replace("&middot;", "·").replace("&hellip;", "…")
+                .replaceAll("\\s+", " ").trim();
+    }
+
+    /** The status banner alone: from its div to the comment that opens the next block. */
+    private static String banner(String html) {
+        int start = html.indexOf("<div class=\"status");
+        return html.substring(start, html.indexOf("FAB-115", start));
+    }
+
+    @Test
+    void eachVersionStateReadsAsItsOwnQuietLine() {
+        Map<NodeVersionCheck.Status, String> expected = new LinkedHashMap<>();
+        expected.put(version(NodeVersionCheck.State.CHECKING, null, 0, 0, null, null, false),
+                META_BASE + " · checking version…");
+        expected.put(version(NodeVersionCheck.State.UP_TO_DATE, SHORT, 0, 0, null, null, false),
+                META_BASE + " · build " + SHORT + " · up to date");
+        expected.put(version(NodeVersionCheck.State.AHEAD, SHORT, 0, 9, null, null, false),
+                META_BASE + " · build " + SHORT + " · 9 ahead of main");
+        expected.put(version(NodeVersionCheck.State.BEHIND, SHORT, 3, 0, COMPARE_LINK, null, false),
+                META_BASE + " · build " + SHORT + " · ⚠ 3 commits behind main");
+        expected.put(version(NodeVersionCheck.State.BEHIND, SHORT, 1, 0, COMPARE_LINK, null, false),
+                META_BASE + " · build " + SHORT + " · ⚠ 1 commit behind main");
+        expected.put(version(NodeVersionCheck.State.BEHIND, SHORT, 74, 9, COMPARE_LINK, null, false),
+                META_BASE + " · build " + SHORT + " · ⚠ 74 commits behind main · 9 not on main");
+        expected.put(version(NodeVersionCheck.State.UNKNOWN, SHORT, 0, 0, null,
+                        "commit " + SHORT + " is unknown to GitHub — a fork or a local build", false),
+                META_BASE + " · build " + SHORT + " · version unknown");
+        expected.put(version(NodeVersionCheck.State.UNKNOWN, null, 0, 0, null,
+                        "this build does not record the commit it was built from", false),
+                META_BASE + " · version unknown");
+        expected.put(version(NodeVersionCheck.State.OFF, null, 0, 0, null,
+                        "off (AQUARIUM_VERSION_CHECK_ENABLED=false) — this node will not contact GitHub", false),
+                META_BASE + " · version check off");
+        expected.put(version(NodeVersionCheck.State.UP_TO_DATE, SHORT, 0, 0, null, null, true),
+                META_BASE + " · build " + SHORT + " · up to date · modified build");
+        expected.put(version(NodeVersionCheck.State.BEHIND, SHORT, 3, 0, COMPARE_LINK, null, true),
+                META_BASE + " · build " + SHORT + " · ⚠ 3 commits behind main · modified build");
+        expected.put(version(NodeVersionCheck.State.OFF, null, 0, 0, null, "off", true),
+                META_BASE + " · version check off · modified build");
+        expected.put(version(NodeVersionCheck.State.CHECKING, null, 0, 0, null, null, true),
+                META_BASE + " · checking version… · modified build");
+
+        expected.forEach((status, text) -> {
+            String html = renderWithVersion(status);
+            assertEquals(text, metaText(html), status.toString());
+            String meta = meta(html);
+            boolean behind = status.state() == NodeVersionCheck.State.BEHIND;
+            assertEquals(behind, meta.contains("class=\"behind\""), "only BEHIND carries the behind class: " + meta);
+            assertEquals(behind, meta.contains("⚠") || meta.contains("&#9888;"), "only BEHIND carries the ⚠: " + meta);
+            assertEquals(behind, meta.contains("<a "), "only BEHIND is a link: " + meta);
+            assertFalse(meta.contains("style=") || meta.contains("<b") || meta.contains("<strong"),
+                    "no inline emphasis: " + meta);
+        });
+    }
+
+    @Test
+    void theBehindLinkOpensTheCompareViewInANewTab() {
+        String meta = meta(renderWithVersion(
+                version(NodeVersionCheck.State.BEHIND, SHORT, 74, 9, COMPARE_LINK, null, false)));
+
+        Matcher anchor = Pattern.compile("<a [^>]*>").matcher(meta);
+        assertTrue(anchor.find(), "the behind state is a link: " + meta);
+        String tag = anchor.group();
+        assertTrue(tag.contains("href=\"" + COMPARE_LINK + "\""), tag);
+        assertTrue(tag.contains("target=\"_blank\""), tag);
+        assertTrue(tag.contains("rel=\"noopener noreferrer\""), tag);
+        assertTrue(tag.contains("class=\"behind\""), tag);
+        assertFalse(anchor.find(), "one link only: " + meta);
+    }
+
+    @Test
+    void anUnknownOrOffVersionCarriesItsReasonAsATooltip() {
+        String reason = "GitHub did not answer within 10s";
+        String unknown = meta(renderWithVersion(
+                version(NodeVersionCheck.State.UNKNOWN, SHORT, 0, 0, null, reason, false)));
+        assertTrue(unknown.contains("title=\"" + reason + "\""), unknown);
+
+        String offReason = "off (AQUARIUM_VERSION_CHECK_ENABLED=false) — this node will not contact GitHub";
+        String off = meta(renderWithVersion(version(NodeVersionCheck.State.OFF, null, 0, 0, null, offReason, false)));
+        assertTrue(off.contains("title=\"" + offReason + "\""), off);
+    }
+
+    @Test
+    void aVersionDetailIsEscaped() {
+        String html = renderWithVersion(version(NodeVersionCheck.State.UNKNOWN, null, 0, 0, null,
+                "<script>alert(1)</script>", false));
+
+        assertTrue(meta(html).contains("&lt;script&gt;alert(1)&lt;/script&gt;"), meta(html));
+        assertFalse(html.contains("<script>alert(1)"), "a detail must never reach the page as markup");
+    }
+
+    @Test
+    void withoutAVersionTheHeaderIsUnchanged() {
+        String html = renderWithVersion(null);
+
+        assertEquals(META_BASE, metaText(html));
+        assertEquals(META_BASE, metaText(render(List.of(fullRow()))), "an unset attribute renders the same");
+    }
+
+    /** Not alarming, by design: the version lives in the header, never in the status banner or its notes. */
+    @Test
+    void theVersionIsNotInTheStatusBanner() {
+        String html = renderWithVersion(
+                version(NodeVersionCheck.State.BEHIND, SHORT, 74, 9, COMPARE_LINK, null, true));
+
+        assertTrue(meta(html).contains("commits behind main"), meta(html));
+        assertEquals(html.indexOf("commits behind main"), html.lastIndexOf("commits behind main"),
+                "the version appears once");
+        String banner = banner(html);
+        for (String fragment : new String[]{"behind main", "not on main", SHORT, "modified build", "version"}) {
+            assertFalse(banner.contains(fragment), "the banner carries '" + fragment + "': " + banner);
+        }
     }
 
     private static LiquidationReadinessController.Row rowWithPool(PoolUsability usability) {
