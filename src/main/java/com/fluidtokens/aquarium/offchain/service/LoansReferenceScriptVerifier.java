@@ -3,6 +3,7 @@ package com.fluidtokens.aquarium.offchain.service;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.BlockfrostKey;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -121,11 +122,11 @@ public class LoansReferenceScriptVerifier {
                                         AppConfig.LiquidationConfiguration configuration,
                                         AppConfig.CompoundConfiguration compound,
                                         @Value("${blockfrost.url}") String blockfrostUrl,
-                                        @Value("${blockfrost.key}") String blockfrostKey,
+                                        BlockfrostKey blockfrostKey,
                                         @Value("${loans.verify-config.fail-on-unreachable:false}")
                                         boolean failOnUnreachable) {
-        this(registry, configuration, compound, new BlockfrostPublishedOutputLookup(blockfrostUrl, blockfrostKey),
-                failOnUnreachable);
+        this(registry, configuration, compound,
+                new BlockfrostPublishedOutputLookup(blockfrostUrl, blockfrostKey.value()), failOnUnreachable);
     }
 
     /** The named keys only, with the lookup stated — the compound list is not checked. */

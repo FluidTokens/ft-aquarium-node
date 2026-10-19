@@ -510,6 +510,58 @@ class PayInAdvanceLiquidationRouterTest {
         assertTrue(thrown.getMessage().contains("flatten == 2"), thrown.getMessage());
     }
 
+    /**
+     * ⛔ FAB-108 OWN-B: the router reads the reference scripts when it BUILDS, not when it is constructed.
+     * The router bean may exist before {@code LoansReferenceScriptVerifier}'s {@code @PostConstruct} narrows
+     * the configuration, so the narrowing here happens AFTER construction, as it does there. The builder is
+     * a spy of the real one — {@code numbers(...)} stays real — with only {@code build} stubbed, to record
+     * the request it is handed.
+     */
+    @Test
+    void theBuilderIsHandedTheReferenceScriptsAsNarrowedAfterTheRouterWasBuilt() {
+        AppConfig.LiquidationConfiguration configuration = configurationWithAllNineReferenceScripts();
+        java.util.concurrent.atomic.AtomicReference<LiquidatePayInAdvanceTransactionBuilder.Request> handed =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        LiquidatePayInAdvanceTransactionBuilder builder = org.mockito.Mockito.spy(
+                new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams()));
+        org.mockito.Mockito.doAnswer(invocation -> {
+            handed.set(invocation.getArgument(0));
+            return null;
+        }).when(builder).build(org.mockito.ArgumentMatchers.any(LiquidatePayInAdvanceTransactionBuilder.Request.class));
+        PayInAdvanceLiquidationRouter router =
+                new PayInAdvanceLiquidationRouter(REGISTRY, converters(), configuration, builder);
+
+        LiquidateTransactionBuilder.ReferenceScripts all = configuration.getConfiguredReferenceScripts();
+        LiquidateTransactionBuilder.ReferenceScripts narrowed = new LiquidateTransactionBuilder.ReferenceScripts(
+                all.loan(), all.loanSpend(), all.lenderManager(), all.lenderManagerSpend(), null,
+                all.lmLiquidateAction(), all.assetManager(), all.lmLiquidateAndPayInAdvanceAction(),
+                all.lmLiquidateAndConvertAction());
+        configuration.narrowReferenceScripts(narrowed);
+        router.buildConvertLiquidation(convertAssessment(BigInteger.valueOf(EQUITY)), loanUtxo(), bondUtxo(),
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS);
+
+        assertTrue(handed.get() != null, "the router never reached the builder, so this test says nothing");
+        assertEquals(narrowed, handed.get().referenceScripts(),
+                "the builder must be handed the scripts as narrowed at boot — loan-claim-action dropped — "
+                        + "not the set the router saw when it was constructed");
+    }
+
+    /** {@link #configuration()} with all nine reference-script slots at distinct fake coordinates. */
+    private static AppConfig.LiquidationConfiguration configurationWithAllNineReferenceScripts() {
+        AppConfig.LiquidationConfiguration configuration = new AppConfig.LiquidationConfiguration(
+                AppConfig.LiquidationConfiguration.Mode.SHADOW, 60L, 120L, 30L,
+                BigInteger.valueOf(1_500_000L), 200,
+                new LiquidateTransactionBuilder.ReferenceScripts(
+                        new TransactionInput("61".repeat(32), 0), new TransactionInput("62".repeat(32), 0),
+                        new TransactionInput("63".repeat(32), 0), new TransactionInput("64".repeat(32), 0),
+                        new TransactionInput("65".repeat(32), 0), new TransactionInput("66".repeat(32), 0),
+                        new TransactionInput("67".repeat(32), 0), new TransactionInput("68".repeat(32), 0),
+                        new TransactionInput("69".repeat(32), 0)));
+        configuration.setMarkets(java.util.List.of(anticipateMarket("lovelace", 1_000_000_000_000L)));
+        return configuration;
+    }
+
     // ⛔ F3 (round 2) — A USDM+ADA WALLET UTXO, not an ada-only one.
     //
     // Before this fix the token-principal test funded its build from WALLET_UTXO — an ADA-ONLY 60 ADA

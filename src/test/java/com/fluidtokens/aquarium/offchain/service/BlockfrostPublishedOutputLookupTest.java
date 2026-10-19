@@ -263,6 +263,24 @@ class BlockfrostPublishedOutputLookupTest {
         assertEquals(SENTINEL, projectId.get());
     }
 
+    /**
+     * ⛔ FAB-141 R1: the visible-ASCII guard on its own. JDK 21's {@code HttpRequest.Builder.header} ACCEPTS
+     * a value holding a space, so for this key there is no JDK refusal behind the guard — only the guard
+     * keeps it from being sent. The class's {@code @AfterEach} searches every text produced for the key.
+     */
+    @Test
+    void aKeyWithAnInnerSpaceIsNeverSentEvenThoughTheJdkWouldSendIt() {
+        serve(200, utxos(output(0, "null", false, SCRIPT)));
+        path.set(null);
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> lookup(base(), SENTINEL + " x", 0));
+
+        assertEquals("blockfrost.key contains characters not allowed in an HTTP header (value withheld)",
+                refused.getMessage());
+        assertNull(path.get(), "the request must never reach the server");
+    }
+
     // ======================================================================================
     // FAB-108 F4 — a response-shape change is not an answer (VH-73)
     // ======================================================================================
