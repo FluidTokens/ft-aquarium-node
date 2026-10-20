@@ -191,19 +191,26 @@ class CompoundAccountingTest {
     }
 
     /**
-     * ⚠ And the withdrawal dummy is one of the bot's outputs, not an extra payment. CCL prepends
-     * exactly one output at the change address when a transaction carries withdrawals (trap 1); an
-     * accounting that looked at only the last change output would under-count what came back.
+     * ⚠ And the withdrawal dummy is the bot's money, not an extra payment. CCL prepends exactly one
+     * output at the change address when a transaction carries withdrawals (trap 1); everything at the
+     * bot's address is the bot's, so an accounting that dropped the dummy would under-count what came back.
+     * FAB-152: the builder now folds that dummy into the change, so the bot gets ONE output holding both.
      */
     @Test
-    void theWithdrawalDummyCountsTowardsWhatTheBotGetsBack() {
-        Transaction tx = build(List.of(walletUtxo("9e", 20_000_000L)));
+    void theBotGetsBackOneAdaOnlyOutputHoldingTheWithdrawalDummy() {
+        Utxo wallet = walletUtxo("9e", 20_000_000L);
+        Transaction tx = build(List.of(wallet));
 
         List<TransactionOutput> botOutputs = tx.getBody().getOutputs().stream()
                 .filter(o -> BOT.equals(o.getAddress())).toList();
 
-        assertEquals(2, botOutputs.size(),
-                "one withdrawal dummy plus one change output — both are the bot's money");
+        assertEquals(1, botOutputs.size(),
+                "the withdrawal dummy is folded into the change — one output, not two");
+        TransactionOutput only = botOutputs.get(0);
+        assertTrue(only.getValue().getMultiAssets() == null || only.getValue().getMultiAssets().isEmpty(),
+                "an ada-only wallet gets an ada-only output back");
+        assertEquals(lovelace(wallet).subtract(tx.getBody().getFee()), only.getValue().getCoin(),
+                "at a zero fee rate the one output is wallet − fee: the dummy's 1 ADA is inside it, not lost");
     }
 
     private static BigInteger lovelace(Utxo utxo) {

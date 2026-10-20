@@ -1,13 +1,21 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
+import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.common.model.SlotConfigs;
+import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -263,5 +271,176 @@ class CompoundDryEvalTest {
                             .getDelegationCredentialHash().orElseThrow()));
         }
         assertEquals(new java.util.TreeSet<>(CompoundTransactionBuilder.withdrawCredentials(REGISTRY)), withdrawn);
+    }
+
+    // ---- FAB-152: the bot ends a compound with ONE output --------------------------------------
+
+    /** CCL's placeholder ex-units (trap 8): a redeemer still carrying these was never evaluated. */
+    private static final BigInteger PLACEHOLDER_MEM = BigInteger.valueOf(10_000);
+
+    /**
+     * The same builder, with an evaluator wired in the way production wires one — so the ex-units and
+     * the fee are cardano-client-lib's own, computed on the body it actually returns.
+     */
+    private static CompoundTransactionBuilder evaluatingBuilder(List<Utxo> universe) {
+        UtxoSupplier supplier = LoanFixtures.utxoSupplier(universe);
+        return new CompoundTransactionBuilder(REGISTRY, Networks.preview(), supplier,
+                EvalFixtures.protocolParams(), new AikenTransactionEvaluator(supplier,
+                EvalFixtures.protocolParams(), EvalFixtures.scriptSupplier(REGISTRY), SlotConfigs.preview()));
+    }
+
+    private static List<TransactionOutput> botOutputs(Transaction tx) {
+        return tx.getBody().getOutputs().stream().filter(o -> BOT.equals(o.getAddress())).toList();
+    }
+
+    /** The lovelace the bot put in, read from the BUILT body's inputs — never from the nominated UTxO. */
+    private static BigInteger botInputLovelace(Transaction tx, List<Utxo> universe) {
+        BigInteger in = BigInteger.ZERO;
+        for (TransactionInput input : tx.getBody().getInputs()) {
+            Utxo spent = universe.stream()
+                    .filter(u -> u.getTxHash().equals(input.getTransactionId())
+                            && u.getOutputIndex() == input.getIndex())
+                    .findFirst().orElseThrow();
+            if (BOT.equals(spent.getAddress())) {
+                in = in.add(spent.getAmount().stream().filter(a -> "lovelace".equals(a.getUnit()))
+                        .map(Amount::getQuantity).findFirst().orElse(BigInteger.ZERO));
+            }
+        }
+        return in;
+    }
+
+    /**
+     * ⛔ FAB-152. cardano-client-lib prepends a 1 ADA withdrawal dummy at the change address (CCL trap 1)
+     * and, with {@code mergeOutputs(false)}, puts the change in a SECOND output beside it — mainnet
+     * {@code 4e40b3fa…}: {@code #0} 1.000000 ADA and {@code #4} 151.639224 ADA. The wallet then reads
+     * {@code ADA_FRAGMENTED} and the rebalancer pays to merge them on the next block. A compound must
+     * leave the bot exactly ONE ada-only output, and the bot's net must still be
+     * {@code compoundingFee − fee}.
+     */
+    @Test
+    void aCompoundLeavesTheBotExactlyOneAdaOnlyOutput() {
+        List<Utxo> universe = universe();
+        Transaction tx = evaluatingBuilder(universe).build(request(FEE));
+
+        List<TransactionOutput> bot = botOutputs(tx);
+        log.info("compound bot outputs {} tx fee {}", bot.stream().map(o -> o.getValue().getCoin()).toList(),
+                tx.getBody().getFee());
+        assertEquals(1, bot.size(), "the bot must end with ONE output, not the withdrawal dummy "
+                + "beside the change: " + bot.stream().map(o -> o.getValue().getCoin()).toList());
+        TransactionOutput only = bot.get(0);
+        assertTrue(only.getValue().getMultiAssets() == null || only.getValue().getMultiAssets().isEmpty(),
+                "an ada-only wallet must get an ada-only output back");
+        assertTrue(only.getInlineDatum() == null && only.getDatumHash() == null && only.getScriptRef() == null);
+
+        BigInteger net = only.getValue().getCoin().subtract(botInputLovelace(tx, universe));
+        assertEquals(FEE.subtract(tx.getBody().getFee()), net, "BOT_NET: compoundingFee − tx fee");
+    }
+
+    /**
+     * ⛔ FAB-152, the property the ticket is about: a wallet already in {@link WalletShape}'s target shape
+     * — one exact-C collateral UTxO and one larger change UTxO, no tokens — is STILL in it after a
+     * compound, so no rebalance follows. On the unfolded body this is {@code ADA_FRAGMENTED}.
+     */
+    @Test
+    void aWalletInTargetShapeIsStillInTargetShapeAfterACompound() throws Exception {
+        var params = EvalFixtures.protocolParams().getProtocolParams();
+        BigInteger collateral = WalletShape.collateralLovelace(params);
+        Utxo exactCollateral = Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(BOT)
+                .amount(List.of(Amount.lovelace(collateral))).build();
+        Utxo change = Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(BOT)
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(150_000_000L)))).build();
+        List<Utxo> walletBefore = List.of(exactCollateral, change);
+        assertTrue(WalletShape.reasons(walletBefore, java.util.Set.of(), collateral).isEmpty(),
+                "the fixture must start in target shape or the test proves nothing");
+
+        List<Utxo> universe = List.of(utxo("escrow"), utxo("bond"), utxo("pool"), utxo("poolManager"),
+                recordedConfig(), recordedLmConfig(), exactCollateral, change);
+        var request = new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
+                recordedConfig(), recordedLmConfig(), change, BOT, FEE, VALID_FROM_SLOT, VALID_TO_SLOT);
+        Transaction tx = evaluatingBuilder(universe).build(request);
+
+        // The wallet afterwards: what it held, minus what the body spent, plus what the body pays it.
+        List<Utxo> walletAfter = new ArrayList<>();
+        for (Utxo u : walletBefore) {
+            boolean spent = tx.getBody().getInputs().stream().anyMatch(i ->
+                    i.getTransactionId().equals(u.getTxHash()) && i.getIndex() == u.getOutputIndex());
+            if (!spent) {
+                walletAfter.add(u);
+            }
+        }
+        String txHash = com.bloxbean.cardano.client.transaction.util.TransactionUtil.getTxHash(tx);
+        List<TransactionOutput> outputs = tx.getBody().getOutputs();
+        for (int i = 0; i < outputs.size(); i++) {
+            if (BOT.equals(outputs.get(i).getAddress())) {
+                walletAfter.add(Utxo.builder().txHash(txHash).outputIndex(i).address(BOT)
+                        .amount(amountsOf(outputs.get(i).getValue())).build());
+            }
+        }
+
+        log.info("wallet after compound: {}", walletAfter.stream()
+                .map(u -> u.getTxHash().substring(0, 8) + "#" + u.getOutputIndex() + "=" + u.getAmount().stream()
+                        .map(a -> a.getQuantity() + " " + a.getUnit()).toList()).toList());
+        var reasons = WalletShape.reasons(walletAfter, java.util.Set.of(), collateral);
+        assertTrue(reasons.isEmpty(), "a compound must not knock a target-shape wallet out of shape: "
+                + reasons);
+    }
+
+    /**
+     * Trap 8, on the FINISHED body: with the fold in {@code preBalanceTx}, every one of the eleven
+     * redeemers still carries the evaluator's ex-units — read off the deserialised transaction, never
+     * off an {@code EvaluationResult} — and that final body still evaluates against the real validators.
+     */
+    @Test
+    void everyRedeemerOnTheBuiltBodyCarriesEvaluatedExUnits() throws Exception {
+        List<Utxo> universe = universe();
+        Transaction reread = Transaction.deserialize(evaluatingBuilder(universe).build(request(FEE)).serialize());
+
+        List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
+        assertEquals(11, redeemers.size(), "four general_spend spends and seven withdraw-0 invocations");
+        for (Redeemer r : redeemers) {
+            assertTrue(r.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    r.getTag() + "#" + r.getIndex() + " carries CCL's placeholder: not evaluated");
+        }
+        assertEquals(11, EvalFixtures.evaluate(reread, universe, REGISTRY).size(),
+                "the final body, fold included, must evaluate");
+    }
+
+    /**
+     * The post-assert, driven directly: a finished body whose bot output has been split back into two
+     * datum-free outputs — lovelace conserved, so BOT_NET and every earlier check still pass — must be
+     * refused with {@code BOT_OUTPUTS_NOT_FOLDED}, naming the count. A regression of the fold is then a
+     * loud build refusal, never a silent rebalance.
+     */
+    @Test
+    void twoDatumFreeOutputsAtTheChangeAddressAreRefused() {
+        CompoundTransactionBuilder builder = builder();
+        Transaction tx = builder.build(request(FEE));
+        TransactionOutput only = botOutputs(tx).get(0);
+        BigInteger split = BigInteger.valueOf(1_000_000L);
+        only.setValue(only.getValue().subtract(Value.builder().coin(split).build()));
+        tx.getBody().getOutputs().add(0, new TransactionOutput(BOT, Value.builder().coin(split).build()));
+
+        List<String> order = builder.withdrawalOrder();
+        var e = assertThrows(CompoundTransactionBuilder.RefusedException.class,
+                () -> builder.assertStructure(tx, request(FEE), order,
+                        CompoundTransactionBuilder.rewardRedeemerIndex(order, REGISTRY.getPoolPolicyId()),
+                        CompoundTransactionBuilder.rewardRedeemerIndex(order,
+                                REGISTRY.getLenderManagerWithdrawScriptHash())));
+        assertEquals(CompoundTransactionBuilder.Refusal.BOT_OUTPUTS_NOT_FOLDED, e.getReason());
+        assertTrue(e.getMessage().contains("2 datum-free outputs"), e.getMessage());
+    }
+
+    private static List<Amount> amountsOf(Value value) {
+        List<Amount> amounts = new ArrayList<>();
+        amounts.add(Amount.lovelace(value.getCoin()));
+        if (value.getMultiAssets() != null) {
+            for (var ma : value.getMultiAssets()) {
+                for (var asset : ma.getAssets()) {
+                    amounts.add(Amount.asset(ma.getPolicyId() + asset.getNameAsHex().replaceFirst("^0x", ""),
+                            asset.getValue()));
+                }
+            }
+        }
+        return amounts;
     }
 }
