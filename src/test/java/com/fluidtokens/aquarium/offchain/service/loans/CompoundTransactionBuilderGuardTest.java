@@ -2,12 +2,17 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
+import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionBody;
+import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.bloxbean.cardano.client.transaction.spec.Withdrawal;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -126,6 +131,68 @@ class CompoundTransactionBuilderGuardTest {
         assertThrows(CompoundTransactionBuilder.RefusedException.class,
                 () -> CompoundTransactionBuilder.echo("deadbeef",
                         CompoundTransactionBuilder.Refusal.BOND_DATUM_NOT_BYTE_IDENTICAL, "bond"));
+    }
+
+    // ---- FAB-152: the bot-output fold -------------------------------------------------------
+
+    private static final String BOT = LoanFixtures.botAddress();
+    private static final String SCRIPT = AddressProvider.getEntAddress(
+            Credential.fromScript("aa".repeat(28)), NETWORK).getAddress();
+
+    private static TransactionOutput out(String address, long lovelace, boolean datum) {
+        TransactionOutput o = new TransactionOutput(address, Value.builder().coin(BigInteger.valueOf(lovelace)).build());
+        if (datum) {
+            o.setInlineDatum(ConstrPlutusData.builder().alternative(0).data(ListPlutusData.of()).build());
+        }
+        return o;
+    }
+
+    /**
+     * ⛔ The fold selects by ADDRESS AND CONTENT, never by index. Output 0 here is a datum-bearing
+     * script output — not the withdrawal dummy — and a datum-bearing output also sits at the bot's own
+     * address; neither may be touched. Only the two datum-free bot outputs merge, into the LAST of them,
+     * carrying every unit across. A fold that assumed "index 0 is the dummy" merges the script output.
+     */
+    @Test
+    void theFoldMatchesByAddressAndContentNeverByIndex() {
+        TransactionOutput script = out(SCRIPT, 1_500_000L, true);
+        TransactionOutput dummy = out(BOT, 1_000_000L, false);
+        TransactionOutput botWithDatum = out(BOT, 2_000_000L, true);
+        TransactionOutput other = out(SCRIPT, 3_000_000L, false);
+        TransactionOutput change = out(BOT, 10_000_000L, false);
+        String unit = "bb".repeat(28) + "cafe";
+        change.setValue(change.getValue().add(Value.from("bb".repeat(28), "0xcafe", BigInteger.valueOf(7))));
+        Transaction txn = Transaction.builder().body(TransactionBody.builder()
+                .outputs(new ArrayList<>(List.of(script, dummy, botWithDatum, other, change))).build()).build();
+
+        CompoundTransactionBuilder.foldBotOutputs(txn, BOT);
+
+        List<TransactionOutput> outputs = txn.getBody().getOutputs();
+        assertEquals(4, outputs.size(), "exactly the dummy is gone");
+        assertTrue(outputs.get(0) == script && script.getValue().getCoin().longValue() == 1_500_000L,
+                "the datum-bearing script output at index 0 is untouched");
+        assertTrue(outputs.contains(botWithDatum) && botWithDatum.getValue().getCoin().longValue() == 2_000_000L,
+                "a datum-bearing output at the bot's address is not the bot's change");
+        assertEquals(3_000_000L, other.getValue().getCoin().longValue());
+        assertTrue(outputs.get(3) == change, "the LAST datum-free bot output is the one kept");
+        assertEquals(11_000_000L, change.getValue().getCoin().longValue());
+        assertEquals(BigInteger.valueOf(7), change.getValue().amountOf("bb".repeat(28), "0xcafe"),
+                "every unit is carried across, not just lovelace: " + unit);
+    }
+
+    @Test
+    void oneDatumFreeBotOutputOrNoneIsLeftAlone() {
+        TransactionOutput change = out(BOT, 10_000_000L, false);
+        Transaction one = Transaction.builder().body(TransactionBody.builder()
+                .outputs(new ArrayList<>(List.of(out(SCRIPT, 2_000_000L, true), change))).build()).build();
+        CompoundTransactionBuilder.foldBotOutputs(one, BOT);
+        assertEquals(2, one.getBody().getOutputs().size());
+        assertEquals(10_000_000L, change.getValue().getCoin().longValue());
+
+        Transaction none = Transaction.builder().body(TransactionBody.builder()
+                .outputs(new ArrayList<>(List.of(out(SCRIPT, 2_000_000L, true)))).build()).build();
+        CompoundTransactionBuilder.foldBotOutputs(none, BOT);
+        assertEquals(1, none.getBody().getOutputs().size());
     }
 
     private static String assertDoesNotThrowHex(String hex) {
