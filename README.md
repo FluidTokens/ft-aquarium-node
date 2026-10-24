@@ -63,6 +63,13 @@ split across the nodes that performed transactions.
 and compound all have to be turned on deliberately. Read
 [docs/deploying.md](docs/deploying.md) §8 before arming anything, and rehearse in `shadow` first.
 
+For native-principal compounding, the pool fee is calculated in raw token units and priced from the
+identified oracle observation. Admission then uses the exact final transaction body:
+`floor(F*n/d) + recovered escrow ADA - transaction fee - pool minimum-ADA top-up`. The
+wallet may reuse a safe token-bearing change UTxO as its ordinary input, but must also retain a
+distinct, datum-free and reference-script-free pure-ADA collateral UTxO. ADA-principal compounding
+remains `fee - transaction fee`; its escrow principal is not counted again as recovered ADA.
+
 **⛔ Do not publish port 8080.** Nothing served there is authenticated, and
 `LOANS_UI_ENABLED=false` does **not** close it: that flag removes the HTML readiness page only.
 `/api/v1/loans`, `/api/v1/loans/liquidations`, `/api/v1/loans/oracle`, `/healthcheck` and

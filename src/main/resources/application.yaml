@@ -131,14 +131,18 @@ loans:
   compound:
     enabled: ${AQUARIUM_COMPOUND_ENABLED:false}
     delay-seconds: ${AQUARIUM_COMPOUND_DELAY_SECONDS:60}
-    # What `expectedFee - txFee` must reach, in lovelace, for a compound to be built.
+    # What the final measured net must reach, in lovelace, for a compound to be submitted. For an
+    # ADA principal that is `F - L`. For a native principal it is `floor(F*n/d) + E - L - T`, where
+    # F is the raw-token fee, n/d its positive oracle price per raw unit, E is escrow ADA recovered
+    # by the bot, L is the exact final-body transaction fee, and T is the pool minimum-ADA top-up.
     #
     # 0 (the default) refuses every net loss while allowing exact break-even. That is what makes a
-    # ZERO-FEE POOL refused out of the box: it pays nothing, so the net is exactly minus the tx fee.
+    # ZERO-FEE ADA POOL refused out of the box: it pays nothing, so the net is exactly minus the tx
+    # fee. A valid zero-fee NATIVE pool can still clear 0 through recovered escrow ADA (`E-L-T`).
     #
     # The fee rate is `compoudingFeePerMille` in the live PoolManagerDatum -- set by the POOL OWNER,
     # not by this node and not fixed by the protocol. Measured 2026-09-02: the only live preview pool
-    # published 0, so out of the box that work pays nothing and is declined.
+    # published 0 for its ADA principal, so out of the box that work pays nothing and is declined.
     #
     # A NEGATIVE value is a number the operator STATES, not a protection they switch off -- the same
     # distinction `liquidation.profit-margin-lovelace` draws, and the reason there is no

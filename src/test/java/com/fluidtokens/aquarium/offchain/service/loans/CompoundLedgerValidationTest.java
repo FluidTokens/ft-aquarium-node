@@ -12,6 +12,7 @@ import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.Value;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
@@ -28,6 +29,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -117,6 +119,56 @@ class CompoundLedgerValidationTest {
                 .calculateMinAda(output);
 
         assertEquals(minimum.max(BigInteger.valueOf(999_999L)), output.getValue().getCoin());
+    }
+
+    @Test
+    void realBuilderFactsDriveExactNativeProfitAcrossTheStablePoolTopUp() {
+        Utxo pool = withLovelace(tokenPool(), BigInteger.ONE);
+        Fixture fixture = tokenFixture(pool, withLovelace(tokenEscrow(), BigInteger.valueOf(8_000_000L)));
+
+        CompoundTransactionBuilder.Built built = fixture.builder().buildWithFacts(fixture.request());
+        TransactionOutput poolOutput = outputWithDatum(built.transaction(), pool);
+        BigInteger expectedTopUp = poolOutput.getValue().getCoin().subtract(BigInteger.ONE);
+        var facts = built.facts();
+
+        assertEquals(BigInteger.valueOf(8_000_000L), facts.recoveredEscrowLovelace());
+        assertEquals(expectedTopUp, facts.poolTopUpLovelace());
+        assertEquals(built.transaction().getBody().getFee(), facts.transactionFeeLovelace());
+        assertArrayEquals(CompoundTransactionBuilder.bodyIdentity(built.transaction()), facts.bodyIdentity());
+        byte[] callerCopy = facts.bodyIdentity();
+        callerCopy[0] ^= 1;
+        assertArrayEquals(CompoundTransactionBuilder.bodyIdentity(built.transaction()), facts.bodyIdentity(),
+                "the kernel body identity is immutable to callers");
+
+        var cfg = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.ZERO);
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var economics = new CompoundEconomics(cfg, network,
+                new PricingService(new FluidOracleClient("http://unused.invalid")));
+        BigInteger pricedF = BigInteger.valueOf(10_000L);
+        var assessment = economics.assessFinal(true, true,
+                fixture.request().candidate().bond().datum().principalAsset(), Q, 5L, facts,
+                new PricingService.Priced(pricedF, null, null));
+        assertEquals(pricedF.add(facts.recoveredEscrowLovelace())
+                        .subtract(facts.transactionFeeLovelace()).subtract(facts.poolTopUpLovelace()),
+                assessment.net(), "pricedF+E-L-T must use the real final body's facts exactly once");
+    }
+
+    @Test
+    void tokenBearingOrdinaryInputIsConservedIntoWalletChange() {
+        Utxo tokenChange = Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(BOT)
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(60_000_000L)),
+                        Amount.asset(UNRELATED, BigInteger.valueOf(77L)))).build();
+        Fixture fixture = tokenFixture(tokenPool(), tokenEscrow(), List.of(), tokenChange);
+
+        Transaction tx = fixture.builder().build(fixture.request());
+
+        assertEquals(BigInteger.valueOf(77L), quantity(walletOutput(tx), UNRELATED),
+                "safe token inventory from prior change must survive balancing into wallet change");
+        assertTrue(tx.getBody().getCollateral().stream().noneMatch(input ->
+                input.getTransactionId().equals(tokenChange.getTxHash())
+                        && input.getIndex() == tokenChange.getOutputIndex()),
+                "the token-bearing ordinary input is never also collateral");
     }
 
     @Test
@@ -361,6 +413,12 @@ class CompoundLedgerValidationTest {
     }
 
     private static Fixture tokenFixture(Utxo pool, Utxo escrow, List<Utxo> extras) {
+        Utxo wallet = Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(BOT)
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(60_000_000L)))).build();
+        return tokenFixture(pool, escrow, extras, wallet);
+    }
+
+    private static Fixture tokenFixture(Utxo pool, Utxo escrow, List<Utxo> extras, Utxo wallet) {
         Utxo originalBond = utxo("bond");
         LenderManagerDatum old = new LenderManagerDatumConverter().deserialize(originalBond.getInlineDatum());
         LenderManagerDatum tokenDatum = new LenderManagerDatum(old.lenderAuth(), old.lenderStakeCredential(),
@@ -371,7 +429,7 @@ class CompoundLedgerValidationTest {
         CompoundCandidate candidate = new CompoundCandidate(LOAN_ID, escrow,
                 new AssetManagerDatumConverter().deserialize(escrow.getInlineDatum()), Q, bond, POOL_ID,
                 pool, utxo("poolManager"), 5L, false, null, "synthetic token-principal candidate");
-        return fixture(candidate, originalBond, pool, F, extras);
+        return fixture(candidate, originalBond, pool, F, extras, wallet);
     }
 
     private static Fixture adaFixture() {
@@ -396,6 +454,11 @@ class CompoundLedgerValidationTest {
                                    BigInteger fee, List<Utxo> extras) {
         Utxo wallet = Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(BOT)
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(60_000_000L)))).build();
+        return fixture(candidate, bondUtxo, pool, fee, extras, wallet);
+    }
+
+    private static Fixture fixture(CompoundCandidate candidate, Utxo bondUtxo, Utxo pool,
+                                   BigInteger fee, List<Utxo> extras, Utxo wallet) {
         Utxo collateral = Utxo.builder().txHash("9f".repeat(32)).outputIndex(0).address(BOT)
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
         Utxo config = config();

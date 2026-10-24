@@ -22,6 +22,7 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 /**
@@ -125,13 +126,20 @@ public class CompoundCandidateScanner {
         String poolId = bond.datum().poolId();
         boolean principalIsAda = bond.datum().principalAsset().isAda();
 
-        // The validator's shape constraint: an ada-principal escrow must carry lovelace and nothing
-        // else. Checked BEFORE the pool lookup because it is cheaper and cannot change.
-        if (principalIsAda && escrow.getAmount().size() != 1) {
+        // Receipt-bearing and unrelated-asset escrows remain outside the ordinary topology. The
+        // native case admitted here is exactly lovelace plus the configured principal unit.
+        String principalUnit = bond.datum().principalAsset().toUnit();
+        var escrowUnits = escrow.getAmount().stream()
+                .filter(a -> a.getQuantity() != null && a.getQuantity().signum() != 0)
+                .collect(java.util.stream.Collectors.toMap(Amount::getUnit, Amount::getQuantity,
+                        BigInteger::add));
+        Set<String> expectedEscrowUnits = principalIsAda
+                ? Set.of("lovelace") : Set.of("lovelace", principalUnit);
+        if (!escrowUnits.keySet().equals(expectedEscrowUnits)) {
             return refuse(escrow, loanId, CompoundExclusion.ESCROW_SHAPE_REJECTED,
-                    "escrow holds " + escrow.getAmount().size() + " distinct assets; an ada-principal "
-                            + "escrow must hold lovelace alone (plus repayment receipt NFTs, which "
-                            + "this node cannot yet identify — see the class note)");
+                    "escrow carries units " + escrowUnits.keySet() + "; ordinary "
+                            + (principalIsAda ? "ADA" : "native") + " compound requires exactly "
+                            + expectedEscrowUnits + " and refuses receipts or unrelated assets");
         }
 
         if (poolId == null || poolId.isBlank()) {
@@ -146,26 +154,26 @@ public class CompoundCandidateScanner {
         }
 
         BigInteger addedLiquidity = principalAmount(escrow, bond);
-        long feePerMille = compoundingFeePerMille(pair.poolManager());
-
-        if (!principalIsAda) {
-            // ⛔ Still refused, but no longer because CompoundEconomics "cannot compare" the fee —
-            // it can now price a token fee via PricingService. This is a structural gate: the
-            // compound TRANSACTION BUILDER assumes an ada principal throughout, and lifting the
-            // refusal is also held on a product ruling from Giovanni (FAB-77, 2026-09-09) about
-            // whether the bot should acquire a token this way at all. See
-            // CompoundExclusion.PRINCIPAL_NOT_ADA's javadoc for both reasons.
+        FeeDecode decodedFee = decodeCompoundingFee(pair.poolManager());
+        if (decodedFee.exclusion() != null) {
             return new CompoundCandidate(loanId, escrow, datum, addedLiquidity, bond, poolId,
-                    pair.pool(), pair.poolManager(), feePerMille, false,
-                    CompoundExclusion.PRINCIPAL_NOT_ADA,
-                    "pool principal is " + bond.datum().principalAsset()
-                            + "; refused structurally — the compound builder does not yet pay out "
-                            + "a non-ada principal, and lifting this is held on a product ruling "
-                            + "(FAB-77), not merely a pricing gap");
+                    pair.pool(), pair.poolManager(), 0L, principalIsAda,
+                    decodedFee.exclusion(), decodedFee.detail());
+        }
+
+        long feePerMille = decodedFee.value();
+        BigInteger fee = addedLiquidity.multiply(BigInteger.valueOf(feePerMille))
+                .divide(BigInteger.valueOf(1000L));
+        if (addedLiquidity.signum() <= 0 || addedLiquidity.subtract(fee).signum() <= 0) {
+            return new CompoundCandidate(loanId, escrow, datum, addedLiquidity, bond, poolId,
+                    pair.pool(), pair.poolManager(), feePerMille, principalIsAda,
+                    CompoundExclusion.PRINCIPAL_AMOUNT_INVALID,
+                    "principal must satisfy Q > 0 and Q-floor(Q*c/1000) > 0; Q="
+                            + addedLiquidity + ", c=" + feePerMille + ", F=" + fee);
         }
 
         return new CompoundCandidate(loanId, escrow, datum, addedLiquidity, bond, poolId,
-                pair.pool(), pair.poolManager(), feePerMille, true, null, pair.detail());
+                pair.pool(), pair.poolManager(), feePerMille, principalIsAda, null, pair.detail());
     }
 
     private CompoundCandidate refuse(Utxo escrow, String loanId, CompoundExclusion why, String detail) {
@@ -195,25 +203,60 @@ public class CompoundCandidateScanner {
      * no bearing on compounding — {@code pm_compound_liquidity} authorises nothing of its own
      * (findings D-17) — so decoding it would be modelling a field to ignore it.
      *
-     * <p>Returns 0 when it cannot be read, which is the fail-closed direction: a fee of 0 makes the
-     * candidate unprofitable and the economics gate refuses it unless the operator has stated
-     * otherwise. A wrong high value would be the dangerous error, not a wrong low one.
+     * <p>Zero is accepted only when it is present as the exact integer zero. Missing, malformed,
+     * overflowing and out-of-range values remain distinct refusals.
      */
-    static long compoundingFeePerMille(Utxo poolManager) {
+    private record FeeDecode(long value, CompoundExclusion exclusion, String detail) {
+        static FeeDecode accepted(long value) {
+            return new FeeDecode(value, null, null);
+        }
+
+        static FeeDecode refused(CompoundExclusion exclusion, String detail) {
+            return new FeeDecode(0L, exclusion, detail);
+        }
+    }
+
+    static FeeDecode decodeCompoundingFee(Utxo poolManager) {
+        if (poolManager.getInlineDatum() == null || poolManager.getInlineDatum().isBlank()) {
+            return FeeDecode.refused(CompoundExclusion.POOL_MANAGER_FEE_MISSING,
+                    "pool manager datum is absent");
+        }
         try {
             var constr = ConstrPlutusData.deserialize(
                     CborSerializationUtil.deserialize(HexUtil.decodeHexString(poolManager.getInlineDatum())));
             var fields = constr.getData().getPlutusDataList();
-            if (fields.size() < 2 || !(fields.get(1) instanceof BigIntPlutusData fee)) {
-                log.warn("pool manager {}#{} datum has no readable compoudingFeePerMille; treating as 0",
-                        poolManager.getTxHash(), poolManager.getOutputIndex());
-                return 0L;
+            if (fields.size() < 2) {
+                return FeeDecode.refused(CompoundExclusion.POOL_MANAGER_FEE_MISSING,
+                        "pool manager datum has no compoudingFeePerMille field");
             }
-            return fee.getValue().longValueExact();
+            if (!(fields.get(1) instanceof BigIntPlutusData fee)) {
+                return FeeDecode.refused(CompoundExclusion.POOL_MANAGER_FEE_MALFORMED,
+                        "pool manager compoudingFeePerMille is not an integer");
+            }
+            final long value;
+            try {
+                value = fee.getValue().longValueExact();
+            } catch (ArithmeticException e) {
+                return FeeDecode.refused(CompoundExclusion.POOL_MANAGER_FEE_OVERFLOW,
+                        "pool manager compoudingFeePerMille exceeds the host integer range");
+            }
+            if (value < 0L || value > 999L) {
+                return FeeDecode.refused(CompoundExclusion.POOL_MANAGER_FEE_OUT_OF_RANGE,
+                        "pool manager compoudingFeePerMille=" + value + " is outside [0,999]");
+            }
+            return FeeDecode.accepted(value);
         } catch (Exception e) {
-            log.warn("could not decode pool manager {}#{} datum ({}); treating compoudingFeePerMille as 0",
-                    poolManager.getTxHash(), poolManager.getOutputIndex(), e.toString());
-            return 0L;
+            return FeeDecode.refused(CompoundExclusion.POOL_MANAGER_FEE_MALFORMED,
+                    "could not decode pool manager datum: " + e.getClass().getSimpleName());
         }
+    }
+
+    /** Legacy fixture helper; production classification consumes the full named decode result. */
+    static long compoundingFeePerMille(Utxo poolManager) {
+        FeeDecode decoded = decodeCompoundingFee(poolManager);
+        if (decoded.exclusion() != null) {
+            throw new IllegalArgumentException(decoded.exclusion() + ": " + decoded.detail());
+        }
+        return decoded.value();
     }
 }

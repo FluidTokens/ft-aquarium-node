@@ -9,6 +9,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The profitability gate for the repayment-escrow compound path, and the only place its arithmetic
@@ -21,9 +23,9 @@ import java.math.BigInteger;
  * mirrored here exactly. <b>Nothing pays the bot.</b> The fee is the part the pool is not required to
  * receive; it stays in the transaction and the builder must place it deliberately (findings §20.1).
  *
- * <p>So the bot's entire outlay is the transaction fee. It advances no principal, holds no bond, and
- * carries no oracle risk — which is why the floor here defaults to 0 rather than to the liquidation
- * path's 1_500_000 premium. See {@code AppConfig.CompoundConfiguration#profitMarginLovelace}.
+ * <p>The exact final-body gate is {@code F-L} for ADA principal and
+ * {@code floor(F*n/d)+E-L-T} for native principal. Native {@code F} is priced from raw units; its
+ * escrow ADA is recovered as {@code E}, while {@code T} is the actual pool minimum-ADA top-up.
  *
  * <h2>⛔ The unit trap this gate no longer papers over by refusing outright</h2>
  * {@code compoudingFeePerMille} applies to the <b>principal asset</b>. For an ADA-principal pool the
@@ -31,16 +33,11 @@ import java.math.BigInteger;
  * token-principal pool it is a token quantity, and subtracting a lovelace cost from it directly
  * would produce a number that looks like profit and means nothing — so it is priced first, through
  * {@link PricingService} (the ONE place a token quantity becomes lovelace in this path), and only
- * refused, as {@link CompoundExclusion#PRICE_UNAVAILABLE}, when that pricing itself fails: no oracle
- * feed, a feed that is not usable at the instant asked, or a feed that is a {@code POOLED} variant.
+ * refused with a specific price exclusion when that pricing itself fails.
  * ADA is the identity in {@link PricingService#toLovelace} — no oracle is consulted for it, so this
  * gate's ada behaviour is unchanged from before this class knew how to price anything else.
  * <p>
- * ⚑ <b>This method alone no longer refuses a non-ADA principal.</b> A candidate still never reaches
- * here with one today — {@code CompoundCandidateScanner} keeps its own, separate,
- * {@link CompoundExclusion#PRINCIPAL_NOT_ADA} refusal upstream, for reasons that have nothing to do
- * with pricing (see that constant's javadoc). This class is written to be correct regardless, ready
- * for the day that upstream gate lifts.
+ * A rounded native {@code F=0} deliberately bypasses the oracle and is decided by {@code E-L-T}.
  */
 @Service
 @Slf4j
@@ -72,8 +69,9 @@ public class CompoundEconomics {
     @PostConstruct
     void announceAndGuard() {
         BigInteger floor = configuration.getProfitMarginLovelace();
-        log.info("COMPOUND ECONOMICS enabled={}; profit-margin={} lovelace (the floor "
-                        + "expectedFee-txFee must reach; 0 refuses every net loss)",
+        log.info("COMPOUND ECONOMICS enabled={}; profit-margin={} lovelace (native net is "
+                        + "pricedFee+recoveredEscrow-txFee-poolTopUp; ADA net is fee-txFee; "
+                        + "0 refuses every net loss)",
                 configuration.isEnabled(), floor);
 
         if (floor == null || floor.signum() >= 0) {
@@ -121,33 +119,135 @@ public class CompoundEconomics {
                                      long feePerMille,
                                      BigInteger txFee,
                                      long atMillis) {
-        if (!configuration.isEnabled()) {
-            return CompoundAssessment.refused(CompoundExclusion.NOT_ARMED);
+        CompoundExclusion structural = structuralExclusion(bondNamesAPool, poolAndManagerLive);
+        if (structural != null) {
+            return CompoundAssessment.refused(structural);
         }
-        if (!bondNamesAPool) {
-            return CompoundAssessment.refused(CompoundExclusion.BOND_NAMES_NO_POOL);
+        BigInteger fee = expectedFee(escrow, feePerMille);
+        PricingService.Priced quote = quote(principalAsset, fee, atMillis);
+        return assessMeasured(bondNamesAPool, poolAndManagerLive, principalAsset, escrow,
+                feePerMille, BigInteger.ZERO, txFee, BigInteger.ZERO, quote);
+    }
+
+    /** Price the raw reward. A rounded {@code F=0} is an exact zero with no oracle lookup. */
+    public PricingService.Priced quote(AssetType principalAsset, BigInteger rawFee, long atMillis) {
+        if (rawFee.signum() == 0) {
+            return PricingService.Priced.priced(BigInteger.ZERO);
         }
-        if (!poolAndManagerLive) {
-            return CompoundAssessment.refused(CompoundExclusion.POOL_NOT_LIVE);
+        return pricingService.toLovelace(principalAsset, rawFee, atMillis);
+    }
+
+    /** Final-body profitability using only facts produced by the transaction kernel. */
+    public CompoundAssessment assessFinal(boolean bondNamesAPool,
+                                          boolean poolAndManagerLive,
+                                          AssetType principalAsset,
+                                          BigInteger escrow,
+                                          long feePerMille,
+                                          CompoundTransactionBuilder.KernelFacts facts,
+                                          PricingService.Priced quote) {
+        Objects.requireNonNull(facts, "facts");
+        return assessMeasured(bondNamesAPool, poolAndManagerLive, principalAsset, escrow,
+                feePerMille, facts.recoveredEscrowLovelace(), facts.transactionFeeLovelace(),
+                facts.poolTopUpLovelace(), quote);
+    }
+
+    private CompoundAssessment assessMeasured(boolean bondNamesAPool,
+                                               boolean poolAndManagerLive,
+                                               AssetType principalAsset,
+                                               BigInteger escrow,
+                                               long feePerMille,
+                                               BigInteger recoveredEscrowLovelace,
+                                               BigInteger txFee,
+                                               BigInteger poolTopUpLovelace,
+                                               PricingService.Priced priced) {
+        CompoundExclusion structural = structuralExclusion(bondNamesAPool, poolAndManagerLive);
+        if (structural != null) {
+            return CompoundAssessment.refused(structural);
         }
 
         BigInteger expectedFee = expectedFee(escrow, feePerMille);
-
-        PricingService.Priced priced = pricingService.toLovelace(principalAsset, expectedFee, atMillis);
         if (!priced.isPriced()) {
-            log.info("compound: cannot price the {} fee slice ({} base units) at {}: {}",
-                    principalAsset.toUnit(), expectedFee, atMillis, priced.refusal());
-            return CompoundAssessment.refused(CompoundExclusion.PRICE_UNAVAILABLE);
+            log.info("compound: cannot price {} raw reward units: {}",
+                    expectedFee, priced.refusal());
+            return CompoundAssessment.refused(priceExclusion(priced.refusal()));
         }
 
         BigInteger expectedFeeLovelace = priced.lovelace();
-        BigInteger net = expectedFeeLovelace.subtract(txFee);
+        BigInteger recovered = principalAsset.isAda() ? BigInteger.ZERO : recoveredEscrowLovelace;
+        BigInteger topUp = principalAsset.isAda() ? BigInteger.ZERO : poolTopUpLovelace;
+        BigInteger net = expectedFeeLovelace.add(recovered).subtract(txFee).subtract(topUp);
         BigInteger floor = configuration.getProfitMarginLovelace();
         boolean approved = net.compareTo(floor) >= 0;
 
         return new CompoundAssessment(approved,
                 approved ? null : CompoundExclusion.NET_BELOW_FLOOR,
-                escrow, feePerMille, expectedFee, expectedFeeLovelace, txFee, net, floor);
+                escrow, feePerMille, expectedFee, expectedFeeLovelace, recovered,
+                txFee, topUp, net, floor, priced.observation());
+    }
+
+    private CompoundExclusion structuralExclusion(boolean bondNamesAPool,
+                                                  boolean poolAndManagerLive) {
+        if (!configuration.isEnabled()) {
+            return CompoundExclusion.NOT_ARMED;
+        }
+        if (!bondNamesAPool) {
+            return CompoundExclusion.BOND_NAMES_NO_POOL;
+        }
+        return poolAndManagerLive ? null : CompoundExclusion.POOL_NOT_LIVE;
+    }
+
+    /** Gross ranking value, explicitly excluding the not-yet-known final fee and pool top-up. */
+    public Optional<BigInteger> grossRecoverableLovelace(AssetType principalAsset,
+                                                         BigInteger escrow,
+                                                         long feePerMille,
+                                                         BigInteger rawEscrowCoin,
+                                                         long atMillis) {
+        try {
+            BigInteger fee = expectedFee(escrow, feePerMille);
+            PricingService.Priced quote = quote(principalAsset, fee, atMillis);
+            if (!quote.isPriced()) {
+                return Optional.empty();
+            }
+            return Optional.of(quote.lovelace().add(principalAsset.isAda()
+                    ? BigInteger.ZERO : rawEscrowCoin));
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Re-read and identify the same still-usable observation immediately before signing. */
+    public CompoundExclusion revalidateObservation(CompoundAssessment assessment,
+                                                   AssetType principalAsset,
+                                                   long atMillis) {
+        if (assessment.expectedFee() == null || assessment.expectedFee().signum() == 0
+                || principalAsset.isAda()) {
+            return null;
+        }
+        PricingService.Priced current = pricingService.toLovelace(
+                principalAsset, assessment.expectedFee(), atMillis);
+        if (!current.isPriced()) {
+            return current.refusal() != null
+                    && current.refusal().reason() == PricingService.RefusalReason.NOT_USABLE_AT_INSTANT
+                    ? CompoundExclusion.PRICE_OBSERVATION_EXPIRED
+                    : priceExclusion(current.refusal());
+        }
+        if (!Objects.equals(assessment.priceObservation(), current.observation())) {
+            return CompoundExclusion.PRICE_OBSERVATION_CHANGED;
+        }
+        return null;
+    }
+
+    static CompoundExclusion priceExclusion(PricingService.PriceRefusal refusal) {
+        if (refusal == null || refusal.reason() == null) {
+            return CompoundExclusion.PRICE_CONVERSION_FAILED;
+        }
+        return switch (refusal.reason()) {
+            case NO_FEED -> CompoundExclusion.PRICE_NO_FEED;
+            case NOT_USABLE_AT_INSTANT -> CompoundExclusion.PRICE_NOT_USABLE;
+            case POOLED -> CompoundExclusion.PRICE_POOLED;
+            case NON_POSITIVE -> CompoundExclusion.PRICE_NON_POSITIVE;
+            case CONVERSION_FAILED -> CompoundExclusion.PRICE_CONVERSION_FAILED;
+        };
     }
 
     /**
@@ -159,6 +259,9 @@ public class CompoundEconomics {
      * required to give up, and the transaction fails phase 2.
      */
     static BigInteger expectedFee(BigInteger escrow, long feePerMille) {
+        if (escrow == null || escrow.signum() <= 0 || feePerMille < 0L || feePerMille > 999L) {
+            throw new IllegalArgumentException("Q > 0 and 0 <= c <= 999 are required");
+        }
         return escrow.multiply(BigInteger.valueOf(feePerMille)).divide(PER_MILLE);
     }
 }

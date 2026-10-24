@@ -106,6 +106,74 @@ public final class WalletInputSelection {
                 .max(BigInteger::compareTo);
     }
 
+    public enum CompoundFundingFailure {
+        MISSING_SAFE_ORDINARY_INPUT,
+        MISSING_DISTINCT_PURE_ADA_COLLATERAL
+    }
+
+    public record CompoundFunding(Utxo ordinaryInput, Utxo collateralInput) {
+        public CompoundFunding {
+            if (ordinaryInput == null || collateralInput == null
+                    || ordinaryInput.getTxHash().equals(collateralInput.getTxHash())
+                    && ordinaryInput.getOutputIndex() == collateralInput.getOutputIndex()) {
+                throw new IllegalArgumentException("compound ordinary input and collateral must be distinct");
+            }
+        }
+    }
+
+    public static final class CompoundFundingException extends RuntimeException {
+        private final CompoundFundingFailure reason;
+
+        public CompoundFundingException(CompoundFundingFailure reason) {
+            super(reason.name());
+            this.reason = reason;
+        }
+
+        public CompoundFundingFailure reason() {
+            return reason;
+        }
+    }
+
+    /**
+     * Compound-only nomination. Ordinary funding may carry reusable token inventory; collateral is
+     * a separate datum-free, reference-script-free pure-ADA UTxO. This does not alter the legacy
+     * ADA-only, liquidation or Tank selectors above.
+     */
+    public static CompoundFunding selectForCompound(List<Utxo> utxos, BigInteger requiredOrdinaryAda) {
+        List<Utxo> ordinary = utxos.stream()
+                .filter(WalletInputSelection::safeOrdinaryCompoundInput)
+                .filter(u -> LedgerCeilings.lovelaceOf(u).compareTo(requiredOrdinaryAda) >= 0)
+                // Reuse token-bearing change before consuming a pure-ADA UTxO needed for collateral.
+                .sorted(Comparator.comparing((Utxo u) -> u.getAmount().size() == 1)
+                        .thenComparing(LedgerCeilings::lovelaceOf, Comparator.reverseOrder()))
+                .toList();
+        if (ordinary.isEmpty()) {
+            throw new CompoundFundingException(CompoundFundingFailure.MISSING_SAFE_ORDINARY_INPUT);
+        }
+        for (Utxo input : ordinary) {
+            Optional<Utxo> collateral = utxos.stream()
+                    .filter(WalletInputSelection::nominable)
+                    .filter(u -> !sameOutRef(u, input))
+                    .max(Comparator.comparing(LedgerCeilings::lovelaceOf));
+            if (collateral.isPresent()) {
+                return new CompoundFunding(input, collateral.get());
+            }
+        }
+        throw new CompoundFundingException(CompoundFundingFailure.MISSING_DISTINCT_PURE_ADA_COLLATERAL);
+    }
+
+    private static boolean safeOrdinaryCompoundInput(Utxo utxo) {
+        return utxo != null && utxo.getAmount() != null && !utxo.getAmount().isEmpty()
+                && utxo.getReferenceScriptHash() == null
+                && utxo.getInlineDatum() == null
+                && utxo.getDataHash() == null;
+    }
+
+    private static boolean sameOutRef(Utxo left, Utxo right) {
+        return left.getOutputIndex() == right.getOutputIndex()
+                && java.util.Objects.equals(left.getTxHash(), right.getTxHash());
+    }
+
     // ---- token-principal nomination (ADDITIVE — Part 2 of the token-principals slice) -------------
     //
     // A pay-in-advance liquidation on a TOKEN principal must front that token, not ada, so the utxo

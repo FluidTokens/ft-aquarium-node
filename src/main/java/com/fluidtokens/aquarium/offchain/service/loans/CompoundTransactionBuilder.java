@@ -198,6 +198,24 @@ public class CompoundTransactionBuilder {
                           long validToSlot) {
     }
 
+    /** Facts measured from the exact final body after every kernel guard has passed. */
+    public record KernelFacts(BigInteger recoveredEscrowLovelace,
+                              BigInteger poolTopUpLovelace,
+                              BigInteger transactionFeeLovelace,
+                              byte[] bodyIdentity) {
+        public KernelFacts {
+            bodyIdentity = bodyIdentity.clone();
+        }
+
+        @Override
+        public byte[] bodyIdentity() {
+            return bodyIdentity.clone();
+        }
+    }
+
+    public record Built(Transaction transaction, KernelFacts facts) {
+    }
+
     private final LoansContractRegistry registry;
     private final Network network;
     private final UtxoSupplier utxoSupplier;
@@ -272,6 +290,10 @@ public class CompoundTransactionBuilder {
     // ---- the one entry point ----------------------------------------------------------------
 
     public Transaction build(Request request) {
+        return buildWithFacts(request).transaction();
+    }
+
+    public Built buildWithFacts(Request request) {
         CompoundCandidate c = request.candidate();
         if (!c.structurallyReady()) {
             throw refuse(Refusal.CANDIDATE_NOT_READY,
@@ -303,9 +325,32 @@ public class CompoundTransactionBuilder {
         ScriptTx tx = assemble(request, configRefIndex, lmConfigRefIndex,
                 poolWithdrawRedeemerIndex, lmWithdrawRedeemerIndex);
 
-        return complete(request, refInputs, tx,
+        Transaction transaction = complete(request, refInputs, tx,
                 (ctx, txn) -> assertStructure(txn, request, withdrawalOrder,
                         poolWithdrawRedeemerIndex, lmWithdrawRedeemerIndex));
+        return new Built(transaction, kernelFacts(request, transaction));
+    }
+
+    private KernelFacts kernelFacts(Request request, Transaction transaction) {
+        BigInteger recovered = request.candidate().principalIsAda()
+                ? BigInteger.ZERO : lovelaceOf(request.candidate().escrow().getAmount());
+        BigInteger topUp = BigInteger.ZERO;
+        if (!request.candidate().principalIsAda()) {
+            TransactionOutput pool = onlyOutputWithDatum(transaction,
+                    request.candidate().pool().getAddress(), request.candidate().pool().getInlineDatum(), "pool");
+            topUp = pool.getValue().getCoin()
+                    .subtract(lovelaceOf(request.candidate().pool().getAmount()));
+        }
+        return new KernelFacts(recovered, topUp, transaction.getBody().getFee(), bodyIdentity(transaction));
+    }
+
+    /** Canonical CBOR identity of the transaction body; witnesses are deliberately excluded. */
+    public static byte[] bodyIdentity(Transaction transaction) {
+        try {
+            return CborSerializationUtil.serialize(transaction.getBody().serialize());
+        } catch (Exception e) {
+            throw refuse(Refusal.VALUE_NOT_CONSERVED, "could not serialise final transaction body: " + e);
+        }
     }
 
     // ---- assembly ---------------------------------------------------------------------------

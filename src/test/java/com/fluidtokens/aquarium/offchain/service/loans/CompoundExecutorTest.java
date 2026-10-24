@@ -9,6 +9,7 @@ import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
@@ -27,7 +28,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -122,11 +125,11 @@ class CompoundExecutorTest {
     }
 
     private static Wiring wiringOnNetwork(List<CompoundCandidate> candidates, String network) {
-        return wiring(candidates, true, -2_000_000L, List.of(wallet()), network);
+        return wiring(candidates, true, -2_000_000L, List.of(wallet(), collateral()), network);
     }
 
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor) {
-        return wiring(candidates, armed, floor, List.of(wallet()), "preview");
+        return wiring(candidates, armed, floor, List.of(wallet(), collateral()), "preview");
     }
 
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor,
@@ -145,7 +148,10 @@ class CompoundExecutorTest {
         };
 
         List<Utxo> universe = new java.util.ArrayList<>(baseUniverse());
-        universe.addAll(walletUtxos);
+        walletUtxos.stream().filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
         var executor = new CompoundExecutor(configuration, network, blockEventListener,
@@ -188,6 +194,148 @@ class CompoundExecutorTest {
         assertEquals(1, w.submitted().size(),
                 "with the loss stated and bounded, the armed loop compounds");
         assertTrue(w.submitted().getFirst().length > 0, "signed bytes reached the submitter");
+    }
+
+    @Test
+    void aSuccessfulSubmissionStopsTheCandidatePass() {
+        Wiring w = wiring(List.of(ready(0L), ready(0L)), true, -2_000_000L);
+
+        w.executor().cycle();
+
+        assertEquals(1, w.submitted().size(),
+                "a successful first submission is terminal; a second intent would violate the pass budget");
+    }
+
+    @Test
+    void anAmbiguousTransportResultStopsButADefinitiveRejectionContinues() {
+        AtomicInteger ambiguousCalls = new AtomicInteger();
+        CompoundExecutor ambiguous = executor(List.of(ready(0L), ready(0L)), realBuilder(), bytes -> {
+            ambiguousCalls.incrementAndGet();
+            throw new java.io.IOException("acceptance unknown");
+        });
+        ambiguous.cycle();
+        assertEquals(1, ambiguousCalls.get(), "transport ambiguity must end the candidate pass");
+
+        AtomicInteger rejectedCalls = new AtomicInteger();
+        CompoundExecutor rejected = executor(List.of(ready(0L), ready(0L)), realBuilder(), bytes -> {
+            rejectedCalls.incrementAndGet();
+            return Result.<String>error("BadInputsUTxO").code(400);
+        });
+        rejected.cycle();
+        assertEquals(2, rejectedCalls.get(), "an explicit HTTP 4xx rejection may try the next candidate");
+    }
+
+    @Test
+    void aWouldSubmitResultIsTerminalEvenWithoutATransactionHash() {
+        AtomicInteger calls = new AtomicInteger();
+        CompoundExecutor executor = executor(List.of(ready(0L), ready(0L)), realBuilder(), bytes -> {
+            calls.incrementAndGet();
+            return Result.success("WOULD_SUBMIT").withValue("WOULD_SUBMIT");
+        });
+
+        executor.cycle();
+
+        assertEquals(1, calls.get(), "WOULD_SUBMIT represents a terminal intent, not a refusal");
+    }
+
+    @Test
+    void evidenceNativeZeroFeeCandidateBuildsAndSubmitsWithoutAnOracleCall() {
+        var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
+        CompoundCandidate base = ready(0L);
+        BigInteger q = BigInteger.valueOf(176_000_000L);
+        Utxo escrow = Utxo.builder().txHash(base.escrow().getTxHash())
+                .outputIndex(base.escrow().getOutputIndex()).address(base.escrow().getAddress())
+                .inlineDatum(base.escrow().getInlineDatum())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(1_986_910L)),
+                        Amount.asset(token.toUnit(), q))).build();
+        LenderBond bond = new LenderBond(base.bond().txHash(), base.bond().outputIndex(), base.bond().address(),
+                base.bond().loanId(), base.bond().inlineDatum(),
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), token));
+        CompoundCandidate nativeCandidate = new CompoundCandidate(base.loanId(), escrow, base.escrowDatum(), q,
+                bond, base.poolId(), base.pool(), base.poolManager(), 0L, false, null,
+                "offline evidence-derived native candidate");
+        List<Utxo> universe = new ArrayList<>(List.of(escrow, utxo("bond"), base.pool(), base.poolManager(),
+                utxo("config"), utxo("lmConfig"), wallet(), collateral()));
+        var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
+        var throwingClient = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed> findFeed(
+                    com.fluidtokens.aquarium.offchain.model.AssetType asset, long atMillis) {
+                throw new AssertionError("native F=0 must not consult the oracle");
+            }
+        };
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.ZERO);
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var block = new BlockEventListener(null);
+        block.getIsSyncing().set(false);
+        AtomicInteger submits = new AtomicInteger();
+        var executor = new CompoundExecutor(configuration, network, block,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(List.of(nativeCandidate)),
+                new CompoundEconomics(configuration, network, new PricingService(throwingClient)), builder,
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), bytes -> {
+                    submits.incrementAndGet();
+                    return Result.success("ok").withValue("native-offline");
+                });
+
+        executor.cycle();
+
+        assertEquals(1, submits.get(), "recovered E exceeds measured L+T at floor zero");
+    }
+
+    @Test
+    void productionSigningSubmitsTheExactKernelValidatedBody() {
+        AtomicReference<byte[]> validatedBody = new AtomicReference<>();
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        CompoundTransactionBuilder recording = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null) {
+            @Override
+            public Built buildWithFacts(Request request) {
+                Built built = super.buildWithFacts(request);
+                validatedBody.set(built.facts().bodyIdentity());
+                return built;
+            }
+        };
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(List.of(ready(0L)), recording, bytes -> {
+            submits.incrementAndGet();
+            Transaction signed = Transaction.deserialize(bytes);
+            assertArrayEquals(validatedBody.get(), CompoundTransactionBuilder.bodyIdentity(signed),
+                    "account.sign(transaction).serialize() may add witnesses but not change the body");
+            return Result.success("ok").withValue("deadbeef");
+        });
+
+        executor.cycle();
+
+        assertNotNull(validatedBody.get());
+        assertEquals(1, submits.get());
+    }
+
+    @Test
+    void bodyMutationAfterKernelValidationIsRefusedImmediatelyBeforeSigning() {
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        CompoundTransactionBuilder mutating = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null) {
+            @Override
+            public Built buildWithFacts(Request request) {
+                Built built = super.buildWithFacts(request);
+                built.transaction().getBody().setFee(built.transaction().getBody().getFee().add(BigInteger.ONE));
+                return built;
+            }
+        };
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(List.of(ready(0L)), mutating, bytes -> {
+            submits.incrementAndGet();
+            return Result.success("unexpected");
+        });
+
+        executor.cycle();
+
+        assertEquals(0, submits.get(), "a post-validation body mutation must not reach signing/submission");
     }
 
     /** A structurally refused candidate never reaches the builder. */
@@ -465,7 +613,8 @@ class CompoundExecutorTest {
         java.util.concurrent.atomic.AtomicReference<CompoundTransactionBuilder.Request> handed =
                 new java.util.concurrent.atomic.AtomicReference<>();
         CompoundTransactionBuilder recording = org.mockito.Mockito.mock(CompoundTransactionBuilder.class);
-        org.mockito.Mockito.when(recording.build(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class)))
+        org.mockito.Mockito.when(recording.buildWithFacts(
+                        org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class)))
                 .thenAnswer(invocation -> {
                     handed.set(invocation.getArgument(0));
                     throw new IllegalStateException("recorded; the transaction itself is not under test here");
@@ -493,6 +642,30 @@ class CompoundExecutorTest {
                 .referenceScriptHash(scriptHash).build();
     }
 
+    private static CompoundTransactionBuilder realBuilder() {
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        return new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
+    }
+
+    private static CompoundExecutor executor(List<CompoundCandidate> candidates,
+                                             CompoundTransactionBuilder builder,
+                                             CompoundExecutor.TransactionSubmitter submitter) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        return new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.converters(), submitter);
+    }
+
     /** The {@code wiring(...)} executor, with the builder stated and the universe the executor resolves against. */
     private static CompoundExecutor executorWithBuilder(AppConfig.CompoundConfiguration configuration,
                                                         CompoundTransactionBuilder builder, List<Utxo> universe) {
@@ -504,7 +677,7 @@ class CompoundExecutorTest {
             throw new AssertionError("nothing is built, so nothing may be submitted");
         };
         return new CompoundExecutor(configuration, network, blockEventListener,
-                new FakeAppUtxoService(List.of(wallet())), ACCOUNT,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
                 new FakeScanner(List.of(ready(0L))), new CompoundEconomics(configuration, network, pricingService()),
                 builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
     }
@@ -562,11 +735,72 @@ class CompoundExecutorTest {
         assertTrue(walked.get(0).contains(rich), "the 20/1000 escrow first: " + walked);
         assertTrue(walked.get(1).contains(cheap), "the 10/1000 escrow second: " + walked);
         assertTrue(walked.get(2).startsWith("compound REFUSED"), "the refused one last: " + walked);
-        assertEquals(List.of("compound order (most profitable first): " + rich + " ≈582185 lovelace, "
-                        + cheap + " ≈291092 lovelace, " + refused().escrowRef() + " unpriced"),
+        assertEquals(List.of("compound order (most profitable first): " + rich + " gross≈582185 lovelace, "
+                        + cheap + " gross≈291092 lovelace, " + refused().escrowRef() + " gross unpriced"),
                 info.stream().filter(line -> line.startsWith("compound order")).toList(),
                 "one INFO line naming the order: " + info);
         assertTrue(w.submitted().isEmpty(), "a disarmed loop transmits nothing");
+    }
+
+    @Test
+    void nativeRankingUsesLovelaceGrossNotRawTokenQuantity() {
+        var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
+        CompoundCandidate largerRaw = nativeCandidate("31".repeat(32), token,
+                BigInteger.valueOf(1_000_000L), 100L, BigInteger.valueOf(2_000_000L));
+        CompoundCandidate smallerRaw = nativeCandidate("32".repeat(32), token,
+                BigInteger.valueOf(1_000L), 100L, BigInteger.valueOf(5_000_000L));
+        var client = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed> findFeed(
+                    com.fluidtokens.aquarium.offchain.model.AssetType asset, long atMillis) {
+                return Optional.of(com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed.aggregated(
+                        token, BigInteger.ONE, BigInteger.valueOf(1_000L), atMillis - 1, atMillis + 1));
+            }
+        };
+        var configuration = new AppConfig.CompoundConfiguration(false, 60L, BigInteger.ZERO);
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var block = new BlockEventListener(null);
+        block.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        var executor = new CompoundExecutor(configuration, network, block,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(List.of(largerRaw, smallerRaw)),
+                new CompoundEconomics(configuration, network, new PricingService(client)), realBuilder(),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                bytes -> { throw new AssertionError("disarmed"); });
+        var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            executor.cycle();
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        String order = appender.list.stream().map(ILoggingEvent::getFormattedMessage)
+                .filter(line -> line.startsWith("compound order")).findFirst().orElseThrow();
+        assertTrue(order.indexOf(smallerRaw.escrowRef()) < order.indexOf(largerRaw.escrowRef()), order);
+        assertTrue(order.contains("gross≈5000000 lovelace"), order);
+        assertTrue(order.contains("gross≈2000100 lovelace"), order);
+    }
+
+    private static CompoundCandidate nativeCandidate(String txHash,
+                                                      com.fluidtokens.aquarium.offchain.model.AssetType token,
+                                                      BigInteger quantity,
+                                                      long feePerMille,
+                                                      BigInteger escrowCoin) {
+        CompoundCandidate base = readyAt(txHash, feePerMille);
+        Utxo escrow = Utxo.builder().txHash(txHash).outputIndex(base.escrow().getOutputIndex())
+                .address(base.escrow().getAddress()).inlineDatum(base.escrow().getInlineDatum())
+                .amount(List.of(Amount.lovelace(escrowCoin), Amount.asset(token.toUnit(), quantity))).build();
+        LenderBond bond = new LenderBond(base.bond().txHash(), base.bond().outputIndex(), base.bond().address(),
+                base.bond().loanId(), base.bond().inlineDatum(),
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), token));
+        return new CompoundCandidate(base.loanId(), escrow, base.escrowDatum(), quantity, bond,
+                base.poolId(), base.pool(), base.poolManager(), feePerMille, false, null, "native ranking");
     }
 
     /** {@link #readyAt} with no {@code addedLiquidity} — ready on paper, but nothing to price. */
@@ -577,7 +811,7 @@ class CompoundExecutorTest {
                 null, base.detail());
     }
 
-    /** {@link #readyAt} whose bond names a non-ada principal — the scanner refuses these today. */
+    /** {@link #readyAt} whose bond names a non-ADA principal, for the legacy ADA-only helper. */
     private static CompoundCandidate tokenPrincipalAt(String escrowTxHash) {
         CompoundCandidate base = readyAt(escrowTxHash, 20L);
         var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
