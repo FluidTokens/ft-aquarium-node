@@ -295,6 +295,37 @@ class CompoundLedgerValidationTest {
                 () -> fixture.builder().validateLedgerShape(tx, fixture.request()));
     }
 
+    @Test
+    void serializedFinalCollateralReturnBelowMinimumAdaIsRefused() throws Exception {
+        Fixture fixture = tokenFixture();
+        Transaction tx = fixture.builder().build(fixture.request());
+        TransactionOutput collateralReturn = tx.getBody().getCollateralReturn();
+        MinAdaCalculator calculator = new MinAdaCalculator(EvalFixtures.protocolParams().getProtocolParams());
+        BigInteger minimum = calculator.calculateMinAda(collateralReturn);
+        BigInteger below = minimum.subtract(BigInteger.ONE);
+        BigInteger capacity = tx.getBody().getCollateral().stream()
+                .map(input -> fixture.universe().stream()
+                        .filter(u -> u.getTxHash().equals(input.getTransactionId())
+                                && u.getOutputIndex() == input.getIndex())
+                        .findFirst().orElseThrow())
+                .map(CompoundLedgerValidationTest::lovelace)
+                .reduce(BigInteger.ZERO, BigInteger::add);
+        BigInteger declared = capacity.subtract(below);
+        BigInteger actualRequired = tx.getBody().getFee()
+                .multiply(EvalFixtures.protocolParams().getProtocolParams().getCollateralPercent().toBigIntegerExact())
+                .add(BigInteger.valueOf(99L)).divide(BigInteger.valueOf(100L));
+        assertTrue(declared.compareTo(actualRequired) >= 0,
+                "the mutant must retain enough declared collateral for the actual final fee");
+        collateralReturn.getValue().setCoin(below);
+        tx.getBody().setTotalCollateral(declared);
+        Transaction serializedFinal = Transaction.deserialize(tx.serialize());
+        assertEquals(below, serializedFinal.getBody().getCollateralReturn().getValue().getCoin(),
+                "the below-minimum collateral return must survive final-body serialization");
+
+        assertRefused(CompoundTransactionBuilder.Refusal.OUTPUT_BELOW_MIN_ADA,
+                () -> fixture.builder().validateLedgerShape(serializedFinal, fixture.request()));
+    }
+
     private static void assertStructure(Fixture fixture, Transaction tx) {
         List<String> order = fixture.builder().withdrawalOrder();
         fixture.builder().assertStructure(tx, fixture.request(), order,

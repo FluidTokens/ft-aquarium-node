@@ -10,12 +10,16 @@ import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.common.model.SlotConfigs;
+import com.bloxbean.cardano.client.function.TxBuilderContext;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.plutus.spec.ExUnits;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
+import com.bloxbean.cardano.client.transaction.spec.VkeyWitness;
+import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -237,6 +241,37 @@ class CompoundProductionWiringTest {
                 + "unpriced, which the ledger rejects as FeeTooSmallUTxO (CCL trap 9)");
         assertTrue(slack.compareTo(smallestShare) < 0, "the slack above the floor (" + slack + ") is not below "
                 + "the smallest script's share (" + smallestShare + "), so an unpriced script could hide in it");
+    }
+
+    @Test
+    void serializedFinalBodyBelowTheFullLedgerMinimumFeeIsRefused() throws Exception {
+        Fixture f = fixture(wallet(60_000_000L), null);
+        CompoundTransactionBuilder builder = production(f.universe(),
+                new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(f.universe())));
+        Transaction tx = Transaction.deserialize(builder.build(f.request()).serialize());
+        BigInteger minimum = fullLedgerMinimum(tx, f.universe());
+        BigInteger underpaid = minimum.subtract(BigInteger.ONE);
+        BigInteger returnedToWallet = tx.getBody().getFee().subtract(underpaid);
+        assertTrue(returnedToWallet.signum() >= 0,
+                "the valid production body must not already be below the independently calculated floor");
+        tx.getBody().setFee(underpaid);
+        TransactionOutput walletOutput = tx.getBody().getOutputs().stream()
+                .filter(o -> BOT.equals(o.getAddress()))
+                .filter(o -> o.getInlineDatum() == null && o.getDatumHash() == null)
+                .findFirst().orElseThrow();
+        walletOutput.getValue().setCoin(walletOutput.getValue().getCoin().add(returnedToWallet));
+        Transaction serializedFinal = Transaction.deserialize(tx.serialize());
+
+        // Every preceding final-body invariant remains valid; only the full ledger minimum is short.
+        builder.validateLedgerShape(serializedFinal, f.request());
+        TxBuilderContext context = TxBuilderContext.init(LoanFixtures.utxoSupplier(f.universe()),
+                EvalFixtures.protocolParams());
+        CompoundTransactionBuilder.RefusedException refused = assertThrows(
+                CompoundTransactionBuilder.RefusedException.class,
+                () -> builder.validateLedgerFee(serializedFinal, context));
+        assertEquals(CompoundTransactionBuilder.Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                refused.getReason(), refused.getMessage());
+        assertTrue(refused.getMessage().contains("below " + minimum), refused.getMessage());
     }
 
     /**
@@ -620,6 +655,33 @@ class CompoundProductionWiringTest {
                     .add(pp.getPriceStep().multiply(new BigDecimal(r.getExUnits().getSteps())));
         }
         return base.add(scripts.setScale(0, RoundingMode.CEILING).toBigIntegerExact());
+    }
+
+    /** Full ledger floor: one vkey witness, evaluator ex-units and every referenced script tier. */
+    private static BigInteger fullLedgerMinimum(Transaction tx, List<Utxo> universe) throws Exception {
+        Transaction witnessed = TransactionUtil.createCopy(tx);
+        if (witnessed.getWitnessSet().getVkeyWitnesses() == null) {
+            witnessed.getWitnessSet().setVkeyWitnesses(new ArrayList<>());
+        }
+        VkeyWitness witness = new VkeyWitness();
+        witness.setVkey(new byte[32]);
+        witness.setSignature(new byte[64]);
+        witnessed.getWitnessSet().getVkeyWitnesses().add(witness);
+        ProtocolParams pp = EvalFixtures.protocolParams().getProtocolParams();
+        BigInteger base = BigInteger.valueOf(pp.getMinFeeA())
+                .multiply(BigInteger.valueOf(witnessed.serialize().length))
+                .add(BigInteger.valueOf(pp.getMinFeeB()));
+        BigDecimal scripts = BigDecimal.ZERO;
+        for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
+            scripts = scripts.add(pp.getPriceMem().multiply(new BigDecimal(redeemer.getExUnits().getMem())))
+                    .add(pp.getPriceStep().multiply(new BigDecimal(redeemer.getExUnits().getSteps())));
+        }
+        long referenceBytes = 0;
+        for (String hash : referencedScriptHashes(tx, universe)) {
+            referenceBytes += rigScripts().getScript(hash).orElseThrow().serializeScriptBody().length;
+        }
+        return base.add(scripts.setScale(0, RoundingMode.CEILING).toBigIntegerExact())
+                .add(refScriptFee(referenceBytes));
     }
 
     /**

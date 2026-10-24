@@ -118,6 +118,13 @@ public class CompoundTransactionBuilder {
     /** Four script inputs, therefore four spend redeemers before the first reward redeemer. */
     static final int SCRIPT_SPEND_COUNT = 4;
 
+    /**
+     * The provisional reservation target used by CCL when the wallet has not yet reached the
+     * protocol-ceiling target shape. It is only a selection preference: the finished body's actual
+     * fee remains the authority in {@link #validateCollateral}.
+     */
+    private static final BigInteger PROVISIONAL_COLLATERAL = BigInteger.valueOf(5_000_000L);
+
     public enum Refusal {
         CANDIDATE_NOT_READY,
         POOL_DATUM_NOT_BYTE_IDENTICAL,
@@ -558,28 +565,30 @@ public class CompoundTransactionBuilder {
                 .sorted(Comparator.comparing((Utxo u) -> lovelaceOf(u.getAmount())).reversed())
                 .toList();
         int limit = Math.max(1, params.getMaxCollateralInputs());
-        List<TransactionInput> chosen = new ArrayList<>();
-        BigInteger capacity = BigInteger.ZERO;
         Utxo preferred = candidates.stream()
                 .filter(u -> lovelaceOf(u.getAmount()).equals(required))
                 .findFirst().orElse(null);
-        if (preferred != null) {
-            chosen.add(inputOf(preferred));
-            capacity = required;
+        if (preferred == null) {
+            // Do not reserve every pure-ADA UTxO merely to chase the protocol-wide fee ceiling. A
+            // temporarily unshaped wallet commonly has one 5 ADA collateral candidate and one larger
+            // balancing input; taking both makes an otherwise valid transaction look unfunded. Prefer
+            // the smallest candidate at least as large as CCL's provisional target, or the largest
+            // available candidate when none reaches it. The exact final fee decides sufficiency below.
+            preferred = candidates.stream()
+                    .filter(u -> lovelaceOf(u.getAmount()).compareTo(PROVISIONAL_COLLATERAL) >= 0)
+                    .min(Comparator.comparing(u -> lovelaceOf(u.getAmount())))
+                    .orElseGet(() -> candidates.stream()
+                            .max(Comparator.comparing(u -> lovelaceOf(u.getAmount())))
+                            .orElse(null));
         }
-        for (Utxo candidate : candidates) {
-            if (candidate == preferred) {
-                continue;
-            }
-            if (chosen.size() >= limit || capacity.compareTo(required) >= 0) {
-                break;
-            }
-            chosen.add(inputOf(candidate));
-            capacity = capacity.add(lovelaceOf(candidate.getAmount()));
-        }
-        if (chosen.isEmpty()) {
+        if (preferred == null) {
             throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
                     "wallet has no distinct pure-ADA collateral candidate");
+        }
+        List<TransactionInput> chosen = List.of(inputOf(preferred));
+        if (chosen.size() > limit) {
+            throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                    "collateral selection exceeds maxCollateralInputs=" + limit);
         }
         // The ceiling is a preferred reservation target, not a minimum. The body does not yet have
         // its evaluator costs or final fee here; validateCollateral later proves this chosen capacity
@@ -636,6 +645,22 @@ public class CompoundTransactionBuilder {
         validateInputsOutputsAndValue(tx, request);
         validateCollateral(tx, request);
         validateMinAdaAndSize(tx, protocolParams());
+    }
+
+    /**
+     * Package-visible mutation seam for the final ledger fee comparison. The test supplies the
+     * production-derived builder context and this method invokes the same guard as
+     * {@link #validateFinalTransaction}; it does not duplicate the fee formula.
+     */
+    void validateLedgerFee(Transaction built, TxBuilderContext context) {
+        final Transaction tx;
+        try {
+            tx = Transaction.deserialize(built.serialize());
+        } catch (Exception e) {
+            throw refuse(Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                    "the unsigned transaction does not round-trip: " + e);
+        }
+        validateMinimumFee(tx, context);
     }
 
     private void validateInputsOutputsAndValue(Transaction tx, Request request) {
