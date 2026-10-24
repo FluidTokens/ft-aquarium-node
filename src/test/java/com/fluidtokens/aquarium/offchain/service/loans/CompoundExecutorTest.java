@@ -203,91 +203,208 @@ class CompoundExecutorTest {
 
     @Test
     void aSuccessfulSubmissionStopsTheCandidatePass() {
-        Wiring w = wiring(twoReadyCandidates(), true, -2_000_000L);
-
-        w.executor().cycle();
-
-        assertEquals(1, w.submitted().size(),
+        assertResponseAttempts(Result.<String>success("ok").withValue("deadbeef"), 1,
                 "a successful first submission is terminal; a second intent would violate the pass budget");
     }
 
     @Test
     void anAmbiguousTransportResultStops() {
         AtomicInteger ambiguousCalls = new AtomicInteger();
-        CompoundExecutor ambiguous = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
+        Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+        CompoundExecutor ambiguous = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()),
+                signingAccount, bytes -> {
             ambiguousCalls.incrementAndGet();
             throw new java.io.IOException("acceptance unknown");
         });
         ambiguous.cycle();
+        org.mockito.Mockito.verify(signingAccount, org.mockito.Mockito.times(1))
+                .sign(org.mockito.ArgumentMatchers.any(Transaction.class));
         assertEquals(1, ambiguousCalls.get(), "transport ambiguity must end the candidate pass");
     }
 
     @Test
-    void aKnownDecodedBlockfrostRejectionContinuesToTheNextCandidate() {
-        AtomicInteger rejectedCalls = new AtomicInteger();
-        CompoundExecutor rejected = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
-            rejectedCalls.incrementAndGet();
-            return blockfrostRejection(400,
-                    "transaction submit error ShelleyTxValidationError ShelleyBasedEraConway "
-                            + "(ApplyTxError [UtxowFailure (UtxoFailure (BadInputsUTxO "
-                            + "(fromList [TxIn deadbeef 0])))])");
-        });
-        rejected.cycle();
-        assertEquals(2, rejectedCalls.get(),
-                "a complete decoded Blockfrost ledger rejection may try the next candidate");
+    void aProviderSubmitRefusalWithALegacyLookingMessageContinuesToTheNextCandidate() {
+        assertResponseAttempts(blockfrostRejection(400,
+                "transaction submit error ShelleyTxValidationError ShelleyBasedEraConway "
+                        + "(ApplyTxError [UtxowFailure (UtxoFailure (BadInputsUTxO "
+                        + "(fromList [TxIn deadbeef 0])))])"), 2,
+                "a complete decoded Blockfrost provider submit refusal may try the next candidate");
+    }
+
+    @Test
+    void documentedBlockfrostBadRequestContinuesToSecondCandidate() {
+        assertResponseAttempts(Result.<String>error(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":"
+                        + "\"Backend did not understand your request.\"}").code(400), 2,
+                "the documented Blockfrost submit-refusal envelope");
+    }
+
+    @Test
+    void opaqueMessageNeverDecidesProviderRefusal() {
+        for (String message : List.of(
+                "",
+                "arbitrary prose",
+                "transaction submit error arbitrary ShelleyTxValidationError text ApplyTxError",
+                "transaction submit error ShelleyTxValidationError (ApplyTxError [BadInputsUTxO])",
+                "{\"constructor\":\"ApplyTxError\",\"details\":[]}")) {
+            assertResponseAttempts(blockfrostRejection(400, message), 2,
+                    "message is opaque: " + message);
+        }
+    }
+
+    @Test
+    void schemaPermittedExtraMemberStillContinues() {
+        assertResponseAttempts(Result.<String>error(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\","
+                        + "\"provider_trace\":{\"region\":\"eu\"}}").code(400), 2,
+                "the provider schema permits additional members");
+    }
+
+    @Test
+    void resultAndEnvelopeStatusMustBothBe400() {
+        List<Result<String>> responses = List.of(
+                Result.<String>error(blockfrostError(400, "Bad Request", "opaque")).code(408),
+                Result.<String>error(blockfrostError(408, "Bad Request", "opaque")).code(400),
+                Result.<String>error("{\"status_code\":400.0,\"error\":\"Bad Request\","
+                        + "\"message\":\"opaque\"}").code(400),
+                Result.<String>error("{\"status_code\":\"400\",\"error\":\"Bad Request\","
+                        + "\"message\":\"opaque\"}").code(400));
+        for (Result<String> response : responses) {
+            assertResponseAttempts(response, 1, "both statuses must be the integral number 400");
+        }
+    }
+
+    @Test
+    void badRequestNameMustMatchRecognizedSubset() {
+        for (String body : List.of(
+                "{\"status_code\":400,\"message\":\"opaque\",\"extra\":0}",
+                "{\"status_code\":400,\"error\":400,\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":\"bad request\",\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":\"Conflict\",\"message\":\"opaque\"}")) {
+            assertResponseAttempts(Result.<String>error(body).code(400), 1,
+                    "error must be the exact recognized provider example");
+        }
+    }
+
+    @Test
+    void allRequiredFieldsAreTyped() {
+        for (String body : List.of(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"extra\":0}",
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":400}",
+                "{\"error\":\"Bad Request\",\"message\":\"opaque\",\"extra\":0}",
+                "{\"status_code\":null,\"error\":\"Bad Request\",\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":null,\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":null}",
+                "[400,\"Bad Request\",\"opaque\"]")) {
+            assertResponseAttempts(Result.<String>error(body).code(400), 1,
+                    "required fields and root must retain their documented JSON types");
+        }
+    }
+
+    @Test
+    void duplicateOrTrailingJsonIsAmbiguous() {
+        for (String body : List.of(
+                "{\"status_code\":400,\"status_code\":400,\"error\":\"Bad Request\","
+                        + "\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\","
+                        + "\"extra\":{\"x\":1,\"x\":2}}",
+                blockfrostError(400, "Bad Request", "opaque") + "{}",
+                blockfrostError(400, "Bad Request", "opaque") + " trailing",
+                "\uFEFF" + blockfrostError(400, "Bad Request", "opaque"))) {
+            assertResponseAttempts(Result.<String>error(body).code(400), 1,
+                    "duplicates, a BOM, and unconsumed input are ambiguous");
+        }
+    }
+
+    @Test
+    void malformedOrUnframed400IsAmbiguous() {
+        for (String body : List.of("{not-json", "Bad Request", "<html>Bad Request</html>", "", " \t\r\n")) {
+            assertResponseAttempts(Result.<String>error(body).code(400), 1,
+                    "only a complete provider JSON envelope is definite");
+        }
+    }
+
+    @Test
+    void decoderBoundsAreClosed() {
+        List<String> exactBounds = List.of(
+                exactLengthBlockfrostBody(131_072),
+                blockfrostError(400, "Bad Request", "x".repeat(65_536)),
+                escapedMessageBody(20_000),
+                longFieldNameBody(65_536),
+                nestedExtraBody(15),
+                extraNumberBody("12345678901234567890"),
+                memberCountBody(32));
+        for (int i = 0; i < exactBounds.size(); i++) {
+            assertResponseAttempts(Result.<String>error(exactBounds.get(i)).code(400), 2,
+                    "exact body/string/escaped-string/field-name/depth/number/member control " + i);
+        }
+
+        List<String> oneOverBounds = List.of(
+                exactLengthBlockfrostBody(131_073),
+                blockfrostError(400, "Bad Request", "x".repeat(65_537)),
+                longFieldNameBody(65_537),
+                nestedExtraBody(16),
+                extraNumberBody("123456789012345678901"),
+                memberCountBody(33));
+        for (int i = 0; i < oneOverBounds.size(); i++) {
+            assertResponseAttempts(Result.<String>error(oneOverBounds.get(i)).code(400), 1,
+                    "one-over body/string/field-name/depth/number/member control " + i);
+        }
+
+        assertResponseAttempts(Result.<String>error(" \t\r\n"
+                + blockfrostError(400, "Bad Request", "opaque") + "\n\t ").code(400), 2,
+                "JSON whitespace around the one complete document is allowed");
     }
 
     @Test
     void http408StopsAfterExactlyOneSignAndSubmitIntent() {
-        assertAmbiguousResponseStops(Result.<String>error(blockfrostError(408, "Request Timeout",
-                        "request timed out while waiting for the backend")).code(408),
+        assertResponseAttempts(Result.<String>error(blockfrostError(408, "Request Timeout",
+                        "request timed out while waiting for the backend")).code(408), 1,
                 "HTTP 408 does not establish rejection");
     }
 
     @Test
     void undecodable4xxStopsAfterExactlyOneSignAndSubmitIntent() {
-        assertAmbiguousResponseStops(Result.<String>error("upstream proxy refused the request").code(429),
+        assertResponseAttempts(Result.<String>error("upstream proxy refused the request").code(429), 1,
                 "an arbitrary 4xx body does not establish rejection");
     }
 
     @Test
-    void raw400CannotMasqueradeAsDecodedRejection() {
-        assertAmbiguousResponseStops(Result.<String>error("BadInputsUTxO").code(400),
-                "a status and raw ledger tag are not a decoded Blockfrost rejection");
+    void nullOther4xxAnd5xxResponsesRemainTerminalAmbiguity() {
+        assertResponseAttempts(null, 1, "a null result has unknown acceptance");
+        assertResponseAttempts(Result.<String>error(null).code(400), 1,
+                "an HTTP 400 without a response body has unknown acceptance");
+        for (int status : List.of(418, 425, 429, 500, 503)) {
+            assertResponseAttempts(Result.<String>error(
+                    blockfrostError(status, "Bad Request", "opaque")).code(status), 1,
+                    "HTTP " + status + " is outside the recognized provider refusal boundary");
+        }
     }
 
     @Test
-    void malformedJsonCannotMasqueradeAsDecodedRejection() {
-        assertAmbiguousResponseStops(Result.<String>error("{not-json").code(400),
-                "malformed JSON is not a decoded Blockfrost rejection");
+    void raw400CannotMasqueradeAsProviderSubmitRefusal() {
+        assertResponseAttempts(Result.<String>error("BadInputsUTxO").code(400), 1,
+                "a status and raw ledger tag are not a decoded provider refusal");
     }
 
     @Test
-    void statusMismatchedPayloadCannotMasqueradeAsDecodedRejection() {
-        assertAmbiguousResponseStops(Result.<String>error(blockfrostError(409, "Conflict",
+    void malformedJsonCannotMasqueradeAsProviderSubmitRefusal() {
+        assertResponseAttempts(Result.<String>error("{not-json").code(400), 1,
+                "malformed JSON is not a decoded provider refusal");
+    }
+
+    @Test
+    void statusMismatchedPayloadCannotMasqueradeAsProviderSubmitRefusal() {
+        assertResponseAttempts(Result.<String>error(blockfrostError(409, "Conflict",
                         "transaction submit error ShelleyTxValidationError ShelleyBasedEraConway "
-                                + "(ApplyTxError [BadInputsUTxO])")).code(400),
+                                + "(ApplyTxError [BadInputsUTxO])")).code(400), 1,
                 "HTTP status and payload status must agree");
     }
 
     @Test
-    void arbitraryNonblankBlockfrostMessageCannotMasqueradeAsDecodedRejection() {
-        assertAmbiguousResponseStops(Result.<String>error(
-                        blockfrostError(400, "Bad Request", "arbitrary nonblank text")).code(400),
-                "a complete JSON shape without a decoded ledger rejection is still ambiguous");
-    }
-
-    @Test
     void aWouldSubmitResultIsTerminalEvenWithoutATransactionHash() {
-        AtomicInteger calls = new AtomicInteger();
-        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
-            calls.incrementAndGet();
-            return Result.success("WOULD_SUBMIT").withValue("WOULD_SUBMIT");
-        });
-
-        executor.cycle();
-
-        assertEquals(1, calls.get(), "WOULD_SUBMIT represents a terminal intent, not a refusal");
+        assertResponseAttempts(Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"), 1,
+                "WOULD_SUBMIT represents a terminal intent, not a refusal");
     }
 
     @Test
@@ -798,16 +915,72 @@ class CompoundExecutorTest {
         }
     }
 
-    private static void assertAmbiguousResponseStops(Result<String> response, String message) {
-        AtomicInteger calls = new AtomicInteger();
-        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
-            calls.incrementAndGet();
-            return response;
-        });
+    private record AttemptCounts(long signs, int submits) {
+    }
 
+    private static AttemptCounts responseAttempts(Result<String> response) {
+        Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()),
+                signingAccount, bytes -> {
+                    submits.incrementAndGet();
+                    return response;
+                });
         executor.cycle();
+        long signs = org.mockito.Mockito.mockingDetails(signingAccount).getInvocations().stream()
+                .filter(invocation -> invocation.getMethod().getName().equals("sign"))
+                .count();
+        return new AttemptCounts(signs, submits.get());
+    }
 
-        assertEquals(1, calls.get(), message);
+    private static void assertResponseAttempts(Result<String> response, int expected, String message) {
+        AttemptCounts counts = responseAttempts(response);
+        assertEquals(expected, counts.signs(), message + " (signs)");
+        assertEquals(expected, counts.submits(), message + " (submits)");
+    }
+
+    private static String exactLengthBlockfrostBody(int targetLength) {
+        String prefix = "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"\""
+                + ",\"a\":\"";
+        String middle = "\",\"b\":\"";
+        String suffix = "\"}";
+        int firstLength = 65_536;
+        int secondLength = targetLength - prefix.length() - firstLength - middle.length() - suffix.length();
+        if (secondLength < 0 || secondLength > 65_536) {
+            throw new IllegalArgumentException("unsupported exact body length " + targetLength);
+        }
+        String body = prefix + "x".repeat(firstLength) + middle + "y".repeat(secondLength) + suffix;
+        assertEquals(targetLength, body.length(), "test fixture must isolate the body-length bound");
+        return body;
+    }
+
+    private static String nestedExtraBody(int nestedArrays) {
+        return "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\","
+                + "\"nested\":" + "[".repeat(nestedArrays) + "0" + "]".repeat(nestedArrays) + "}";
+    }
+
+    private static String escapedMessageBody(int decodedLength) {
+        return "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\""
+                + "\\u0061".repeat(decodedLength) + "\"}";
+    }
+
+    private static String longFieldNameBody(int fieldNameLength) {
+        return "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\",\""
+                + "f".repeat(fieldNameLength) + "\":null}";
+    }
+
+    private static String extraNumberBody(String numberToken) {
+        return "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\","
+                + "\"number\":" + numberToken + "}";
+    }
+
+    private static String memberCountBody(int memberCount) {
+        StringBuilder body = new StringBuilder(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\"");
+        for (int i = 3; i < memberCount; i++) {
+            body.append(",\"extra").append(i).append("\":null");
+        }
+        return body.append('}').toString();
     }
 
     private static List<CompoundCandidate> twoReadyCandidates() {
