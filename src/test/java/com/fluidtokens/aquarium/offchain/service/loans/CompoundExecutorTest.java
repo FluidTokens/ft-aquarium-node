@@ -152,6 +152,11 @@ class CompoundExecutorTest {
                         existing.getTxHash().equals(candidate.getTxHash())
                                 && existing.getOutputIndex() == candidate.getOutputIndex()))
                 .forEach(universe::add);
+        candidates.stream().map(CompoundCandidate::escrow)
+                .filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
         var executor = new CompoundExecutor(configuration, network, blockEventListener,
@@ -198,7 +203,7 @@ class CompoundExecutorTest {
 
     @Test
     void aSuccessfulSubmissionStopsTheCandidatePass() {
-        Wiring w = wiring(List.of(ready(0L), ready(0L)), true, -2_000_000L);
+        Wiring w = wiring(twoReadyCandidates(), true, -2_000_000L);
 
         w.executor().cycle();
 
@@ -207,28 +212,75 @@ class CompoundExecutorTest {
     }
 
     @Test
-    void anAmbiguousTransportResultStopsButADefinitiveRejectionContinues() {
+    void anAmbiguousTransportResultStops() {
         AtomicInteger ambiguousCalls = new AtomicInteger();
-        CompoundExecutor ambiguous = executor(List.of(ready(0L), ready(0L)), realBuilder(), bytes -> {
+        CompoundExecutor ambiguous = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
             ambiguousCalls.incrementAndGet();
             throw new java.io.IOException("acceptance unknown");
         });
         ambiguous.cycle();
         assertEquals(1, ambiguousCalls.get(), "transport ambiguity must end the candidate pass");
+    }
 
+    @Test
+    void aKnownDecodedBlockfrostRejectionContinuesToTheNextCandidate() {
         AtomicInteger rejectedCalls = new AtomicInteger();
-        CompoundExecutor rejected = executor(List.of(ready(0L), ready(0L)), realBuilder(), bytes -> {
+        CompoundExecutor rejected = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
             rejectedCalls.incrementAndGet();
-            return Result.<String>error("BadInputsUTxO").code(400);
+            return blockfrostRejection(400,
+                    "transaction submit error ShelleyTxValidationError ShelleyBasedEraConway "
+                            + "(ApplyTxError [UtxowFailure (UtxoFailure (BadInputsUTxO "
+                            + "(fromList [TxIn deadbeef 0])))])");
         });
         rejected.cycle();
-        assertEquals(2, rejectedCalls.get(), "an explicit HTTP 4xx rejection may try the next candidate");
+        assertEquals(2, rejectedCalls.get(),
+                "a complete decoded Blockfrost ledger rejection may try the next candidate");
+    }
+
+    @Test
+    void http408StopsAfterExactlyOneSignAndSubmitIntent() {
+        assertAmbiguousResponseStops(Result.<String>error(blockfrostError(408, "Request Timeout",
+                        "request timed out while waiting for the backend")).code(408),
+                "HTTP 408 does not establish rejection");
+    }
+
+    @Test
+    void undecodable4xxStopsAfterExactlyOneSignAndSubmitIntent() {
+        assertAmbiguousResponseStops(Result.<String>error("upstream proxy refused the request").code(429),
+                "an arbitrary 4xx body does not establish rejection");
+    }
+
+    @Test
+    void raw400CannotMasqueradeAsDecodedRejection() {
+        assertAmbiguousResponseStops(Result.<String>error("BadInputsUTxO").code(400),
+                "a status and raw ledger tag are not a decoded Blockfrost rejection");
+    }
+
+    @Test
+    void malformedJsonCannotMasqueradeAsDecodedRejection() {
+        assertAmbiguousResponseStops(Result.<String>error("{not-json").code(400),
+                "malformed JSON is not a decoded Blockfrost rejection");
+    }
+
+    @Test
+    void statusMismatchedPayloadCannotMasqueradeAsDecodedRejection() {
+        assertAmbiguousResponseStops(Result.<String>error(blockfrostError(409, "Conflict",
+                        "transaction submit error ShelleyTxValidationError ShelleyBasedEraConway "
+                                + "(ApplyTxError [BadInputsUTxO])")).code(400),
+                "HTTP status and payload status must agree");
+    }
+
+    @Test
+    void arbitraryNonblankBlockfrostMessageCannotMasqueradeAsDecodedRejection() {
+        assertAmbiguousResponseStops(Result.<String>error(
+                        blockfrostError(400, "Bad Request", "arbitrary nonblank text")).code(400),
+                "a complete JSON shape without a decoded ledger rejection is still ambiguous");
     }
 
     @Test
     void aWouldSubmitResultIsTerminalEvenWithoutATransactionHash() {
         AtomicInteger calls = new AtomicInteger();
-        CompoundExecutor executor = executor(List.of(ready(0L), ready(0L)), realBuilder(), bytes -> {
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
             calls.incrementAndGet();
             return Result.success("WOULD_SUBMIT").withValue("WOULD_SUBMIT");
         });
@@ -327,15 +379,47 @@ class CompoundExecutorTest {
                 return built;
             }
         };
+        Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
         AtomicInteger submits = new AtomicInteger();
-        CompoundExecutor executor = executor(List.of(ready(0L)), mutating, bytes -> {
+        CompoundExecutor executor = executor(List.of(ready(0L)), mutating, signingAccount, bytes -> {
             submits.incrementAndGet();
             return Result.success("unexpected");
         });
 
         executor.cycle();
 
-        assertEquals(0, submits.get(), "a post-validation body mutation must not reach signing/submission");
+        org.mockito.Mockito.verify(signingAccount, org.mockito.Mockito.never())
+                .sign(org.mockito.ArgumentMatchers.any(Transaction.class));
+        assertEquals(0, submits.get(), "a post-validation body mutation must not reach submission");
+    }
+
+    @Test
+    void changedAndExpiredPriceObservationsAreRefusedBeforeSigning() {
+        for (CompoundExclusion refusal : List.of(CompoundExclusion.PRICE_OBSERVATION_CHANGED,
+                CompoundExclusion.PRICE_OBSERVATION_EXPIRED)) {
+            var configuration = new AppConfig.CompoundConfiguration(
+                    true, 60L, BigInteger.valueOf(-2_000_000L));
+            var network = new AppConfig.Network();
+            network.setNetworkForTest("preview");
+            CompoundEconomics economics = org.mockito.Mockito.spy(
+                    new CompoundEconomics(configuration, network, pricingService()));
+            org.mockito.Mockito.doReturn(refusal).when(economics).revalidateObservation(
+                    org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                    org.mockito.ArgumentMatchers.anyLong());
+            Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+            AtomicInteger submits = new AtomicInteger();
+            CompoundExecutor executor = executor(List.of(ready(0L)), realBuilder(), signingAccount,
+                    economics, bytes -> {
+                        submits.incrementAndGet();
+                        return Result.success("unexpected");
+                    });
+
+            executor.cycle();
+
+            org.mockito.Mockito.verify(signingAccount, org.mockito.Mockito.never())
+                    .sign(org.mockito.ArgumentMatchers.any(Transaction.class));
+            assertEquals(0, submits.get(), refusal + " must refuse before signing or submission");
+        }
     }
 
     /** A structurally refused candidate never reaches the builder. */
@@ -643,14 +727,42 @@ class CompoundExecutorTest {
     }
 
     private static CompoundTransactionBuilder realBuilder() {
+        return realBuilder(List.of());
+    }
+
+    private static CompoundTransactionBuilder realBuilder(List<CompoundCandidate> candidates) {
         List<Utxo> universe = new ArrayList<>(baseUniverse());
         universe.add(wallet());
+        candidates.stream().map(CompoundCandidate::escrow)
+                .filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
         return new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
     }
 
     private static CompoundExecutor executor(List<CompoundCandidate> candidates,
                                              CompoundTransactionBuilder builder,
+                                             CompoundExecutor.TransactionSubmitter submitter) {
+        return executor(candidates, builder, ACCOUNT, submitter);
+    }
+
+    private static CompoundExecutor executor(List<CompoundCandidate> candidates,
+                                             CompoundTransactionBuilder builder,
+                                             Account account,
+                                             CompoundExecutor.TransactionSubmitter submitter) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        return executor(candidates, builder, account,
+                new CompoundEconomics(configuration, network, pricingService()), submitter);
+    }
+
+    private static CompoundExecutor executor(List<CompoundCandidate> candidates,
+                                             CompoundTransactionBuilder builder,
+                                             Account account,
+                                             CompoundEconomics economics,
                                              CompoundExecutor.TransactionSubmitter submitter) {
         var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
         var network = new AppConfig.Network();
@@ -659,11 +771,47 @@ class CompoundExecutorTest {
         blockEventListener.getIsSyncing().set(false);
         List<Utxo> universe = new ArrayList<>(baseUniverse());
         universe.add(wallet());
+        candidates.stream().map(CompoundCandidate::escrow)
+                .filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
         return new CompoundExecutor(configuration, network, blockEventListener,
-                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
-                new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
+                new FakeAppUtxoService(List.of(wallet(), collateral())), account,
+                new FakeScanner(candidates), economics,
                 builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe),
                 LoanFixtures.converters(), submitter);
+    }
+
+    private static Result<String> blockfrostRejection(int statusCode, String message) {
+        return Result.<String>error(blockfrostError(statusCode, "Bad Request", message)).code(statusCode);
+    }
+
+    private static String blockfrostError(int statusCode, String error, String message) {
+        try {
+            return new ObjectMapper().writeValueAsString(java.util.Map.of(
+                    "status_code", statusCode,
+                    "error", error,
+                    "message", message));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new AssertionError("test-only Blockfrost response fixture must serialize", e);
+        }
+    }
+
+    private static void assertAmbiguousResponseStops(Result<String> response, String message) {
+        AtomicInteger calls = new AtomicInteger();
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
+            calls.incrementAndGet();
+            return response;
+        });
+
+        executor.cycle();
+
+        assertEquals(1, calls.get(), message);
+    }
+
+    private static List<CompoundCandidate> twoReadyCandidates() {
+        return List.of(readyAt("11".repeat(32), 0L), readyAt("12".repeat(32), 0L));
     }
 
     /** The {@code wiring(...)} executor, with the builder stated and the universe the executor resolves against. */
