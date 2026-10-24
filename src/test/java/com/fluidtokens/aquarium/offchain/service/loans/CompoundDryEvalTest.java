@@ -91,15 +91,21 @@ class CompoundDryEvalTest {
                 .build();
     }
 
-    /** The bot's own funds — the one synthetic object, and ada-only so it can serve as collateral. */
+    /** The bot's ordinary fee-paying funds. */
     private static Utxo wallet() {
         return Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(BOT)
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
     }
 
+    /** A distinct pure-ADA UTxO reserved for collateral and never available to balancing. */
+    private static Utxo collateral() {
+        return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(BOT)
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+    }
+
     private static List<Utxo> universe() {
         return List.of(utxo("escrow"), utxo("bond"), utxo("pool"), utxo("poolManager"),
-                recordedConfig(), recordedLmConfig(), wallet());
+                recordedConfig(), recordedLmConfig(), wallet(), collateral());
     }
 
     /**

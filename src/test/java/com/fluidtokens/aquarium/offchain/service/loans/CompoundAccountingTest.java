@@ -129,6 +129,7 @@ class CompoundAccountingTest {
         List<Utxo> universe = new ArrayList<>(List.of(utxo("escrow"), utxo("bond"), utxo("pool"),
                 utxo("poolManager"), recordedConfig(), recordedLmConfig()));
         universe.addAll(walletUtxos);
+        universe.add(walletUtxo("c0", 5_000_000L));
         TransactionEvaluator evaluator = new AikenTransactionEvaluator(
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
                 EvalFixtures.scriptSupplier(REGISTRY), SlotConfigs.preview());
@@ -157,6 +158,10 @@ class CompoundAccountingTest {
         assertTrue(botInputs > 1,
                 "this fixture must actually exercise multi-input selection, or it re-proves nothing "
                         + "— the rig that missed the production defect had exactly one wallet input");
+        assertTrue(!tx.getBody().getCollateral().isEmpty(),
+                "the build must select explicit pure-ADA collateral");
+        assertTrue(tx.getBody().getCollateral().stream().noneMatch(tx.getBody().getInputs()::contains),
+                "the balancing shortfall selector must not reuse reserved collateral as an ordinary input");
         log.info("thin wallet: {} bot inputs selected, fee {}", botInputs, tx.getBody().getFee());
     }
 

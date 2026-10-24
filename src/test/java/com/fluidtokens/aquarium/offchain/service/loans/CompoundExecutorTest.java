@@ -79,9 +79,21 @@ class CompoundExecutorTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
     }
 
+    private static Utxo collateral() {
+        return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0)
+                .address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+    }
+
     private static List<Utxo> universe() {
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        return List.copyOf(universe);
+    }
+
+    private static List<Utxo> baseUniverse() {
         return List.of(utxo("escrow"), utxo("bond"), utxo("pool"), utxo("poolManager"),
-                utxo("config"), utxo("lmConfig"), wallet());
+                utxo("config"), utxo("lmConfig"), collateral());
     }
 
     private static CompoundCandidate ready(long feePerMille) {
@@ -132,7 +144,7 @@ class CompoundExecutorTest {
             return Result.success("deadbeefcafe").withValue("deadbeefcafe");
         };
 
-        List<Utxo> universe = new java.util.ArrayList<>(universe());
+        List<Utxo> universe = new java.util.ArrayList<>(baseUniverse());
         universe.addAll(walletUtxos);
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
