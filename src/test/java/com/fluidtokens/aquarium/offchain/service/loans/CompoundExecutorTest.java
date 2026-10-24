@@ -10,23 +10,42 @@ import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.BlockfrostKey;
+import com.fluidtokens.aquarium.offchain.config.BoundedBFBackendService;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import okhttp3.OkHttpClient;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.lang.reflect.Field;
 import java.math.BigInteger;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -220,6 +239,46 @@ class CompoundExecutorTest {
         org.mockito.Mockito.verify(signingAccount, org.mockito.Mockito.times(1))
                 .sign(org.mockito.ArgumentMatchers.any(Transaction.class));
         assertEquals(1, ambiguousCalls.get(), "transport ambiguity must end the candidate pass");
+    }
+
+    @Test
+    void boundedBackendCanonicalProviderRefusalAdvancesToTheDistinctSecondCandidate() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.PROVIDER_400_THEN_SUCCESS);
+
+        assertEquals(2, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 2);
+    }
+
+    @Test
+    void boundedBackendHttp408IsTerminalAfterTheFirstCandidate() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.HTTP_408);
+
+        assertEquals(1, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 1);
+    }
+
+    @Test
+    void boundedBackendHttp500IsTerminalAfterTheFirstCandidate() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.HTTP_500);
+
+        assertEquals(1, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 1);
+    }
+
+    @Test
+    void boundedBackendResetAfterFullBodyIsOneTerminalPostWithoutReplay() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.RESET_AFTER_BODY);
+
+        assertEquals(1, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 1);
+    }
+
+    @Test
+    void boundedBackendDecodedSuccessStopsAfterTheFirstCandidate() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.SUCCESS);
+
+        assertEquals(1, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 1);
     }
 
     @Test
@@ -916,6 +975,242 @@ class CompoundExecutorTest {
     }
 
     private record AttemptCounts(long signs, int submits) {
+    }
+
+    private enum WireOutcome {
+        PROVIDER_400_THEN_SUCCESS,
+        HTTP_408,
+        HTTP_500,
+        RESET_AFTER_BODY,
+        SUCCESS
+    }
+
+    private record BoundedWireAttempts(long signs, List<byte[]> posts, List<String> requestLines) {
+    }
+
+    private static BoundedWireAttempts boundedWireAttempts(WireOutcome outcome) throws Exception {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+        try (CompoundSubmitServer server = new CompoundSubmitServer(outcome)) {
+            BoundedBFBackendService backend = new BoundedBFBackendService(
+                    server.baseUrl(), BlockfrostKey.of("test-key"),
+                    1, 2, 2, 2, 2, 2, 5);
+            try {
+                executorWithBackend(candidates, realBuilder(candidates), signingAccount, backend).cycle();
+                server.awaitQuiescent();
+                long signs = org.mockito.Mockito.mockingDetails(signingAccount).getInvocations().stream()
+                        .filter(invocation -> invocation.getMethod().getName().equals("sign"))
+                        .count();
+                return new BoundedWireAttempts(signs, server.posts(), server.requestLines());
+            } finally {
+                closeBackend(backend);
+            }
+        }
+    }
+
+    private static CompoundExecutor executorWithBackend(List<CompoundCandidate> candidates,
+                                                        CompoundTransactionBuilder builder,
+                                                        Account account,
+                                                        BoundedBFBackendService backend) {
+        var configuration = new AppConfig.CompoundConfiguration(
+                true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        candidates.stream().map(CompoundCandidate::escrow)
+                .filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
+        return new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), account,
+                new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), backend);
+    }
+
+    private static void assertSubmittedCandidateOrder(BoundedWireAttempts attempts, int expectedPosts)
+            throws Exception {
+        assertEquals(expectedPosts, attempts.posts().size(), "exactly one POST is allowed per signed intent");
+        assertEquals(expectedPosts, attempts.requestLines().size());
+        assertTrue(attempts.requestLines().stream()
+                .allMatch("POST /api/v0/tx/submit HTTP/1.1"::equals));
+
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        for (int i = 0; i < expectedPosts; i++) {
+            Transaction submitted = Transaction.deserialize(attempts.posts().get(i));
+            TransactionInput expected = new TransactionInput(
+                    candidates.get(i).escrow().getTxHash(), candidates.get(i).escrow().getOutputIndex());
+            TransactionInput other = new TransactionInput(
+                    candidates.get(1 - i).escrow().getTxHash(), candidates.get(1 - i).escrow().getOutputIndex());
+            assertTrue(submitted.getBody().getInputs().contains(expected),
+                    "POST " + i + " must spend candidate " + candidates.get(i).escrowRef());
+            assertFalse(submitted.getBody().getInputs().contains(other),
+                    "POST " + i + " must not replay or substitute candidate "
+                            + candidates.get(1 - i).escrowRef());
+        }
+        if (expectedPosts == 2) {
+            assertFalse(Arrays.equals(attempts.posts().get(0), attempts.posts().get(1)),
+                    "the second POST must be the distinct second candidate, not a retry");
+        }
+    }
+
+    private static void closeBackend(BoundedBFBackendService backend) throws Exception {
+        Field baseClientField = BoundedBFBackendService.class.getDeclaredField("baseClient");
+        baseClientField.setAccessible(true);
+        OkHttpClient client = (OkHttpClient) baseClientField.get(backend);
+        client.dispatcher().cancelAll();
+        client.connectionPool().evictAll();
+        client.dispatcher().executorService().shutdown();
+        assertTrue(client.dispatcher().executorService().awaitTermination(3, TimeUnit.SECONDS),
+                "the bounded client dispatcher did not terminate");
+    }
+
+    private static final class CompoundSubmitServer implements AutoCloseable {
+        private static final int QUIET_ACCEPT_MILLIS = 700;
+        private static final long FIXTURE_SECONDS = 4;
+
+        private final WireOutcome outcome;
+        private final ServerSocket server;
+        private final ExecutorService handler = Executors.newSingleThreadExecutor();
+        private final CountDownLatch exited = new CountDownLatch(1);
+        private final AtomicReference<Throwable> failure = new AtomicReference<>();
+        private final List<byte[]> posts = new CopyOnWriteArrayList<>();
+        private final List<String> requestLines = new CopyOnWriteArrayList<>();
+
+        private CompoundSubmitServer(WireOutcome outcome) throws IOException {
+            this.outcome = outcome;
+            this.server = new ServerSocket(0, 4, InetAddress.getLoopbackAddress());
+            this.server.setSoTimeout((int) TimeUnit.SECONDS.toMillis(FIXTURE_SECONDS));
+            handler.submit(this::serve);
+        }
+
+        private String baseUrl() {
+            return "http://127.0.0.1:" + server.getLocalPort() + "/api/v0/";
+        }
+
+        private List<byte[]> posts() {
+            return posts.stream().map(byte[]::clone).toList();
+        }
+
+        private List<String> requestLines() {
+            return List.copyOf(requestLines);
+        }
+
+        private void serve() {
+            try {
+                while (true) {
+                    try (Socket socket = server.accept()) {
+                        socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(FIXTURE_SECONDS));
+                        RequestBody request = readRequest(socket.getInputStream());
+                        requestLines.add(request.requestLine());
+                        posts.add(request.body());
+                        server.setSoTimeout(QUIET_ACCEPT_MILLIS);
+                        if (outcome == WireOutcome.RESET_AFTER_BODY) {
+                            socket.setSoLinger(true, 0);
+                            continue;
+                        }
+                        writeResponse(socket.getOutputStream(), responseFor(posts.size()));
+                    }
+                }
+            } catch (SocketTimeoutException quiet) {
+                // The quiet accept window is the negative control for a replay or second candidate.
+            } catch (Throwable throwable) {
+                failure.compareAndSet(null, throwable);
+            } finally {
+                exited.countDown();
+            }
+        }
+
+        private HttpResponse responseFor(int postNumber) {
+            return switch (outcome) {
+                case PROVIDER_400_THEN_SUCCESS -> postNumber == 1
+                        ? new HttpResponse("400 Bad Request",
+                        "{\"status_code\":400,\"error\":\"Bad Request\","
+                                + "\"message\":\"Backend did not understand your request.\"}")
+                        : new HttpResponse("200 OK", "\"deadbeef\"");
+                case HTTP_408 -> new HttpResponse("408 Request Timeout", "{}");
+                case HTTP_500 -> new HttpResponse("500 Internal Server Error", "{}");
+                case SUCCESS -> new HttpResponse("200 OK", "\"deadbeef\"");
+                case RESET_AFTER_BODY -> throw new AssertionError("reset responses have no HTTP envelope");
+            };
+        }
+
+        private static RequestBody readRequest(InputStream input) throws IOException {
+            ByteArrayOutputStream headerBytes = new ByteArrayOutputStream();
+            int a = -1;
+            int b = -1;
+            int c = -1;
+            for (int next; (next = input.read()) != -1; ) {
+                headerBytes.write(next);
+                if (headerBytes.size() > 65_536) {
+                    throw new IOException("request headers exceed fixture bound");
+                }
+                if (a == '\r' && b == '\n' && c == '\r' && next == '\n') {
+                    break;
+                }
+                a = b;
+                b = c;
+                c = next;
+            }
+            String headers = headerBytes.toString(StandardCharsets.US_ASCII);
+            int firstLineEnd = headers.indexOf("\r\n");
+            if (firstLineEnd < 0) {
+                throw new IOException("request headers did not complete");
+            }
+            int contentLength = -1;
+            for (String line : headers.split("\r\n")) {
+                if (line.regionMatches(true, 0, "Content-Length:", 0, "Content-Length:".length())) {
+                    contentLength = Integer.parseInt(line.substring(line.indexOf(':') + 1).trim());
+                }
+            }
+            if (contentLength < 0) {
+                throw new IOException("submission request has no Content-Length");
+            }
+            byte[] body = input.readNBytes(contentLength);
+            if (body.length != contentLength) {
+                throw new IOException("submission body ended at " + body.length + " of " + contentLength);
+            }
+            return new RequestBody(headers.substring(0, firstLineEnd), body);
+        }
+
+        private static void writeResponse(OutputStream output, HttpResponse response) throws IOException {
+            byte[] body = response.body().getBytes(StandardCharsets.UTF_8);
+            output.write(("HTTP/1.1 " + response.status() + "\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: " + body.length + "\r\n"
+                    + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            output.write(body);
+            output.flush();
+        }
+
+        private void awaitQuiescent() throws Exception {
+            assertTrue(exited.await(FIXTURE_SECONDS, TimeUnit.SECONDS),
+                    "the joint submission handler did not terminate");
+            if (failure.get() != null) {
+                throw new AssertionError("joint submission fixture failed", failure.get());
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            server.close();
+            handler.shutdownNow();
+            assertTrue(handler.awaitTermination(FIXTURE_SECONDS, TimeUnit.SECONDS),
+                    "the joint submission fixture executor did not terminate");
+            if (failure.get() != null) {
+                throw new AssertionError("joint submission fixture failed", failure.get());
+            }
+        }
+
+        private record RequestBody(String requestLine, byte[] body) {
+        }
+
+        private record HttpResponse(String status, String body) {
+        }
     }
 
     private static AttemptCounts responseAttempts(Result<String> response) {

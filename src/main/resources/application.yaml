@@ -532,6 +532,16 @@ scheduling:
 blockfrost:
   url: https://cardano-mainnet.blockfrost.io/api/v0/
   key: ""
+  timeout:
+    connect-seconds: ${BLOCKFROST_TIMEOUT_CONNECT_SECONDS:5}
+    read-seconds: ${BLOCKFROST_TIMEOUT_READ_SECONDS:30}
+    write-seconds: ${BLOCKFROST_TIMEOUT_WRITE_SECONDS:30}
+    discovery-call-seconds: ${BLOCKFROST_TIMEOUT_DISCOVERY_CALL_SECONDS:12}
+    evaluation-call-seconds: ${BLOCKFROST_TIMEOUT_EVALUATION_CALL_SECONDS:30}
+    submission-call-seconds: ${BLOCKFROST_TIMEOUT_SUBMISSION_CALL_SECONDS:30}
+
+wallet-coordinator:
+  pass-timeout-seconds: ${WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS:120}
 
 store:
   cardano:

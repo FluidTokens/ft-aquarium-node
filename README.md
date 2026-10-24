@@ -135,6 +135,16 @@ Using Yaci Store also gives the following benefits:
 the Aquarium Node
 3. Blockfrost api: Yaci can serve blockfrost compatible APIs out of the box
 
+Every production Blockfrost call has a whole-call deadline: 12 seconds for discovery reads and
+30 seconds for transaction evaluation or submission, within a 120-second wallet-coordinator pass.
+Connection, read and write idle limits are 5, 30 and 30 seconds. These positive integer seconds can
+be overridden with the `BLOCKFROST_TIMEOUT_*_SECONDS` and
+`WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS` settings documented in `docker/.env.advanced.example`.
+Submission redirects and automatic connection retries are disabled: if the peer reads a POST and
+the response is lost, the outcome is ambiguous and the transport does not replay it.
+The separately cached Fluid oracle registry refresh remains on its existing reactive timeout; a
+coordinator pass reads its held snapshot. These bounds do not arm a worker or activate mainnet.
+
 ## Building it yourself
 
 You do not need to: CI publishes an image built from `main` **after** running the full test suite.
