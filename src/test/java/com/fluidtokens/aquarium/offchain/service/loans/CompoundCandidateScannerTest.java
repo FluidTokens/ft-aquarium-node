@@ -288,6 +288,50 @@ class CompoundCandidateScannerTest {
         assertEquals(50L, c.feePerMille());
     }
 
+    /**
+     * ⛔ FAB-167 admission: {@code Q - F <= 0} is refused with {@code PRINCIPAL_AMOUNT_INVALID}, where
+     * {@code F} is the validator's fee — so since 2026-10-26 an ADA escrow of 1 ADA or less is refused even
+     * at rate 0 (the pool would gain nothing, which {@code pool_compound_action} rejects), equality
+     * included, while one lovelace more is admitted. There is no {@code c == 0} skip.
+     */
+    @Test
+    void anAdaEscrowThatTheOneAdaFloorWouldConsumeIsRefusedEqualityIncluded() {
+        for (long lovelace : new long[]{999_999L, 1_000_000L}) {
+            var c = scanner(List.of(escrow(LIVE_LOAN, BigInteger.valueOf(lovelace))),
+                    List.of(bond(LIVE_LOAN, LIVE_POOL, AssetType.ada())),
+                    Map.of(LIVE_POOL, resolved(0L))).scan().candidates().getFirst();
+            assertEquals(CompoundExclusion.PRINCIPAL_AMOUNT_INVALID, c.exclusion(), "Q=" + lovelace);
+            assertTrue(c.detail().contains("F=1000000") && c.detail().contains("max(Q*c/1000, 1 ADA)"),
+                    c.detail());
+        }
+        var justAbove = scanner(List.of(escrow(LIVE_LOAN, BigInteger.valueOf(1_000_001L))),
+                List.of(bond(LIVE_LOAN, LIVE_POOL, AssetType.ada())),
+                Map.of(LIVE_POOL, resolved(0L))).scan().candidates().getFirst();
+        assertTrue(justAbove.structurallyReady(), "Q - 1 ADA = 1 lovelace still adds principal");
+
+        var zeroRate = scanner(List.of(escrow(LIVE_LOAN, LIVE_ESCROW)),
+                List.of(bond(LIVE_LOAN, LIVE_POOL, AssetType.ada())),
+                Map.of(LIVE_POOL, resolved(0L))).scan().candidates().getFirst();
+        assertTrue(zeroRate.structurallyReady(), "rate 0 is admitted: it pays the floor, it is not skipped");
+    }
+
+    /** No token floor: a token escrow far below 1 ADA's worth of units is admitted at rate 0 (F = 0). */
+    @Test
+    void aTokenEscrowHasNoFloorAndRateZeroIsAdmitted() {
+        var principal = new AssetType("0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62",
+                "0014df1074464c4454");
+        var oneUnit = Amount.builder().unit(principal.toUnit()).quantity(BigInteger.ONE).build();
+        var c = scanner(List.of(escrow(LIVE_LOAN, BigInteger.valueOf(2_000_000L), oneUnit)),
+                List.of(bond(LIVE_LOAN, LIVE_POOL, principal)),
+                Map.of(LIVE_POOL, resolved(0L))).scan().candidates().getFirst();
+        assertTrue(c.structurallyReady(), c.exclusion() + ": " + c.detail());
+
+        var consumed = scanner(List.of(escrow(LIVE_LOAN, BigInteger.valueOf(2_000_000L), oneUnit)),
+                List.of(bond(LIVE_LOAN, LIVE_POOL, principal)),
+                Map.of(LIVE_POOL, resolved(999L))).scan().candidates().getFirst();
+        assertTrue(consumed.structurallyReady(), "1 * 999 / 1000 = 0: the token pool still gains 1 unit");
+    }
+
     /** A malformed pool-manager fee is a named refusal, never valid zero. */
     @Test
     void anUnreadablePoolManagerDatumIsNotConvertedToZero() {

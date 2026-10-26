@@ -282,8 +282,8 @@ public class CompoundExecutor {
                     || !candidate.bond().datum().principalAsset().isAda()) {
                 return Optional.empty();
             }
-            return Optional.of(CompoundEconomics.expectedFee(candidate.addedLiquidity(),
-                    candidate.feePerMille()));
+            return Optional.of(CompoundEconomics.compoundingFee(candidate.addedLiquidity(),
+                    candidate.feePerMille(), candidate.bond().datum().principalAsset()));
         } catch (RuntimeException e) {
             return Optional.empty();
         }
@@ -333,8 +333,8 @@ public class CompoundExecutor {
         if (!configuration.isEnabled()) {
             // Not a fault, and said at INFO because a ready candidate going unprocessed is exactly
             // what an operator will ask about.
-            log.info("compound READY but NOT ARMED {} escrow {}: Q={} raw units into pool {} at {}/1000 "
-                            + "— set loans.compound.enabled=true to act on it",
+            log.info("compound READY but NOT ARMED {} escrow {}: Q={} raw units into pool {} at "
+                            + "compoudingFeePerMille={} — set loans.compound.enabled=true to act on it",
                     candidate.loanId(), candidate.escrowRef(), candidate.addedLiquidity(),
                     candidate.poolId(), candidate.feePerMille());
             return CandidateOutcome.DEFINITE_FAILURE;
@@ -372,7 +372,10 @@ public class CompoundExecutor {
             return CandidateOutcome.DEFINITE_FAILURE;
         }
 
-        BigInteger fee = CompoundEconomics.expectedFee(candidate.addedLiquidity(), candidate.feePerMille());
+        // THE validator's fee (ADA: at least 1 ADA since 2026-10-26; token: Q*c/1000). It is what the
+        // builder hands the pool owner's share to, what the pool output is reduced by, and what is priced.
+        BigInteger fee = CompoundEconomics.compoundingFee(candidate.addedLiquidity(), candidate.feePerMille(),
+                candidate.bond().datum().principalAsset());
 
         long now = System.currentTimeMillis();
         long anchor = Math.min(now, tipMillis());
@@ -416,8 +419,8 @@ public class CompoundExecutor {
                 candidate.feePerMille(), built.facts(), quote);
 
         if (!assessment.approved()) {
-            log.info("compound NOT APPROVED {} escrow {}: {} — Q={} raw units at {}/1000 gives "
-                            + "F={} raw units, priced reward={} lovelace, recovered E={} lovelace, "
+            log.info("compound NOT APPROVED {} escrow {}: {} — Q={} raw units at compoudingFeePerMille={} "
+                            + "gives F={} raw units, priced reward={} lovelace, recovered E={} lovelace, "
                             + "final fee L={} lovelace, pool top-up T={} lovelace, net={} lovelace "
                             + "against floor={} lovelace{}",
                     candidate.loanId(), candidate.escrowRef(), assessment.exclusion(),
@@ -425,8 +428,9 @@ public class CompoundExecutor {
                     assessment.expectedFeeLovelace(), assessment.recoveredEscrowLovelace(),
                     assessment.txFee(), assessment.poolTopUpLovelace(), assessment.net(), assessment.floor(),
                     assessment.zeroFeePool()
-                            ? " (this pool publishes NO compounding fee; this measured net requires "
-                              + "a lower operator-stated floor)"
+                            ? " (this pool publishes compoudingFeePerMille = 0: an ADA pool still pays the "
+                              + "1 ADA floor and a token pool pays nothing; this measured net requires a "
+                              + "lower operator-stated floor)"
                             : "");
             return CandidateOutcome.DEFINITE_FAILURE;
         }

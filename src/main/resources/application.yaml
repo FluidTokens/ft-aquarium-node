@@ -136,18 +136,20 @@ loans:
     # F is the raw-token fee, n/d its positive oracle price per raw unit, E is escrow ADA recovered
     # by the bot, L is the exact final-body transaction fee, and T is the pool minimum-ADA top-up.
     #
-    # 0 (the default) refuses every net loss while allowing exact break-even. That is what makes a
-    # ZERO-FEE ADA POOL refused out of the box: it pays nothing, so the net is exactly minus the tx
-    # fee. A valid zero-fee NATIVE pool can still clear 0 through recovered escrow ADA (`E-L-T`).
+    # 0 (the default) refuses every net loss while allowing exact break-even. F is the validator's own
+    # fee: since FluidTokens' 2026-10-26 update an ADA pool ALWAYS pays at least 1 ADA
+    # (`max(Q*c/1000, 1 ADA)`), even at rate 0, so a zero-rate ADA pool is approved out of the box when
+    # the transaction costs no more than that. A token pool pays `Q*c/1000` raw units -- nothing at
+    # rate 0 -- and a zero-rate NATIVE pool clears 0 only through recovered escrow ADA (`E-L-T`).
     #
     # The fee rate is `compoudingFeePerMille` in the live PoolManagerDatum -- set by the POOL OWNER,
-    # not by this node and not fixed by the protocol. Measured 2026-09-02: the only live preview pool
-    # published 0 for its ADA principal, so out of the box that work pays nothing and is declined.
+    # not by this node; the 1 ADA minimum for ADA pools is the protocol's. Measured 2026-09-02: the
+    # only live preview pool published 0 for its ADA principal.
     #
     # A NEGATIVE value is a number the operator STATES, not a protection they switch off -- the same
     # distinction `liquidation.profit-margin-lovelace` draws, and the reason there is no
-    # `ignore-profit-check` twin here. Setting it negative arms compounding for pools that pay
-    # nothing, and still bounds the loss: a candidate worse than the stated figure is refused.
+    # `ignore-profit-check` twin here. Setting it negative arms compounding that pays less than it
+    # costs, and still bounds the loss: a candidate worse than the stated figure is refused.
     # Giovanni's ruling, 2026-09-02: acceptable "as long as operator checks this himself and owns it".
     #
     # ⚠ STALE UNTIL 2026-09-04: this said "negative on mainnet is a hard startup failure, exactly

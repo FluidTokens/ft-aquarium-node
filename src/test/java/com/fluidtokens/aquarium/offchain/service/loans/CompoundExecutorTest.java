@@ -198,18 +198,23 @@ class CompoundExecutorTest {
         assertTrue(w.submitted().isEmpty(), "a disarmed loop must transmit nothing");
     }
 
-    /** ⛔ The zero-fee pool at the safe default: built, priced, and declined on the numbers. */
+    /**
+     * ⛔ A below-cost compound at the safe default: built, priced, and declined on the numbers. Since
+     * FAB-167 a zero-rate ADA pool pays the 1 ADA floor, so this is no longer "pays nothing": it is
+     * declined because this rig builds ALL-INLINE (no reference scripts), and that final fee — measured
+     * 1,270,532 lovelace — exceeds the 1 ADA the pool pays.
+     */
     @Test
     void aZeroFeePoolIsDeclinedAtTheDefaultFloor() {
         Wiring w = wiring(List.of(ready(0L)), true, 0L);
         w.executor().cycle();
         assertTrue(w.submitted().isEmpty(),
-                "expectedFee 0 minus a real tx fee is negative, and the default floor refuses it");
+                "the 1 ADA floor minus an all-inline tx fee above 1 ADA is negative, and the default floor refuses it");
     }
 
     /**
-     * ⛔ AND THE RULED CASE. The same candidate, the same zero fee, with the operator's stated
-     * negative bound — this is the transaction that will actually fire on preview.
+     * ⛔ AND THE RULED CASE (FAB-167 task 4: unchanged). The same below-cost candidate, with the
+     * operator's stated negative bound, IS compounded — a negative margin still admits a loss.
      */
     @Test
     void aStatedNegativeFloorProcessesTheZeroFeeCandidate() {
@@ -1328,15 +1333,16 @@ class CompoundExecutorTest {
     }
 
     /**
-     * FAB-144, cycle level. Scanned refused-first, then the 10/1000 escrow, then the 20/1000 one: the
-     * cycle must walk the 20/1000 escrow first (582,185 lovelace on 29,109,268), then the 10/1000
-     * (291,092), and the structurally refused one last — still reported, never dropped. Disarmed, so
-     * each ready candidate says READY BUT NOT ARMED and nothing is built.
+     * FAB-144, cycle level. Scanned refused-first, then the 40/1000 escrow, then the 80/1000 one: the
+     * cycle must walk the 80/1000 escrow first (2,328,741 lovelace on 29,109,268), then the 40/1000
+     * (1,164,370), and the structurally refused one last — still reported, never dropped. Disarmed, so
+     * each ready candidate says READY BUT NOT ARMED and nothing is built. (FAB-167: both rates sit above
+     * the 1 ADA floor on this escrow, so the per-mille term is what ranks them.)
      */
     @Test
     void aCycleWalksTheMostProfitableCompoundFirstAndARefusedOneLast() {
-        CompoundCandidate tenPerMille = readyAt("01".repeat(32), 10L);
-        CompoundCandidate twentyPerMille = readyAt("02".repeat(32), 20L);
+        CompoundCandidate tenPerMille = readyAt("01".repeat(32), 40L);
+        CompoundCandidate twentyPerMille = readyAt("02".repeat(32), 80L);
         String cheap = tenPerMille.escrowRef();
         String rich = twentyPerMille.escrowRef();
         Wiring w = wiring(List.of(refused(), tenPerMille, twentyPerMille), false, 0L);
@@ -1348,11 +1354,11 @@ class CompoundExecutorTest {
                         || line.startsWith("compound REFUSED"))
                 .toList();
         assertEquals(3, walked.size(), "every candidate is reported, each once: " + info);
-        assertTrue(walked.get(0).contains(rich), "the 20/1000 escrow first: " + walked);
-        assertTrue(walked.get(1).contains(cheap), "the 10/1000 escrow second: " + walked);
+        assertTrue(walked.get(0).contains(rich), "the 80/1000 escrow first: " + walked);
+        assertTrue(walked.get(1).contains(cheap), "the 40/1000 escrow second: " + walked);
         assertTrue(walked.get(2).startsWith("compound REFUSED"), "the refused one last: " + walked);
-        assertEquals(List.of("compound order (most profitable first): " + rich + " gross≈582185 lovelace, "
-                        + cheap + " gross≈291092 lovelace, " + refused().escrowRef() + " gross unpriced"),
+        assertEquals(List.of("compound order (most profitable first): " + rich + " gross≈2328741 lovelace, "
+                        + cheap + " gross≈1164370 lovelace, " + refused().escrowRef() + " gross unpriced"),
                 info.stream().filter(line -> line.startsWith("compound order")).toList(),
                 "one INFO line naming the order: " + info);
         assertTrue(w.submitted().isEmpty(), "a disarmed loop transmits nothing");
@@ -1440,15 +1446,19 @@ class CompoundExecutorTest {
     }
 
     /**
-     * FAB-144: the compound ranking key is {@code expectedFee} — 29,109,268 × 20 / 1000 = 582,185.36,
-     * truncated to 582,185 lovelace — and empty, never thrown, for whatever cannot be priced.
+     * FAB-144: the compound ranking key is {@code expectedFee} — 29,109,268 × 80 / 1000 = 2,328,741.44,
+     * truncated to 2,328,741 lovelace — and empty, never thrown, for whatever cannot be priced. FAB-167:
+     * it is the validator's fee, so below the crossover every ADA rate ranks at the 1 ADA floor.
      */
     @Test
     void theCompoundRankingKeyIsTheExpectedFeeAndEmptyForWhatCannotBePriced() {
-        assertEquals(Optional.of(BigInteger.valueOf(582_185L)),
-                CompoundExecutor.expectedFeeLovelace(readyAt("02".repeat(32), 20L)));
-        assertEquals(Optional.of(BigInteger.ZERO), CompoundExecutor.expectedFeeLovelace(ready(0L)),
-                "a zero-fee pool is priced at zero, not unpriced");
+        assertEquals(Optional.of(BigInteger.valueOf(2_328_741L)),
+                CompoundExecutor.expectedFeeLovelace(readyAt("02".repeat(32), 80L)));
+        assertEquals(Optional.of(BigInteger.valueOf(1_000_000L)), CompoundExecutor.expectedFeeLovelace(ready(0L)),
+                "a zero-rate ADA pool is priced at the 1 ADA floor, not at zero and not unpriced");
+        assertEquals(Optional.of(BigInteger.valueOf(1_000_000L)),
+                CompoundExecutor.expectedFeeLovelace(readyAt("02".repeat(32), 20L)),
+                "582,185 per mille on this escrow is below the floor, so 1 ADA");
         assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(refused()),
                 "structurally unready");
         assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(readyWithoutAmountAt("03".repeat(32))),
@@ -1468,9 +1478,9 @@ class CompoundExecutorTest {
         CompoundCandidate refused = refused();                          // fb48…#2, unpriced
         CompoundCandidate noAmount = readyWithoutAmountAt("03".repeat(32)); // unpriced
         CompoundCandidate nonAda = tokenPrincipalAt("05".repeat(32));     // unpriced
-        CompoundCandidate ten = readyAt("01".repeat(32), 10L);            // 291,092
-        CompoundCandidate twentyB = readyAt("04".repeat(32), 20L);        // 582,185
-        CompoundCandidate twentyA = readyAt("02".repeat(32), 20L);        // 582,185
+        CompoundCandidate ten = readyAt("01".repeat(32), 40L);            // 1,164,370
+        CompoundCandidate twentyB = readyAt("04".repeat(32), 80L);        // 2,328,741
+        CompoundCandidate twentyA = readyAt("02".repeat(32), 80L);        // 2,328,741
         List<CompoundCandidate> scanned = List.of(refused, noAmount, nonAda, ten, twentyB, twentyA);
 
         List<CompoundCandidate> ordered = CompoundExecutor.mostProfitableFirst(scanned,
@@ -1518,7 +1528,7 @@ class CompoundExecutorTest {
     /**
      * FAB-144: a structurally unready candidate is unpriced BECAUSE it is unready. {@link #refused()}
      * cannot show that — it has no amount and no bond, so it is empty for those reasons too; this one
-     * has both and an ada principal, and would be priced at 582,185 lovelace were readiness not checked.
+     * has both and an ada principal, and would be priced at the 1 ADA floor were readiness not checked.
      */
     @Test
     void aStructurallyUnreadyCompoundIsUnpricedEvenWithAnAmountABondAndAnAdaPrincipal() {

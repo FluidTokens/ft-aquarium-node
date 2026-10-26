@@ -18,10 +18,13 @@ import java.util.Optional;
  *
  * <h2>The economics, and why they are not the liquidation's</h2>
  * On chain {@code lm_compound_action} requires the pool to receive
- * {@code addedLiquidity - compoundingFee}, where
- * {@code compoundingFee = addedLiquidity * compoudingFeePerMille / 1000} — integer division,
- * mirrored here exactly. <b>Nothing pays the bot.</b> The fee is the part the pool is not required to
- * receive; it stays in the transaction and the builder must place it deliberately (findings §20.1).
+ * {@code addedLiquidity - compoundingFee}, where {@code compoundingFee} is FluidTokens'
+ * {@code finance.get_compounding_fee} — since their 2026-10-26 update (upstream {@code a02d4e2}) an ADA
+ * principal pays {@code max(addedLiquidity * compoudingFeePerMille / 1000, 1 ADA)} and any other
+ * principal {@code addedLiquidity * compoudingFeePerMille / 1000}, integer division throughout.
+ * {@link #compoundingFee} mirrors it exactly and is the ONLY place this node computes it.
+ * <b>Nothing pays the bot.</b> The fee is the part the pool is not required to receive; it stays in the
+ * transaction and the builder must place it deliberately (findings §20.1).
  *
  * <p>The exact final-body gate is {@code F-L} for ADA principal and
  * {@code floor(F*n/d)+E-L-T} for native principal. Native {@code F} is priced from raw units; its
@@ -45,6 +48,12 @@ public class CompoundEconomics {
 
     private static final BigInteger PER_MILLE = BigInteger.valueOf(1000L);
 
+    /**
+     * {@code constants.min_compounding_fee_lovelace} (upstream {@code a02d4e2}): the least an ADA pool pays
+     * the compounding bot, whatever its {@code compoudingFeePerMille} — 0 included.
+     */
+    public static final BigInteger MIN_ADA_COMPOUNDING_FEE_LOVELACE = BigInteger.valueOf(1_000_000L);
+
     private final AppConfig.CompoundConfiguration configuration;
     private final AppConfig.Network network;
     private final PricingService pricingService;
@@ -61,7 +70,9 @@ public class CompoundEconomics {
      *
      * <p>⛔ <b>Not fatal on mainnet.</b> Giovanni, 2026-09-03: <i>"it's fundamental to allow operators
      * to operate at a loss … operating at a loss MUST be implemented even on mainnet."</i> Compounding
-     * a pool that pays nothing is exactly the protocol-health work the bot exists to do. The
+     * a pool that pays less than the work costs is exactly the protocol-health work the bot exists to do.
+     * Since FluidTokens' 2026-10-26 update an ADA pool always pays at least 1 ADA; a token pool pays
+     * {@code Q*c/1000}, so a zero-rate token pool still pays nothing. The
      * protection is the DEFAULT of 0 — which refuses every loss on every network — so only an
      * explicitly negative value gets here, and it is a stated intention rather than a copy-paste
      * accident. A bot that will do unpaid work still has to say so where the operator already looks.
@@ -85,13 +96,13 @@ public class CompoundEconomics {
             log.warn("⛔ OPERATING AT A LOSS ON MAINNET, BY OPERATOR CONFIGURATION — path: compound; "
                             + "loans.compound.profit-margin-lovelace = {} lovelace (network {}). This "
                             + "node will compound pools that pay it less than the work costs — including "
-                            + "pools whose compoudingFeePerMille is 0 — down to that stated floor. A "
+                            + "token pools whose compoudingFeePerMille is 0 — down to that stated floor. A "
                             + "deliberate protocol-health setting, not a fault.",
                     floor, networkName);
             return;
         }
         log.warn("⛔ loans.compound.profit-margin-lovelace is {} (negative) on network {} — the bot will "
-                + "compound AT A LOSS down to that bound, including for pools whose "
+                + "compound AT A LOSS down to that bound, including for token pools whose "
                 + "compoudingFeePerMille is 0. This is a stated operator bound, not a disabled check.",
                 floor, networkName);
     }
@@ -123,7 +134,7 @@ public class CompoundEconomics {
         if (structural != null) {
             return CompoundAssessment.refused(structural);
         }
-        BigInteger fee = expectedFee(escrow, feePerMille);
+        BigInteger fee = compoundingFee(escrow, feePerMille, principalAsset);
         PricingService.Priced quote = quote(principalAsset, fee, atMillis);
         return assessMeasured(bondNamesAPool, poolAndManagerLive, principalAsset, escrow,
                 feePerMille, BigInteger.ZERO, txFee, BigInteger.ZERO, quote);
@@ -165,14 +176,16 @@ public class CompoundEconomics {
             return CompoundAssessment.refused(structural);
         }
 
-        BigInteger expectedFee = expectedFee(escrow, feePerMille);
+        BigInteger expectedFee = compoundingFee(escrow, feePerMille, principalAsset);
         if (!priced.isPriced()) {
             log.info("compound: cannot price {} raw reward units: {}",
                     expectedFee, priced.refusal());
             return CompoundAssessment.refused(priceExclusion(priced.refusal()));
         }
 
-        BigInteger expectedFeeLovelace = priced.lovelace();
+        // ADA is its own price: the net is the validator's fee itself, never a caller-supplied figure, so
+        // a quote computed from any other fee cannot move an ADA decision.
+        BigInteger expectedFeeLovelace = principalAsset.isAda() ? expectedFee : priced.lovelace();
         BigInteger recovered = principalAsset.isAda() ? BigInteger.ZERO : recoveredEscrowLovelace;
         BigInteger topUp = principalAsset.isAda() ? BigInteger.ZERO : poolTopUpLovelace;
         BigInteger net = expectedFeeLovelace.add(recovered).subtract(txFee).subtract(topUp);
@@ -203,7 +216,7 @@ public class CompoundEconomics {
                                                          BigInteger rawEscrowCoin,
                                                          long atMillis) {
         try {
-            BigInteger fee = expectedFee(escrow, feePerMille);
+            BigInteger fee = compoundingFee(escrow, feePerMille, principalAsset);
             PricingService.Priced quote = quote(principalAsset, fee, atMillis);
             if (!quote.isPriced()) {
                 return Optional.empty();
@@ -251,17 +264,42 @@ public class CompoundEconomics {
     }
 
     /**
-     * {@code escrow * feePerMille / 1000}, integer division, matching
-     * {@code lm_compound_action}'s {@code addedLiquidity * compoudingFeePerMille / 1000} exactly.
+     * ⛔ THE effective compounding fee — FluidTokens' {@code finance.get_compounding_fee} (upstream
+     * {@code a02d4e2}, {@code lib/fluidtokens/finance.ak}), which {@code lm_compound_action} computes the
+     * pool's required output from:
+     * <pre>
+     *   expect compoudingFeePerMille >= 0
+     *   let perMilleFee = addedLiquidity * compoudingFeePerMille / 1000
+     *   if principalPolicyId == ada_policy_id { max(perMilleFee, 1_000_000) } else { perMilleFee }
+     * </pre>
+     * Every fee this node admits on, ranks by, builds with, asserts on or logs is this value; nothing else
+     * in the compound path multiplies by a per-mille rate.
      *
-     * <p>The truncation is deliberate and must not be rounded: the validator computes the pool's
-     * required output from this same expression, so a fee we round UP is a fee the pool is not
-     * required to give up, and the transaction fails phase 2.
+     * <p>The division is Aiken's {@code /}, which FLOORS; it is ported as a floor for every integer, so for
+     * the only inputs that reach it ({@code Q > 0}, {@code c >= 0}) it is plain truncation. It must not be
+     * rounded: the validator demands exactly {@code Q - fee} in the pool, so a fee one unit off either way
+     * fails phase 2. Since 2026-10-26 an ADA pool pays at least 1 ADA even at {@code c = 0}; a token pool
+     * pays {@code Q*c/1000} raw units with NO floor (upstream: the bot already keeps the escrow's min-ADA).
+     * "ADA" is decided as the validator decides it — the principal's policy id is the empty ADA policy.
+     *
+     * @throws IllegalArgumentException for {@code c < 0}, where the validator's {@code expect} fails
      */
-    static BigInteger expectedFee(BigInteger escrow, long feePerMille) {
-        if (escrow == null || escrow.signum() <= 0 || feePerMille < 0L || feePerMille > 999L) {
-            throw new IllegalArgumentException("Q > 0 and 0 <= c <= 999 are required");
+    public static BigInteger compoundingFee(BigInteger addedLiquidity, long feePerMille, AssetType principalAsset) {
+        Objects.requireNonNull(addedLiquidity, "addedLiquidity");
+        Objects.requireNonNull(principalAsset, "principalAsset");
+        if (feePerMille < 0L) {
+            throw new IllegalArgumentException("get_compounding_fee requires compoudingFeePerMille >= 0, got "
+                    + feePerMille);
         }
-        return escrow.multiply(BigInteger.valueOf(feePerMille)).divide(PER_MILLE);
+        BigInteger[] quotientAndRemainder = addedLiquidity.multiply(BigInteger.valueOf(feePerMille))
+                .divideAndRemainder(PER_MILLE);
+        BigInteger perMilleFee = quotientAndRemainder[1].signum() < 0
+                ? quotientAndRemainder[0].subtract(BigInteger.ONE) : quotientAndRemainder[0];
+        return adaPolicy(principalAsset) ? perMilleFee.max(MIN_ADA_COMPOUNDING_FEE_LOVELACE) : perMilleFee;
+    }
+
+    /** {@code principalPolicyId == ada_policy_id}: the principal's on-chain policy id is the empty one. */
+    private static boolean adaPolicy(AssetType principalAsset) {
+        return principalAsset.isAda() || principalAsset.policyId() == null || principalAsset.policyId().isEmpty();
     }
 }

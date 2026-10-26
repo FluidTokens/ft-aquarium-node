@@ -40,9 +40,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * liquidation; the bot was never armed and never acted — and output 0 of that transaction is a
  * <b>25,000,000 lovelace repayment escrow</b> sitting at the asset-manager credential.
  *
- * <p>⚠ <b>The structural claim flipped. The profitability claim did not</b>, and keeping those apart
- * is the point of this class: the only live mainnet pool manager still publishes
- * {@code compoudingFeePerMille = 0}, so the work pays nothing and is refused at the shipped margin.
+ * <p>⚠ <b>The structural claim flipped. The profitability claim did not — until FluidTokens'
+ * 2026-10-26 update changed the rule (FAB-167)</b>, and keeping those apart is the point of this class:
+ * the last live mainnet pool manager measured published {@code compoudingFeePerMille = 0}, which until
+ * then meant the work paid nothing and was refused at the shipped margin. Since 2026-10-26 an ADA pool
+ * pays at least 1 ADA whatever its rate, so the same escrow now pays the bot 1 ADA.
  * <b>"There is finally something to compound" and "compounding it is worth doing" are different
  * questions</b>, and the first being answered does not answer the second.
  *
@@ -63,7 +65,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       compound" apart from "compounding it is worth doing" — and the second half is answered
  *       <em>only</em> by reading the live pool manager's {@code compoudingFeePerMille}. With that
  *       NFT gone the fee cannot be read at all, so
- *       {@link #atTheShippedMarginTheOnlyMainnetPoolWouldRefuseThisEscrow()} would still pass while
+ *       {@link #atTheShippedMarginAZeroRateMainnetPoolNowPaysTheOneAdaFloor()} would still pass while
  *       having stopped being a fact about mainnet — a green test asserting a number nothing on chain
  *       supplies any more. The park is class-level for that reason: the remaining tests are not
  *       independently meaningful once the measurement behind them is gone.</li>
@@ -94,7 +96,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
                 + "any more, so the live fee this class exists to measure cannot be read. That is a "
                 + "STALE FIXTURE, not a code fault — do not repair it. Re-enable only with a live "
                 + "mainnet pool manager whose compoudingFeePerMille can actually be read; without "
-                + "one, the refusal test still passes but has stopped being a fact about mainnet.")
+                + "one, the economics test still passes but has stopped being a fact about mainnet.")
 class MainnetCompoundEscrowTest {
 
     private static final String CONFIG_POLICY_ID = "db2c498e1b93da91e6a79f58526a1e66591d97ace3f8e43d2619b416";
@@ -180,16 +182,16 @@ class MainnetCompoundEscrowTest {
     }
 
     /**
-     * ⛔ <b>AND THE ANSWER THE OPERATOR ACTUALLY NEEDS: it would be REFUSED, and not for a fixable
-     * reason.</b>
+     * ⛔ <b>AND THE ANSWER THE OPERATOR ACTUALLY NEEDS — which FluidTokens' 2026-10-26 update flipped.</b>
      *
      * <p>Driven through the production {@link CompoundEconomics}, at the shipped margin of zero, with
-     * the fee the only live mainnet pool manager really publishes. <b>A zero fee means the work pays
-     * nothing</b>, so the net is exactly minus the transaction fee — refused, correctly, and the lever
-     * is the POOL OWNER's rather than the operator's.
+     * the rate the last measured live mainnet pool manager published. Until 2026-10-26 <b>a zero rate
+     * meant the work paid nothing</b> and this escrow was refused. The live {@code lm_compound_action}
+     * now makes an ADA pool pay {@code max(Q*c/1000, 1 ADA)}, so at rate 0 the bot earns the 1 ADA floor
+     * and, against a representative 0.3 ADA transaction, the compound is APPROVED (FAB-167).
      */
     @Test
-    void atTheShippedMarginTheOnlyMainnetPoolWouldRefuseThisEscrow() {
+    void atTheShippedMarginAZeroRateMainnetPoolNowPaysTheOneAdaFloor() {
         var network = new AppConfig.Network();
         ReflectionTestUtils.setField(network, "network", "mainnet");
         var configuration = new AppConfig.CompoundConfiguration();
@@ -206,15 +208,14 @@ class MainnetCompoundEscrowTest {
                 BigInteger.valueOf(300_000L),            // a representative tx fee
                 System.currentTimeMillis());
 
-        assertFalse(assessment.approved(),
-                "a zero-fee pool must be refused at the shipped margin: the compound pays nothing and "
-                        + "costs a transaction fee. ⚠ If this ever passes, either the pool owner set a "
-                        + "fee or the margin went negative — and the second is an operator's stated "
-                        + "loss, not a bug");
+        assertEquals(BigInteger.valueOf(1_000_000L), assessment.expectedFee(),
+                "a zero-rate ADA pool pays the 1 ADA floor since 2026-10-26");
+        assertTrue(assessment.approved(),
+                "1 ADA against a 0.3 ADA transaction clears the shipped margin of zero");
     }
 
     /**
-     * ⚑ The measurement that makes the refusal above a FACT about mainnet rather than a hypothesis:
+     * ⚑ The measurement that makes the assessment above a FACT about mainnet rather than a hypothesis:
      * the only live pool manager publishes a zero fee, read through the production decoder.
      */
     @Test
@@ -237,9 +238,8 @@ class MainnetCompoundEscrowTest {
                     .amount(List.of(Amount.lovelace(BigInteger.ONE)))
                     .inlineDatum(u.get("inline_datum").asText()).build();
             assertEquals(0L, CompoundCandidateScanner.compoundingFeePerMille(utxo),
-                    "the mainnet pool manager now publishes a NON-ZERO compounding fee — compounding "
-                            + "may finally pay, and the refusal above needs re-reading rather than "
-                            + "re-asserting");
+                    "the mainnet pool manager now publishes a NON-ZERO compounding fee — the "
+                            + "assessment above needs re-reading rather than re-asserting");
             return;
         }
         throw new AssertionError("no UTxO at the pool-manager address carries the pool-manager NFT");

@@ -41,7 +41,12 @@ public enum CompoundExclusion {
     /** The pool-manager fee is outside the validator-supported {@code [0,999]} range. */
     POOL_MANAGER_FEE_OUT_OF_RANGE,
 
-    /** The escrow principal must satisfy {@code Q > 0} and leave {@code Q-F > 0}. */
+    /**
+     * The escrow principal must satisfy {@code Q > 0} and leave {@code Q - F > 0}, where {@code F} is the
+     * validator's compounding fee ({@code CompoundEconomics.compoundingFee}). Since FluidTokens'
+     * 2026-10-26 update an ADA pool pays at least 1 ADA, so an ADA escrow of 1 ADA or less is refused
+     * here: the pool would gain nothing, which {@code pool_compound_action} rejects.
+     */
     PRINCIPAL_AMOUNT_INVALID,
 
     /** Legacy broad price refusal retained only for source compatibility; production uses names below. */
@@ -94,9 +99,11 @@ public enum CompoundExclusion {
     /**
      * The net result does not clear the operator's stated floor.
      *
-     * <p>This is the ordinary outcome for a pool whose {@code compoudingFeePerMille} is zero: the
-     * expected fee is zero, the net is exactly minus the transaction fee, and the default floor of
-     * zero refuses it. An operator who wants that work done states a negative floor and owns it.
+     * <p>Since FluidTokens' 2026-10-26 update an ADA pool always pays at least 1 ADA, so this is no
+     * longer the automatic outcome of {@code compoudingFeePerMille = 0}: an ADA compound is refused only
+     * when the final transaction fee exceeds that fee by more than the floor allows. A token pool pays
+     * {@code Q*c/1000} raw units — nothing at rate 0 — and is decided on that plus the escrow ADA it
+     * recovers. An operator who wants below-cost work done states a negative floor and owns it.
      */
     NET_BELOW_FLOOR
 }
