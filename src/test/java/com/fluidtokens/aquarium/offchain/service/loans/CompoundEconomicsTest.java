@@ -24,13 +24,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>The shape that encodes "owns it" is the same one the liquidation margin uses: a floor the
  * operator <b>states</b>, never a check they switch off. So there is no boolean here to disable the
- * gate — arming zero-fee work means stating a negative number, which still bounds the loss.
+ * gate — accepting a measured loss means stating a negative number, which still bounds that loss.
  *
  * <p>Since the oracle-pricing slice (2026-09-09), {@link CompoundEconomics#assess} also prices a
  * non-ada principal's fee slice through {@link PricingService} — every test up to that heading uses
- * ada throughout, unchanged from before that slice; the ones under it exercise the new pricing path
- * directly, independent of whether {@code CompoundCandidateScanner} routes a live candidate to it
- * today (it does not yet — see {@code CompoundExclusion.PRINCIPAL_NOT_ADA}'s javadoc).
+ * ada throughout, unchanged from before that slice; the ones under it exercise native pricing.
  */
 class CompoundEconomicsTest {
 
@@ -231,10 +229,7 @@ class CompoundEconomicsTest {
     /**
      * ⛔ THE OLD BEHAVIOUR THIS REPLACES. Before this slice a non-ada principal was refused outright
      * with {@code PRINCIPAL_NOT_ADA} regardless of whether a price existed. {@link CompoundEconomics}
-     * itself no longer does that — it prices the fee slice and decides on the number. (A live
-     * candidate still never reaches here with a non-ada principal today: see
-     * {@code CompoundCandidateScanner}, which keeps its own separate, structural
-     * {@code PRINCIPAL_NOT_ADA} gate for reasons that have nothing to do with pricing.)
+     * itself no longer does that — it prices the fee slice and decides on the number.
      */
     @Test
     void aTokenPrincipalWithAnAvailablePriceIsPricedAndDecidedOnTheNumber() {
@@ -263,7 +258,7 @@ class CompoundEconomicsTest {
                 BigInteger.valueOf(999_000_000L), 50L, TX_FEE, AT_MILLIS);
 
         assertFalse(a.approved());
-        assertEquals(CompoundExclusion.PRICE_UNAVAILABLE, a.exclusion());
+        assertEquals(CompoundExclusion.PRICE_NO_FEED, a.exclusion());
         assertNullNet(a);
     }
 
@@ -277,7 +272,7 @@ class CompoundEconomicsTest {
                 BigInteger.valueOf(999_000_000L), 50L, TX_FEE, AT_MILLIS);
 
         assertFalse(a.approved());
-        assertEquals(CompoundExclusion.PRICE_UNAVAILABLE, a.exclusion());
+        assertEquals(CompoundExclusion.PRICE_NOT_USABLE, a.exclusion());
         assertNullNet(a);
     }
 
@@ -293,7 +288,126 @@ class CompoundEconomicsTest {
                 BigInteger.valueOf(999_000_000L), 50L, TX_FEE, AT_MILLIS));
 
         assertFalse(a.approved());
-        assertEquals(CompoundExclusion.PRICE_UNAVAILABLE, a.exclusion());
+        assertEquals(CompoundExclusion.PRICE_POOLED, a.exclusion());
+    }
+
+    @Test
+    void evidenceNativeZeroFeeUsesRecoveredAdaWithoutAnyOracleLookup() {
+        var throwingClient = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<OraclePriceFeed> findFeed(AssetType asset, long atMillis) {
+                throw new AssertionError("F=0 must not query a price feed");
+            }
+
+            @Override
+            public Optional<OraclePriceFeed> findFeedIgnoringValidity(AssetType asset) {
+                throw new AssertionError("F=0 must not query a price feed");
+            }
+        };
+        CompoundEconomics profitable = economics(true, 0, "preview", new PricingService(throwingClient));
+        BigInteger q = BigInteger.valueOf(176_000_000L);
+        BigInteger e = BigInteger.valueOf(1_986_910L);
+        var quote = assertDoesNotThrow(() -> profitable.quote(TOKEN, BigInteger.ZERO, AT_MILLIS));
+        assertEquals(Optional.of(e), assertDoesNotThrow(() -> profitable.grossRecoverableLovelace(
+                TOKEN, q, 0L, e, AT_MILLIS)), "F=0 ranking is E and also makes no oracle call");
+
+        CompoundAssessment approved = profitable.assessFinal(true, true, TOKEN, q, 0L,
+                facts(e, BigInteger.valueOf(100_000L), BigInteger.valueOf(300_000L)), quote);
+        assertTrue(approved.approved());
+        assertEquals(BigInteger.valueOf(1_586_910L), approved.net(), "E-L-T");
+
+        CompoundAssessment belowFloor = economics(true, 1_600_000L, "preview",
+                new PricingService(throwingClient)).assessFinal(true, true, TOKEN, q, 0L,
+                facts(e, BigInteger.valueOf(100_000L), BigInteger.valueOf(300_000L)), quote);
+        assertFalse(belowFloor.approved());
+        assertEquals(CompoundExclusion.NET_BELOW_FLOOR, belowFloor.exclusion());
+
+        BigInteger roundedF = CompoundEconomics.expectedFee(BigInteger.valueOf(999L), 1L);
+        assertEquals(BigInteger.ZERO, roundedF);
+        CompoundAssessment roundedZero = profitable.assessFinal(true, true, TOKEN,
+                BigInteger.valueOf(999L), 1L,
+                facts(e, BigInteger.valueOf(100_000L), BigInteger.valueOf(300_000L)),
+                assertDoesNotThrow(() -> profitable.quote(TOKEN, roundedF, AT_MILLIS)));
+        assertTrue(roundedZero.approved(), "rounded native F=0 also has no oracle dependency");
+    }
+
+    @Test
+    void largeZeroFeeAdaNeverCountsEscrowCoinAsRecoveredProfit() {
+        BigInteger q = BigInteger.valueOf(9_000_000_000L);
+        BigInteger l = BigInteger.valueOf(400_000L);
+        CompoundTransactionBuilder.KernelFacts deliberatelyNoisyFacts =
+                facts(q, BigInteger.valueOf(777_777L), l);
+
+        CompoundAssessment safeDefault = armed(0).assessFinal(true, true, AssetType.ada(), q, 0L,
+                deliberatelyNoisyFacts, PricingService.Priced.priced(BigInteger.ZERO));
+        assertEquals(l.negate(), safeDefault.net(), "ADA net is F-L, never Q+F-L");
+        assertEquals(BigInteger.ZERO, safeDefault.recoveredEscrowLovelace());
+        assertEquals(BigInteger.ZERO, safeDefault.poolTopUpLovelace());
+        assertFalse(safeDefault.approved());
+
+        CompoundAssessment statedLoss = armed(-400_000L).assessFinal(true, true, AssetType.ada(), q, 0L,
+                deliberatelyNoisyFacts, PricingService.Priced.priced(BigInteger.ZERO));
+        assertTrue(statedLoss.approved());
+    }
+
+    @Test
+    void nativeFinalAssessmentUsesTheExactRawRationalQuoteAndKernelFacts() {
+        var client = new StubOracleClient();
+        client.usable = OraclePriceFeed.aggregated(TOKEN, BigInteger.TEN, BigInteger.valueOf(3L),
+                AT_MILLIS - 1_000, AT_MILLIS + 1_000);
+        CompoundEconomics economics = economics(true, 0, "preview", new PricingService(client));
+        BigInteger q = BigInteger.valueOf(1_999L);
+        BigInteger f = CompoundEconomics.expectedFee(q, 1L);
+        PricingService.Priced quote = economics.quote(TOKEN, f, AT_MILLIS);
+
+        CompoundAssessment assessment = economics.assessFinal(true, true, TOKEN, q, 1L,
+                facts(BigInteger.valueOf(2_000_000L), BigInteger.valueOf(700_000L),
+                        BigInteger.valueOf(400_000L)), quote);
+
+        assertEquals(BigInteger.ONE, assessment.expectedFee(), "F is floor(Q*c/1000) in raw units");
+        assertEquals(BigInteger.valueOf(3L), assessment.expectedFeeLovelace(), "floor(F*10/3)");
+        assertEquals(BigInteger.valueOf(900_003L), assessment.net(), "pricedF+E-L-T");
+        assertEquals(client.usable, assessment.priceObservation());
+    }
+
+    @Test
+    void finalObservationMustRemainTheSameAndUsable() {
+        var client = new StubOracleClient();
+        OraclePriceFeed first = OraclePriceFeed.aggregated(TOKEN, BigInteger.TWO, BigInteger.ONE,
+                AT_MILLIS - 1_000, AT_MILLIS + 10_000);
+        client.usable = first;
+        CompoundEconomics economics = economics(true, 0, "preview", new PricingService(client));
+        BigInteger q = BigInteger.valueOf(100_000L);
+        PricingService.Priced quote = economics.quote(TOKEN,
+                CompoundEconomics.expectedFee(q, 10L), AT_MILLIS);
+        CompoundAssessment assessment = economics.assessFinal(true, true, TOKEN, q, 10L,
+                facts(BigInteger.valueOf(2_000_000L), BigInteger.ZERO, BigInteger.valueOf(300_000L)), quote);
+
+        client.usable = OraclePriceFeed.aggregated(TOKEN, BigInteger.valueOf(3L), BigInteger.ONE,
+                AT_MILLIS - 1_000, AT_MILLIS + 10_000);
+        assertEquals(CompoundExclusion.PRICE_OBSERVATION_CHANGED,
+                economics.revalidateObservation(assessment, TOKEN, AT_MILLIS));
+
+        client.usable = null;
+        client.anyHeld = first;
+        assertEquals(CompoundExclusion.PRICE_OBSERVATION_EXPIRED,
+                economics.revalidateObservation(assessment, TOKEN, AT_MILLIS + 20_000L));
+    }
+
+    @Test
+    void nonPositiveAndConversionPriceFailuresKeepTheirProductionExclusionNames() {
+        assertEquals(CompoundExclusion.PRICE_NON_POSITIVE,
+                CompoundEconomics.priceExclusion(new PricingService.PriceRefusal(TOKEN, AT_MILLIS,
+                        PricingService.RefusalReason.NON_POSITIVE, 1L, 2L, 1L)));
+        assertEquals(CompoundExclusion.PRICE_CONVERSION_FAILED,
+                CompoundEconomics.priceExclusion(new PricingService.PriceRefusal(TOKEN, AT_MILLIS,
+                        PricingService.RefusalReason.CONVERSION_FAILED, null, null, null)));
+    }
+
+    private static CompoundTransactionBuilder.KernelFacts facts(BigInteger recovered,
+                                                                 BigInteger topUp,
+                                                                 BigInteger fee) {
+        return new CompoundTransactionBuilder.KernelFacts(recovered, topUp, fee, new byte[]{1, 2, 3});
     }
 
     private static void assertNullNet(CompoundAssessment a) {

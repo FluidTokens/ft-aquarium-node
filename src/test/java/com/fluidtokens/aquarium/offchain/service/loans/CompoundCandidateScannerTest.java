@@ -5,6 +5,7 @@ import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.AuthorizationMethod;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
@@ -87,10 +88,13 @@ class CompoundCandidateScannerTest {
 
     /** A pool manager UTxO whose datum publishes the given fee. */
     private static Utxo poolManager(long feePerMille) {
-        var datum = ConstrPlutusData.of(0,
+        return poolManagerWithDatum(ConstrPlutusData.of(0,
                 ConstrPlutusData.of(0, com.bloxbean.cardano.client.plutus.spec.BytesPlutusData
                         .of(new byte[28])),
-                BigIntPlutusData.of(feePerMille));
+                BigIntPlutusData.of(feePerMille)));
+    }
+
+    private static Utxo poolManagerWithDatum(PlutusData datum) {
         try {
             return Utxo.builder().txHash("ef".repeat(32)).outputIndex(1)
                     .address("addr_test1_pm")
@@ -123,6 +127,11 @@ class CompoundCandidateScannerTest {
     private static LiquidationUtxoResolver.PoolPair resolved(long fee) {
         return new LiquidationUtxoResolver.PoolPair(LiquidationUtxoResolver.PoolLookup.RESOLVED,
                 pool(), poolManager(fee), "both NFTs present");
+    }
+
+    private static LiquidationUtxoResolver.PoolPair resolved(Utxo manager) {
+        return new LiquidationUtxoResolver.PoolPair(LiquidationUtxoResolver.PoolLookup.RESOLVED,
+                pool(), manager, "both NFTs present");
     }
 
     private static final LiquidationUtxoResolver.PoolPair NOT_VISIBLE =
@@ -259,15 +268,9 @@ class CompoundCandidateScannerTest {
         assertEquals(CompoundExclusion.BOND_NOT_FOUND, scan.candidates().getFirst().exclusion());
     }
 
-    /**
-     * A token-principal pool: still refused structurally here — NOT because
-     * {@code CompoundEconomics} cannot compare a token fee to a lovelace tx fee any more (it can, via
-     * {@code PricingService}, see {@code CompoundEconomicsTest}), but because the compound builder
-     * does not yet pay out a non-ada principal and lifting this is held on a product ruling
-     * (FAB-77). See {@code CompoundExclusion.PRINCIPAL_NOT_ADA}'s javadoc.
-     */
+    /** The supported native topology is lovelace plus exactly the configured principal asset. */
     @Test
-    void aTokenPrincipalPoolIsRefused() {
+    void aStandardTokenPrincipalPoolIsAdmitted() {
         var principal = new AssetType("0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62",
                 "0014df1074464c4454");
         var tFLDT = Amount.builder().unit(principal.toUnit())
@@ -278,21 +281,73 @@ class CompoundCandidateScannerTest {
                 Map.of(LIVE_POOL, resolved(50L))).scan();
 
         var c = scan.candidates().getFirst();
-        assertEquals(CompoundExclusion.PRINCIPAL_NOT_ADA, c.exclusion());
+        assertNull(c.exclusion(), "the standard native escrow is an ordinary compound candidate");
+        assertTrue(c.structurallyReady());
         assertEquals(BigInteger.valueOf(200_000_000L), c.addedLiquidity(),
                 "the principal quantity is still reported, in the principal's own unit");
-        assertFalse(c.detail().contains("cannot be compared"),
-                "the old reason is stale now that CompoundEconomics CAN price a token fee: " + c.detail());
+        assertEquals(50L, c.feePerMille());
     }
 
-    /** An unreadable pool-manager datum must read as a zero fee, never as a high one. */
+    /** A malformed pool-manager fee is a named refusal, never valid zero. */
     @Test
-    void anUnreadablePoolManagerDatumFailsClosedToZero() {
+    void anUnreadablePoolManagerDatumIsNotConvertedToZero() {
         var broken = Utxo.builder().txHash("aa".repeat(32)).outputIndex(0)
                 .address("addr_test1_pm").amount(List.of(Amount.lovelace(BigInteger.TWO)))
                 .inlineDatum("deadbeef").build();
 
-        assertEquals(0L, CompoundCandidateScanner.compoundingFeePerMille(broken));
+        var scan = scanner(List.of(escrow(LIVE_LOAN, LIVE_ESCROW)),
+                List.of(bond(LIVE_LOAN, LIVE_POOL, AssetType.ada())),
+                Map.of(LIVE_POOL, resolved(broken))).scan();
+
+        assertEquals("POOL_MANAGER_FEE_MALFORMED", scan.candidates().getFirst().exclusion().name());
+        assertFalse(scan.candidates().getFirst().structurallyReady());
+    }
+
+    @Test
+    void everyInvalidPoolManagerFeeHasItsOwnRefusalAndExactZeroRemainsValid() {
+        PlutusData owner = ConstrPlutusData.of(0,
+                com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(new byte[28]));
+        List<Map.Entry<Utxo, CompoundExclusion>> invalid = List.of(
+                Map.entry(poolManagerWithDatum(ConstrPlutusData.of(0, owner)),
+                        CompoundExclusion.POOL_MANAGER_FEE_MISSING),
+                Map.entry(poolManagerWithDatum(ConstrPlutusData.of(0, owner,
+                                com.bloxbean.cardano.client.plutus.spec.BytesPlutusData.of(new byte[]{1}))),
+                        CompoundExclusion.POOL_MANAGER_FEE_MALFORMED),
+                Map.entry(poolManagerWithDatum(ConstrPlutusData.of(0, owner,
+                                BigIntPlutusData.of(BigInteger.ONE.shiftLeft(80)))),
+                        CompoundExclusion.POOL_MANAGER_FEE_OVERFLOW),
+                Map.entry(poolManager(1000L), CompoundExclusion.POOL_MANAGER_FEE_OUT_OF_RANGE));
+
+        invalid.forEach(entry -> {
+            Utxo manager = entry.getKey();
+            CompoundExclusion expected = entry.getValue();
+            var candidate = scanner(List.of(escrow(LIVE_LOAN, LIVE_ESCROW)),
+                    List.of(bond(LIVE_LOAN, LIVE_POOL, AssetType.ada())),
+                    Map.of(LIVE_POOL, resolved(manager))).scan().candidates().getFirst();
+            assertEquals(expected, candidate.exclusion());
+            assertFalse(candidate.structurallyReady());
+        });
+
+        var zero = scanner(List.of(escrow(LIVE_LOAN, LIVE_ESCROW)),
+                List.of(bond(LIVE_LOAN, LIVE_POOL, AssetType.ada())),
+                Map.of(LIVE_POOL, resolved(0L))).scan().candidates().getFirst();
+        assertTrue(zero.structurallyReady(), "present integer zero is a valid configured fee");
+        assertEquals(0L, zero.feePerMille());
+    }
+
+    @Test
+    void nativeEscrowsWithReceiptOrUnrelatedAssetsRemainOutsideTheStandardTopology() {
+        var principal = new AssetType("0b77d150c275bd0a600633e4be7d09f83c4b9f00981e22ac9c9d3f62",
+                "0014df1074464c4454");
+        Amount principalAmount = Amount.asset(principal.toUnit(), BigInteger.valueOf(176_000_000L));
+        for (String extraUnit : List.of(REGISTRY.getLoanPolicyId() + "01", "cd".repeat(28) + "02")) {
+            Amount extra = Amount.asset(extraUnit, BigInteger.ONE);
+            var candidate = scanner(List.of(escrow(LIVE_LOAN, BigInteger.valueOf(1_986_910L),
+                            principalAmount, extra)),
+                    List.of(bond(LIVE_LOAN, LIVE_POOL, principal)),
+                    Map.of(LIVE_POOL, resolved(0L))).scan().candidates().getFirst();
+            assertEquals(CompoundExclusion.ESCROW_SHAPE_REJECTED, candidate.exclusion());
+        }
     }
 
     @Test

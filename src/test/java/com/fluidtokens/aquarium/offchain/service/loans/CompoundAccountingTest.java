@@ -7,6 +7,7 @@ import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.common.model.SlotConfigs;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -126,6 +127,12 @@ class CompoundAccountingTest {
     }
 
     private static Transaction build(List<Utxo> walletUtxos) {
+        List<Utxo> completeWallet = new ArrayList<>(walletUtxos);
+        completeWallet.add(walletUtxo("c0", 5_000_000L));
+        return build(completeWallet, walletUtxos.getFirst());
+    }
+
+    private static Transaction build(List<Utxo> walletUtxos, Utxo nominated) {
         List<Utxo> universe = new ArrayList<>(List.of(utxo("escrow"), utxo("bond"), utxo("pool"),
                 utxo("poolManager"), recordedConfig(), recordedLmConfig()));
         universe.addAll(walletUtxos);
@@ -135,7 +142,7 @@ class CompoundAccountingTest {
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), evaluator);
         return builder.build(new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
-                recordedConfig(), recordedLmConfig(), walletUtxos.getFirst(), BOT,
+                recordedConfig(), recordedLmConfig(), nominated, BOT,
                 BigInteger.ZERO, 70_000_000L, 70_000_300L));
     }
 
@@ -157,7 +164,41 @@ class CompoundAccountingTest {
         assertTrue(botInputs > 1,
                 "this fixture must actually exercise multi-input selection, or it re-proves nothing "
                         + "— the rig that missed the production defect had exactly one wallet input");
+        assertTrue(!tx.getBody().getCollateral().isEmpty(),
+                "the build must select explicit pure-ADA collateral");
+        assertTrue(tx.getBody().getCollateral().stream().noneMatch(tx.getBody().getInputs()::contains),
+                "the balancing shortfall selector must not reuse reserved collateral as an ordinary input");
         log.info("thin wallet: {} bot inputs selected, fee {}", botInputs, tx.getBody().getFee());
+    }
+
+    /**
+     * The selector-first late-balancing path in CCL 0.7.2. The nominated input is too thin, the
+     * reserved 5 ADA collateral appears before a free 10 ADA input in the supplier, and both are
+     * strictly large enough for {@code ChangeOutputAdjustments.findFirst}. With the production
+     * exclusion wrapper the free input is spent and collateral remains disjoint. Removing only that
+     * wrapper makes the selector consume the reserved input first and the final disjointness guard
+     * refuses the build.
+     */
+    @Test
+    void selectorFirstBalancingSkipsReservedCollateralAndUsesTheFreeAdaInput() {
+        Utxo nominated = walletUtxo("b1", 1_000_000L);
+        Utxo collateral = walletUtxo("b2", 5_000_000L);
+        Utxo free = walletUtxo("b3", 10_000_000L);
+
+        Transaction tx = build(List.of(nominated, collateral, free), nominated);
+        TransactionInput collateralInput = new TransactionInput(collateral.getTxHash(), collateral.getOutputIndex());
+        TransactionInput freeInput = new TransactionInput(free.getTxHash(), free.getOutputIndex());
+
+        assertEquals(List.of(collateralInput), tx.getBody().getCollateral(),
+                "the 5 ADA actual-sufficient candidate is reserved alone, below the protocol ceiling");
+        assertTrue(tx.getBody().getInputs().contains(freeInput),
+                "the selector-first shortfall path must take the separate free balancing input");
+        assertTrue(!tx.getBody().getInputs().contains(collateralInput),
+                "the selector-first path must not consume the reserved collateral");
+        assertTrue(BigInteger.valueOf(5_000_000L).compareTo(
+                LiquidateTransactionBuilder.maxPossibleCollateral(
+                        EvalFixtures.protocolParams().getProtocolParams())) < 0,
+                "the control must remain below the protocol-wide ceiling");
     }
 
     /** The identity, on the single-input shape, stated as arithmetic rather than as a passing build. */

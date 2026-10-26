@@ -4,36 +4,54 @@ import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.address.AddressProvider;
 import com.bloxbean.cardano.client.address.Credential;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.MinAdaCalculator;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Amount;
+import com.bloxbean.cardano.client.api.model.EvaluationResult;
+import com.bloxbean.cardano.client.api.model.ProtocolParams;
+import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
+import com.bloxbean.cardano.client.api.util.ValueUtil;
+import com.bloxbean.cardano.client.coinselection.impl.ExcludeUtxoSelector;
 import com.bloxbean.cardano.client.common.cbor.CborSerializationUtil;
 import com.bloxbean.cardano.client.common.model.Network;
 import com.bloxbean.cardano.client.function.TxBuilder;
+import com.bloxbean.cardano.client.function.TxBuilderContext;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
+import com.bloxbean.cardano.client.plutus.spec.Redeemer;
 import com.bloxbean.cardano.client.quicktx.QuickTxBuilder;
 import com.bloxbean.cardano.client.quicktx.ScriptTx;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
+import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
 import com.bloxbean.cardano.client.transaction.spec.Value;
+import com.bloxbean.cardano.client.transaction.spec.VkeyWitness;
+import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * Builds the unsigned repayment-escrow <b>compound</b> transaction: collect a repaid loan's principal
@@ -100,6 +118,13 @@ public class CompoundTransactionBuilder {
     /** Four script inputs, therefore four spend redeemers before the first reward redeemer. */
     static final int SCRIPT_SPEND_COUNT = 4;
 
+    /**
+     * The provisional reservation target used by CCL when the wallet has not yet reached the
+     * protocol-ceiling target shape. It is only a selection preference: the finished body's actual
+     * fee remains the authority in {@link #validateCollateral}.
+     */
+    private static final BigInteger PROVISIONAL_COLLATERAL = BigInteger.valueOf(5_000_000L);
+
     public enum Refusal {
         CANDIDATE_NOT_READY,
         POOL_DATUM_NOT_BYTE_IDENTICAL,
@@ -110,7 +135,20 @@ public class CompoundTransactionBuilder {
         ECHO_NOT_BYTE_IDENTICAL,
         BOT_NET_MISMATCH,
         COLLATERAL_RETURN_NEGATIVE,
-        BOT_OUTPUTS_NOT_FOLDED
+        BOT_OUTPUTS_NOT_FOLDED,
+        PRINCIPAL_MISMATCH,
+        POOL_MIN_ADA_UNSTABLE,
+        INPUT_NOT_UNIQUE,
+        INPUT_UNRESOLVED,
+        UNEXPECTED_SPENDING_INPUT,
+        UNEXPECTED_OUTPUT,
+        VALUE_NOT_CONSERVED,
+        MINT_OR_WITHDRAWAL_NOT_ZERO,
+        OUTPUT_BELOW_MIN_ADA,
+        COLLATERAL_NOT_DISTINCT_PURE_ADA,
+        FEE_BELOW_LEDGER_MINIMUM,
+        TRANSACTION_TOO_LARGE,
+        FINAL_EVALUATION_MISMATCH
     }
 
     @Getter
@@ -140,7 +178,8 @@ public class CompoundTransactionBuilder {
      *                       real amounts, from the same index read that produced the candidate
      * @param configUtxo     the main config UTxO, a reference input
      * @param lmConfigUtxo   the lender-manager config UTxO, a reference input
-     * @param walletUtxo     the bot's ada-only input, paying the fee and serving as collateral
+     * @param walletUtxo     the bot's nominated ordinary input, paying the fee; collateral is a
+     *                       separate pure-ADA UTxO selected from the same credential
      * @param changeAddress  the bot's address — <b>where the compounding fee lands</b>
      * @param compoundingFee {@code addedLiquidity * feePerMille / 1000}, computed by
      *                       {@link CompoundEconomics} with the validator's truncation
@@ -157,6 +196,24 @@ public class CompoundTransactionBuilder {
                           BigInteger compoundingFee,
                           long validFromSlot,
                           long validToSlot) {
+    }
+
+    /** Facts measured from the exact final body after every kernel guard has passed. */
+    public record KernelFacts(BigInteger recoveredEscrowLovelace,
+                              BigInteger poolTopUpLovelace,
+                              BigInteger transactionFeeLovelace,
+                              byte[] bodyIdentity) {
+        public KernelFacts {
+            bodyIdentity = bodyIdentity.clone();
+        }
+
+        @Override
+        public byte[] bodyIdentity() {
+            return bodyIdentity.clone();
+        }
+    }
+
+    public record Built(Transaction transaction, KernelFacts facts) {
     }
 
     private final LoansContractRegistry registry;
@@ -233,6 +290,10 @@ public class CompoundTransactionBuilder {
     // ---- the one entry point ----------------------------------------------------------------
 
     public Transaction build(Request request) {
+        return buildWithFacts(request).transaction();
+    }
+
+    public Built buildWithFacts(Request request) {
         CompoundCandidate c = request.candidate();
         if (!c.structurallyReady()) {
             throw refuse(Refusal.CANDIDATE_NOT_READY,
@@ -264,9 +325,32 @@ public class CompoundTransactionBuilder {
         ScriptTx tx = assemble(request, configRefIndex, lmConfigRefIndex,
                 poolWithdrawRedeemerIndex, lmWithdrawRedeemerIndex);
 
-        return complete(request, refInputs, tx,
+        Transaction transaction = complete(request, refInputs, tx,
                 (ctx, txn) -> assertStructure(txn, request, withdrawalOrder,
                         poolWithdrawRedeemerIndex, lmWithdrawRedeemerIndex));
+        return new Built(transaction, kernelFacts(request, transaction));
+    }
+
+    private KernelFacts kernelFacts(Request request, Transaction transaction) {
+        BigInteger recovered = request.candidate().principalIsAda()
+                ? BigInteger.ZERO : lovelaceOf(request.candidate().escrow().getAmount());
+        BigInteger topUp = BigInteger.ZERO;
+        if (!request.candidate().principalIsAda()) {
+            TransactionOutput pool = onlyOutputWithDatum(transaction,
+                    request.candidate().pool().getAddress(), request.candidate().pool().getInlineDatum(), "pool");
+            topUp = pool.getValue().getCoin()
+                    .subtract(lovelaceOf(request.candidate().pool().getAmount()));
+        }
+        return new KernelFacts(recovered, topUp, transaction.getBody().getFee(), bodyIdentity(transaction));
+    }
+
+    /** Canonical CBOR identity of the transaction body; witnesses are deliberately excluded. */
+    public static byte[] bodyIdentity(Transaction transaction) {
+        try {
+            return CborSerializationUtil.serialize(transaction.getBody().serialize());
+        } catch (Exception e) {
+            throw refuse(Refusal.VALUE_NOT_CONSERVED, "could not serialise final transaction body: " + e);
+        }
     }
 
     // ---- assembly ---------------------------------------------------------------------------
@@ -284,12 +368,12 @@ public class CompoundTransactionBuilder {
         tx.collectFrom(c.poolManager(), GENERAL_SPEND_REDEEMER);
         tx.collectFrom(request.walletUtxo());
 
-        // The pool gains addedLiquidity MINUS the fee. Everything else about it is unchanged, and
-        // pool_compound_action checks the whole value with equals_data — so the input's other assets
-        // are carried across verbatim rather than reconstructed.
-        BigInteger delta = c.addedLiquidity().subtract(request.compoundingFee());
-        tx.payToContract(c.pool().getAddress(), plusLovelace(c.pool().getAmount(), delta),
-                echo(c.pool().getInlineDatum(), Refusal.POOL_DATUM_NOT_BYTE_IDENTICAL, "pool"));
+        // The pool gains Q-F in the principal's own raw unit. ADA keeps its established combined
+        // lovelace semantics. For a native principal the pool's complete value is preserved, only the
+        // principal quantity changes, and coin rises solely by the current-protocol min-ADA top-up T.
+        PlutusData poolDatum = echo(c.pool().getInlineDatum(),
+                Refusal.POOL_DATUM_NOT_BYTE_IDENTICAL, "pool");
+        tx.payToContract(c.pool().getAddress(), poolOutputAmounts(request, poolDatum), poolDatum);
 
         // Two byte-identical restorations: equals_data compares the WHOLE output, so value and datum
         // both go back exactly as they came in.
@@ -346,6 +430,8 @@ public class CompoundTransactionBuilder {
     private Transaction complete(Request request, List<TransactionInput> refInputs,
                                  ScriptTx tx, TxBuilder verify) {
         tx.readFrom(refInputs.toArray(TransactionInput[]::new));
+        TransactionInput[] collateralInputs = collateralInputsFor(request);
+        Set<TransactionInput> reservedCollateral = Set.of(collateralInputs);
         // Production: the injected utxo supplier (the local index first), the per-epoch protocol params and
         // a SCRIPT SUPPLIER serving verified script bytes. The processor slot is null and stays null: the
         // evaluator arrives through withTxEvaluator below (CCL trap 8), so this builder can price a
@@ -371,7 +457,13 @@ public class CompoundTransactionBuilder {
                 // ⛔ ONE LAMBDA: preBalanceTx is a SETTER (QuickTxBuilder:263 assigns), so a second call
                 // would silently discard the first. Both jobs live here.
                 .preBalanceTx((ctx, txn) -> {
-                    ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier));
+                    // QuickTxBuilder initially wraps the selector to exclude explicit collateral,
+                    // but replacing it here would discard that wrapper. Reapply it every time this
+                    // setter is used so neither the explicit selection nor a balancing shortfall can
+                    // consume the reserved pure-ADA collateral.
+                    ctx.setUtxoSelector(new ExcludeUtxoSelector(
+                            ReferenceScriptSafeUtxoSelection.selector(utxoSupplier),
+                            reservedCollateral));
                     // FAB-152: after the selector, fold the bot's outputs into one. This runs after
                     // input selection and change, and BEFORE collateral, script-cost evaluation and
                     // balancing — so the ex-units and the fee are computed on the folded body.
@@ -382,11 +474,10 @@ public class CompoundTransactionBuilder {
                 // DefaultUtxoSelectionStrategyImpl (a hardcoded 5 ADA target) — blind to both guards
                 // above. Measured (FAB-134 B3b-4): a 3.0-4.5 ADA wallet beside published reference
                 // scripts pledged one of them as COLLATERAL, which a phase-2 failure consumes. So the
-                // collateral is chosen here from reference-script-free wallet UTxOs, sized from the
-                // protocol parameters — the liquidation builders' helper, shared rather than copied.
-                .withCollateralInputs(LiquidateTransactionBuilder.collateralInputsFor(utxoSupplier,
-                        protocolParamsSupplier, request.changeAddress(), request.walletUtxo()))
-                .postBalanceTx(verify);
+                // collateral is chosen here from reference-script-free wallet UTxOs. The protocol
+                // ceiling is a preferred target; the exact final fee decides sufficiency below.
+                .withCollateralInputs(collateralInputs)
+                .postBalanceTx(verify.andThen((ctx, txn) -> validateFinalTransaction(ctx, txn, request)));
 
         // CCL trap 9: the reference-script fee is only charged for bytes the library can OBTAIN.
         // Without this it charges ZERO and the transaction is short by 15 lovelace per byte —
@@ -422,6 +513,631 @@ public class CompoundTransactionBuilder {
         return context.build();
     }
 
+    // ---- asset-aware construction and finished-body ledger checks ---------------------------
+
+    private List<Amount> poolOutputAmounts(Request request, PlutusData datum) {
+        return ValueUtil.toAmountList(poolOutputValue(request, datum));
+    }
+
+    private Value poolOutputValue(Request request, PlutusData datum) {
+        CompoundCandidate candidate = request.candidate();
+        BigInteger delta = compoundDelta(request);
+        Value value = valueOf(candidate.pool().getAmount());
+        if (candidate.principalIsAda()) {
+            return value.addCoin(delta);
+        }
+
+        String unit = principalUnit(request);
+        value = value.add(assetValue(unit, delta));
+        BigInteger originalCoin = lovelaceOf(candidate.pool().getAmount());
+        BigInteger coin = originalCoin;
+        ProtocolParams params = protocolParams();
+        MinAdaCalculator calculator = new MinAdaCalculator(params);
+        for (int attempt = 0; attempt < 16; attempt++) {
+            value.setCoin(coin);
+            TransactionOutput output = new TransactionOutput(candidate.pool().getAddress(), value);
+            output.setInlineDatum(datum);
+            BigInteger required = calculator.calculateMinAda(output);
+            BigInteger next = originalCoin.add(required.subtract(originalCoin).max(BigInteger.ZERO));
+            if (next.equals(coin)) {
+                return value;
+            }
+            coin = next;
+        }
+        throw refuse(Refusal.POOL_MIN_ADA_UNSTABLE,
+                "pool coin/min-ADA did not stabilise after 16 serialisation-aware iterations");
+    }
+
+    private BigInteger compoundDelta(Request request) {
+        BigInteger quantity = request.candidate().addedLiquidity();
+        BigInteger fee = request.compoundingFee();
+        if (quantity == null || fee == null || quantity.signum() <= 0 || fee.signum() < 0
+                || fee.compareTo(quantity) >= 0) {
+            throw refuse(Refusal.PRINCIPAL_MISMATCH,
+                    "principal quantity and fee must satisfy Q > F >= 0, got Q=" + quantity + ", F=" + fee);
+        }
+        String unit = principalUnit(request);
+        BigInteger actual = unitsOf(request.candidate().escrow().getAmount())
+                .getOrDefault(unit, BigInteger.ZERO);
+        if (!actual.equals(quantity)) {
+            throw refuse(Refusal.PRINCIPAL_MISMATCH,
+                    "escrow carries " + actual + " " + unit + ", candidate says Q=" + quantity);
+        }
+        Set<String> allowed = request.candidate().principalIsAda()
+                ? Set.of("lovelace") : Set.of("lovelace", unit);
+        Set<String> carried = new HashSet<>(unitsOf(request.candidate().escrow().getAmount()).keySet());
+        carried.removeIf(k -> unitsOf(request.candidate().escrow().getAmount()).get(k).signum() == 0);
+        if (!allowed.containsAll(carried)) {
+            throw refuse(Refusal.PRINCIPAL_MISMATCH,
+                    "escrow carries unsupported units " + carried + ", allowed " + allowed);
+        }
+        return quantity.subtract(fee);
+    }
+
+    private String principalUnit(Request request) {
+        CompoundCandidate candidate = request.candidate();
+        if (candidate.principalIsAda()) {
+            return "lovelace";
+        }
+        if (candidate.bond() == null || candidate.bond().datum() == null
+                || candidate.bond().datum().principalAsset() == null
+                || candidate.bond().datum().principalAsset().isAda()) {
+            throw refuse(Refusal.PRINCIPAL_MISMATCH,
+                    "token-principal candidate has no non-ADA principal unit in its lender bond");
+        }
+        return candidate.bond().datum().principalAsset().toUnit();
+    }
+
+    /** Reserve distinct pure-ADA collateral; exact sufficiency is proven against the final fee. */
+    private TransactionInput[] collateralInputsFor(Request request) {
+        ProtocolParams params = protocolParams();
+        BigInteger required = LiquidateTransactionBuilder.maxPossibleCollateral(params);
+        Set<TransactionInput> ordinary = Set.of(inputOf(request.candidate().escrow()),
+                inputOf(request.bondUtxo()), inputOf(request.candidate().pool()),
+                inputOf(request.candidate().poolManager()), inputOf(request.walletUtxo()));
+        List<Utxo> wallet;
+        try {
+            wallet = utxoSupplier.getAll(request.changeAddress());
+        } catch (Exception e) {
+            throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                    "could not read wallet UTxOs while reserving collateral: " + e);
+        }
+        List<Utxo> candidates = wallet.stream()
+                .filter(ReferenceScriptSafeUtxoSelection::spendable)
+                .filter(u -> u.getInlineDatum() == null && u.getDataHash() == null)
+                .filter(CompoundTransactionBuilder::pureAda)
+                .filter(u -> !ordinary.contains(inputOf(u)))
+                .sorted(Comparator.comparing((Utxo u) -> lovelaceOf(u.getAmount())).reversed())
+                .toList();
+        int limit = Math.max(1, params.getMaxCollateralInputs());
+        Utxo preferred = candidates.stream()
+                .filter(u -> lovelaceOf(u.getAmount()).equals(required))
+                .findFirst().orElse(null);
+        if (preferred == null) {
+            // Do not reserve every pure-ADA UTxO merely to chase the protocol-wide fee ceiling. A
+            // temporarily unshaped wallet commonly has one 5 ADA collateral candidate and one larger
+            // balancing input; taking both makes an otherwise valid transaction look unfunded. Prefer
+            // the smallest candidate at least as large as CCL's provisional target, or the largest
+            // available candidate when none reaches it. The exact final fee decides sufficiency below.
+            preferred = candidates.stream()
+                    .filter(u -> lovelaceOf(u.getAmount()).compareTo(PROVISIONAL_COLLATERAL) >= 0)
+                    .min(Comparator.comparing(u -> lovelaceOf(u.getAmount())))
+                    .orElseGet(() -> candidates.stream()
+                            .max(Comparator.comparing(u -> lovelaceOf(u.getAmount())))
+                            .orElse(null));
+        }
+        if (preferred == null) {
+            throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                    "wallet has no distinct pure-ADA collateral candidate");
+        }
+        List<TransactionInput> chosen = List.of(inputOf(preferred));
+        if (chosen.size() > limit) {
+            throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                    "collateral selection exceeds maxCollateralInputs=" + limit);
+        }
+        // The ceiling is a preferred reservation target, not a minimum. The body does not yet have
+        // its evaluator costs or final fee here; validateCollateral later proves this chosen capacity
+        // against ceil(actual final fee * collateralPercent / 100) and refuses any shortfall.
+        return chosen.toArray(TransactionInput[]::new);
+    }
+
+    private ProtocolParams protocolParams() {
+        try {
+            ProtocolParams params = protocolParamsSupplier.getProtocolParams();
+            if (params == null || params.getCoinsPerUtxoSize() == null
+                    || params.getCoinsPerUtxoSize().isBlank()) {
+                throw new IllegalStateException("missing coinsPerUtxoSize");
+            }
+            return params;
+        } catch (Exception e) {
+            throw refuse(Refusal.POOL_MIN_ADA_UNSTABLE,
+                    "current protocol parameters are unavailable: " + e);
+        }
+    }
+
+    private void validateFinalTransaction(TxBuilderContext context, Transaction built, Request request) {
+        final Transaction tx;
+        try {
+            tx = Transaction.deserialize(built.serialize());
+        } catch (Exception e) {
+            throw refuse(Refusal.VALUE_NOT_CONSERVED,
+                    "the final unsigned transaction does not round-trip: " + e);
+        }
+        List<String> order = withdrawalOrder();
+        assertStructure(tx, request, order,
+                rewardRedeemerIndex(order, registry.getPoolPolicyId()),
+                rewardRedeemerIndex(order, registry.getLenderManagerWithdrawScriptHash()));
+        validateInputsOutputsAndValue(tx, request);
+        validateCollateral(tx, request);
+        validateMinAdaAndSize(tx, context.getProtocolParams());
+        validateMinimumFee(tx, context);
+        validateFinalEvaluation(tx, context.getAllUtxos());
+    }
+
+    /**
+     * Package-visible mutation seam for the ledger-shaped tests. It deliberately serialises and
+     * deserialises first, just like the production post-balance gate, so a test cannot prove a
+     * property of an in-memory shape that is not the body which would leave this builder.
+     */
+    void validateLedgerShape(Transaction built, Request request) {
+        final Transaction tx;
+        try {
+            tx = Transaction.deserialize(built.serialize());
+        } catch (Exception e) {
+            throw refuse(Refusal.VALUE_NOT_CONSERVED,
+                    "the unsigned transaction does not round-trip: " + e);
+        }
+        validateInputsOutputsAndValue(tx, request);
+        validateCollateral(tx, request);
+        validateMinAdaAndSize(tx, protocolParams());
+    }
+
+    /**
+     * Package-visible mutation seam for the final ledger fee comparison. The test supplies the
+     * production-derived builder context and this method invokes the same guard as
+     * {@link #validateFinalTransaction}; it does not duplicate the fee formula.
+     */
+    void validateLedgerFee(Transaction built, TxBuilderContext context) {
+        final Transaction tx;
+        try {
+            tx = Transaction.deserialize(built.serialize());
+        } catch (Exception e) {
+            throw refuse(Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                    "the unsigned transaction does not round-trip: " + e);
+        }
+        validateMinimumFee(tx, context);
+    }
+
+    private void validateInputsOutputsAndValue(Transaction tx, Request request) {
+        List<TransactionInput> inputs = tx.getBody().getInputs();
+        if (inputs.size() != new HashSet<>(inputs).size()) {
+            throw refuse(Refusal.INPUT_NOT_UNIQUE, "the final body repeats a spending input");
+        }
+        Set<TransactionInput> expectedScripts = Set.of(inputOf(request.candidate().escrow()),
+                inputOf(request.bondUtxo()), inputOf(request.candidate().pool()),
+                inputOf(request.candidate().poolManager()));
+        Set<TransactionInput> foundScripts = new HashSet<>();
+        Map<String, BigInteger> allInputs = new TreeMap<>();
+        Map<String, BigInteger> walletInputs = new TreeMap<>();
+        for (TransactionInput input : inputs) {
+            Utxo spent = resolve(input, Refusal.INPUT_UNRESOLVED, "spending input");
+            addUnits(allInputs, unitsOf(spent.getAmount()));
+            if (expectedScripts.contains(input)) {
+                foundScripts.add(input);
+            } else if (samePaymentCredential(spent.getAddress(), request.changeAddress())) {
+                addUnits(walletInputs, unitsOf(spent.getAmount()));
+            } else {
+                throw refuse(Refusal.UNEXPECTED_SPENDING_INPUT,
+                        "unclassified spending input " + ref(input) + " at " + spent.getAddress()
+                                + "; ordinary compound permits only escrow/bond/pool/manager and wallet inputs");
+            }
+        }
+        if (!foundScripts.equals(expectedScripts)) {
+            throw refuse(Refusal.UNEXPECTED_SPENDING_INPUT,
+                    "expected script inputs " + expectedScripts + ", found " + foundScripts);
+        }
+
+        if (tx.getBody().getMint() != null && tx.getBody().getMint().stream()
+                .flatMap(ma -> ma.getAssets().stream()).anyMatch(a -> a.getValue().signum() != 0)) {
+            throw refuse(Refusal.MINT_OR_WITHDRAWAL_NOT_ZERO, "ordinary compound must mint/burn zero");
+        }
+        if (tx.getBody().getWithdrawals() != null && tx.getBody().getWithdrawals().stream()
+                .anyMatch(w -> w.getCoin().signum() != 0)) {
+            throw refuse(Refusal.MINT_OR_WITHDRAWAL_NOT_ZERO,
+                    "ordinary compound withdrawals must all be zero");
+        }
+        if (tx.getBody().getCerts() != null && !tx.getBody().getCerts().isEmpty()) {
+            throw refuse(Refusal.MINT_OR_WITHDRAWAL_NOT_ZERO, "ordinary compound carries certificates");
+        }
+
+        TransactionOutput pool = onlyOutputWithDatum(tx, request.candidate().pool().getAddress(),
+                request.candidate().pool().getInlineDatum(), "pool");
+        TransactionOutput bond = onlyOutputWithDatum(tx, request.bondUtxo().getAddress(),
+                request.candidate().bond().inlineDatum(), "lender bond");
+        TransactionOutput manager = onlyOutputWithDatum(tx, request.candidate().poolManager().getAddress(),
+                request.candidate().poolManager().getInlineDatum(), "pool manager");
+        Map<String, BigInteger> allOutputs = new TreeMap<>();
+        Map<String, BigInteger> walletOutputs = new TreeMap<>();
+        for (TransactionOutput output : tx.getBody().getOutputs()) {
+            addUnits(allOutputs, unitsOf(output.getValue()));
+            if (output == pool || output == bond || output == manager) {
+                continue;
+            }
+            if (samePaymentCredential(output.getAddress(), request.changeAddress())) {
+                addUnits(walletOutputs, unitsOf(output.getValue()));
+            } else {
+                throw refuse(Refusal.UNEXPECTED_OUTPUT,
+                        "unclassified output at " + output.getAddress() + " with value "
+                                + unitsOf(output.getValue()));
+            }
+        }
+
+        Map<String, BigInteger> lhs = new TreeMap<>(allInputs);
+        if (tx.getBody().getMint() != null) {
+            tx.getBody().getMint().forEach(ma -> ma.getAssets().forEach(a ->
+                    lhs.merge(ma.getPolicyId() + a.getNameAsHex().replaceFirst("^0x", ""),
+                            a.getValue(), BigInteger::add)));
+        }
+        Map<String, BigInteger> rhs = new TreeMap<>(allOutputs);
+        rhs.merge("lovelace", tx.getBody().getFee(), BigInteger::add);
+        removeZeros(lhs);
+        removeZeros(rhs);
+        if (!lhs.equals(rhs)) {
+            throw refuse(Refusal.VALUE_NOT_CONSERVED,
+                    "inputs+mint " + lhs + " != outputs+fee " + rhs);
+        }
+
+        Map<String, BigInteger> walletDelta = new TreeMap<>(walletOutputs);
+        subtractUnits(walletDelta, walletInputs);
+        Map<String, BigInteger> expectedDelta = new TreeMap<>();
+        PlutusData expectedPoolDatum = echo(request.candidate().pool().getInlineDatum(),
+                Refusal.POOL_DATUM_NOT_BYTE_IDENTICAL, "pool");
+        BigInteger poolTopUp = poolOutputValue(request, expectedPoolDatum).getCoin()
+                .subtract(lovelaceOf(request.candidate().pool().getAmount()));
+        if (request.candidate().principalIsAda()) {
+            expectedDelta.put("lovelace", request.compoundingFee().subtract(tx.getBody().getFee()));
+        } else {
+            String principal = principalUnit(request);
+            BigInteger principalPaidToCredential = tx.getBody().getOutputs().stream()
+                    .filter(o -> samePaymentCredential(o.getAddress(), request.changeAddress()))
+                    .map(o -> unitsOf(o.getValue()).getOrDefault(principal, BigInteger.ZERO))
+                    .reduce(BigInteger.ZERO, BigInteger::add);
+            BigInteger principalSpentByCredential = inputs.stream()
+                    .map(i -> resolve(i, Refusal.INPUT_UNRESOLVED, "principal-accounting input"))
+                    .filter(u -> samePaymentCredential(u.getAddress(), request.changeAddress()))
+                    .map(u -> unitsOf(u.getAmount()).getOrDefault(principal, BigInteger.ZERO))
+                    .reduce(BigInteger.ZERO, BigInteger::add);
+            BigInteger actualPrincipalDelta = principalPaidToCredential.subtract(principalSpentByCredential);
+            if (!actualPrincipalDelta.equals(request.compoundingFee())) {
+                throw refuse(Refusal.BOT_NET_MISMATCH,
+                        "credential-owned wallet principal delta is " + actualPrincipalDelta
+                                + " " + principal + ", expected fee " + request.compoundingFee());
+            }
+            expectedDelta.put(principal, request.compoundingFee());
+            expectedDelta.put("lovelace", lovelaceOf(request.candidate().escrow().getAmount())
+                    .subtract(tx.getBody().getFee()).subtract(poolTopUp));
+        }
+        removeZeros(walletDelta);
+        removeZeros(expectedDelta);
+        if (!walletDelta.equals(expectedDelta)) {
+            throw refuse(Refusal.BOT_NET_MISMATCH,
+                    "credential-owned wallet delta is " + walletDelta + ", expected " + expectedDelta);
+        }
+    }
+
+    private void validateCollateral(Transaction tx, Request request) {
+        List<TransactionInput> collateral = tx.getBody().getCollateral() == null
+                ? List.of() : tx.getBody().getCollateral();
+        if (collateral.isEmpty() || collateral.size() != new HashSet<>(collateral).size()) {
+            throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                    "collateral must be a non-empty unique set");
+        }
+        Set<TransactionInput> spending = new HashSet<>(tx.getBody().getInputs());
+        BigInteger capacity = BigInteger.ZERO;
+        for (TransactionInput input : collateral) {
+            if (spending.contains(input)) {
+                throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                        "collateral " + ref(input) + " is also an ordinary spending input");
+            }
+            Utxo utxo = resolve(input, Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA, "collateral input");
+            if (!pureAda(utxo) || utxo.getInlineDatum() != null || utxo.getDataHash() != null
+                    || utxo.getReferenceScriptHash() != null
+                    || !samePaymentCredential(utxo.getAddress(), request.changeAddress())) {
+                throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                        "collateral " + ref(input)
+                                + " is not datum-free, reference-script-free credential-owned pure ADA");
+            }
+            capacity = capacity.add(lovelaceOf(utxo.getAmount()));
+        }
+        ProtocolParams params = protocolParams();
+        BigInteger required = ceilPercent(tx.getBody().getFee(), params.getCollateralPercent());
+        BigInteger declared = tx.getBody().getTotalCollateral();
+        if (declared == null || declared.compareTo(required) < 0 || capacity.compareTo(declared) < 0) {
+            throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                    "capacity=" + capacity + ", declared=" + declared + ", required=" + required);
+        }
+        BigInteger returned = capacity.subtract(declared);
+        TransactionOutput collateralReturn = tx.getBody().getCollateralReturn();
+        if (returned.signum() == 0) {
+            if (collateralReturn != null && !unitsOf(collateralReturn.getValue()).isEmpty()) {
+                throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                        "zero collateral return expected, body carries " + unitsOf(collateralReturn.getValue()));
+            }
+        } else if (collateralReturn == null
+                || !samePaymentCredential(collateralReturn.getAddress(), request.changeAddress())
+                || !unitsOf(collateralReturn.getValue()).equals(Map.of("lovelace", returned))) {
+            throw refuse(Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA,
+                    "collateral return does not equal capacity-totalCollateral: " + returned);
+        }
+    }
+
+    private void validateMinAdaAndSize(Transaction tx, ProtocolParams params) {
+        MinAdaCalculator calculator = new MinAdaCalculator(params);
+        List<TransactionOutput> outputs = new ArrayList<>(tx.getBody().getOutputs());
+        if (tx.getBody().getCollateralReturn() != null) {
+            outputs.add(tx.getBody().getCollateralReturn());
+        }
+        for (int i = 0; i < outputs.size(); i++) {
+            TransactionOutput output = outputs.get(i);
+            if (unitsOf(output.getValue()).values().stream().anyMatch(q -> q.signum() < 0)) {
+                throw refuse(Refusal.VALUE_NOT_CONSERVED, "output " + i + " carries a negative quantity");
+            }
+            BigInteger minimum = calculator.calculateMinAda(output);
+            if (output.getValue().getCoin().compareTo(minimum) < 0) {
+                throw refuse(Refusal.OUTPUT_BELOW_MIN_ADA,
+                        "output " + i + " has " + output.getValue().getCoin() + ", minimum " + minimum);
+            }
+        }
+        try {
+            Transaction witnessed = withDummyWitness(tx);
+            int size = witnessed.serialize().length;
+            if (params.getMaxTxSize() == null || size > params.getMaxTxSize()) {
+                throw refuse(Refusal.TRANSACTION_TOO_LARGE,
+                        "one-witness transaction is " + size + " bytes, max " + params.getMaxTxSize());
+            }
+        } catch (RefusedException e) {
+            throw e;
+        } catch (Exception e) {
+            throw refuse(Refusal.TRANSACTION_TOO_LARGE, "could not measure final transaction: " + e);
+        }
+    }
+
+    private void validateMinimumFee(Transaction tx, TxBuilderContext context) {
+        try {
+            ProtocolParams params = context.getProtocolParams();
+            Transaction witnessed = withDummyWitness(tx);
+            BigInteger base = BigInteger.valueOf(params.getMinFeeA())
+                    .multiply(BigInteger.valueOf(witnessed.serialize().length))
+                    .add(BigInteger.valueOf(params.getMinFeeB()));
+            BigDecimal script = BigDecimal.ZERO;
+            for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
+                script = script.add(params.getPriceMem().multiply(new BigDecimal(redeemer.getExUnits().getMem())))
+                        .add(params.getPriceStep().multiply(new BigDecimal(redeemer.getExUnits().getSteps())));
+            }
+            BigInteger scriptFee = script.setScale(0, RoundingMode.CEILING).toBigIntegerExact();
+            long referenceBytes = referenceScriptBytes(tx, context);
+            BigInteger referenceFee = tierReferenceFee(referenceBytes,
+                    params.getMinFeeRefScriptCostPerByte());
+            BigInteger minimum = base.add(scriptFee).add(referenceFee);
+            if (tx.getBody().getFee().compareTo(minimum) < 0) {
+                throw refuse(Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                        "fee " + tx.getBody().getFee() + " is below " + minimum
+                                + " (base " + base + ", scripts " + scriptFee
+                                + ", reference scripts " + referenceFee + ")");
+            }
+        } catch (RefusedException e) {
+            throw e;
+        } catch (Exception e) {
+            throw refuse(Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                    "could not calculate the final ledger fee floor: " + e);
+        }
+    }
+
+    private long referenceScriptBytes(Transaction tx, TxBuilderContext context) {
+        Map<String, PlutusScript> declared = new HashMap<>();
+        for (PlutusScript script : context.getRefPlutusScripts()) {
+            try {
+                declared.put(HexUtil.encodeHexString(script.getScriptHash()), script);
+            } catch (Exception e) {
+                throw refuse(Refusal.FEE_BELOW_LEDGER_MINIMUM, "could not hash declared reference script: " + e);
+            }
+        }
+        long bytes = 0;
+        for (TransactionInput input : tx.getBody().getReferenceInputs()) {
+            Utxo utxo = resolve(input, Refusal.FEE_BELOW_LEDGER_MINIMUM, "reference input");
+            if (utxo.getReferenceScriptHash() == null) {
+                continue;
+            }
+            PlutusScript script = declared.get(utxo.getReferenceScriptHash());
+            if (script == null && scriptSupplier != null) {
+                try {
+                    script = scriptSupplier.getScript(utxo.getReferenceScriptHash()).orElse(null);
+                } catch (Exception e) {
+                    throw refuse(Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                            "could not load reference script " + utxo.getReferenceScriptHash() + ": " + e);
+                }
+            }
+            if (script == null) {
+                throw refuse(Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                        "no bytes for referenced script " + utxo.getReferenceScriptHash());
+            }
+            try {
+                bytes += script.serializeScriptBody().length;
+            } catch (Exception e) {
+                throw refuse(Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                        "could not serialise referenced script " + utxo.getReferenceScriptHash() + ": " + e);
+            }
+        }
+        return bytes;
+    }
+
+    private void validateFinalEvaluation(Transaction tx, Set<Utxo> resolved) {
+        if (scriptCostEvaluator == null) {
+            return; // Legacy offline sizing rigs cannot submit; production constructor forbids null.
+        }
+        final Result<List<EvaluationResult>> result;
+        try {
+            result = scriptCostEvaluator.evaluateTx(tx.serialize(), resolved);
+        } catch (Exception e) {
+            throw refuse(Refusal.FINAL_EVALUATION_MISMATCH, "final-body evaluation failed: " + e);
+        }
+        if (result == null || !result.isSuccessful() || result.getValue() == null) {
+            throw refuse(Refusal.FINAL_EVALUATION_MISMATCH,
+                    "final-body evaluator returned " + (result == null ? "null" : result.getResponse()));
+        }
+        Map<String, EvaluationResult> fresh = new HashMap<>();
+        for (EvaluationResult costing : result.getValue()) {
+            String key = redeemerKey(costing.getRedeemerTag().name(), costing.getIndex());
+            if (fresh.put(key, costing) != null) {
+                throw refuse(Refusal.FINAL_EVALUATION_MISMATCH,
+                        "evaluator returned duplicate costing for " + key);
+            }
+        }
+        for (Redeemer declared : tx.getWitnessSet().getRedeemers()) {
+            String key = redeemerKey(declared.getTag().name(), declared.getIndex().intValue());
+            EvaluationResult costing = fresh.remove(key);
+            if (costing == null || costing.getExUnits() == null
+                    || costing.getExUnits().getMem().signum() <= 0
+                    || costing.getExUnits().getSteps().signum() <= 0
+                    || !costing.getExUnits().getMem().equals(declared.getExUnits().getMem())
+                    || !costing.getExUnits().getSteps().equals(declared.getExUnits().getSteps())) {
+                throw refuse(Refusal.FINAL_EVALUATION_MISMATCH,
+                        "declared ex-units do not equal fresh final-body evaluation for " + key);
+            }
+        }
+        if (!fresh.isEmpty()) {
+            throw refuse(Refusal.FINAL_EVALUATION_MISMATCH,
+                    "evaluator returned costings for absent redeemers " + fresh.keySet());
+        }
+    }
+
+    private Utxo resolve(TransactionInput input, Refusal reason, String what) {
+        try {
+            return utxoSupplier.getTxOutput(input.getTransactionId(), input.getIndex())
+                    .orElseThrow(() -> refuse(reason, what + " " + ref(input) + " is unresolved"));
+        } catch (RefusedException e) {
+            throw e;
+        } catch (Exception e) {
+            throw refuse(reason, what + " " + ref(input) + " could not be resolved: " + e);
+        }
+    }
+
+    private static Transaction withDummyWitness(Transaction tx) {
+        Transaction copy = TransactionUtil.createCopy(tx);
+        if (copy.getWitnessSet() == null) {
+            copy.setWitnessSet(new TransactionWitnessSet());
+        }
+        if (copy.getWitnessSet().getVkeyWitnesses() == null) {
+            copy.getWitnessSet().setVkeyWitnesses(new ArrayList<>());
+        }
+        VkeyWitness witness = new VkeyWitness();
+        witness.setVkey(new byte[32]);
+        witness.setSignature(new byte[64]);
+        copy.getWitnessSet().getVkeyWitnesses().add(witness);
+        return copy;
+    }
+
+    private static BigInteger ceilPercent(BigInteger amount, BigDecimal percent) {
+        return new BigDecimal(amount).multiply(percent).divide(BigDecimal.valueOf(100), 0,
+                RoundingMode.CEILING).toBigIntegerExact();
+    }
+
+    private static BigInteger tierReferenceFee(long bytes, BigDecimal initialPrice) {
+        if (bytes == 0 || initialPrice == null) {
+            return BigInteger.ZERO;
+        }
+        long remaining = bytes;
+        BigDecimal price = initialPrice;
+        BigDecimal total = BigDecimal.ZERO;
+        while (remaining > 0) {
+            long inTier = Math.min(25_600L, remaining);
+            total = total.add(price.multiply(BigDecimal.valueOf(inTier)));
+            remaining -= inTier;
+            price = price.multiply(new BigDecimal("1.2"));
+        }
+        return total.setScale(0, RoundingMode.FLOOR).toBigIntegerExact();
+    }
+
+    private static String redeemerKey(String tag, int index) {
+        return tag.toLowerCase() + "#" + index;
+    }
+
+    private static String ref(TransactionInput input) {
+        return input.getTransactionId() + "#" + input.getIndex();
+    }
+
+    private static boolean pureAda(Utxo utxo) {
+        Map<String, BigInteger> units = unitsOf(utxo.getAmount());
+        units.entrySet().removeIf(e -> e.getValue().signum() == 0);
+        return units.keySet().equals(Set.of("lovelace"))
+                && units.get("lovelace").signum() > 0;
+    }
+
+    private static boolean samePaymentCredential(String left, String right) {
+        try {
+            var a = new Address(left).getPaymentCredential().orElse(null);
+            var b = new Address(right).getPaymentCredential().orElse(null);
+            return a != null && b != null && a.getType() == b.getType()
+                    && Arrays.equals(a.getBytes(), b.getBytes());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static Value valueOf(List<Amount> amounts) {
+        Value value = Value.builder().coin(BigInteger.ZERO).multiAssets(new ArrayList<>()).build();
+        for (Amount amount : amounts) {
+            if ("lovelace".equals(amount.getUnit())) {
+                value = value.addCoin(amount.getQuantity());
+            } else {
+                value = value.add(assetValue(amount.getUnit(), amount.getQuantity()));
+            }
+        }
+        return value;
+    }
+
+    private static Value assetValue(String unit, BigInteger quantity) {
+        return Value.from(unit.substring(0, 56), "0x" + unit.substring(56), quantity);
+    }
+
+    private static Map<String, BigInteger> unitsOf(List<Amount> amounts) {
+        Map<String, BigInteger> units = new TreeMap<>();
+        for (Amount amount : amounts) {
+            units.merge(amount.getUnit(), amount.getQuantity(), BigInteger::add);
+        }
+        removeZeros(units);
+        return units;
+    }
+
+    private static Map<String, BigInteger> unitsOf(Value value) {
+        return unitsOf(ValueUtil.toAmountList(value));
+    }
+
+    private static void addUnits(Map<String, BigInteger> target, Map<String, BigInteger> add) {
+        add.forEach((unit, quantity) -> target.merge(unit, quantity, BigInteger::add));
+    }
+
+    private static void subtractUnits(Map<String, BigInteger> target, Map<String, BigInteger> subtract) {
+        subtract.forEach((unit, quantity) -> target.merge(unit, quantity.negate(), BigInteger::add));
+    }
+
+    private static void removeZeros(Map<String, BigInteger> units) {
+        units.entrySet().removeIf(e -> e.getValue() == null || e.getValue().signum() == 0);
+    }
+
+    private static TransactionOutput onlyOutputWithDatum(Transaction tx, String address,
+                                                         String datumHex, String what) {
+        List<TransactionOutput> matches = tx.getBody().getOutputs().stream()
+                .filter(o -> address.equals(o.getAddress()))
+                .filter(o -> o.getInlineDatum() != null && datumHexOf(o).equalsIgnoreCase(datumHex))
+                .toList();
+        if (matches.size() != 1) {
+            throw refuse(Refusal.UNEXPECTED_OUTPUT,
+                    what + " has " + matches.size() + " outputs carrying its address+datum, expected one");
+        }
+        return matches.getFirst();
+    }
+
     // ---- the post-assert, which is the real guard --------------------------------------------
 
     /**
@@ -439,20 +1155,21 @@ public class CompoundTransactionBuilder {
         assertRewardRedeemerAt(txn, lmWithdrawRedeemerIndex,
                 registry.getLenderManagerWithdrawScriptHash(), "lenderManagerWithdrawRedeemerIndex");
 
-        // 2. The pool output really is the input plus (addedLiquidity - fee), and nothing else moved.
-        BigInteger expected = lovelaceOf(c.pool().getAmount())
-                .add(c.addedLiquidity()).subtract(request.compoundingFee());
+        // 2. The pool output is the complete input Value plus Q-F in the principal unit and, for a
+        // token principal, only the stable current-protocol min-ADA top-up T.
         TransactionOutput poolOut = outputWithDatum(txn, c.pool().getAddress(), c.pool().getInlineDatum());
         if (poolOut == null) {
             throw refuse(Refusal.POOL_OUTPUT_MISMATCH,
                     "no output at the pool address carries the pool's original datum bytes");
         }
-        if (poolOut.getValue().getCoin().compareTo(expected) != 0) {
+        PlutusData poolDatum = echo(c.pool().getInlineDatum(),
+                Refusal.POOL_DATUM_NOT_BYTE_IDENTICAL, "pool");
+        Map<String, BigInteger> expectedPool = unitsOf(poolOutputValue(request, poolDatum));
+        Map<String, BigInteger> actualPool = unitsOf(poolOut.getValue());
+        if (!actualPool.equals(expectedPool)) {
             throw refuse(Refusal.POOL_OUTPUT_MISMATCH,
-                    "pool output holds %s lovelace, expected %s (input %s + added %s - fee %s)"
-                            .formatted(poolOut.getValue().getCoin(), expected,
-                                    lovelaceOf(c.pool().getAmount()), c.addedLiquidity(),
-                                    request.compoundingFee()));
+                    "pool output is %s, expected %s (input plus Q-F in %s and only required top-up)"
+                            .formatted(actualPool, expectedPool, principalUnit(request)));
         }
 
         // 3. The two equals_data echoes are byte-identical, checked on the built body rather than on
@@ -462,42 +1179,9 @@ public class CompoundTransactionBuilder {
         assertEcho(txn, c.poolManager().getAddress(), c.poolManager().getInlineDatum(),
                 c.poolManager().getAmount(), "pool manager");
 
-        // 4. The bot's net position IS the fee minus the transaction fee. This is what stops the
-        //    builder donating its own fee to the pool (§20.1) — no validator objects to that, so
-        //    nothing else would catch it.
-        BigInteger toBot = txn.getBody().getOutputs().stream()
-                .filter(o -> request.changeAddress().equals(o.getAddress()))
-                .map(o -> o.getValue().getCoin())
-                .reduce(BigInteger.ZERO, BigInteger::add);
-        // ⛔ The bot's contribution is read from the BUILT BODY, never from the nominated UTxO.
-        //
-        // Measured in production 2026-09-02: this assertion refused a correct transaction because it
-        // had assumed the nominated wallet input was the ONLY one. cardano-client-lib's coin
-        // selection had added 3,804,491 lovelace of further wallet inputs to cover the fee, the
-        // min-ada on the outputs and the withdrawal dummy — the bot's OWN money, returning as change.
-        // Conservation was intact and the pool had its full addedLiquidity; only the baseline was
-        // wrong. The offline rig had missed it because its wallet held one fat 20 ADA UTxO, so
-        // nothing extra was ever selected: the FIXTURE SUPPLIED WHAT PRODUCTION HAS TO EARN.
-        BigInteger fromBot = BigInteger.ZERO;
-        for (TransactionInput input : txn.getBody().getInputs()) {
-            Utxo spent = utxoSupplier.getTxOutput(input.getTransactionId(), input.getIndex())
-                    .orElseThrow(() -> refuse(Refusal.BOT_NET_MISMATCH,
-                            "input " + input.getTransactionId() + "#" + input.getIndex()
-                                    + " could not be resolved, so the bot's contribution cannot be "
-                                    + "accounted; refusing rather than assuming it was zero"));
-            if (request.changeAddress().equals(spent.getAddress())) {
-                fromBot = fromBot.add(lovelaceOf(spent.getAmount()));
-            }
-        }
-        BigInteger net = toBot.subtract(fromBot);
-        BigInteger want = request.compoundingFee().subtract(txn.getBody().getFee());
-        if (net.compareTo(want) != 0) {
-            throw refuse(Refusal.BOT_NET_MISMATCH,
-                    ("bot nets %s lovelace, expected %s (fee earned %s - tx fee %s). "
-                            + "It put in %s across its own inputs and got back %s")
-                            .formatted(net, want, request.compoundingFee(), txn.getBody().getFee(),
-                                    fromBot, toBot));
-        }
+        // 4. Full per-unit wallet accounting is performed by validateFinalTransaction on the
+        // deserialised finished body, including every balancer-added input and credential-owned
+        // output. Keeping it there makes the exact returned bytes, not this mutable object, the gate.
 
         // 5. CCL trap 16: a negative collateral return is not a phase-1 rejection, it is an
         //    unparseable transaction — refused before any validation runs, and hard to diagnose.
@@ -581,10 +1265,12 @@ public class CompoundTransactionBuilder {
             throw refuse(Refusal.ECHO_NOT_BYTE_IDENTICAL,
                     what + " echo is absent, or its datum bytes moved");
         }
-        if (out.getValue().getCoin().compareTo(lovelaceOf(amounts)) != 0) {
+        Map<String, BigInteger> actual = unitsOf(out.getValue());
+        Map<String, BigInteger> expected = unitsOf(amounts);
+        if (!actual.equals(expected)) {
             throw refuse(Refusal.ECHO_NOT_BYTE_IDENTICAL,
-                    "%s echo holds %s lovelace, input held %s — equals_data compares the whole output"
-                            .formatted(what, out.getValue().getCoin(), lovelaceOf(amounts)));
+                    "%s echo is %s, input was %s — equals_data compares the complete Value"
+                            .formatted(what, actual, expected));
         }
     }
 

@@ -223,7 +223,14 @@ class BlockfrostKeyTest {
 
     private static final String QUALIFIER = "(?:[A-Za-z_$][\\w$]*\\s*\\.\\s*)*";
     private static final Pattern PLACEHOLDER = Pattern.compile(Pattern.quote("${blockfrost.key"));
-    private static final Pattern NEW_BACKEND_SERVICE = construction("BFBackendService");
+    private static final Pattern NEW_BACKEND_SERVICE = Pattern.compile(
+            "\\bnew\\s+" + QUALIFIER + "(?:BFBackendService|BoundedBFBackendService)\\s*(?:<[^()]*>\\s*)?\\("
+                    + "|\\b" + QUALIFIER + "(?:BFBackendService|BoundedBFBackendService)\\s*::\\s*new\\b");
+    private static final Pattern RAW_BOUNDED_KEY = Pattern.compile(
+            "\\bnew\\s+" + QUALIFIER + "BoundedBFBackendService\\s*\\(\\s*[^,]+,\\s*(?:raw\\b|\"\")");
+    private static final Pattern NORMALIZED_BOUNDED_KEY = Pattern.compile(
+            "\\bnew\\s+" + QUALIFIER
+                    + "BoundedBFBackendService\\s*\\(\\s*blockfrostUrl\\s*,\\s*blockfrostKey\\s*,");
     private static final Pattern NEW_LOOKUP = construction("BlockfrostPublishedOutputLookup");
     private static final Pattern GET_PROPERTY = Pattern.compile("\\bgetProperty\\s*\\(\\s*\"blockfrost");
     private static final Pattern CONFIGURATION_PROPERTIES = Pattern.compile("@\\s*" + QUALIFIER
@@ -263,7 +270,18 @@ class BlockfrostKeyTest {
             violations.add("${blockfrost.key appears " + inConfig + " times in BlockfrostConfig: " + placeholders
                     + " — it belongs there once, as the BlockfrostKey bean's parameter");
         }
-        onlyIn(scan(NEW_BACKEND_SERVICE), BLOCKFROST_CONFIG, "new BFBackendService(", violations);
+        List<Site> backends = scan(NEW_BACKEND_SERVICE);
+        onlyIn(backends, BLOCKFROST_CONFIG, "a compatible Blockfrost backend construction", violations);
+        long backendInConfig = backends.stream().filter(site -> site.file().equals(BLOCKFROST_CONFIG)).count();
+        if (backendInConfig != 1) {
+            violations.add("compatible Blockfrost backend constructions appear " + backendInConfig
+                    + " times in BlockfrostConfig: " + backends + " — exactly one bounded client belongs there");
+        }
+        List<Site> normalizedBackends = scan(NORMALIZED_BOUNDED_KEY);
+        if (normalizedBackends.size() != 1 || !normalizedBackends.getFirst().file().equals(BLOCKFROST_CONFIG)) {
+            violations.add("the one bounded backend must receive BlockfrostConfig's normalized BlockfrostKey bean: "
+                    + normalizedBackends);
+        }
         onlyIn(scan(NEW_LOOKUP), VERIFIER, "new BlockfrostPublishedOutputLookup(", violations);
         scan(GET_PROPERTY).forEach(site -> violations.add("getProperty(\"blockfrost at " + site
                 + " — a second read of the property, handed the raw value"));
@@ -271,6 +289,8 @@ class BlockfrostKeyTest {
                 + "blockfrost prefix at " + site + " — a second binding of the key, never normalised"));
         scan(ENVIRONMENT_NAME).forEach(site -> violations.add("BLOCKFROST_KEY at " + site
                 + " — the environment variable read directly, around the normalised bean"));
+        scan(RAW_BOUNDED_KEY).forEach(site -> violations.add("raw or blank key passed to bounded backend at " + site
+                + " — construction must accept the normalized BlockfrostKey bean"));
 
         assertTrue(violations.isEmpty(), String.join("\n", violations));
     }
@@ -282,7 +302,7 @@ class BlockfrostKeyTest {
                 "the scan did not find BlockfrostConfig's ${blockfrost.key placeholder: it is not reading the "
                         + "source it guards");
         assertTrue(scan(NEW_BACKEND_SERVICE).stream().anyMatch(site -> site.file().equals(BLOCKFROST_CONFIG)),
-                "the scan did not find BlockfrostConfig's new BFBackendService(");
+                "the scan did not find BlockfrostConfig's compatible bounded backend construction");
         assertTrue(scan(NEW_LOOKUP).stream().anyMatch(site -> site.file().equals(VERIFIER)),
                 "the scan did not find LoansReferenceScriptVerifier's new BlockfrostPublishedOutputLookup(");
     }
@@ -299,11 +319,26 @@ class BlockfrostKeyTest {
 
         for (String code : List.of("new BFBackendService(url, key)",
                 "new com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService (url, key)",
-                "Function<String, BFBackendService> f = BFBackendService::new;")) {
+                "Function<String, BFBackendService> f = BFBackendService::new;",
+                "new BoundedBFBackendService(url, normalized, 5, 30, 30, 12, 30, 30, 120)",
+                "Factory f = BoundedBFBackendService::new;")) {
             assertEquals(1, matches(code, NEW_BACKEND_SERVICE), code);
         }
-        assertEquals(0, matches("new BFBackendServiceFactory(url); new MyBFBackendService(url);",
+        assertEquals(0, matches("new BFBackendServiceFactory(url); new MyBFBackendService(url); "
+                        + "new RawBoundedBackendService(url, raw); new BoundedBFBackendServiceFactory();",
                 NEW_BACKEND_SERVICE));
+        assertEquals(1, matches("new BoundedBFBackendService(url, raw, 5, 30, 30, 12, 30, 30, 120)",
+                RAW_BOUNDED_KEY));
+        assertEquals(1, matches("new BoundedBFBackendService(url, \"\", 5, 30, 30, 12, 30, 30, 120)",
+                RAW_BOUNDED_KEY));
+        assertEquals(0, matches("new BoundedBFBackendService(url, blockfrostKey, 5, 30, 30, 12, 30, 30, 120)",
+                RAW_BOUNDED_KEY));
+        assertEquals(1, matches("new BoundedBFBackendService(blockfrostUrl, blockfrostKey, 5, 30, 30, 12, 30, 30, 120)",
+                NORMALIZED_BOUNDED_KEY));
+        assertEquals(0, matches("new BoundedBFBackendService(blockfrostUrl, raw, 5, 30, 30, 12, 30, 30, 120)",
+                NORMALIZED_BOUNDED_KEY));
+        assertEquals(0, matches("new BoundedBFBackendService(blockfrostUrl, BlockfrostKey.of(\"\"), 5, 30, 30, 12, 30, 30, 120)",
+                NORMALIZED_BOUNDED_KEY));
         assertEquals(1, matches("new BlockfrostPublishedOutputLookup(url, key)", NEW_LOOKUP));
 
         assertEquals(1, matches("environment.getProperty(\"blockfrost.key\")", GET_PROPERTY));

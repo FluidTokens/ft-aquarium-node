@@ -10,11 +10,16 @@ import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.common.model.SlotConfigs;
+import com.bloxbean.cardano.client.function.TxBuilderContext;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
 import com.bloxbean.cardano.client.plutus.spec.Redeemer;
+import com.bloxbean.cardano.client.plutus.spec.ExUnits;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionWitnessSet;
+import com.bloxbean.cardano.client.transaction.spec.VkeyWitness;
+import com.bloxbean.cardano.client.transaction.util.TransactionUtil;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -49,6 +54,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -119,7 +125,9 @@ class CompoundProductionWiringTest {
                 evaluator);
         Transaction built = builder.build(f.request);
 
-        assertEquals(1, evaluator.calls.get(), "exactly one evaluation per compound");
+        assertEquals(2, evaluator.calls.get(), "CCL costing plus strict final-body re-evaluation");
+        assertArrayEquals(built.serialize(), evaluator.lastCbor.get(),
+                "the strict evaluator must receive the exact final unsigned bytes returned by build");
         Transaction reread = Transaction.deserialize(built.serialize());
         List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
         assertEquals(11, redeemers.size(), "four general_spend spends and seven withdraw-0 invocations");
@@ -235,6 +243,37 @@ class CompoundProductionWiringTest {
                 + "the smallest script's share (" + smallestShare + "), so an unpriced script could hide in it");
     }
 
+    @Test
+    void serializedFinalBodyBelowTheFullLedgerMinimumFeeIsRefused() throws Exception {
+        Fixture f = fixture(wallet(60_000_000L), null);
+        CompoundTransactionBuilder builder = production(f.universe(),
+                new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(f.universe())));
+        Transaction tx = Transaction.deserialize(builder.build(f.request()).serialize());
+        BigInteger minimum = fullLedgerMinimum(tx, f.universe());
+        BigInteger underpaid = minimum.subtract(BigInteger.ONE);
+        BigInteger returnedToWallet = tx.getBody().getFee().subtract(underpaid);
+        assertTrue(returnedToWallet.signum() >= 0,
+                "the valid production body must not already be below the independently calculated floor");
+        tx.getBody().setFee(underpaid);
+        TransactionOutput walletOutput = tx.getBody().getOutputs().stream()
+                .filter(o -> BOT.equals(o.getAddress()))
+                .filter(o -> o.getInlineDatum() == null && o.getDatumHash() == null)
+                .findFirst().orElseThrow();
+        walletOutput.getValue().setCoin(walletOutput.getValue().getCoin().add(returnedToWallet));
+        Transaction serializedFinal = Transaction.deserialize(tx.serialize());
+
+        // Every preceding final-body invariant remains valid; only the full ledger minimum is short.
+        builder.validateLedgerShape(serializedFinal, f.request());
+        TxBuilderContext context = TxBuilderContext.init(LoanFixtures.utxoSupplier(f.universe()),
+                EvalFixtures.protocolParams());
+        CompoundTransactionBuilder.RefusedException refused = assertThrows(
+                CompoundTransactionBuilder.RefusedException.class,
+                () -> builder.validateLedgerFee(serializedFinal, context));
+        assertEquals(CompoundTransactionBuilder.Refusal.FEE_BELOW_LEDGER_MINIMUM,
+                refused.getReason(), refused.getMessage());
+        assertTrue(refused.getMessage().contains("below " + minimum), refused.getMessage());
+    }
+
     /**
      * ⛔ The stale coordinate. {@code CompoundExecutor} references any configured coordinate that publishes
      * a script, so an operator override still naming a superseded validator after a redeploy adds a
@@ -313,7 +352,9 @@ class CompoundProductionWiringTest {
         Transaction reread = Transaction.deserialize(production(f.universe(),
                 new HashCheckedScriptSupplier(rigScripts()), evaluator).build(request).serialize());
 
-        assertEquals(1, evaluator.calls.get(), "the all-inline build was evaluated");
+        assertEquals(2, evaluator.calls.get(), "the all-inline build was costed and re-evaluated");
+        assertArrayEquals(reread.serialize(), evaluator.lastCbor.get(),
+                "the final evaluation must cover the exact returned bytes");
         for (Redeemer redeemer : reread.getWitnessSet().getRedeemers()) {
             assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
                     redeemer.getTag() + "#" + redeemer.getIndex() + " carries the placeholder mem");
@@ -429,6 +470,38 @@ class CompoundProductionWiringTest {
         String chain = Stream.iterate((Throwable) refused, t -> t != null, Throwable::getCause)
                 .map(String::valueOf).collect(Collectors.joining(" <- "));
         assertTrue(chain.contains("FAB-134-6d marker"), "refused for another reason: " + chain);
+    }
+
+    /** A second evaluation with zero or stale costs must veto the exact final body. */
+    @Test
+    void zeroOrStaleFinalExUnitsRefuseTheBuild() {
+        for (boolean zero : List.of(true, false)) {
+            Fixture f = fixture(wallet(60_000_000L), null);
+            TransactionEvaluator delegate = aiken(f.universe());
+            AtomicInteger calls = new AtomicInteger();
+            TransactionEvaluator mutant = (cbor, inputs) -> {
+                Result<List<EvaluationResult>> result = delegate.evaluateTx(cbor, inputs);
+                if (calls.incrementAndGet() == 1 || !result.isSuccessful()) {
+                    return result;
+                }
+                List<EvaluationResult> changed = result.getValue().stream().map(costing ->
+                        EvaluationResult.builder().redeemerTag(costing.getRedeemerTag())
+                                .index(costing.getIndex())
+                                .exUnits(new ExUnits(
+                                        zero ? BigInteger.ZERO : costing.getExUnits().getMem().add(BigInteger.ONE),
+                                        zero ? BigInteger.ZERO : costing.getExUnits().getSteps()))
+                                .build()).toList();
+                return Result.<List<EvaluationResult>>success("final-body mutant").withValue(changed);
+            };
+
+            CompoundTransactionBuilder.RefusedException refused = assertThrows(
+                    CompoundTransactionBuilder.RefusedException.class,
+                    () -> production(f.universe(), new HashCheckedScriptSupplier(rigScripts()), mutant)
+                            .build(f.request()));
+            assertEquals(CompoundTransactionBuilder.Refusal.FINAL_EVALUATION_MISMATCH,
+                    refused.getReason(), refused.getMessage());
+            assertEquals(2, calls.get(), "the mutant must reach the strict final-body evaluation");
+        }
     }
 
     /**
@@ -584,6 +657,33 @@ class CompoundProductionWiringTest {
         return base.add(scripts.setScale(0, RoundingMode.CEILING).toBigIntegerExact());
     }
 
+    /** Full ledger floor: one vkey witness, evaluator ex-units and every referenced script tier. */
+    private static BigInteger fullLedgerMinimum(Transaction tx, List<Utxo> universe) throws Exception {
+        Transaction witnessed = TransactionUtil.createCopy(tx);
+        if (witnessed.getWitnessSet().getVkeyWitnesses() == null) {
+            witnessed.getWitnessSet().setVkeyWitnesses(new ArrayList<>());
+        }
+        VkeyWitness witness = new VkeyWitness();
+        witness.setVkey(new byte[32]);
+        witness.setSignature(new byte[64]);
+        witnessed.getWitnessSet().getVkeyWitnesses().add(witness);
+        ProtocolParams pp = EvalFixtures.protocolParams().getProtocolParams();
+        BigInteger base = BigInteger.valueOf(pp.getMinFeeA())
+                .multiply(BigInteger.valueOf(witnessed.serialize().length))
+                .add(BigInteger.valueOf(pp.getMinFeeB()));
+        BigDecimal scripts = BigDecimal.ZERO;
+        for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
+            scripts = scripts.add(pp.getPriceMem().multiply(new BigDecimal(redeemer.getExUnits().getMem())))
+                    .add(pp.getPriceStep().multiply(new BigDecimal(redeemer.getExUnits().getSteps())));
+        }
+        long referenceBytes = 0;
+        for (String hash : referencedScriptHashes(tx, universe)) {
+            referenceBytes += rigScripts().getScript(hash).orElseThrow().serializeScriptBody().length;
+        }
+        return base.add(scripts.setScale(0, RoundingMode.CEILING).toBigIntegerExact())
+                .add(refScriptFee(referenceBytes));
+    }
+
     /**
      * The Conway reference-script fee for {@code bytes}: {@code minFeeRefScriptCostPerByte} for the first
      * 25,600 bytes, then x1.2 per further 25,600-byte tier (the ledger's {@code tierRefScriptFee}, floored).
@@ -625,6 +725,7 @@ class CompoundProductionWiringTest {
         final TransactionEvaluator delegate;
         final AtomicInteger calls = new AtomicInteger();
         final AtomicReference<List<EvaluationResult>> last = new AtomicReference<>();
+        final AtomicReference<byte[]> lastCbor = new AtomicReference<>();
 
         Recording(TransactionEvaluator delegate) {
             this.delegate = delegate;
@@ -634,6 +735,7 @@ class CompoundProductionWiringTest {
         public Result<List<EvaluationResult>> evaluateTx(byte[] cbor, Set<Utxo> inputUtxos)
                 throws com.bloxbean.cardano.client.api.exception.ApiException {
             calls.incrementAndGet();
+            lastCbor.set(cbor.clone());
             Result<List<EvaluationResult>> result = delegate.evaluateTx(cbor, inputUtxos);
             last.set(result.getValue());
             return result;
@@ -664,7 +766,7 @@ class CompoundProductionWiringTest {
 
     private static List<Utxo> baseUniverse(Utxo wallet) {
         return List.of(utxo("escrow"), utxo("bond"), utxo("pool"), utxo("poolManager"), config(), lmConfig(),
-                wallet);
+                wallet, collateral());
     }
 
     private static CompoundTransactionBuilder.Request request(Map<String, TransactionInput> refs, Utxo wallet) {
@@ -672,10 +774,16 @@ class CompoundProductionWiringTest {
                 wallet, BOT, BigInteger.ZERO, VALID_FROM_SLOT, VALID_TO_SLOT);
     }
 
-    /** The bot's own funds — ada-only, so it can serve as collateral. */
+    /** The bot's ordinary fee-paying funds. */
     private static Utxo wallet(long lovelace) {
         return Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(BOT)
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(lovelace)))).build();
+    }
+
+    /** A distinct pure-ADA UTxO reserved for collateral and excluded from balancing. */
+    private static Utxo collateral() {
+        return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(BOT)
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
     }
 
     private static Utxo utxo(String key) {

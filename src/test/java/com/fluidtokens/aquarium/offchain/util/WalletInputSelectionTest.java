@@ -13,7 +13,9 @@ import java.util.function.Function;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * T-052 — the wallet input is chosen to cover the transaction, smallest that suffices.
@@ -208,6 +210,39 @@ class WalletInputSelectionTest {
         Utxo usdmAndAda = token("usdm1", 0, 1_100_000_000L, 1_400_000L);
         assertEquals(BigInteger.valueOf(1_100_000_000L), WalletInputSelection.tokenQuantityOf(usdmAndAda, USDM));
         assertEquals(BigInteger.ZERO, WalletInputSelection.tokenQuantityOf(ada("aa", 0, 5_000_000L), USDM));
+    }
+
+    @Test
+    void compoundSelectionAcceptsTokenChangeAndReservesDistinctPureAdaCollateral() throws Exception {
+        Utxo priorCompoundChange = token("change", 0, 5_000L, 8_000_000L);
+        Utxo collateral = ada("collateral", 1, 5_000_000L);
+        try {
+            var method = WalletInputSelection.class.getMethod("selectForCompound", List.class, BigInteger.class);
+            Object result = method.invoke(null, List.of(priorCompoundChange, collateral), BigInteger.ZERO);
+            var ordinary = result.getClass().getMethod("ordinaryInput").invoke(result);
+            var reserved = result.getClass().getMethod("collateralInput").invoke(result);
+            assertEquals(priorCompoundChange, ordinary);
+            assertEquals(collateral, reserved);
+            assertFalse(ordinary.equals(reserved));
+        } catch (NoSuchMethodException e) {
+            fail("compound-specific ordinary/collateral selection is missing", e);
+        }
+    }
+
+    @Test
+    void compoundSelectionNamesMissingOrdinaryAndMissingDistinctCollateralSeparately() {
+        Utxo unsafe = ada("datum", 0, 9_000_000L);
+        unsafe.setInlineDatum("d87980");
+        var noOrdinary = assertThrows(WalletInputSelection.CompoundFundingException.class,
+                () -> WalletInputSelection.selectForCompound(List.of(unsafe), BigInteger.ZERO));
+        assertEquals(WalletInputSelection.CompoundFundingFailure.MISSING_SAFE_ORDINARY_INPUT,
+                noOrdinary.reason());
+
+        Utxo only = ada("only", 0, 9_000_000L);
+        var noCollateral = assertThrows(WalletInputSelection.CompoundFundingException.class,
+                () -> WalletInputSelection.selectForCompound(List.of(only), BigInteger.ZERO));
+        assertEquals(WalletInputSelection.CompoundFundingFailure.MISSING_DISTINCT_PURE_ADA_COLLATERAL,
+                noCollateral.reason());
     }
 
     // ---- FAB-128 — the token the balance gate does NOT count, and why ------------------------------

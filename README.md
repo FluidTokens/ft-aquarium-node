@@ -63,6 +63,13 @@ split across the nodes that performed transactions.
 and compound all have to be turned on deliberately. Read
 [docs/deploying.md](docs/deploying.md) §8 before arming anything, and rehearse in `shadow` first.
 
+For native-principal compounding, the pool fee is calculated in raw token units and priced from the
+identified oracle observation. Admission then uses the exact final transaction body:
+`floor(F*n/d) + recovered escrow ADA - transaction fee - pool minimum-ADA top-up`. The
+wallet may reuse a safe token-bearing change UTxO as its ordinary input, but must also retain a
+distinct, datum-free and reference-script-free pure-ADA collateral UTxO. ADA-principal compounding
+remains `fee - transaction fee`; its escrow principal is not counted again as recovered ADA.
+
 **⛔ Do not publish port 8080.** Nothing served there is authenticated, and
 `LOANS_UI_ENABLED=false` does **not** close it: that flag removes the HTML readiness page only.
 `/api/v1/loans`, `/api/v1/loans/liquidations`, `/api/v1/loans/oracle`, `/healthcheck` and
@@ -127,6 +134,16 @@ Using Yaci Store also gives the following benefits:
 2. Straightforward horizontal scaling: by replicating the DB and launching Yaci in read only mode, is very simple to linearly scale
 the Aquarium Node
 3. Blockfrost api: Yaci can serve blockfrost compatible APIs out of the box
+
+Every production Blockfrost call has a whole-call deadline: 12 seconds for discovery reads and
+30 seconds for transaction evaluation or submission, within a 120-second wallet-coordinator pass.
+Connection, read and write idle limits are 5, 30 and 30 seconds. These positive integer seconds can
+be overridden with the `BLOCKFROST_TIMEOUT_*_SECONDS` and
+`WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS` settings documented in `docker/.env.advanced.example`.
+Submission redirects and automatic connection retries are disabled: if the peer reads a POST and
+the response is lost, the outcome is ambiguous and the transport does not replay it.
+The separately cached Fluid oracle registry refresh remains on its existing reactive timeout; a
+coordinator pass reads its held snapshot. These bounds do not arm a worker or activate mainnet.
 
 ## Building it yourself
 

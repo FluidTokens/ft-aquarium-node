@@ -239,11 +239,14 @@ jobs:
       # GH-55 (NodeVersionCheckTest) on top of FAB-141 (BlockfrostKeyTest), re-measured cold on feat/gh-55-version-check
       # after merging main at f17d153: 200 files / 1862 tests / 0 failures / 0 errors / 50 skipped, 0 orphans. Floor 200.
       #
+      # FAB-164 integrated native-compound and bounded-transport trees, re-measured cold keyless:
+      # 202 mapped XML files, 0 orphans. Floor 202.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '200'
+          RESULT_FILE_FLOOR: '202'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

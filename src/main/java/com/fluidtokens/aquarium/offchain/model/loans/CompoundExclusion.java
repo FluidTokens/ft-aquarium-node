@@ -26,45 +26,34 @@ public enum CompoundExclusion {
      */
     POOL_NOT_LIVE,
 
-    /**
-     * ⛔ The pool's principal is not ADA — a <b>structural, build-capability</b> refusal, distinct
-     * from {@link #PRICE_UNAVAILABLE} below.
-     *
-     * <p>{@link com.fluidtokens.aquarium.offchain.service.loans.CompoundEconomics#assess} no longer
-     * refuses on this alone: it prices the fee slice through
-     * {@link com.fluidtokens.aquarium.offchain.service.loans.PricingService} regardless of the
-     * principal's asset, and only refuses with {@link #PRICE_UNAVAILABLE} when that pricing itself
-     * fails. This exclusion is emitted upstream instead, by
-     * {@code CompoundCandidateScanner#classify}, for two reasons that both still hold today:
-     *
-     * <ol>
-     *   <li>{@code CompoundTransactionBuilder} computes the pool's output and the bot's own net
-     *   position entirely in lovelace ({@code plusLovelace}/{@code lovelaceOf} applied directly to
-     *   {@code addedLiquidity} and the compounding fee) — sound only because the one principal that
-     *   has ever reached it is ada, where "the principal's own unit" and "lovelace" are the same
-     *   thing. It is not yet generalised to pay a token amount instead of a lovelace one, and until
-     *   it is, letting a non-ada candidate reach it would build an incorrect transaction.</li>
-     *   <li>Held on a product ruling from Giovanni (FAB-77, 2026-09-09): a token-principal compound
-     *   pays its fee in ADA and is rewarded in the principal token — i.e. the bot acquires a token —
-     *   the same class of decision as convert's "the bot buys collateral". Lifting this exclusion is
-     *   not only a build question.</li>
-     * </ol>
-     *
-     * <p>So a token-principal escrow is refused here structurally, <b>regardless of whether its
-     * price would in fact be available</b> — that is the "case that is still refused" the
-     * oracle-pricing slice's contract names.
-     */
+    /** Legacy broad refusal retained only for source compatibility; production no longer emits it. */
     PRINCIPAL_NOT_ADA,
 
-    /**
-     * ⛔ {@code PricingService} could not price the fee slice into lovelace: no oracle feed for the
-     * principal asset at all, a feed present but not usable at the instant asked (expired, or not
-     * yet valid), or a feed present and covering the instant but a {@code POOLED} variant —
-     * {@code get_token_amount_in_lovelace} is an outright {@code fail} on that variant on chain, so
-     * it cannot be priced off chain either (hazard: {@code OraclePriceFeed.price()} throws for it).
-     * Fail-closed: never a 1:1 fallback, never a last-known price.
-     */
+    /** The pool-manager datum does not contain the required fee field. */
+    POOL_MANAGER_FEE_MISSING,
+
+    /** The pool-manager fee field is present but is not an exactly decoded integer. */
+    POOL_MANAGER_FEE_MALFORMED,
+
+    /** The exact pool-manager fee integer cannot be represented by the host API. */
+    POOL_MANAGER_FEE_OVERFLOW,
+
+    /** The pool-manager fee is outside the validator-supported {@code [0,999]} range. */
+    POOL_MANAGER_FEE_OUT_OF_RANGE,
+
+    /** The escrow principal must satisfy {@code Q > 0} and leave {@code Q-F > 0}. */
+    PRINCIPAL_AMOUNT_INVALID,
+
+    /** Legacy broad price refusal retained only for source compatibility; production uses names below. */
     PRICE_UNAVAILABLE,
+
+    PRICE_NO_FEED,
+    PRICE_NOT_USABLE,
+    PRICE_POOLED,
+    PRICE_NON_POSITIVE,
+    PRICE_CONVERSION_FAILED,
+    PRICE_OBSERVATION_CHANGED,
+    PRICE_OBSERVATION_EXPIRED,
 
     /**
      * ⛔ The escrow UTxO carries assets the validator will not accept.
