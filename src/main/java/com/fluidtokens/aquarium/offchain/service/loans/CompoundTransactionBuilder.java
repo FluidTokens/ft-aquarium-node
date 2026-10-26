@@ -78,6 +78,17 @@ import java.util.Objects;
  * {@code ignoreScriptCostEvaluationError(evaluator == null)}, and the operator's whole risk case
  * ("exposure is the transaction fee per execution") is true only while that holds: placeholder
  * ex-units move the exposure to the collateral.
+ *
+ * <h2>The bot ends with ONE output (FAB-152)</h2>
+ * The seven withdrawals make cardano-client-lib add a 1 ADA "dummy" output at the change address to
+ * trigger input selection (CCL trap 1), and {@code mergeOutputs(false)} — needed so the pool, bond and
+ * pool-manager echoes are never coalesced — puts the change in a SECOND output beside it. A
+ * target-shape wallet then read {@code ADA_FRAGMENTED} after every compound and the rebalancer paid a
+ * fee on the next block to merge the two (mainnet {@code 4e40b3fa…}: {@code #0} 1 ADA, {@code #4} the
+ * change). So the {@code preBalanceTx} hook folds every datum-free, script-free output at the change
+ * address into the last of them, matched by address and content and never by index. It runs before
+ * collateral, script-cost evaluation and balancing, so ex-units and the fee are computed on the
+ * folded body; {@link #assertStructure} refuses a finished body that still has two.
  */
 @Slf4j
 public class CompoundTransactionBuilder {
@@ -98,7 +109,8 @@ public class CompoundTransactionBuilder {
         POOL_OUTPUT_MISMATCH,
         ECHO_NOT_BYTE_IDENTICAL,
         BOT_NET_MISMATCH,
-        COLLATERAL_RETURN_NEGATIVE
+        COLLATERAL_RETURN_NEGATIVE,
+        BOT_OUTPUTS_NOT_FOLDED
     }
 
     @Getter
@@ -356,8 +368,15 @@ public class CompoundTransactionBuilder {
                 // CCL trap 9b, BOTH seams: the default selector will happily spend a UTxO carrying a
                 // reference script, and ChangeOutputAdjustments falls through to its own selector.
                 .withUtxoSelectionStrategy(ReferenceScriptSafeUtxoSelection.strategy(utxoSupplier))
-                .preBalanceTx((ctx, txn) ->
-                        ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier)))
+                // ⛔ ONE LAMBDA: preBalanceTx is a SETTER (QuickTxBuilder:263 assigns), so a second call
+                // would silently discard the first. Both jobs live here.
+                .preBalanceTx((ctx, txn) -> {
+                    ctx.setUtxoSelector(ReferenceScriptSafeUtxoSelection.selector(utxoSupplier));
+                    // FAB-152: after the selector, fold the bot's outputs into one. This runs after
+                    // input selection and change, and BEFORE collateral, script-cost evaluation and
+                    // balancing — so the ex-units and the fee are computed on the folded body.
+                    foldBotOutputs(txn, request.changeAddress());
+                })
                 // ⛔ CCL trap 9b, the THIRD seam: with no collateral inputs named, QuickTxBuilder's
                 // buildCollateralOutput picks collateral with its own unguarded
                 // DefaultUtxoSelectionStrategyImpl (a hardcoded 5 ADA target) — blind to both guards
@@ -488,6 +507,42 @@ public class CompoundTransactionBuilder {
                     "collateral return is " + collateralReturn.getValue().getCoin()
                             + "; the pure-ada collateral capacity cannot cover the required amount");
         }
+
+        // 6. FAB-152: the bot gets ONE datum-free output back. Two means the fold did not run, and the
+        //    wallet would come out ADA_FRAGMENTED and pay a rebalance — refused loudly instead.
+        long datumFreeAtChange = txn.getBody().getOutputs().stream()
+                .filter(o -> request.changeAddress().equals(o.getAddress()))
+                .filter(o -> o.getInlineDatum() == null && o.getDatumHash() == null)
+                .count();
+        if (datumFreeAtChange > 1) {
+            throw refuse(Refusal.BOT_OUTPUTS_NOT_FOLDED,
+                    datumFreeAtChange + " datum-free outputs at the change address, expected at most one");
+        }
+    }
+
+    /**
+     * FAB-152: folds every output at {@code changeAddress} carrying no datum (inline or hash) and no
+     * script reference into the LAST such output, removing the others. Selected by address and
+     * content, never by index — the withdrawal dummy's position is cardano-client-lib's (CCL trap 1).
+     * One such output or none: nothing to do.
+     */
+    static void foldBotOutputs(Transaction txn, String changeAddress) {
+        List<TransactionOutput> outputs = txn.getBody().getOutputs();
+        List<TransactionOutput> bot = outputs.stream()
+                .filter(o -> changeAddress.equals(o.getAddress()))
+                .filter(o -> o.getInlineDatum() == null && o.getDatumHash() == null && o.getScriptRef() == null)
+                .toList();
+        if (bot.size() < 2) {
+            return;
+        }
+        TransactionOutput keep = bot.get(bot.size() - 1);
+        Value sum = Value.builder().coin(BigInteger.ZERO).multiAssets(new ArrayList<>()).build();
+        for (TransactionOutput o : bot) {
+            sum = sum.add(o.getValue());
+        }
+        keep.setValue(sum);
+        // By identity: two outputs of equal value are still two outputs.
+        outputs.removeIf(o -> o != keep && bot.stream().anyMatch(b -> b == o));
     }
 
     private void assertRewardRedeemerAt(Transaction txn, long position, String scriptHash, String field) {
