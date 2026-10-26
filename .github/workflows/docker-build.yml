@@ -5,6 +5,9 @@ on:
     branches:
       - main  # or any branch you want to trigger the action for
       - preview
+      # Integration branch (2026-10-26): every accepted workstream lands here first and is deployed
+      # to test before anything reaches main. Tagged `latest-dev` below, NEVER `latest`.
+      - dev
   workflow_dispatch:
 
 jobs:
@@ -360,13 +363,15 @@ jobs:
           ##                operator pins. Any one of these will always be the same bytes.
           ##    latest      MOVING. A pointer to the newest build, and it changes under anyone who
           ##                tracks it. Fine for trying the node; wrong for running one.
-          ## Don't push latest for preview
-          if [ $GITHUB_REF_NAME == "preview" ]
-          then
-            DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest-pv"
-          else
-            DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest"
-          fi
+          ## Don't push latest for preview or dev. ⛔ `latest` is what operators pull, so ONLY main
+          ## may move it: any other ref (a workflow_dispatch on a feature branch included) used to fall
+          ## through to `latest`, and now refuses instead of overwriting it.
+          case "$GITHUB_REF_NAME" in
+            main)    DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest" ;;
+            preview) DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest-pv" ;;
+            dev)     DOCKER_IMAGE_LATEST="${DOCKER_IMAGE_NAME}:latest-dev" ;;
+            *) echo "refusing to publish from ref '$GITHUB_REF_NAME': only main, preview and dev have a moving tag" >&2; exit 1 ;;
+          esac
           docker build -t "${DOCKER_IMAGE}" -t "${DOCKER_IMAGE_LATEST}" --push .
 
         env:
