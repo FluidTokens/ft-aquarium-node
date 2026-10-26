@@ -253,11 +253,15 @@ jobs:
       # re-measured cold keyless on feat/fab-165-oct26-update: 204 files / 2030 tests / 0 failures / 0 errors /
       # 50 skipped, 0 orphans. Floor 204.
       #
+      # FAB-168 (LiquidationEscrowCompoundRoundTripTest: liquidation escrows through the new lm_compound_action)
+      # re-measured cold keyless on feat/fab-165-oct26-update: 205 files / 2043 tests / 0 failures / 0 errors /
+      # 50 skipped, 0 orphans. Floor 205.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '204'
+          RESULT_FILE_FLOOR: '205'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
