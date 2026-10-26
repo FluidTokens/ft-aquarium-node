@@ -52,7 +52,7 @@ class ShippedDefaultsTest {
 
     private static final String RESOURCE = "application.yaml";
     private static final String MAINNET_CONFIG_TX =
-            "3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c"; // 2026-10-01 in-place update
+            "75e459a0e97d3808031d97b8360308782f197bc778471d3dbc4aa51245886dc5"; // 2026-10-23 in-place update (was 3d800e98…, 2026-10-01)
     /**
      * Superseded lm_compound references: 2a8faf65… (before FluidTokens' 2026-10-01 redeploy) and 71515a89…
      * (2026-10-01 until the 2026-10-26 LMConfigDatum rewrite). Both are still unspent on chain.
