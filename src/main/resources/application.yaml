@@ -176,10 +176,18 @@ loans:
     # validator an earlier coordinate already supplies. One it could not ask is REFERENCE_SCRIPT_UNVERIFIED
     # and used as configured. Each of the eleven no usable coordinate supplies is REFERENCE_SCRIPT_MISSING
     # and travels inline. All are WARNs plus a readiness-page banner; lending is NOT refused.
-    # ⛔ RE-POINTED at FluidTokens' 2026-09-17 redeploy, and again on 2026-10-01 (FTAI-001/002/102):
-    # only lmCompoundAction moved (2a8faf65 -> 71515a89, 29f63a1e...#0); the other ten scripts are
-    # unchanged. All ELEVEN verified: for each one, the hash this node DERIVES equals the
-    # reference_script_hash the chain publishes at that coordinate (Koios utxo_info, 2026-10-01).
+    # ⛔ RE-POINTED at FluidTokens' 2026-09-17 redeploy, again on 2026-10-01 (FTAI-001/002/102), and
+    # again on 2026-10-26 (LMConfigDatum rewritten in place, upstream a02d4e2 "1 ADA minimum compounding
+    # fee"): each time only lmCompoundAction moved (2a8faf65 -> 71515a89 -> 4713a925, now
+    # 588695...#0, block 14,117,824); the other ten scripts are unchanged. The coordinate and the
+    # blueprint that derives 4713a925 ship in ONE commit (FAB-166; blueprint provenance in
+    # src/test/resources/loans-v4/blueprint/loans-v4-blueprint-2026-10-26.PROVENANCE.md). All ELEVEN
+    # verified: for each one, the hash this node DERIVES equals the reference_script_hash the chain
+    # publishes at that coordinate (Koios utxo_info, 2026-10-26).
+    #
+    # NOT LISTED, deliberately: 047020cf...#0 publishes lm_liquidate_pay_in_advance_and_compound_action
+    # (00e38efa, LMConfigDatum[6]), the same day. It is not one of the eleven and nothing in this node
+    # builds a transaction that invokes it, so it has no consumer here.
     #
     # ⚠ THE ELEVENTH WAS NEARLY MISREPORTED AS MISSING, and the near-miss is the lesson.
     # lm_compound_action takes poolManagerSpendScriptHash and poolManagerPolicyId among its eight
@@ -192,9 +200,9 @@ loans:
     # Order is presentation only -- the builder matches on the SET of published hashes, not position.
     #   assetManagerSpend b256da41  lenderManagerSpend 6743f4b6  poolSpend ecd0c0fc
     #   poolManagerSpend dfb1d21e   assetManagerWithdraw addd060d  lenderManagerWithdraw 247065fa
-    #   lmCompoundAction 71515a89   poolPolicy 20f765d2  poolCompoundAction fef12ea6
+    #   lmCompoundAction 4713a925   poolPolicy 20f765d2  poolCompoundAction fef12ea6
     #   poolManagerPolicy 1e0bf58a  pmCompoundLiquidity 96f1e889
-    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:af5bc4815ec1aefb86d51e25649ffd22abc2b0385eb0909512a96adccd4048ec#0,691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0,d39ada3381d91682fd063b5f4a2351c2bddff8ec3259916b328a428394eb14ed#0,ed3fa111c1529bb0b6a57dc7ffb255231db7fe390d21fc8bab181c7fd67e289c#0,bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0,b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0,29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0,b35ed92547f040c6733104a810d5611edf04fc2df6a9202f3fa78d38fe1bffc6#0,7d3ad6d0ad994c032aa1a99b49abff3ff2f79612a5407c5d96c957a3cd48708e#0,58b7b66d8adafc8b2e83d34c3980af24e70f6528995faa647cc66e6eaeba5ff5#0,8a2372acd140ef84fd3b62ff64874684aca683c18ae1c7fa3b8ec1fdc361c7ff#0}
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:af5bc4815ec1aefb86d51e25649ffd22abc2b0385eb0909512a96adccd4048ec#0,691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0,d39ada3381d91682fd063b5f4a2351c2bddff8ec3259916b328a428394eb14ed#0,ed3fa111c1529bb0b6a57dc7ffb255231db7fe390d21fc8bab181c7fd67e289c#0,bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0,b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0,588695471b9f865ceac88066883fad118a5a1800c9c69a0663e5ff560d656b1a#0,b35ed92547f040c6733104a810d5611edf04fc2df6a9202f3fa78d38fe1bffc6#0,7d3ad6d0ad994c032aa1a99b49abff3ff2f79612a5407c5d96c957a3cd48708e#0,58b7b66d8adafc8b2e83d34c3980af24e70f6528995faa647cc66e6eaeba5ff5#0,8a2372acd140ef84fd3b62ff64874684aca683c18ae1c7fa3b8ec1fdc361c7ff#0}
 
   # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
   #

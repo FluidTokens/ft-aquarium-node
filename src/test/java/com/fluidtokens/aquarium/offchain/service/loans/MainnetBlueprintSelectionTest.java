@@ -31,7 +31,7 @@ class MainnetBlueprintSelectionTest {
 
     private static final String BLUEPRINT = "loans-v4.plutus.json";
     private static final String BLUEPRINT_SHA256 =
-            "a638e71ca047b668f74eeeff1b80e76695626ddfe506a9ca1d2721e9a1e72704"; // 2026-10-01 hybrid, see blueprint PROVENANCE
+            "d2f12d046ee130f93c23ccb490012ace375a21d14fd5c13b824266c504b8ae2d"; // 2026-10-26 hybrid, see blueprint PROVENANCE
     private static final String CONFIG = "235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200";
     private static final String LM_CONFIG = "fb6ae2027358b4a0b62710eb95102d87fa13f66ecf55d8943699c492";
     private static final String ASSET = "706172616d6574657273";
@@ -44,7 +44,8 @@ class MainnetBlueprintSelectionTest {
     // The captured fourth-deployment preview datum against the shipped artefact. Since FluidTokens'
     // 2026-10-01 mainnet redeploy (FTAI-001) it also differs at [11] claim, [23] borrow, [24] sell and the
     // LenderManager actions parameterised by the claim or changed in code (LM[2], [3], [4], [6]) --
-    // preview was not redeployed, so each of these is the artefact moving, not the chain.
+    // preview was not redeployed, so each of these is the artefact moving, not the chain. The derived [24],
+    // LM[3] and LM[6] moved again with the 2026-10-26 artefact (FAB-166, upstream a02d4e2).
     private static final List<String> OLD_PREVIEW_MISMATCHES = List.of(
             "ConfigDatum[2]: derived 1c330cfbd58d994945d29c7c52ec001d054b93f733317ec59d9a0537, "
                     + "chain a33aee4034165f1772e57af5fb975f26c35f7e9080b7e44b4634f227",
@@ -56,7 +57,7 @@ class MainnetBlueprintSelectionTest {
                     + "chain 1628910a5fbdba415c3b1bf7304672106659ac527442f10701472753",
             "ConfigDatum[23]: derived 2ecae5102d682a7bb8f622e357b2129112b5d50a39abf0f9a3fa1f08, "
                     + "chain 344755c30db0617ff43cb41e5212379b729985352a213371b15c90cd",
-            "ConfigDatum[24]: derived 5dcebd73c56d86ab0c8049d09748dba14a6c19734aab121eb0613d25, "
+            "ConfigDatum[24]: derived 44b4e470c9a4642b3a6cc84c481cc3b3848a85c408384accbab45c92, "
                     + "chain db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56",
             "ConfigDatum[26]: derived 1322b6d1e7e46ac543769a8fcfb43840606f040d2e9efa2e59389d86, "
                     + "chain b4ad9a6f2710d68067177e0de5a4378ebe4fcdfdc929c7488479c313",
@@ -66,11 +67,11 @@ class MainnetBlueprintSelectionTest {
                     + "chain d815766d61c1241742ff78164cdf8edaef1746a99a242a7fb7938aa6",
             "LMConfigDatum[2]: derived f3c7a201440b39458111ab44c26863c4d089e66e71ae847fb87233bd, "
                     + "chain e0a13838d176cea9de466afe2075f38f682603013604021a3959700f",
-            "LMConfigDatum[3]: derived f9be2926201f9ed40da47cc77a40db0ad8b39d21842511116ddb644d, "
+            "LMConfigDatum[3]: derived 6ab215727d8af4601813859a57ead01ed09cc9a3c30e9d8c49d72ed1, "
                     + "chain dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457",
             "LMConfigDatum[4]: derived 3a155105a91c371b74b96f480114ef1d4ec80389d27902426f553c99, "
                     + "chain 00b8a30bd2f18962e527d7c03712e86077a688bfce7e2934ef70034d",
-            "LMConfigDatum[6]: derived 1760b3c462d707870b904eca90145dc48619d0e770253728412f3bf3, "
+            "LMConfigDatum[6]: derived 81fd0ba8cd906f157f4e07d92c75c8d60df4a5fb8e30eb3d0ee7b501, "
                     + "chain 70b149e7c84a4cf47fb273d87ed2fe97562f0148bfce0b4681afa480");
 
     @Configuration(proxyBeanMethods = false)
@@ -133,9 +134,10 @@ class MainnetBlueprintSelectionTest {
             assertNull(ctx.getStartupFailure(), () -> "mainnet context failed: " + ctx.getStartupFailure());
             var registry = ctx.getBean(LoansContractRegistry.class);
             // Since 2026-10-01 the live datum carries ONE advisory difference by FluidTokens' design: recast
-            // [14] points at their unpublished pause hash. Nothing the node uses may differ.
+            // [14] points at their unpublished pause hash. Nothing the node uses may differ. (Datums as last
+            // rewritten: ConfigDatum 2026-10-23, LMConfigDatum 2026-10-26.)
             var findings = verifier(registry, "mainnet").verifyAgainstBySeverity(
-                    fixture("mainnet-config-datum-2026-10-01.hex"), fixture("mainnet-lm-config-datum-2026-10-01.hex"));
+                    fixture("mainnet-config-datum-2026-10-23.hex"), fixture("mainnet-lm-config-datum-2026-10-26.hex"));
             assertEquals(List.of(), findings.enforced(), "nothing the node uses may differ from the live datums");
             assertEquals(1, findings.advisory().size(), () -> "advisory: " + findings.advisory());
             assertTrue(findings.advisory().getFirst().startsWith("ConfigDatum[14]:")
@@ -181,7 +183,7 @@ class MainnetBlueprintSelectionTest {
 
     @Test
     void currentMainnetDatumMutationAddsOneSpecificMismatch() throws IOException {
-        String current = fixture("mainnet-config-datum-2026-10-01.hex");
+        String current = fixture("mainnet-config-datum-2026-10-23.hex");
         // ConfigDatum[2], the pool policy: present in the CURRENT mainnet datum. The previous
         // target (12773eaf...) belonged to the pre-redeploy datum and no longer appears.
         String published = "20f765d25da3a36644371f7619d97bdccf034f3067921921d9dce0f7";
@@ -190,7 +192,7 @@ class MainnetBlueprintSelectionTest {
         assertNotEquals(current, mutant, "the captured mainnet mutation did not apply");
 
         List<String> mismatches = verifier(mainnet(), "mainnet")
-                .verifyAgainstBySeverity(mutant, fixture("mainnet-lm-config-datum-2026-10-01.hex")).enforced();
+                .verifyAgainstBySeverity(mutant, fixture("mainnet-lm-config-datum-2026-10-26.hex")).enforced();
         assertEquals(1, mismatches.size(), "one corrupted credential must add one mismatch: " + mismatches);
         assertTrue(mismatches.getFirst().contains("ConfigDatum[2]")
                         && mismatches.getFirst().contains(corrupted),
@@ -200,7 +202,8 @@ class MainnetBlueprintSelectionTest {
     @Test
     void fixedArtifactMatchesPublishedCompoundBytesAndPreservesConvertHash() throws Exception {
         LoansContractRegistry registry = mainnet();
-        assertEquals(fixture("mainnet-compound-script-2026-10-01.hex"),
+        // the reference script at 588695…#0, published 2026-10-26 (lm_compound_action 4713a925…)
+        assertEquals(fixture("mainnet-compound-script-2026-10-26.hex"),
                 HexUtil.encodeHexString(registry.getLmCompoundActionScript().serializeScriptBody()));
         assertEquals(CONVERT, registry.getLmLiquidateAndConvertActionScriptHash());
     }

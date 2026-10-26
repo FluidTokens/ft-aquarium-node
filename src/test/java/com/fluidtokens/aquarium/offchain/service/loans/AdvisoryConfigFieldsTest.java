@@ -87,7 +87,7 @@ class AdvisoryConfigFieldsTest {
         return new LoansConfigVerifier(registry, SMART, network, null, true);
     }
 
-    /** FluidTokens' recast pause: the one advisory difference the live 2026-10-01 datum carries by design. */
+    /** FluidTokens' recast pause: the one advisory difference the live datum carries by design since 2026-10-01. */
     private static final String RECAST_PAUSE = "64d9b13f973be664a05c22365f90b222b0f9018b94918d3cb5d0220f";
 
     @Test
@@ -120,10 +120,10 @@ class AdvisoryConfigFieldsTest {
         // ConfigDatum[23], pool_borrow_action -- moved again by FluidTokens on 2026-10-01.
         String published = "b8f1870006e7372cc6eaa19e69b742d86c756dbf77e9be6264c000b3";
         String corrupted = "b8f1870006e7372cc6eaa19e69b742d86c756dbf77e9be6264c00000";
-        String mutant = fixture("mainnet-config-datum-2026-10-01.hex").replace(published, corrupted);
+        String mutant = fixture("mainnet-config-datum-2026-10-23.hex").replace(published, corrupted);
 
         LoansConfigVerifier.Findings findings =
-                verifier().verifyAgainstBySeverity(mutant, fixture("mainnet-lm-config-datum-2026-10-01.hex"));
+                verifier().verifyAgainstBySeverity(mutant, fixture("mainnet-lm-config-datum-2026-10-26.hex"));
 
         assertEquals(List.of(), findings.enforced(),
                 "a pool-side validator this node never invokes must not be fatal: " + findings.enforced());
@@ -138,11 +138,11 @@ class AdvisoryConfigFieldsTest {
         // ConfigDatum[2], the pool policy id -- five call sites, and it decides what gets indexed.
         String published = "20f765d25da3a36644371f7619d97bdccf034f3067921921d9dce0f7";
         String corrupted = "20f765d25da3a36644371f7619d97bdccf034f3067921921d9dce000";
-        String mutant = fixture("mainnet-config-datum-2026-10-01.hex").replace(published, corrupted);
-        assertTrue(!mutant.equals(fixture("mainnet-config-datum-2026-10-01.hex")), "the mutation did not apply");
+        String mutant = fixture("mainnet-config-datum-2026-10-23.hex").replace(published, corrupted);
+        assertTrue(!mutant.equals(fixture("mainnet-config-datum-2026-10-23.hex")), "the mutation did not apply");
 
         LoansConfigVerifier.Findings findings =
-                verifier().verifyAgainstBySeverity(mutant, fixture("mainnet-lm-config-datum-2026-10-01.hex"));
+                verifier().verifyAgainstBySeverity(mutant, fixture("mainnet-lm-config-datum-2026-10-26.hex"));
 
         assertEquals(1, findings.advisory().size(), "the pool policy is not advisory: " + findings.advisory());
         assertTrue(findings.advisory().getFirst().contains("ConfigDatum[14]"),
@@ -176,13 +176,14 @@ class AdvisoryConfigFieldsTest {
     }
 
     /**
-     * The live datums captured after FluidTokens' 2026-10-01 redeploy: nothing the node uses differs, and
-     * the single advisory difference is FluidTokens' recast pause, by their design.
+     * The live datums as FluidTokens last rewrote them (ConfigDatum 2026-10-23, LMConfigDatum 2026-10-26):
+     * nothing the node uses differs, and the single advisory difference is FluidTokens' recast pause, by
+     * their design.
      */
     @Test
     void theLiveMainnetDatumsDifferOnlyAtFluidTokensRecastPause() throws IOException {
         LoansConfigVerifier.Findings findings = verifier().verifyAgainstBySeverity(
-                fixture("mainnet-config-datum-2026-10-01.hex"), fixture("mainnet-lm-config-datum-2026-10-01.hex"));
+                fixture("mainnet-config-datum-2026-10-23.hex"), fixture("mainnet-lm-config-datum-2026-10-26.hex"));
         assertEquals(List.of(), findings.enforced(), "nothing the node uses may differ: " + findings);
         assertEquals(1, findings.advisory().size(), "advisory: " + findings.advisory());
         assertTrue(findings.advisory().getFirst().startsWith("ConfigDatum[14]:")

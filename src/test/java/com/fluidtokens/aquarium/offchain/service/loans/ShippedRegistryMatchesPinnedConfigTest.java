@@ -47,7 +47,9 @@ class ShippedRegistryMatchesPinnedConfigTest {
     private static final String THIRD_DEPLOYMENT = "/loans-v4/preview-config-datum.hex";
     // Since FluidTokens' 2026-10-01 mainnet redeploy (FTAI-001) the shipped artefact also differs from the
     // captured preview at [11] claim, [23] borrow, [24] sell and LM[2]/[3]/[4]/[6] -- preview was not
-    // redeployed, so each is the artefact moving, not the chain.
+    // redeployed, so each is the artefact moving, not the chain. The derived [24], LM[3] and LM[6] moved
+    // again with the 2026-10-26 artefact (FAB-166: upstream a02d4e2's sell, compound and pay-in-advance-
+    // and-compound code); the captured chain side is untouched.
     private static final List<String> OLD_PREVIEW_MISMATCHES = List.of(
             "ConfigDatum[2]: derived 1c330cfbd58d994945d29c7c52ec001d054b93f733317ec59d9a0537, "
                     + "chain a33aee4034165f1772e57af5fb975f26c35f7e9080b7e44b4634f227",
@@ -59,7 +61,7 @@ class ShippedRegistryMatchesPinnedConfigTest {
                     + "chain 1628910a5fbdba415c3b1bf7304672106659ac527442f10701472753",
             "ConfigDatum[23]: derived 2ecae5102d682a7bb8f622e357b2129112b5d50a39abf0f9a3fa1f08, "
                     + "chain 344755c30db0617ff43cb41e5212379b729985352a213371b15c90cd",
-            "ConfigDatum[24]: derived 5dcebd73c56d86ab0c8049d09748dba14a6c19734aab121eb0613d25, "
+            "ConfigDatum[24]: derived 44b4e470c9a4642b3a6cc84c481cc3b3848a85c408384accbab45c92, "
                     + "chain db9a5bf043f37e744bbb43b96ec89a3e175f7c5523d02dd563ed9c56",
             "ConfigDatum[26]: derived 1322b6d1e7e46ac543769a8fcfb43840606f040d2e9efa2e59389d86, "
                     + "chain b4ad9a6f2710d68067177e0de5a4378ebe4fcdfdc929c7488479c313",
@@ -69,11 +71,11 @@ class ShippedRegistryMatchesPinnedConfigTest {
                     + "chain d815766d61c1241742ff78164cdf8edaef1746a99a242a7fb7938aa6",
             "LMConfigDatum[2]: derived f3c7a201440b39458111ab44c26863c4d089e66e71ae847fb87233bd, "
                     + "chain e0a13838d176cea9de466afe2075f38f682603013604021a3959700f",
-            "LMConfigDatum[3]: derived f9be2926201f9ed40da47cc77a40db0ad8b39d21842511116ddb644d, "
+            "LMConfigDatum[3]: derived 6ab215727d8af4601813859a57ead01ed09cc9a3c30e9d8c49d72ed1, "
                     + "chain dd4709091734af2dc36321e774cf496222a1f92377ad6c5bef100457",
             "LMConfigDatum[4]: derived 3a155105a91c371b74b96f480114ef1d4ec80389d27902426f553c99, "
                     + "chain 00b8a30bd2f18962e527d7c03712e86077a688bfce7e2934ef70034d",
-            "LMConfigDatum[6]: derived 1760b3c462d707870b904eca90145dc48619d0e770253728412f3bf3, "
+            "LMConfigDatum[6]: derived 81fd0ba8cd906f157f4e07d92c75c8d60df4a5fb8e30eb3d0ee7b501, "
                     + "chain 70b149e7c84a4cf47fb273d87ed2fe97562f0148bfce0b4681afa480");
 
     private static String fixture(String path) throws IOException {

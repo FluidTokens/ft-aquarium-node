@@ -61,14 +61,18 @@ class MainnetReferenceScriptsTest {
     // The derivation coordinates are now read from application.yaml like the reference coordinates are:
     // a gate that keeps its own copy of the thing it guards is guarding the copy.
     private static final String CONFIG_ASSET_NAME = "706172616d6574657273";
-    /** The config NFT outputs after FluidTokens' 2026-10-01 in-place update (their CONFIG_REF_UTXO / LM_CONFIG_REF_UTXO). */
-    private static final String CONFIG = "3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c#0";
-    private static final String LM_CONFIG = "ab3e3aafe7ea0e6fec24d9ac9249e01edb242dee55aeaa2399da097a21177620#0";
-    /** lm_compound_action since 2026-10-01 (LMConfigDatum[3]). */
-    private static final String COMPOUND = "29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0";
-    /** lm_compound_action before 2026-10-01 -- still unspent, which is what makes it a fair negative. */
-    private static final String OLD_COMPOUND = "ec592cc9e0dffdc1fdefa197cb353c4f60a07910c257cd4236293b844ceeabb7#0";
-    private static final String COMPOUND_HASH = "71515a89fd399166d8d1e6a63d49822fc2684b76782c8bbf3f817982";
+    /**
+     * The config NFT outputs after FluidTokens' latest in-place rewrites: ConfigDatum 2026-10-23 (block
+     * 14,105,271), LMConfigDatum 2026-10-26 (block 14,118,734). The 2026-10-01 outputs (3d800e98…#0 /
+     * ab3e3aaf…#0) are spent.
+     */
+    private static final String CONFIG = "75e459a0e97d3808031d97b8360308782f197bc778471d3dbc4aa51245886dc5#0";
+    private static final String LM_CONFIG = "c0f0d8219ca1ab77e55163cc9c75858815793b38b2167cbee113bea034e6ef36#0";
+    /** lm_compound_action since 2026-10-26 (LMConfigDatum[3]). */
+    private static final String COMPOUND = "588695471b9f865ceac88066883fad118a5a1800c9c69a0663e5ff560d656b1a#0";
+    /** lm_compound_action 2026-10-01 .. 2026-10-26 (71515a89…) -- still unspent, which is what makes it a fair negative. */
+    private static final String OLD_COMPOUND = "29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0";
+    private static final String COMPOUND_HASH = "4713a925302692076b686eee3de80963c94e464108522afacf19039c";
 
     private static final String BF = "https://cardano-mainnet.blockfrost.io/api/v0";
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -329,9 +333,9 @@ class MainnetReferenceScriptsTest {
 
     @Test
     void currentConfigOutputsAreUnspentExactNftsWithCapturedDatums() throws Exception {
-        assertCurrentConfig(CONFIG, configPolicyId() + CONFIG_ASSET_NAME, "mainnet-config-datum-2026-10-01.hex");
+        assertCurrentConfig(CONFIG, configPolicyId() + CONFIG_ASSET_NAME, "mainnet-config-datum-2026-10-23.hex");
         assertCurrentConfig(LM_CONFIG, lmConfigPolicyId() + CONFIG_ASSET_NAME,
-                "mainnet-lm-config-datum-2026-10-01.hex");
+                "mainnet-lm-config-datum-2026-10-26.hex");
     }
 
     private static void assertCurrentConfig(String coordinate, String nft, String fixture) throws Exception {
@@ -379,7 +383,7 @@ class MainnetReferenceScriptsTest {
     /**
      * The compound path's own withdraw credentials, checked separately from the liquidation ones because
      * compound is disabled on mainnet by default: a red here grounds compound, not liquidation.
-     * {@code lm_compound_action} moved on 2026-10-01 like the liquidate actions did.
+     * {@code lm_compound_action} moved on 2026-10-01 like the liquidate actions did, and again on 2026-10-26.
      */
     @Test
     void everyCompoundWithdrawCredentialIsRegistered() throws Exception {

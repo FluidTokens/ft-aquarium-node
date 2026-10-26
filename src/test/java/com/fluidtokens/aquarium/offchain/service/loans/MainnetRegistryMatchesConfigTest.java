@@ -67,11 +67,11 @@ class MainnetRegistryMatchesConfigTest {
         ReflectionTestUtils.setField(network, "network", "mainnet");
         LoansContractRegistry registry = mainnetRegistry();
 
-        // The live datums after FluidTokens' 2026-10-01 redeploy. Their one advisory difference, the
-        // recast pause at [14], is by FluidTokens' design; nothing the node USES may differ.
+        // The live datums as FluidTokens last rewrote them (2026-10-23 / 2026-10-26). Their one advisory
+        // difference, the recast pause at [14], is by FluidTokens' design; nothing the node USES may differ.
         var findings = new LoansConfigVerifier(registry, SMART_TOKENS_SPEND, network, null, true)
-                .verifyAgainstBySeverity(fixture("/loans-v4/mainnet-config-datum-2026-10-01.hex"),
-                        fixture("/loans-v4/mainnet-lm-config-datum-2026-10-01.hex"));
+                .verifyAgainstBySeverity(fixture("/loans-v4/mainnet-config-datum-2026-10-23.hex"),
+                        fixture("/loans-v4/mainnet-lm-config-datum-2026-10-26.hex"));
         List<String> mismatches = findings.enforced();
         assertEquals(1, findings.advisory().size(), "advisory: " + findings.advisory());
         assertTrue(findings.advisory().getFirst().startsWith("ConfigDatum[14]:"), "advisory: " + findings.advisory());
