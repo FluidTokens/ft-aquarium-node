@@ -25,10 +25,18 @@ It is **the first real mainnet artefact the compound path has ever had.** Findin
 that the path was *structurally* empty — one loan ever minted, never burned, therefore no escrow —
 and that stopped being true at 08:52:48 UTC. See §56.
 
-⚠ **The economics did not change with it.** The only live mainnet pool manager still publishes
-`compoudingFeePerMille = 0`, so a compound of this escrow pays nothing and is refused at the shipped
-margin. `MainnetCompoundEscrowTest` asserts both halves separately on purpose: *there is finally
-something to compound* and *compounding it is worth doing* are different questions.
+⚠ **The economics did not change with it** (as recorded 2026-09-04). The only live mainnet pool
+manager still publishes `compoudingFeePerMille = 0`, so a compound of this escrow pays nothing and is
+refused at the shipped margin. `MainnetCompoundEscrowTest` asserts both halves separately on purpose:
+*there is finally something to compound* and *compounding it is worth doing* are different questions.
+
+> **Since 2026-10-26 the sentence above is historical, not current.** FluidTokens' 2026-10-26
+> `lm_compound_action` (upstream `a02d4e2`, `finance.get_compounding_fee`) makes an **ADA-principal**
+> pool pay `max(escrow * compoudingFeePerMille / 1000, 1 ADA)` — at least 1 ADA even at a rate of 0
+> (FAB-167, `CompoundEconomics.compoundingFee`). This escrow is ada-principal, so under today's rule a
+> compound of it pays at least 1,000,000 lovelace, and at the shipped margin of 0 such a compound is
+> **approved** whenever the transaction fee does not exceed the fee it pays. The floor applies to ADA
+> principals only; a token-principal pool at a rate of 0 still pays no principal fee.
 
 ⚠ **This datum is checked against the live chain by that test rather than trusted.** Two recorded
 config datums have already aged out from under this suite (§53, and the LM config on 2026-09-04),

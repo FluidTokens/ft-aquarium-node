@@ -136,18 +136,20 @@ loans:
     # F is the raw-token fee, n/d its positive oracle price per raw unit, E is escrow ADA recovered
     # by the bot, L is the exact final-body transaction fee, and T is the pool minimum-ADA top-up.
     #
-    # 0 (the default) refuses every net loss while allowing exact break-even. That is what makes a
-    # ZERO-FEE ADA POOL refused out of the box: it pays nothing, so the net is exactly minus the tx
-    # fee. A valid zero-fee NATIVE pool can still clear 0 through recovered escrow ADA (`E-L-T`).
+    # 0 (the default) refuses every net loss while allowing exact break-even. F is the validator's own
+    # fee: since FluidTokens' 2026-10-26 update an ADA pool ALWAYS pays at least 1 ADA
+    # (`max(Q*c/1000, 1 ADA)`), even at rate 0, so a zero-rate ADA pool is approved out of the box when
+    # the transaction costs no more than that. A token pool pays `Q*c/1000` raw units -- nothing at
+    # rate 0 -- and a zero-rate NATIVE pool clears 0 only through recovered escrow ADA (`E-L-T`).
     #
     # The fee rate is `compoudingFeePerMille` in the live PoolManagerDatum -- set by the POOL OWNER,
-    # not by this node and not fixed by the protocol. Measured 2026-09-02: the only live preview pool
-    # published 0 for its ADA principal, so out of the box that work pays nothing and is declined.
+    # not by this node; the 1 ADA minimum for ADA pools is the protocol's. Measured 2026-09-02: the
+    # only live preview pool published 0 for its ADA principal.
     #
     # A NEGATIVE value is a number the operator STATES, not a protection they switch off -- the same
     # distinction `liquidation.profit-margin-lovelace` draws, and the reason there is no
-    # `ignore-profit-check` twin here. Setting it negative arms compounding for pools that pay
-    # nothing, and still bounds the loss: a candidate worse than the stated figure is refused.
+    # `ignore-profit-check` twin here. Setting it negative arms compounding that pays less than it
+    # costs, and still bounds the loss: a candidate worse than the stated figure is refused.
     # Giovanni's ruling, 2026-09-02: acceptable "as long as operator checks this himself and owns it".
     #
     # ⚠ STALE UNTIL 2026-09-04: this said "negative on mainnet is a hard startup failure, exactly
@@ -176,10 +178,18 @@ loans:
     # validator an earlier coordinate already supplies. One it could not ask is REFERENCE_SCRIPT_UNVERIFIED
     # and used as configured. Each of the eleven no usable coordinate supplies is REFERENCE_SCRIPT_MISSING
     # and travels inline. All are WARNs plus a readiness-page banner; lending is NOT refused.
-    # ⛔ RE-POINTED at FluidTokens' 2026-09-17 redeploy, and again on 2026-10-01 (FTAI-001/002/102):
-    # only lmCompoundAction moved (2a8faf65 -> 71515a89, 29f63a1e...#0); the other ten scripts are
-    # unchanged. All ELEVEN verified: for each one, the hash this node DERIVES equals the
-    # reference_script_hash the chain publishes at that coordinate (Koios utxo_info, 2026-10-01).
+    # ⛔ RE-POINTED at FluidTokens' 2026-09-17 redeploy, again on 2026-10-01 (FTAI-001/002/102), and
+    # again on 2026-10-26 (LMConfigDatum rewritten in place, upstream a02d4e2 "1 ADA minimum compounding
+    # fee"): each time only lmCompoundAction moved (2a8faf65 -> 71515a89 -> 4713a925, now
+    # 588695...#0, block 14,117,824); the other ten scripts are unchanged. The coordinate and the
+    # blueprint that derives 4713a925 ship in ONE commit (FAB-166; blueprint provenance in
+    # src/test/resources/loans-v4/blueprint/loans-v4-blueprint-2026-10-26.PROVENANCE.md). All ELEVEN
+    # verified: for each one, the hash this node DERIVES equals the reference_script_hash the chain
+    # publishes at that coordinate (Koios utxo_info, 2026-10-26).
+    #
+    # NOT LISTED, deliberately: 047020cf...#0 publishes lm_liquidate_pay_in_advance_and_compound_action
+    # (00e38efa, LMConfigDatum[6]), the same day. It is not one of the eleven and nothing in this node
+    # builds a transaction that invokes it, so it has no consumer here.
     #
     # ⚠ THE ELEVENTH WAS NEARLY MISREPORTED AS MISSING, and the near-miss is the lesson.
     # lm_compound_action takes poolManagerSpendScriptHash and poolManagerPolicyId among its eight
@@ -192,17 +202,19 @@ loans:
     # Order is presentation only -- the builder matches on the SET of published hashes, not position.
     #   assetManagerSpend b256da41  lenderManagerSpend 6743f4b6  poolSpend ecd0c0fc
     #   poolManagerSpend dfb1d21e   assetManagerWithdraw addd060d  lenderManagerWithdraw 247065fa
-    #   lmCompoundAction 71515a89   poolPolicy 20f765d2  poolCompoundAction fef12ea6
+    #   lmCompoundAction 4713a925   poolPolicy 20f765d2  poolCompoundAction fef12ea6
     #   poolManagerPolicy 1e0bf58a  pmCompoundLiquidity 96f1e889
-    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:af5bc4815ec1aefb86d51e25649ffd22abc2b0385eb0909512a96adccd4048ec#0,691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0,d39ada3381d91682fd063b5f4a2351c2bddff8ec3259916b328a428394eb14ed#0,ed3fa111c1529bb0b6a57dc7ffb255231db7fe390d21fc8bab181c7fd67e289c#0,bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0,b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0,29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0,b35ed92547f040c6733104a810d5611edf04fc2df6a9202f3fa78d38fe1bffc6#0,7d3ad6d0ad994c032aa1a99b49abff3ff2f79612a5407c5d96c957a3cd48708e#0,58b7b66d8adafc8b2e83d34c3980af24e70f6528995faa647cc66e6eaeba5ff5#0,8a2372acd140ef84fd3b62ff64874684aca683c18ae1c7fa3b8ec1fdc361c7ff#0}
+    reference-scripts: ${AQUARIUM_COMPOUND_REFERENCE_SCRIPTS:af5bc4815ec1aefb86d51e25649ffd22abc2b0385eb0909512a96adccd4048ec#0,691a9cd9464dae30366c8ab1a16cb37bd9014089d49fca7c2ecc9f79a65adb6a#0,d39ada3381d91682fd063b5f4a2351c2bddff8ec3259916b328a428394eb14ed#0,ed3fa111c1529bb0b6a57dc7ffb255231db7fe390d21fc8bab181c7fd67e289c#0,bc9dcf69d9093efc98ec3b7c31506b18b61074286c8d9a479443a98a1d4f20f0#0,b6a5f0148f58996d8b6988e0434680cdfb359a94bf0f5b5f7b27d192a4197cb8#0,588695471b9f865ceac88066883fad118a5a1800c9c69a0663e5ff560d656b1a#0,b35ed92547f040c6733104a810d5611edf04fc2df6a9202f3fa78d38fe1bffc6#0,7d3ad6d0ad994c032aa1a99b49abff3ff2f79612a5407c5d96c957a3cd48708e#0,58b7b66d8adafc8b2e83d34c3980af24e70f6528995faa647cc66e6eaeba5ff5#0,8a2372acd140ef84fd3b62ff64874684aca683c18ae1c7fa3b8ec1fdc361c7ff#0}
 
   # ── Lending v4 on MAINNET — FluidTokens shipped 2026-09-02 ──────────────────────────────────
   #
-  # Verified read-only against the chain on 2026-10-01, after FluidTokens' FTAI-001 redeploy: the current
-  # config NFTs are unspent at 3d800e98…#0 (ConfigDatum) and ab3e3aaf…#0 (LMConfigDatum), asset name
-  # `parameters`, and the vendored blueprint derives every credential their datums publish except the
-  # recast pause at ConfigDatum[14] (advisory, by FluidTokens' design). See MainnetRegistryMatchesConfigTest
-  # and MainnetReferenceScriptsTest. (Earlier outputs: ffced74c…#0 / 1c4a9128…#0, verified 2026-09-11.)
+  # Verified read-only against the chain on 2026-10-26, after FluidTokens rewrote both config datums in
+  # place (ConfigDatum 2026-10-23, LMConfigDatum 2026-10-26; same config NFTs): the current config NFTs are
+  # unspent at 75e459a0…#0 (ConfigDatum) and c0f0d821…#0 (LMConfigDatum), asset name `parameters`, and the
+  # vendored blueprint derives every credential their datums publish except the recast pause at
+  # ConfigDatum[14] (advisory, by FluidTokens' design). See MainnetRegistryMatchesConfigTest,
+  # MainnetRedeploy20261026Test and MainnetReferenceScriptsTest. (Earlier outputs: 3d800e98…#0 /
+  # ab3e3aaf…#0, verified 2026-10-01; ffced74c…#0 / 1c4a9128…#0, verified 2026-09-11.)
   #
   # ⚠ CONFIGURED IS NOT ARMED. The liquidation mode is `disabled`, compound is disabled, and the
   # scheduled-transaction processor is disabled. These values derive and read mainnet only.
@@ -210,10 +222,11 @@ loans:
   # The preview profile overrides the deployment coordinates, while the image keeps the single
   # latest artifact; it remains incompatible with the captured old preview deployment until Fluid migrates it.
   config:
-    # Current Config NFT output (FluidTokens' 2026-10-01 in-place update: 3d800e98…#0, block 14,012,337).
+    # Current Config NFT output (FluidTokens' 2026-10-23 in-place ConfigDatum rewrite: 75e459a0…#0,
+    # block 14,105,271; before it 3d800e98…#0, block 14,012,337, the 2026-10-01 update).
     # Runtime discovery uses policy id + asset name -- NOTHING READS THIS KEY; it is provenance and
     # operator configuration, not a mint point or a sync-start instruction.
-    ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c}
+    ref-utxo-tx-hash: ${LOANS_CONFIG_REF_UTXO_TX_HASH:75e459a0e97d3808031d97b8360308782f197bc778471d3dbc4aa51245886dc5}
     policy-id: ${LOANS_CONFIG_POLICY_ID:235b32040fe1177c03b1d34febc470440c6eaaa2228a9c1b0e375200}
     # The config NFTs' asset name, "parameters" in hex. Identical on every network — stated
     # rather than inlined, because a key that exists nowhere can be neither overridden nor

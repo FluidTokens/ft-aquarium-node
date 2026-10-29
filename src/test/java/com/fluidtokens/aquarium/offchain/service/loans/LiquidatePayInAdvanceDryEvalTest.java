@@ -1247,7 +1247,7 @@ class LiquidatePayInAdvanceDryEvalTest {
         return new Fixture(loan, loanUtxo, bond, bondUtxo, oracle, request);
     }
 
-    private static List<Utxo> universe(Fixture fixture) {
+    static List<Utxo> universe(Fixture fixture) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
                 fixture.loanUtxo(), fixture.bondUtxo()));
         universe.add(LoanFixtures.utxo(ORACLE_REF_INPUT.getTransactionId(), ORACLE_REF_INPUT.getIndex(),
@@ -1267,7 +1267,7 @@ class LiquidatePayInAdvanceDryEvalTest {
         return universe;
     }
 
-    private static PlutusScript oracleScript() {
+    static PlutusScript oracleScript() {
         try {
             return PlutusBlueprintUtil.getPlutusScriptFromCompiledCode(
                     LoanFixtures.fixture("preview-oracle-script.hex"), PlutusVersion.v3);

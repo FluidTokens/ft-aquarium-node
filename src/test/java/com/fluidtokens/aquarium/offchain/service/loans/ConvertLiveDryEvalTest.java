@@ -95,7 +95,9 @@ class ConvertLiveDryEvalTest {
 
     /** Current Config NFT holder; its original mint and every superseded pin remain documented below. */
     // 2026-10-01: FluidTokens' FTAI-001 in-place update (was ffced74c…, then 3add9d68…).
-    private static final String CONFIG_TX = "3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c";
+    // Repointed 2026-10-26 (FAB-169): FluidTokens' 2026-10-23 10:45 UTC in-place update spent 3d800e98…#0
+    // and recreated the ConfigDatum at 75e459a0…#0 (checked on Blockfrost: 3d800e98…#0 consumed_by 75e459a0…).
+    private static final String CONFIG_TX = "75e459a0e97d3808031d97b8360308782f197bc778471d3dbc4aa51245886dc5";
     private static final int CONFIG_IX = 0;
 
     /**
@@ -122,8 +124,11 @@ class ConvertLiveDryEvalTest {
     // Repointed again 2026-09-11: the current datum publishes the new compound action while keeping
     // the convert action unchanged. The live-set assertion below is what prevents this pin rotting.
     // Repointed again 2026-10-01 (FTAI-001: the LenderManager actions moved with the new claim action).
+    // Repointed again 2026-10-26 (FAB-169): FluidTokens' 2026-10-26 13:40 UTC in-place update (the new
+    // lm_compound_action) spent ab3e3aaf…#0 and recreated the LMConfigDatum at c0f0d821…#0 (checked on
+    // Blockfrost: ab3e3aaf…#0 consumed_by c0f0d821…).
     private static final String LM_CONFIG_TX =
-            "ab3e3aafe7ea0e6fec24d9ac9249e01edb242dee55aeaa2399da097a21177620";
+            "c0f0d8219ca1ab77e55163cc9c75858815793b38b2167cbee113bea034e6ef36";
     private static final int LM_CONFIG_IX = 0;
 
     // ---- mainnet deployment coordinates -----------------------------------------------------------

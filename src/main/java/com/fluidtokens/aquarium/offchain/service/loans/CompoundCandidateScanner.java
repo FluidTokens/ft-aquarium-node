@@ -161,15 +161,21 @@ public class CompoundCandidateScanner {
                     decodedFee.exclusion(), decodedFee.detail());
         }
 
+        // Admission uses THE fee the validator computes (CompoundEconomics.compoundingFee): an ADA pool
+        // pays at least 1 ADA since FluidTokens' 2026-10-26 update, so an ADA escrow of 1 ADA or less
+        // leaves the pool nothing (Q - F <= 0) and pool_compound_action's addedPrincipal > 0 refuses it.
+        // There is deliberately no c == 0 skip: an ADA pool at c = 0 pays the floor, and a token pool at
+        // c = 0 pays 0 and is decided by the escrow ADA the bot recovers.
         long feePerMille = decodedFee.value();
-        BigInteger fee = addedLiquidity.multiply(BigInteger.valueOf(feePerMille))
-                .divide(BigInteger.valueOf(1000L));
+        BigInteger fee = CompoundEconomics.compoundingFee(addedLiquidity, feePerMille,
+                bond.datum().principalAsset());
         if (addedLiquidity.signum() <= 0 || addedLiquidity.subtract(fee).signum() <= 0) {
             return new CompoundCandidate(loanId, escrow, datum, addedLiquidity, bond, poolId,
                     pair.pool(), pair.poolManager(), feePerMille, principalIsAda,
                     CompoundExclusion.PRINCIPAL_AMOUNT_INVALID,
-                    "principal must satisfy Q > 0 and Q-floor(Q*c/1000) > 0; Q="
-                            + addedLiquidity + ", c=" + feePerMille + ", F=" + fee);
+                    "principal must satisfy Q > 0 and Q - F > 0, where F is the validator's compounding "
+                            + "fee (" + (principalIsAda ? "ADA: max(Q*c/1000, 1 ADA)" : "token: Q*c/1000")
+                            + "); Q=" + addedLiquidity + ", c=" + feePerMille + ", F=" + fee);
         }
 
         return new CompoundCandidate(loanId, escrow, datum, addedLiquidity, bond, poolId,

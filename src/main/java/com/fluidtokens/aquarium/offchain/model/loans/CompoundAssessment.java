@@ -11,9 +11,11 @@ import java.math.BigInteger;
  * @param escrow        the principal sitting in the asset manager, in the pool's principal unit
  * @param feePerMille   {@code compoudingFeePerMille} read from the live {@code PoolManagerDatum} —
  *                      <b>set by the pool owner, not by us and not by the protocol</b>
- * @param expectedFee   {@code escrow * feePerMille / 1000}, the on-chain formula, integer division —
- *                      in the <b>principal's own unit</b>, exactly what the pool is entitled to
- *                      withhold on chain
+ * @param expectedFee   the validator's compounding fee, {@code CompoundEconomics.compoundingFee}:
+ *                      {@code max(escrow * feePerMille / 1000, 1 ADA)} for an ADA principal since
+ *                      FluidTokens' 2026-10-26 update, {@code escrow * feePerMille / 1000} for a token —
+ *                      integer division, in the <b>principal's own unit</b>, exactly what the pool
+ *                      gives up on chain
  * @param expectedFeeLovelace {@link #expectedFee} priced into lovelace via
  *                      {@code PricingService} — the identity for an ada principal, so this equals
  *                      {@link #expectedFee} exactly whenever the principal is ada
@@ -58,7 +60,11 @@ public record CompoundAssessment(boolean approved,
                 null, null, null, null, null, null);
     }
 
-    /** True when the pool owner has set no compounding fee, so this work pays nothing. */
+    /**
+     * True when the pool owner publishes {@code compoudingFeePerMille = 0}. That no longer means the work
+     * pays nothing: since FluidTokens' 2026-10-26 update an ADA pool always pays at least 1 ADA; only a
+     * token pool at rate 0 pays no fee (its net is then the escrow ADA the bot recovers).
+     */
     public boolean zeroFeePool() {
         return feePerMille == 0L;
     }

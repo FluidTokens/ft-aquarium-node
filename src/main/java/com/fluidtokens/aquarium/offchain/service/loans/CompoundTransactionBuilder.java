@@ -85,11 +85,13 @@ import java.util.TreeMap;
  * the remainder simply is not constrained, so it flows to the change address — which must be the
  * bot's. §20.1 warns that a builder balancing the whole escrow into the pool donates its own fee, so
  * the pool output is computed as {@code poolInput + (addedLiquidity − fee)} and the bot's net position
- * is re-derived from the finished body and asserted. <b>An explicit fee output is deliberately not
- * emitted</b>: the fee is frequently zero (the only live preview pool publishes
- * {@code compoudingFeePerMille = 0}) and often below min-ada, and an output that cannot hold it would
- * turn an economic question into a build failure. The assertion, not the output shape, is what
- * protects the value.
+ * is re-derived from the finished body and asserted. The fee is {@code Request.compoundingFee} and
+ * nothing else: this class computes none of its own, so the value it builds with, reduces the pool by
+ * and asserts the bot's net against is the one {@link CompoundEconomics#compoundingFee} produced — since
+ * FluidTokens' 2026-10-26 update at least 1 ADA for an ADA pool, and {@code Q*c/1000} raw units (often
+ * zero) for a token pool. <b>An explicit fee output is deliberately not emitted</b>: a token pool's fee is
+ * frequently zero or below min-ada, and an output that cannot hold it would turn an economic question
+ * into a build failure. The assertion, not the output shape, is what protects the value.
  *
  * <h2>Ex-units</h2>
  * Measured, never guessed — CCL trap 8. An evaluator is wired through {@code withTxEvaluator} and
@@ -181,8 +183,10 @@ public class CompoundTransactionBuilder {
      * @param walletUtxo     the bot's nominated ordinary input, paying the fee; collateral is a
      *                       separate pure-ADA UTxO selected from the same credential
      * @param changeAddress  the bot's address — <b>where the compounding fee lands</b>
-     * @param compoundingFee {@code addedLiquidity * feePerMille / 1000}, computed by
-     *                       {@link CompoundEconomics} with the validator's truncation
+     * @param compoundingFee the validator's {@code get_compounding_fee(addedLiquidity, feePerMille,
+     *                       principal)}, computed by {@link CompoundEconomics#compoundingFee} — the
+     *                       ONE place the node computes it; the pool receives exactly
+     *                       {@code addedLiquidity - compoundingFee}
      * @param validFromSlot  ⚠ anchor this to the chain tip, not a wall clock (CCL trap 20). The
      *                       builder takes slots because only the caller knows the node's position.
      */
