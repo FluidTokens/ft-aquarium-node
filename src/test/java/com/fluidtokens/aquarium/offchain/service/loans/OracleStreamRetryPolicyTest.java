@@ -279,15 +279,43 @@ class OracleStreamRetryPolicyTest {
         policy.next(Outcome.refused(429));
         policy.next(Outcome.refused(400));
 
-        Decision proactive = policy.next(Outcome.proactive());
+        Decision proactive = policy.next(Outcome.proactive(SHORT));
         assertEquals(Duration.ZERO, proactive.delay());
         assertEquals(Rule.PROACTIVE, proactive.rule());
         assertEquals("proactive", proactive.stateKey());
-        policy.next(Outcome.proactive());
+        policy.next(Outcome.proactive(SHORT));
 
         assertEquals(2_000, transport(policy, Duration.ZERO), "the transport ladder did not move");
         assertEquals(120, policy.next(Outcome.refused(429)).delay().toSeconds(), "nor the 429 ladder");
         assertEquals(120, policy.next(Outcome.refused(400)).delay().toSeconds(), "nor the auth ladder");
+    }
+
+    /**
+     * r3 ruling F4: the at-least-60-s-open reset applies to ANY end of a connection, the proactive one included.
+     * Earlier failures leave the transport ladder at step 4; a proactive end after the 115-minute connection
+     * restarts it, so a failure right after the proactive reconnect waits step 1 — not step 4. A proactive end
+     * after less than 60 s open (only reachable with scaled timings) restarts nothing, exactly like a transport end.
+     */
+    @Test
+    void aProactiveEndOfAConnectionOpenSixtySecondsRestartsTheTransportLadder() {
+        OracleStreamRetryPolicy policy = new OracleStreamRetryPolicy(MID);
+        assertEquals(1_000, transport(policy, Duration.ZERO));
+        assertEquals(2_000, transport(policy, Duration.ZERO));
+        assertEquals(5_000, transport(policy, Duration.ZERO), "fixture: three failures, the ladder stands at step 4");
+
+        Decision proactive = policy.next(Outcome.proactive(OracleStreamClient.Timings.PRODUCTION.proactiveReconnectAfter()));
+        assertEquals(Duration.ZERO, proactive.delay(), "the proactive reconnect itself still waits nothing");
+        assertEquals(Rule.PROACTIVE, proactive.rule());
+        assertEquals(1_000, transport(policy, Duration.ZERO),
+                "a failure right after the proactive reconnect waits step 1, not step 4");
+        assertEquals(2_000, transport(policy, Duration.ZERO), "and the ladder climbs again from there");
+
+        policy.next(Outcome.proactive(Duration.ofSeconds(60)));
+        assertEquals(1_000, transport(policy, Duration.ZERO), "exactly 60 s open resets on the proactive path too");
+
+        transport(policy, Duration.ZERO);
+        policy.next(Outcome.proactive(Duration.ofMillis(59_999)));
+        assertEquals(5_000, transport(policy, Duration.ZERO), "just under 60 s open does not reset");
     }
 
     // ======================================================================================

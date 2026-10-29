@@ -54,8 +54,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       after a successful open;</li>
  *   <li>every meter exists at zero before the first connection and moves as its scenario says;</li>
  *   <li>FAB-174-2 audit residue R2 (a throwing listener), R4 (the ladder against an injected clock) and R5
- *       (a close that overtakes the handshake's completion).</li>
+ *       (a close that overtakes the handshake's completion);</li>
+ *   <li>r3: an ended connection's pong deadline never kills the next connection (F2), and a failure right after
+ *       a proactive reconnect waits the first transport step (F4).</li>
  * </ul>
+ *
+ * <p>⛔ <b>Every assertion on a CLIENT-side fact — a counter, {@code status()}, a close reason, a log line — first
+ * awaits that fact itself, never a server-side count.</b> The server counts a request before it answers it, so
+ * "the server saw N requests" says nothing about whether the client has finished handling the (N−1)th answer;
+ * asserting on the client after such a wait raced its handshake-completion task and failed under CPU load
+ * (r2 audit, 2 of 6 cold runs). A status the test reads more than once is captured once, by {@link #awaitState}.
  */
 class OracleStreamClientLivenessTest {
 
@@ -157,11 +165,12 @@ class OracleStreamClientLivenessTest {
     @Test
     void pushSilenceForThreePingIntervalsWithPongsAnsweredCausesNoReconnect() {
         server = new OracleStreamTestServer().start();
-        Duration ping = Duration.ofMillis(100);
-        Duration pong = Duration.ofMillis(300);
+        Duration ping = Duration.ofMillis(200);
+        Duration pong = Duration.ofMillis(1_000);
         start(server.uri(), timings(ping, pong, LONG, 0.05));
         OracleStreamTestServer.Session session = server.awaitSession(0, WAIT);
-        Instant deadline = session.openedAt.plus(ping.multipliedBy(3)).plus(pong).plusMillis(200);
+        Instant opened = awaitState(OracleStreamClient.Status.State.CONNECTED).since();
+        Instant deadline = opened.plus(ping.multipliedBy(3)).plus(pong).plusMillis(200);
         await(() -> !Instant.now().isBefore(deadline), WAIT, "three silent ping intervals and a pong timeout");
 
         assertTrue(session.pings.get() >= 3, "pings were sent and answered: " + session.pings.get());
@@ -188,14 +197,88 @@ class OracleStreamClientLivenessTest {
                 "break-then-make: connection 1 closed at " + first.closedAt + ", connection 2 opened at "
                         + second.openedAt);
         assertTrue(ts(server.queries().get(1)) > ts(server.queries().get(0)), "a fresh ts: " + server.queries());
-        assertTrue(lines().stream().anyMatch(l -> l.startsWith("[oracle-stream] closed ")
-                && l.contains(" reason=proactive up_s=")), lines().toString());
-        assertTrue(infoLines("closed").stream().anyMatch(l -> l.contains(" reason=proactive ")),
-                "the proactive close is INFO: " + lines());
-        assertEquals(List.of(), warnLines("closed"), "a planned reconnect is not a warning");
+        await(() -> infoLines("closed").stream().anyMatch(l -> l.contains(" reason=proactive up_s=")), WAIT,
+                "the proactive close, at INFO");
         await(() -> recorder.opens.size() >= 2, WAIT, "the second onOpen");
-        assertTrue(counter(OracleStreamClient.METER_DISCONNECTS, "reason", "proactive") >= 1);
+        assertEquals(List.of(), warnLines("closed"), "a planned reconnect is not a warning");
+        await(() -> counter(OracleStreamClient.METER_DISCONNECTS, "reason", "proactive") >= 1, WAIT,
+                "the proactive disconnect counted");
+        await(() -> !recorder.closeReasons.isEmpty(), WAIT, "onClose");
         assertEquals("proactive", recorder.closeReasons.getFirst());
+    }
+
+    /**
+     * r3 F2: connection A's pong deadline never kills connection B. The server leaves A's first ping unanswered
+     * and closes A right after it; the client reconnects to B (first transport step, 50 ms) well within the pong
+     * timeout, so A's deadline fires while B is the live connection. B has sent no ping of its own by then, so
+     * only the guard that numbers B's pings above the ones sent before it opened keeps A's deadline off B.
+     */
+    @Test
+    void anEndedConnectionsPongDeadlineNeverKillsTheNextConnection() {
+        server = new OracleStreamTestServer().answerPings(false).start();
+        Duration ping = Duration.ofSeconds(3);
+        Duration pong = Duration.ofSeconds(2);
+        start(server.uri(), timings(ping, pong, LONG, 0.05));
+        OracleStreamTestServer.Session a = server.awaitSession(0, WAIT);
+        server.answerPings(true); // read per session at its handshake: A ignores pings, B answers them
+        await(() -> a.pings.get() >= 1, WAIT, "A's first ping");
+        Instant pinged = Instant.now();
+        a.close(1000);
+
+        OracleStreamTestServer.Session b = server.awaitSession(1, WAIT);
+        await(() -> recorder.opens.size() == 2, WAIT, "B open on the client");
+        Instant bOpen = Instant.now();
+        assertTrue(bOpen.isBefore(pinged.plus(pong).minusMillis(500)),
+                "fixture: B opened on the client within A's pong timeout, so A's deadline fires while B is live: "
+                        + Duration.between(pinged, bOpen).toMillis() + " ms after A's ping");
+        assertEquals("server-close(1000)", recorder.closeReasons.getFirst(), "A ended by the server's close");
+
+        Instant afterDeadline = pinged.plus(pong).plusMillis(500);
+        await(() -> !Instant.now().isBefore(afterDeadline), WAIT, "A's pong deadline, and some");
+
+        assertEquals(0, b.pings.get(), "fixture: B had not pinged yet, so no pong of B's can cover A's deadline");
+        assertTrue(b.open(), "B stays open");
+        assertEquals(2, server.sessions().size(), "no third connection");
+        assertEquals(0.0, counter(OracleStreamClient.METER_DISCONNECTS, "reason", "no_pong"), "no_pong");
+        assertEquals(OracleStreamClient.Status.State.CONNECTED, client.status().state());
+        assertEquals(1.0, gauge(OracleStreamClient.METER_CONNECTED));
+        assertEquals(List.of("server-close(1000)"), recorder.closeReasons, "B was never closed");
+        assertFalse(lines().stream().anyMatch(l -> l.contains(" reason=no-pong ")), lines().toString());
+    }
+
+    /**
+     * r3 F4, end to end: the client hands the proactive end its real time open. Two quick server closes leave the
+     * transport ladder at step 3; the third connection stays up 60 s on the clock and is replaced proactively; the
+     * server then closes the fourth at once — and the wait is ladder step 1, not step 3.
+     */
+    @Test
+    void aFailureRightAfterAProactiveReconnectWaitsTheFirstLadderStep() {
+        server = new OracleStreamTestServer().start();
+        MutableClock clock = new MutableClock(Instant.parse("2026-10-29T12:00:00Z"));
+        double scale = 0.5;
+        start(server.uri(), timings(Duration.ofSeconds(30), Duration.ofSeconds(10), Duration.ofMillis(2_500), scale),
+                () -> false, clock, newScheduler());
+
+        for (int i = 0; i < 2; i++) {
+            int opens = i + 1;
+            OracleStreamTestServer.Session quick = server.awaitSession(i, WAIT);
+            await(() -> recorder.opens.size() == opens, WAIT, "open " + opens);
+            quick.close(1000);
+            assertEquals(Duration.ofMillis(Math.round(OracleStreamRetryPolicy.TRANSPORT_LADDER_SECONDS[i] * 1000 * scale)),
+                    retryDelay(clock), "fixture: close " + opens + " waits ladder step " + opens);
+        }
+
+        server.awaitSession(2, WAIT);
+        await(() -> recorder.opens.size() == 3, WAIT, "open 3");
+        clock.advance(Duration.ofSeconds(60));
+        OracleStreamTestServer.Session fourth = server.awaitSession(3, WAIT);
+        await(() -> recorder.opens.size() == 4, WAIT, "open 4, after the proactive reconnect");
+        await(() -> infoLines("closed").stream().anyMatch(l -> l.contains(" reason=proactive up_s=60")), WAIT,
+                "the proactive close of the connection open for 60 s");
+        fourth.close(1000);
+
+        assertEquals(Duration.ofMillis(Math.round(1_000 * scale)), retryDelay(clock),
+                "a failure right after the proactive reconnect waits ladder step 1, not step 3");
     }
 
     // ======================================================================================
@@ -208,6 +291,10 @@ class OracleStreamClientLivenessTest {
         double scale = 0.005; // 60 s → 300 ms
         start(server.uri(), timings(Duration.ofSeconds(30), Duration.ofSeconds(10), LONG, scale));
         await(() -> server.queries().size() >= 3, WAIT, "three attempts");
+        // The server counts the third request before answering it: every client-side fact is awaited itself.
+        await(() -> counter(OracleStreamClient.METER_REFUSALS, "status", "401") >= 3, WAIT, "three 401s counted");
+        await(() -> debugLines("refused").size() >= 2, WAIT, "the second and third 401 said at DEBUG");
+        OracleStreamClient.Status status = awaitState(OracleStreamClient.Status.State.REFUSED);
 
         List<String> queries = List.copyOf(server.queries());
         long resign = ts(queries.get(1)) - ts(queries.get(0));
@@ -221,10 +308,6 @@ class OracleStreamClientLivenessTest {
         assertEquals(1, warns.size(), "one WARN for the repeated 401: " + lines());
         assertTrue(warns.getFirst().contains(" status=401 msg=\"invalid signature or ts older than 2 minutes\" retry_s=0 "
                 + "-- signature rejected; check the system clock"), warns.getFirst());
-        assertFalse(debugLines("refused").isEmpty(), "the repeat is DEBUG");
-        assertTrue(counter(OracleStreamClient.METER_REFUSALS, "status", "401") >= 3);
-        OracleStreamClient.Status status = client.status();
-        assertEquals(OracleStreamClient.Status.State.REFUSED, status.state());
         assertEquals(401, status.refusalStatus());
         assertEquals("invalid signature or ts older than 2 minutes", status.refusalMessage());
         assertNotNull(status.nextAttemptAt());
@@ -270,14 +353,15 @@ class OracleStreamClientLivenessTest {
         assertTrue(afterFlipMs < 1_500, "retried at the next re-check, not after the 3.6 s hold: " + afterFlipMs + " ms");
         assertEquals(List.of("oracle-stream"), readers.stream().distinct().toList(),
                 "the stake is read only on the oracle-stream thread");
-        assertTrue(counter(OracleStreamClient.METER_REFUSALS, "status", "403") >= 2);
+        await(() -> counter(OracleStreamClient.METER_REFUSALS, "status", "403") >= 2, WAIT,
+                "the retried attempt's 403 counted");
     }
 
     @Test
     void threeRepeated429sWarnOnceThenASuccessThenA429WarnsAgain() {
         server = new OracleStreamTestServer().refuse(429, REFUSED_429).start();
         double scale = 0.005; // 60, 120, 240 s → 300, 600, 1200 ms
-        start(server.uri(), timings(Duration.ofSeconds(30), Duration.ofSeconds(10), Duration.ofMillis(600), scale));
+        start(server.uri(), timings(Duration.ofSeconds(30), Duration.ofSeconds(10), Duration.ofMillis(1_500), scale));
         // Switched only once the client has HANDLED the third 429, so the third request cannot be the one accepted.
         await(() -> debugLines("refused").size() >= 2, WAIT, "three 429s handled: one WARN, two repeats");
         server.refuse(0, null); // the next attempt, 1.2 s later, is accepted
@@ -288,8 +372,10 @@ class OracleStreamClientLivenessTest {
                 warnLines("refused").getFirst());
 
         server.awaitSession(0, WAIT);
+        // Server-side control, set the moment the server holds the session: the proactive reconnect, 1.5 s after
+        // the client's open, is refused — and can never be accepted because the test thread was slow to look.
+        server.refuse(429, REFUSED_429);
         await(() -> infoLines("connected").size() == 1, WAIT, "the INFO connected line");
-        server.refuse(429, REFUSED_429); // the proactive reconnect, 600 ms after the open, is refused
         await(() -> warnLines("refused").size() == 2, WAIT, "the 429 after the success");
 
         List<String> all = lines();
@@ -298,7 +384,7 @@ class OracleStreamClientLivenessTest {
         assertTrue(connected < warnedAgain, "the second WARN follows the open: " + all);
         assertEquals(1, infoLines("connected").size());
         assertEquals(List.of(), warnLines("closed"), "the reconnect between was proactive, not a warning");
-        assertTrue(counter(OracleStreamClient.METER_REFUSALS, "status", "429") >= 4);
+        await(() -> counter(OracleStreamClient.METER_REFUSALS, "status", "429") >= 4, WAIT, "four 429s counted");
     }
 
     // ======================================================================================
@@ -357,11 +443,11 @@ class OracleStreamClientLivenessTest {
         assertEquals(recorder.pushes.get(1).at(), status.lastPushAt());
 
         session.close(1000);
-        await(() -> client.status().state() == OracleStreamClient.Status.State.RETRYING, WAIT, "RETRYING");
+        OracleStreamClient.Status retrying = awaitState(OracleStreamClient.Status.State.RETRYING);
         assertEquals(0.0, gauge(OracleStreamClient.METER_CONNECTED));
         assertEquals(1.0, counter(OracleStreamClient.METER_DISCONNECTS, "reason", "server_close"));
-        assertEquals("server-close(1000)", client.status().detail());
-        assertEquals(2, client.status().pushes(), "the count survives the end");
+        assertEquals("server-close(1000)", retrying.detail());
+        assertEquals(2, retrying.pushes(), "the count survives the end");
 
         OracleStreamTestServer.Session second = server.awaitSession(1, WAIT);
         await(() -> gauge(OracleStreamClient.METER_CONNECTED) == 1.0, WAIT, "connected again");
@@ -473,7 +559,7 @@ class OracleStreamClientLivenessTest {
     void theFirstReconnectUsesStepOneAndTheLadderResetsAfterSixtySecondsOpen() {
         server = new OracleStreamTestServer().start();
         MutableClock clock = new MutableClock(Instant.parse("2026-10-29T12:00:00Z"));
-        double scale = 0.2;
+        double scale = 0.5; // the shortest RETRYING window, step 1, is 500 ms: wide enough to be seen under load
         start(server.uri(), timings(Duration.ofSeconds(30), Duration.ofSeconds(10), LONG, scale), () -> false, clock,
                 newScheduler());
 
@@ -497,7 +583,8 @@ class OracleStreamClientLivenessTest {
         third.close(1000);
         assertEquals(Duration.ofMillis(Math.round(1_000 * scale)), retryDelay(clock),
                 "close 3, open for 60 s: the ladder restarted at step 1");
-        assertTrue(lines().stream().anyMatch(l -> l.contains(" reason=server-close(1000) up_s=60")), lines().toString());
+        await(() -> lines().stream().anyMatch(l -> l.contains(" reason=server-close(1000) up_s=60")), WAIT,
+                "the closed line of the connection open for 60 s");
     }
 
     /**
@@ -567,10 +654,27 @@ class OracleStreamClientLivenessTest {
         return thread;
     }
 
-    /** The delay to the next attempt, read off the status against the frozen clock. */
+    /**
+     * The delay to the next attempt, read off ONE RETRYING status against the frozen clock — never a second read,
+     * which could already see the CONNECTING that follows it.
+     */
     private Duration retryDelay(MutableClock clock) {
-        await(() -> client.status().state() == OracleStreamClient.Status.State.RETRYING, WAIT, "RETRYING");
-        return Duration.between(clock.instant(), client.status().nextAttemptAt());
+        OracleStreamClient.Status retrying = awaitState(OracleStreamClient.Status.State.RETRYING);
+        return Duration.between(clock.instant(), retrying.nextAttemptAt());
+    }
+
+    /** Waits until the client's status is in {@code state} and returns that one status, captured once. */
+    private OracleStreamClient.Status awaitState(OracleStreamClient.Status.State state) {
+        AtomicReference<OracleStreamClient.Status> seen = new AtomicReference<>();
+        await(() -> {
+            OracleStreamClient.Status now = client.status();
+            if (now.state() != state) {
+                return false;
+            }
+            seen.set(now);
+            return true;
+        }, WAIT, state.name());
+        return seen.get();
     }
 
     private double counter(String name, String tag, String value) {

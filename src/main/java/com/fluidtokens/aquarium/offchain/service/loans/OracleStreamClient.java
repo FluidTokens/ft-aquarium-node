@@ -577,7 +577,7 @@ public final class OracleStreamClient {
             }
             reopened[0] = true;
             connection.socket.abort();
-            scheduleConnect(policy.next(OracleStreamRetryPolicy.Outcome.proactive()).delay());
+            scheduleConnect(policy.next(OracleStreamRetryPolicy.Outcome.proactive(up)).delay());
         };
         try {
             connection.socket.sendClose(WebSocket.NORMAL_CLOSURE, "proactive");

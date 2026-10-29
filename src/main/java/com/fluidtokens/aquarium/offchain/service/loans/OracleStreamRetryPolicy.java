@@ -25,10 +25,12 @@ import java.util.random.RandomGenerator;
  *       the refusal ({@link #holdStarted}, {@link #stakeChanged}).</li>
  *   <li><b>429</b> — another node on this bond holds the one connection it grants:
  *       {@link #BACKOFF_LADDER_SECONDS}, its own ladder.</li>
- *   <li><b>Proactive reconnect</b> — no wait, and no ladder moves.</li>
+ *   <li><b>Proactive reconnect</b> — no wait, and no ladder advances.</li>
  * </ul>
  * A successful open ({@link #onConnected}) restarts the auth and 429 ladders and re-arms the immediate 401
- * re-sign. It does NOT restart the transport ladder: only a connection that stayed open long enough does.
+ * re-sign. It does NOT restart the transport ladder: only a connection that stayed open long enough does —
+ * whatever ended it, a proactive reconnect included (FAB-174-3 r3 ruling F4), so a failure right after a
+ * proactive reconnect waits the first transport step, not the step earlier failures left behind.
  *
  * <p>Not thread-safe: the client calls it from its single {@code oracle-stream} thread only.
  */
@@ -65,7 +67,8 @@ public final class OracleStreamRetryPolicy {
      *
      * @param reason for a transport end, its reason token ({@code server-close(1000)}, {@code no-pong}, …)
      * @param status for a refusal, the handshake's HTTP status
-     * @param up     for a transport end, how long the connection had been open; zero if it never opened
+     * @param up     for a transport or proactive end, how long the connection had been open; zero if it never
+     *               opened
      */
     record Outcome(Kind kind, String reason, int status, Duration up) {
 
@@ -77,8 +80,8 @@ public final class OracleStreamRetryPolicy {
             return new Outcome(Kind.REFUSED, null, status, Duration.ZERO);
         }
 
-        static Outcome proactive() {
-            return new Outcome(Kind.PROACTIVE, null, 0, Duration.ZERO);
+        static Outcome proactive(Duration up) {
+            return new Outcome(Kind.PROACTIVE, null, 0, up == null ? Duration.ZERO : up);
         }
     }
 
@@ -110,7 +113,7 @@ public final class OracleStreamRetryPolicy {
     /** The next attempt after {@code outcome}; advances the ladder it used. */
     Decision next(Outcome outcome) {
         return switch (outcome.kind()) {
-            case PROACTIVE -> new Decision(Duration.ZERO, "proactive", Rule.PROACTIVE);
+            case PROACTIVE -> proactive(outcome.up());
             case TRANSPORT -> transport(outcome.up(), "closed:" + outcome.reason());
             case REFUSED -> refused(outcome.status());
         };
@@ -168,11 +171,22 @@ public final class OracleStreamRetryPolicy {
         }
     }
 
+    /** No wait and no step taken; a connection open long enough still restarts the transport ladder. */
+    private Decision proactive(Duration up) {
+        restartTransportLadderIfLongOpen(up);
+        return new Decision(Duration.ZERO, "proactive", Rule.PROACTIVE);
+    }
+
     private Decision transport(Duration up, String key) {
+        restartTransportLadderIfLongOpen(up);
+        return new Decision(ladder(TRANSPORT_LADDER_SECONDS, transportStep++), key, Rule.TRANSPORT);
+    }
+
+    /** Any end of a connection that had been open for at least {@link #LADDER_RESET_AFTER}. */
+    private void restartTransportLadderIfLongOpen(Duration up) {
         if (up.compareTo(LADDER_RESET_AFTER) >= 0) {
             transportStep = 0;
         }
-        return new Decision(ladder(TRANSPORT_LADDER_SECONDS, transportStep++), key, Rule.TRANSPORT);
     }
 
     private Duration ladder(int[] seconds, int step) {

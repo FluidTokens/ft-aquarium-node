@@ -6,6 +6,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
@@ -37,12 +38,17 @@ import java.io.InputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Parameter;
 import java.net.URI;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static com.fluidtokens.aquarium.offchain.service.loans.OracleStreamTestServer.await;
@@ -233,9 +239,14 @@ class OracleStreamLauncherTest {
                 server.uri().toString());
         launcher.start();
         server.awaitSession(0, WAIT);
-        await(() -> launcher.status().state() == OracleStreamClient.Status.State.CONNECTED, WAIT, "CONNECTED");
+        AtomicReference<OracleStreamClient.Status> seen = new AtomicReference<>();
+        await(() -> {
+            OracleStreamClient.Status now = launcher.status();
+            seen.set(now);
+            return now.state() == OracleStreamClient.Status.State.CONNECTED;
+        }, WAIT, "CONNECTED");
 
-        OracleStreamClient.Status connected = launcher.status();
+        OracleStreamClient.Status connected = seen.get();
         assertNotNull(connected.since());
         assertNull(connected.lastPushAt(), "no push yet");
         assertEquals(0, connected.pushes());
@@ -243,6 +254,55 @@ class OracleStreamLauncherTest {
         launcher.stop();
         assertEquals(OracleStreamClient.Status.State.OFF, launcher.status().state());
         assertEquals("stopped", launcher.status().detail());
+    }
+
+    /**
+     * r3 F3: the PRODUCTION stake supplier ends a 403 hold. Nothing hands the client a supplier here: the launcher
+     * builds its own from {@link StakerService#findStakerRefInput()}, and when that flips from empty to a bond the
+     * held stream retries at the next re-check, long before the hold would have ended — read only on the
+     * {@code oracle-stream} thread.
+     */
+    @Test
+    void theLaunchersOwnStakeSupplierEndsA403HoldWhenTheBondAppears() {
+        server = new OracleStreamTestServer().refuse(403,
+                "{\"message\":\"no Aquarium staking bond found for this stake key\"}").start();
+        AtomicBoolean bonded = new AtomicBoolean(false);
+        AtomicInteger reads = new AtomicInteger();
+        List<String> readers = new CopyOnWriteArrayList<>();
+        StakerService staker = org.mockito.Mockito.mock(StakerService.class);
+        org.mockito.Mockito.when(staker.findStakerRefInput()).thenAnswer(invocation -> {
+            readers.add(Thread.currentThread().getName());
+            reads.incrementAndGet();
+            return bonded.get() ? List.of(new TransactionInput("ab".repeat(32), 0)) : List.of();
+        });
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker, meters(), "true",
+                server.uri().toString());
+        OracleStreamClient.Timings production = OracleStreamClient.Timings.PRODUCTION;
+        double scale = 0.003; // the 1 h hold → 10.8 s ±5%, the 5 min re-check → 900 ms
+        launcher.useForTest(new OracleStreamClient.Timings(production.tcpConnectTimeout(),
+                production.handshakeTimeout(), production.pingInterval(), production.pongTimeout(),
+                production.proactiveReconnectAfter(), scale), Clock.systemUTC());
+        launcher.start();
+
+        AtomicReference<OracleStreamClient.Status> seen = new AtomicReference<>();
+        await(() -> {
+            OracleStreamClient.Status now = launcher.status();
+            seen.set(now);
+            return now.state() == OracleStreamClient.Status.State.REFUSED
+                    && Integer.valueOf(403).equals(now.refusalStatus());
+        }, WAIT, "the 403 hold");
+        Instant holdEnds = seen.get().nextAttemptAt();
+        assertNotNull(holdEnds);
+        await(() -> reads.get() >= 2, WAIT, "the stake read at the refusal and at the first re-check");
+        assertEquals(1, server.requests(), "no retry while the stake is unchanged");
+
+        bonded.set(true);
+        await(() -> server.requests() >= 2, WAIT, "the retry after the bond appeared");
+        Instant retried = Instant.now();
+        assertTrue(retried.isBefore(holdEnds), "the hold ended early: retried at " + retried
+                + ", the hold ran to " + holdEnds);
+        assertEquals(List.of(OracleStreamLauncher.THREAD_NAME), readers.stream().distinct().toList(),
+                "the stake is read only on the oracle-stream thread");
     }
 
     // ======================================================================================
@@ -356,14 +416,15 @@ class OracleStreamLauncherTest {
                     OracleStreamTestServer.Session session = server.awaitSession(0, WAIT);
                     session.sendText(push);
                     await(() -> bean.pushes() == 1, WAIT, "the shadow's onPush");
+                    // The listener counts the push BEFORE it logs it: the line is awaited itself.
+                    await(() -> messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] push ")
+                            && l.contains(" push=1 n=") && l.contains(" chars=" + push.length())
+                            && l.contains(" ts=1793279099046 dly_ms=")), WAIT, "the push line");
 
                     assertEquals(1, context.getBeanNamesForType(FluidOracleClient.class).length);
                     assertSame(oracle, context.getBeanProvider(FluidOracleClient.class).getIfAvailable());
                     assertEquals(entriesBefore, Set.copyOf(oracle.entries()), "the shadow changed the prices");
                     assertEquals(refreshedBefore, oracle.lastRefresh(), "the shadow refreshed the oracle client");
-                    assertTrue(messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] push ")
-                            && l.contains(" push=1 n=") && l.contains(" chars=" + push.length())
-                            && l.contains(" ts=1793279099046 dly_ms=")), messages(streamLines()).toString());
                     assertTrue(messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] on ")
                             && l.endsWith(" network=preview host=127.0.0.1")), messages(streamLines()).toString());
                     assertEquals(List.of(), server.authFailures());
@@ -474,8 +535,8 @@ class OracleStreamLauncherTest {
         launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), enabled, url);
         launcher.start();
         server.awaitSession(0, WAIT);
-        assertTrue(messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] on ")),
-                messages(streamLines()).toString());
+        await(() -> messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] on ")), WAIT,
+                "the on line");
 
         StandardEnvironment off = environment(base, Map.of("LOANS_ORACLE_STREAM_ENABLED", "false"));
         assertEquals("false", off.resolvePlaceholders("${loans.oracle.stream.enabled:true}"));
