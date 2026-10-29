@@ -7,6 +7,8 @@ import ch.qos.logback.core.read.ListAppender;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.service.StakerService;
@@ -74,6 +76,7 @@ class OracleStreamLauncherTest {
     private static final Duration WAIT = Duration.ofSeconds(15);
     private static final String SERVER = "<server>";
     private static final String PREVIEW_PUSH = "/loans-v4/oracle-ws/preview-push-20261029T130459Z.json";
+    private static final String PREVIEW_API = "/loans-v4/oracle-ws/preview-api-20261029T130525Z.json";
     private static final String RESOURCE = "application.yaml";
 
     private final Account account = new Account(Networks.preview());
@@ -432,6 +435,62 @@ class OracleStreamLauncherTest {
         assertEquals(List.of(), streamThreadsAfterAWhile(), "closing the context stops the stream");
     }
 
+    /**
+     * FAB-175, production-shaped: the comparison hears the API side only through the context's one
+     * {@link FluidOracleClient} — its own load, here called as the poller would call it. A real push of the preview
+     * fixture, then that load of the API snapshot parse-equal to it: one MATCHED {@code cmp} line, still one bean,
+     * and the bean holds exactly what that load produced — the shadow never wrote.
+     */
+    @Test
+    void aPushThenThePollersLoadOfTheSameEntriesIsOneMatchedLineAndTheShadowNeverWrites() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        String push = resource(PREVIEW_PUSH);
+        JsonNode api = new ObjectMapper().readTree(resource(PREVIEW_API));
+        Set<OracleEntry> apiParsed = Set.copyOf(OracleClients.fromFixture(PREVIEW_API).entries());
+        new ApplicationContextRunner()
+                .withPropertyValues("network=preview", "loans.oracle.stream.url=" + server.uri())
+                .withBean(FluidOracleClient.class, () -> {
+                    try {
+                        return OracleClients.mainnetTwoVersions();
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                })
+                .withBean(Account.class, () -> account)
+                .withBean(StakerService.class, OracleStreamLauncherTest::staker)
+                .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
+                .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withBean(OracleStreamLauncher.class)
+                .run(context -> {
+                    assertNull(context.getStartupFailure(), "the context started");
+                    FluidOracleClient oracle = context.getBean(FluidOracleClient.class);
+                    OracleStreamLauncher bean = context.getBean(OracleStreamLauncher.class);
+                    bean.start();
+                    server.awaitSession(0, WAIT).sendText(push);
+                    await(() -> bean.pushes() == 1, WAIT, "the comparator's onPush");
+                    assertEquals(List.of(), cmpLines(), "the push waits for the API");
+
+                    oracle.load(api); // the poller's load, on this thread
+                    Set<OracleEntry> loaded = Set.copyOf(oracle.entries());
+                    Instant loadedAt = oracle.lastRefresh();
+                    await(() -> !cmpLines().isEmpty(), WAIT, "the cmp line");
+
+                    List<String> cmp = cmpLines();
+                    assertEquals(1, cmp.size(), cmp.toString());
+                    assertTrue(cmp.getFirst().contains(" cmp boot=") && cmp.getFirst().contains(
+                            " push=1 out=MATCHED n=5 h=" + OracleStreamComparator.hash(apiParsed) + " lag_s="),
+                            cmp.getFirst());
+                    assertTrue(cmp.getFirst().contains(" rep=0 gap_s="), cmp.getFirst());
+                    assertEquals(1, context.getBeanNamesForType(FluidOracleClient.class).length);
+                    assertEquals(apiParsed, loaded, "fixture: the bean holds exactly what that load produced");
+                    assertEquals(loaded, Set.copyOf(oracle.entries()), "the shadow changed the prices");
+                    assertEquals(loadedAt, oracle.lastRefresh(), "the shadow refreshed the oracle client");
+                    assertEquals(List.of(), server.authFailures());
+                });
+        assertEquals(1, cmpLines().size(), "nothing was waiting at shutdown");
+        assertEquals(List.of(), streamThreadsAfterAWhile(), "closing the context stops the stream");
+    }
+
     @Test
     void startReturnsAtOnceWhenTheHandshakeHangs() throws IOException {
         hanging = new OracleStreamTestServer.Hanging();
@@ -592,6 +651,10 @@ class OracleStreamLauncherTest {
         return List.copyOf(appender.list).stream()
                 .filter(e -> e.getFormattedMessage().startsWith("[oracle-stream] "))
                 .toList();
+    }
+
+    private List<String> cmpLines() {
+        return messages(streamLines()).stream().filter(l -> l.startsWith("[oracle-stream] cmp ")).toList();
     }
 
     private static List<String> messages(List<ILoggingEvent> events) {

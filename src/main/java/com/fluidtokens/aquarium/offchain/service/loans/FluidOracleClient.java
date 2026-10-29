@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -65,9 +66,27 @@ public class FluidOracleClient {
     /** Last state warned about, per asset and warning kind — see {@link #warnOnce}. */
     private final java.util.Map<String, String> warnedStates = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * Told what every {@link #load} produced, once all of it is held. ⛔ <b>Read-only by construction</b>
+     * (FAB-175): a listener receives the immutable entries and the very {@link Instant} stored as
+     * {@link #lastRefresh()}, after every map, the refresh time and the shape line are set, and each call is
+     * caught on its own — so a listener can neither change what the node prices with nor break the refresh.
+     */
+    @FunctionalInterface
+    public interface LoadListener {
+        void loaded(java.util.Collection<OracleEntry> entries, Instant loadedAt);
+    }
+
+    private final List<LoadListener> loadListeners = new CopyOnWriteArrayList<>();
+
     public FluidOracleClient(@Value("${loans.oracle.url:https://api.fluidtokens.com/get-oracle-tokens}") String url) {
         this.webClient = WebClient.builder().baseUrl(url).build();
         log.info("FluidTokens oracle registry: {}", url);
+    }
+
+    /** Registers a {@link LoadListener}; listeners are told in registration order. */
+    public void addLoadListener(LoadListener l) {
+        loadListeners.add(l);
     }
 
     @PostConstruct
@@ -279,10 +298,24 @@ public class FluidOracleClient {
         var versions = new HashMap<AssetType, List<OracleEntry>>();
         versionsPerToken.forEach((token, list) -> versions.put(token, List.copyOf(list)));
         versionsByToken.set(Map.copyOf(versions));
-        lastRefresh.set(Instant.now());
+        Instant now = Instant.now();
+        lastRefresh.set(now);
         reportShapeOnChange(oracleTokens.size(), tokens.size(),
                 (int) versionsPerToken.values().stream().filter(v -> v.size() > 1).count());
+        notifyLoadListeners(now);
         return tokens.size();
+    }
+
+    /** Each listener in its own catch: one that throws is named by its exception's class and skipped. */
+    private void notifyLoadListeners(Instant loadedAt) {
+        Collection<OracleEntry> entries = byOracleToken.get().values();
+        for (LoadListener listener : loadListeners) {
+            try {
+                listener.loaded(entries, loadedAt);
+            } catch (RuntimeException e) {
+                log.warn("oracle load listener failed ({})", e.getClass().getSimpleName());
+            }
+        }
     }
 
     private volatile String lastShape;

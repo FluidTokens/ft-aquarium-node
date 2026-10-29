@@ -277,11 +277,16 @@ jobs:
       # feat/fab-173-oracle-ws-shadow: 215 files / 2157 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
       # Floor 215.
       #
+      # FAB-175-1 (FluidOracleClientLoadListenerTest, OracleStreamComparatorTest: every push compared against the
+      # poller's load; plus one case in OracleStreamLauncherTest) re-measured cold keyless on
+      # feat/fab-173-oracle-ws-shadow: 217 files / 2178 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
+      # Floor 217.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '215'
+          RESULT_FILE_FLOOR: '217'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

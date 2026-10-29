@@ -18,24 +18,28 @@ import java.time.Instant;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
 /**
  * Starts the SHADOW oracle stream (FAB-174) once the node is ready, or says in one line why it does not.
  *
- * <p>⛔ <b>A shadow: nothing reads what it produces.</b> Each push is parsed and logged as one
- * {@code [oracle-stream] push} line; no decision, price, readiness figure or {@link FluidOracleClient} state
- * changes. It is on by default ({@code loans.oracle.stream.enabled}, Giovanni's ruling A2 of 2026-10-29) so
- * every operator's log shows how the stream behaves before anything depends on it.
+ * <p>⛔ <b>A shadow: nothing reads what it produces.</b> Each push is parsed and judged by an
+ * {@link OracleStreamComparator} against what the production poller loads, and said as one
+ * {@code [oracle-stream] cmp} line (FAB-175; the push receipt itself is DEBUG); no decision, price, readiness
+ * figure or {@link FluidOracleClient} state changes. It is on by default ({@code loans.oracle.stream.enabled},
+ * Giovanni's ruling A2 of 2026-10-29) so every operator's log shows how the stream behaves before anything
+ * depends on it.
  *
- * <p>⛔ <b>{@link FluidOracleClient} only through an {@link ObjectProvider}, and only to ask whether it
- * exists.</b> With {@code loans.oracle.enabled=false} that bean is absent, and a hard dependency would fail
- * the boot (the trap {@code StaticReferenceInputs} documents). Without it there is nothing to compare the
- * stream against, so the stream stays off.
+ * <p>⛔ <b>{@link FluidOracleClient} only through an {@link ObjectProvider}, to ask whether it exists and to
+ * listen to its loads.</b> With {@code loans.oracle.enabled=false} that bean is absent, and a hard dependency would
+ * fail the boot (the trap {@code StaticReferenceInputs} documents). Without it there is nothing to compare the
+ * stream against, so the stream stays off. Its {@link FluidOracleClient.LoadListener} only hands the poller's
+ * result to the {@code oracle-stream} thread: the stream never fetches the API itself.
  *
  * <p>⛔ <b>Its own threads, never Spring's scheduler.</b> Spring's scheduled-task pool is shared by the
  * transaction processor, liquidation, compound and the oracle refresh, and an operator may size it to 1. The
@@ -57,6 +61,8 @@ public class OracleStreamLauncher {
     static final String IO_THREAD_PREFIX = "oracle-stream-io-";
 
     private static final int VALUE_ECHO = 16;
+    /** How often pushes older than {@link OracleStreamComparator#WINDOW} are resolved. */
+    private static final long COMPARE_TICK_SECONDS = 10;
 
     private final Account account;
     private final AppConfig.Network network;
@@ -66,7 +72,6 @@ public class OracleStreamLauncher {
     private final String enabled;
     private final String url;
     private final OracleStreamLog events = new OracleStreamLog();
-    private final AtomicLong pushes = new AtomicLong();
 
     private OracleStreamClient.Timings timings = OracleStreamClient.Timings.PRODUCTION;
     private Clock clock = Clock.systemUTC();
@@ -76,6 +81,8 @@ public class OracleStreamLauncher {
     private ExecutorService io;
     /** Read by {@link #status()} from any thread. */
     private volatile OracleStreamClient client;
+    /** Confined to the {@code oracle-stream} thread, apart from {@link #pushes()}. */
+    private volatile OracleStreamComparator comparator;
     /** Why the stream is off while no client runs; what {@link #status()} reports then. */
     private volatile String offDetail = "not started";
     private volatile Instant offSince;
@@ -102,9 +109,10 @@ public class OracleStreamLauncher {
         this.clock = clock;
     }
 
-    /** Pushes logged so far — for tests, which wait on it. */
+    /** Pushes compared so far — for tests, which wait on it. */
     long pushes() {
-        return pushes.longValue();
+        OracleStreamComparator comparing = comparator;
+        return comparing == null ? 0 : comparing.pushes();
     }
 
     // ======================================================================================
@@ -134,6 +142,7 @@ public class OracleStreamLauncher {
     public synchronized void stop() {
         try {
             off("stopped");
+            shutDownComparator();
             shutDown();
         } catch (Throwable t) {
             // ⛔ never throws: this runs on Spring's shutdown path
@@ -252,11 +261,67 @@ public class OracleStreamLauncher {
             return thread;
         });
         StakerService staker = stakerService;
+        ScheduledExecutorService stream = scheduler;
+        Clock streamClock = clock;
+        OracleStreamComparator comparing = new OracleStreamComparator(events, meterRegistry);
+        comparator = comparing;
+
+        // The poller's own result, after each of its loads, handed to the stream thread: no fetch, no blocking.
+        FluidOracleClient fc = oracleClient.getIfAvailable();
+        if (fc != null) {
+            fc.addLoadListener((entries, at) -> {
+                try {
+                    stream.execute(guarded("cmp-api-load", () -> comparing.onApiLoad(at, entries)));
+                } catch (RejectedExecutionException ignored) {
+                    // the stream has stopped: nothing left to compare
+                }
+            });
+            stream.execute(guarded("cmp-seed", () -> {
+                if (!Instant.EPOCH.equals(fc.lastRefresh())) {
+                    comparing.onApiLoad(fc.lastRefresh(), fc.entries());
+                }
+            }));
+        }
+        stream.scheduleWithFixedDelay(guarded("cmp-tick", () -> comparing.tick(streamClock.instant())),
+                COMPARE_TICK_SECONDS, COMPARE_TICK_SECONDS, TimeUnit.SECONDS);
+
         OracleStreamClient created = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, clock,
-                new LoggingListener(), events, scheduler, io, () -> !staker.findStakerRefInput().isEmpty(),
+                comparing, events, scheduler, io, () -> !staker.findStakerRefInput().isEmpty(),
                 meterRegistry);
         client = created;
         created.start();
+    }
+
+    /**
+     * The pushes still waiting are resolved {@code UNCOVERED why=shutdown} — on the {@code oracle-stream} thread,
+     * like every other call into the comparator, waiting for it at most a second.
+     */
+    private void shutDownComparator() {
+        OracleStreamComparator comparing = comparator;
+        ScheduledExecutorService stream = scheduler;
+        Clock streamClock = clock;
+        if (comparing == null || stream == null) {
+            return;
+        }
+        try {
+            Future<?> done = stream.submit(guarded("cmp-shutdown", () -> comparing.shutdown(streamClock.instant())));
+            done.get(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            // rejected or slow: the stream is going down regardless
+        }
+    }
+
+    /** A task body that logs a throw by its simple class name and never lets it escape (it would cancel a tick). */
+    private Runnable guarded(String task, Runnable body) {
+        return () -> {
+            try {
+                body.run();
+            } catch (Throwable t) {
+                events.warn("task-error", "task=" + task + " error=" + OracleStreamLog.simpleName(t));
+            }
+        };
     }
 
     /**
@@ -310,25 +375,6 @@ public class OracleStreamLauncher {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-        }
-    }
-
-    /** The shadow's only output: one line per push. FAB-175-1 demotes it when the comparison line replaces it. */
-    private final class LoggingListener implements OracleStreamClient.Listener {
-
-        @Override
-        public void onOpen(Instant at) {
-        }
-
-        @Override
-        public void onClose(Instant at, String reason) {
-        }
-
-        @Override
-        public void onPush(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars) {
-            long seq = pushes.incrementAndGet();
-            events.info("push", "push=" + seq + " n=" + parsed.entries().size() + " chars=" + chars
-                    + " ts=" + serverTimestamp + " dly_ms=" + (at.toEpochMilli() - serverTimestamp));
         }
     }
 }
