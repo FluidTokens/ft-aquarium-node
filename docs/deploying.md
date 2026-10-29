@@ -578,9 +578,18 @@ example — and needs your attention: suspend rebalancing, fix the wallet, resum
 - [ ] Postgres is on `127.0.0.1` (the shipped file does this; check if you edited it)
 - [ ] A real `DB_PASSWORD`
 - [ ] The image version is **pinned**, not `latest`
-- [ ] Host firewall allows only what you intend — the node makes **outbound** connections to your
-      relay, Blockfrost and `api.github.com` (the daily version check, which you can turn off — §11);
-      it needs no inbound at all
+- [ ] Host firewall allows only what you intend — the node needs no inbound at all, and makes
+      **outbound** connections to:
+      - your relay, and Blockfrost;
+      - `api.github.com` — the daily version check, which you can turn off (§11);
+      - FluidTokens' oracle registry, `api.fluidtokens.com` (mainnet) or `testapi.fluidtokens.com`
+        (preview), polled every 30 s — a plain request for the price list: no key, no account, nothing
+        of yours beyond the host's IP address;
+      - FluidTokens' oracle stream, a WebSocket on AWS API Gateway in eu-west-1
+        (`25mxd4whnj.execute-api.eu-west-1.amazonaws.com` on mainnet,
+        `2tgda3mk4l.execute-api.eu-west-1.amazonaws.com` on preview), on by default (§11) — it sends the
+        wallet's stake address, its stake public key, the time and a signature over the address and the
+        time, never the mnemonic; `LOANS_ORACLE_STREAM_ENABLED=false` turns it off
 - [ ] Log rotation is on (the shipped file sets it) — logs are verbose and the disk is shared with
       your database
 
@@ -671,7 +680,8 @@ line at startup saying the check is off and never contacts GitHub.
 ### The oracle stream (shadow)
 
 On by default, the node also holds one WebSocket open to FluidTokens' oracle stream, which pushes prices
-as they change. It signs in with the wallet's own stake key — it sends the stake address, the stake public
+after they change — FluidTokens checks for changes about once a minute, so a push can follow a change by up
+to about 60 s. It signs in with the wallet's own stake key — it sends the stake address, the stake public
 key, the time and a signature, and no new secret is involved — and FluidTokens allows one connection per
 staking bond. It is a **shadow**: each push is only logged as an `[oracle-stream]` line, and no decision
 reads it; prices still come from the HTTP registry. To turn it off, set `LOANS_ORACLE_STREAM_ENABLED=false`

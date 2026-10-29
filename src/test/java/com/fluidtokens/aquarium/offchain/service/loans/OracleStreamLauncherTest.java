@@ -58,6 +58,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -481,6 +482,9 @@ class OracleStreamLauncherTest {
                             " push=1 out=MATCHED n=5 h=" + OracleStreamComparator.hash(apiParsed) + " lag_s="),
                             cmp.getFirst());
                     assertTrue(cmp.getFirst().contains(" rep=0 gap_s="), cmp.getFirst());
+                    // FAB-175-1 audit residue (b): the poller's load was handed to the stream thread, never
+                    // judged on the poller's own (here, this test's) thread.
+                    assertEquals(OracleStreamLauncher.THREAD_NAME, cmpEvents().getFirst().getThreadName());
                     assertEquals(1, context.getBeanNamesForType(FluidOracleClient.class).length);
                     assertEquals(apiParsed, loaded, "fixture: the bean holds exactly what that load produced");
                     assertEquals(loaded, Set.copyOf(oracle.entries()), "the shadow changed the prices");
@@ -557,6 +561,69 @@ class OracleStreamLauncherTest {
         assertTrue(cmp.getFirst().contains(" push=1 out=UNCOVERED n=5 h=")
                 && cmp.getFirst().contains(" why=shutdown gap_s="), cmp.getFirst());
         assertEquals(List.of(), streamThreadsAfterAWhile(), "closing the context stops the stream");
+    }
+
+    /**
+     * FAB-175-1 audit residue (a), the {@code cmp-seed} task: the oracle bean already holds the 13:05:25Z preview
+     * snapshot before {@code start()}, and the push parse-equal to it arrives twice. Only the seed tells the
+     * comparator what the API served before the connection opened, so the repeat resolves AT ONCE as UNCOVERED
+     * {@code why=pre-connect} — no poller load needed. Then the poller's next load of the same snapshot resolves
+     * push 1 the same way: no lag is ever measured against what the node found at start.
+     */
+    @Test
+    void theSeedIsWhatTheOracleBeanHeldBeforeStartSoItsContentIsPreConnect() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        String push = resource(PREVIEW_PUSH);
+        FluidOracleClient oracle = OracleClients.fromFixture(PREVIEW_API);
+        assertNotEquals(Instant.EPOCH, oracle.lastRefresh(), "fixture: loaded before start");
+        launcher = new OracleStreamLauncher(account, network("preview"), present(oracle), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.start();
+        OracleStreamTestServer.Session session = server.awaitSession(0, WAIT);
+        session.sendText(push);
+        session.sendText(push);
+        await(() -> launcher.pushes() == 2, WAIT, "both pushes");
+        await(() -> !cmpLines().isEmpty(), WAIT, "the repeat's cmp line, resolved by the seed alone");
+        String h = OracleStreamComparator.hash(oracle.entries());
+        assertEquals(1, cmpLines().size(), cmpLines().toString());
+        assertTrue(cmpLines().getFirst().contains(" push=2 out=UNCOVERED n=5 h=" + h + " why=pre-connect "),
+                cmpLines().getFirst());
+
+        oracle.load(new ObjectMapper().readTree(resource(PREVIEW_API))); // the poller's next load
+        await(() -> cmpLines().size() == 2, WAIT, "push 1's cmp line");
+        assertTrue(cmpLines().get(1).contains(" push=1 out=UNCOVERED n=5 h=" + h + " why=pre-connect "),
+                cmpLines().get(1));
+    }
+
+    /**
+     * FAB-175-2: the {@code day} line is scheduled on the stream thread at the next UTC midnight of the INJECTED
+     * clock, re-computed after each line. The clock stands at 23:59:59.500Z and never moves, so every next
+     * midnight is 500 ms away and the lines keep coming — a fixed 24 h rate from the boot would have said one, and
+     * a delay not taken from that clock none. stop() then says the final {@code last=1} line once.
+     */
+    @Test
+    void theDayLineIsScheduledAtEachNextUtcMidnightOfTheInjectedClock() {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        OracleStreamClientLivenessTest.MutableClock clock =
+                new OracleStreamClientLivenessTest.MutableClock(Instant.parse("2026-11-01T23:59:59.500Z"));
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.useForTest(OracleStreamClient.Timings.PRODUCTION, clock);
+        launcher.start();
+
+        await(() -> dayEvents().size() >= 2, WAIT, "two midnight day lines");
+        List<ILoggingEvent> midnight = dayEvents();
+        assertTrue(midnight.stream().allMatch(e -> e.getFormattedMessage().endsWith(" last=0")), messages(midnight)
+                .toString());
+        assertEquals(List.of(OracleStreamLauncher.THREAD_NAME),
+                midnight.stream().map(ILoggingEvent::getThreadName).distinct().toList(), "on the stream thread");
+
+        launcher.stop();
+        List<String> last = messages(dayEvents()).stream().filter(l -> l.endsWith(" last=1")).toList();
+        assertEquals(1, last.size(), messages(dayEvents()).toString());
+        assertEquals(List.of(), streamThreadsAfterAWhile());
+        assertTrue(messages(streamLines()).stream().noneMatch(l -> l.contains(" task-error ")),
+                messages(streamLines()).toString());
     }
 
     @Test
@@ -700,8 +767,12 @@ class OracleStreamLauncherTest {
     }
 
     private static ObjectProvider<FluidOracleClient> present() {
+        return present(new FluidOracleClient("http://unused.invalid"));
+    }
+
+    private static ObjectProvider<FluidOracleClient> present(FluidOracleClient client) {
         StaticListableBeanFactory factory = new StaticListableBeanFactory();
-        factory.addBean("fluidOracleClient", new FluidOracleClient("http://unused.invalid"));
+        factory.addBean("fluidOracleClient", client);
         return factory.getBeanProvider(FluidOracleClient.class);
     }
 
@@ -722,7 +793,15 @@ class OracleStreamLauncherTest {
     }
 
     private List<String> cmpLines() {
-        return messages(streamLines()).stream().filter(l -> l.startsWith("[oracle-stream] cmp ")).toList();
+        return messages(cmpEvents());
+    }
+
+    private List<ILoggingEvent> cmpEvents() {
+        return streamLines().stream().filter(e -> e.getFormattedMessage().startsWith("[oracle-stream] cmp ")).toList();
+    }
+
+    private List<ILoggingEvent> dayEvents() {
+        return streamLines().stream().filter(e -> e.getFormattedMessage().startsWith("[oracle-stream] day ")).toList();
     }
 
     private static List<String> messages(List<ILoggingEvent> events) {

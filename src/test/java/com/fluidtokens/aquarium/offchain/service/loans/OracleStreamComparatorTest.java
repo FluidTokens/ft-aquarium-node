@@ -33,6 +33,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * three are pairwise different. A push of {@code A1} is the API array parsed as a push's tokens, which is the same
  * parser either way.
  *
+ * <p>R-d (FAB-175-2): the very first API load is never a timing witness, so a test that wants a MATCHED lag first
+ * loads {@link #baseline()} — the mainnet registry, different from all three — before the connection opens, the
+ * way production's seed does.
+ *
  * <p>Seconds are {@code floor(milliseconds / 1000)} throughout.
  */
 class OracleStreamComparatorTest {
@@ -51,6 +55,7 @@ class OracleStreamComparatorTest {
     private OracleRegistryParser.Parsed a1;
     private OracleRegistryParser.Parsed p1;
     private OracleRegistryParser.Parsed p2;
+    private Collection<OracleEntry> mainnet;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -67,6 +72,9 @@ class OracleStreamComparatorTest {
         p1 = OracleRegistryParser.parse(FluidOracleClientLoadPinTest.resource(PUSH_1).path("tokens"));
         p2 = OracleRegistryParser.parse(FluidOracleClientLoadPinTest.resource(PUSH_2).path("tokens"));
         assertEquals(3, Set.of(h(a1), h(p1), h(p2)).size(), "fixture: three different sets");
+        mainnet = OracleClients.mainnetTwoVersions().entries();
+        assertEquals(4, Set.of(h(a1), h(p1), h(p2), OracleStreamComparator.hash(mainnet)).size(),
+                "fixture: the baseline differs from all three");
     }
 
     // ======================================================================================
@@ -105,6 +113,7 @@ class OracleStreamComparatorTest {
     /** A repeat of a push the API is already on resolves at once, lag 0, {@code rep=1}; the lag gauge keeps rep=0's. */
     @Test
     void aRepeatPushTheApiIsAlreadyOnIsMatchedAtOnceWithRep1() {
+        baseline();
         comparator.onOpen(OPEN);
         push(OPEN.plusSeconds(10), a1);
         comparator.onApiLoad(OPEN.plusSeconds(20), entries(a1));
@@ -120,6 +129,7 @@ class OracleStreamComparatorTest {
     /** A repeat the API is NOT on waits like any push, and matches with {@code rep=1} when the API serves it. */
     @Test
     void aRepeatPushTheApiIsNotOnWaitsAndMatchesWithRep1() {
+        baseline();
         comparator.onOpen(OPEN);
         push(OPEN.plusSeconds(10), a1);
         comparator.onApiLoad(OPEN.plusSeconds(20), entries(a1));
@@ -139,6 +149,7 @@ class OracleStreamComparatorTest {
      */
     @Test
     void anApiLoadExactlyWindowAfterThePushIsStillMatched() {
+        baseline();
         comparator.onOpen(OPEN);
         push(OPEN.plusSeconds(10), a1);
         comparator.onApiLoad(OPEN.plusSeconds(10).plus(OracleStreamComparator.WINDOW), entries(a1));
@@ -204,6 +215,7 @@ class OracleStreamComparatorTest {
      */
     @Test
     void aRepeatPushTheApiWasOnBeforeAReconnectIsUncoveredPreConnect() {
+        baseline();
         comparator.onOpen(OPEN);
         push(OPEN.plusSeconds(10), a1);
         comparator.onApiLoad(OPEN.plusSeconds(20), entries(a1));
@@ -232,6 +244,33 @@ class OracleStreamComparatorTest {
         assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=20 rep=0 gap_s=100 dly_ms=100"),
                 cmpFields());
         assertEquals(20.0, lag());
+    }
+
+    /**
+     * FAB-175-2 ruling R-d, the baseline is never a timing witness: the very first API load is an unwatched state.
+     * Here it is loaded AFTER the connection opened and after the push, and it carries the push's entries — still
+     * UNCOVERED {@code why=pre-connect}, no lag measured, the gauge NaN. A repeat the API is on since that baseline
+     * is the same. The control: once the API has moved off the baseline and back, a push it serves is MATCHED.
+     */
+    @Test
+    void aPushWhoseFirstMatchingLoadIsTheBaselineIsUncoveredPreConnectEvenAfterTheOpen() {
+        comparator.onOpen(OPEN);
+        push(OPEN.plusSeconds(100), a1);
+        comparator.onApiLoad(OPEN.plusSeconds(130), entries(a1));
+        push(OPEN.plusSeconds(140), a1);
+        comparator.onApiLoad(OPEN.plusSeconds(160), entries(a1));
+
+        assertEquals(List.of(
+                "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100",
+                "push=2 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=40 dly_ms=100"), cmpFields());
+        assertEquals(Double.NaN, lag(), "no lag against the baseline");
+
+        comparator.onApiLoad(OPEN.plusSeconds(190), entries(p1));
+        push(OPEN.plusSeconds(200), a1);
+        comparator.onApiLoad(OPEN.plusSeconds(220), entries(a1));
+        assertEquals("push=3 out=MATCHED n=5 h=" + h(a1) + " lag_s=20 rep=1 gap_s=60 dly_ms=100", cmpFields().get(2),
+                "a change the node watched is a witness again");
+        assertCounts(1, 0, 0, 0, 2);
     }
 
     // ======================================================================================
@@ -288,6 +327,7 @@ class OracleStreamComparatorTest {
      */
     @Test
     void mismatchNamesTheApiAndThatItIsStillOnAnEarlierPushAndItsDetailIsLatched() {
+        baseline();
         comparator.onOpen(OPEN);
         push(OPEN.plusSeconds(10), p1);
         comparator.onApiLoad(OPEN.plusSeconds(20), entries(p1));
@@ -325,6 +365,7 @@ class OracleStreamComparatorTest {
     /** The API moved to entries no push had carried, 120 s or more after the open; the push then arrives: lead_s. */
     @Test
     void aPushArrivingAfterTheApiHadItIsApiAheadWithItsLead() {
+        baseline();
         comparator.onOpen(OPEN);
         push(OPEN.plusSeconds(130), a1);
         comparator.onApiLoad(OPEN.plusSeconds(140), entries(a1));
@@ -347,6 +388,7 @@ class OracleStreamComparatorTest {
     /** An API change no push carries is reported once WINDOW has passed, with {@code push=-} and the API's n and h. */
     @Test
     void anApiChangeNoPushEverCarriedIsAnOrphanApiAhead() {
+        baseline();
         comparator.onOpen(OPEN);
         push(OPEN.plusSeconds(130), a1);
         comparator.onApiLoad(OPEN.plusSeconds(140), entries(a1));
@@ -375,6 +417,7 @@ class OracleStreamComparatorTest {
      */
     @Test
     void anApiChangeWithin120sOfAReconnectIsNotApiAhead() {
+        baseline();
         comparator.onOpen(OPEN);
         push(OPEN.plusSeconds(130), a1);
         comparator.onApiLoad(OPEN.plusSeconds(140), entries(a1));
@@ -389,6 +432,26 @@ class OracleStreamComparatorTest {
                 "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=unjudgeable gap_s=70 dly_ms=100"), cmpFields());
         assertEquals(List.of(), detailFields(Level.WARN));
         assertCounts(1, 0, 0, 0, 1);
+    }
+
+    /**
+     * FAB-175-1 audit residue (c), the orphan rule's {@code judgeable} clause: after a reconnect, the API changes
+     * within 120 s to entries NO push ever carries. Past {@link OracleStreamComparator#WINDOW} that change is not an
+     * orphan API_AHEAD — it may be the API catching up on a push missed while disconnected.
+     */
+    @Test
+    void anOrphanApiChangeWithin120sOfAReconnectIsNeverApiAhead() {
+        comparator.onOpen(OPEN);
+        comparator.onApiLoad(OPEN.plusSeconds(10), entries(a1));
+        comparator.onClose(OPEN.plusSeconds(100), "no-pong");
+        comparator.onOpen(OPEN.plusSeconds(200));
+        comparator.onApiLoad(OPEN.plusSeconds(250), entries(p2));
+        comparator.tick(OPEN.plusSeconds(251).plus(OracleStreamComparator.WINDOW));
+        comparator.tick(OPEN.plusSeconds(260).plus(OracleStreamComparator.WINDOW));
+
+        assertEquals(List.of(), cmpFields());
+        assertEquals(List.of(), detailFields(Level.WARN));
+        assertCounts(0, 0, 0, 0, 0);
     }
 
     @Test
@@ -574,6 +637,11 @@ class OracleStreamComparatorTest {
     // ======================================================================================
     // Helpers
     // ======================================================================================
+
+    /** The poller's first load, before {@link #OPEN}: the mainnet registry, so no test entry is its baseline. */
+    private void baseline() {
+        comparator.onApiLoad(OPEN.minusSeconds(60), mainnet);
+    }
 
     /** A push received at {@code at}, stamped by the server 100 ms earlier. */
     private void push(Instant at, OracleRegistryParser.Parsed parsed) {

@@ -14,7 +14,9 @@ import org.springframework.stereotype.Component;
 
 import java.net.URI;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -51,6 +53,10 @@ import java.util.function.BooleanSupplier;
  *
  * <p>The stake presence the client re-reads during a 403 hold is {@link StakerService}'s own verdict — read
  * only on the {@code oracle-stream} thread, only during that hold, while no connection is open.
+ *
+ * <p>At each UTC midnight of the injected clock the comparator says its cumulative {@code day} line (FAB-175-2), on
+ * the {@code oracle-stream} thread. The delay to the next midnight is computed afresh each time, never a fixed
+ * 24 h rate from the boot, so the lines stay on midnight whenever the node started.
  */
 @Component
 public class OracleStreamLauncher {
@@ -284,6 +290,7 @@ public class OracleStreamLauncher {
         }
         stream.scheduleWithFixedDelay(guarded("cmp-tick", () -> comparing.tick(streamClock.instant())),
                 COMPARE_TICK_SECONDS, COMPARE_TICK_SECONDS, TimeUnit.SECONDS);
+        scheduleDaySummary(stream, comparing, streamClock);
 
         OracleStreamClient created = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, clock,
                 comparing, events, scheduler, io, () -> !staker.findStakerRefInput().isEmpty(),
@@ -311,6 +318,30 @@ public class OracleStreamLauncher {
         } catch (Exception e) {
             // rejected or slow: the stream is going down regardless
         }
+    }
+
+    /**
+     * The comparator's {@code day} line at the next UTC midnight of {@code streamClock}, which then schedules the
+     * one after — the delay computed from the clock each time.
+     */
+    private void scheduleDaySummary(ScheduledExecutorService stream, OracleStreamComparator comparing,
+                                    Clock streamClock) {
+        try {
+            stream.schedule(guarded("cmp-day", () -> {
+                try {
+                    comparing.daySummary(streamClock.instant(), false);
+                } finally {
+                    scheduleDaySummary(stream, comparing, streamClock);
+                }
+            }), nextUtcMidnightDelay(streamClock.instant()).toMillis(), TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+            // the stream has stopped: its last day line is the comparator's shutdown's
+        }
+    }
+
+    /** From {@code now} to the next UTC midnight strictly after it: 1 s at 23:59:59Z, 24 h at 00:00:00Z. */
+    static Duration nextUtcMidnightDelay(Instant now) {
+        return Duration.between(now, now.truncatedTo(ChronoUnit.DAYS).plus(1, ChronoUnit.DAYS));
     }
 
     /** A task body that logs a throw by its simple class name and never lets it escape (it would cancel a tick). */

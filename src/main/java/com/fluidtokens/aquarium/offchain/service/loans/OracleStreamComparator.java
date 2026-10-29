@@ -39,14 +39,20 @@ import java.util.stream.Collectors;
  *       ({@code push=-});</li>
  *   <li>{@code UNCOVERED}: nothing can be judged — no API load in the window ({@code why=no-api}), the API's change
  *       fell inside {@link #API_LAG_ALLOWANCE} of a (re)connect ({@code why=unjudgeable}), the API already served
- *       the push's entries before the push's connection opened ({@code why=pre-connect}), the queue overflowed
- *       ({@code why=overflow}) or the node stopped ({@code why=shutdown}).</li>
+ *       the push's entries before the push's connection opened or only as its first-ever load
+ *       ({@code why=pre-connect}), the queue overflowed ({@code why=overflow}) or the node stopped
+ *       ({@code why=shutdown}).</li>
  * </ul>
  *
  * <p><b>{@code why=pre-connect}</b> (ruling R-a): when the first API observation that matches a push is content the
  * API was already serving before that push's connection opened — the poller's baseline, typically the load the
  * node held at start — the push is not MATCHED and the lag gauge does not move. The API's state from before this
  * node was listening says nothing about who was first, so any lag measured against it would be invented.
+ *
+ * <p><b>The baseline is never a timing witness</b> (ruling R-d, FAB-175-2): the first API load this comparator ever
+ * sees is an unwatched state — nothing says when the API moved to it. A push whose first matching API observation
+ * is that baseline (or a later load of the same content) is {@code UNCOVERED why=pre-connect} even when the baseline
+ * was loaded AFTER the connection opened, so no lag is ever measured against it.
  *
  * <p><b>{@code lag_s=0}</b> (ruling R-b) means "not behind, within the poll and hand-off measurement error": the lag
  * and its gauge are clamped at 0. A push stamped a few milliseconds after a poller load whose hand-off has not yet
@@ -78,6 +84,11 @@ import java.util.stream.Collectors;
  * standing difference is said once at WARN and again only when it changes. The sides it compares:
  * MISMATCH — the push against the API's last load; API_AHEAD — the API's change against what the WS held before
  * it (the push before, for a push-attached one; the last push, for {@code push=-}).
+ *
+ * <p><b>The {@code day} line</b> (FAB-175-2): {@link #daySummary} says, at each UTC midnight and once more at
+ * {@link #shutdown}, everything counted since this comparator started — cumulative, never reset, so the last
+ * {@code day} line of a boot (the highest {@code ev}) carries the whole boot. Its fields are documented on
+ * {@link #daySummary}; docs/oracle-stream.md computes the W3 gate from them.
  */
 public final class OracleStreamComparator implements OracleStreamClient.Listener {
 
@@ -144,6 +155,20 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         }
     }
 
+    /** One {@code day} line's fields, in their fixed order — see {@link #daySummary}. */
+    record Day(long push, long upS, long connS, long pushes, long matched, long superseded, long mismatch,
+               long apiAhead, long uncovered, long lagMaxS, long gapMaxS, long drops, long heals, long proactive,
+               boolean last) {
+
+        String fields() {
+            return "push=" + push + " up_s=" + upS + " conn_s=" + connS + " pushes=" + pushes
+                    + " matched=" + matched + " superseded=" + superseded + " mismatch=" + mismatch
+                    + " api_ahead=" + apiAhead + " uncovered=" + uncovered + " lag_max_s=" + lagMaxS
+                    + " gap_max_s=" + gapMaxS + " drops=" + drops + " heals=" + heals + " proactive=" + proactive
+                    + " last=" + (last ? 1 : 0);
+        }
+    }
+
     static Cmp matched(long seq, int n, String hash, long lagS, int rep, String gapS, long dlyMs) {
         return new Cmp(String.valueOf(seq), Outcome.MATCHED, n, hash, lagS, rep, null, null, null, null, null,
                 gapS, dlyMs);
@@ -176,9 +201,10 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
 
     /**
      * The API's last load. {@code since} is the first load of the run of loads that served {@code hash} — the
-     * earliest instant the API is known to have served it.
+     * earliest instant the API is known to have served it. {@code baseline}: that run began with the very first
+     * load this comparator saw, so nothing says when the API moved to it (R-d).
      */
-    private record ApiState(String hash, Set<OracleEntry> entries, Instant at, Instant since) {
+    private record ApiState(String hash, Set<OracleEntry> entries, Instant at, Instant since, boolean baseline) {
     }
 
     /** An API load whose hash moved from the previous load's. */
@@ -251,6 +277,18 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
     private volatile double connectedSeconds;
     private volatile double lastLagSeconds = Double.NaN;
 
+    // The day line's tallies, since the stream started; never reset (FAB-175-2).
+    /** The first instant the stream's side reported: an open, close, push, tick, summary or shutdown. */
+    private Instant streamStart;
+    private final Map<Outcome, Long> outcomeCounts = new EnumMap<>(Outcome.class);
+    private long lagMaxSeconds;
+    private long gapMaxSeconds;
+    private long drops;
+    private long heals;
+    private long proactiveCloses;
+    /** The last close was a drop and no open has followed it yet. */
+    private boolean dropOpen;
+
     public OracleStreamComparator(OracleStreamLog log, MeterRegistry registry) {
         this.events = log;
         if (registry != null) {
@@ -279,21 +317,41 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
 
     @Override
     public void onOpen(Instant at) {
+        started(at);
         advance(at);
+        quietGap(at);
         closeSpan();
         connOpenSince = at;
+        if (dropOpen) {
+            heals++;
+            dropOpen = false;
+        }
         publishConnected();
     }
 
+    /**
+     * {@code proactive} is the planned reconnect; {@code shutdown} the node stopping (the client says that itself,
+     * so it seldom arrives here). Any other reason is a drop, healed by the next open.
+     */
     @Override
     public void onClose(Instant at, String reason) {
+        started(at);
         advance(at);
+        quietGap(at);
         closeSpan();
+        if ("proactive".equals(reason)) {
+            proactiveCloses++;
+        } else if (!"shutdown".equals(reason)) {
+            drops++;
+            dropOpen = true;
+        }
     }
 
     @Override
     public void onPush(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars) {
+        started(at);
         advance(at);
+        quietGap(at);
         long seq = pushSeq + 1;
         pushSeq = seq;
         Set<OracleEntry> entries = Set.copyOf(parsed.byOracleToken().values());
@@ -356,7 +414,7 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         advance(at);
         Set<OracleEntry> held = Set.copyOf(entries);
         String hash = hash(held);
-        // The first load is a baseline, not a change: nothing says when the API moved to it.
+        // The first load is a baseline, not a change: nothing says when the API moved to it (R-d).
         if (apiLast != null && !apiLast.hash().equals(hash)) {
             boolean judgeable = connOpenSince != null && !connOpenSince.isAfter(at.minus(API_LAG_ALLOWANCE));
             apiChanges.addLast(new ApiChange(hash, held, at, judgeable));
@@ -364,8 +422,10 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
                 apiChanges.removeFirst();
             }
         }
-        Instant since = apiLast != null && apiLast.hash().equals(hash) ? apiLast.since() : at;
-        apiLast = new ApiState(hash, held, at, since);
+        boolean same = apiLast != null && apiLast.hash().equals(hash);
+        Instant since = same ? apiLast.since() : at;
+        boolean baseline = apiLast == null || same && apiLast.baseline();
+        apiLast = new ApiState(hash, held, at, since, baseline);
         Iterator<Pending> waiting = pending.iterator();
         while (waiting.hasNext()) {
             Pending p = waiting.next();
@@ -391,6 +451,7 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
 
     /** Resolves every push older than {@link #WINDOW}, then every API change no push carried. */
     void tick(Instant now) {
+        started(now);
         advance(now);
         Iterator<Pending> waiting = pending.iterator();
         while (waiting.hasNext()) {
@@ -423,14 +484,50 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         apiChanges.removeIf(change -> change.at.isBefore(horizon));
     }
 
-    /** The node is stopping: every push still waiting is UNCOVERED, and so is every push after this (R-c). */
+    /**
+     * The node is stopping: every push still waiting is UNCOVERED, and so is every push after this (R-c). Then the
+     * final {@code day} line, {@code last=1}, so it counts them.
+     */
     void shutdown(Instant now) {
+        started(now);
         advance(now);
         stopped = true;
         for (Pending p : pending) {
             emit(uncovered(p.seq, p.entries.size(), p.hash, "shutdown", p.gapS, p.dlyMs));
         }
         pending.clear();
+        daySummary(now, true);
+    }
+
+    /**
+     * One INFO {@code day} line: everything since the stream started, cumulative. In order —
+     * <ul>
+     *   <li>{@code push}: the last push's sequence number, the key every {@code cmp} line carries;</li>
+     *   <li>{@code up_s}: seconds since the stream started — the first open, close, push, tick, summary or shutdown
+     *       it reported, which is within one {@code cmp-tick} (10 s) of the launch;</li>
+     *   <li>{@code conn_s}: seconds a connection was open, the one open now included;</li>
+     *   <li>{@code pushes}: pushes received (equal to {@code push}, said as a count);</li>
+     *   <li>{@code matched superseded mismatch api_ahead uncovered}: {@code cmp} lines by outcome —
+     *       {@code api_ahead} includes the {@code push=-} ones;</li>
+     *   <li>{@code lag_max_s}: the largest {@code lag_s} of a MATCHED line (at most {@link #WINDOW});</li>
+     *   <li>{@code gap_max_s}: the largest quiet gap inside one connection — between consecutive pushes, from the
+     *       open to the first push, or from the last push (or the open) to the close — updated at each push and
+     *       each close;</li>
+     *   <li>{@code drops}: closes other than {@code proactive} or {@code shutdown}; {@code heals}: opens that
+     *       followed a drop; {@code proactive}: planned reconnects;</li>
+     *   <li>{@code last}: 1 on the shutdown line, 0 at midnight.</li>
+     * </ul>
+     * Seconds are whole seconds rounded down. At most 250 bytes of fields after {@code ev=} for any value up to
+     * eight digits (about three years of seconds, a hundred million pushes).
+     */
+    void daySummary(Instant now, boolean last) {
+        started(now);
+        advance(now);
+        long connS = Math.floorDiv(closedMillis, 1000L) + openSpanSeconds(now);
+        events.info("day", new Day(pushSeq, Math.max(0, seconds(streamStart, now)), connS, pushSeq,
+                count(Outcome.MATCHED), count(Outcome.SUPERSEDED), count(Outcome.MISMATCH),
+                count(Outcome.API_AHEAD), count(Outcome.UNCOVERED), lagMaxSeconds, gapMaxSeconds, drops, heals,
+                proactiveCloses, last).fields());
     }
 
     // ======================================================================================
@@ -441,6 +538,10 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         Counter counter = outcomes.get(cmp.outcome());
         if (counter != null) {
             counter.increment();
+        }
+        outcomeCounts.merge(cmp.outcome(), 1L, Long::sum);
+        if (cmp.outcome() == Outcome.MATCHED && cmp.lagS() > lagMaxSeconds) {
+            lagMaxSeconds = cmp.lagS();
         }
         if (cmp.outcome().warn()) {
             events.warn("cmp", cmp.fields());
@@ -482,11 +583,12 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
     }
 
     /**
-     * R-a: the API was already serving {@code api}'s content before the push's connection opened — its baseline,
-     * not a change this node watched — so a match against it would invent a lag.
+     * R-a: the API was already serving {@code api}'s content before the push's connection opened — not a change
+     * this node watched — so a match against it would invent a lag. R-d: nor is the very first load ever seen, even
+     * one after the open.
      */
     private static boolean preConnect(ApiState api, Instant connOpenedAt) {
-        return connOpenedAt != null && api.since().isBefore(connOpenedAt);
+        return api.baseline() || connOpenedAt != null && api.since().isBefore(connOpenedAt);
     }
 
     /** The earliest remembered API change to {@code hash} strictly before {@code at}, or null. */
@@ -497,6 +599,28 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
             }
         }
         return null;
+    }
+
+    private void started(Instant at) {
+        if (streamStart == null) {
+            streamStart = at;
+        }
+    }
+
+    /** The quiet gap ending at {@code at} inside the open connection, if one is open: since its last push or open. */
+    private void quietGap(Instant at) {
+        if (connOpenSince != null) {
+            gapMaxSeconds = Math.max(gapMaxSeconds, seconds(later(lastPushAt, connOpenSince), at));
+        }
+    }
+
+    /** The open connection's seconds up to {@code at}; 0 while none is open. */
+    private long openSpanSeconds(Instant at) {
+        return connOpenSince == null ? 0 : Math.max(0, seconds(connOpenSince, at));
+    }
+
+    private long count(Outcome outcome) {
+        return outcomeCounts.getOrDefault(outcome, 0L);
     }
 
     private void advance(Instant at) {

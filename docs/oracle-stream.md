@@ -8,8 +8,10 @@ to turn the stream off. Nothing here needs action on a healthy node.
 ## 1. What it is
 
 FluidTokens publishes oracle prices on two channels: the HTTP registry the node has always polled
-(`api.fluidtokens.com/get-oracle-tokens`), and a WebSocket that **pushes** the same registry the moment it
-changes. The node connects to the WebSocket and listens — **as a shadow**:
+(`api.fluidtokens.com/get-oracle-tokens`), and a WebSocket that **pushes** the same registry after it
+changes. FluidTokens checks for changes about once a minute, so a push can follow a price change by up to
+about 60 s; that timing is theirs, not the node's. The node connects to the WebSocket and listens — **as a
+shadow**:
 
 - **No decision reads it.** Every push is parsed and written to the log as one line, and that is all. No
   liquidation, price, health figure or readiness verdict changes because of it.
@@ -184,4 +186,219 @@ node report unhealthy, and nothing that restarts containers on `/healthcheck` wi
 
 ## Comparing the stream with the API
 
-Added by FAB-175.
+Every push is judged against what the node's own HTTP poller loads, and said as **one** `cmp` line.
+The poller's result is handed to the stream after each of its loads; the stream never calls the API
+itself, and nothing it concludes reaches a decision.
+
+### The outcomes
+
+"Equal" here means **parse-equal**: both sides run through the same parser, and the two sets of parsed
+entries are compared (see the blind spots below). `h` is the first 8 hex characters of a digest of the
+parsed entries, so two lines with the same `h` carry the same prices.
+
+| `out=` | Level | The rule |
+|---|---|---|
+| `MATCHED` | INFO | the poller loaded the push's entries within **5 minutes** of the push. `lag_s` is how far behind the API was. **`lag_s=0` means "not behind"**: the lag is clamped at 0, because a load handed over a few milliseconds after a push stamped just after it would otherwise read as negative |
+| `SUPERSEDED` | INFO | a newer, different push came first (`by=` its number) and the API never served this one within the 5 minutes |
+| `MISMATCH` | WARN | the poller loaded within the 5 minutes, but never the push's entries; `api=`/`api_n=` are what it held instead |
+| `API_AHEAD` | WARN | the API served entries **before** any push carried them. Either a push that arrived after the API had them (`lead_s=` by how much), or — once 5 minutes have passed — an API change no push ever carried, logged with `push=-` and the API's own `n` and `h` |
+| `UNCOVERED` | INFO | nothing can be judged, and `why=` says why (below) |
+
+- **The 5-minute window** covers what preview showed: the WebSocket led the API by 6–30 s, FluidTokens'
+  change detector runs every minute, and the node polls every 30 s.
+- **The 120-second allowance.** An API change less than 120 s after a (re)connect may be the API catching
+  up on a push the node missed while disconnected, so it is never called `API_AHEAD`: a push carrying it
+  is `UNCOVERED why=unjudgeable`, and an orphan of it is not logged at all.
+- **Repeat pushes** (`rep=1`): a push of entries an earlier push already carried. If the API is already on
+  them it is `MATCHED lag_s=0 rep=1` at once; otherwise it waits like any other push.
+- **The same API change can be logged twice**: first as an orphan (`push=-`), then attached to a push that
+  carries it late. Count `API_AHEAD` by distinct `h`, never by lines — the recipe below does.
+
+The `why=` of an `UNCOVERED` line — **none of these is a failure**; each is a push nobody can verify:
+
+| `why=` | Meaning |
+|---|---|
+| `no-api` | no poller load at all within the 5 minutes (the API, or the poller, was unreachable) |
+| `unjudgeable` | the API's change fell within 120 s of a (re)connect |
+| `pre-connect` | the first poller load matching the push is one that does not witness timing: the API already served those entries before the push's connection opened, or it is the very first load the node ever made (its starting point, which says nothing about when the API moved to it). No lag is ever measured against either |
+| `overflow` | more than 64 pushes were waiting for a verdict; the oldest is given up |
+| `shutdown` | the node stopped before the 5 minutes were up — or a push arrived while it was stopping |
+
+`MISMATCH` and `API_AHEAD` are each followed by one `cmp-detail` line naming the oracle NFTs that differ
+(`only_ws`, `only_api`, `differ`, at most five of each). A standing difference is said once at WARN and
+again only when it changes.
+
+### The `day` line
+
+At each **UTC midnight**, and once more when the node stops, the stream writes one INFO summary:
+
+```
+[oracle-stream] day boot=<id> ev=<n> push=<last push> up_s= conn_s= pushes= matched= superseded= mismatch= api_ahead= uncovered= lag_max_s= gap_max_s= drops= heals= proactive= last=<0|1>
+```
+
+Everything in it is **cumulative since the node started** — never reset at midnight — so the last `day`
+line of a boot (its highest `ev`) carries the whole boot, and `last=1` marks the one written at shutdown.
+
+- `up_s`: seconds since the stream started — counted from its first event after startup, which is at most
+  10 s after the launch; `conn_s`: seconds a connection was open, including the one open now.
+- `matched` … `uncovered`: `cmp` lines by outcome; `api_ahead` counts lines, orphans included.
+- `lag_max_s`: the largest `lag_s` of a `MATCHED` line.
+- `gap_max_s`: the longest quiet stretch inside one connection — between two pushes, from the open to the
+  first push, or from the last push to the close. It is measured at each push and each close, so a quiet
+  stretch still running when the line is written is not in it yet.
+- `drops`: connections that ended other than by the planned reconnect or by shutdown; `heals`: connections
+  that opened after a drop; `proactive`: planned reconnects (§7).
+
+⚠ **A `kill -9` (or an out-of-memory kill) loses everything since the last `day` line.** The recipe then
+reports what it can see — `ev` gaps — rather than inventing the missing numbers.
+
+### What parse-equality cannot see
+
+A `MATCHED` line proves the two sides carried the same **parsed** entries, not the same bytes:
+
+- **Fields the parser ignores** never take part: `_id`, `ticker`, `decimals`, `governanceToken`, logo and
+  name, and whether a key is `null` or absent.
+- **Entries both sides drop** are invisible: an inactive entry, an unknown provider, a zero denominator, or
+  an entry that fails to parse.
+- **Signatures from keys outside `publicKeys`** are dropped on both sides, so a difference there is not
+  seen.
+- **A duplicated oracle NFT** collapses to the last entry naming it, on both sides.
+- **Array order** is irrelevant.
+- **Lag is only as fine as the poll**: the poller loads every 30 s, so `lag_s` has a resolution of 30 s.
+
+### How much log it takes
+
+An assumption, not a guarantee: the worst case is **one push a minute**, because FluidTokens' change
+detector runs every minute (measured on preview on 2026-10-29). That is 1,440 `cmp` lines a day, each at
+most 300 bytes as the node writes it, plus about 80 bytes of Docker's own wrapping per line — roughly
+**0.55 MB a day**. The connection, refusal and `day` lines are negligible beside that.
+
+The node's container keeps at most **50 MB of log** (`max-size: 10m`, `max-file: 5` in
+`docker/docker-compose.yaml`), so the stream uses about 1.1% of it a day, and a 7-day gate needs about
+3.9 MB of `[oracle-stream]` lines. That budget is shared with **everything** else the node logs, which is
+far more, so do not count on Docker still holding a week: **export daily**.
+
+### Exporting the lines
+
+Once a day (from cron, for example), on the host — `<node>` is the container's name, `aquarium` in the
+shipped compose file:
+
+```sh
+docker logs <node> --since 24h 2>&1 | grep '\[oracle-stream\]' >> oracle-stream.log
+```
+
+Overlapping exports are harmless: the recipe ignores a line it has already counted. A missed day is not —
+it shows up as `ev` gaps.
+
+### The W3 gate recipe
+
+The gate the stream must pass before anything may depend on it (Giovanni, 2026-10-29): at least **7 days**
+of mainnet shadow; **every** push parse-equal to the API content it precedes; the API **never** ahead of
+the stream; at least **99% uptime**, with every drop healing by itself; and the longest quiet gap measured.
+
+Run it over the exported file, with any POSIX `sh` and `awk`:
+
+```sh
+sh w3-gate.sh < oracle-stream.log
+```
+
+where `w3-gate.sh` is exactly this block:
+
+<!-- w3-gate-recipe:start -->
+```sh
+# W3 gate over exported [oracle-stream] lines on stdin. POSIX sh + awk only.
+awk '
+function fixed2(a, b,   x) {
+  if (b == 0) return "-"
+  x = int(a * 100 / b)
+  return sprintf("%d.%02d", int(x / 100), x % 100)
+}
+{
+  sub(/\r$/, "")
+  s = $0; found = 0
+  # The first "[oracle-stream] <event> boot=.. ev=.." on the line: any log prefix is skipped.
+  while ((i = index(s, "[oracle-stream] ")) > 0) {
+    s = substr(s, i + 16)
+    n = split(s, t, " ")
+    if (n >= 3 && t[2] ~ /^boot=/ && t[3] ~ /^ev=/) { found = 1; break }
+  }
+  if (!found) next
+  split("", f)
+  for (j = 2; j <= n; j++) {
+    if (t[j] == "--") break
+    p = index(t[j], "=")
+    if (p > 1) f[substr(t[j], 1, p - 1)] = substr(t[j], p + 1)
+  }
+  b = f["boot"]; e = f["ev"] + 0
+  if (!(b in known)) { known[b] = 1; boot[++nb] = b; evmax[b] = 0; evn[b] = 0; dayev[b] = 0 }
+  if (e > 0 && !((b, e) in seenev)) { seenev[b, e] = 1; evn[b]++; if (e > evmax[b]) evmax[b] = e }
+  if (t[1] == "cmp") {
+    # API_AHEAD by distinct h: one API change can be logged as an orphan, then on a late push.
+    if (f["out"] == "API_AHEAD" && !((b, f["h"]) in ahead)) { ahead[b, f["h"]] = 1; api_ahead++ }
+    if (f["push"] != "-" && !((b, f["push"]) in seenpush)) {
+      seenpush[b, f["push"]] = 1; pushes++; out[f["out"]]++
+      if (f["out"] == "MATCHED" && f["lag_s"] + 0 > lag_max) lag_max = f["lag_s"] + 0
+    }
+  } else if (t[1] == "day" && e > dayev[b]) {
+    # The day line with the highest ev is the latest: its fields cover the whole boot.
+    dayev[b] = e; up[b] = f["up_s"] + 0; conn[b] = f["conn_s"] + 0
+    drops[b] = f["drops"] + 0; heals[b] = f["heals"] + 0; gap[b] = f["gap_max_s"] + 0
+  }
+}
+END {
+  U = 0; C = 0; D = 0; H = 0; G = 0; gaps = ""
+  for (k = 1; k <= nb; k++) {
+    b = boot[k]
+    U += up[b]; C += conn[b]; D += drops[b]; H += heals[b]
+    if (gap[b] + 0 > G) G = gap[b] + 0
+    gaps = gaps (k > 1 ? "," : "") b ":" (evmax[b] - evn[b])
+  }
+  print "boots=" nb + 0
+  print "pushes=" pushes + 0
+  print "matched=" out["MATCHED"] + 0
+  print "superseded=" out["SUPERSEDED"] + 0
+  print "mismatch=" out["MISMATCH"] + 0
+  print "api_ahead=" api_ahead + 0
+  print "uncovered=" out["UNCOVERED"] + 0
+  print "verified_pct=" fixed2(out["MATCHED"] * 100, pushes)
+  print "up_s=" U
+  print "conn_s=" C
+  print "uptime_pct=" fixed2(C * 100, U)
+  print "drops=" D
+  print "heals=" H
+  print "unhealed=" D - H
+  print "gap_max_s=" G
+  print "lag_max_s=" lag_max + 0
+  print "days=" fixed2(U, 86400)
+  print "ev_gaps=" gaps
+  r = ""
+  if (out["MISMATCH"] > 0) r = r ",mismatch"
+  if (api_ahead > 0) r = r ",api_ahead"
+  if (C * 100 < 99 * U) r = r ",uptime"
+  if (D - H > 0) r = r ",unhealed"
+  if (U < 7 * 86400) r = r ",days"
+  print "verdict=" (r == "" ? "PASS" : "FAIL") " reasons=" substr(r, 2)
+  exit (r == "" ? 0 : 1)
+}'
+```
+<!-- w3-gate-recipe:end -->
+
+It prints one `key=value` per line and ends with `verdict=PASS reasons=` or `verdict=FAIL reasons=<list>`,
+exiting 0 on PASS and 1 on FAIL (anything else means the recipe itself failed).
+
+- **How it counts.** Outcomes come from `cmp` lines, each push counted once per boot (`boot`, `push`), so
+  an overlapping export counts nothing twice; `api_ahead` counts distinct `h` per boot. Uptime comes from
+  each boot's latest `day` line (`up_s`, `conn_s`, `drops`, `heals`, `gap_max_s`), summed across boots — or,
+  for `gap_max_s`, the largest. `lag_max_s` is the largest `MATCHED` lag. `days` is the summed `up_s` over
+  86,400, rounded down to two decimals, as are both percentages.
+- **FAIL** when any of: `mismatch` above 0, `api_ahead` above 0, `uptime_pct` below 99, `unhealed` (drops
+  minus heals) above 0, `days` below 7. `reasons` names each.
+- ⚠ **`SUPERSEDED` and `UNCOVERED` pushes are UNVERIFIED** — neither proven equal nor proven different.
+  They do not fail the gate; `verified_pct` (matched over pushes) is reported for Giovanni's judgement, not
+  turned into a verdict.
+- **`ev_gaps`** lists, per boot, how many `ev` numbers are missing between 1 and the highest seen —
+  lines lost, a boot whose start fell outside every export, or a missed export. A boot with no `day` line at
+  all (killed before its first midnight) adds nothing to `up_s`. **A PASS over gapped or partial logs is a
+  verdict on the lines that survived, not on the week.**
+- `lag_s=0` lines are "not behind", not missing data; `why=pre-connect` and every other `UNCOVERED` reason
+  are unverified pushes, not failures.
