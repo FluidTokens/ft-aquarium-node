@@ -491,6 +491,74 @@ class OracleStreamLauncherTest {
         assertEquals(List.of(), streamThreadsAfterAWhile(), "closing the context stops the stream");
     }
 
+    /**
+     * r2 (a): the launcher's SCHEDULED tick is the only production path that resolves a push once
+     * {@link OracleStreamComparator#WINDOW} has passed — SUPERSEDED, MISMATCH, UNCOVERED {@code why=no-api} and the
+     * orphan API_AHEAD all come from it. A real push, no poller load, the launcher's clock moved past WINDOW, and
+     * nothing here calls tick(): the {@code why=no-api} line can only come from the {@code cmp-tick} the launcher
+     * scheduled.
+     */
+    @Test
+    void theScheduledTickResolvesAPushNoLoadServedAsUncoveredNoApi() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        String push = resource(PREVIEW_PUSH);
+        OracleStreamClientLivenessTest.MutableClock clock = new OracleStreamClientLivenessTest.MutableClock(Instant.now());
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.useForTest(OracleStreamClient.Timings.PRODUCTION, clock);
+        launcher.start();
+        server.awaitSession(0, WAIT).sendText(push);
+        await(() -> launcher.pushes() == 1, WAIT, "the comparator's onPush");
+        assertEquals(List.of(), cmpLines(), "fixture: nothing has resolved the push yet");
+
+        clock.advance(OracleStreamComparator.WINDOW.plusSeconds(1));
+        await(() -> !cmpLines().isEmpty(), WAIT, "the scheduled tick's cmp line");
+
+        List<String> cmp = cmpLines();
+        assertEquals(1, cmp.size(), cmp.toString());
+        assertTrue(cmp.getFirst().contains(" push=1 out=UNCOVERED n=5 h=")
+                && cmp.getFirst().contains(" why=no-api gap_s="), cmp.getFirst());
+    }
+
+    /**
+     * r2 (b): closing the context runs {@code stop()}, which resolves every push still waiting as UNCOVERED
+     * {@code why=shutdown} — on the stream thread, before the client stops. A real push nothing matched, then the
+     * context closes: exactly one such line.
+     */
+    @Test
+    void aPushStillWaitingWhenTheContextClosesIsOneUncoveredShutdownLine() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        String push = resource(PREVIEW_PUSH);
+        new ApplicationContextRunner()
+                .withPropertyValues("network=preview", "loans.oracle.stream.url=" + server.uri())
+                .withBean(FluidOracleClient.class, () -> {
+                    try {
+                        return OracleClients.mainnetTwoVersions();
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                })
+                .withBean(Account.class, () -> account)
+                .withBean(StakerService.class, OracleStreamLauncherTest::staker)
+                .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
+                .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withBean(OracleStreamLauncher.class)
+                .run(context -> {
+                    assertNull(context.getStartupFailure(), "the context started");
+                    OracleStreamLauncher bean = context.getBean(OracleStreamLauncher.class);
+                    bean.start();
+                    server.awaitSession(0, WAIT).sendText(push);
+                    await(() -> bean.pushes() == 1, WAIT, "the comparator's onPush");
+                    assertEquals(List.of(), cmpLines(), "fixture: the push is still waiting");
+                });
+
+        List<String> cmp = cmpLines();
+        assertEquals(1, cmp.size(), cmp.toString());
+        assertTrue(cmp.getFirst().contains(" push=1 out=UNCOVERED n=5 h=")
+                && cmp.getFirst().contains(" why=shutdown gap_s="), cmp.getFirst());
+        assertEquals(List.of(), streamThreadsAfterAWhile(), "closing the context stops the stream");
+    }
+
     @Test
     void startReturnsAtOnceWhenTheHandshakeHangs() throws IOException {
         hanging = new OracleStreamTestServer.Hanging();

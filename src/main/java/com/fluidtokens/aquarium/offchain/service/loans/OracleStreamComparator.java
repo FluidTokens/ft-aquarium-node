@@ -38,9 +38,22 @@ import java.util.stream.Collectors;
  *       the API had it ({@code lead_s}), or, after {@link #WINDOW}, an API change no push ever carried
  *       ({@code push=-});</li>
  *   <li>{@code UNCOVERED}: nothing can be judged — no API load in the window ({@code why=no-api}), the API's change
- *       fell inside {@link #API_LAG_ALLOWANCE} of a (re)connect ({@code why=unjudgeable}), the queue overflowed or
- *       the node stopped.</li>
+ *       fell inside {@link #API_LAG_ALLOWANCE} of a (re)connect ({@code why=unjudgeable}), the API already served
+ *       the push's entries before the push's connection opened ({@code why=pre-connect}), the queue overflowed
+ *       ({@code why=overflow}) or the node stopped ({@code why=shutdown}).</li>
  * </ul>
+ *
+ * <p><b>{@code why=pre-connect}</b> (ruling R-a): when the first API observation that matches a push is content the
+ * API was already serving before that push's connection opened — the poller's baseline, typically the load the
+ * node held at start — the push is not MATCHED and the lag gauge does not move. The API's state from before this
+ * node was listening says nothing about who was first, so any lag measured against it would be invented.
+ *
+ * <p><b>{@code lag_s=0}</b> (ruling R-b) means "not behind, within the poll and hand-off measurement error": the lag
+ * and its gauge are clamped at 0. A push stamped a few milliseconds after a poller load whose hand-off has not yet
+ * reached the {@code oracle-stream} thread would otherwise read as a negative lag.
+ *
+ * <p><b>After {@link #shutdown}</b> (ruling R-c) any further push resolves at once as {@code UNCOVERED why=shutdown},
+ * so a push that lands between the comparator's shutdown and the client's stop still gets its one line.
  *
  * <p>⛔ <b>The API side is the production poller's own result</b>, handed over by a
  * {@link FluidOracleClient.LoadListener} after each of its loads: no fetch of its own and no refresh. And it writes
@@ -99,6 +112,10 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
      * One {@code cmp} line's fields. Null fields are left out; the order is fixed:
      * {@code push out n h}, then the outcome's own ({@code lag_s rep by api api_n lead_s why}), then
      * {@code gap_s dly_ms} for an outcome attached to a push.
+     *
+     * <p>{@code lag_s} is never below 0: {@code lag_s=0} means "not behind, within the poll and hand-off
+     * measurement error" (R-b). {@code why} is one of {@code no-api}, {@code unjudgeable}, {@code pre-connect},
+     * {@code overflow}, {@code shutdown}.
      */
     record Cmp(String push, Outcome outcome, int n, String hash, Long lagS, Integer rep, Long by, String api,
                Integer apiN, Long leadS, String why, String gapS, Long dlyMs) {
@@ -157,8 +174,11 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
                 gapS, dlyMs);
     }
 
-    /** The API's last load. */
-    private record ApiState(String hash, Set<OracleEntry> entries, Instant at) {
+    /**
+     * The API's last load. {@code since} is the first load of the run of loads that served {@code hash} — the
+     * earliest instant the API is known to have served it.
+     */
+    private record ApiState(String hash, Set<OracleEntry> entries, Instant at, Instant since) {
     }
 
     /** An API load whose hash moved from the previous load's. */
@@ -186,10 +206,13 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         final int rep;
         final String gapS;
         final long dlyMs;
+        /** When the connection that delivered this push opened. */
+        final Instant connOpenedAt;
         Long supersededBy;
         int apiObservations;
 
-        Pending(long seq, Instant at, String hash, Set<OracleEntry> entries, int rep, String gapS, long dlyMs) {
+        Pending(long seq, Instant at, String hash, Set<OracleEntry> entries, int rep, String gapS, long dlyMs,
+                Instant connOpenedAt) {
             this.seq = seq;
             this.at = at;
             this.hash = hash;
@@ -197,6 +220,7 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
             this.rep = rep;
             this.gapS = gapS;
             this.dlyMs = dlyMs;
+            this.connOpenedAt = connOpenedAt;
         }
     }
 
@@ -218,6 +242,8 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
     private volatile long pushSeq;
     private Instant lastPushAt;
     private Set<OracleEntry> lastPushEntries = Set.of();
+    /** Set by {@link #shutdown}: every later push is UNCOVERED {@code why=shutdown} at once (R-c). */
+    private boolean stopped;
 
     /** Connected time: closed spans, plus the open one up to the latest instant seen. */
     private long closedMillis;
@@ -281,17 +307,26 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         events.debug("push", "push=" + seq + " n=" + parsed.entries().size() + " chars=" + chars
                 + " ts=" + serverTimestamp + " dly_ms=" + dlyMs);
 
+        if (stopped) {
+            // R-c: the comparator has shut down, but the client has not stopped yet — still one line.
+            emit(uncovered(seq, entries.size(), hash, "shutdown", gapS, dlyMs));
+            return;
+        }
         if (pushedHashes.containsKey(hash)) {
             // A repeat: the API may already be on it.
             if (apiLast != null && apiLast.hash().equals(hash)) {
-                emit(matched(seq, entries.size(), hash, 0, 1, gapS, dlyMs));
+                if (preConnect(apiLast, connOpenSince)) {
+                    emit(uncovered(seq, entries.size(), hash, "pre-connect", gapS, dlyMs));
+                } else {
+                    emit(matched(seq, entries.size(), hash, 0, 1, gapS, dlyMs));
+                }
             } else {
-                pending.add(new Pending(seq, at, hash, entries, 1, gapS, dlyMs));
+                pending.add(new Pending(seq, at, hash, entries, 1, gapS, dlyMs, connOpenSince));
             }
         } else {
             ApiChange ahead = firstChangeTo(hash, at);
             if (ahead == null) {
-                pending.add(new Pending(seq, at, hash, entries, 0, gapS, dlyMs));
+                pending.add(new Pending(seq, at, hash, entries, 0, gapS, dlyMs, connOpenSince));
             } else if (ahead.judgeable) {
                 ahead.reported = true;
                 emit(apiAhead(seq, entries.size(), hash, seconds(ahead.at, at), gapS, dlyMs));
@@ -329,7 +364,8 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
                 apiChanges.removeFirst();
             }
         }
-        apiLast = new ApiState(hash, held, at);
+        Instant since = apiLast != null && apiLast.hash().equals(hash) ? apiLast.since() : at;
+        apiLast = new ApiState(hash, held, at, since);
         Iterator<Pending> waiting = pending.iterator();
         while (waiting.hasNext()) {
             Pending p = waiting.next();
@@ -339,7 +375,12 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
             p.apiObservations++;
             if (p.hash.equals(hash)) {
                 waiting.remove();
-                long lag = seconds(p.at, at);
+                if (preConnect(apiLast, p.connOpenedAt)) {
+                    emit(uncovered(p.seq, p.entries.size(), p.hash, "pre-connect", p.gapS, p.dlyMs));
+                    continue;
+                }
+                // R-b: a load handed off after a push stamped just after it is "not behind", never negative.
+                long lag = Math.max(0, seconds(p.at, at));
                 if (p.rep == 0) {
                     lastLagSeconds = lag;
                 }
@@ -382,9 +423,10 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         apiChanges.removeIf(change -> change.at.isBefore(horizon));
     }
 
-    /** The node is stopping: every push still waiting is UNCOVERED. */
+    /** The node is stopping: every push still waiting is UNCOVERED, and so is every push after this (R-c). */
     void shutdown(Instant now) {
         advance(now);
+        stopped = true;
         for (Pending p : pending) {
             emit(uncovered(p.seq, p.entries.size(), p.hash, "shutdown", p.gapS, p.dlyMs));
         }
@@ -437,6 +479,14 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         List<String> shown = units.size() <= DETAIL_UNITS ? units : units.subList(0, DETAIL_UNITS);
         String more = units.size() > DETAIL_UNITS ? ",+" + (units.size() - DETAIL_UNITS) : "";
         return "[" + String.join(",", shown) + more + "]";
+    }
+
+    /**
+     * R-a: the API was already serving {@code api}'s content before the push's connection opened — its baseline,
+     * not a change this node watched — so a match against it would invent a lag.
+     */
+    private static boolean preConnect(ApiState api, Instant connOpenedAt) {
+        return connOpenedAt != null && api.since().isBefore(connOpenedAt);
     }
 
     /** The earliest remembered API change to {@code hash} strictly before {@code at}, or null. */

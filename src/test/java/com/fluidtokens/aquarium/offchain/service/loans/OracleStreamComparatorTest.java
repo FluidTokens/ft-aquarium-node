@@ -133,6 +133,107 @@ class OracleStreamComparatorTest {
         assertEquals(20.0, lag(), "the last rep=0 match (push 2)");
     }
 
+    /**
+     * r2 (d), the window's own edge: an API load exactly {@link OracleStreamComparator#WINDOW} after the push still
+     * counts — MATCHED {@code lag_s=300}.
+     */
+    @Test
+    void anApiLoadExactlyWindowAfterThePushIsStillMatched() {
+        comparator.onOpen(OPEN);
+        push(OPEN.plusSeconds(10), a1);
+        comparator.onApiLoad(OPEN.plusSeconds(10).plus(OracleStreamComparator.WINDOW), entries(a1));
+
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=300 rep=0 gap_s=10 dly_ms=100"),
+                cmpFields());
+        assertEquals(300.0, lag());
+        assertCounts(1, 0, 0, 0, 0);
+    }
+
+    /**
+     * r2 R-b, the hand-off race: the poller loads at L and hands its result to the stream thread; a push stamped
+     * 3 ms after L is processed BEFORE that hand-off. The push waits, then the load at L matches it — 3 ms "before"
+     * it. {@code lag_s} and the gauge are clamped at 0: not behind, within the measurement error.
+     */
+    @Test
+    void aLoadHandedOffAfterAPushStampedJustAfterItIsLagZeroNeverNegative() {
+        comparator.onOpen(OPEN);
+        comparator.onApiLoad(OPEN.plusSeconds(10), entries(a1));
+        Instant loadedAt = OPEN.plusSeconds(200);
+        push(loadedAt.plusMillis(3), p1);
+        assertEquals(List.of(), cmpFields(), "fixture: the load has not reached the stream thread yet");
+        comparator.onApiLoad(loadedAt, entries(p1));
+
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=0 rep=0 gap_s=200 dly_ms=100"),
+                cmpFields());
+        assertEquals(0.0, lag(), "the gauge is clamped too");
+        assertCounts(1, 0, 0, 0, 0);
+    }
+
+    // ======================================================================================
+    // R-a: no invented lag from the API's state before this connection
+    // ======================================================================================
+
+    /**
+     * r2 R-a, the shape production starts in: the poller's load (the seed) is older than the connection, the first
+     * push after connecting carries what the API already served, and the next poll serves it again. That is not a
+     * lag — the API had it before this node was listening — so the push is UNCOVERED {@code why=pre-connect} and
+     * the lag gauge stays NaN.
+     */
+    @Test
+    void aPushTheApiAlreadyServedBeforeTheConnectionOpenedIsUncoveredPreConnect() {
+        comparator.onApiLoad(OPEN.minusSeconds(60), entries(a1));
+        comparator.onOpen(OPEN);
+        push(OPEN.plusSeconds(100), a1);
+        assertEquals(List.of(), cmpFields(), "no API change to it: it waits for the next load");
+        comparator.onApiLoad(OPEN.plusSeconds(120), entries(a1));
+
+        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100"),
+                cmpFields());
+        assertEquals(Level.INFO, cmpEvents().getFirst().getLevel());
+        assertEquals(Double.NaN, lag(), "the lag gauge does not move");
+        assertCounts(0, 0, 0, 0, 1);
+
+        comparator.tick(OPEN.plusSeconds(900));
+        assertOneLinePerPush(1);
+    }
+
+    /**
+     * r2 R-a, the same rule on the repeat path: a repeat after a reconnect, the API on it since before that
+     * reconnect, is UNCOVERED {@code why=pre-connect} rather than MATCHED {@code rep=1}. Before the reconnect the
+     * same repeat matched, which is the control.
+     */
+    @Test
+    void aRepeatPushTheApiWasOnBeforeAReconnectIsUncoveredPreConnect() {
+        comparator.onOpen(OPEN);
+        push(OPEN.plusSeconds(10), a1);
+        comparator.onApiLoad(OPEN.plusSeconds(20), entries(a1));
+        push(OPEN.plusSeconds(40), a1);
+        comparator.onClose(OPEN.plusSeconds(100), "no-pong");
+        comparator.onOpen(OPEN.plusSeconds(200));
+        comparator.onApiLoad(OPEN.plusSeconds(230), entries(a1));
+        push(OPEN.plusSeconds(250), a1);
+
+        assertEquals(List.of(
+                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=10 dly_ms=100",
+                "push=2 out=MATCHED n=5 h=" + h(a1) + " lag_s=0 rep=1 gap_s=30 dly_ms=100",
+                "push=3 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=50 dly_ms=100"), cmpFields());
+        assertEquals(10.0, lag());
+        assertCounts(2, 0, 0, 0, 1);
+    }
+
+    /** r2 R-a's boundary: an API change after the connection opened is a change this node watched — MATCHED. */
+    @Test
+    void aPushTheApiMovedToAfterTheConnectionOpenedIsMatched() {
+        comparator.onApiLoad(OPEN.minusSeconds(60), entries(a1));
+        comparator.onOpen(OPEN);
+        push(OPEN.plusSeconds(100), p1);
+        comparator.onApiLoad(OPEN.plusSeconds(120), entries(p1));
+
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=20 rep=0 gap_s=100 dly_ms=100"),
+                cmpFields());
+        assertEquals(20.0, lag());
+    }
+
     // ======================================================================================
     // SUPERSEDED
     // ======================================================================================
@@ -155,6 +256,25 @@ class OracleStreamComparatorTest {
                 "push=2 out=SUPERSEDED n=5 h=" + h(p1) + " by=3 gap_s=10 dly_ms=100",
                 "push=3 out=UNCOVERED n=5 h=" + h(p2) + " why=no-api gap_s=10 dly_ms=100"), cmpFields());
         assertCounts(0, 2, 0, 0, 1);
+    }
+
+    /**
+     * r2 (c), the supersede rule's {@code hash ≠ h} clause: a repeat of the SAME entries does not supersede the push
+     * before it. Both are then judged on the API they saw — MISMATCH — and push 1 is never SUPERSEDED by push 2.
+     */
+    @Test
+    void aRepeatOfTheSameEntriesDoesNotSupersedeThePushBeforeIt() {
+        comparator.onOpen(OPEN);
+        push(OPEN.plusSeconds(10), a1);
+        push(OPEN.plusSeconds(20), a1);
+        comparator.onApiLoad(OPEN.plusSeconds(30), entries(p2));
+        comparator.tick(OPEN.plusSeconds(400));
+
+        assertEquals(List.of(
+                "push=1 out=MISMATCH n=5 h=" + h(a1) + " api=" + h(p2) + " api_n=5 gap_s=10 dly_ms=100",
+                "push=2 out=MISMATCH n=5 h=" + h(a1) + " api=" + h(p2) + " api_n=5 gap_s=10 dly_ms=100"),
+                cmpFields());
+        assertCounts(0, 0, 2, 0, 0);
     }
 
     // ======================================================================================
@@ -283,6 +403,26 @@ class OracleStreamComparatorTest {
         assertEquals(List.of("push=1 out=API_AHEAD n=5 h=" + h(p1) + " lead_s=30 gap_s=150 dly_ms=100"), cmpFields());
     }
 
+    /**
+     * r2 (d), {@code a < t} in the API_AHEAD rule: an API change at the very instant of the push is not "ahead" of
+     * it. The push waits, and the next load serves it: MATCHED.
+     */
+    @Test
+    void anApiChangeAtTheSameInstantAsThePushIsNotApiAhead() {
+        comparator.onOpen(OPEN);
+        comparator.onApiLoad(OPEN.plusSeconds(10), entries(a1));
+        comparator.onApiLoad(OPEN.plusSeconds(200), entries(p1));
+        push(OPEN.plusSeconds(200), p1);
+        assertEquals(List.of(), cmpFields(), "a change at t is not before t");
+        comparator.onApiLoad(OPEN.plusSeconds(230), entries(p1));
+
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=30 rep=0 gap_s=200 dly_ms=100"),
+                cmpFields());
+        assertCounts(1, 0, 0, 0, 0);
+        comparator.tick(OPEN.plusSeconds(900));
+        assertEquals(1, cmpFields().size(), "the change the push carried is no orphan either");
+    }
+
     @Test
     void anApiChangeWhileDisconnectedIsNotJudged() {
         comparator.onApiLoad(OPEN.minusSeconds(600), entries(a1));
@@ -325,6 +465,28 @@ class OracleStreamComparatorTest {
                 "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=10 dly_ms=100",
                 "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=shutdown gap_s=10 dly_ms=100"), cmpFields());
         assertCounts(0, 0, 0, 0, 2);
+    }
+
+    /**
+     * r2 R-c: after the comparator's shutdown — the launcher's stop() runs it before it stops the client — a push
+     * that still lands is resolved at once as UNCOVERED {@code why=shutdown}, never left without a line.
+     */
+    @Test
+    void aPushAfterShutdownIsUncoveredShutdownAtOnce() {
+        comparator.onOpen(OPEN);
+        push(OPEN.plusSeconds(10), a1);
+        comparator.shutdown(OPEN.plusSeconds(20));
+        push(OPEN.plusSeconds(21), p1);
+        push(OPEN.plusSeconds(22), a1);
+
+        assertEquals(List.of(
+                "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=10 dly_ms=100",
+                "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=shutdown gap_s=11 dly_ms=100",
+                "push=3 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=1 dly_ms=100"), cmpFields());
+        comparator.onApiLoad(OPEN.plusSeconds(25), entries(p1));
+        comparator.tick(OPEN.plusSeconds(900));
+        assertOneLinePerPush(3);
+        assertCounts(0, 0, 0, 0, 3);
     }
 
     /** More than {@link OracleStreamComparator#MAX_PENDING} waiting: the oldest is UNCOVERED {@code why=overflow}. */
@@ -397,6 +559,7 @@ class OracleStreamComparatorTest {
                 OracleStreamComparator.apiAhead(push, n, h, 999_999, gap, dly),
                 OracleStreamComparator.apiAheadOrphan(n, h),
                 OracleStreamComparator.uncovered(push, n, h, "unjudgeable", gap, dly),
+                OracleStreamComparator.uncovered(push, n, h, "pre-connect", gap, dly),
                 OracleStreamComparator.uncovered(push, n, h, "shutdown", gap, dly),
                 OracleStreamComparator.uncovered(push, n, h, "overflow", gap, dly),
                 OracleStreamComparator.uncovered(push, n, h, "no-api", gap, dly));
