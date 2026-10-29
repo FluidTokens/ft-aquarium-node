@@ -14,6 +14,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
@@ -56,7 +58,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>FAB-174-2 audit residue R2 (a throwing listener), R4 (the ladder against an injected clock) and R5
  *       (a close that overtakes the handshake's completion);</li>
  *   <li>r3: an ended connection's pong deadline never kills the next connection (F2), and a failure right after
- *       a proactive reconnect waits the first transport step (F4).</li>
+ *       a proactive reconnect waits the first transport step (F4);</li>
+ *   <li>FAB-174-3 audit residue R-1 (break-then-make against a server that never answers the Close) and R-2 (an
+ *       attempt that never opened counts no disconnect).</li>
  * </ul>
  *
  * <p>⛔ <b>Every assertion on a CLIENT-side fact — a counter, {@code status()}, a close reason, a log line — first
@@ -205,6 +209,41 @@ class OracleStreamClientLivenessTest {
                 "the proactive disconnect counted");
         await(() -> !recorder.closeReasons.isEmpty(), WAIT, "onClose");
         assertEquals("proactive", recorder.closeReasons.getFirst());
+    }
+
+    /**
+     * FAB-174-3 audit residue R-1: break-then-make, made deterministic. The server never answers the client's
+     * Close frame, so connection 1 ends only by the client's abort after {@link OracleStreamClient#CLOSE_GRACE}.
+     * Against a server that does answer, a client opening the new socket BEFORE closing the old one still passed
+     * the case above: its Close frame, sent microseconds after the new TCP connect, reached the server first. Here
+     * the second request can only arrive once the close has been given its full grace.
+     */
+    @Test
+    void theProactiveReconnectWaitsOutTheCloseGraceBeforeTheNextRequestWhenTheServerNeverAnswersTheClose() {
+        server = new OracleStreamTestServer().ignoreClientClose(true).start();
+        start(server.uri(), timings(Duration.ofSeconds(30), Duration.ofSeconds(10), Duration.ofMillis(500), 1.0));
+        OracleStreamTestServer.Session first = server.awaitSession(0, WAIT);
+        server.awaitSession(1, WAIT);
+
+        Instant closeFrame = first.clientCloseAt;
+        assertNotNull(closeFrame, "fixture: connection 1's Close frame reached the server, which swallowed it");
+        Instant secondRequest = server.requestTimes().get(1);
+        long tolerance = 100;
+        long afterClose = Duration.between(closeFrame, secondRequest).toMillis();
+        assertTrue(afterClose >= OracleStreamClient.CLOSE_GRACE.toMillis() - tolerance,
+                "request 2 arrived " + afterClose + " ms after connection 1's Close frame; break-then-make waits "
+                        + "the close grace of " + OracleStreamClient.CLOSE_GRACE.toMillis() + " ms first");
+        assertNotNull(first.closedAt, "connection 1 was closed or aborted");
+        assertTrue(Duration.between(closeFrame, first.closedAt).toMillis()
+                        >= OracleStreamClient.CLOSE_GRACE.toMillis() - tolerance,
+                "fixture: connection 1 ended by the client's abort after the grace, not by a closing handshake: "
+                        + Duration.between(closeFrame, first.closedAt).toMillis() + " ms after its Close frame");
+        assertFalse(first.closedAt.isAfter(secondRequest),
+                "connection 1 ended at " + first.closedAt + ", after request 2 at " + secondRequest);
+        await(() -> recorder.opens.size() >= 2, WAIT, "the second onOpen");
+        List<String> reasons = List.copyOf(recorder.closeReasons);
+        assertFalse(reasons.isEmpty(), "onClose for connection 1");
+        assertTrue(reasons.stream().allMatch("proactive"::equals), "proactive ends only: " + reasons);
     }
 
     /**
@@ -457,6 +496,52 @@ class OracleStreamClientLivenessTest {
         assertEquals(0.0, gauge(OracleStreamClient.METER_CONNECTED));
         assertEquals(0.0, counter(OracleStreamClient.METER_DISCONNECTS, "reason", "no_pong"));
         assertEquals(0.0, counter(OracleStreamClient.METER_DISCONNECTS, "reason", "proactive"));
+    }
+
+    /**
+     * FAB-174-3 audit residue R-2: a disconnect is the end of a connection that OPENED. Attempts that never
+     * opened — a handshake that times out, and a TCP connect refused — end the transport way and move no
+     * {@code disconnects} counter, under any reason.
+     */
+    @Test
+    void anAttemptThatNeverOpenedCountsNoDisconnect() throws IOException {
+        Duration handshake = Duration.ofMillis(300);
+        OracleStreamClient.Timings quick = new OracleStreamClient.Timings(Duration.ofSeconds(2), handshake,
+                Duration.ofSeconds(30), Duration.ofSeconds(10), LONG, 0.05);
+        int refusedPort;
+        try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            refusedPort = probe.getLocalPort(); // closed below: nothing listens there
+        }
+        try (OracleStreamTestServer.Hanging hanging = new OracleStreamTestServer.Hanging()) {
+            for (URI target : List.of(hanging.uri(), URI.create("ws://127.0.0.1:" + refusedPort + "/dev"))) {
+                SimpleMeterRegistry meters = new SimpleMeterRegistry();
+                ScheduledExecutorService stream = newScheduler();
+                ExecutorService transport = Executors.newCachedThreadPool(r -> daemon(r, "oracle-stream-io"));
+                OracleStreamClient never = new OracleStreamClient(target, new OracleStreamAuth(account), quick,
+                        Clock.systemUTC(), recorder, new OracleStreamLog(), stream, transport, () -> false, meters,
+                        new OracleStreamRetryPolicy(MID));
+                int before = linesOf("closed").size();
+                try {
+                    never.start();
+                    await(() -> linesOf("closed").size() >= before + 2, WAIT, "two ended attempts against " + target);
+                    await(() -> never.status().state() == OracleStreamClient.Status.State.RETRYING, WAIT,
+                            "RETRYING against " + target);
+                    assertTrue(linesOf("closed").get(before).contains(" reason=error("), linesOf("closed").get(before));
+                    for (String reason : OracleStreamClient.DISCONNECT_REASONS) {
+                        assertEquals(0.0, meters.get(OracleStreamClient.METER_DISCONNECTS).tag("reason", reason)
+                                .counter().count(), target + ": an attempt that never opened counted under " + reason);
+                    }
+                    assertEquals(0.0, meters.get(OracleStreamClient.METER_CONNECTED).gauge().value());
+                } finally {
+                    never.stop();
+                    stream.shutdownNow();
+                    transport.shutdownNow();
+                }
+            }
+            assertTrue(hanging.accepted() >= 1, "fixture: the client reached the hanging listener");
+        }
+        assertEquals(List.of(), recorder.opens, "fixture: nothing ever opened");
+        assertEquals(List.of(), recorder.closeReasons, "no onClose for a connection that never opened");
     }
 
     @Test

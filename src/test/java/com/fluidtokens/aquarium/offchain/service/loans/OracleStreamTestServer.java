@@ -7,13 +7,18 @@ import com.bloxbean.cardano.client.cip.cip8.COSESign1;
 import com.bloxbean.cardano.client.util.HexUtil;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
+import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.ContinuationWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.PingWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.PongWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
 import io.netty.handler.codec.http.websocketx.WebSocketFrame;
+import io.netty.util.ReferenceCountUtil;
+import reactor.netty.NettyPipeline;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 import reactor.netty.DisposableServer;
@@ -57,7 +62,9 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  *       measured 401;</li>
  *   <li><b>accept</b> — open the WebSocket with {@code handlePing(true)}, so every ping reaches the handler
  *       and is counted. When pings are answered the handler pongs them itself; when ignored, no pong is
- *       ever sent.</li>
+ *       ever sent. With {@link #ignoreClientClose(boolean)}, the client's Close frame is recorded and
+ *       swallowed before Reactor Netty can answer it, so the client's closing handshake never completes and
+ *       only its own abort ends the connection (FAB-174-3 audit residue R-1).</li>
  * </ul>
  * Per connection it records the open and close instants, the raw query and the pings received, and can push a
  * text message as one frame or as a {@code TextWebSocketFrame(false, ...)} followed by continuation frames,
@@ -76,6 +83,7 @@ final class OracleStreamTestServer implements AutoCloseable {
     static final String REFUSED_401 = "{\"message\":\"invalid signature or ts older than 2 minutes\"}";
 
     private final AtomicInteger requests = new AtomicInteger();
+    private final List<Instant> requestTimes = new CopyOnWriteArrayList<>();
     private final List<Session> sessions = new CopyOnWriteArrayList<>();
     private final List<String> queries = new CopyOnWriteArrayList<>();
     private final List<String> authFailures = new CopyOnWriteArrayList<>();
@@ -84,6 +92,7 @@ final class OracleStreamTestServer implements AutoCloseable {
     private volatile String refuseBody;
     private volatile String expectedStakeAddress;
     private volatile boolean answerPings = true;
+    private volatile boolean ignoreClientClose;
     private DisposableServer server;
 
     /** Refuse every handshake with this status and body. */
@@ -104,6 +113,15 @@ final class OracleStreamTestServer implements AutoCloseable {
         return this;
     }
 
+    /**
+     * Never answer the client's Close frame: record when it arrived ({@link Session#clientCloseAt}) and drop it,
+     * so the connection stays open until the client aborts it. Read per session at its handshake.
+     */
+    OracleStreamTestServer ignoreClientClose(boolean ignore) {
+        this.ignoreClientClose = ignore;
+        return this;
+    }
+
     OracleStreamTestServer start() {
         server = HttpServer.create()
                 .host("127.0.0.1")
@@ -120,6 +138,11 @@ final class OracleStreamTestServer implements AutoCloseable {
     /** Every HTTP request seen, refused or not. */
     int requests() {
         return requests.get();
+    }
+
+    /** When each HTTP request reached this server, in order. */
+    List<Instant> requestTimes() {
+        return requestTimes;
     }
 
     List<Session> sessions() {
@@ -149,6 +172,7 @@ final class OracleStreamTestServer implements AutoCloseable {
     }
 
     private org.reactivestreams.Publisher<Void> handle(HttpServerRequest request, HttpServerResponse response) {
+        requestTimes.add(Instant.now());
         requests.incrementAndGet();
         String uri = request.uri();
         int q = uri.indexOf('?');
@@ -167,7 +191,8 @@ final class OracleStreamTestServer implements AutoCloseable {
         }
         Session session = new Session(query);
         boolean pong = answerPings;
-        return response.sendWebsocket((in, out) -> session.run(in, out, pong),
+        boolean silentOnClose = ignoreClientClose;
+        return response.sendWebsocket((in, out) -> session.run(in, out, pong, silentOnClose),
                 WebsocketServerSpec.builder().handlePing(true).build());
     }
 
@@ -248,6 +273,8 @@ final class OracleStreamTestServer implements AutoCloseable {
         final String query;
         final Instant openedAt = Instant.now();
         volatile Instant closedAt;
+        /** When the client's Close frame arrived; recorded only in {@link #ignoreClientClose(boolean)} mode. */
+        volatile Instant clientCloseAt;
         final AtomicInteger pings = new AtomicInteger();
         final AtomicInteger framesSent = new AtomicInteger();
         private final Sinks.Many<WebSocketFrame> outbound = Sinks.many().unicast().onBackpressureBuffer();
@@ -258,7 +285,8 @@ final class OracleStreamTestServer implements AutoCloseable {
             this.query = query;
         }
 
-        private org.reactivestreams.Publisher<Void> run(WebsocketInbound in, WebsocketOutbound out, boolean pong) {
+        private org.reactivestreams.Publisher<Void> run(WebsocketInbound in, WebsocketOutbound out, boolean pong,
+                                                        boolean silentOnClose) {
             this.out = out;
             in.withConnection(connection -> {
                 this.connection = connection;
@@ -267,6 +295,23 @@ final class OracleStreamTestServer implements AutoCloseable {
                         closedAt = Instant.now();
                     }
                 });
+                if (silentOnClose) {
+                    // Ahead of Reactor Netty's bridge, which would answer the Close frame and end the connection.
+                    connection.channel().pipeline().addBefore(NettyPipeline.ReactiveBridge, "ignore-client-close",
+                            new ChannelInboundHandlerAdapter() {
+                                @Override
+                                public void channelRead(ChannelHandlerContext ctx, Object msg) {
+                                    if (msg instanceof CloseWebSocketFrame) {
+                                        if (clientCloseAt == null) {
+                                            clientCloseAt = Instant.now();
+                                        }
+                                        ReferenceCountUtil.release(msg);
+                                        return;
+                                    }
+                                    ctx.fireChannelRead(msg);
+                                }
+                            });
+                }
             });
             sessions.add(this);
             Mono<Void> inbound = in.receiveFrames()
