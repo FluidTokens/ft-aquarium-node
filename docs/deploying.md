@@ -671,10 +671,11 @@ line at startup saying the check is off and never contacts GitHub.
 ### The oracle stream (shadow)
 
 On by default, the node also holds one WebSocket open to FluidTokens' oracle stream, which pushes prices
-as they change. It signs in with the wallet's own stake key — it sends the stake address, the time and a
-signature, and no new secret is involved — and FluidTokens allows one connection per staking bond. It is a
-**shadow**: each push is only logged as an `[oracle-stream]` line, and no decision reads it; prices still
-come from the HTTP registry. To turn it off, set `LOANS_ORACLE_STREAM_ENABLED=false` in `docker/.env`.
+as they change. It signs in with the wallet's own stake key — it sends the stake address, the stake public
+key, the time and a signature, and no new secret is involved — and FluidTokens allows one connection per
+staking bond. It is a **shadow**: each push is only logged as an `[oracle-stream]` line, and no decision
+reads it; prices still come from the HTTP registry. To turn it off, set `LOANS_ORACLE_STREAM_ENABLED=false`
+in `docker/.env`.
 Every log line, metric and refusal is explained in [oracle-stream.md](oracle-stream.md).
 
 ---

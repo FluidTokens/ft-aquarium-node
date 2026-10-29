@@ -32,8 +32,11 @@ LOANS_ORACLE_STREAM_ENABLED=false
 ```
 
 The node then logs one line at startup — `[oracle-stream] off … reason=disabled` — and opens no
-connection. Any value other than `true` or `false` is refused with a WARN (`reason=unrecognised-enabled`)
-and the stream stays off.
+connection. Unset or blank means on; `true` and `false` are case-insensitive; any other value is refused
+with a WARN (`reason=unrecognised-enabled`) and the stream stays off.
+
+⚠ **An empty `LOANS_ORACLE_STREAM_ENABLED=` line in `docker/.env` turns the stream ON**, not off — blank
+means on. To turn it off, write `false`.
 
 It also stays off, with one INFO line saying why, when:
 
@@ -65,9 +68,10 @@ The node refuses, with a WARN and the stream off:
 The node signs in with **its own wallet's stake key** — the one derived from `WALLET_MNEMONIC` (and
 `WALLET_ACCOUNT_INDEX`), the same key your Aquarium staking bond is named after. You configure nothing.
 
-On every connection attempt it sends the wallet's stake address, the current time, and a CIP-30
-signature over a fixed text containing both. The signature is valid for two minutes, is never written to
-the log, and proves only that this node holds the stake key; it authorises nothing on chain.
+On every connection attempt it sends the wallet's stake address, the stake public key, the current time,
+and a CIP-30 signature over a fixed text containing the stake address and the time. The signature is
+valid for two minutes, is never written to the log, and proves only that this node holds the stake key;
+it authorises nothing on chain.
 
 **One connection per bond.** FluidTokens' server grants one open connection for each 30,000 FLDT
 Aquarium staking bond. A second node on the same bond — a standby, or a test node started from the same
