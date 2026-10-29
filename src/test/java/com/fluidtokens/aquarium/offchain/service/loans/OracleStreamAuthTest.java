@@ -83,7 +83,7 @@ class OracleStreamAuthTest {
             assertFalse(shown.contains(secret), "toString() carries " + secret);
         }
         assertFalse(new OracleStreamClient(BASE, auth, OracleStreamClient.Timings.PRODUCTION, null, null, null,
-                null, null).toString().contains("?"), "the client's toString() carries no query");
+                null, null, null, null).toString().contains("?"), "the client's toString() carries no query");
     }
 
     /**

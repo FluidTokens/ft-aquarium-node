@@ -281,6 +281,27 @@
     </div>
   </div>
 
+  <!--/* FAB-174: the SHADOW oracle stream, one quiet line. Nothing the bot decides reads it, and the line says so;
+         /healthcheck never includes it. Every value is th:text: the refusal message is server text. */-->
+  <div class="note oracle-stream" th:if="${oracleStream != null}" title="shadow only — no decision reads it"
+       style="color:var(--muted)">
+    <th:block th:switch="${oracleStream.state.name()}">
+      <span th:case="'OFF'" th:text="|Oracle stream (shadow): off — ${oracleStream.detail}|">off</span>
+      <span th:case="'CONNECTING'">Oracle stream (shadow): connecting…</span>
+      <th:block th:case="'CONNECTED'">
+        <span th:if="${oracleStream.lastPushAt == null}"
+              th:text="|Oracle stream (shadow): connected ${oracleStream.since} — no push yet (pushes arrive only when a price changes)|">connected</span>
+        <span th:if="${oracleStream.lastPushAt != null}"
+              th:text="|Oracle stream (shadow): connected ${oracleStream.since} · last push ${oracleStream.lastPushAt} · ${oracleStream.pushes} pushes|">connected</span>
+      </th:block>
+      <span th:case="'RETRYING'"
+            th:text="|Oracle stream (shadow): disconnected (${oracleStream.detail}) — retrying at ${oracleStream.nextAttemptAt}|">disconnected</span>
+      <span th:case="'REFUSED'"
+            th:text="|Oracle stream (shadow): refused ${oracleStream.refusalStatus} — ${oracleStream.refusalMessage} — retrying at ${oracleStream.nextAttemptAt}|">refused</span>
+    </th:block>
+    <span>· no decision reads it</span>
+  </div>
+
   <!-- ⛔ FAB-115: a Lending v4 config mismatch no longer stops the node; it closes the lending gate.
        Said first and loudly, because every row below will still render. -->
   <div th:if="${lendingConfigBlocked}" class="note" style="color:var(--warn);font-weight:600">

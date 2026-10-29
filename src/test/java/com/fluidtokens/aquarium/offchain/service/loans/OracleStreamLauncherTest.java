@@ -8,6 +8,9 @@ import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
+import com.fluidtokens.aquarium.offchain.service.StakerService;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.annotation.PreDestroy;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -145,7 +148,7 @@ class OracleStreamLauncherTest {
         server = new OracleStreamTestServer().start();
         String resolvedUrl = url.replace(SERVER, server.uri().toString());
         ObjectProvider<FluidOracleClient> oracle = apiOracle ? present() : absent();
-        launcher = assertDoesNotThrow(() -> new OracleStreamLauncher(account, network(network), oracle, enabled,
+        launcher = assertDoesNotThrow(() -> new OracleStreamLauncher(account, network(network), oracle, staker(), meters(), enabled,
                 resolvedUrl));
         appender.list.clear();
 
@@ -166,7 +169,7 @@ class OracleStreamLauncherTest {
 
     @Test
     void constructionNeverThrowsEvenWithGarbageAndStartSaysWhyItIsOff() {
-        launcher = assertDoesNotThrow(() -> new OracleStreamLauncher(null, null, null, null, null));
+        launcher = assertDoesNotThrow(() -> new OracleStreamLauncher(null, null, null, null, null, null, null));
         assertDoesNotThrow(launcher::start);
         List<ILoggingEvent> lines = streamLines();
         assertEquals(1, lines.size(), messages(lines).toString());
@@ -176,7 +179,7 @@ class OracleStreamLauncherTest {
                 lines.getFirst().getFormattedMessage());
 
         appender.list.clear();
-        OracleStreamLauncher garbage = assertDoesNotThrow(() -> new OracleStreamLauncher(null, null, null,
+        OracleStreamLauncher garbage = assertDoesNotThrow(() -> new OracleStreamLauncher(null, null, null, null, null,
                 " \u0000 yes\nplease, a long one", "::::"));
         assertDoesNotThrow(garbage::start);
         assertDoesNotThrow(garbage::stop);
@@ -187,6 +190,132 @@ class OracleStreamLauncherTest {
         assertFalse(line.chars().anyMatch(Character::isISOControl), "no control character reaches the line: " + line);
         String value = line.substring(line.indexOf("value=") + "value=".length());
         assertTrue(value.length() <= 16 && !value.contains(" "), "first 16 chars, no spaces: '" + value + "'");
+    }
+
+    // ======================================================================================
+    // status(): what the readiness page reads
+    // ======================================================================================
+
+    /** Each OFF state is reported by {@code status()} as OFF, its detail beginning with the line's reason token. */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("offStates")
+    void eachOffStateIsReportedByStatusWithItsReason(String name, String enabled, boolean apiOracle, String network,
+                                                     String url, Level level, String expected) {
+        server = new OracleStreamTestServer().start();
+        String resolvedUrl = url.replace(SERVER, server.uri().toString());
+        launcher = new OracleStreamLauncher(account, network(network), apiOracle ? present() : absent(), staker(),
+                meters(), enabled, resolvedUrl);
+        assertEquals(OracleStreamClient.Status.State.OFF, launcher.status().state(), "before start()");
+        assertEquals("not started", launcher.status().detail());
+
+        launcher.start();
+
+        String reason = expected.substring("reason=".length()).split(" ")[0];
+        OracleStreamClient.Status status = launcher.status();
+        assertEquals(OracleStreamClient.Status.State.OFF, status.state(), name);
+        assertNotNull(status.detail(), name);
+        assertTrue(status.detail().startsWith(reason + " ("), name + ": " + status.detail());
+        assertNotNull(status.since(), name);
+    }
+
+    @Test
+    void anInternalErrorIsReportedByStatusAsOffWithItsClass() {
+        launcher = new OracleStreamLauncher(null, null, null, null, null, null, null);
+        launcher.start();
+        assertEquals(OracleStreamClient.Status.State.OFF, launcher.status().state());
+        assertEquals("internal-error(NullPointerException)", launcher.status().detail());
+    }
+
+    @Test
+    void statusIsConnectedAfterTheOpenAndOffAfterStop() {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.start();
+        server.awaitSession(0, WAIT);
+        await(() -> launcher.status().state() == OracleStreamClient.Status.State.CONNECTED, WAIT, "CONNECTED");
+
+        OracleStreamClient.Status connected = launcher.status();
+        assertNotNull(connected.since());
+        assertNull(connected.lastPushAt(), "no push yet");
+        assertEquals(0, connected.pushes());
+
+        launcher.stop();
+        assertEquals(OracleStreamClient.Status.State.OFF, launcher.status().state());
+        assertEquals("stopped", launcher.status().detail());
+    }
+
+    // ======================================================================================
+    // FAB-174-2 residue R1: the default-ON path for the SHIPPED hosts
+    // ======================================================================================
+
+    /**
+     * Every ON case above connects to {@code ws://127.0.0.1}, which no network check can ever reject — so widening
+     * the host-mismatch check to refuse the node's OWN shipped host turned the stream off on both networks with
+     * the suite green. This decides with the URLs application.yaml actually ships, through the same pure
+     * function {@code start()} uses, and opens no socket.
+     */
+    @Test
+    void eachNetworkWithItsShippedUrlIsOnAtItsShippedHost() throws IOException {
+        Map<String, String> shipped = shippedUrls();
+        for (String network : List.of("mainnet", "preview")) {
+            String url = shipped.get(network);
+            OracleStreamLauncher.Decision decision = decide(network, url);
+            String host = network.equals("mainnet") ? OracleStreamLauncher.MAINNET_HOST : OracleStreamLauncher.PREVIEW_HOST;
+            assertTrue(decision.on(), network + " with its shipped URL must be ON: " + decision);
+            assertEquals("network=" + network + " host=" + host, decision.fields(),
+                    "the 'on' line's fields for " + network);
+            assertEquals(URI.create(url), decision.uri());
+            assertNull(decision.detail());
+        }
+        assertEquals("25mxd4whnj.execute-api.eu-west-1.amazonaws.com", OracleStreamLauncher.MAINNET_HOST);
+        assertEquals("2tgda3mk4l.execute-api.eu-west-1.amazonaws.com", OracleStreamLauncher.PREVIEW_HOST);
+    }
+
+    /** {@code wss://} is the shipped scheme, and accepting it is the point, not an accident of a ws-only check. */
+    @Test
+    void wssIsAcceptedOnPurpose() throws IOException {
+        for (String url : shippedUrls().values()) {
+            assertEquals("wss", URI.create(url).getScheme(), "fixture: the shipped URL is wss: " + url);
+            assertNotNull(OracleStreamLauncher.validUri(url), url);
+        }
+        assertNotNull(OracleStreamLauncher.validUri("WSS://" + OracleStreamLauncher.PREVIEW_HOST + "/dev"),
+                "the scheme is case-insensitive");
+        assertNotNull(OracleStreamLauncher.validUri("ws://127.0.0.1:1/dev"), "plain ws stays accepted (the tests' server)");
+        assertNull(OracleStreamLauncher.validUri("https://" + OracleStreamLauncher.PREVIEW_HOST + "/dev"));
+    }
+
+    /** And the check that exists for a reason still holds: each network on the OTHER's shipped host stays off. */
+    @Test
+    void eachNetworkOnTheOtherNetworksShippedHostStaysOffWithTheWarn() throws IOException {
+        Map<String, String> shipped = shippedUrls();
+        OracleStreamLauncher.Decision mainnet = decide("mainnet", shipped.get("preview"));
+        assertFalse(mainnet.on());
+        assertTrue(mainnet.warn(), "a mismatch is a WARN");
+        assertEquals("reason=url-network-mismatch network=mainnet host=" + OracleStreamLauncher.PREVIEW_HOST,
+                mainnet.fields());
+
+        OracleStreamLauncher.Decision preview = decide("preview", shipped.get("mainnet"));
+        assertFalse(preview.on());
+        assertTrue(preview.warn());
+        assertEquals("reason=url-network-mismatch network=preview host=" + OracleStreamLauncher.MAINNET_HOST,
+                preview.fields());
+    }
+
+    private static OracleStreamLauncher.Decision decide(String network, String url) {
+        return OracleStreamLauncher.decide("true", () -> true, network(network), url);
+    }
+
+    /** The default of each network's {@code loans.oracle.stream.url} placeholder, as application.yaml ships it. */
+    private static Map<String, String> shippedUrls() throws IOException {
+        List<PropertySource<?>> documents = new YamlPropertySourceLoader().load(RESOURCE, new ClassPathResource(RESOURCE));
+        PropertySource<?> preview = documents.stream()
+                .filter(d -> "preview".equals(String.valueOf(d.getProperty("spring.config.activate.on-profile"))))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no document activates the preview profile"));
+        return Map.of(
+                "mainnet", placeholderDefault(String.valueOf(documents.getFirst().getProperty("loans.oracle.stream.url"))),
+                "preview", placeholderDefault(String.valueOf(preview.getProperty("loans.oracle.stream.url"))));
     }
 
     // ======================================================================================
@@ -211,6 +340,8 @@ class OracleStreamLauncherTest {
                     }
                 })
                 .withBean(Account.class, () -> account)
+                .withBean(StakerService.class, OracleStreamLauncherTest::staker)
+                .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
                 .withBean(AppConfig.Network.class, () -> network("preview"))
                 .withBean(OracleStreamLauncher.class)
                 .run(context -> {
@@ -243,7 +374,7 @@ class OracleStreamLauncherTest {
     @Test
     void startReturnsAtOnceWhenTheHandshakeHangs() throws IOException {
         hanging = new OracleStreamTestServer.Hanging();
-        launcher = new OracleStreamLauncher(account, network("preview"), present(), "true", hanging.uri().toString());
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), "true", hanging.uri().toString());
         long started = System.nanoTime();
         launcher.start();
         long elapsedMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
@@ -264,7 +395,7 @@ class OracleStreamLauncherTest {
     @Test
     void stopLeavesNoStreamThreadAlive() {
         server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
-        launcher = new OracleStreamLauncher(account, network("preview"), present(), "true", server.uri().toString());
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), "true", server.uri().toString());
         launcher.start();
         launcher.start();
         server.awaitSession(0, WAIT);
@@ -340,7 +471,7 @@ class OracleStreamLauncherTest {
         assertEquals("", enabled, "the blank env var reaches the property");
         assertEquals(server.uri().toString(), url, "LOANS_ORACLE_STREAM_URL binds loans.oracle.stream.url");
 
-        launcher = new OracleStreamLauncher(account, network("preview"), present(), enabled, url);
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), enabled, url);
         launcher.start();
         server.awaitSession(0, WAIT);
         assertTrue(messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] on ")),
@@ -369,6 +500,15 @@ class OracleStreamLauncherTest {
     /** {@code ${NAME:default}} → {@code default}. */
     private static String placeholderDefault(String placeholder) {
         return placeholder.substring(placeholder.indexOf(':') + 1, placeholder.length() - 1);
+    }
+
+    /** A stake check that reads "no stake"; the launcher only ever reads it during a 403 hold. */
+    private static StakerService staker() {
+        return org.mockito.Mockito.mock(StakerService.class);
+    }
+
+    private static MeterRegistry meters() {
+        return new SimpleMeterRegistry();
     }
 
     private static ObjectProvider<FluidOracleClient> present() {

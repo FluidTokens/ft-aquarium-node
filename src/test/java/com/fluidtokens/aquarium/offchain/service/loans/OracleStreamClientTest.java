@@ -8,6 +8,7 @@ import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -61,7 +62,9 @@ class OracleStreamClientTest {
     private static final double RETRY_SCALE = 0.2;
     private static final OracleStreamClient.Timings TIMINGS = new OracleStreamClient.Timings(
             OracleStreamClient.Timings.PRODUCTION.tcpConnectTimeout(),
-            OracleStreamClient.Timings.PRODUCTION.handshakeTimeout(), PING, RETRY_SCALE);
+            OracleStreamClient.Timings.PRODUCTION.handshakeTimeout(), PING,
+            OracleStreamClient.Timings.PRODUCTION.pongTimeout(),
+            OracleStreamClient.Timings.PRODUCTION.proactiveReconnectAfter(), RETRY_SCALE);
     private static final Duration WAIT = Duration.ofSeconds(15);
     private static final String PREVIEW_PUSH = "/loans-v4/oracle-ws/preview-push-20261029T130459Z.json";
     private static final String MAINNET_REGISTRY = "/loans-v4/mainnet-oracle-registry-2026-10-01.json";
@@ -252,7 +255,7 @@ class OracleStreamClientTest {
 
         Instant closedAt = recorder.closes.getFirst();
         long delayMs = Duration.between(closedAt, second.openedAt).toMillis();
-        long step = OracleStreamClient.TRANSPORT_BACKOFF_SECONDS[0] * 1000L;
+        long step = OracleStreamRetryPolicy.TRANSPORT_LADDER_SECONDS[0] * 1000L;
         assertTrue(delayMs >= Math.round(step * 0.8 * RETRY_SCALE) - 20,
                 "reconnected after " + delayMs + " ms, sooner than the first step's lower bound");
         assertTrue(delayMs <= Math.round(step * 1.2 * RETRY_SCALE) + 2_000,
@@ -280,16 +283,21 @@ class OracleStreamClientTest {
         assertEquals(List.of(), recorder.opens);
     }
 
+    /**
+     * The pong timeout is set far beyond the window on purpose: this case counts pings, and an unanswered ping
+     * ending the connection is {@code OracleStreamClientLivenessTest}'s case, not this one's.
+     */
     @Test
     void atLeastThreePingsArriveWithinFourPingIntervals() {
         server = new OracleStreamTestServer().answerPings(false).start();
-        start(server.uri());
+        start(server.uri(), new OracleStreamClient.Timings(TIMINGS.tcpConnectTimeout(), TIMINGS.handshakeTimeout(),
+                PING, Duration.ofHours(1), TIMINGS.proactiveReconnectAfter(), RETRY_SCALE));
         OracleStreamTestServer.Session session = server.awaitSession(0, WAIT);
         Instant deadline = session.openedAt.plus(PING.multipliedBy(4));
         await(() -> !Instant.now().isBefore(deadline), WAIT, "four ping intervals");
 
         assertTrue(session.pings.get() >= 3, "pings within 4 x " + PING + ": " + session.pings.get());
-        assertTrue(session.open(), "unanswered pings do not end the connection in this slice");
+        assertTrue(session.open(), "unanswered pings do not end the connection before the pong timeout");
     }
 
     /**
@@ -362,11 +370,15 @@ class OracleStreamClientTest {
     }
 
     private void start(URI uri) {
+        start(uri, TIMINGS);
+    }
+
+    private void start(URI uri, OracleStreamClient.Timings timings) {
         AtomicInteger ioThreads = new AtomicInteger();
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> daemon(r, "oracle-stream"));
         io = Executors.newCachedThreadPool(r -> daemon(r, "oracle-stream-io-" + ioThreads.incrementAndGet()));
-        client = new OracleStreamClient(uri, new OracleStreamAuth(account), TIMINGS, Clock.systemUTC(), recorder,
-                new OracleStreamLog(), scheduler, io);
+        client = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, Clock.systemUTC(), recorder,
+                new OracleStreamLog(), scheduler, io, () -> false, new SimpleMeterRegistry());
         client.start();
     }
 

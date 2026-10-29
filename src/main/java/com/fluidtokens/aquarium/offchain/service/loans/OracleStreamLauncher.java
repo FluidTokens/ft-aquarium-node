@@ -2,6 +2,8 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.account.Account;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.service.StakerService;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,6 +22,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 /**
  * Starts the SHADOW oracle stream (FAB-174) once the node is ready, or says in one line why it does not.
@@ -40,7 +43,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * the transport — the same reasoning as {@code NodeVersionCheck}.
  *
  * <p>⛔ <b>Never throws</b>: not from the constructor (which only stores), not from {@link #start()}, not from
- * {@link #stop()}. A shadow must never be the reason a node fails to start.
+ * {@link #stop()}, not from {@link #status()}. A shadow must never be the reason a node fails to start.
+ *
+ * <p>The stake presence the client re-reads during a 403 hold is {@link StakerService}'s own verdict — read
+ * only on the {@code oracle-stream} thread, only during that hold, while no connection is open.
  */
 @Component
 public class OracleStreamLauncher {
@@ -55,6 +61,8 @@ public class OracleStreamLauncher {
     private final Account account;
     private final AppConfig.Network network;
     private final ObjectProvider<FluidOracleClient> oracleClient;
+    private final StakerService stakerService;
+    private final MeterRegistry meterRegistry;
     private final String enabled;
     private final String url;
     private final OracleStreamLog events = new OracleStreamLog();
@@ -66,16 +74,24 @@ public class OracleStreamLauncher {
     private boolean started;
     private ScheduledExecutorService scheduler;
     private ExecutorService io;
-    private OracleStreamClient client;
+    /** Read by {@link #status()} from any thread. */
+    private volatile OracleStreamClient client;
+    /** Why the stream is off while no client runs; what {@link #status()} reports then. */
+    private volatile String offDetail = "not started";
+    private volatile Instant offSince;
 
     @Autowired
     public OracleStreamLauncher(Account account, AppConfig.Network network,
                                 ObjectProvider<FluidOracleClient> oracleClient,
+                                StakerService stakerService,
+                                MeterRegistry meterRegistry,
                                 @Value("${loans.oracle.stream.enabled:true}") String enabled,
                                 @Value("${loans.oracle.stream.url:}") String url) {
         this.account = account;
         this.network = network;
         this.oracleClient = oracleClient;
+        this.stakerService = stakerService;
+        this.meterRegistry = meterRegistry;
         this.enabled = enabled;
         this.url = url;
     }
@@ -108,57 +124,122 @@ public class OracleStreamLauncher {
             launch();
         } catch (Throwable t) {
             shutDown();
-            events.warn("off", "reason=internal-error(" + OracleStreamLog.simpleName(t) + ")");
+            String reason = "internal-error(" + OracleStreamLog.simpleName(t) + ")";
+            off(reason);
+            events.warn("off", "reason=" + reason);
         }
     }
 
     @PreDestroy
     public synchronized void stop() {
         try {
+            off("stopped");
             shutDown();
         } catch (Throwable t) {
             // ⛔ never throws: this runs on Spring's shutdown path
         }
     }
 
-    /** The first state that matches wins, and says so in exactly one line. */
-    private void launch() {
+    /**
+     * Where the shadow stream stands, for the readiness page: the client's own status while it runs, otherwise
+     * OFF with why. Never blocks, never throws; safe from any thread.
+     */
+    public OracleStreamClient.Status status() {
+        try {
+            OracleStreamClient running = client;
+            return running != null ? running.status() : OracleStreamClient.Status.off(offDetail, offSince);
+        } catch (Throwable t) {
+            return OracleStreamClient.Status.off("internal-error(" + OracleStreamLog.simpleName(t) + ")", null);
+        }
+    }
+
+    private void off(String detail) {
+        Clock now = clock;
+        offSince = now == null ? null : now.instant();
+        offDetail = detail;
+    }
+
+    /**
+     * What {@link #start()} decides, before any thread exists: ON with the URI to connect to, or OFF with the
+     * one line that says why.
+     *
+     * @param uri    the stream URL when ON, null when OFF
+     * @param warn   the line is a WARN (an operator's setting is wrong) rather than an INFO
+     * @param fields the line's fields: {@code network=… host=…} when ON, {@code reason=…} when OFF
+     * @param text   the line's free text, or null
+     * @param detail OFF: why, for {@link #status()}, beginning with the reason token; null when ON
+     */
+    record Decision(URI uri, boolean warn, String fields, String text, String detail) {
+
+        boolean on() {
+            return uri != null;
+        }
+
+        private static Decision off(boolean warn, String fields, String text, String detail) {
+            return new Decision(null, warn, fields, text, detail);
+        }
+    }
+
+    /**
+     * The first state that matches wins. Pure: the inputs are read only as far as the decision needs them, in
+     * this order, so a setting that already turns the stream off never touches the oracle bean or the network.
+     * Package-private so the shipped hosts can be pinned without opening a socket.
+     */
+    static Decision decide(String enabled, BooleanSupplier apiOraclePresent, AppConfig.Network networkConfig,
+                           String url) {
         String flag = enabled == null ? "" : enabled.trim().toLowerCase(Locale.ROOT);
         if (flag.equals("false")) {
-            events.info("off", "reason=disabled", "loans.oracle.stream.enabled=false");
-            return;
+            return Decision.off(false, "reason=disabled", "loans.oracle.stream.enabled=false",
+                    "disabled (loans.oracle.stream.enabled=false)");
         }
         if (!flag.isEmpty() && !flag.equals("true")) {
-            events.warn("off", "reason=unrecognised-enabled value="
-                    + OracleStreamLog.token(enabled.trim(), VALUE_ECHO));
-            return;
+            return Decision.off(true, "reason=unrecognised-enabled value="
+                            + OracleStreamLog.token(enabled.trim(), VALUE_ECHO), null,
+                    "unrecognised-enabled (loans.oracle.stream.enabled is neither true nor false)");
         }
-        if (oracleClient.getIfAvailable() == null) {
-            events.info("off", "reason=no-api-oracle", "loans.oracle.enabled=false: nothing to compare against");
-            return;
+        if (!apiOraclePresent.getAsBoolean()) {
+            return Decision.off(false, "reason=no-api-oracle", "loans.oracle.enabled=false: nothing to compare against",
+                    "no-api-oracle (loans.oracle.enabled=false: nothing to compare against)");
         }
-        String networkName = network.getNetwork();
+        String network = networkConfig.getNetwork();
         String otherHost;
-        if ("mainnet".equals(networkName)) {
+        if ("mainnet".equals(network)) {
             otherHost = PREVIEW_HOST;
-        } else if ("preview".equals(networkName)) {
+        } else if ("preview".equals(network)) {
             otherHost = MAINNET_HOST;
         } else {
-            events.info("off", "reason=network-unsupported network=" + OracleStreamLog.token(networkName, 32));
-            return;
+            String shown = OracleStreamLog.token(network, 32);
+            return Decision.off(false, "reason=network-unsupported network=" + shown, null,
+                    "network-unsupported (network " + shown + ")");
         }
         URI uri = validUri(url);
         if (uri == null) {
-            events.warn("off", "reason=invalid-url");
-            return;
+            return Decision.off(true, "reason=invalid-url", null,
+                    "invalid-url (loans.oracle.stream.url must be a ws or wss URL with a host and no query)");
         }
         String host = uri.getHost();
         if (host.equalsIgnoreCase(otherHost)) {
-            events.warn("off", "reason=url-network-mismatch network=" + networkName + " host=" + host);
+            return Decision.off(true, "reason=url-network-mismatch network=" + network + " host=" + host, null,
+                    "url-network-mismatch (host " + host + " is the other network's)");
+        }
+        return new Decision(uri, false, "network=" + network + " host=" + host, null, null);
+    }
+
+    /** One line either way; ON builds the threads and the client. */
+    private void launch() {
+        Decision decision = decide(enabled, () -> oracleClient.getIfAvailable() != null, network, url);
+        if (!decision.on()) {
+            off(decision.detail());
+            if (decision.warn()) {
+                events.warn("off", decision.fields(), decision.text());
+            } else {
+                events.info("off", decision.fields(), decision.text());
+            }
             return;
         }
+        URI uri = decision.uri();
 
-        events.info("on", "network=" + networkName + " host=" + host);
+        events.info("on", decision.fields());
         scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, THREAD_NAME);
             thread.setDaemon(true);
@@ -170,9 +251,12 @@ public class OracleStreamLauncher {
             thread.setDaemon(true);
             return thread;
         });
-        client = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, clock, new LoggingListener(),
-                events, scheduler, io);
-        client.start();
+        StakerService staker = stakerService;
+        OracleStreamClient created = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, clock,
+                new LoggingListener(), events, scheduler, io, () -> !staker.findStakerRefInput().isEmpty(),
+                meterRegistry);
+        client = created;
+        created.start();
     }
 
     /**

@@ -61,7 +61,8 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * </ul>
  * Per connection it records the open and close instants, the raw query and the pings received, and can push a
  * text message as one frame or as a {@code TextWebSocketFrame(false, ...)} followed by continuation frames,
- * push a binary message, or close. Its own logs are never asserted on.
+ * push a binary message, close, or drop the TCP connection with no close frame. Its own logs are never asserted
+ * on.
  *
  * <p>{@link Hanging} is a raw {@link ServerSocket} that accepts and never answers — the handshake-timeout case.
  */
@@ -251,6 +252,7 @@ final class OracleStreamTestServer implements AutoCloseable {
         final AtomicInteger framesSent = new AtomicInteger();
         private final Sinks.Many<WebSocketFrame> outbound = Sinks.many().unicast().onBackpressureBuffer();
         private volatile WebsocketOutbound out;
+        private volatile reactor.netty.Connection connection;
 
         Session(String query) {
             this.query = query;
@@ -258,11 +260,14 @@ final class OracleStreamTestServer implements AutoCloseable {
 
         private org.reactivestreams.Publisher<Void> run(WebsocketInbound in, WebsocketOutbound out, boolean pong) {
             this.out = out;
-            in.withConnection(connection -> connection.onDispose(() -> {
-                if (closedAt == null) {
-                    closedAt = Instant.now();
-                }
-            }));
+            in.withConnection(connection -> {
+                this.connection = connection;
+                connection.onDispose(() -> {
+                    if (closedAt == null) {
+                        closedAt = Instant.now();
+                    }
+                });
+            });
             sessions.add(this);
             Mono<Void> inbound = in.receiveFrames()
                     .doOnNext(frame -> {
@@ -310,6 +315,18 @@ final class OracleStreamTestServer implements AutoCloseable {
             WebsocketOutbound current = out;
             if (current != null) {
                 current.sendClose(code, "server close").subscribe(null, error -> { });
+            }
+        }
+
+        /**
+         * Resets the TCP connection under the WebSocket — no close frame — so the client sees the connection fail,
+         * not close. ({@code Connection.dispose()} would send a close frame first.)
+         */
+        void drop() {
+            reactor.netty.Connection current = connection;
+            if (current != null) {
+                current.channel().config().setOption(io.netty.channel.ChannelOption.SO_LINGER, 0);
+                current.channel().close();
             }
         }
 
