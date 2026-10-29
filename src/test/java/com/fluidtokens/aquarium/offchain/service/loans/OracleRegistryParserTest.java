@@ -131,11 +131,32 @@ class OracleRegistryParserTest {
     /**
      * (d) Anything but an array parses to nothing, without throwing — including a whole push message,
      * whose entries sit under {@code tokens} and must not be found by walking the object's values.
+     *
+     * <p>⚠ The push alone cannot prove the guard: none of its top-level values is an entry, so it parses
+     * empty with or without the {@code isArray} check. An object whose values ARE valid entries is the
+     * input only the guard keeps empty, because Jackson iterates an object's values exactly as it iterates
+     * an array's elements. The same two entries as an array parse to two, so the emptiness is the guard's
+     * doing and not the entries'.
      */
     @Test
-    void aNonArrayParsesToNothing() {
-        var parsed = assertDoesNotThrow(() -> OracleRegistryParser.parse(resource(PUSH_1)));
+    void aNonArrayParsesToNothing() throws Exception {
+        assertParsesToNothing(assertDoesNotThrow(() -> OracleRegistryParser.parse(resource(PUSH_1))));
 
+        var valuesAreEntries = MAPPER.createObjectNode();
+        var sameEntriesAsArray = MAPPER.createArrayNode();
+        for (JsonNode entry : MAPPER.readTree(SYNTHETIC_REGISTRY)) {
+            String id = entry.path("_id").asText();
+            if (id.startsWith("h ") || id.startsWith("l ")) {
+                valuesAreEntries.set(id, entry);
+                sameEntriesAsArray.add(entry);
+            }
+        }
+        assertEquals(2, OracleRegistryParser.parse(sameEntriesAsArray).entries().size(),
+                "the well-formed multisig (h) and c3 (l) entries must parse, or the object below proves nothing");
+        assertParsesToNothing(assertDoesNotThrow(() -> OracleRegistryParser.parse(valuesAreEntries)));
+    }
+
+    private static void assertParsesToNothing(OracleRegistryParser.Parsed parsed) {
         assertTrue(parsed.entries().isEmpty());
         assertTrue(parsed.byOracleToken().isEmpty());
         assertTrue(parsed.diagnostics().isEmpty());

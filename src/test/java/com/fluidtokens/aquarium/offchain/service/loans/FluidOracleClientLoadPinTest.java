@@ -50,12 +50,17 @@ class FluidOracleClientLoadPinTest {
      * absent from {@code supportedOracle}, (d) a zero denominator, (e) an unknown provider, (f) signatures
      * without {@code publicKeys}, (g) a signature from a key outside {@code publicKeys}, (h) a well-formed
      * multisig v1, (i) h's token at v2 under another NFT and price, (j) h's NFT again with another
-     * {@code rewardAddress}, (k) c3 with a blank c3 policy and a malformed reference input, (l) a
-     * well-formed c3, (m) a {@code rewardAddress} that is not bech32, which throws inside the parse, and
-     * (n) {@code oracleVersion} as a string.
+     * {@code rewardAddress} and a signature from a key outside its {@code publicKeys}, (k) c3 with a blank
+     * c3 policy and a malformed reference input, (l) a well-formed c3, (m) a {@code rewardAddress} that is
+     * not bech32, which throws inside the parse, and (n) {@code oracleVersion} as a string.
      *
      * <p>(m) was checked at the base to reach the parse's catch: {@code new Address("not-a-bech32-address")}
      * throws {@code StringIndexOutOfBoundsException}, and the recorded WARN carries the JDK 21 wording of it.
+     *
+     * <p>⚠ (j) is the one entry that carries BOTH a parse condition and a duplicate NFT, which is what pins
+     * their interleaving: its unresolved-key WARN must come before the duplicate-NFT line, on the first load
+     * and again (both at DEBUG, latched) on the second. Its latch (h's NFT, unresolved keys) is shared with
+     * no other entry, so no other entry's state can mask or reopen it.
      */
     static final String SYNTHETIC_REGISTRY = """
             [
@@ -90,10 +95,10 @@ class FluidOracleClientLoadPinTest {
              "fluidOracle":{"policyId":"99999999999999999999999999999999999999999999999999999999","assetName":"6f7261636c65","rewardAddress":"stake_test17pqzexzdvwtl2zxw6pn5v34m9lxk0avnckmemy0puhqtzfqwavks2","referenceInput":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#0","referenceScript":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb#0"},
              "multisigOracle":{"publicKeys":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"],"requiredSignatures":2},
              "supportedOracle":{"multisig":{"tokenPriceInLovelaces":5000,"tokenPriceDenominator":1000000,"validFrom":0,"validTo":99999999999,"multisigOracle":{"signatures":[{"publicKey":"1111111111111111111111111111111111111111111111111111111111111111","signature":"t1"},{"publicKey":"2222222222222222222222222222222222222222222222222222222222222222","signature":"t2"}]}}}},
-            {"_id":"j h's oracle NFT again","token":{"policyId":"88888888888888888888888888888888888888888888888888888888","assetName":"546f6b656e"},"active":true,"preferredOracle":"multisig","oracleVersion":1,
+            {"_id":"j h's oracle NFT again, with a signature from a key outside publicKeys","token":{"policyId":"88888888888888888888888888888888888888888888888888888888","assetName":"546f6b656e"},"active":true,"preferredOracle":"multisig","oracleVersion":1,
              "fluidOracle":{"policyId":"88888888888888888888888888888888888888888888888888888888","assetName":"6f7261636c65","rewardAddress":"stake178tzp8jzvtts5t59f7q2vgrn49p2smpaq9kgvfekup359fqle74mk","referenceInput":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#0","referenceScript":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb#0"},
              "multisigOracle":{"publicKeys":["1111111111111111111111111111111111111111111111111111111111111111","2222222222222222222222222222222222222222222222222222222222222222"],"requiredSignatures":2},
-             "supportedOracle":{"multisig":{"tokenPriceInLovelaces":1000,"tokenPriceDenominator":1000000,"validFrom":0,"validTo":99999999999,"multisigOracle":{"signatures":[{"publicKey":"1111111111111111111111111111111111111111111111111111111111111111","signature":"s1"},{"publicKey":"2222222222222222222222222222222222222222222222222222222222222222","signature":"s2"}]}}}},
+             "supportedOracle":{"multisig":{"tokenPriceInLovelaces":1000,"tokenPriceDenominator":1000000,"validFrom":0,"validTo":99999999999,"multisigOracle":{"signatures":[{"publicKey":"1111111111111111111111111111111111111111111111111111111111111111","signature":"s1"},{"publicKey":"abababababababababababababababababababababababababababababababab","signature":"sA"}]}}}},
             {"_id":"k c3 with blank policyId","token":{"policyId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assetName":"546f6b656e"},"active":true,"preferredOracle":"c3","oracleVersion":1,
              "fluidOracle":{"policyId":"11111111111111111111111111111111111111111111111111111111","assetName":"6f7261636c65","rewardAddress":"stake_test17pqzexzdvwtl2zxw6pn5v34m9lxk0avnckmemy0puhqtzfqwavks2","referenceInput":"abc#x","referenceScript":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb#0"},
              "supportedOracle":{"c3":{"policyId":"","assetName":"4f7261636c6546656564","referenceInput":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd#0","tokenPriceInLovelaces":2000,"tokenPriceDenominator":1000000,"validFrom":0,"validTo":99999999999}}},
@@ -164,18 +169,24 @@ class FluidOracleClientLoadPinTest {
         }
     }
 
-    /** Recorded at the base: every event of the {@code FluidOracleClient} logger at DEBUG and above. */
+    /**
+     * Recorded at the base (95e67f3): every event of the {@code FluidOracleClient} logger at DEBUG and above.
+     * Re-recorded there when (j) gained its unresolved key — see its two lines just before each duplicate-NFT
+     * line, which is the interleaving this list exists to hold.
+     */
     private static final List<String> EXPECTED_EVENTS = List.of(
             "INFO|FluidTokens oracle registry: http://unused.invalid",
             "WARN|oracle 55555555555555555555555555555555555555555555555555555555546f6b656e uses unknown provider 'orcfax'; skipping it rather than guessing a variant",
             "WARN|oracle 66666666666666666666666666666666666666666666666666666666546f6b656e publishes 2 signature(s) but no publicKeys; cannot resolve key positions, so it stays priceable but not liquidatable",
             "WARN|oracle 77777777777777777777777777777777777777777777777777777777546f6b656e published signatures from keys outside its publicKeys [9999999999999999999999999999999999999999999999999999999999999999]; dropping them",
+            "WARN|oracle 88888888888888888888888888888888888888888888888888888888546f6b656e published signatures from keys outside its publicKeys [abababababababababababababababababababababababababababababababab]; dropping them",
             "WARN|oracle registry lists oracle NFT 888888888888888888888888888888888888888888888888888888886f7261636c65 TWICE (token 88888888888888888888888888888888888888888888888888888888546f6b656e) — keeping the last. A loan names its oracle by this NFT, so which entry it gets is now arbitrary.",
             "WARN|could not parse a FluidTokens oracle entry: java.lang.StringIndexOutOfBoundsException: Range [0, -1) out of bounds for length 20",
             "INFO|FluidTokens oracle registry: 7 oracles across 6 tokens, 1 tokens with more than one oracle version",
             "WARN|oracle 55555555555555555555555555555555555555555555555555555555546f6b656e uses unknown provider 'orcfax'; skipping it rather than guessing a variant",
             "DEBUG|oracle 66666666666666666666666666666666666666666666666666666666546f6b656e publishes 2 signature(s) but no publicKeys; cannot resolve key positions, so it stays priceable but not liquidatable",
             "DEBUG|oracle 77777777777777777777777777777777777777777777777777777777546f6b656e published signatures from keys outside its publicKeys [9999999999999999999999999999999999999999999999999999999999999999]; dropping them",
+            "DEBUG|oracle 88888888888888888888888888888888888888888888888888888888546f6b656e published signatures from keys outside its publicKeys [abababababababababababababababababababababababababababababababab]; dropping them",
             "DEBUG|oracle registry lists oracle NFT 888888888888888888888888888888888888888888888888888888886f7261636c65 TWICE (token 88888888888888888888888888888888888888888888888888888888546f6b656e) — keeping the last. A loan names its oracle by this NFT, so which entry it gets is now arbitrary.",
             "WARN|could not parse a FluidTokens oracle entry: java.lang.StringIndexOutOfBoundsException: Range [0, -1) out of bounds for length 20",
             "INFO|FluidTokens oracle registry: 35 oracles across 19 tokens, 16 tokens with more than one oracle version",
@@ -186,10 +197,10 @@ class FluidOracleClientLoadPinTest {
             "INFO|FluidTokens oracle registry: 5 oracles across 5 tokens, 0 tokens with more than one oracle version",
             "DEBUG|oracle 4f4e7bb17c0e7201cc82f0177ab22695fbcee2d99735d1c3fdc44eac66476f6c64 publishes 3 signature(s) but no publicKeys; cannot resolve key positions, so it stays priceable but not liquidatable");
 
-    /** Recorded at the base: trackedAssets, trackedOracles and the entries digest after each load. */
+    /** Recorded at the base (95e67f3): trackedAssets, trackedOracles and the entries digest after each load. */
     private static final List<String> EXPECTED_HELD = List.of(
-            "6 assets / 7 oracles / 99f7c4b3b4f1fcf2f50c5b41f1335e6a60bbc50c19e50b6e2f5a451ef20326aa",
-            "6 assets / 7 oracles / 99f7c4b3b4f1fcf2f50c5b41f1335e6a60bbc50c19e50b6e2f5a451ef20326aa",
+            "6 assets / 7 oracles / 4dc0dcb6f688e4a033b4aae2e7eb7ff5b73793bacadb1b5382818d7e8d841009",
+            "6 assets / 7 oracles / 4dc0dcb6f688e4a033b4aae2e7eb7ff5b73793bacadb1b5382818d7e8d841009",
             "19 assets / 35 oracles / cfe89af0e4ed25260220bccfb26af5c82ebe27976e3e6bac52d8718e84a7b65f",
             "5 assets / 5 oracles / 5723d238a55c6d98b08b5be22ca351333aa99a62a013f6b4b00c91b671564636",
             "19 assets / 19 oracles / 07bf9ba1cd384cae29ebbbeb5c4808ed91199d572308ab2c699780f03e4a6aee",
