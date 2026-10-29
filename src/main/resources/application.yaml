@@ -105,6 +105,12 @@ loans:
   oracle:
     enabled: ${LOANS_ORACLE_ENABLED:true}
     url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
+    # FluidTokens' oracle WebSocket, signed in with this wallet's stake key. SHADOW ONLY: each push is
+    # parsed and logged as one `[oracle-stream]` line, and no decision reads it. On by default per
+    # Giovanni's 2026-10-29 ruling A2; it stays off when `loans.oracle.enabled` is false.
+    stream:
+      enabled: ${LOANS_ORACLE_STREAM_ENABLED:true}
+      url: ${LOANS_ORACLE_STREAM_URL:wss://25mxd4whnj.execute-api.eu-west-1.amazonaws.com/prod}
   # The auto-liquidation bot. `mode` is disabled / shadow / live, and it is the WHOLE node-level dial.
   #
   # ⛔ `liquidation.enabled` IS GONE (2026-09-04). It was a second arming boolean that had to agree
@@ -619,6 +625,9 @@ loans:
   # collateral on the loans we index — so health is fully computable here.
   oracle:
     url: ${LOANS_ORACLE_URL:https://testapi.fluidtokens.com/get-oracle-tokens}
+    # The preview oracle WebSocket (shadow only, as in the base document; `enabled` is inherited).
+    stream:
+      url: ${LOANS_ORACLE_STREAM_URL:wss://2tgda3mk4l.execute-api.eu-west-1.amazonaws.com/dev}
   ui:
     # Blank: the mainnet USDM unit means nothing here, so the readiness page shows USD as unavailable.
     usd-reference-unit: ""
