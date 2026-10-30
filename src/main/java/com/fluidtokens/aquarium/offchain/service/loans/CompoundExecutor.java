@@ -28,6 +28,9 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -36,6 +39,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -75,6 +79,8 @@ public class CompoundExecutor {
     private static final int MAX_PROVIDER_JSON_NUMBER_LENGTH = 20;
     private static final int MIN_PROVIDER_ROOT_MEMBERS = 3;
     private static final int MAX_PROVIDER_ROOT_MEMBERS = 32;
+    /** FAB-180: an unchanged cycle summary is still said at INFO this often, so a quiet log is not a dead one. */
+    private static final Duration SUMMARY_HEARTBEAT = Duration.ofHours(1);
     private static final ObjectMapper BLOCKFROST_ERROR_MAPPER = new ObjectMapper(JsonFactory.builder()
             .streamReadConstraints(StreamReadConstraints.builder()
                     .maxNestingDepth(MAX_PROVIDER_JSON_DEPTH)
@@ -101,6 +107,40 @@ public class CompoundExecutor {
         }
     }
 
+    /**
+     * FAB-180: what one cycle's walk saw, for its single summary line. Counting only — nothing reads it
+     * to decide anything. {@code escrows == Σrefused + ready}, and every walk outcome counted here
+     * (not approved, not armed, not reached) is a ready candidate.
+     */
+    static final class CycleTally {
+        int escrows;
+        int priced;
+        int ready;
+        final Map<String, Integer> refused = new TreeMap<>();
+        final Map<String, Integer> notApproved = new TreeMap<>();
+        int notArmed;
+        int notReached;
+
+        void notApproved(CompoundExclusion exclusion) {
+            notApproved.merge(String.valueOf(exclusion), 1, Integer::sum);
+        }
+
+        String summary() {
+            StringBuilder line = new StringBuilder("compound scan: ")
+                    .append(escrows).append(" escrows, ")
+                    .append(priced).append(" priced, ")
+                    .append(ready).append(" ready, refused ").append(refused)
+                    .append(", not approved ").append(notApproved);
+            if (notArmed > 0) {
+                line.append(", not armed ").append(notArmed);
+            }
+            if (notReached > 0) {
+                line.append(", not reached ").append(notReached);
+            }
+            return line.toString();
+        }
+    }
+
     private final AppConfig.CompoundConfiguration configuration;
     private final AppConfig.Network network;
     private final BlockEventListener blockEventListener;
@@ -121,6 +161,15 @@ public class CompoundExecutor {
      */
     private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
     private volatile boolean lendingGateRefusalLogged;
+
+    /** FAB-180: read ONLY for the summary's heartbeat. Nothing that builds, prices or submits uses it. */
+    Clock clock = Clock.systemUTC();
+    private String lastInfoSummary;
+    private Instant lastInfoSummaryAt;
+
+    void setClock(Clock clock) {
+        this.clock = clock;
+    }
 
     @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
@@ -231,6 +280,16 @@ public class CompoundExecutor {
             return;
         }
 
+        CycleTally tally = new CycleTally();
+        for (CompoundCandidate candidate : scan.candidates()) {
+            tally.escrows++;
+            if (candidate.structurallyReady()) {
+                tally.ready++;
+            } else {
+                tally.refused.merge(String.valueOf(candidate.exclusion()), 1, Integer::sum);
+            }
+        }
+
         // FAB-144 — THE MOST PROFITABLE ESCROW FIRST. Only the ORDER changes: every candidate is still
         // walked exactly once, and one whose fee cannot be estimated — refused, non-ada, no amount —
         // goes last rather than missing. Guarded: ranking must never cost a compound, so a fault in it
@@ -238,40 +297,84 @@ public class CompoundExecutor {
         List<CompoundCandidate> ordered = scan.candidates();
         if (ordered.size() >= 2) {
             try {
-                ordered = mostProfitableFirstThisCycle(scan.candidates());
+                ordered = mostProfitableFirstThisCycle(scan.candidates(), tally);
             } catch (RuntimeException e) {
                 log.warn("compound: ranking this cycle's candidates failed ({}); they are walked in "
                         + "scan order", e.toString());
             }
+        } else {
+            // FAB-180: no ranking ran, so the one candidate's reward is computed here, once, and only
+            // counted. A fault leaves it unpriced; it must never cost the cycle.
+            try {
+                if (grossRecoverableLovelace(ordered.getFirst()).isPresent()) {
+                    tally.priced = 1;
+                }
+            } catch (RuntimeException e) {
+                tally.priced = 0;
+            }
         }
 
         // Every escrow is reported, refused or not: "nothing to do" and "eight things all blocked"
-        // must not look alike to an operator.
+        // must not look alike to an operator. Per escrow at DEBUG; the cycle's summary carries the counts.
+        int readyWalked = 0;
         for (CompoundCandidate candidate : ordered) {
             if (!candidate.structurallyReady()) {
-                log.info("compound REFUSED {} escrow {}: {} — {}", candidate.loanId(),
+                log.debug("compound REFUSED {} escrow {}: {} — {}", candidate.loanId(),
                         candidate.escrowRef(), candidate.exclusion(), candidate.detail());
                 continue;
             }
-            if (consider(candidate).terminal()) {
+            readyWalked++;
+            if (consider(candidate, tally).terminal()) {
+                tally.notReached = tally.ready - readyWalked;
+                logSummary(tally);
                 return;
             }
+        }
+        logSummary(tally);
+    }
+
+    /**
+     * FAB-180: one line per walk. INFO when it says something the last INFO summary did not, or when that
+     * line is {@link #SUMMARY_HEARTBEAT} old; DEBUG otherwise, so an unchanging world is quiet.
+     */
+    private void logSummary(CycleTally tally) {
+        String summary = tally.summary();
+        Instant now = clock.instant();
+        if (!summary.equals(lastInfoSummary)
+                || Duration.between(lastInfoSummaryAt, now).compareTo(SUMMARY_HEARTBEAT) >= 0) {
+            lastInfoSummary = summary;
+            lastInfoSummaryAt = now;
+            log.info("{}", summary);
+        } else {
+            log.debug("{}", summary);
         }
     }
 
     // ---- the order a cycle walks its candidates in (FAB-144) ------------------------------------
 
-    /** {@code candidates} reordered by expected fee, each computed once, and the order logged at INFO. */
-    private List<CompoundCandidate> mostProfitableFirstThisCycle(List<CompoundCandidate> candidates) {
+    /**
+     * {@code candidates} reordered by expected fee, each computed once, and the order logged — at INFO
+     * when at least one is priced, at DEBUG when none is. The priced count goes to {@code tally} last, so
+     * a ranking that throws leaves it at zero.
+     */
+    private List<CompoundCandidate> mostProfitableFirstThisCycle(List<CompoundCandidate> candidates,
+                                                                 CycleTally tally) {
         Map<CompoundCandidate, Optional<BigInteger>> rewards = new IdentityHashMap<>();
         for (CompoundCandidate candidate : candidates) {
             rewards.put(candidate, grossRecoverableLovelace(candidate));
         }
         List<CompoundCandidate> ordered = mostProfitableFirst(candidates, rewards::get);
-        log.info("compound order (most profitable first): {}", ordered.stream()
+        String order = ordered.stream()
                 .map(candidate -> candidate.escrowRef() + rewards.get(candidate)
                         .map(fee -> " gross≈" + fee + " lovelace").orElse(" gross unpriced"))
-                .collect(Collectors.joining(", ")));
+                .collect(Collectors.joining(", "));
+        int priced = (int) rewards.values().stream().filter(Optional::isPresent).count();
+        if (priced > 0) {
+            log.info("compound order (most profitable first): {}", order);
+        } else {
+            log.debug("compound order (most profitable first): {}", order);
+        }
+        tally.priced = priced;
         return ordered;
     }
 
@@ -329,11 +432,12 @@ public class CompoundExecutor {
         return ordered;
     }
 
-    private CandidateOutcome consider(CompoundCandidate candidate) {
+    private CandidateOutcome consider(CompoundCandidate candidate, CycleTally tally) {
         if (!configuration.isEnabled()) {
-            // Not a fault, and said at INFO because a ready candidate going unprocessed is exactly
-            // what an operator will ask about.
-            log.info("compound READY but NOT ARMED {} escrow {}: Q={} raw units into pool {} at "
+            // Not a fault. Said at DEBUG per escrow (FAB-180); the cycle summary's `not armed` count is
+            // what answers an operator asking why a ready candidate went unprocessed.
+            tally.notArmed++;
+            log.debug("compound READY but NOT ARMED {} escrow {}: Q={} raw units into pool {} at "
                             + "compoudingFeePerMille={} — set loans.compound.enabled=true to act on it",
                     candidate.loanId(), candidate.escrowRef(), candidate.addedLiquidity(),
                     candidate.poolId(), candidate.feePerMille());
@@ -390,7 +494,8 @@ public class CompoundExecutor {
                 candidate.bond().datum().principalAsset(), fee, now);
         if (!quote.isPriced()) {
             CompoundExclusion exclusion = CompoundEconomics.priceExclusion(quote.refusal());
-            log.info("compound NOT APPROVED {} escrow {}: {} — F={} raw units, quote={}",
+            tally.notApproved(exclusion);
+            log.debug("compound NOT APPROVED {} escrow {}: {} — F={} raw units, quote={}",
                     candidate.loanId(), candidate.escrowRef(), exclusion, fee, quote.refusal());
             return CandidateOutcome.DEFINITE_FAILURE;
         }
@@ -419,7 +524,8 @@ public class CompoundExecutor {
                 candidate.feePerMille(), built.facts(), quote);
 
         if (!assessment.approved()) {
-            log.info("compound NOT APPROVED {} escrow {}: {} — Q={} raw units at compoudingFeePerMille={} "
+            tally.notApproved(assessment.exclusion());
+            log.debug("compound NOT APPROVED {} escrow {}: {} — Q={} raw units at compoudingFeePerMille={} "
                             + "gives F={} raw units, priced reward={} lovelace, recovered E={} lovelace, "
                             + "final fee L={} lovelace, pool top-up T={} lovelace, net={} lovelace "
                             + "against floor={} lovelace{}",
@@ -435,11 +541,12 @@ public class CompoundExecutor {
             return CandidateOutcome.DEFINITE_FAILURE;
         }
 
-        return submit(candidate, built, assessment, quote);
+        return submit(candidate, built, assessment, quote, tally);
     }
 
     private CandidateOutcome submit(CompoundCandidate candidate, CompoundTransactionBuilder.Built built,
-                                    CompoundAssessment assessment, PricingService.Priced quote) {
+                                    CompoundAssessment assessment, PricingService.Priced quote,
+                                    CycleTally tally) {
         // ⛔ THE NETWORK GATE IS GONE — `loans.submittable-network` was removed on 2026-09-04
         // (Giovanni: "a barrier that silently blocks submission even when everything else is armed
         // is a bug, not a safeguard"). `config.network` alone decides where this node acts, and it
@@ -467,6 +574,7 @@ public class CompoundExecutor {
         CompoundExclusion observationRefusal = economics.revalidateObservation(assessment,
                 candidate.bond().datum().principalAsset(), System.currentTimeMillis());
         if (observationRefusal != null) {
+            tally.notApproved(observationRefusal);
             log.info("compound NOT APPROVED {} escrow {}: {} immediately before signing",
                     candidate.loanId(), candidate.escrowRef(), observationRefusal);
             return CandidateOutcome.DEFINITE_FAILURE;
@@ -475,6 +583,7 @@ public class CompoundExecutor {
                 candidate.bond().datum().principalAsset(), candidate.addedLiquidity(),
                 candidate.feePerMille(), built.facts(), quote);
         if (!finalAssessment.approved()) {
+            tally.notApproved(finalAssessment.exclusion());
             log.info("compound NOT APPROVED {} escrow {}: {} on the immediate pre-sign recheck",
                     candidate.loanId(), candidate.escrowRef(), finalAssessment.exclusion());
             return CandidateOutcome.DEFINITE_FAILURE;
