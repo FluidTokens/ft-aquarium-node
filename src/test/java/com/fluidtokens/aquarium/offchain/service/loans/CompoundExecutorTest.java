@@ -37,6 +37,10 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -48,6 +52,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1315,21 +1321,39 @@ class CompoundExecutorTest {
                 base.principalIsAda(), base.exclusion(), base.detail());
     }
 
-    /** One disarmed cycle's INFO lines, in the order the executor logged them. */
-    private static List<String> infoLinesOfOneCycle(Wiring w) {
+    /** One logged line: its level and its formatted text. */
+    private record Line(Level level, String text) {
+    }
+
+    /**
+     * Every line {@code action} logs, at every level, in order. The executor's logger is held at DEBUG for
+     * the duration — a Spring test earlier in the same JVM may have left it at INFO — and restored after.
+     */
+    private static List<Line> linesOf(Runnable action) {
         var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
+        Level previous = logger.getLevel();
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
         logger.addAppender(appender);
+        logger.setLevel(Level.DEBUG);
         try {
-            w.executor().cycle();
+            action.run();
         } finally {
+            logger.setLevel(previous);
             logger.detachAppender(appender);
         }
         return appender.list.stream()
-                .filter(event -> event.getLevel() == Level.INFO)
-                .map(ILoggingEvent::getFormattedMessage)
+                .map(event -> new Line(event.getLevel(), event.getFormattedMessage()))
                 .toList();
+    }
+
+    /** One cycle's lines, at every level, in the order the executor logged them. */
+    private static List<Line> linesOfOneCycle(Wiring w) {
+        return linesOf(() -> w.executor().cycle());
+    }
+
+    private static List<String> at(Level level, List<Line> lines) {
+        return lines.stream().filter(line -> line.level() == level).map(Line::text).toList();
     }
 
     /**
@@ -1347,13 +1371,15 @@ class CompoundExecutorTest {
         String rich = twentyPerMille.escrowRef();
         Wiring w = wiring(List.of(refused(), tenPerMille, twentyPerMille), false, 0L);
 
-        List<String> info = infoLinesOfOneCycle(w);
+        List<Line> lines = linesOfOneCycle(w);
+        List<String> info = at(Level.INFO, lines);
 
-        List<String> walked = info.stream()
+        // FAB-180: the per-escrow lines are at DEBUG now, text unchanged.
+        List<String> walked = at(Level.DEBUG, lines).stream()
                 .filter(line -> line.startsWith("compound READY but NOT ARMED")
                         || line.startsWith("compound REFUSED"))
                 .toList();
-        assertEquals(3, walked.size(), "every candidate is reported, each once: " + info);
+        assertEquals(3, walked.size(), "every candidate is reported, each once: " + lines);
         assertTrue(walked.get(0).contains(rich), "the 80/1000 escrow first: " + walked);
         assertTrue(walked.get(1).contains(cheap), "the 40/1000 escrow second: " + walked);
         assertTrue(walked.get(2).startsWith("compound REFUSED"), "the refused one last: " + walked);
@@ -1550,16 +1576,367 @@ class CompoundExecutorTest {
     @Test
     void theCompoundOrderIsNotLoggedForOneCandidateAndLoggedExactlyOnceForTwo() {
         CompoundCandidate only = readyAt("01".repeat(32), 10L);
-        List<String> single = infoLinesOfOneCycle(wiring(List.of(only), false, 0L));
-        assertEquals(1, single.stream().filter(line -> line.startsWith("compound READY but NOT ARMED")).count(),
-                "the one candidate is still reported: " + single);
+        List<Line> singleLines = linesOfOneCycle(wiring(List.of(only), false, 0L));
+        List<String> single = at(Level.INFO, singleLines);
+        // FAB-180: the per-escrow NOT ARMED line is at DEBUG now, text unchanged.
+        assertEquals(1, at(Level.DEBUG, singleLines).stream()
+                        .filter(line -> line.startsWith("compound READY but NOT ARMED")).count(),
+                "the one candidate is still reported: " + singleLines);
         assertEquals(List.of(), single.stream().filter(line -> line.startsWith("compound order")).toList(),
                 "one candidate: no choice was made, so no order is logged");
 
-        List<String> pair = infoLinesOfOneCycle(wiring(
-                List.of(readyAt("01".repeat(32), 10L), readyAt("02".repeat(32), 20L)), false, 0L));
+        List<String> pair = at(Level.INFO, linesOfOneCycle(wiring(
+                List.of(readyAt("01".repeat(32), 10L), readyAt("02".repeat(32), 20L)), false, 0L)));
         assertEquals(1, pair.stream().filter(line -> line.startsWith("compound order")).count(),
                 "two candidates: exactly one order line: " + pair);
+    }
+
+    // ---- FAB-180: one summary per walk instead of a line per escrow ------------------------------
+
+    private static final Instant T0 = Instant.parse("2026-10-30T12:00:00Z");
+    private static final Pattern SUMMARY = Pattern.compile("compound scan: (\\d+) escrows, (\\d+) priced, "
+            + "(\\d+) ready, refused \\{([^}]*)}, not approved \\{([^}]*)}"
+            + "(?:, not armed (\\d+))?(?:, not reached (\\d+))?");
+
+    /** {@link #refused()} at its own escrow ref and with its own exclusion. */
+    private static CompoundCandidate refusedAt(String escrowTxHash, CompoundExclusion exclusion) {
+        Utxo escrow = utxo("escrow");
+        escrow.setTxHash(escrowTxHash);
+        return new CompoundCandidate(LOAN_ID, escrow, null, null, null, POOL_ID, null, null,
+                0L, true, exclusion, "refused for the test");
+    }
+
+    /** The exact per-escrow structural refusal text, as {@code cycle()} formats it. */
+    private static String refusalLine(CompoundCandidate candidate) {
+        return "compound REFUSED " + candidate.loanId() + " escrow " + candidate.escrowRef() + ": "
+                + candidate.exclusion() + " — " + candidate.detail();
+    }
+
+    /** A scanner whose world the test can change between cycles. */
+    private static final class SwitchingScanner extends FakeScanner {
+        private final AtomicReference<List<CompoundCandidate>> world;
+
+        SwitchingScanner(List<CompoundCandidate> first) {
+            super(first);
+            this.world = new AtomicReference<>(first);
+        }
+
+        @Override
+        public Scan scan() {
+            return new Scan(world.get());
+        }
+    }
+
+    /** An armed executor over {@code scanner}, which may offer nothing ready, so nothing may be submitted. */
+    private static CompoundExecutor executorOver(CompoundCandidateScanner scanner) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        return new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT, scanner,
+                new CompoundEconomics(configuration, network, pricingService()), realBuilder(),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                bytes -> { throw new AssertionError("nothing here is ready, so nothing may be submitted"); });
+    }
+
+    private static List<Line> cycleAt(CompoundExecutor executor, Instant at) {
+        executor.setClock(Clock.fixed(at, ZoneOffset.UTC));
+        return linesOf(executor::cycle);
+    }
+
+    /** The one summary line of a cycle, at whichever level it was said. */
+    private static Line summaryOf(List<Line> lines) {
+        List<Line> summaries = lines.stream().filter(line -> line.text().startsWith("compound scan:")).toList();
+        assertEquals(1, summaries.size(), "exactly one summary per walk: " + lines);
+        return summaries.getFirst();
+    }
+
+    private static int sum(String map) {
+        if (map.isEmpty()) {
+            return 0;
+        }
+        int total = 0;
+        for (String entry : map.split(", ")) {
+            total += Integer.parseInt(entry.substring(entry.indexOf('=') + 1));
+        }
+        return total;
+    }
+
+    /**
+     * The reconciliation every summary must satisfy: E = Σrefused + R, and
+     * R ≥ Σnot approved + not armed + not reached + the terminal outcomes; P ≤ E.
+     */
+    private static void assertReconciles(String summary, int terminal) {
+        Matcher m = SUMMARY.matcher(summary);
+        assertTrue(m.matches(), "the summary has the stated shape: " + summary);
+        int escrows = Integer.parseInt(m.group(1));
+        int priced = Integer.parseInt(m.group(2));
+        int ready = Integer.parseInt(m.group(3));
+        int notArmed = m.group(6) == null ? 0 : Integer.parseInt(m.group(6));
+        int notReached = m.group(7) == null ? 0 : Integer.parseInt(m.group(7));
+        assertFalse("0".equals(m.group(6)) || "0".equals(m.group(7)), "a zero count is omitted: " + summary);
+        assertEquals(escrows, sum(m.group(4)) + ready, "E = Σrefused + R: " + summary);
+        assertTrue(ready >= sum(m.group(5)) + notArmed + notReached + terminal,
+                "R ≥ Σnot approved + not armed + not reached + terminal(" + terminal + "): " + summary);
+        assertTrue(priced <= escrows, "P ≤ E: " + summary);
+    }
+
+    /**
+     * FAB-180: an all-refused world under a clock that does not move. The first cycle says its summary
+     * at INFO and nothing else at INFO; the second, unchanged, says it at DEBUG. The per-escrow lines
+     * are all still there, at DEBUG, with their text unchanged.
+     */
+    @Test
+    void anUnchangedAllRefusedWorldSaysItsSummaryAtInfoOnceThenAtDebug() {
+        CompoundCandidate a = refusedAt("a1".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        CompoundCandidate b = refusedAt("a2".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        CompoundExecutor executor = executorOver(new FakeScanner(List.of(a, b)));
+        String expected = "compound scan: 2 escrows, 0 priced, 0 ready, refused {POOL_NOT_LIVE=2}, "
+                + "not approved {}";
+
+        List<Line> first = cycleAt(executor, T0);
+        List<Line> second = cycleAt(executor, T0);
+
+        assertEquals(List.of(expected), at(Level.INFO, first), "only the summary is said at INFO: " + first);
+        assertEquals(List.of(), at(Level.INFO, second), "an unchanged world says nothing at INFO: " + second);
+        assertEquals(new Line(Level.DEBUG, expected), summaryOf(second));
+        for (List<Line> cycle : List.of(first, second)) {
+            assertTrue(at(Level.DEBUG, cycle).containsAll(List.of(refusalLine(a), refusalLine(b))),
+                    "every escrow is still reported at DEBUG, text unchanged: " + cycle);
+            assertReconciles(summaryOf(cycle).text(), 0);
+        }
+    }
+
+    /** FAB-180: the heartbeat. An unchanged summary is said at INFO again once an hour has passed — not at 59 min. */
+    @Test
+    void anUnchangedSummaryIsSaidAtInfoAgainAfterAnHourAndNotBefore() {
+        CompoundExecutor executor = executorOver(new FakeScanner(List.of(
+                refusedAt("a1".repeat(32), CompoundExclusion.POOL_NOT_LIVE),
+                refusedAt("a2".repeat(32), CompoundExclusion.BOND_NAMES_NO_POOL))));
+
+        assertEquals(Level.INFO, summaryOf(cycleAt(executor, T0)).level(), "the first summary");
+        assertEquals(Level.DEBUG, summaryOf(cycleAt(executor, T0.plus(Duration.ofMinutes(59)))).level(),
+                "59 min after the last INFO summary: not yet");
+        Line heartbeat = summaryOf(cycleAt(executor, T0.plus(Duration.ofHours(1))));
+        assertEquals(Level.INFO, heartbeat.level(), "1 h after the last INFO summary: the heartbeat");
+        assertEquals(Level.DEBUG, summaryOf(cycleAt(executor,
+                        T0.plus(Duration.ofHours(1)).plus(Duration.ofMinutes(59)))).level(),
+                "the hour is measured from the heartbeat itself");
+        assertEquals("compound scan: 2 escrows, 0 priced, 0 ready, "
+                + "refused {BOND_NAMES_NO_POOL=1, POOL_NOT_LIVE=1}, not approved {}", heartbeat.text(),
+                "maps print in sorted key order");
+        assertReconciles(heartbeat.text(), 0);
+    }
+
+    /** FAB-180: one refusal reason flipping is a change, and is said at INFO that very cycle. */
+    @Test
+    void aChangedCountIsSaidAtInfoThatCycle() {
+        CompoundCandidate a = refusedAt("a1".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        CompoundCandidate b = refusedAt("a2".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        SwitchingScanner scanner = new SwitchingScanner(List.of(a, b));
+        CompoundExecutor executor = executorOver(scanner);
+
+        Line before = summaryOf(cycleAt(executor, T0));
+        Line unchanged = summaryOf(cycleAt(executor, T0.plusSeconds(60)));
+        scanner.world.set(List.of(a, refusedAt("a2".repeat(32), CompoundExclusion.BOND_NAMES_NO_POOL)));
+        Line flipped = summaryOf(cycleAt(executor, T0.plusSeconds(120)));
+        Line again = summaryOf(cycleAt(executor, T0.plusSeconds(180)));
+
+        assertEquals(Level.INFO, before.level());
+        assertEquals(Level.DEBUG, unchanged.level());
+        assertEquals(new Line(Level.INFO, "compound scan: 2 escrows, 0 priced, 0 ready, "
+                        + "refused {BOND_NAMES_NO_POOL=1, POOL_NOT_LIVE=1}, not approved {}"), flipped,
+                "a flipped reason is a different summary, said at INFO with no wait for the heartbeat");
+        assertEquals(Level.DEBUG, again.level(), "and the new world, unchanged, is quiet again");
+        for (Line summary : List.of(before, unchanged, flipped, again)) {
+            assertReconciles(summary.text(), 0);
+        }
+    }
+
+    /**
+     * FAB-180: a walk that stops on a terminal outcome — a submission, or WOULD_SUBMIT — still says its
+     * summary, after the walk, with the ready candidate it never reached counted as {@code not reached}.
+     * The refused one walked last is counted as refused, not as unreached.
+     */
+    @Test
+    void aWalkThatStopsOnATerminalOutcomeStillSaysItsSummaryWithNotReached() {
+        for (Result<String> response : List.of(Result.<String>success("ok").withValue("deadbeef"),
+                Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"))) {
+            List<CompoundCandidate> candidates = new ArrayList<>(twoReadyCandidates());
+            candidates.add(refused());
+            AtomicInteger submits = new AtomicInteger();
+            CompoundExecutor executor = executor(candidates, realBuilder(candidates), bytes -> {
+                submits.incrementAndGet();
+                return response;
+            });
+
+            List<Line> lines = cycleAt(executor, T0);
+
+            assertEquals(1, submits.get(), "the first submission is terminal: " + response.getValue());
+            Line summary = summaryOf(lines);
+            assertEquals(new Line(Level.INFO, "compound scan: 3 escrows, 2 priced, 2 ready, "
+                    + "refused {POOL_NOT_LIVE=1}, not approved {}, not reached 1"), summary);
+            assertEquals(summary, lines.getLast(), "the summary comes AFTER the walk, so its counts are final");
+            assertReconciles(summary.text(), 1);
+        }
+    }
+
+    /** FAB-180: a disarmed node counts its ready candidates as {@code not armed} and says none of them at INFO. */
+    @Test
+    void notArmedIsCountedInTheSummaryAndNoPerEscrowLineIsInfo() {
+        CompoundCandidate forty = readyAt("01".repeat(32), 40L);
+        CompoundCandidate eighty = readyAt("02".repeat(32), 80L);
+        List<Line> lines = linesOfOneCycle(wiring(List.of(refused(), forty, eighty), false, 0L));
+
+        List<String> info = at(Level.INFO, lines);
+        assertEquals(2, info.size(), "the order line and the summary, nothing per escrow: " + info);
+        assertTrue(info.getFirst().startsWith("compound order (most profitable first): "), info.toString());
+        String summary = "compound scan: 3 escrows, 2 priced, 2 ready, refused {POOL_NOT_LIVE=1}, "
+                + "not approved {}, not armed 2";
+        assertEquals(summary, info.get(1));
+        assertTrue(at(Level.DEBUG, lines).contains("compound READY but NOT ARMED " + LOAN_ID + " escrow "
+                        + eighty.escrowRef() + ": Q=" + ESCROW + " raw units into pool " + POOL_ID
+                        + " at compoudingFeePerMille=80 — set loans.compound.enabled=true to act on it"),
+                "the per-escrow line is at DEBUG with its text unchanged: " + lines);
+        assertReconciles(summary, 0);
+    }
+
+    /** FAB-180: the order line is INFO when it prices something, and DEBUG, same text, when it prices nothing. */
+    @Test
+    void theOrderLineIsInfoWhenSomethingIsPricedAndDebugWhenNothingIs() {
+        List<Line> priced = linesOfOneCycle(wiring(
+                List.of(readyAt("01".repeat(32), 10L), readyAt("02".repeat(32), 20L)), false, 0L));
+        assertEquals(1, at(Level.INFO, priced).stream()
+                .filter(line -> line.startsWith("compound order (most profitable first): ")).count(), priced.toString());
+
+        CompoundCandidate a = refusedAt("a1".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        CompoundCandidate b = refusedAt("a2".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        List<Line> unpriced = cycleAt(executorOver(new FakeScanner(List.of(b, a))), T0);
+        assertEquals(List.of(new Line(Level.DEBUG, "compound order (most profitable first): "
+                        + a.escrowRef() + " gross unpriced, " + b.escrowRef() + " gross unpriced")),
+                unpriced.stream().filter(line -> line.text().startsWith("compound order")).toList());
+        assertReconciles(summaryOf(priced).text(), 0);
+        assertReconciles(summaryOf(unpriced).text(), 0);
+    }
+
+    /** FAB-180: a fault keeps its level and its text — BUILD FAILED is still an ERROR — and the walk is still summarised. */
+    @Test
+    void aBuildFailureIsStillAnErrorWithItsTextUnchanged() {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        CompoundTransactionBuilder failing = org.mockito.Mockito.mock(CompoundTransactionBuilder.class);
+        org.mockito.Mockito.when(failing.buildWithFacts(
+                        org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class)))
+                .thenThrow(new IllegalStateException("kernel said no"));
+        CompoundCandidate only = ready(0L);
+        CompoundExecutor executor = executorWithBuilder(configuration, failing, universe());
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        assertTrue(lines.contains(new Line(Level.ERROR, "compound BUILD FAILED " + LOAN_ID + " escrow "
+                        + only.escrowRef() + ": java.lang.IllegalStateException: kernel said no")),
+                "BUILD FAILED stays at ERROR, text unchanged: " + lines);
+        Line summary = summaryOf(lines);
+        assertEquals(new Line(Level.INFO, "compound scan: 1 escrows, 1 priced, 1 ready, refused {}, "
+                + "not approved {}"), summary, "one candidate: priced once for the summary, no ranking");
+        assertReconciles(summary.text(), 0);
+    }
+
+    /** FAB-180: the post-build NOT APPROVED moves to DEBUG, text unchanged, and is counted by its reason. */
+    @Test
+    void aPostBuildNotApprovedIsDebugAndCounted() {
+        List<Line> lines = linesOfOneCycle(wiring(List.of(ready(0L)), true, 0L));
+
+        List<String> notApproved = lines.stream()
+                .filter(line -> line.text().startsWith("compound NOT APPROVED "))
+                .map(line -> line.level() + " " + line.text()).toList();
+        assertEquals(1, notApproved.size(), lines.toString());
+        assertTrue(notApproved.getFirst().startsWith("DEBUG compound NOT APPROVED " + LOAN_ID + " escrow "
+                + ready(0L).escrowRef() + ": NET_BELOW_FLOOR — Q=" + ESCROW + " raw units at compoudingFeePerMille=0 "
+                + "gives F=1000000 raw units, priced reward=1000000 lovelace"), notApproved.getFirst());
+        assertEquals(List.of("compound scan: 1 escrows, 1 priced, 1 ready, refused {}, "
+                + "not approved {NET_BELOW_FLOOR=1}"), at(Level.INFO, lines), "only the summary at INFO");
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /** FAB-180: an unpriced quote's NOT APPROVED moves to DEBUG, text unchanged, and is counted by its reason. */
+    @Test
+    void anUnpricedQuoteNotApprovedIsDebugAndCounted() {
+        var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
+        CompoundCandidate candidate = nativeCandidate("33".repeat(32), token,
+                BigInteger.valueOf(1_000_000L), 100L, BigInteger.valueOf(2_000_000L));
+        var client = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed> findFeed(
+                    com.fluidtokens.aquarium.offchain.model.AssetType asset, long atMillis) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed> findFeedIgnoringValidity(
+                    com.fluidtokens.aquarium.offchain.model.AssetType asset) {
+                return Optional.empty();
+            }
+        };
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var block = new BlockEventListener(null);
+        block.getIsSyncing().set(false);
+        var executor = new CompoundExecutor(configuration, network, block,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(List.of(candidate)),
+                new CompoundEconomics(configuration, network, new PricingService(client)), realBuilder(),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                bytes -> { throw new AssertionError("an unpriced candidate must not be submitted"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        List<Line> notApproved = lines.stream()
+                .filter(line -> line.text().startsWith("compound NOT APPROVED ")).toList();
+        assertEquals(1, notApproved.size(), lines.toString());
+        assertEquals(Level.DEBUG, notApproved.getFirst().level(), "the unpriced NOT APPROVED is at DEBUG");
+        assertTrue(notApproved.getFirst().text().startsWith("compound NOT APPROVED " + LOAN_ID + " escrow "
+                        + candidate.escrowRef() + ": PRICE_NO_FEED — F=100000 raw units, quote="),
+                "text unchanged: " + notApproved);
+        assertEquals(List.of("compound scan: 1 escrows, 0 priced, 1 ready, refused {}, "
+                + "not approved {PRICE_NO_FEED=1}"), at(Level.INFO, lines), "only the summary at INFO");
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /**
+     * FAB-180: the pre-sign rechecks are NOT routine — a transaction was built and validated — so they keep
+     * their INFO level and text; their reasons count under the same {@code not approved} map.
+     */
+    @Test
+    void thePreSignRecheckStaysInfoAndCountsUnderNotApproved() {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        CompoundEconomics economics = org.mockito.Mockito.spy(
+                new CompoundEconomics(configuration, network, pricingService()));
+        org.mockito.Mockito.doReturn(CompoundExclusion.PRICE_OBSERVATION_CHANGED).when(economics)
+                .revalidateObservation(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.anyLong());
+        CompoundExecutor executor = executor(List.of(ready(0L)), realBuilder(), ACCOUNT, economics,
+                bytes -> { throw new AssertionError("refused before signing"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        assertEquals(List.of("compound NOT APPROVED " + LOAN_ID + " escrow " + ready(0L).escrowRef()
+                        + ": PRICE_OBSERVATION_CHANGED immediately before signing",
+                        "compound scan: 1 escrows, 1 priced, 1 ready, refused {}, "
+                                + "not approved {PRICE_OBSERVATION_CHANGED=1}"),
+                at(Level.INFO, lines));
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /** FAB-180: a cycle that ends before the walk — here, an empty scan — says no summary at all. */
+    @Test
+    void aCycleThatEndsBeforeTheWalkSaysNoSummary() {
+        List<Line> lines = linesOfOneCycle(wiring(List.of(), true, -2_000_000L));
+        assertEquals(List.of(), lines.stream().filter(line -> line.text().startsWith("compound scan")).toList());
     }
 
     // ---- fakes -------------------------------------------------------------------------------
