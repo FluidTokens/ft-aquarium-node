@@ -257,11 +257,44 @@ jobs:
       # re-measured cold keyless on feat/fab-165-oct26-update: 205 files / 2043 tests / 0 failures / 0 errors /
       # 50 skipped, 0 orphans. Floor 205.
       #
+      # FAB-174-1 (FluidOracleClientLoadPinTest, OracleRegistryParserTest: the oracle registry parser, extracted
+      # and pinned) re-measured cold keyless on feat/fab-173-oracle-ws-shadow: 207 files / 2049 tests /
+      # 0 failures / 0 errors / 50 skipped, 0 orphans. Floor 207.
+      #
+      # FAB-174-2 (OracleStreamAuthTest, OracleStreamClientTest, OracleStreamLauncherTest: the shadow oracle
+      # stream connects, authenticates and receives) re-measured cold keyless on feat/fab-173-oracle-ws-shadow:
+      # 210 files / 2090 tests / 0 failures / 0 errors / 50 skipped, 0 orphans. Floor 210.
+      #
+      # FAB-174-3 (OracleStreamRetryPolicyTest, OracleStreamClientLivenessTest, OracleStreamLogTest,
+      # ReadinessOracleStreamLineTest: liveness, per-status retry, metrics and the readiness line) re-measured
+      # cold keyless on feat/fab-173-oracle-ws-shadow: 214 files / 2149 tests / 0 failures / 0 errors /
+      # 50 skipped, 0 orphans. Floor 214.
+      # FAB-174-3 r3 (no new class; four new cases in existing ones) re-measured cold keyless:
+      # 214 files / 2153 tests / 0 failures / 0 errors / 50 skipped, 0 orphans. Floor stays 214.
+      #
+      # FAB-174-4 (OracleStreamPreviewLiveTest: the env-gated preview rig, skipped keyless; plus one case in
+      # EnvGatedRigReachabilityTest and two in OracleStreamClientLivenessTest) re-measured cold keyless on
+      # feat/fab-173-oracle-ws-shadow: 215 files / 2157 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
+      # Floor 215.
+      #
+      # FAB-175-1 (FluidOracleClientLoadListenerTest, OracleStreamComparatorTest: every push compared against the
+      # poller's load; plus one case in OracleStreamLauncherTest) re-measured cold keyless on
+      # feat/fab-173-oracle-ws-shadow: 217 files / 2178 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
+      # Floor 217. Its r2 added cases to existing classes: re-measured cold keyless at 2264835 (the FAB-175-2
+      # base), 217 files / 2188 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
+      #
+      # FAB-175-2 (OracleStreamDailySummaryTest, OracleStreamGateRecipeTest: the day line and the W3 gate recipe
+      # in docs/oracle-stream.md, run as the doc prints it; plus cases in OracleStreamComparatorTest and
+      # OracleStreamLauncherTest) re-measured cold keyless on feat/fab-173-oracle-ws-shadow:
+      # 219 files / 2200 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 219. Its r2 added cases to
+      # those four classes (one day line per midnight; every recipe FAIL reason, no-pushes and lost-lines among
+      # them): re-measured cold keyless, 219 files / 2212 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '205'
+          RESULT_FILE_FLOOR: '219'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
