@@ -43,6 +43,8 @@ import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -596,13 +598,48 @@ class OracleStreamLauncherTest {
     }
 
     /**
-     * FAB-175-2: the {@code day} line is scheduled on the stream thread at the next UTC midnight of the INJECTED
-     * clock, re-computed after each line. The clock stands at 23:59:59.500Z and never moves, so every next
-     * midnight is 500 ms away and the lines keep coming — a fixed 24 h rate from the boot would have said one, and
-     * a delay not taken from that clock none. stop() then says the final {@code last=1} line once.
+     * FAB-175-2 r2 (F1), one {@code day} line per midnight: the injected clock MOVES, 1:1 with
+     * {@link System#nanoTime()}, and its first reading — the launcher's, when it schedules the first line — is
+     * 999 µs before midnight. The task is scheduled to the nanosecond, so it wakes at or after midnight by that
+     * clock: exactly ONE {@code last=0} line for that midnight, on the stream thread, and not one early wake. The next
+     * target is a day later, so nothing more follows. r1 truncated the delay to whole milliseconds (0 here), woke
+     * early, and re-fired at 0 ms until the clock passed midnight: a burst of lines.
      */
     @Test
-    void theDayLineIsScheduledAtEachNextUtcMidnightOfTheInjectedClock() {
+    void aMidnightASubMillisecondFractionAwayGivesExactlyOneDayLine() {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        NanoClock clock = new NanoClock(Instant.parse("2026-11-02T00:00:00Z").minusNanos(999_000));
+        launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.useForTest(OracleStreamClient.Timings.PRODUCTION, clock);
+        launcher.start();
+
+        await(() -> !dayEvents().isEmpty(), WAIT, "the midnight day line");
+        sleepMillis(500);
+        List<ILoggingEvent> midnight = dayEvents();
+        assertEquals(1, midnight.size(), messages(midnight).toString());
+        assertTrue(midnight.getFirst().getFormattedMessage().endsWith(" last=0"), messages(midnight).toString());
+        assertEquals(OracleStreamLauncher.THREAD_NAME, midnight.getFirst().getThreadName(), "on the stream thread");
+        assertEquals(0, launcher.dayEarlyWakes(), "a task that woke before midnight");
+
+        launcher.stop();
+        List<String> lines = messages(dayEvents());
+        assertEquals(2, lines.size(), lines.toString());
+        assertTrue(lines.get(1).endsWith(" last=1"), lines.toString());
+        assertEquals(List.of(), streamThreadsAfterAWhile());
+        assertTrue(messages(streamLines()).stream().noneMatch(l -> l.contains(" task-error ")),
+                messages(streamLines()).toString());
+    }
+
+    /**
+     * FAB-175-2 r2 (F1): a task that wakes before its midnight by the injected clock waits again and writes
+     * nothing. The clock stands still at 23:59:59.500Z, so the task, due 500 ms later, keeps waking early: no
+     * line. Once the clock reaches midnight, exactly one {@code last=0} line, from the stream thread, and the next
+     * target is a day away. The delay comes from the injected clock: a fixed 24 h from the boot would never have
+     * woken at all.
+     */
+    @Test
+    void aDayTaskThatWakesBeforeItsMidnightWaitsAgainAndWritesNothing() {
         server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
         OracleStreamClientLivenessTest.MutableClock clock =
                 new OracleStreamClientLivenessTest.MutableClock(Instant.parse("2026-11-01T23:59:59.500Z"));
@@ -611,12 +648,16 @@ class OracleStreamLauncherTest {
         launcher.useForTest(OracleStreamClient.Timings.PRODUCTION, clock);
         launcher.start();
 
-        await(() -> dayEvents().size() >= 2, WAIT, "two midnight day lines");
+        await(() -> launcher.dayEarlyWakes() >= 2, WAIT, "two early wakes");
+        assertEquals(List.of(), messages(dayEvents()), "no line before midnight");
+
+        clock.advance(Duration.ofMillis(500));
+        await(() -> !dayEvents().isEmpty(), WAIT, "the midnight day line");
+        sleepMillis(1200);
         List<ILoggingEvent> midnight = dayEvents();
-        assertTrue(midnight.stream().allMatch(e -> e.getFormattedMessage().endsWith(" last=0")), messages(midnight)
-                .toString());
-        assertEquals(List.of(OracleStreamLauncher.THREAD_NAME),
-                midnight.stream().map(ILoggingEvent::getThreadName).distinct().toList(), "on the stream thread");
+        assertEquals(1, midnight.size(), messages(midnight).toString());
+        assertTrue(midnight.getFirst().getFormattedMessage().endsWith(" last=0"), messages(midnight).toString());
+        assertEquals(OracleStreamLauncher.THREAD_NAME, midnight.getFirst().getThreadName(), "on the stream thread");
 
         launcher.stop();
         List<String> last = messages(dayEvents()).stream().filter(l -> l.endsWith(" last=1")).toList();
@@ -832,6 +873,37 @@ class OracleStreamLauncherTest {
             Thread.sleep(millis);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * A clock that moves 1:1 with {@link System#nanoTime()} from {@code start}, counted from its FIRST reading — so
+     * the first reader sees exactly {@code start}, however long the set-up before it took.
+     */
+    private static final class NanoClock extends Clock {
+
+        private final Instant start;
+        private final AtomicReference<Long> origin = new AtomicReference<>();
+
+        NanoClock(Instant start) {
+            this.start = start;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            long now = System.nanoTime();
+            origin.compareAndSet(null, now);
+            return start.plusNanos(now - origin.get());
         }
     }
 

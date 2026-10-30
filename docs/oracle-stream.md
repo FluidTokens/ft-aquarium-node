@@ -107,7 +107,10 @@ after a connection WARNs again.
 | `off` | INFO or WARN | `reason=` (and `value=`, `network=`, `host=` where relevant) | at startup: the stream is off, and why (§2, §3). WARN when a setting of yours is wrong; also `reason=internal-error(<class>)` if the stream itself failed to start — the rest of the node is unaffected |
 | `connecting` | DEBUG | `attempt=` | an attempt is starting |
 | `connected` | INFO | `attempt=` `handshake_ms=` | the connection is open; `attempt` counts the attempts it took |
-| `push` | INFO | `push=` `n=` `chars=` `ts=` `dly_ms=` | a push arrived and parsed: its sequence number, entries, size, the server's timestamp, and how many ms after that timestamp it arrived |
+| `push` | DEBUG | `push=` `n=` `chars=` `ts=` `dly_ms=` | a push arrived and parsed: its sequence number, entries, size, the server's timestamp, and how many ms after that timestamp it arrived. DEBUG because its `cmp` line says the same push at INFO |
+| `cmp` | INFO, or WARN for `MISMATCH` and `API_AHEAD` | `push=` `out=` `n=` `h=`, then the outcome's own | the one verdict on a push compared with the API (or, with `push=-`, on an API change no push carried) — [Comparing the stream with the API](#comparing-the-stream-with-the-api) |
+| `cmp-detail` | WARN or DEBUG | `push=` `out=` `only_ws=` `only_api=` `differ=` (and `api_is_push=`) | after a `MISMATCH` or `API_AHEAD`: which oracle NFTs differ. WARN when the set differs from the last one said, DEBUG while it repeats |
+| `day` | INFO | `push=` `up_s=` `conn_s=` `pushes=` … `last=` | the cumulative summary at each UTC midnight, and `last=1` when the node stops — [The `day` line](#the-day-line) |
 | `push-ignored` | WARN or DEBUG | `reason=` `count=` | a message that is not a usable push: `malformed`, `unknown-type:<type>`, `oversize` (over 1,048,576 characters) or `binary`. The connection stays up; the message is counted, never echoed |
 | `refused` | WARN or DEBUG | `status=` `msg="…"` `retry_s=` | the server refused the connection (§6) |
 | `closed` | WARN, DEBUG or INFO | `reason=` `up_s=` | a connection ended, and how long it had been open. `reason` is `server-close(<code>)`, `error(<class>)`, `no-pong`, `proactive` (INFO — planned, §7) or `shutdown` (INFO — the node is stopping) |
@@ -160,9 +163,12 @@ On `/actuator/prometheus`, alongside the node's other metrics:
 | `aquarium_oracle_stream_pushes_total{result}` | counter | messages received, by `result`: `parsed`, `unknown_type`, `malformed`, `oversize`, `binary` |
 | `aquarium_oracle_stream_refusals_total{status}` | counter | refused connections, by `status`: `400`, `401`, `403`, `429`, `other` |
 | `aquarium_oracle_stream_disconnects_total{reason}` | counter | connections that **had opened** and then ended, by `reason`: `proactive`, `server_close`, `error`, `no_pong`. An attempt that never opened is not a disconnect |
+| `aquarium_oracle_stream_comparison_total{outcome}` | counter | `cmp` lines, by `outcome`: `matched`, `superseded`, `mismatch`, `api_ahead`, `uncovered` |
+| `aquarium_oracle_stream_comparison_lag_seconds` | gauge | the `lag_s` of the last first-time `MATCHED` push (`rep=0`); NaN before any |
+| `aquarium_oracle_stream_connected_seconds_total` | counter | seconds a connection has been open since startup, the open one included |
 
-Every series exists from startup at 0, so an absent series means the stream is off, not that nothing
-happened.
+Every series exists from startup at 0 (the lag gauge at NaN), so an absent series means the stream is off,
+not that nothing happened.
 
 ---
 
@@ -220,7 +226,7 @@ The `why=` of an `UNCOVERED` line — **none of these is a failure**; each is a 
 |---|---|
 | `no-api` | no poller load at all within the 5 minutes (the API, or the poller, was unreachable) |
 | `unjudgeable` | the API's change fell within 120 s of a (re)connect |
-| `pre-connect` | the first poller load matching the push is one that does not witness timing: the API already served those entries before the push's connection opened, or it is the very first load the node ever made (its starting point, which says nothing about when the API moved to it). No lag is ever measured against either |
+| `pre-connect` | the first poller load matching the push is one that does not witness timing: the API already served those entries before the push's connection opened, or it is the very first load the node ever made, or a later load still serving that same content (its starting point, which says nothing about when the API moved to it). No lag is ever measured against either |
 | `overflow` | more than 64 pushes were waiting for a verdict; the oldest is given up |
 | `shutdown` | the node stopped before the 5 minutes were up — or a push arrived while it was stopping |
 
@@ -238,6 +244,8 @@ At each **UTC midnight**, and once more when the node stops, the stream writes o
 
 Everything in it is **cumulative since the node started** — never reset at midnight — so the last `day`
 line of a boot (its highest `ev`) carries the whole boot, and `last=1` marks the one written at shutdown.
+There is exactly one `last=0` line per midnight; if the host's clock jumps forward over several midnights
+(a suspended VM, say), each one gets its line when the node wakes.
 
 - `up_s`: seconds since the stream started — counted from its first event after startup, which is at most
   10 s after the launch; `conn_s`: seconds a connection was open, including the one open now.
@@ -323,13 +331,14 @@ function fixed2(a, b,   x) {
     if (n >= 3 && t[2] ~ /^boot=/ && t[3] ~ /^ev=/) { found = 1; break }
   }
   if (!found) next
+  # boot and ev by position: a server msg="..." later on the line cannot rewrite them.
+  b = substr(t[2], 6); e = substr(t[3], 4) + 0
   split("", f)
-  for (j = 2; j <= n; j++) {
+  for (j = 4; j <= n; j++) {
     if (t[j] == "--") break
     p = index(t[j], "=")
     if (p > 1) f[substr(t[j], 1, p - 1)] = substr(t[j], p + 1)
   }
-  b = f["boot"]; e = f["ev"] + 0
   if (!(b in known)) { known[b] = 1; boot[++nb] = b; evmax[b] = 0; evn[b] = 0; dayev[b] = 0 }
   if (e > 0 && !((b, e) in seenev)) { seenev[b, e] = 1; evn[b]++; if (e > evmax[b]) evmax[b] = e }
   if (t[1] == "cmp") {
@@ -346,24 +355,25 @@ function fixed2(a, b,   x) {
   }
 }
 END {
-  U = 0; C = 0; D = 0; H = 0; G = 0; gaps = ""
+  U = 0; C = 0; D = 0; H = 0; G = 0; L = 0; gaps = ""
   for (k = 1; k <= nb; k++) {
     b = boot[k]
-    U += up[b]; C += conn[b]; D += drops[b]; H += heals[b]
+    U += up[b]; C += conn[b]; D += drops[b]; H += heals[b]; L += evmax[b] - evn[b]
     if (gap[b] + 0 > G) G = gap[b] + 0
     gaps = gaps (k > 1 ? "," : "") b ":" (evmax[b] - evn[b])
   }
+  P = pushes + 0
   print "boots=" nb + 0
-  print "pushes=" pushes + 0
+  print "pushes=" P
   print "matched=" out["MATCHED"] + 0
   print "superseded=" out["SUPERSEDED"] + 0
   print "mismatch=" out["MISMATCH"] + 0
   print "api_ahead=" api_ahead + 0
   print "uncovered=" out["UNCOVERED"] + 0
-  print "verified_pct=" fixed2(out["MATCHED"] * 100, pushes)
+  print "verified_pct=" fixed2(out["MATCHED"] * 100, pushes + 0)
   print "up_s=" U
   print "conn_s=" C
-  print "uptime_pct=" fixed2(C * 100, U)
+  print "uptime_pct=" fixed2(C * 100, U + 0)
   print "drops=" D
   print "heals=" H
   print "unhealed=" D - H
@@ -372,11 +382,13 @@ END {
   print "days=" fixed2(U, 86400)
   print "ev_gaps=" gaps
   r = ""
-  if (out["MISMATCH"] > 0) r = r ",mismatch"
-  if (api_ahead > 0) r = r ",api_ahead"
+  if (out["MISMATCH"] + 0 > 0) r = r ",mismatch"
+  if (api_ahead + 0 > 0) r = r ",api_ahead"
   if (C * 100 < 99 * U) r = r ",uptime"
   if (D - H > 0) r = r ",unhealed"
   if (U < 7 * 86400) r = r ",days"
+  if (P == 0) r = r ",no-pushes"
+  if (L > 0) r = r ",lost-lines"
   print "verdict=" (r == "" ? "PASS" : "FAIL") " reasons=" substr(r, 2)
   exit (r == "" ? 0 : 1)
 }'
@@ -387,18 +399,28 @@ It prints one `key=value` per line and ends with `verdict=PASS reasons=` or `ver
 exiting 0 on PASS and 1 on FAIL (anything else means the recipe itself failed).
 
 - **How it counts.** Outcomes come from `cmp` lines, each push counted once per boot (`boot`, `push`), so
-  an overlapping export counts nothing twice; `api_ahead` counts distinct `h` per boot. Uptime comes from
-  each boot's latest `day` line (`up_s`, `conn_s`, `drops`, `heals`, `gap_max_s`), summed across boots — or,
-  for `gap_max_s`, the largest. `lag_max_s` is the largest `MATCHED` lag. `days` is the summed `up_s` over
-  86,400, rounded down to two decimals, as are both percentages.
-- **FAIL** when any of: `mismatch` above 0, `api_ahead` above 0, `uptime_pct` below 99, `unhealed` (drops
-  minus heals) above 0, `days` below 7. `reasons` names each.
+  an overlapping export counts nothing twice; `api_ahead` counts distinct `h` per boot. `boot` and `ev` are
+  read by their position right after the event name, so a server's quoted `msg="…"` later on a line can
+  never stand in for them. Uptime comes from each boot's latest `day` line (`up_s`, `conn_s`, `drops`,
+  `heals`, `gap_max_s`), summed across boots — or, for `gap_max_s`, the largest. `lag_max_s` is the largest
+  `MATCHED` lag. `days` is the summed `up_s` over 86,400, rounded down to two decimals, as are both
+  percentages (`-` when there is nothing to divide by).
+- **FAIL** when any of: `mismatch` above 0, `api_ahead` above 0, `uptime_pct` below 99 (exactly 99.00 passes),
+  `unhealed` (drops minus heals) above 0, `days` below 7, `no-pushes`, `lost-lines`. `reasons` names each.
+- **The gate fails without evidence** (Giovanni, 2026-10-29). Two of the reasons are about the log, not the
+  stream:
+  - `no-pushes`: not one push in the whole log. Nothing was compared, so nothing was proven — a quiet week
+    is not a passing week.
+  - `lost-lines`: any `ev` gap in any boot (`ev_gaps` below). A missing line may have been the `MISMATCH`
+    or `API_AHEAD` that fails the gate, so the gate cannot pass over it. Re-export the missing days if Docker
+    still holds them; otherwise the week has to be run again.
 - ⚠ **`SUPERSEDED` and `UNCOVERED` pushes are UNVERIFIED** — neither proven equal nor proven different.
   They do not fail the gate; `verified_pct` (matched over pushes) is reported for Giovanni's judgement, not
   turned into a verdict.
 - **`ev_gaps`** lists, per boot, how many `ev` numbers are missing between 1 and the highest seen —
-  lines lost, a boot whose start fell outside every export, or a missed export. A boot with no `day` line at
-  all (killed before its first midnight) adds nothing to `up_s`. **A PASS over gapped or partial logs is a
-  verdict on the lines that survived, not on the week.**
+  lines lost, a boot whose start fell outside every export, or a missed export. Any of them is a
+  `lost-lines` FAIL. A boot with no `day` line at all (killed before its first midnight) adds nothing to
+  `up_s`, and the lines a `kill -9` lost after the last `day` line leave no gap to see: **a PASS is a
+  verdict on the lines that survived.**
 - `lag_s=0` lines are "not behind", not missing data; `why=pre-connect` and every other `UNCOVERED` reason
   are unverified pushes, not failures.

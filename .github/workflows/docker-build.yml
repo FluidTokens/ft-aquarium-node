@@ -286,7 +286,9 @@ jobs:
       # FAB-175-2 (OracleStreamDailySummaryTest, OracleStreamGateRecipeTest: the day line and the W3 gate recipe
       # in docs/oracle-stream.md, run as the doc prints it; plus cases in OracleStreamComparatorTest and
       # OracleStreamLauncherTest) re-measured cold keyless on feat/fab-173-oracle-ws-shadow:
-      # 219 files / 2200 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 219.
+      # 219 files / 2200 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 219. Its r2 added cases to
+      # those four classes (one day line per midnight; every recipe FAIL reason, no-pushes and lost-lines among
+      # them): re-measured cold keyless, 219 files / 2212 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.

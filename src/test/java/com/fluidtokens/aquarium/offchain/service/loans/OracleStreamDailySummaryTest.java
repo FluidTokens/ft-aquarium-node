@@ -129,6 +129,22 @@ class OracleStreamDailySummaryTest {
     }
 
     /**
+     * FAB-175-2 r2 (F1): the delay to a carried midnight is kept to the nanosecond — a target 999 µs away is
+     * 999000 ns, never the 0 ms a millisecond truncation makes of it — and a target already passed is 0, never
+     * negative.
+     */
+    @Test
+    void theDelayToACarriedMidnightIsNeverTruncatedBelowIt() {
+        Instant midnight = Instant.parse("2026-11-02T00:00:00Z");
+        assertEquals(999_000L, OracleStreamLauncher.delayUntil(midnight, midnight.minusNanos(999_000)));
+        assertEquals(1L, OracleStreamLauncher.delayUntil(midnight, midnight.minusNanos(1)));
+        assertEquals(0L, OracleStreamLauncher.delayUntil(midnight, midnight));
+        assertEquals(0L, OracleStreamLauncher.delayUntil(midnight, midnight.plusSeconds(5)), "late: at once");
+        assertEquals(Duration.ofHours(24).toNanos(),
+                OracleStreamLauncher.delayUntil(midnight.plus(Duration.ofDays(1)), midnight));
+    }
+
+    /**
      * Every field at eight digits — about three years of seconds and a hundred million pushes — and
      * {@code lag_max_s} at three (it never exceeds {@link OracleStreamComparator#WINDOW}): the fields fit 250
      * bytes, and the whole message, under a ten-digit {@code ev}, stays within 300.

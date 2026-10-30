@@ -273,6 +273,27 @@ class OracleStreamComparatorTest {
         assertCounts(1, 0, 0, 0, 2);
     }
 
+    /**
+     * FAB-175-2 r2 (F3), the baseline carries over to a later load of the same content ({@code same &&
+     * apiLast.baseline()}): the first API load arrives AFTER the open, a push of that content follows, and the
+     * poller's next load of the same content is the push's first matching observation. That load is still the
+     * baseline's run — nothing says when the API moved to it — so the push is UNCOVERED {@code why=pre-connect}, not
+     * MATCHED at a lag of 30 s, and the gauge never moves.
+     */
+    @Test
+    void aLaterLoadOfTheBaselineContentIsStillNoTimingWitness() {
+        comparator.onOpen(OPEN);
+        comparator.onApiLoad(OPEN.plusSeconds(10), entries(a1));
+        push(OPEN.plusSeconds(100), a1);
+        assertEquals(List.of(), cmpFields(), "the push waits: the baseline is not an API change");
+        comparator.onApiLoad(OPEN.plusSeconds(130), entries(a1));
+
+        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100"),
+                cmpFields());
+        assertEquals(Double.NaN, lag(), "no lag against the baseline");
+        assertCounts(0, 0, 0, 0, 1);
+    }
+
     // ======================================================================================
     // SUPERSEDED
     // ======================================================================================

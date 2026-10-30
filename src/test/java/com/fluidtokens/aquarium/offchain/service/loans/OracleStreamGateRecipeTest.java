@@ -40,7 +40,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       MATCHED (lag 30);</li>
  *   <li>Σ up_s 648000 = 7.50 days.</li>
  * </ul>
- * ⛔ No skip: a missing {@code sh} or {@code awk} fails this test.
+ * Every FAIL reason has a run of its own that fails for that reason alone (r2: {@code api_ahead}, {@code unhealed},
+ * {@code days}, and Giovanni's 2026-10-29 ruling that the gate fails without evidence: {@code no-pushes},
+ * {@code lost-lines}), and so do the counting rules a wrong recipe would get wrong quietly: the (boot, push)
+ * de-duplication, the 99.00% boundary, a boot that waited days for its first open, and a server message that
+ * names {@code boot=} and {@code ev=}.
+ *
+ * <p>⛔ No skip: a missing {@code sh} or {@code awk} fails this test.
  */
 class OracleStreamGateRecipeTest {
 
@@ -55,6 +61,33 @@ class OracleStreamGateRecipeTest {
     private static final Instant B1_END = Instant.parse("2026-11-05T06:00:00Z");
     private static final Instant B2 = Instant.parse("2026-11-05T06:05:00Z");
     private static final Instant B2_END = Instant.parse("2026-11-08T18:05:00Z");
+    /** The refused boot: its first cmp-tick, its first open almost two days later, and its end. */
+    private static final Instant R0 = Instant.parse("2026-11-01T00:00:10Z");
+    private static final Instant R_OPEN = Instant.parse("2026-11-02T23:00:10Z");
+    private static final Instant R_END = Instant.parse("2026-11-09T00:00:10Z");
+
+    /** The seven-and-a-half-day week's figures, as {@link #twoBootsOverSevenDaysPass} pins them. */
+    private static final List<String> PASS_FIGURES = List.of(
+            "boots=2",
+            "pushes=4",
+            "matched=3",
+            "superseded=1",
+            "mismatch=0",
+            "api_ahead=0",
+            "uncovered=0",
+            "verified_pct=75.00",
+            "up_s=648000",
+            "conn_s=647399",
+            "uptime_pct=99.90",
+            "drops=1",
+            "heals=1",
+            "unhealed=0",
+            "gap_max_s=193790",
+            "lag_max_s=30",
+            "days=7.50");
+
+    /** How boot 2 goes: as planned, or with the one thing a run is about. */
+    private enum Two { PLAIN, MISMATCH, API_AHEAD, UNHEALED, NO_PUSHES }
 
     private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
     private Logger logger;
@@ -88,41 +121,144 @@ class OracleStreamGateRecipeTest {
     @Test
     void twoBootsOverSevenDaysPass() throws Exception {
         List<String> boot1 = bootOne(600);
-        List<String> boot2 = bootTwo(false);
+        List<String> boot2 = bootTwo(Two.PLAIN);
         List<String> log = new ArrayList<>(boot1);
         log.addAll(boot1.subList(boot1.size() - 5, boot1.size()));
         log.addAll(boot2);
 
         Result result = run(log);
 
-        assertEquals(List.of(
-                "boots=2",
-                "pushes=4",
-                "matched=3",
-                "superseded=1",
-                "mismatch=0",
-                "api_ahead=0",
-                "uncovered=0",
-                "verified_pct=75.00",
-                "up_s=648000",
-                "conn_s=647399",
-                "uptime_pct=99.90",
-                "drops=1",
-                "heals=1",
-                "unhealed=0",
-                "gap_max_s=193790",
-                "lag_max_s=30",
-                "days=7.50",
-                "ev_gaps=" + boot(boot1) + ":0," + boot(boot2) + ":0",
+        assertEquals(figures(PASS_FIGURES, "ev_gaps=" + boot(boot1) + ":0," + boot(boot2) + ":0",
                 "verdict=PASS reasons="), result.lines(), result.toString());
         assertEquals(0, result.exit(), result.toString());
+    }
+
+    /**
+     * r4, the (boot, push) de-duplication: boot 1 exported twice in full — every {@code cmp} and {@code day} line
+     * repeated — counts nothing twice. The figures are the PASS week's exactly.
+     */
+    @Test
+    void aBootExportedTwiceInFullCountsOnce() throws Exception {
+        List<String> boot1 = bootOne(600);
+        List<String> boot2 = bootTwo(Two.PLAIN);
+        List<String> log = new ArrayList<>(boot1);
+        log.addAll(boot1);
+        log.addAll(boot2);
+        assertEquals(3, boot1.stream().filter(l -> l.contains("[oracle-stream] cmp ")).count(), "fixture: 3 cmp");
+        assertEquals(7, log.stream().filter(l -> l.contains("[oracle-stream] cmp ")).count(), "fixture: twice, +1");
+
+        Result result = run(log);
+
+        assertEquals(figures(PASS_FIGURES, "ev_gaps=" + boot(boot1) + ":0," + boot(boot2) + ":0",
+                "verdict=PASS reasons="), result.lines(), result.toString());
+        assertEquals(0, result.exit(), result.toString());
+    }
+
+    /**
+     * F2, {@code api_ahead}: in boot 2 the API moves to P1, which no push carries; once
+     * {@link OracleStreamComparator#WINDOW} has passed that is an orphan {@code push=-}, and the push of P1 that
+     * then arrives is API_AHEAD again, attached, with the SAME {@code h}. One API change: {@code api_ahead=1}.
+     */
+    @Test
+    void anOrphanAndALatePushOfTheSameApiChangeAreOneApiAheadAndFail() throws Exception {
+        List<String> boot1 = bootOne(600);
+        List<String> boot2 = bootTwo(Two.API_AHEAD);
+        List<String> log = new ArrayList<>(boot1);
+        log.addAll(boot2);
+        String h = OracleStreamComparator.hash(entries(p1));
+        assertEquals(1, log.stream().filter(l -> l.contains(" push=- out=API_AHEAD n=5 h=" + h)).count(), "fixture");
+        assertEquals(1, log.stream().filter(l -> l.contains(" push=2 out=API_AHEAD n=5 h=" + h + " lead_s=350 "))
+                .count(), "fixture: the late push, same h");
+
+        Result result = run(log);
+
+        assertEquals(figures(PASS_FIGURES, "pushes=5", "api_ahead=1", "verified_pct=60.00",
+                "ev_gaps=" + boot(boot1) + ":0," + boot(boot2) + ":0",
+                "verdict=FAIL reasons=api_ahead"), result.lines(), result.toString());
+        assertEquals(1, result.exit(), result.toString());
+    }
+
+    /**
+     * F2, {@code unhealed}: boot 2's connection drops 60 s before its shutdown and never reopens. 647339 of 648000
+     * connected is still 99.89%, so the drop with no heal is the only reason. Its quiet gap, the reopen at +6901 to
+     * that drop, is now the longest: 295439 s.
+     */
+    @Test
+    void aDropWithNoReopenBeforeShutdownFailsUnhealed() throws Exception {
+        List<String> boot1 = bootOne(600);
+        List<String> boot2 = bootTwo(Two.UNHEALED);
+        List<String> log = new ArrayList<>(boot1);
+        log.addAll(boot2);
+
+        Result result = run(log);
+
+        assertEquals(figures(PASS_FIGURES, "conn_s=647339", "uptime_pct=99.89", "drops=2", "unhealed=1",
+                "gap_max_s=295439", "ev_gaps=" + boot(boot1) + ":0," + boot(boot2) + ":0",
+                "verdict=FAIL reasons=unhealed"), result.lines(), result.toString());
+        assertEquals(1, result.exit(), result.toString());
+    }
+
+    /** F2, {@code days}: boot 1 alone is four days, healthy in every other way. */
+    @Test
+    void oneBootOfFourDaysFailsDays() throws Exception {
+        List<String> boot1 = bootOne(600);
+
+        Result result = run(boot1);
+
+        assertEquals(figures(PASS_FIGURES, "boots=1", "pushes=3", "matched=2", "verified_pct=66.66", "up_s=345600",
+                "conn_s=345000", "uptime_pct=99.82", "days=4.00", "ev_gaps=" + boot(boot1) + ":0",
+                "verdict=FAIL reasons=days"), result.lines(), result.toString());
+        assertEquals(1, result.exit(), result.toString());
+    }
+
+    /**
+     * Giovanni's ruling (2026-10-29), the gate fails without evidence — {@code no-pushes}: the same healthy week
+     * with not one push. Nothing was compared, so nothing was proven. {@code verified_pct} has nothing to divide by
+     * (F4: {@code pushes + 0}, which BusyBox awk needs) and the longest quiet gap is boot 1's open to its drop.
+     */
+    @Test
+    void aWeekWithNoPushFailsNoPushes() throws Exception {
+        List<String> boot1 = bootOne(600, false);
+        List<String> boot2 = bootTwo(Two.NO_PUSHES);
+        List<String> log = new ArrayList<>(boot1);
+        log.addAll(boot2);
+        assertEquals(0, log.stream().filter(l -> l.contains("[oracle-stream] cmp ")).count(), "fixture: no cmp");
+
+        Result result = run(log);
+
+        assertEquals(figures(PASS_FIGURES, "pushes=0", "matched=0", "superseded=0", "verified_pct=-",
+                "gap_max_s=194400", "lag_max_s=0", "ev_gaps=" + boot(boot1) + ":0," + boot(boot2) + ":0",
+                "verdict=FAIL reasons=no-pushes"), result.lines(), result.toString());
+        assertEquals(1, result.exit(), result.toString());
+    }
+
+    /**
+     * Giovanni's ruling (2026-10-29), the gate fails without evidence — {@code lost-lines}: the PASS week with one
+     * line missing from boot 1 (its first midnight {@code day} line, so no figure moves). The lost line could have
+     * been the one that fails the gate, so the gate cannot pass over it.
+     */
+    @Test
+    void oneLostLineFailsLostLines() throws Exception {
+        List<String> boot1 = new ArrayList<>(bootOne(600));
+        List<String> boot2 = bootTwo(Two.PLAIN);
+        String firstDay = boot1.stream().filter(l -> l.contains("[oracle-stream] day ")).findFirst().orElseThrow();
+        assertTrue(firstDay.endsWith(" last=0"), firstDay);
+        boot1.remove(firstDay);
+        List<String> log = new ArrayList<>(boot1);
+        log.addAll(boot2);
+
+        Result result = run(log);
+
+        assertEquals(figures(PASS_FIGURES, "ev_gaps=" + boot(boot1) + ":1," + boot(boot2) + ":0",
+                "verdict=FAIL reasons=lost-lines"), result.lines(), result.toString());
+        assertEquals(1, result.exit(), result.toString());
     }
 
     /** The same week with one MISMATCH in boot 2 (and its cmp-detail line): FAIL, reason mismatch, exit 1. */
     @Test
     void oneMismatchFails() throws Exception {
         List<String> boot1 = bootOne(600);
-        List<String> boot2 = bootTwo(true);
+        List<String> boot2 = bootTwo(Two.MISMATCH);
         List<String> log = new ArrayList<>(boot1);
         log.addAll(boot2);
         assertEquals(1, log.stream().filter(l -> l.contains(" out=MISMATCH n=")).count(), "fixture: one MISMATCH");
@@ -143,7 +279,7 @@ class OracleStreamGateRecipeTest {
     @Test
     void ninetyEightPercentUptimeFails() throws Exception {
         List<String> boot1 = bootOne(12_959);
-        List<String> boot2 = bootTwo(false);
+        List<String> boot2 = bootTwo(Two.PLAIN);
         List<String> log = new ArrayList<>(boot1);
         log.addAll(boot2);
 
@@ -153,6 +289,68 @@ class OracleStreamGateRecipeTest {
         assertEquals("uptime_pct=98.00", result.lines().get(10), result.toString());
         assertEquals("unhealed=0", result.lines().get(13), result.toString());
         assertEquals("verdict=FAIL reasons=uptime", result.lines().getLast(), result.toString());
+        assertEquals(1, result.exit(), result.toString());
+    }
+
+    /**
+     * r10, the 99% boundary: a drop of 6479 s leaves (345600 − 6479) + (302400 − 1) = 641520 connected of 648000 —
+     * exactly 99.00%, a PASS. One second more, 641519, is 98.99% rounded down: FAIL, reason uptime.
+     */
+    @Test
+    void exactlyNinetyNinePercentPassesAndOneSecondLessFails() throws Exception {
+        List<String> boot2 = bootTwo(Two.PLAIN);
+        List<String> pass = bootOne(6_479);
+        List<String> log = new ArrayList<>(pass);
+        log.addAll(boot2);
+
+        Result exact = run(log);
+
+        assertEquals(figures(PASS_FIGURES, "conn_s=641520", "uptime_pct=99.00",
+                "ev_gaps=" + boot(pass) + ":0," + boot(boot2) + ":0", "verdict=PASS reasons="), exact.lines(),
+                exact.toString());
+        assertEquals(0, exact.exit(), exact.toString());
+
+        List<String> fail = bootOne(6_480);
+        log = new ArrayList<>(fail);
+        log.addAll(boot2);
+
+        Result under = run(log);
+
+        assertEquals(figures(PASS_FIGURES, "conn_s=641519", "uptime_pct=98.99",
+                "ev_gaps=" + boot(fail) + ":0," + boot(boot2) + ":0", "verdict=FAIL reasons=uptime"), under.lines(),
+                under.toString());
+        assertEquals(1, under.exit(), under.toString());
+    }
+
+    /**
+     * g9, a boot refused for days before its first open: its first {@code cmp-tick} (R0) starts {@code up_s}, so
+     * the 47 hours it waited count against its uptime. up_s = R0 → R_END = 691200 (8.00 days), conn_s = R_OPEN →
+     * R_END = 522000: 75.52%, FAIL uptime. Were the tick not to start the clock, up_s would begin at the first
+     * midnight {@code day} line, a day late, and the refused day would vanish from the figures.
+     */
+    @Test
+    void aBootRefusedForDaysBeforeItsFirstOpenCountsThemAsDown() throws Exception {
+        List<String> boot = refusedBoot("no bond");
+
+        Result result = run(boot);
+
+        assertEquals(refusedFigures(boot), result.lines(), result.toString());
+        assertEquals(1, result.exit(), result.toString());
+    }
+
+    /**
+     * F5: a server's refusal text is quoted on the line as {@code msg="…"} and may say anything — here
+     * {@code ev=900 boot=zzzz}. The recipe reads {@code boot} and {@code ev} by position, so that line is boot R's
+     * and its own {@code ev}: one boot, no gap, the same figures as the plain refused boot.
+     */
+    @Test
+    void aServerMessageNamingBootAndEvChangesNothing() throws Exception {
+        List<String> boot = refusedBoot("x ev=900 boot=zzzz");
+        assertEquals(1, boot.stream().filter(l -> l.contains(" msg=\"x ev=900 boot=zzzz\" ")).count(), "fixture");
+
+        Result result = run(boot);
+
+        assertEquals(refusedFigures(boot), result.lines(), result.toString());
         assertEquals(1, result.exit(), result.toString());
     }
 
@@ -173,16 +371,22 @@ class OracleStreamGateRecipeTest {
     // ======================================================================================
 
     private List<String> bootOne(long dropSeconds) {
+        return bootOne(dropSeconds, true);
+    }
+
+    private List<String> bootOne(long dropSeconds, boolean withPushes) {
         appender.list.clear();
         OracleStreamLog log = new OracleStreamLog(logger);
         OracleStreamComparator c = new OracleStreamComparator(log, null);
         c.onApiLoad(B1.minusSeconds(60), mainnet); // the poller's seed
         c.onOpen(B1);
-        push(c, B1.plusSeconds(300), a1);
-        c.onApiLoad(B1.plusSeconds(320), entries(a1));
-        push(c, B1.plusSeconds(600), p1);
-        push(c, B1.plusSeconds(610), p2);
-        c.onApiLoad(B1.plusSeconds(640), entries(p2));
+        if (withPushes) {
+            push(c, B1.plusSeconds(300), a1);
+            c.onApiLoad(B1.plusSeconds(320), entries(a1));
+            push(c, B1.plusSeconds(600), p1);
+            push(c, B1.plusSeconds(610), p2);
+            c.onApiLoad(B1.plusSeconds(640), entries(p2));
+        }
         c.tick(B1.plusSeconds(1000));
         c.daySummary(Instant.parse("2026-11-02T00:00:00Z"), false);
         c.daySummary(Instant.parse("2026-11-03T00:00:00Z"), false);
@@ -194,26 +398,107 @@ class OracleStreamGateRecipeTest {
         return captured(log);
     }
 
-    private List<String> bootTwo(boolean withMismatch) {
+    private List<String> bootTwo(Two variant) {
         appender.list.clear();
         OracleStreamLog log = new OracleStreamLog(logger);
         OracleStreamComparator c = new OracleStreamComparator(log, null);
         c.onApiLoad(B2.minusSeconds(60), entries(p2)); // the seed: what the API served when boot 1 ended
         c.onOpen(B2);
-        push(c, B2.plusSeconds(200), a1);
-        c.onApiLoad(B2.plusSeconds(230), entries(a1));
-        if (withMismatch) {
+        if (variant != Two.NO_PUSHES) {
+            push(c, B2.plusSeconds(200), a1);
+            c.onApiLoad(B2.plusSeconds(230), entries(a1));
+        }
+        if (variant == Two.MISMATCH) {
             push(c, B2.plusSeconds(400), p1);
             c.onApiLoad(B2.plusSeconds(430), entries(a1));
             c.tick(B2.plusSeconds(800));
+        }
+        if (variant == Two.API_AHEAD) {
+            c.onApiLoad(B2.plusSeconds(400), entries(p1)); // no push carries P1 yet
+            c.tick(B2.plusSeconds(701)); // WINDOW past the change: the orphan
+            push(c, B2.plusSeconds(750), p1); // then a push carries it: attached, lead_s 350
         }
         c.onClose(B2.plusSeconds(6900), "proactive");
         c.onOpen(B2.plusSeconds(6901));
         c.daySummary(Instant.parse("2026-11-06T00:00:00Z"), false);
         c.daySummary(Instant.parse("2026-11-07T00:00:00Z"), false);
         c.daySummary(Instant.parse("2026-11-08T00:00:00Z"), false);
+        if (variant == Two.UNHEALED) {
+            c.onClose(B2_END.minusSeconds(60), "no-pong");
+        }
         c.shutdown(B2_END);
         return captured(log);
+    }
+
+    /**
+     * A boot whose connection is refused from R0 until R_OPEN: the comparator hears only its {@code cmp-tick}s and
+     * the first midnight; the client says {@code refused} with the server's {@code message}. One push, MATCHED.
+     */
+    private List<String> refusedBoot(String serverMessage) {
+        appender.list.clear();
+        OracleStreamLog log = new OracleStreamLog(logger);
+        OracleStreamComparator c = new OracleStreamComparator(log, null);
+        c.onApiLoad(R0.minusSeconds(60), mainnet); // the poller's seed
+        c.tick(R0);
+        log.warn("refused", "status=403 " + OracleStreamLog.msg(serverMessage) + " retry_s=3600",
+                "no Aquarium staking bond for this wallet's stake key; retrying hourly or when the stake appears");
+        c.tick(R0.plusSeconds(10));
+        c.daySummary(Instant.parse("2026-11-02T00:00:00Z"), false);
+        c.onOpen(R_OPEN);
+        push(c, R_OPEN.plusSeconds(300), a1);
+        c.onApiLoad(R_OPEN.plusSeconds(330), entries(a1));
+        for (int day = 3; day <= 9; day++) {
+            c.daySummary(Instant.parse("2026-11-0" + day + "T00:00:00Z"), false);
+        }
+        c.shutdown(R_END);
+        return captured(log);
+    }
+
+    /** {@link #refusedBoot}'s figures, worked out by hand. */
+    private static List<String> refusedFigures(List<String> boot) {
+        return List.of(
+                "boots=1",
+                "pushes=1",
+                "matched=1",
+                "superseded=0",
+                "mismatch=0",
+                "api_ahead=0",
+                "uncovered=0",
+                "verified_pct=100.00",
+                "up_s=691200",
+                "conn_s=522000",
+                "uptime_pct=75.52",
+                "drops=0",
+                "heals=0",
+                "unhealed=0",
+                "gap_max_s=300",
+                "lag_max_s=30",
+                "days=8.00",
+                "ev_gaps=" + boot(boot) + ":0",
+                "verdict=FAIL reasons=uptime");
+    }
+
+    /**
+     * {@code figures} with each {@code key=value} in {@code changes} replacing the line of the same key; a change
+     * whose key is not there ({@code ev_gaps}, {@code verdict}) is appended, in order.
+     */
+    private static List<String> figures(List<String> figures, String... changes) {
+        List<String> out = new ArrayList<>(figures);
+        for (String change : changes) {
+            String key = change.substring(0, change.indexOf('=') + 1);
+            int at = -1;
+            for (int i = 0; i < out.size(); i++) {
+                if (out.get(i).startsWith(key)) {
+                    at = i;
+                }
+            }
+            if (at >= 0) {
+                out.set(at, change);
+            } else {
+                out.add(change);
+            }
+        }
+        return out;
     }
 
     /** Every line the boot logged, behind the fake Spring Boot prefix, in order. */

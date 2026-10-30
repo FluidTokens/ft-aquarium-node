@@ -25,6 +25,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -55,8 +56,9 @@ import java.util.function.BooleanSupplier;
  * only on the {@code oracle-stream} thread, only during that hold, while no connection is open.
  *
  * <p>At each UTC midnight of the injected clock the comparator says its cumulative {@code day} line (FAB-175-2), on
- * the {@code oracle-stream} thread. The delay to the next midnight is computed afresh each time, never a fixed
- * 24 h rate from the boot, so the lines stay on midnight whenever the node started.
+ * the {@code oracle-stream} thread: exactly one per midnight. The delay to the next midnight is computed afresh each
+ * time from that clock, never a fixed 24 h rate from the boot, so the lines stay on midnight whenever the node
+ * started.
  */
 @Component
 public class OracleStreamLauncher {
@@ -89,6 +91,8 @@ public class OracleStreamLauncher {
     private volatile OracleStreamClient client;
     /** Confined to the {@code oracle-stream} thread, apart from {@link #pushes()}. */
     private volatile OracleStreamComparator comparator;
+    /** {@code day} tasks that woke before their midnight by the injected clock, and so wrote nothing — for tests. */
+    private final AtomicLong dayEarlyWakes = new AtomicLong();
     /** Why the stream is off while no client runs; what {@link #status()} reports then. */
     private volatile String offDetail = "not started";
     private volatile Instant offSince;
@@ -113,6 +117,11 @@ public class OracleStreamLauncher {
     synchronized void useForTest(OracleStreamClient.Timings timings, Clock clock) {
         this.timings = timings;
         this.clock = clock;
+    }
+
+    /** {@code day} tasks that woke early and waited again — for tests. */
+    long dayEarlyWakes() {
+        return dayEarlyWakes.get();
     }
 
     /** Pushes compared so far — for tests, which wait on it. */
@@ -321,19 +330,41 @@ public class OracleStreamLauncher {
     }
 
     /**
-     * The comparator's {@code day} line at the next UTC midnight of {@code streamClock}, which then schedules the
-     * one after — the delay computed from the clock each time.
+     * The comparator's {@code day} line at the next UTC midnight of {@code streamClock}, then at each midnight after
+     * it — see {@link #scheduleDaySummary(ScheduledExecutorService, OracleStreamComparator, Clock, Instant)}.
      */
     private void scheduleDaySummary(ScheduledExecutorService stream, OracleStreamComparator comparing,
                                     Clock streamClock) {
+        Instant now = streamClock.instant();
+        scheduleDaySummary(stream, comparing, streamClock, now.plus(nextUtcMidnightDelay(now)));
+    }
+
+    /**
+     * The {@code day} line at {@code target}, a UTC midnight, which then schedules the next one at {@code target} + 1
+     * day. The delay is taken from the clock each time, to the nanosecond, never truncated below the target.
+     *
+     * <p>⛔ <b>One line per midnight.</b> The executor's timer is not the injected clock, so a task may wake before
+     * {@code target} by that clock: it then waits again and writes nothing. (FAB-175-2 r1 truncated the delay to
+     * milliseconds and re-computed the midnight from the waking instant, so a wake a fraction of a millisecond early
+     * fired again at 0 ms — a burst of up to 14 lines per midnight.) A clock that jumps forward over several
+     * midnights gets one line for each, at once.
+     */
+    private void scheduleDaySummary(ScheduledExecutorService stream, OracleStreamComparator comparing,
+                                    Clock streamClock, Instant target) {
         try {
             stream.schedule(guarded("cmp-day", () -> {
-                try {
-                    comparing.daySummary(streamClock.instant(), false);
-                } finally {
-                    scheduleDaySummary(stream, comparing, streamClock);
+                Instant now = streamClock.instant();
+                if (now.isBefore(target)) {
+                    dayEarlyWakes.incrementAndGet();
+                    scheduleDaySummary(stream, comparing, streamClock, target);
+                    return;
                 }
-            }), nextUtcMidnightDelay(streamClock.instant()).toMillis(), TimeUnit.MILLISECONDS);
+                try {
+                    comparing.daySummary(now, false);
+                } finally {
+                    scheduleDaySummary(stream, comparing, streamClock, target.plus(1, ChronoUnit.DAYS));
+                }
+            }), delayUntil(target, streamClock.instant()), TimeUnit.NANOSECONDS);
         } catch (RejectedExecutionException ignored) {
             // the stream has stopped: its last day line is the comparator's shutdown's
         }
@@ -342,6 +373,11 @@ public class OracleStreamLauncher {
     /** From {@code now} to the next UTC midnight strictly after it: 1 s at 23:59:59Z, 24 h at 00:00:00Z. */
     static Duration nextUtcMidnightDelay(Instant now) {
         return Duration.between(now, now.truncatedTo(ChronoUnit.DAYS).plus(1, ChronoUnit.DAYS));
+    }
+
+    /** {@code max(0, target − now)} in nanoseconds: a target a fraction of a millisecond away is not 0. */
+    static long delayUntil(Instant target, Instant now) {
+        return Math.max(0, Duration.between(now, target).toNanos());
     }
 
     /** A task body that logs a throw by its simple class name and never lets it escape (it would cancel a tick). */
