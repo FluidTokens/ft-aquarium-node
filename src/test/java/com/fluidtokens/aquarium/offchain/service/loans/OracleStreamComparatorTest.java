@@ -46,7 +46,9 @@ class OracleStreamComparatorTest {
     private static final String PUSH_2 = "/loans-v4/oracle-ws/preview-push-20261029T130959Z.json";
     private static final String API_130505 = "/loans-v4/oracle-ws/preview-api-20261029T130505Z.json";
     private static final String API_130525 = "/loans-v4/oracle-ws/preview-api-20261029T130525Z.json";
-    private static final int BUDGET_BYTES = 180;
+    private static final int BUDGET_BYTES = 240;
+    /** The transfer time {@link #push} hands the comparator: not 0, so a line that drops it cannot pass. */
+    private static final long XFER_MS = 7;
 
     private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
     private SimpleMeterRegistry registry;
@@ -84,6 +86,7 @@ class OracleStreamComparatorTest {
     /**
      * The real preview cycle of 2026-10-29: push 1 received 13:04:59.194Z (server timestamp .046), the poller still
      * on the old windows at 13:05:05Z and on the push's entries at 13:05:25Z. Lag = floor(25 806 ms / 1000) = 25.
+     * The line, written at 13:05:25Z, names the push's own arrival: {@code rcv} 13:04:59.194Z.
      */
     @Test
     void matchedWithTheRealPreviewData() throws Exception {
@@ -93,14 +96,14 @@ class OracleStreamComparatorTest {
                 "fixture: the 13:05:25Z API load is parse-equal to push 1");
 
         comparator.onOpen(OPEN);
-        comparator.onPush(Instant.parse("2026-10-29T13:04:59.194Z"), 1793279099046L, p1, 1000);
+        comparator.onPush(Instant.parse("2026-10-29T13:04:59.194Z"), 1793279099046L, 12, p1, 1000);
         assertEquals(List.of(), cmpFields(), "pending until the API serves it");
         comparator.onApiLoad(Instant.parse("2026-10-29T13:05:05Z"), OracleClients.fromFixture(API_130505).entries());
         assertEquals(List.of(), cmpFields(), "the old windows are an observation, not a match");
         comparator.onApiLoad(Instant.parse("2026-10-29T13:05:25Z"), poller.entries());
 
-        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=25 rep=0 gap_s=273 dly_ms=148"),
-                cmpFields());
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=25 rep=0 gap_s=273 dly_ms=148"
+                + " ts=1793279099046 rcv=1793279099194 xfer_ms=12"), cmpFields());
         assertEquals(Level.INFO, cmpEvents().getFirst().getLevel());
         assertEquals(25.0, lag());
         assertCounts(1, 0, 0, 0, 0);
@@ -120,8 +123,8 @@ class OracleStreamComparatorTest {
         push(OPEN.plusSeconds(40), a1);
 
         assertEquals(List.of(
-                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=10 dly_ms=100",
-                "push=2 out=MATCHED n=5 h=" + h(a1) + " lag_s=0 rep=1 gap_s=30 dly_ms=100"), cmpFields());
+                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=10 dly_ms=100" + arrived(10),
+                "push=2 out=MATCHED n=5 h=" + h(a1) + " lag_s=0 rep=1 gap_s=30 dly_ms=100" + arrived(40)), cmpFields());
         assertEquals(10.0, lag(), "a rep=1 match does not move the lag gauge");
         assertCounts(2, 0, 0, 0, 0);
     }
@@ -139,7 +142,8 @@ class OracleStreamComparatorTest {
         assertEquals(2, cmpFields().size(), "the repeat waits");
         comparator.onApiLoad(OPEN.plusSeconds(75), entries(a1));
 
-        assertEquals("push=3 out=MATCHED n=5 h=" + h(a1) + " lag_s=15 rep=1 gap_s=30 dly_ms=100", cmpFields().get(2));
+        assertEquals("push=3 out=MATCHED n=5 h=" + h(a1) + " lag_s=15 rep=1 gap_s=30 dly_ms=100"
+                + arrived(60), cmpFields().get(2));
         assertEquals(20.0, lag(), "the last rep=0 match (push 2)");
     }
 
@@ -154,7 +158,8 @@ class OracleStreamComparatorTest {
         push(OPEN.plusSeconds(10), a1);
         comparator.onApiLoad(OPEN.plusSeconds(10).plus(OracleStreamComparator.WINDOW), entries(a1));
 
-        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=300 rep=0 gap_s=10 dly_ms=100"),
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=300 rep=0 gap_s=10 dly_ms=100"
+                + arrived(10)),
                 cmpFields());
         assertEquals(300.0, lag());
         assertCounts(1, 0, 0, 0, 0);
@@ -174,7 +179,8 @@ class OracleStreamComparatorTest {
         assertEquals(List.of(), cmpFields(), "fixture: the load has not reached the stream thread yet");
         comparator.onApiLoad(loadedAt, entries(p1));
 
-        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=0 rep=0 gap_s=200 dly_ms=100"),
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=0 rep=0 gap_s=200 dly_ms=100"
+                + arrived(loadedAt.plusMillis(3))),
                 cmpFields());
         assertEquals(0.0, lag(), "the gauge is clamped too");
         assertCounts(1, 0, 0, 0, 0);
@@ -198,7 +204,8 @@ class OracleStreamComparatorTest {
         assertEquals(List.of(), cmpFields(), "no API change to it: it waits for the next load");
         comparator.onApiLoad(OPEN.plusSeconds(120), entries(a1));
 
-        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100"),
+        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100"
+                + arrived(100)),
                 cmpFields());
         assertEquals(Level.INFO, cmpEvents().getFirst().getLevel());
         assertEquals(Double.NaN, lag(), "the lag gauge does not move");
@@ -226,9 +233,10 @@ class OracleStreamComparatorTest {
         push(OPEN.plusSeconds(250), a1);
 
         assertEquals(List.of(
-                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=10 dly_ms=100",
-                "push=2 out=MATCHED n=5 h=" + h(a1) + " lag_s=0 rep=1 gap_s=30 dly_ms=100",
-                "push=3 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=50 dly_ms=100"), cmpFields());
+                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=10 dly_ms=100" + arrived(10),
+                "push=2 out=MATCHED n=5 h=" + h(a1) + " lag_s=0 rep=1 gap_s=30 dly_ms=100" + arrived(40),
+                "push=3 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=50 dly_ms=100"
+                        + arrived(250)), cmpFields());
         assertEquals(10.0, lag());
         assertCounts(2, 0, 0, 0, 1);
     }
@@ -241,7 +249,8 @@ class OracleStreamComparatorTest {
         push(OPEN.plusSeconds(100), p1);
         comparator.onApiLoad(OPEN.plusSeconds(120), entries(p1));
 
-        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=20 rep=0 gap_s=100 dly_ms=100"),
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=20 rep=0 gap_s=100 dly_ms=100"
+                + arrived(100)),
                 cmpFields());
         assertEquals(20.0, lag());
     }
@@ -261,14 +270,16 @@ class OracleStreamComparatorTest {
         comparator.onApiLoad(OPEN.plusSeconds(160), entries(a1));
 
         assertEquals(List.of(
-                "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100",
-                "push=2 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=40 dly_ms=100"), cmpFields());
+                "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100" + arrived(100),
+                "push=2 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=40 dly_ms=100"
+                        + arrived(140)), cmpFields());
         assertEquals(Double.NaN, lag(), "no lag against the baseline");
 
         comparator.onApiLoad(OPEN.plusSeconds(190), entries(p1));
         push(OPEN.plusSeconds(200), a1);
         comparator.onApiLoad(OPEN.plusSeconds(220), entries(a1));
-        assertEquals("push=3 out=MATCHED n=5 h=" + h(a1) + " lag_s=20 rep=1 gap_s=60 dly_ms=100", cmpFields().get(2),
+        assertEquals("push=3 out=MATCHED n=5 h=" + h(a1) + " lag_s=20 rep=1 gap_s=60 dly_ms=100"
+                + arrived(200), cmpFields().get(2),
                 "a change the node watched is a witness again");
         assertCounts(1, 0, 0, 0, 2);
     }
@@ -288,7 +299,8 @@ class OracleStreamComparatorTest {
         assertEquals(List.of(), cmpFields(), "the push waits: the baseline is not an API change");
         comparator.onApiLoad(OPEN.plusSeconds(130), entries(a1));
 
-        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100"),
+        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=pre-connect gap_s=100 dly_ms=100"
+                + arrived(100)),
                 cmpFields());
         assertEquals(Double.NaN, lag(), "no lag against the baseline");
         assertCounts(0, 0, 0, 0, 1);
@@ -312,9 +324,9 @@ class OracleStreamComparatorTest {
         comparator.tick(OPEN.plusSeconds(31).plus(OracleStreamComparator.WINDOW));
 
         assertEquals(List.of(
-                "push=1 out=SUPERSEDED n=5 h=" + h(a1) + " by=2 gap_s=10 dly_ms=100",
-                "push=2 out=SUPERSEDED n=5 h=" + h(p1) + " by=3 gap_s=10 dly_ms=100",
-                "push=3 out=UNCOVERED n=5 h=" + h(p2) + " why=no-api gap_s=10 dly_ms=100"), cmpFields());
+                "push=1 out=SUPERSEDED n=5 h=" + h(a1) + " by=2 gap_s=10 dly_ms=100" + arrived(10),
+                "push=2 out=SUPERSEDED n=5 h=" + h(p1) + " by=3 gap_s=10 dly_ms=100" + arrived(20),
+                "push=3 out=UNCOVERED n=5 h=" + h(p2) + " why=no-api gap_s=10 dly_ms=100" + arrived(30)), cmpFields());
         assertCounts(0, 2, 0, 0, 1);
     }
 
@@ -331,8 +343,8 @@ class OracleStreamComparatorTest {
         comparator.tick(OPEN.plusSeconds(400));
 
         assertEquals(List.of(
-                "push=1 out=MISMATCH n=5 h=" + h(a1) + " api=" + h(p2) + " api_n=5 gap_s=10 dly_ms=100",
-                "push=2 out=MISMATCH n=5 h=" + h(a1) + " api=" + h(p2) + " api_n=5 gap_s=10 dly_ms=100"),
+                "push=1 out=MISMATCH n=5 h=" + h(a1) + " api=" + h(p2) + " api_n=5 gap_s=10 dly_ms=100" + arrived(10),
+                "push=2 out=MISMATCH n=5 h=" + h(a1) + " api=" + h(p2) + " api_n=5 gap_s=10 dly_ms=100" + arrived(20)),
                 cmpFields());
         assertCounts(0, 0, 2, 0, 0);
     }
@@ -358,8 +370,9 @@ class OracleStreamComparatorTest {
         comparator.tick(OPEN.plusSeconds(601));
 
         assertEquals(List.of(
-                "push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=10 rep=0 gap_s=10 dly_ms=100",
-                "push=2 out=MISMATCH n=5 h=" + h(p2) + " api=" + h(p1) + " api_n=5 gap_s=290 dly_ms=100"),
+                "push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=10 rep=0 gap_s=10 dly_ms=100" + arrived(10),
+                "push=2 out=MISMATCH n=5 h=" + h(p2) + " api=" + h(p1) + " api_n=5 gap_s=290 dly_ms=100"
+                        + arrived(300)),
                 cmpFields());
         assertEquals(Level.WARN, cmpEvents().get(1).getLevel());
         List<String> differ = differingUnits(p2, p1);
@@ -372,7 +385,8 @@ class OracleStreamComparatorTest {
         push(OPEN.plusSeconds(620), p2);
         comparator.onApiLoad(OPEN.plusSeconds(650), entries(p1));
         comparator.tick(OPEN.plusSeconds(921));
-        assertEquals("push=3 out=MISMATCH n=5 h=" + h(p2) + " api=" + h(p1) + " api_n=5 gap_s=320 dly_ms=100",
+        assertEquals("push=3 out=MISMATCH n=5 h=" + h(p2) + " api=" + h(p1) + " api_n=5 gap_s=320 dly_ms=100"
+                + arrived(620),
                 cmpFields().get(2));
         assertEquals(1, detailFields(Level.WARN).size(), "the same signature is said once at WARN");
         assertEquals(1, detailFields(Level.DEBUG).size(), "and then at DEBUG");
@@ -394,8 +408,8 @@ class OracleStreamComparatorTest {
         push(OPEN.plusSeconds(230), p1);
 
         assertEquals(List.of(
-                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=130 dly_ms=100",
-                "push=2 out=API_AHEAD n=5 h=" + h(p1) + " lead_s=29 gap_s=100 dly_ms=100"), cmpFields());
+                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=130 dly_ms=100" + arrived(130),
+                "push=2 out=API_AHEAD n=5 h=" + h(p1) + " lead_s=29 gap_s=100 dly_ms=100" + arrived(230)), cmpFields());
         assertEquals(Level.WARN, cmpEvents().get(1).getLevel());
         List<String> differ = differingUnits(a1, p1);
         assertEquals(List.of("push=2 out=API_AHEAD only_ws=0 only_api=0 differ=" + differ.size()
@@ -421,7 +435,8 @@ class OracleStreamComparatorTest {
         comparator.tick(OPEN.plusSeconds(201).plus(OracleStreamComparator.WINDOW));
         comparator.tick(OPEN.plusSeconds(211).plus(OracleStreamComparator.WINDOW));
 
-        assertEquals("push=- out=API_AHEAD n=5 h=" + h(p2), cmpFields().get(1));
+        assertEquals("push=- out=API_AHEAD n=5 h=" + h(p2), cmpFields().get(1),
+                "an orphan carries no gap_s, dly_ms, ts, rcv or xfer_ms: no push arrived");
         assertEquals(2, cmpFields().size(), "reported once");
         assertEquals(Level.WARN, cmpEvents().get(1).getLevel());
         List<String> differ = differingUnits(a1, p2);
@@ -449,8 +464,9 @@ class OracleStreamComparatorTest {
         comparator.tick(OPEN.plusSeconds(900));
 
         assertEquals(List.of(
-                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=130 dly_ms=100",
-                "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=unjudgeable gap_s=70 dly_ms=100"), cmpFields());
+                "push=1 out=MATCHED n=5 h=" + h(a1) + " lag_s=10 rep=0 gap_s=130 dly_ms=100" + arrived(130),
+                "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=unjudgeable gap_s=70 dly_ms=100"
+                        + arrived(330)), cmpFields());
         assertEquals(List.of(), detailFields(Level.WARN));
         assertCounts(1, 0, 0, 0, 1);
     }
@@ -484,7 +500,8 @@ class OracleStreamComparatorTest {
         comparator.onApiLoad(OPEN.plusSeconds(300), entries(p1));
         push(OPEN.plusSeconds(330), p1);
 
-        assertEquals(List.of("push=1 out=API_AHEAD n=5 h=" + h(p1) + " lead_s=30 gap_s=150 dly_ms=100"), cmpFields());
+        assertEquals(List.of("push=1 out=API_AHEAD n=5 h=" + h(p1) + " lead_s=30 gap_s=150 dly_ms=100"
+                + arrived(330)), cmpFields());
     }
 
     /**
@@ -500,7 +517,8 @@ class OracleStreamComparatorTest {
         assertEquals(List.of(), cmpFields(), "a change at t is not before t");
         comparator.onApiLoad(OPEN.plusSeconds(230), entries(p1));
 
-        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=30 rep=0 gap_s=200 dly_ms=100"),
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=30 rep=0 gap_s=200 dly_ms=100"
+                + arrived(200)),
                 cmpFields());
         assertCounts(1, 0, 0, 0, 0);
         comparator.tick(OPEN.plusSeconds(900));
@@ -515,7 +533,8 @@ class OracleStreamComparatorTest {
         push(OPEN.plusSeconds(10), p1);
         comparator.tick(OPEN.plusSeconds(900));
 
-        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(p1) + " why=unjudgeable gap_s=10 dly_ms=100"),
+        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(p1) + " why=unjudgeable gap_s=10 dly_ms=100"
+                + arrived(10)),
                 cmpFields());
     }
 
@@ -531,7 +550,7 @@ class OracleStreamComparatorTest {
         comparator.onApiLoad(OPEN.plusSeconds(10).plus(OracleStreamComparator.WINDOW).plusMillis(1), entries(p1));
         comparator.tick(OPEN.plusSeconds(11).plus(OracleStreamComparator.WINDOW));
 
-        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=no-api gap_s=10 dly_ms=100"),
+        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=no-api gap_s=10 dly_ms=100" + arrived(10)),
                 cmpFields());
         assertEquals(Level.INFO, cmpEvents().getFirst().getLevel());
         assertCounts(0, 0, 0, 0, 1);
@@ -546,8 +565,9 @@ class OracleStreamComparatorTest {
         comparator.shutdown(OPEN.plusSeconds(40));
 
         assertEquals(List.of(
-                "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=10 dly_ms=100",
-                "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=shutdown gap_s=10 dly_ms=100"), cmpFields());
+                "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=10 dly_ms=100" + arrived(10),
+                "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=shutdown gap_s=10 dly_ms=100"
+                        + arrived(20)), cmpFields());
         assertCounts(0, 0, 0, 0, 2);
     }
 
@@ -564,9 +584,9 @@ class OracleStreamComparatorTest {
         push(OPEN.plusSeconds(22), a1);
 
         assertEquals(List.of(
-                "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=10 dly_ms=100",
-                "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=shutdown gap_s=11 dly_ms=100",
-                "push=3 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=1 dly_ms=100"), cmpFields());
+                "push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=10 dly_ms=100" + arrived(10),
+                "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=shutdown gap_s=11 dly_ms=100" + arrived(21),
+                "push=3 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=1 dly_ms=100" + arrived(22)), cmpFields());
         comparator.onApiLoad(OPEN.plusSeconds(25), entries(p1));
         comparator.tick(OPEN.plusSeconds(900));
         assertOneLinePerPush(3);
@@ -583,14 +603,68 @@ class OracleStreamComparatorTest {
         assertEquals(List.of(), cmpFields(), "64 waiting is within the bound");
 
         push(OPEN.plusSeconds(65), a1);
-        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=overflow gap_s=1 dly_ms=100"),
+        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=overflow gap_s=1 dly_ms=100" + arrived(1)),
                 cmpFields());
         push(OPEN.plusSeconds(66), p1);
-        assertEquals("push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=overflow gap_s=1 dly_ms=100", cmpFields().get(1));
+        assertEquals("push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=overflow gap_s=1 dly_ms=100"
+                + arrived(2), cmpFields().get(1));
         assertCounts(0, 0, 0, 0, 2);
 
         comparator.shutdown(OPEN.plusSeconds(70));
         assertOneLinePerPush(66);
+    }
+
+    // ======================================================================================
+    // Arrival: ts, rcv, xfer_ms (FAB-178)
+    // ======================================================================================
+
+    /**
+     * A late write: a push at T, the API serving it at T + 80 s. The MATCHED line is written at T + 80 s and names
+     * T — {@code rcv=1793278926000} (13:02:06Z), never 1793279006000 — with the push's own {@code ts} and
+     * {@code xfer_ms}, and {@code dly_ms = rcv − ts}. The DEBUG {@code push} line said the same at T.
+     */
+    @Test
+    void aMatchedLineWrittenEightySecondsLaterNamesThePushsOwnArrival() {
+        baseline();
+        comparator.onOpen(OPEN);
+        Instant t = OPEN.plusSeconds(100);
+        comparator.onPush(t, 1793278925750L, 1_234, p1, 4321);
+        comparator.onApiLoad(t.plusSeconds(80), entries(p1));
+
+        assertEquals(List.of("push=1 out=MATCHED n=5 h=" + h(p1) + " lag_s=80 rep=0 gap_s=100 dly_ms=250"
+                + " ts=1793278925750 rcv=1793278926000 xfer_ms=1234"), cmpFields());
+        assertEquals(List.of("push=1 n=5 chars=4321 ts=1793278925750 rcv=1793278926000 dly_ms=250 xfer_ms=1234"),
+                debugFields("push"));
+    }
+
+    /**
+     * The same for lines {@code tick} writes minutes after the push: a SUPERSEDED and an UNCOVERED {@code no-api},
+     * resolved at T + 6 min, each name their own push's arrival.
+     */
+    @Test
+    void supersededAndNoApiLinesWrittenByALaterTickNameTheirPushsOwnArrival() {
+        comparator.onOpen(OPEN);
+        comparator.onPush(OPEN.plusSeconds(10), 1793278835900L, 40, a1, 1000);
+        comparator.onPush(OPEN.plusSeconds(20), 1793278845000L, 0, p1, 1000);
+        comparator.tick(OPEN.plusSeconds(380));
+
+        assertEquals(List.of(
+                "push=1 out=SUPERSEDED n=5 h=" + h(a1) + " by=2 gap_s=10 dly_ms=100"
+                        + " ts=1793278835900 rcv=1793278836000 xfer_ms=40",
+                "push=2 out=UNCOVERED n=5 h=" + h(p1) + " why=no-api gap_s=10 dly_ms=1000"
+                        + " ts=1793278845000 rcv=1793278846000 xfer_ms=0"), cmpFields());
+    }
+
+    /** The four-argument {@code onPush} — a listener that has no transfer time to tell — is {@code xfer_ms=0}. */
+    @Test
+    void theFourArgumentOnPushIsXferZero() {
+        comparator.onOpen(OPEN);
+        comparator.onPush(OPEN.plusSeconds(10), OPEN.plusSeconds(10).toEpochMilli() - 100, a1, 1000);
+        comparator.shutdown(OPEN.plusSeconds(20));
+
+        assertEquals(List.of("push=1 out=UNCOVERED n=5 h=" + h(a1) + " why=shutdown gap_s=10 dly_ms=100"
+                + " ts=1793278835900 rcv=1793278836000 xfer_ms=0"), cmpFields());
+        assertTrue(debugFields("push").getFirst().endsWith(" dly_ms=100 xfer_ms=0"), debugFields("push").toString());
     }
 
     // ======================================================================================
@@ -626,8 +700,9 @@ class OracleStreamComparatorTest {
 
     /**
      * The worst case of each outcome, through the very builders the comparator emits with — a 10-digit {@code ev}
-     * and {@code push}, 6-digit seconds, a 4-digit {@code n}, a 10-digit negative {@code dly_ms} — still fits 180
-     * bytes as the whole formatted message, so the line stays within 300 under Spring Boot's ~110-byte prefix.
+     * and {@code push}, 6-digit seconds, a 4-digit {@code n}, a 10-digit negative {@code dly_ms}, a 13-digit
+     * {@code ts} and {@code rcv}, a 6-digit {@code xfer_ms} — still fits 240 bytes as the whole formatted message,
+     * so the line stays within 350 under Spring Boot's ~110-byte prefix.
      */
     @Test
     void theWorstCaseCmpMessageOfEachOutcomeFitsTheByteBudget() {
@@ -636,17 +711,20 @@ class OracleStreamComparatorTest {
         String h = "ffffffff";
         String gap = "999999";
         long dly = -9_999_999_999L;
+        long ts = 9_999_999_999_999L;
+        long rcv = 9_999_999_999_999L;
+        long xfer = 999_999;
         List<Cmp> worst = List.of(
-                OracleStreamComparator.matched(push, n, h, 999_999, 1, gap, dly),
-                OracleStreamComparator.superseded(push, n, h, push, gap, dly),
-                OracleStreamComparator.mismatch(push, n, h, h, n, gap, dly),
-                OracleStreamComparator.apiAhead(push, n, h, 999_999, gap, dly),
+                OracleStreamComparator.matched(push, n, h, 999_999, 1, gap, dly, ts, rcv, xfer),
+                OracleStreamComparator.superseded(push, n, h, push, gap, dly, ts, rcv, xfer),
+                OracleStreamComparator.mismatch(push, n, h, h, n, gap, dly, ts, rcv, xfer),
+                OracleStreamComparator.apiAhead(push, n, h, 999_999, gap, dly, ts, rcv, xfer),
                 OracleStreamComparator.apiAheadOrphan(n, h),
-                OracleStreamComparator.uncovered(push, n, h, "unjudgeable", gap, dly),
-                OracleStreamComparator.uncovered(push, n, h, "pre-connect", gap, dly),
-                OracleStreamComparator.uncovered(push, n, h, "shutdown", gap, dly),
-                OracleStreamComparator.uncovered(push, n, h, "overflow", gap, dly),
-                OracleStreamComparator.uncovered(push, n, h, "no-api", gap, dly));
+                OracleStreamComparator.uncovered(push, n, h, "unjudgeable", gap, dly, ts, rcv, xfer),
+                OracleStreamComparator.uncovered(push, n, h, "pre-connect", gap, dly, ts, rcv, xfer),
+                OracleStreamComparator.uncovered(push, n, h, "shutdown", gap, dly, ts, rcv, xfer),
+                OracleStreamComparator.uncovered(push, n, h, "overflow", gap, dly, ts, rcv, xfer),
+                OracleStreamComparator.uncovered(push, n, h, "no-api", gap, dly, ts, rcv, xfer));
         for (Cmp cmp : worst) {
             String message = OracleStreamLog.PREFIX + "cmp boot=ffffffff ev=9999999999 " + cmp.fields();
             int bytes = message.getBytes(StandardCharsets.UTF_8).length;
@@ -664,9 +742,19 @@ class OracleStreamComparatorTest {
         comparator.onApiLoad(OPEN.minusSeconds(60), mainnet);
     }
 
-    /** A push received at {@code at}, stamped by the server 100 ms earlier. */
+    /** A push received at {@code at}, stamped by the server 100 ms earlier, {@link #XFER_MS} first part to last. */
     private void push(Instant at, OracleRegistryParser.Parsed parsed) {
-        comparator.onPush(at, at.toEpochMilli() - 100, parsed, 1000);
+        comparator.onPush(at, at.toEpochMilli() - 100, XFER_MS, parsed, 1000);
+    }
+
+    /** {@link #push}'s own {@code ts rcv xfer_ms} for a push received {@code seconds} after {@link #OPEN}. */
+    private static String arrived(long seconds) {
+        return arrived(OPEN.plusSeconds(seconds));
+    }
+
+    /** {@link #push}'s own {@code ts rcv xfer_ms} for a push received at {@code at}: never a later instant. */
+    private static String arrived(Instant at) {
+        return " ts=" + (at.toEpochMilli() - 100) + " rcv=" + at.toEpochMilli() + " xfer_ms=" + XFER_MS;
     }
 
     private static Collection<OracleEntry> entries(OracleRegistryParser.Parsed parsed) {
@@ -690,15 +778,45 @@ class OracleStreamComparatorTest {
         return differ;
     }
 
+    /**
+     * Every {@code cmp} line so far, each checked: within {@link #BUDGET_BYTES}; a push-attached line carries
+     * {@code dly_ms ts rcv xfer_ms}, in that order, last, with {@code dly_ms = rcv − ts}; an orphan
+     * ({@code push=-}) carries none of them.
+     */
     private List<ILoggingEvent> cmpEvents() {
         List<ILoggingEvent> events = List.copyOf(appender.list).stream()
                 .filter(e -> e.getFormattedMessage().startsWith(OracleStreamLog.PREFIX + "cmp "))
                 .toList();
         for (ILoggingEvent event : events) {
-            int bytes = event.getFormattedMessage().getBytes(StandardCharsets.UTF_8).length;
-            assertTrue(bytes <= BUDGET_BYTES, bytes + " bytes: " + event.getFormattedMessage());
+            String message = event.getFormattedMessage();
+            int bytes = message.getBytes(StandardCharsets.UTF_8).length;
+            assertTrue(bytes <= BUDGET_BYTES, bytes + " bytes: " + message);
+            List<String> tokens = List.of(afterEv(message).split(" "));
+            Map<String, String> f = tokens.stream().collect(Collectors.toMap(
+                    t -> t.substring(0, t.indexOf('=')), t -> t.substring(t.indexOf('=') + 1)));
+            if ("-".equals(f.get("push"))) {
+                for (String key : List.of("dly_ms", "ts", "rcv", "xfer_ms")) {
+                    assertTrue(!f.containsKey(key), "an orphan carries no " + key + ": " + message);
+                }
+            } else {
+                List<String> keys = tokens.stream().map(t -> t.substring(0, t.indexOf('='))).toList();
+                assertEquals(List.of("dly_ms", "ts", "rcv", "xfer_ms"), keys.subList(keys.size() - 4, keys.size()),
+                        message);
+                assertEquals(Long.parseLong(f.get("rcv")) - Long.parseLong(f.get("ts")),
+                        Long.parseLong(f.get("dly_ms")), "dly_ms = rcv - ts: " + message);
+            }
         }
         return events;
+    }
+
+    /** Each DEBUG line of {@code event}'s fields, after {@code boot} and {@code ev}. */
+    private List<String> debugFields(String event) {
+        return List.copyOf(appender.list).stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.startsWith(OracleStreamLog.PREFIX + event + " "))
+                .map(OracleStreamComparatorTest::afterEv)
+                .toList();
     }
 
     /** Each {@code cmp} line's fields, after {@code boot} and {@code ev}. */

@@ -23,6 +23,8 @@ import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,6 +33,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
@@ -136,6 +139,7 @@ class OracleStreamClientTest {
         assertEquals(expected, received.parsed());
         assertEquals(expected.entries(), received.parsed().entries());
         assertEquals(1_793_279_099_046L, received.serverTimestamp());
+        assertTrue(received.xferMs() >= 0, "first part to last part: " + received.xferMs());
         assertEquals(push.length(), received.chars());
         assertEquals(List.of(), server.authFailures(), "the server's verification of the signed query");
         assertEquals(1, client.pushesParsed());
@@ -155,6 +159,7 @@ class OracleStreamClientTest {
 
         assertTrue(session.framesSent.get() >= 4, "fixture: ~56 KB went as >= 4 frames, not " + session.framesSent);
         assertMainnetRegistry(message, recorder.pushes.getFirst());
+        assertTrue(recorder.pushes.getFirst().xferMs() >= 0, "xfer_ms: " + recorder.pushes.getFirst().xferMs());
     }
 
     @Test
@@ -166,6 +171,68 @@ class OracleStreamClientTest {
 
         assertEquals(1, session.framesSent.get());
         assertMainnetRegistry(message, recorder.pushes.getFirst());
+        assertTrue(recorder.pushes.getFirst().xferMs() >= 0, "xfer_ms: " + recorder.pushes.getFirst().xferMs());
+    }
+
+    // ======================================================================================
+    // Arrival and transfer time (FAB-178), under a clock the test steps
+    // ======================================================================================
+
+    /**
+     * A message in a text frame and continuations: {@code xferMs} is the clock's reading at the LAST part minus its
+     * reading at the FIRST, and {@code at} is that last reading. Once stepped, the clock's k-th read is
+     * {@code base + k²} s, so the first two reads — the first part and the last — are 1 s apart, while two reads
+     * further on (one per part) would be at least 3 s apart.
+     */
+    @Test
+    void aMessageInContinuationFramesCarriesItsFirstToLastFrameTime() throws Exception {
+        SteppedClock clock = new SteppedClock();
+        String message = mainnetPush();
+        OracleStreamTestServer.Session session = openSession(clock);
+        clock.step();
+        session.sendFragmented(message, 16 * 1024);
+        await(() -> recorder.pushes.size() == 1, WAIT, "onPush");
+
+        assertTrue(session.framesSent.get() >= 4, "fixture: >= 4 frames, not " + session.framesSent);
+        Recorder.Push received = recorder.pushes.getFirst();
+        assertMainnetRegistry(message, received);
+        assertEquals(clock.read(1), received.at(), "the last part's reading");
+        assertEquals(clock.read(1).toEpochMilli() - clock.read(0).toEpochMilli(), received.xferMs());
+        assertEquals(1_000, received.xferMs());
+    }
+
+    /** One frame, under a clock that stands still between the two reads: {@code xferMs} is 0. */
+    @Test
+    void aSingleFrameMessageUnderAStillClockHasXferZero() throws Exception {
+        SteppedClock clock = new SteppedClock();
+        OracleStreamTestServer.Session session = openSession(clock);
+        session.sendText(resource(PREVIEW_PUSH));
+        await(() -> recorder.pushes.size() == 1, WAIT, "onPush");
+
+        assertEquals(1, session.framesSent.get());
+        assertEquals(0, recorder.pushes.getFirst().xferMs());
+        assertEquals(clock.base, recorder.pushes.getFirst().at());
+    }
+
+    /**
+     * An oversize message, then a normal one: the normal one's {@code xferMs} runs from ITS first part. Reads 0 and
+     * 1 are the oversize message's first and last parts, 2 and 3 the push's: 9 s − 4 s = 5 s. Measured from the
+     * oversize message's first part instead it would be read 2 − read 0 = 4 s.
+     */
+    @Test
+    void afterAnOversizeMessageTheNextMessageIsTimedFromItsOwnFirstFrame() throws Exception {
+        SteppedClock clock = new SteppedClock();
+        OracleStreamTestServer.Session session = openSession(clock);
+        clock.step();
+        session.sendText("x".repeat(OracleStreamClient.MAX_MESSAGE_CHARS + 1));
+        session.sendText(resource(PREVIEW_PUSH));
+        await(() -> recorder.pushes.size() == 1, WAIT, "onPush after the oversize message");
+
+        assertEquals(1, client.ignored("oversize"));
+        Recorder.Push received = recorder.pushes.getFirst();
+        assertEquals(clock.read(3), received.at(), "the push's last part is the fourth read");
+        assertEquals(clock.read(3).toEpochMilli() - clock.read(2).toEpochMilli(), received.xferMs());
+        assertEquals(5_000, received.xferMs());
     }
 
     @Test
@@ -362,8 +429,12 @@ class OracleStreamClientTest {
     }
 
     private OracleStreamTestServer.Session openSession() {
+        return openSession(Clock.systemUTC());
+    }
+
+    private OracleStreamTestServer.Session openSession(Clock clock) {
         server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
-        start(server.uri());
+        start(server.uri(), TIMINGS, clock);
         OracleStreamTestServer.Session session = server.awaitSession(server.sessions().size(), WAIT);
         await(() -> recorder.opens.size() == 1, WAIT, "onOpen");
         return session;
@@ -374,10 +445,14 @@ class OracleStreamClientTest {
     }
 
     private void start(URI uri, OracleStreamClient.Timings timings) {
+        start(uri, timings, Clock.systemUTC());
+    }
+
+    private void start(URI uri, OracleStreamClient.Timings timings, Clock clock) {
         AtomicInteger ioThreads = new AtomicInteger();
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> daemon(r, "oracle-stream"));
         io = Executors.newCachedThreadPool(r -> daemon(r, "oracle-stream-io-" + ioThreads.incrementAndGet()));
-        client = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, Clock.systemUTC(), recorder,
+        client = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, clock, recorder,
                 new OracleStreamLog(), scheduler, io, () -> false, new SimpleMeterRegistry());
         client.start();
     }
@@ -429,10 +504,47 @@ class OracleStreamClientTest {
                 .toList();
     }
 
+    /**
+     * Stands at {@link #base} — the real time when built, so the signed query's {@code ts} verifies — until
+     * {@link #step()}; from then on its k-th read (k from 0) is {@link #read read(k)} = {@code base + k²} s, on
+     * whatever thread reads it. No two pairs of consecutive reads are the same distance apart, so a duration says
+     * which reads it spans. Once the connection is open nothing but the I/O side's part callbacks reads it.
+     */
+    static final class SteppedClock extends Clock {
+
+        final Instant base = Instant.ofEpochMilli(System.currentTimeMillis());
+        private final AtomicBoolean stepping = new AtomicBoolean();
+        private final AtomicInteger reads = new AtomicInteger();
+
+        void step() {
+            stepping.set(true);
+        }
+
+        Instant read(int k) {
+            return base.plusSeconds((long) k * k);
+        }
+
+        @Override
+        public Instant instant() {
+            return stepping.get() ? read(reads.getAndIncrement()) : base;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+    }
+
     /** Records every callback and the thread it ran on. */
     static final class Recorder implements OracleStreamClient.Listener {
 
-        record Push(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars) {
+        /** {@code xferMs} is {@link Long#MIN_VALUE} when the client called the four-argument form instead. */
+        record Push(Instant at, long serverTimestamp, long xferMs, OracleRegistryParser.Parsed parsed, int chars) {
         }
 
         final List<String> threads = new CopyOnWriteArrayList<>();
@@ -456,8 +568,14 @@ class OracleStreamClientTest {
 
         @Override
         public void onPush(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars) {
+            onPush(at, serverTimestamp, Long.MIN_VALUE, parsed, chars);
+        }
+
+        @Override
+        public void onPush(Instant at, long serverTimestamp, long xferMs, OracleRegistryParser.Parsed parsed,
+                           int chars) {
             threads.add(Thread.currentThread().getName());
-            pushes.add(new Push(at, serverTimestamp, parsed, chars));
+            pushes.add(new Push(at, serverTimestamp, xferMs, parsed, chars));
         }
     }
 }

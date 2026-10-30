@@ -125,6 +125,9 @@ class OracleStreamGateRecipeTest {
         List<String> log = new ArrayList<>(boot1);
         log.addAll(boot1.subList(boot1.size() - 5, boot1.size()));
         log.addAll(boot2);
+        assertTrue(log.stream().filter(l -> l.contains("[oracle-stream] cmp ")).allMatch(
+                l -> l.matches(".* dly_ms=-?\\d+ ts=\\d+ rcv=\\d+ xfer_ms=\\d+")),
+                "fixture: every cmp line carries FAB-178's ts, rcv and xfer_ms, and the figures do not move");
 
         Result result = run(log);
 

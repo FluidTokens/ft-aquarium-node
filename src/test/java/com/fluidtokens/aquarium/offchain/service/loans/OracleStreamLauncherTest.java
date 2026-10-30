@@ -425,7 +425,7 @@ class OracleStreamLauncherTest {
                     // The listener counts the push BEFORE it logs it: the line is awaited itself.
                     await(() -> messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] push ")
                             && l.contains(" push=1 n=") && l.contains(" chars=" + push.length())
-                            && l.contains(" ts=1793279099046 dly_ms=")), WAIT, "the push line");
+                            && l.contains(" ts=1793279099046 rcv=")), WAIT, "the push line");
 
                     assertEquals(1, context.getBeanNamesForType(FluidOracleClient.class).length);
                     assertSame(oracle, context.getBeanProvider(FluidOracleClient.class).getIfAvailable());

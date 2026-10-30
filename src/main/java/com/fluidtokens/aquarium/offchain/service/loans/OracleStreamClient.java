@@ -134,6 +134,19 @@ public final class OracleStreamClient {
          * @param chars           the message's length in chars
          */
         void onPush(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars);
+
+        /**
+         * The form the client calls; by default it forgets {@code xferMs} and calls the four-argument form.
+         *
+         * @param at              when the message's last part arrived, read before it was parsed
+         * @param serverTimestamp the message's {@code timestamp}, epoch milliseconds
+         * @param xferMs          milliseconds from the message's first frame to its last frame; 0 for a single frame
+         * @param chars           the message's length in chars
+         */
+        default void onPush(Instant at, long serverTimestamp, long xferMs, OracleRegistryParser.Parsed parsed,
+                            int chars) {
+            onPush(at, serverTimestamp, parsed, chars);
+        }
     }
 
     /**
@@ -633,8 +646,11 @@ public final class OracleStreamClient {
         }
     }
 
-    /** One complete text message: an {@code oracle-tokens} push goes to the listener, anything else is counted. */
-    private void message(Connection connection, String text, Instant at) {
+    /**
+     * One complete text message: an {@code oracle-tokens} push goes to the listener, anything else is counted.
+     * {@code at} and {@code xferMs} were read on the I/O side as its parts arrived, never here.
+     */
+    private void message(Connection connection, String text, Instant at, long xferMs) {
         if (connection.ended) {
             return;
         }
@@ -670,7 +686,7 @@ public final class OracleStreamClient {
                 last.refusalMessage(), last.nextAttemptAt());
         long serverTimestamp = timestamp.longValue();
         int chars = text.length();
-        notifyListener("onPush", () -> listener.onPush(at, serverTimestamp, parsed, chars));
+        notifyListener("onPush", () -> listener.onPush(at, serverTimestamp, xferMs, parsed, chars));
     }
 
     /** Counts a message the stream could not use and says so on change — ⛔ never echoing it. */
@@ -764,6 +780,8 @@ public final class OracleStreamClient {
         // I/O side
         private StringBuilder text = new StringBuilder();
         private boolean oversize;
+        /** When the current message's first part arrived; null between messages. */
+        private Instant firstFrameAt;
 
         // Scheduler side (socket and openedAt are also read by stop())
         volatile WebSocket socket;
@@ -789,6 +807,10 @@ public final class OracleStreamClient {
 
         @Override
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+            // ⛔ The null check, not an empty buffer: an oversize message empties the buffer mid-message.
+            if (firstFrameAt == null) {
+                firstFrameAt = clock.instant();
+            }
             if (!oversize) {
                 if (text.length() + data.length() > MAX_MESSAGE_CHARS) {
                     oversize = true;
@@ -799,13 +821,15 @@ public final class OracleStreamClient {
             }
             if (last) {
                 Instant at = clock.instant();
+                long xferMs = at.toEpochMilli() - firstFrameAt.toEpochMilli();
+                firstFrameAt = null;
                 if (oversize) {
                     oversize = false;
                     handOff("oversize", () -> ignore("oversize", "oversize"));
                 } else {
                     String message = text.toString();
                     text = new StringBuilder();
-                    handOff("message", () -> message(this, message, at));
+                    handOff("message", () -> message(this, message, at, xferMs));
                 }
             }
             webSocket.request(1);
