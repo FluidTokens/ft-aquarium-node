@@ -26,6 +26,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -282,6 +283,61 @@ class OracleStreamClientTest {
     }
 
     // ======================================================================================
+    // The X-FT-Node-Version handshake header (FAB-179)
+    // ======================================================================================
+
+    @Test
+    void aNodeVersionIsSentAsTheHandshakeHeaderAndTheSignedQueryIsUnchanged() {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        start(server.uri(), "abc123");
+        server.awaitSession(0, WAIT);
+        await(() -> recorder.opens.size() == 1, WAIT, "onOpen");
+
+        assertEquals(List.of("abc123"), server.nodeVersions());
+        assertEquals(List.of(), server.authFailures(), "the server's verification of the signed query");
+        assertEquals(1, server.queries().size());
+        assertEquals(List.of("stakeAddress", "ts", "key", "signature"),
+                Stream.of(server.queries().getFirst().split("&")).map(pair -> pair.substring(0, pair.indexOf('=')))
+                        .toList(), "the query carries only the signed four");
+        assertEquals(List.of(), debugLines("node-ver-rejected"));
+    }
+
+    @Test
+    void noNodeVersionSendsNoHeader() {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        start(server.uri(), (String) null);
+        server.awaitSession(0, WAIT);
+        await(() -> recorder.opens.size() == 1, WAIT, "onOpen");
+
+        assertEquals(Arrays.asList((String) null), server.nodeVersions());
+        assertEquals(List.of(), server.authFailures());
+        assertEquals(List.of(), debugLines("node-ver-rejected"));
+    }
+
+    /**
+     * Handed straight to the client, past the launcher's own check: the JDK would accept the value at
+     * {@code header(...)} and fail every opening handshake on it, so the client drops the header itself — one DEBUG
+     * line, the value never echoed — and connects, and the push path works.
+     */
+    @Test
+    void aNodeVersionTheHeaderCannotCarryIsDroppedAndTheConnectionProceeds() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        start(server.uri(), "bad\r\nvalue");
+        OracleStreamTestServer.Session session = server.awaitSession(0, WAIT);
+        await(() -> recorder.opens.size() == 1, WAIT, "onOpen");
+        session.sendText(resource(PREVIEW_PUSH));
+        await(() -> recorder.pushes.size() == 1, WAIT, "onPush");
+
+        assertEquals(Arrays.asList((String) null), server.nodeVersions(), "no header reached the server");
+        assertEquals(List.of(), server.authFailures());
+        assertEquals(1, server.requests(), "connected on the first attempt");
+        List<String> rejected = debugLines("node-ver-rejected");
+        assertEquals(1, rejected.size(), lines().toString());
+        assertTrue(lines().stream().noneMatch(l -> l.contains("bad\r") || l.contains("\nvalue")
+                || l.contains("node_ver=")), "the value is never echoed: " + lines());
+    }
+
+    // ======================================================================================
     // Refusals, ends, timeouts, pings
     // ======================================================================================
 
@@ -454,6 +510,16 @@ class OracleStreamClientTest {
         io = Executors.newCachedThreadPool(r -> daemon(r, "oracle-stream-io-" + ioThreads.incrementAndGet()));
         client = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, clock, recorder,
                 new OracleStreamLog(), scheduler, io, () -> false, new SimpleMeterRegistry());
+        client.start();
+    }
+
+    /** Through the public constructor that takes the {@code X-FT-Node-Version} value. */
+    private void start(URI uri, String nodeVersion) {
+        AtomicInteger ioThreads = new AtomicInteger();
+        scheduler = Executors.newSingleThreadScheduledExecutor(r -> daemon(r, "oracle-stream"));
+        io = Executors.newCachedThreadPool(r -> daemon(r, "oracle-stream-io-" + ioThreads.incrementAndGet()));
+        client = new OracleStreamClient(uri, new OracleStreamAuth(account), TIMINGS, Clock.systemUTC(), recorder,
+                new OracleStreamLog(), scheduler, io, () -> false, new SimpleMeterRegistry(), nodeVersion);
         client.start();
     }
 

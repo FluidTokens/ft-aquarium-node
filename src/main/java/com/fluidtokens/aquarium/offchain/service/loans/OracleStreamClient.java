@@ -183,6 +183,8 @@ public final class OracleStreamClient {
     private final Executor ioExecutor;
     private final BooleanSupplier stakePresent;
     private final OracleStreamRetryPolicy policy;
+    /** The handshake's {@code X-FT-Node-Version} value (FAB-179), or null for no header. */
+    private final String nodeVersion;
 
     private final AtomicLong pushesParsed = new AtomicLong();
     private final Map<String, AtomicLong> ignored = new ConcurrentHashMap<>();
@@ -212,13 +214,33 @@ public final class OracleStreamClient {
                               OracleStreamLog log, ScheduledExecutorService scheduler, Executor ioExecutor,
                               BooleanSupplier stakePresent, MeterRegistry meterRegistry) {
         this(base, auth, timings, clock, listener, log, scheduler, ioExecutor, stakePresent, meterRegistry,
-                new OracleStreamRetryPolicy(new SplittableRandom()));
+                (String) null);
+    }
+
+    /**
+     * @param nodeVersion the {@code X-FT-Node-Version} header sent on every handshake, or null for none; a value the
+     *                    header cannot carry is dropped and the connection proceeds without it
+     */
+    public OracleStreamClient(URI base, OracleStreamAuth auth, Timings timings, Clock clock, Listener listener,
+                              OracleStreamLog log, ScheduledExecutorService scheduler, Executor ioExecutor,
+                              BooleanSupplier stakePresent, MeterRegistry meterRegistry, String nodeVersion) {
+        this(base, auth, timings, clock, listener, log, scheduler, ioExecutor, stakePresent, meterRegistry,
+                new OracleStreamRetryPolicy(new SplittableRandom()), nodeVersion);
     }
 
     /** For tests: a policy with a known jitter source. */
     OracleStreamClient(URI base, OracleStreamAuth auth, Timings timings, Clock clock, Listener listener,
                        OracleStreamLog log, ScheduledExecutorService scheduler, Executor ioExecutor,
                        BooleanSupplier stakePresent, MeterRegistry meterRegistry, OracleStreamRetryPolicy policy) {
+        this(base, auth, timings, clock, listener, log, scheduler, ioExecutor, stakePresent, meterRegistry, policy,
+                null);
+    }
+
+    private OracleStreamClient(URI base, OracleStreamAuth auth, Timings timings, Clock clock, Listener listener,
+                               OracleStreamLog log, ScheduledExecutorService scheduler, Executor ioExecutor,
+                               BooleanSupplier stakePresent, MeterRegistry meterRegistry,
+                               OracleStreamRetryPolicy policy, String nodeVersion) {
+        this.nodeVersion = nodeVersion;
         this.base = base;
         this.auth = auth;
         this.timings = timings;
@@ -355,15 +377,39 @@ public final class OracleStreamClient {
         try {
             // A fresh ts on every attempt: the authorizer refuses a signature older than two minutes.
             URI signed = auth.signedUri(base, clock.millis());
-            opening = http.newWebSocketBuilder()
-                    .connectTimeout(timings.handshakeTimeout())
-                    .buildAsync(signed, connection);
+            WebSocket.Builder builder = http.newWebSocketBuilder()
+                    .connectTimeout(timings.handshakeTimeout());
+            if (nodeVersion != null) {
+                try {
+                    builder.header("X-FT-Node-Version", headerValue(nodeVersion));
+                } catch (IllegalArgumentException e) {
+                    // ⛔ a version is never worth a connection: no header, and the value is never echoed
+                    events.debug("node-ver-rejected", null);
+                }
+            }
+            opening = builder.buildAsync(signed, connection);
         } catch (RuntimeException e) {
             end(connection, "error(" + OracleStreamLog.simpleName(e) + ")", false);
             return;
         }
         opening.whenCompleteAsync((socket, failure) ->
                 guarded("opened", () -> opened(connection, socket, failure)).run(), scheduler);
+    }
+
+    /**
+     * {@code value} when every character is visible ASCII (0x21–0x7E); otherwise {@link IllegalArgumentException}.
+     * Checked here, before the builder, because the JDK's {@code WebSocket.Builder.header} accepts a CR or LF and
+     * only its opening handshake rejects it — as a failed connection attempt (measured on JDK 21.0.11), which would
+     * cost every connection the node makes.
+     */
+    private static String headerValue(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 0x21 || c > 0x7E) {
+                throw new IllegalArgumentException("not visible ASCII");
+            }
+        }
+        return value;
     }
 
     private void opened(Connection connection, WebSocket socket, Throwable failure) {

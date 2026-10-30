@@ -23,6 +23,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.support.StaticListableBeanFactory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -432,7 +433,7 @@ class OracleStreamLauncherTest {
                     assertEquals(entriesBefore, Set.copyOf(oracle.entries()), "the shadow changed the prices");
                     assertEquals(refreshedBefore, oracle.lastRefresh(), "the shadow refreshed the oracle client");
                     assertTrue(messages(streamLines()).stream().anyMatch(l -> l.contains("[oracle-stream] on ")
-                            && l.endsWith(" network=preview host=127.0.0.1")), messages(streamLines()).toString());
+                            && l.endsWith(" network=preview host=127.0.0.1 node_ver=-")), messages(streamLines()).toString());
                     assertEquals(List.of(), server.authFailures());
                 });
         assertEquals(List.of(), streamThreadsAfterAWhile(), "closing the context stops the stream");
@@ -715,6 +716,90 @@ class OracleStreamLauncherTest {
     }
 
     // ======================================================================================
+    // The X-FT-Node-Version handshake header (FAB-179)
+    // ======================================================================================
+
+    static Stream<Arguments> nodeVersions() {
+        String seventy = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!#$%&'*+-.^";
+        return Stream.of(
+                Arguments.of("clean", "ac2c009c6f40", "false", "ac2c009c6f40"),
+                Arguments.of("dirty", "ac2c009c6f40", "true", "ac2c009c6f40-dirty"),
+                Arguments.of("dirty, any case and padded", " ac2c009c6f40 ", " TRUE ", "ac2c009c6f40-dirty"),
+                Arguments.of("dirty unknown appends nothing", "ac2c009c6f40", "unknown", "ac2c009c6f40"),
+                Arguments.of("dirty null appends nothing", "ac2c009c6f40", null, "ac2c009c6f40"),
+                Arguments.of("commit null", null, "true", null),
+                Arguments.of("commit empty", "", "false", null),
+                Arguments.of("commit blank", "  ", "true", null),
+                Arguments.of("commit unknown", "unknown", "false", null),
+                Arguments.of("commit UNKNOWN", "UNKNOWN", "true", null),
+                Arguments.of("70 visible chars cut to 64", seventy.substring(0, 70), "false", seventy.substring(0, 64)),
+                Arguments.of("CR LF", "bad\r\nvalue", "false", null),
+                Arguments.of("space", "ac2c 009c6f40", "false", null),
+                Arguments.of("tab", "ac2c\t009c6f40", "false", null),
+                Arguments.of("non-ASCII", "ac2c009c6f4\u00e9", "false", null));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("nodeVersions")
+    void theNodeVersionIsTheCommitPlusDirtyCappedAndVisibleAsciiOrNothing(String name, String commitShort,
+                                                                         String dirty, String expected) {
+        assertEquals(expected, OracleStreamLauncher.nodeVersion(commitShort, dirty));
+    }
+
+    @Test
+    void springWiredTheBuildsCommitIsTheHandshakeHeaderAndTheOnLineNamesIt() {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        nodeVersionContext("aquarium.build.commitShort=ac2c009c6f40", "aquarium.build.dirty=false")
+                .run(context -> {
+                    assertNull(context.getStartupFailure(), "the context started");
+                    context.getBean(OracleStreamLauncher.class).start();
+                    server.awaitSession(0, WAIT);
+
+                    assertEquals(List.of("ac2c009c6f40"), server.nodeVersions());
+                    assertEquals(List.of(), server.authFailures());
+                    List<String> on = onLines();
+                    assertEquals(1, on.size(), on.toString());
+                    assertTrue(on.getFirst().endsWith(" network=preview host=127.0.0.1 node_ver=ac2c009c6f40"),
+                            on.getFirst());
+                });
+    }
+
+    @Test
+    void springWiredWithoutTheBuildsProvenanceNoHeaderIsSentAndTheConnectionSucceeds() {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        nodeVersionContext().run(context -> {
+            assertNull(context.getStartupFailure(), "the context started");
+            OracleStreamLauncher bean = context.getBean(OracleStreamLauncher.class);
+            bean.start();
+            server.awaitSession(0, WAIT);
+            await(() -> bean.status().state() == OracleStreamClient.Status.State.CONNECTED, WAIT, "connected");
+
+            assertEquals(Arrays.asList((String) null), server.nodeVersions());
+            assertEquals(List.of(), server.authFailures());
+            List<String> on = onLines();
+            assertEquals(1, on.size(), on.toString());
+            assertTrue(on.getFirst().endsWith(" network=preview host=127.0.0.1 node_ver=-"), on.getFirst());
+        });
+    }
+
+    /** The launcher as Spring builds it, against {@link #server}, with these extra properties. */
+    private ApplicationContextRunner nodeVersionContext(String... properties) {
+        return new ApplicationContextRunner()
+                .withPropertyValues("network=preview", "loans.oracle.stream.url=" + server.uri())
+                .withPropertyValues(properties)
+                .withBean(FluidOracleClient.class, () -> new FluidOracleClient("http://unused.invalid"))
+                .withBean(Account.class, () -> account)
+                .withBean(StakerService.class, OracleStreamLauncherTest::staker)
+                .withBean(MeterRegistry.class, SimpleMeterRegistry::new)
+                .withBean(AppConfig.Network.class, () -> network("preview"))
+                .withBean(OracleStreamLauncher.class);
+    }
+
+    private List<String> onLines() {
+        return messages(streamLines()).stream().filter(l -> l.startsWith("[oracle-stream] on ")).toList();
+    }
+
+    // ======================================================================================
     // Shipped configuration
     // ======================================================================================
 
@@ -741,15 +826,19 @@ class OracleStreamLauncherTest {
         assertEquals(OracleStreamLauncher.MAINNET_HOST, URI.create(placeholderDefault(baseUrl)).getHost());
         assertEquals(OracleStreamLauncher.PREVIEW_HOST, URI.create(placeholderDefault(previewUrl)).getHost());
 
-        // The constructor's own defaults: the url has none a profile could not reach (§4), and the flag's is ON.
-        Constructor<?> constructor = OracleStreamLauncher.class.getConstructors()[0];
-        assertEquals(1, OracleStreamLauncher.class.getConstructors().length);
+        // The injection constructor's own defaults: the url has none a profile could not reach (§4), the flag's is ON,
+        // and the build provenance falls back to "unknown", which sends no header (FAB-179).
+        List<Constructor<?>> injected = Arrays.stream(OracleStreamLauncher.class.getConstructors())
+                .filter(c -> c.isAnnotationPresent(Autowired.class)).toList();
+        assertEquals(1, injected.size(), "exactly one injection constructor");
+        Constructor<?> constructor = injected.getFirst();
         List<String> values = Arrays.stream(constructor.getParameters())
                 .map(p -> p.getAnnotation(Value.class))
                 .filter(java.util.Objects::nonNull)
                 .map(Value::value)
                 .toList();
-        assertEquals(List.of("${loans.oracle.stream.enabled:true}", "${loans.oracle.stream.url:}"), values);
+        assertEquals(List.of("${loans.oracle.stream.enabled:true}", "${loans.oracle.stream.url:}",
+                "${aquarium.build.commitShort:unknown}", "${aquarium.build.dirty:unknown}"), values);
         assertTrue(Arrays.stream(constructor.getParameters()).map(Parameter::getType)
                 .anyMatch(ObjectProvider.class::equals), "FluidOracleClient only through an ObjectProvider");
         assertFalse(Arrays.stream(constructor.getParameters()).map(Parameter::getType)

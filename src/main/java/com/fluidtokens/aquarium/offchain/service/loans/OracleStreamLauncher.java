@@ -69,6 +69,8 @@ public class OracleStreamLauncher {
     static final String IO_THREAD_PREFIX = "oracle-stream-io-";
 
     private static final int VALUE_ECHO = 16;
+    /** FluidTokens truncate {@code X-FT-Node-Version} to this many characters. */
+    static final int NODE_VERSION_MAX = 64;
     /** How often pushes older than {@link OracleStreamComparator#WINDOW} are resolved. */
     private static final long COMPARE_TICK_SECONDS = 10;
 
@@ -79,6 +81,8 @@ public class OracleStreamLauncher {
     private final MeterRegistry meterRegistry;
     private final String enabled;
     private final String url;
+    private final String buildCommitShort;
+    private final String buildDirty;
     private final OracleStreamLog events = new OracleStreamLog();
 
     private OracleStreamClient.Timings timings = OracleStreamClient.Timings.PRODUCTION;
@@ -97,13 +101,20 @@ public class OracleStreamLauncher {
     private volatile String offDetail = "not started";
     private volatile Instant offSince;
 
+    /**
+     * @param buildCommitShort the jar's own short commit — the banner's {@code aquarium.build.commitShort} — sent as
+     *                         the handshake's {@code X-FT-Node-Version} (FAB-179); see {@link #nodeVersion}
+     * @param buildDirty       {@code aquarium.build.dirty}: {@code true} appends {@code -dirty}
+     */
     @Autowired
     public OracleStreamLauncher(Account account, AppConfig.Network network,
                                 ObjectProvider<FluidOracleClient> oracleClient,
                                 StakerService stakerService,
                                 MeterRegistry meterRegistry,
                                 @Value("${loans.oracle.stream.enabled:true}") String enabled,
-                                @Value("${loans.oracle.stream.url:}") String url) {
+                                @Value("${loans.oracle.stream.url:}") String url,
+                                @Value("${aquarium.build.commitShort:unknown}") String buildCommitShort,
+                                @Value("${aquarium.build.dirty:unknown}") String buildDirty) {
         this.account = account;
         this.network = network;
         this.oracleClient = oracleClient;
@@ -111,6 +122,18 @@ public class OracleStreamLauncher {
         this.meterRegistry = meterRegistry;
         this.enabled = enabled;
         this.url = url;
+        this.buildCommitShort = buildCommitShort;
+        this.buildDirty = buildDirty;
+    }
+
+    /** Without the build's provenance: the stream sends no {@code X-FT-Node-Version} header. */
+    public OracleStreamLauncher(Account account, AppConfig.Network network,
+                                ObjectProvider<FluidOracleClient> oracleClient,
+                                StakerService stakerService,
+                                MeterRegistry meterRegistry,
+                                String enabled,
+                                String url) {
+        this(account, network, oracleClient, stakerService, meterRegistry, enabled, url, "unknown", "unknown");
     }
 
     /** For tests only: the timings and clock the client is built with. */
@@ -249,6 +272,44 @@ public class OracleStreamLauncher {
         return new Decision(uri, false, "network=" + network + " host=" + host, null, null);
     }
 
+    /**
+     * The handshake's {@code X-FT-Node-Version} value (FAB-179, asked for by FluidTokens to see which build each node
+     * runs), or {@code null} for no header. Pure.
+     *
+     * <ul>
+     *   <li>{@code null} when {@code commitShort} is null, blank, or {@code unknown} (any case) after trim — the
+     *       banner's fallback, so a jar without build-info sends nothing rather than a placeholder;</li>
+     *   <li>otherwise the trimmed {@code commitShort}, plus {@code -dirty} iff {@code dirty} trimmed is {@code true}
+     *       (any case) — any other value, {@code unknown} included, appends nothing;</li>
+     *   <li>cut to {@value #NODE_VERSION_MAX} characters, the length FluidTokens truncate the header to;</li>
+     *   <li>{@code null} when any character of the result is outside visible ASCII (0x21–0x7E): CR, LF, space, tab,
+     *       anything non-ASCII. The JDK's {@code WebSocket.Builder.header} accepts a CR or LF, and its opening
+     *       handshake then rejects the value with an {@link IllegalArgumentException} — a failed connection attempt,
+     *       on every attempt (measured on JDK 21.0.11). A version is never worth a connection, so such a value is
+     *       dropped here, before the client, which checks it again around its {@code header} call.</li>
+     * </ul>
+     */
+    static String nodeVersion(String commitShort, String dirty) {
+        if (commitShort == null) {
+            return null;
+        }
+        String commit = commitShort.trim();
+        if (commit.isEmpty() || commit.equalsIgnoreCase("unknown")) {
+            return null;
+        }
+        String value = dirty != null && dirty.trim().equalsIgnoreCase("true") ? commit + "-dirty" : commit;
+        if (value.length() > NODE_VERSION_MAX) {
+            value = value.substring(0, NODE_VERSION_MAX);
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 0x21 || c > 0x7E) {
+                return null;
+            }
+        }
+        return value;
+    }
+
     /** One line either way; ON builds the threads and the client. */
     private void launch() {
         Decision decision = decide(enabled, () -> oracleClient.getIfAvailable() != null, network, url);
@@ -262,8 +323,9 @@ public class OracleStreamLauncher {
             return;
         }
         URI uri = decision.uri();
+        String nodeVersion = nodeVersion(buildCommitShort, buildDirty);
 
-        events.info("on", decision.fields());
+        events.info("on", decision.fields() + " node_ver=" + (nodeVersion == null ? "-" : nodeVersion));
         scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, THREAD_NAME);
             thread.setDaemon(true);
@@ -303,7 +365,7 @@ public class OracleStreamLauncher {
 
         OracleStreamClient created = new OracleStreamClient(uri, new OracleStreamAuth(account), timings, clock,
                 comparing, events, scheduler, io, () -> !staker.findStakerRefInput().isEmpty(),
-                meterRegistry);
+                meterRegistry, nodeVersion);
         client = created;
         created.start();
     }

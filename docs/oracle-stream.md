@@ -75,6 +75,14 @@ and a CIP-30 signature over a fixed text containing the stake address and the ti
 valid for two minutes, is never written to the log, and proves only that this node holds the stake key;
 it authorises nothing on chain.
 
+**Which build is connecting.** Every handshake also carries one HTTP header, `X-FT-Node-Version`, so
+FluidTokens can see which build each node runs. Its value is the commit the node was built from — the 12
+characters the startup banner prints after `commit`, the same as the last 12 characters of FluidTokens' image
+tags — with `-dirty` appended for a build made from uncommitted changes. It is informational: it is not part
+of the signature, and the connection does not depend on it. It is left out when the build does not know its
+commit (the banner then says `unknown`), and when the value holds any character a header cannot carry; the
+connection goes ahead either way. The `on` line says what is sent (`node_ver=`, §5).
+
 **One connection per bond.** FluidTokens' server grants one open connection for each 30,000 FLDT
 Aquarium staking bond. A second node on the same bond — a standby, or a test node started from the same
 mnemonic — is refused with **429** while the first is connected. In the shadow this is harmless: the
@@ -103,7 +111,7 @@ after a connection WARNs again.
 
 | Event | Level | Fields | Meaning |
 |---|---|---|---|
-| `on` | INFO | `network=` `host=` | at startup: the stream is starting, and where it connects |
+| `on` | INFO | `network=` `host=` `node_ver=` | at startup: the stream is starting, where it connects, and the `X-FT-Node-Version` it sends (`-` for none, §4) |
 | `off` | INFO or WARN | `reason=` (and `value=`, `network=`, `host=` where relevant) | at startup: the stream is off, and why (§2, §3). WARN when a setting of yours is wrong; also `reason=internal-error(<class>)` if the stream itself failed to start — the rest of the node is unaffected |
 | `connecting` | DEBUG | `attempt=` | an attempt is starting |
 | `connected` | INFO | `attempt=` `handshake_ms=` | the connection is open; `attempt` counts the attempts it took |
