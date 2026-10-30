@@ -633,25 +633,31 @@ class OracleStreamLauncherTest {
 
     /**
      * FAB-175-2 r2 (F1): a task that wakes before its midnight by the injected clock waits again and writes
-     * nothing. The clock stands still at 23:59:59.500Z, so the task, due 500 ms later, keeps waking early: no
-     * line. Once the clock reaches midnight, exactly one {@code last=0} line, from the stream thread, and the next
-     * target is a day away. The delay comes from the injected clock: a fixed 24 h from the boot would never have
-     * woken at all.
+     * nothing. The clock stands still 500 µs before midnight, so the task keeps waking early: no line. Each wait is
+     * the full 500 µs to the nanosecond, so it cannot wake more than once per 500 µs of real time — a delay
+     * truncated to whole milliseconds (0 here) would re-fire at 0 ms, far more often than that, even on a busy host.
+     * Once the clock reaches midnight, exactly one {@code last=0} line, from the stream thread, and the next target
+     * is a day away. The delay comes from the injected clock: a fixed 24 h from the boot would never have woken.
      */
     @Test
     void aDayTaskThatWakesBeforeItsMidnightWaitsAgainAndWritesNothing() {
         server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
-        OracleStreamClientLivenessTest.MutableClock clock =
-                new OracleStreamClientLivenessTest.MutableClock(Instant.parse("2026-11-01T23:59:59.500Z"));
+        OracleStreamClientLivenessTest.MutableClock clock = new OracleStreamClientLivenessTest.MutableClock(
+                Instant.parse("2026-11-02T00:00:00Z").minusNanos(500_000));
         launcher = new OracleStreamLauncher(account, network("preview"), present(), staker(), meters(), "true",
                 server.uri().toString());
         launcher.useForTest(OracleStreamClient.Timings.PRODUCTION, clock);
+        long started = System.nanoTime();
         launcher.start();
 
         await(() -> launcher.dayEarlyWakes() >= 2, WAIT, "two early wakes");
+        sleepMillis(300);
+        long wakes = launcher.dayEarlyWakes();
+        long bound = (System.nanoTime() - started) / 500_000 + 1;
+        assertTrue(wakes <= bound, wakes + " early wakes in at most " + bound + " waits of 500 µs");
         assertEquals(List.of(), messages(dayEvents()), "no line before midnight");
 
-        clock.advance(Duration.ofMillis(500));
+        clock.advance(Duration.ofNanos(500_000));
         await(() -> !dayEvents().isEmpty(), WAIT, "the midnight day line");
         sleepMillis(1200);
         List<ILoggingEvent> midnight = dayEvents();

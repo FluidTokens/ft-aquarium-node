@@ -13,8 +13,8 @@ changes. FluidTokens checks for changes about once a minute, so a push can follo
 about 60 s; that timing is theirs, not the node's. The node connects to the WebSocket and listens — **as a
 shadow**:
 
-- **No decision reads it.** Every push is parsed and written to the log as one line, and that is all. No
-  liquidation, price, health figure or readiness verdict changes because of it.
+- **No decision reads it.** Every push is parsed, compared with the HTTP registry and written to the log as
+  one `cmp` line, and that is all. No liquidation, price, health figure or readiness verdict changes because of it.
 - **The HTTP registry stays the source of truth.** The node keeps polling it exactly as before; the stream
   neither replaces nor corrects it.
 - It exists so that every operator's log shows how the stream behaves — how promptly pushes arrive, how
