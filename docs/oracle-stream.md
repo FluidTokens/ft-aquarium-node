@@ -75,6 +75,14 @@ and a CIP-30 signature over a fixed text containing the stake address and the ti
 valid for two minutes, is never written to the log, and proves only that this node holds the stake key;
 it authorises nothing on chain.
 
+**Which build is connecting.** Every handshake also carries one HTTP header, `X-FT-Node-Version`, so
+FluidTokens can see which build each node runs. Its value is the commit the node was built from — the 12
+characters the startup banner prints after `commit`, the same as the last 12 characters of FluidTokens' image
+tags — with `-dirty` appended for a build made from uncommitted changes. It is informational: it is not part
+of the signature, and the connection does not depend on it. It is left out when the build does not know its
+commit (the banner then says `unknown`), and when the value holds any character a header cannot carry; the
+connection goes ahead either way. The `on` line says what is sent (`node_ver=`, §5).
+
 **One connection per bond.** FluidTokens' server grants one open connection for each 30,000 FLDT
 Aquarium staking bond. A second node on the same bond — a standby, or a test node started from the same
 mnemonic — is refused with **429** while the first is connected. In the shadow this is harmless: the
@@ -103,12 +111,12 @@ after a connection WARNs again.
 
 | Event | Level | Fields | Meaning |
 |---|---|---|---|
-| `on` | INFO | `network=` `host=` | at startup: the stream is starting, and where it connects |
+| `on` | INFO | `network=` `host=` `node_ver=` | at startup: the stream is starting, where it connects, and the `X-FT-Node-Version` it sends (`-` for none, §4) |
 | `off` | INFO or WARN | `reason=` (and `value=`, `network=`, `host=` where relevant) | at startup: the stream is off, and why (§2, §3). WARN when a setting of yours is wrong; also `reason=internal-error(<class>)` if the stream itself failed to start — the rest of the node is unaffected |
 | `connecting` | DEBUG | `attempt=` | an attempt is starting |
 | `connected` | INFO | `attempt=` `handshake_ms=` | the connection is open; `attempt` counts the attempts it took |
-| `push` | DEBUG | `push=` `n=` `chars=` `ts=` `dly_ms=` | a push arrived and parsed: its sequence number, entries, size, the server's timestamp, and how many ms after that timestamp it arrived. DEBUG because its `cmp` line says the same push at INFO |
-| `cmp` | INFO, or WARN for `MISMATCH` and `API_AHEAD` | `push=` `out=` `n=` `h=`, then the outcome's own | the one verdict on a push compared with the API (or, with `push=-`, on an API change no push carried) — [Comparing the stream with the API](#comparing-the-stream-with-the-api) |
+| `push` | DEBUG | `push=` `n=` `chars=` `ts=` `rcv=` `dly_ms=` `xfer_ms=` | a push arrived and parsed: its sequence number, entries, size, the server's timestamp, when it arrived, how many ms after that timestamp it arrived, and how long its frames took ([Measuring delivery](#measuring-delivery)). DEBUG because its `cmp` line says the same push at INFO |
+| `cmp` | INFO, or WARN for `MISMATCH` and `API_AHEAD` | `push=` `out=` `n=` `h=`, then the outcome's own, then — on a line about a push — `gap_s=` `dly_ms=` `ts=` `rcv=` `xfer_ms=` | the one verdict on a push compared with the API (or, with `push=-`, on an API change no push carried) — [Comparing the stream with the API](#comparing-the-stream-with-the-api) |
 | `cmp-detail` | WARN or DEBUG | `push=` `out=` `only_ws=` `only_api=` `differ=` (and `api_is_push=`) | after a `MISMATCH` or `API_AHEAD`: which oracle NFTs differ. WARN when the set differs from the last one said, DEBUG while it repeats |
 | `day` | INFO | `push=` `up_s=` `conn_s=` `pushes=` … `last=` | the cumulative summary at each UTC midnight, and `last=1` when the node stops — [The `day` line](#the-day-line) |
 | `push-ignored` | WARN or DEBUG | `reason=` `count=` | a message that is not a usable push: `malformed`, `unknown-type:<type>`, `oversize` (over 1,048,576 characters) or `binary`. The connection stays up; the message is counted, never echoed |
@@ -234,6 +242,26 @@ The `why=` of an `UNCOVERED` line — **none of these is a failure**; each is a 
 (`only_ws`, `only_api`, `differ`, at most five of each). A standing difference is said once at WARN and
 again only when it changes.
 
+### Measuring delivery
+
+Every `cmp` line about a push ends with how that push was delivered, so push delay can be measured from the
+line itself — across nodes and across clients — without trusting the log's own timestamp:
+
+| Field | Meaning |
+|---|---|
+| `ts` | FluidTokens' own `timestamp` on the push, epoch milliseconds, exactly as sent |
+| `rcv` | when this node received the **complete** message — its last frame — in epoch milliseconds from the host's clock, read before the message is parsed |
+| `dly_ms` | `rcv − ts`: how long after FluidTokens stamped the push this node had all of it |
+| `xfer_ms` | milliseconds from the message's first frame to its last; `0` for a message in one frame. Measured where the Java WebSocket client hands the frames over, so it includes that client's own buffering — not a wire-level figure |
+
+- **The values are taken when the push arrives** and travel with it, so a `cmp` line written minutes later —
+  when the API catches up — still names the arrival, never the moment the line was written. An `API_AHEAD`
+  with `push=-` carries none of them: no push arrived.
+- **Comparing nodes is only as accurate as each host's clock.** `rcv` comes from the host's clock, so a node
+  whose clock is a second fast reports every push a second late. Keep the clock synchronised (chrony or NTP);
+  a skewed clock reads as delay — or as a negative one — and the node cannot detect its own skew.
+- **The same push on several nodes** is joined by `ts` (or by `h`: the same 8-hex content hash on every node).
+
 ### The `day` line
 
 At each **UTC midnight**, and once more when the node stops, the stream writes one INFO summary:
@@ -278,12 +306,12 @@ A `MATCHED` line proves the two sides carried the same **parsed** entries, not t
 
 An assumption, not a guarantee: the worst case is **one push a minute**, because FluidTokens' change
 detector runs every minute (measured on preview on 2026-10-29). That is 1,440 `cmp` lines a day, each at
-most 300 bytes as the node writes it, plus about 80 bytes of Docker's own wrapping per line — roughly
-**0.55 MB a day**. The connection, refusal and `day` lines are negligible beside that.
+most 350 bytes as the node writes it, plus about 80 bytes of Docker's own wrapping per line — 430 × 1,440,
+roughly **0.62 MB a day**. The connection, refusal and `day` lines are negligible beside that.
 
 The node's container keeps at most **50 MB of log** (`max-size: 10m`, `max-file: 5` in
-`docker/docker-compose.yaml`), so the stream uses about 1.1% of it a day, and a 7-day gate needs about
-3.9 MB of `[oracle-stream]` lines. That budget is shared with **everything** else the node logs, which is
+`docker/docker-compose.yaml`), so the stream uses about 1.2% of it a day, and a 7-day gate needs about
+4.3 MB of `[oracle-stream]` lines. That budget is shared with **everything** else the node logs, which is
 far more, so do not count on Docker still holding a week: **export daily**.
 
 ### Exporting the lines

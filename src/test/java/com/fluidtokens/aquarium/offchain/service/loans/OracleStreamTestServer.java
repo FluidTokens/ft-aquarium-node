@@ -66,10 +66,10 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  *       swallowed before Reactor Netty can answer it, so the client's closing handshake never completes and
  *       only its own abort ends the connection (FAB-174-3 audit residue R-1).</li>
  * </ul>
- * Per connection it records the open and close instants, the raw query and the pings received, and can push a
- * text message as one frame or as a {@code TextWebSocketFrame(false, ...)} followed by continuation frames,
- * push a binary message, close, or drop the TCP connection with no close frame. Its own logs are never asserted
- * on.
+ * Every request's raw query and {@code X-FT-Node-Version} header are recorded. Per connection it records the open
+ * and close instants, the raw query and the pings received, and can push a text message as one frame or as a
+ * {@code TextWebSocketFrame(false, ...)} followed by continuation frames, push a binary message, close, or drop the
+ * TCP connection with no close frame. Its own logs are never asserted on.
  *
  * <p>{@link Hanging} is a raw {@link ServerSocket} that accepts and never answers — the handshake-timeout case.
  */
@@ -86,6 +86,7 @@ final class OracleStreamTestServer implements AutoCloseable {
     private final List<Instant> requestTimes = new CopyOnWriteArrayList<>();
     private final List<Session> sessions = new CopyOnWriteArrayList<>();
     private final List<String> queries = new CopyOnWriteArrayList<>();
+    private final List<String> nodeVersions = new CopyOnWriteArrayList<>();
     private final List<String> authFailures = new CopyOnWriteArrayList<>();
 
     private volatile int refuseStatus;
@@ -154,6 +155,14 @@ final class OracleStreamTestServer implements AutoCloseable {
         return queries;
     }
 
+    /**
+     * Every request's {@code X-FT-Node-Version} header (FAB-179), in order — null where it was absent. Never a
+     * reason to refuse.
+     */
+    List<String> nodeVersions() {
+        return nodeVersions;
+    }
+
     /** Why each authorize-mode refusal happened. */
     List<String> authFailures() {
         return authFailures;
@@ -178,6 +187,7 @@ final class OracleStreamTestServer implements AutoCloseable {
         int q = uri.indexOf('?');
         String query = q < 0 ? "" : uri.substring(q + 1);
         queries.add(query);
+        nodeVersions.add(request.requestHeaders().get("X-FT-Node-Version"));
         if (refuseStatus != 0) {
             return answer(response, refuseStatus, refuseBody);
         }

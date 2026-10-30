@@ -134,6 +134,19 @@ public final class OracleStreamClient {
          * @param chars           the message's length in chars
          */
         void onPush(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars);
+
+        /**
+         * The form the client calls; by default it forgets {@code xferMs} and calls the four-argument form.
+         *
+         * @param at              when the message's last part arrived, read before it was parsed
+         * @param serverTimestamp the message's {@code timestamp}, epoch milliseconds
+         * @param xferMs          milliseconds from the message's first frame to its last frame; 0 for a single frame
+         * @param chars           the message's length in chars
+         */
+        default void onPush(Instant at, long serverTimestamp, long xferMs, OracleRegistryParser.Parsed parsed,
+                            int chars) {
+            onPush(at, serverTimestamp, parsed, chars);
+        }
     }
 
     /**
@@ -170,6 +183,8 @@ public final class OracleStreamClient {
     private final Executor ioExecutor;
     private final BooleanSupplier stakePresent;
     private final OracleStreamRetryPolicy policy;
+    /** The handshake's {@code X-FT-Node-Version} value (FAB-179), or null for no header. */
+    private final String nodeVersion;
 
     private final AtomicLong pushesParsed = new AtomicLong();
     private final Map<String, AtomicLong> ignored = new ConcurrentHashMap<>();
@@ -199,13 +214,33 @@ public final class OracleStreamClient {
                               OracleStreamLog log, ScheduledExecutorService scheduler, Executor ioExecutor,
                               BooleanSupplier stakePresent, MeterRegistry meterRegistry) {
         this(base, auth, timings, clock, listener, log, scheduler, ioExecutor, stakePresent, meterRegistry,
-                new OracleStreamRetryPolicy(new SplittableRandom()));
+                (String) null);
+    }
+
+    /**
+     * @param nodeVersion the {@code X-FT-Node-Version} header sent on every handshake, or null for none; a value the
+     *                    header cannot carry is dropped and the connection proceeds without it
+     */
+    public OracleStreamClient(URI base, OracleStreamAuth auth, Timings timings, Clock clock, Listener listener,
+                              OracleStreamLog log, ScheduledExecutorService scheduler, Executor ioExecutor,
+                              BooleanSupplier stakePresent, MeterRegistry meterRegistry, String nodeVersion) {
+        this(base, auth, timings, clock, listener, log, scheduler, ioExecutor, stakePresent, meterRegistry,
+                new OracleStreamRetryPolicy(new SplittableRandom()), nodeVersion);
     }
 
     /** For tests: a policy with a known jitter source. */
     OracleStreamClient(URI base, OracleStreamAuth auth, Timings timings, Clock clock, Listener listener,
                        OracleStreamLog log, ScheduledExecutorService scheduler, Executor ioExecutor,
                        BooleanSupplier stakePresent, MeterRegistry meterRegistry, OracleStreamRetryPolicy policy) {
+        this(base, auth, timings, clock, listener, log, scheduler, ioExecutor, stakePresent, meterRegistry, policy,
+                null);
+    }
+
+    private OracleStreamClient(URI base, OracleStreamAuth auth, Timings timings, Clock clock, Listener listener,
+                               OracleStreamLog log, ScheduledExecutorService scheduler, Executor ioExecutor,
+                               BooleanSupplier stakePresent, MeterRegistry meterRegistry,
+                               OracleStreamRetryPolicy policy, String nodeVersion) {
+        this.nodeVersion = nodeVersion;
         this.base = base;
         this.auth = auth;
         this.timings = timings;
@@ -342,15 +377,39 @@ public final class OracleStreamClient {
         try {
             // A fresh ts on every attempt: the authorizer refuses a signature older than two minutes.
             URI signed = auth.signedUri(base, clock.millis());
-            opening = http.newWebSocketBuilder()
-                    .connectTimeout(timings.handshakeTimeout())
-                    .buildAsync(signed, connection);
+            WebSocket.Builder builder = http.newWebSocketBuilder()
+                    .connectTimeout(timings.handshakeTimeout());
+            if (nodeVersion != null) {
+                try {
+                    builder.header("X-FT-Node-Version", headerValue(nodeVersion));
+                } catch (IllegalArgumentException e) {
+                    // ⛔ a version is never worth a connection: no header, and the value is never echoed
+                    events.debug("node-ver-rejected", null);
+                }
+            }
+            opening = builder.buildAsync(signed, connection);
         } catch (RuntimeException e) {
             end(connection, "error(" + OracleStreamLog.simpleName(e) + ")", false);
             return;
         }
         opening.whenCompleteAsync((socket, failure) ->
                 guarded("opened", () -> opened(connection, socket, failure)).run(), scheduler);
+    }
+
+    /**
+     * {@code value} when every character is visible ASCII (0x21–0x7E); otherwise {@link IllegalArgumentException}.
+     * Checked here, before the builder, because the JDK's {@code WebSocket.Builder.header} accepts a CR or LF and
+     * only its opening handshake rejects it — as a failed connection attempt (measured on JDK 21.0.11), which would
+     * cost every connection the node makes.
+     */
+    private static String headerValue(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 0x21 || c > 0x7E) {
+                throw new IllegalArgumentException("not visible ASCII");
+            }
+        }
+        return value;
     }
 
     private void opened(Connection connection, WebSocket socket, Throwable failure) {
@@ -633,8 +692,11 @@ public final class OracleStreamClient {
         }
     }
 
-    /** One complete text message: an {@code oracle-tokens} push goes to the listener, anything else is counted. */
-    private void message(Connection connection, String text, Instant at) {
+    /**
+     * One complete text message: an {@code oracle-tokens} push goes to the listener, anything else is counted.
+     * {@code at} and {@code xferMs} were read on the I/O side as its parts arrived, never here.
+     */
+    private void message(Connection connection, String text, Instant at, long xferMs) {
         if (connection.ended) {
             return;
         }
@@ -670,7 +732,7 @@ public final class OracleStreamClient {
                 last.refusalMessage(), last.nextAttemptAt());
         long serverTimestamp = timestamp.longValue();
         int chars = text.length();
-        notifyListener("onPush", () -> listener.onPush(at, serverTimestamp, parsed, chars));
+        notifyListener("onPush", () -> listener.onPush(at, serverTimestamp, xferMs, parsed, chars));
     }
 
     /** Counts a message the stream could not use and says so on change — ⛔ never echoing it. */
@@ -764,6 +826,8 @@ public final class OracleStreamClient {
         // I/O side
         private StringBuilder text = new StringBuilder();
         private boolean oversize;
+        /** When the current message's first part arrived; null between messages. */
+        private Instant firstFrameAt;
 
         // Scheduler side (socket and openedAt are also read by stop())
         volatile WebSocket socket;
@@ -789,6 +853,10 @@ public final class OracleStreamClient {
 
         @Override
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+            // ⛔ The null check, not an empty buffer: an oversize message empties the buffer mid-message.
+            if (firstFrameAt == null) {
+                firstFrameAt = clock.instant();
+            }
             if (!oversize) {
                 if (text.length() + data.length() > MAX_MESSAGE_CHARS) {
                     oversize = true;
@@ -799,13 +867,15 @@ public final class OracleStreamClient {
             }
             if (last) {
                 Instant at = clock.instant();
+                long xferMs = at.toEpochMilli() - firstFrameAt.toEpochMilli();
+                firstFrameAt = null;
                 if (oversize) {
                     oversize = false;
                     handOff("oversize", () -> ignore("oversize", "oversize"));
                 } else {
                     String message = text.toString();
                     text = new StringBuilder();
-                    handOff("message", () -> message(this, message, at));
+                    handOff("message", () -> message(this, message, at, xferMs));
                 }
             }
             webSocket.request(1);

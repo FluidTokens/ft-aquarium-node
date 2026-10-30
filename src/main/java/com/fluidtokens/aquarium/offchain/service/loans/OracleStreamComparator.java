@@ -122,14 +122,19 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
     /**
      * One {@code cmp} line's fields. Null fields are left out; the order is fixed:
      * {@code push out n h}, then the outcome's own ({@code lag_s rep by api api_n lead_s why}), then
-     * {@code gap_s dly_ms} for an outcome attached to a push.
+     * {@code gap_s dly_ms ts rcv xfer_ms} for an outcome attached to a push.
      *
      * <p>{@code lag_s} is never below 0: {@code lag_s=0} means "not behind, within the poll and hand-off
      * measurement error" (R-b). {@code why} is one of {@code no-api}, {@code unjudgeable}, {@code pre-connect},
      * {@code overflow}, {@code shutdown}.
+     *
+     * <p>{@code ts} is the push's server {@code timestamp}, {@code rcv} the epoch milliseconds its last part
+     * arrived, {@code xfer_ms} its first part to its last, and {@code dly_ms = rcv − ts} (FAB-178). All three are
+     * the push's own, taken when it arrived — never the instant the line is written. At most 240 bytes as the whole
+     * formatted message, so a line stays within 350 under Spring Boot's ~110-byte prefix.
      */
     record Cmp(String push, Outcome outcome, int n, String hash, Long lagS, Integer rep, Long by, String api,
-               Integer apiN, Long leadS, String why, String gapS, Long dlyMs) {
+               Integer apiN, Long leadS, String why, String gapS, Long dlyMs, Long ts, Long rcv, Long xferMs) {
 
         String fields() {
             StringBuilder out = new StringBuilder("push=").append(push)
@@ -145,6 +150,9 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
             append(out, "why", why);
             append(out, "gap_s", gapS);
             append(out, "dly_ms", dlyMs);
+            append(out, "ts", ts);
+            append(out, "rcv", rcv);
+            append(out, "xfer_ms", xferMs);
             return out.toString();
         }
 
@@ -169,34 +177,40 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         }
     }
 
-    static Cmp matched(long seq, int n, String hash, long lagS, int rep, String gapS, long dlyMs) {
+    static Cmp matched(long seq, int n, String hash, long lagS, int rep, String gapS, long dlyMs, long ts,
+                       long rcv, long xferMs) {
         return new Cmp(String.valueOf(seq), Outcome.MATCHED, n, hash, lagS, rep, null, null, null, null, null,
-                gapS, dlyMs);
+                gapS, dlyMs, ts, rcv, xferMs);
     }
 
-    static Cmp superseded(long seq, int n, String hash, long by, String gapS, long dlyMs) {
+    static Cmp superseded(long seq, int n, String hash, long by, String gapS, long dlyMs, long ts, long rcv,
+                          long xferMs) {
         return new Cmp(String.valueOf(seq), Outcome.SUPERSEDED, n, hash, null, null, by, null, null, null, null,
-                gapS, dlyMs);
+                gapS, dlyMs, ts, rcv, xferMs);
     }
 
-    static Cmp mismatch(long seq, int n, String hash, String api, int apiN, String gapS, long dlyMs) {
+    static Cmp mismatch(long seq, int n, String hash, String api, int apiN, String gapS, long dlyMs, long ts,
+                        long rcv, long xferMs) {
         return new Cmp(String.valueOf(seq), Outcome.MISMATCH, n, hash, null, null, null, api, apiN, null, null,
-                gapS, dlyMs);
+                gapS, dlyMs, ts, rcv, xferMs);
     }
 
-    static Cmp apiAhead(long seq, int n, String hash, long leadS, String gapS, long dlyMs) {
+    static Cmp apiAhead(long seq, int n, String hash, long leadS, String gapS, long dlyMs, long ts, long rcv,
+                        long xferMs) {
         return new Cmp(String.valueOf(seq), Outcome.API_AHEAD, n, hash, null, null, null, null, null, leadS, null,
-                gapS, dlyMs);
+                gapS, dlyMs, ts, rcv, xferMs);
     }
 
     /** An API change no push carried: the API's own {@code n} and {@code h}, and nothing attached to a push. */
     static Cmp apiAheadOrphan(int n, String hash) {
-        return new Cmp("-", Outcome.API_AHEAD, n, hash, null, null, null, null, null, null, null, null, null);
+        return new Cmp("-", Outcome.API_AHEAD, n, hash, null, null, null, null, null, null, null, null, null, null,
+                null, null);
     }
 
-    static Cmp uncovered(long seq, int n, String hash, String why, String gapS, long dlyMs) {
+    static Cmp uncovered(long seq, int n, String hash, String why, String gapS, long dlyMs, long ts, long rcv,
+                         long xferMs) {
         return new Cmp(String.valueOf(seq), Outcome.UNCOVERED, n, hash, null, null, null, null, null, null, why,
-                gapS, dlyMs);
+                gapS, dlyMs, ts, rcv, xferMs);
     }
 
     /**
@@ -232,13 +246,19 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         final int rep;
         final String gapS;
         final long dlyMs;
+        /** The push's server timestamp, epoch ms. */
+        final long ts;
+        /** When its last part arrived, epoch ms: {@code at}, kept for a line written later. */
+        final long rcvMs;
+        /** Its first part to its last, ms. */
+        final long xferMs;
         /** When the connection that delivered this push opened. */
         final Instant connOpenedAt;
         Long supersededBy;
         int apiObservations;
 
         Pending(long seq, Instant at, String hash, Set<OracleEntry> entries, int rep, String gapS, long dlyMs,
-                Instant connOpenedAt) {
+                long ts, long xferMs, Instant connOpenedAt) {
             this.seq = seq;
             this.at = at;
             this.hash = hash;
@@ -246,6 +266,9 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
             this.rep = rep;
             this.gapS = gapS;
             this.dlyMs = dlyMs;
+            this.ts = ts;
+            this.rcvMs = at.toEpochMilli();
+            this.xferMs = xferMs;
             this.connOpenedAt = connOpenedAt;
         }
     }
@@ -347,8 +370,15 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         }
     }
 
+    /** A push with no transfer time to tell: {@code xfer_ms=0}. */
     @Override
     public void onPush(Instant at, long serverTimestamp, OracleRegistryParser.Parsed parsed, int chars) {
+        onPush(at, serverTimestamp, 0, parsed, chars);
+    }
+
+    @Override
+    public void onPush(Instant at, long serverTimestamp, long xferMs, OracleRegistryParser.Parsed parsed,
+                       int chars) {
         started(at);
         advance(at);
         quietGap(at);
@@ -358,39 +388,45 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         String hash = hash(entries);
         Instant since = later(lastPushAt, connOpenSince);
         String gapS = since == null ? "-" : String.valueOf(seconds(since, at));
-        long dlyMs = at.toEpochMilli() - serverTimestamp;
+        long rcvMs = at.toEpochMilli();
+        long dlyMs = rcvMs - serverTimestamp;
         Set<OracleEntry> before = lastPushEntries;
         lastPushAt = at;
         lastPushEntries = entries;
         events.debug("push", "push=" + seq + " n=" + parsed.entries().size() + " chars=" + chars
-                + " ts=" + serverTimestamp + " dly_ms=" + dlyMs);
+                + " ts=" + serverTimestamp + " rcv=" + rcvMs + " dly_ms=" + dlyMs + " xfer_ms=" + xferMs);
 
         if (stopped) {
             // R-c: the comparator has shut down, but the client has not stopped yet — still one line.
-            emit(uncovered(seq, entries.size(), hash, "shutdown", gapS, dlyMs));
+            emit(uncovered(seq, entries.size(), hash, "shutdown", gapS, dlyMs, serverTimestamp, rcvMs, xferMs));
             return;
         }
         if (pushedHashes.containsKey(hash)) {
             // A repeat: the API may already be on it.
             if (apiLast != null && apiLast.hash().equals(hash)) {
                 if (preConnect(apiLast, connOpenSince)) {
-                    emit(uncovered(seq, entries.size(), hash, "pre-connect", gapS, dlyMs));
+                    emit(uncovered(seq, entries.size(), hash, "pre-connect", gapS, dlyMs, serverTimestamp, rcvMs,
+                            xferMs));
                 } else {
-                    emit(matched(seq, entries.size(), hash, 0, 1, gapS, dlyMs));
+                    emit(matched(seq, entries.size(), hash, 0, 1, gapS, dlyMs, serverTimestamp, rcvMs, xferMs));
                 }
             } else {
-                pending.add(new Pending(seq, at, hash, entries, 1, gapS, dlyMs, connOpenSince));
+                pending.add(new Pending(seq, at, hash, entries, 1, gapS, dlyMs, serverTimestamp, xferMs,
+                        connOpenSince));
             }
         } else {
             ApiChange ahead = firstChangeTo(hash, at);
             if (ahead == null) {
-                pending.add(new Pending(seq, at, hash, entries, 0, gapS, dlyMs, connOpenSince));
+                pending.add(new Pending(seq, at, hash, entries, 0, gapS, dlyMs, serverTimestamp, xferMs,
+                        connOpenSince));
             } else if (ahead.judgeable) {
                 ahead.reported = true;
-                emit(apiAhead(seq, entries.size(), hash, seconds(ahead.at, at), gapS, dlyMs));
+                emit(apiAhead(seq, entries.size(), hash, seconds(ahead.at, at), gapS, dlyMs, serverTimestamp, rcvMs,
+                        xferMs));
                 detail(String.valueOf(seq), Outcome.API_AHEAD, before, ahead.entries, "");
             } else {
-                emit(uncovered(seq, entries.size(), hash, "unjudgeable", gapS, dlyMs));
+                emit(uncovered(seq, entries.size(), hash, "unjudgeable", gapS, dlyMs, serverTimestamp, rcvMs,
+                        xferMs));
             }
         }
         pushedHashes.put(hash, seq);
@@ -401,7 +437,8 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         }
         while (pending.size() > MAX_PENDING) {
             Pending oldest = pending.removeFirst();
-            emit(uncovered(oldest.seq, oldest.entries.size(), oldest.hash, "overflow", oldest.gapS, oldest.dlyMs));
+            emit(uncovered(oldest.seq, oldest.entries.size(), oldest.hash, "overflow", oldest.gapS, oldest.dlyMs,
+                    oldest.ts, oldest.rcvMs, oldest.xferMs));
         }
     }
 
@@ -436,7 +473,8 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
             if (p.hash.equals(hash)) {
                 waiting.remove();
                 if (preConnect(apiLast, p.connOpenedAt)) {
-                    emit(uncovered(p.seq, p.entries.size(), p.hash, "pre-connect", p.gapS, p.dlyMs));
+                    emit(uncovered(p.seq, p.entries.size(), p.hash, "pre-connect", p.gapS, p.dlyMs, p.ts, p.rcvMs,
+                            p.xferMs));
                     continue;
                 }
                 // R-b: a load handed off after a push stamped just after it is "not behind", never negative.
@@ -444,7 +482,8 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
                 if (p.rep == 0) {
                     lastLagSeconds = lag;
                 }
-                emit(matched(p.seq, p.entries.size(), p.hash, lag, p.rep, p.gapS, p.dlyMs));
+                emit(matched(p.seq, p.entries.size(), p.hash, lag, p.rep, p.gapS, p.dlyMs, p.ts, p.rcvMs,
+                        p.xferMs));
             }
         }
     }
@@ -461,12 +500,13 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
             }
             waiting.remove();
             if (p.supersededBy != null) {
-                emit(superseded(p.seq, p.entries.size(), p.hash, p.supersededBy, p.gapS, p.dlyMs));
+                emit(superseded(p.seq, p.entries.size(), p.hash, p.supersededBy, p.gapS, p.dlyMs, p.ts, p.rcvMs,
+                        p.xferMs));
             } else if (p.apiObservations == 0) {
-                emit(uncovered(p.seq, p.entries.size(), p.hash, "no-api", p.gapS, p.dlyMs));
+                emit(uncovered(p.seq, p.entries.size(), p.hash, "no-api", p.gapS, p.dlyMs, p.ts, p.rcvMs, p.xferMs));
             } else {
                 emit(mismatch(p.seq, p.entries.size(), p.hash, apiLast.hash(), apiLast.entries().size(), p.gapS,
-                        p.dlyMs));
+                        p.dlyMs, p.ts, p.rcvMs, p.xferMs));
                 Long apiIsPush = pushedHashes.get(apiLast.hash());
                 detail(String.valueOf(p.seq), Outcome.MISMATCH, p.entries, apiLast.entries(),
                         apiIsPush == null ? "" : " api_is_push=" + apiIsPush);
@@ -493,7 +533,7 @@ public final class OracleStreamComparator implements OracleStreamClient.Listener
         advance(now);
         stopped = true;
         for (Pending p : pending) {
-            emit(uncovered(p.seq, p.entries.size(), p.hash, "shutdown", p.gapS, p.dlyMs));
+            emit(uncovered(p.seq, p.entries.size(), p.hash, "shutdown", p.gapS, p.dlyMs, p.ts, p.rcvMs, p.xferMs));
         }
         pending.clear();
         daySummary(now, true);
