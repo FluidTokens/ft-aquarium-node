@@ -178,6 +178,11 @@
     .prices .px-age { color:var(--muted); font-size:.7rem; }
     .prices .px.stale { opacity:.55; cursor:help; }
     .prices .px-reason, .prices .px-caveat { font-size:.7rem; color:var(--muted); }
+    /* With a book, a wide screen shows the prices in its right half instead, so the strip is the narrow view's
+       only. Without a book it stays at every width: the prices are never left with nowhere to show. */
+    @media (min-width: 701px) {
+      .prices.prices-narrow { display:none; }
+    }
 
     /* ---- the book: counts and collateral locked, above the filters ---------------------------- */
     .book { margin:0 0 .9rem; padding:.6rem .8rem; border:1px solid var(--rule); border-radius:8px;
@@ -191,6 +196,19 @@
     .book-tokens li { margin:.12rem 0; font-variant-numeric:tabular-nums; }
     .book-total { display:flex; flex-wrap:wrap; gap:.3rem 1.2rem; font-weight:600; }
     .book-tokens .reason, .book-total .reason { display:inline; margin:0 0 0 .3rem; font-weight:400; }
+    /* FAB-182: with prices, the book splits in two — the summary left, the prices right — and the right half
+       wraps below the left when the book is too narrow for both. min-width:0 keeps either from forcing a
+       horizontal scroll. */
+    .book-split { display:flex; flex-wrap:wrap; gap:.6rem 1.6rem; }
+    .book-split .book-main { flex:1 1 22rem; min-width:0; }
+    .book-prices { flex:1 1 16rem; min-width:0; }
+    .book-px-list { list-style:none; margin:.35rem 0 .4rem; padding:0; }
+    .book-px { margin:.12rem 0; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+    .book-px .ticker { margin-left:0; }
+    .book-px.stale { opacity:.55; cursor:help; }
+    .book-px .px-usd { color:var(--ink-2); }
+    .book-px .px-age { color:var(--muted); font-size:.74rem; }
+    .book-prices .px-reason, .book-prices .px-caveat { display:block; font-size:.72rem; color:var(--muted); }
 
     /* ---- the exception mark ------------------------------------------------------------------ */
     /* ⚠ Deliberately the only warning colour in the table body, so it cannot be lost among chips. */
@@ -362,9 +380,13 @@
          (data-server-now), never the browser's clock alone. No validity column: at ~9 minutes old a fresh
          price is about to land, and the age says so. A muted entry has no feed usable now and shows the
          last one held. USD is the book's one rate, through the reference stablecoin counted as $1 — and the
-         strip SAYS so in words, by the token's own label, because the phone view has no book and no hover. */-->
+         strip SAYS so in words, by the token's own label, because the phone view has no book and no hover.
+         With a book, a wide screen shows the same entries in the book's right half and hides this strip
+         (prices-narrow); without one, the strip is the only place they show, so it stays at every width.
+         This strip's data-server-now is the page's ONE server instant: the ticker reads it for every age. */-->
   <th:block th:unless="${disabledReason}">
-  <div class="prices" th:if="${prices != null}" th:attr="data-server-now=${prices.serverNow}">
+  <div class="prices" th:if="${prices != null}" th:classappend="${book != null} ? 'prices-narrow'"
+       th:attr="data-server-now=${prices.serverNow}">
     <span class="wallet-label">prices</span>
     <span class="px" th:each="p : ${prices.entries}" th:classappend="${p.stale} ? 'stale'"
           th:title="${p.stale} ? 'no price usable right now — showing the last one held' : null">
@@ -409,45 +431,76 @@
        whose collateral has no usable price stays in its token's amount, is left out of every value, and is
        counted. -->
   <div class="book" th:if="${book != null}">
-    <div class="book-head">
-      <span class="book-label">The book</span>
-      <span class="book-caveat">an estimate at oracle prices, following the filters</span>
+    <!--/* FAB-182: with prices, the book splits into halves; without them it renders exactly as before. */-->
+    <div th:classappend="${prices != null} ? 'book-split'">
+      <div class="book-main">
+        <div class="book-head">
+          <span class="book-label">The book</span>
+          <span class="book-caveat">an estimate at oracle prices, following the filters</span>
+        </div>
+        <div class="book-counts">
+          <span><b th:text="${book.loans}">0</b> loan(s)</span>
+          <span><b th:text="${book.liquidatable}">0</b> liquidatable now</span>
+          <span><b th:text="${book.blocked}">0</b> the bot could not process</span>
+        </div>
+        <div class="book-label">Collateral locked (TVL)</div>
+        <ul class="book-tokens">
+          <li th:each="t : ${book.tokens}">
+            <span th:title="|exact: ${t.amount.exactText} ${t.amount.label}|" th:text="${t.amount.amountText}">0</span>
+            <span class="ticker" th:text="${t.amount.label}" th:title="${t.amount.policyId}">TKR</span>
+            <span th:if="${t.amount.metadataUnknown}" class="nometa"
+                  th:title="|no metadata found for ${t.amount.unit} — raw, unscaled base units|">&#10071;</span>
+            <span th:if="${t.valueDisplay != null}" th:title="|exact: ${t.valueDisplay.exactText} ADA|"
+                  th:text="|≈ ${t.valueDisplay.amountText} ADA|">≈ 0 ADA</span>
+            <span th:if="${t.valueDisplay == null}" class="unknown">no usable oracle price</span>
+            <span class="reason" th:text="|· ${t.loans} loan(s)|">· 1 loan(s)</span>
+            <span class="reason" th:if="${t.valueDisplay != null and t.unpricedLoans > 0}"
+                  th:text="|· ${t.unpricedLoans} not priced|">· 1 not priced</span>
+          </li>
+        </ul>
+        <div class="book-total">
+          <span th:if="${book.totalAdaDisplay != null}" th:title="|exact: ${book.totalAdaDisplay.exactText} ADA|"
+                th:text="|≈ ${book.totalAdaDisplay.amountText} ADA|">≈ 0 ADA</span>
+          <span th:if="${book.totalAdaDisplay == null}" class="unknown">ADA total unknown</span>
+          <span th:if="${book.usdDisplay != null}"
+                th:title="|exact: ${book.usdDisplay.exactText} ${book.usdDisplay.label}. An estimate, not a quote: the ADA total converted at the ${book.usdDisplay.label} oracle price.|"
+                th:text="'≈ $' + ${book.usdDisplay.amountText} + ' (estimated)'">≈ $0 (estimated)</span>
+          <span th:if="${book.adaUsdRateDisplay != null}" class="reason"
+                th:with="ref=${book.adaUsdRateDisplay.label}"
+                th:text="'estimated from ADA → ' + ${ref} + ' at the ' + ${ref} + ' oracle price (1 ADA ≈ $' + ${book.adaUsdRateDisplay.amountText} + '), counting 1 ' + ${ref} + ' as $1'">estimated from ADA at the reference oracle price</span>
+          <span th:if="${book.usdDisplay == null}" class="reason"
+                th:text="|USD unavailable: ${book.usdUnavailableReason}|">USD unavailable</span>
+        </div>
+        <div class="reason" th:if="${book.unpricedLoans > 0}"
+             th:text="|${book.unpricedLoans} loan(s) excluded: their collateral has no usable oracle price|">excluded</div>
+      </div>
+      <!--/* FAB-182: the RIGHT half — the same entries, conditions and model fields as the strip under the
+             wallet, one line per token: ticker (policy id on hover), ADA price, (USD), · age. It does NOT follow
+             the filters the left half does, and says so. Its ages carry data-valid-from, so the one ticker below
+             counts them up with the strip's. */-->
+      <div class="book-prices" th:if="${prices != null}">
+        <div class="book-head">
+          <span class="book-label">Oracle prices</span>
+          <span class="book-caveat">all tokens — not filtered</span>
+        </div>
+        <ul class="book-px-list">
+          <li class="book-px" th:each="p : ${prices.entries}" th:classappend="${p.stale} ? 'stale'"
+              th:title="${p.stale} ? 'no price usable right now — showing the last one held' : null">
+            <span class="ticker" th:text="${p.label}" th:title="${p.policyId}">TKR</span>
+            <span th:if="${p.adaText != null}" th:text="|${p.adaText} ADA|">0 ADA</span>
+            <span th:if="${p.metadataUnknown}" class="nometa"
+                  th:title="|no metadata for ${p.unit} — priced per raw, unscaled base unit|">&#10071;</span>
+            <span class="px-usd" th:text="${p.adaText != null} ? |(${p.usdText})| : ${p.usdText}">($0)</span>
+            <th:block th:if="${p.validFrom != null}">&middot;
+              <span class="px-age" th:attr="data-valid-from=${p.validFrom}" th:text="${p.ageText}">0m0s</span></th:block>
+          </li>
+        </ul>
+        <span class="px-caveat" th:if="${prices.usdUnavailableReason == null and prices.usdReference != null}"
+              th:text="'USD ≈ via ' + ${prices.usdReference} + ', 1 ' + ${prices.usdReference} + ' counted as $1'">USD ≈ via the reference stablecoin</span>
+        <span class="px-reason" th:if="${prices.usdUnavailableReason != null}"
+              th:text="|USD unavailable: ${prices.usdUnavailableReason}|">USD unavailable</span>
+      </div>
     </div>
-    <div class="book-counts">
-      <span><b th:text="${book.loans}">0</b> loan(s)</span>
-      <span><b th:text="${book.liquidatable}">0</b> liquidatable now</span>
-      <span><b th:text="${book.blocked}">0</b> the bot could not process</span>
-    </div>
-    <div class="book-label">Collateral locked (TVL)</div>
-    <ul class="book-tokens">
-      <li th:each="t : ${book.tokens}">
-        <span th:title="|exact: ${t.amount.exactText} ${t.amount.label}|" th:text="${t.amount.amountText}">0</span>
-        <span class="ticker" th:text="${t.amount.label}" th:title="${t.amount.policyId}">TKR</span>
-        <span th:if="${t.amount.metadataUnknown}" class="nometa"
-              th:title="|no metadata found for ${t.amount.unit} — raw, unscaled base units|">&#10071;</span>
-        <span th:if="${t.valueDisplay != null}" th:title="|exact: ${t.valueDisplay.exactText} ADA|"
-              th:text="|≈ ${t.valueDisplay.amountText} ADA|">≈ 0 ADA</span>
-        <span th:if="${t.valueDisplay == null}" class="unknown">no usable oracle price</span>
-        <span class="reason" th:text="|· ${t.loans} loan(s)|">· 1 loan(s)</span>
-        <span class="reason" th:if="${t.valueDisplay != null and t.unpricedLoans > 0}"
-              th:text="|· ${t.unpricedLoans} not priced|">· 1 not priced</span>
-      </li>
-    </ul>
-    <div class="book-total">
-      <span th:if="${book.totalAdaDisplay != null}" th:title="|exact: ${book.totalAdaDisplay.exactText} ADA|"
-            th:text="|≈ ${book.totalAdaDisplay.amountText} ADA|">≈ 0 ADA</span>
-      <span th:if="${book.totalAdaDisplay == null}" class="unknown">ADA total unknown</span>
-      <span th:if="${book.usdDisplay != null}"
-            th:title="|exact: ${book.usdDisplay.exactText} ${book.usdDisplay.label}. An estimate, not a quote: the ADA total converted at the ${book.usdDisplay.label} oracle price.|"
-            th:text="'≈ $' + ${book.usdDisplay.amountText} + ' (estimated)'">≈ $0 (estimated)</span>
-      <span th:if="${book.adaUsdRateDisplay != null}" class="reason"
-            th:with="ref=${book.adaUsdRateDisplay.label}"
-            th:text="'estimated from ADA → ' + ${ref} + ' at the ' + ${ref} + ' oracle price (1 ADA ≈ $' + ${book.adaUsdRateDisplay.amountText} + '), counting 1 ' + ${ref} + ' as $1'">estimated from ADA at the reference oracle price</span>
-      <span th:if="${book.usdDisplay == null}" class="reason"
-            th:text="|USD unavailable: ${book.usdUnavailableReason}|">USD unavailable</span>
-    </div>
-    <div class="reason" th:if="${book.unpricedLoans > 0}"
-         th:text="|${book.unpricedLoans} loan(s) excluded: their collateral has no usable oracle price|">excluded</div>
   </div>
 
   <!-- ⚠ Query parameters, not JavaScript: the page re-GETs its own URL every minute, so client-side
@@ -746,15 +799,17 @@
     if (box.checked) { start(); } else { stop(); }
   })();
 
-  // FAB-182: the prices strip's ages count up every second, auto-refresh on or off. Measured from the
-  // server's render instant plus the time since this page loaded, never the browser's clock alone, so a
-  // skewed laptop clock cannot move an age. No HTTP call: the prices themselves change only on a reload.
+  // FAB-182: every price age on the page — the strip's and the book's right half alike — counts up every
+  // second, auto-refresh on or off. Measured from the server's render instant plus the time since this page
+  // loaded, never the browser's clock alone, so a skewed laptop clock cannot move an age. ONE server instant
+  // for all of them, the first element that carries it, so two ages can never tick from different clocks.
+  // No HTTP call: the prices themselves change only on a reload.
   (function () {
-    var strip = document.querySelector('.prices[data-server-now]');
-    if (!strip) { return; }
-    var serverNow = Number(strip.getAttribute('data-server-now'));
+    var source = document.querySelector('[data-server-now]');
+    if (!source) { return; }
+    var serverNow = Number(source.getAttribute('data-server-now'));
     var loadedAt = Date.now();
-    var ages = strip.querySelectorAll('[data-valid-from]');
+    var ages = document.querySelectorAll('[data-valid-from]');
     function format(ms) {
       var s = Math.floor(Math.max(0, ms) / 1000);
       return s < 3600 ? Math.floor(s / 60) + 'm' + (s % 60) + 's'

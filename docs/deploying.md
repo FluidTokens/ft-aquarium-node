@@ -271,8 +271,9 @@ just moves the open door. If you want browser access from outside, terminate TLS
 
 ### The summary at the top of the page
 
-Directly under the node-wallet strip, a **prices strip** — on the phone view too — lists every token the
-oracle registry prices, from the same oracle feeds the bot prices with: its price in ADA and in USD, and the
+On a wide screen the prices sit in the right half of the summary below (the Book), unfiltered; on a narrow phone view,
+and whenever that summary is absent, they sit in a **prices strip** directly under the node-wallet strip.
+Either way they list every token the oracle registry prices, from the same oracle feeds the bot prices with: its price in ADA and in USD, and the
 feed's age, which counts up live between reloads (a muted entry has no price usable right now and shows the
 last one held).
 
