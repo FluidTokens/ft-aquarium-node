@@ -1212,8 +1212,8 @@ class ReadinessTemplateRendersRowsTest {
     private static final long SERVER_NOW = 1_800_000_000_000L;
 
     /**
-     * ADA, FLDT (live, 9m5s old) and USDCx (STALE, 1h2m old), with USD available — or every USD a dash and
-     * {@code usdReason} stated once.
+     * ADA, FLDT (live, 9m5s old) and USDCx (STALE, 1h2m old), with USD available through USDCx — or every USD a
+     * dash and {@code usdReason} stated once.
      */
     private static LiquidationReadinessController.PriceStrip priceStrip(String usdReason) {
         boolean usd = usdReason == null;
@@ -1224,7 +1224,7 @@ class ReadinessTemplateRendersRowsTest {
                         "0.2345", usd ? "$0.1563" : "—", false, false, SERVER_NOW - 545_000L, "9m5s"),
                 new LiquidationReadinessController.TokenPrice(USDCX_UNIT, "USDCx", USDCX_UNIT.substring(0, 56),
                         "1.5", usd ? "$1" : "—", false, true, SERVER_NOW - 3_720_000L, "1h2m")),
-                usdReason, SERVER_NOW);
+                "USDCx", usdReason, SERVER_NOW);
     }
 
     /** The strip element alone — never the CSS in {@code <style>}, which also says "prices". */
@@ -1342,5 +1342,35 @@ class ReadinessTemplateRendersRowsTest {
                         .contains("ADA → USDCx at the USDCx oracle price (1 ADA ≈ $0.666666), counting 1 USDCx as $1"),
                 "the rate line names USDCx: " + book);
         assertFalse(html.contains("USDM"), "no rendered text says USDM when USDCx is the configured reference");
+    }
+
+    /**
+     * ⛔ FAB-182 r2 (F2): the phone view has no book and no hover, so the STRIP itself says in words that USD is
+     * an estimate through the reference stablecoin, naming it by its label — and, when USD is unavailable,
+     * says that instead and claims no conversion at all.
+     */
+    @Test
+    void theStripSaysInWordsThatUsdIsAnEstimateThroughTheReference() {
+        String html = render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(null)));
+        String strip = prices(html);
+        assertNotNull(strip);
+
+        assertEquals(1, count(strip, Pattern.quote("USD ≈ via USDCx, 1 USDCx counted as $1")),
+                "the caveat, on the strip itself and by the reference's label: " + strip);
+        assertTrue(strip.contains("class=\"px-caveat\""), "a visible span, not a tooltip: " + strip);
+        assertFalse(html.matches("(?s).*max-width: 700px\\)[^}]*\\.px-caveat.*"), "not hidden on the phone view");
+        String other = prices(render(List.of(fullRow()), ctx -> ctx.setVariable("prices",
+                new LiquidationReadinessController.PriceStrip(List.of(), "DJED", null, SERVER_NOW))));
+        assertNotNull(other);
+        assertTrue(other.contains("USD ≈ via DJED, 1 DJED counted as $1"),
+                "the label is the configured token's, never a ticker written into the template: " + other);
+
+        String reason = "no usable USDCx oracle price right now";
+        String unavailable = prices(render(List.of(fullRow()),
+                ctx -> ctx.setVariable("prices", priceStrip(reason))));
+        assertNotNull(unavailable);
+        assertFalse(unavailable.contains("counted as $1"), "no caveat without a rate: " + unavailable);
+        assertFalse(unavailable.contains("px-caveat"), unavailable);
+        assertTrue(unavailable.contains("USD unavailable: " + reason), "the reason is shown instead: " + unavailable);
     }
 }

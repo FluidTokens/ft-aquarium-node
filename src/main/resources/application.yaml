@@ -629,7 +629,7 @@ loans:
     stream:
       url: ${LOANS_ORACLE_STREAM_URL:wss://2tgda3mk4l.execute-api.eu-west-1.amazonaws.com/dev}
   ui:
-    # Blank: the mainnet USDM unit means nothing here, so the readiness page shows USD as unavailable.
+    # Blank: the mainnet USDCx unit means nothing here, so the readiness page shows USD as unavailable.
     usd-reference-unit: ""
   # Preview is where the bot is exercised, so the loop runs by default here — in shadow, which
   # scans, builds, prices and records and never submits a liquidation. ⚠ With an `action: ANTICIPATE`

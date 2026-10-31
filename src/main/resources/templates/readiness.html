@@ -177,7 +177,7 @@
     .prices .px-usd { color:var(--ink-2); }
     .prices .px-age { color:var(--muted); font-size:.7rem; }
     .prices .px.stale { opacity:.55; cursor:help; }
-    .prices .px-reason { font-size:.7rem; color:var(--muted); }
+    .prices .px-reason, .prices .px-caveat { font-size:.7rem; color:var(--muted); }
 
     /* ---- the book: counts and collateral locked, above the filters ---------------------------- */
     .book { margin:0 0 .9rem; padding:.6rem .8rem; border:1px solid var(--rule); border-radius:8px;
@@ -361,7 +361,8 @@
          USD, and the feed's AGE — which the script below ticks every second from the server's render instant
          (data-server-now), never the browser's clock alone. No validity column: at ~9 minutes old a fresh
          price is about to land, and the age says so. A muted entry has no feed usable now and shows the
-         last one held. USD is the book's one rate, through the reference stablecoin counted as $1. */-->
+         last one held. USD is the book's one rate, through the reference stablecoin counted as $1 — and the
+         strip SAYS so in words, by the token's own label, because the phone view has no book and no hover. */-->
   <th:block th:unless="${disabledReason}">
   <div class="prices" th:if="${prices != null}" th:attr="data-server-now=${prices.serverNow}">
     <span class="wallet-label">prices</span>
@@ -375,6 +376,8 @@
       <span class="px-age" th:if="${p.validFrom != null}" th:attr="data-valid-from=${p.validFrom}"
             th:text="${p.ageText}">0m0s</span>
     </span>
+    <span class="px-caveat" th:if="${prices.usdUnavailableReason == null and prices.usdReference != null}"
+          th:text="'USD ≈ via ' + ${prices.usdReference} + ', 1 ' + ${prices.usdReference} + ' counted as $1'">USD ≈ via the reference stablecoin</span>
     <span class="px-reason" th:if="${prices.usdUnavailableReason != null}"
           th:text="|USD unavailable: ${prices.usdUnavailableReason}|">USD unavailable</span>
   </div>

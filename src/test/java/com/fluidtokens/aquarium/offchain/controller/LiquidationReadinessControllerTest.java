@@ -474,6 +474,166 @@ class LiquidationReadinessControllerTest {
                 "one rate, so one reason when it is missing");
     }
 
+    // ---- FAB-182 r2: the one-rate wiring, the trimmed unit, and a strip that cannot fail the page ----------
+
+    private static final String USDCX_UNIT = "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378";
+
+    /** USDCx at 3/2 lovelace per base unit (6 decimals: 1 USDCx = 1.5 ADA, 1 ADA = $0.6666…) over the window. */
+    private static OracleEntry usdcxEntry(long validFrom, long validTo) {
+        AssetType usdcx = AssetType.fromUnit(USDCX_UNIT);
+        return LoanFixtures.charli3(usdcx, new AssetType("ee".repeat(28), "55534443"), "11".repeat(28),
+                OraclePriceFeed.priceDataCharlie(usdcx, BigInteger.valueOf(3), BigInteger.TWO, validFrom, validTo),
+                input("22"), input("33"), input("44"));
+    }
+
+    /** COLLATERAL_TOKEN at 1:1, usable now, so the book has a priced total to convert. */
+    private static OracleEntry collateralEntry(long now) {
+        return LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT, "11".repeat(28),
+                OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.ONE, BigInteger.ONE,
+                        now - 60_000L, now + 1_800_000L),
+                input("22"), input("33"), input("44"));
+    }
+
+    /**
+     * The page as {@code readiness()} builds it, priced by {@code client}, with {@code usdUnit} configured EXACTLY
+     * as given (padding included) and metadata that knows USDCx (6 decimals) and ADA.
+     */
+    private static LiquidationReadinessController usdcxPage(FluidOracleClient client, String usdUnit) {
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "oracleClient", provide(client));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "tokenMetadata",
+                provide(new com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService(null, null,
+                        java.time.Clock.systemUTC()) {
+                    @Override
+                    public TokenMetadata lookup(String unit) {
+                        return USDCX_UNIT.equals(unit)
+                                ? new TokenMetadata(unit, "USDCx", "USDCx", 6, TokenMetadata.Source.REGISTRY)
+                                : "lovelace".equals(unit) ? TokenMetadata.ada() : TokenMetadata.unknown(unit);
+                    }
+                }));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "usdReferenceUnit", usdUnit);
+        return controller;
+    }
+
+    /**
+     * ⛔ FAB-182 r2 (F1): the strip is priced through the BOOK's reference feed — {@code usdFeed(now)}, usable
+     * now — and through nothing else. USDCx is HELD but expired 70 minutes ago, so the book has no USD rate;
+     * neither may the strip. A strip given any other reference feed (the held one regardless of validity,
+     * say) would show a dollar figure here the book refuses to show — two rates on one page.
+     */
+    @Test
+    void anExpiredReferenceFeedLeavesTheStripWithoutUsdExactlyAsTheBook() {
+        long now = System.currentTimeMillis();
+        var controller = usdcxPage(new FakeOracleClient(
+                usdcxEntry(now - 6_000_000L, now - 4_200_000L), collateralEntry(now)), USDCX_UNIT);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+        var prices = (LiquidationReadinessController.PriceStrip) model.getAttribute("prices");
+
+        assertNotNull(prices, "an oracle client is present, so the strip is");
+        assertEquals("no usable USDCx oracle price right now", book.usdUnavailableReason(),
+                "premise: the book has no usable reference feed");
+        assertEquals(book.usdUnavailableReason(), prices.usdUnavailableReason(),
+                "the strip gives the book's reason: one rate, so one answer");
+        assertEquals("ADA", prices.entries().get(0).label());
+        assertEquals("—", prices.entries().get(0).usdText(), "no USD per ADA from an expired reference");
+        assertTrue(prices.entries().stream().allMatch(e -> "—".equals(e.usdText())),
+                "and no USD cell anywhere on the strip: " + prices.entries());
+    }
+
+    /**
+     * ⛔ FAB-182 r2 (F3): a padded {@code LOANS_UI_USD_REFERENCE_UNIT} is trimmed once, where it enters the
+     * controller, so the book and the strip price the SAME unit — both priced, at the same rate. Untrimmed,
+     * the book's metadata lookup missed the padded unit and refused a figure the strip showed.
+     */
+    @Test
+    void aPaddedReferenceUnitIsOneUnitForTheBookAndTheStrip() {
+        long now = System.currentTimeMillis();
+        var controller = usdcxPage(new FakeOracleClient(
+                usdcxEntry(now - 60_000L, now + 1_800_000L), collateralEntry(now)), "  " + USDCX_UNIT + "  ");
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+        var prices = (LiquidationReadinessController.PriceStrip) model.getAttribute("prices");
+
+        assertNotNull(prices);
+        assertNull(book.usdUnavailableReason(), "the book is priced: " + book.usdUnavailableReason());
+        assertNull(prices.usdUnavailableReason(), "and so is the strip: " + prices.usdUnavailableReason());
+        assertEquals("0.666666", book.adaUsdRateDisplay().amountText());
+        assertEquals("USDCx", book.adaUsdRateDisplay().label(), "the book names the trimmed unit's token");
+        assertEquals("$0.6667", prices.entries().get(0).usdText(), "the strip, at the same rate");
+        assertEquals("USDCx", prices.usdReference(), "and the strip names the same token");
+    }
+
+    /**
+     * ⛔ FAB-182 r2: the page never fails because of the strip. An oracle client whose {@code entries()} throws
+     * leaves NO strip, and everything else — rows, book, its USD rate — renders as before.
+     */
+    @Test
+    void aRegistryThatThrowsLeavesNoStripAndThePageStillRenders() {
+        long now = System.currentTimeMillis();
+        var client = new FakeOracleClient(usdcxEntry(now - 60_000L, now + 1_800_000L), collateralEntry(now)) {
+            @Override
+            public java.util.Collection<OracleEntry> entries() {
+                throw new IllegalStateException("the registry exploded");
+            }
+        };
+        var controller = usdcxPage(client, USDCX_UNIT);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        String view = controller.readiness(model, null, null, null, null, null);
+        @SuppressWarnings("unchecked")
+        var rows = (List<LiquidationReadinessController.Row>) model.getAttribute("rows");
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+
+        assertEquals("readiness", view, "the page renders");
+        assertNull(model.getAttribute("prices"), "with no strip");
+        assertEquals(3, rows.size(), "the rows still render");
+        assertNotNull(book, "the book still renders");
+        assertNull(book.usdUnavailableReason(), "with its USD rate: the strip's failure is the strip's alone");
+    }
+
+    /**
+     * ⛔ FAB-182 r2: one token whose price cannot be computed (a POOLED feed — {@code price()} throws, as it does
+     * in finance.ak) is left out, and every other token still renders.
+     */
+    @Test
+    void aTokenWhosePriceThrowsIsLeftOutAndTheOthersRender() {
+        long now = System.currentTimeMillis();
+        AssetType pooled = new AssetType("ab".repeat(28), "504f4f4c");
+        OracleEntry pooledEntry = LoanFixtures.charli3(pooled, new AssetType("ac".repeat(28), "6f7261636c65"),
+                "11".repeat(28), new OraclePriceFeed(OraclePriceFeed.Variant.POOLED, pooled, BigInteger.ONE,
+                        BigInteger.ONE, now - 60_000L, now + 1_800_000L),
+                input("22"), input("33"), input("44"));
+        List<OracleEntry> registry = List.of(usdcxEntry(now - 60_000L, now + 1_800_000L), collateralEntry(now),
+                pooledEntry);
+        var client = new FakeOracleClient(registry.toArray(OracleEntry[]::new)) {
+            @Override
+            public java.util.Collection<OracleEntry> entries() {
+                return registry;
+            }
+        };
+        var controller = usdcxPage(client, USDCX_UNIT);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        var prices = (LiquidationReadinessController.PriceStrip) model.getAttribute("prices");
+
+        assertNotNull(prices, "one bad token does not take the strip down");
+        List<String> units = prices.entries().stream().map(LiquidationReadinessController.TokenPrice::unit).toList();
+        assertFalse(units.contains(pooled.toUnit()), "the token whose price throws is left out: " + units);
+        assertEquals(java.util.Set.of("lovelace", USDCX_UNIT, COLLATERAL_TOKEN.toUnit()), java.util.Set.copyOf(units),
+                "and every other token renders: " + units);
+        var usdcx = prices.entries().stream().filter(e -> USDCX_UNIT.equals(e.unit())).findFirst().orElseThrow();
+        assertEquals("1.5", usdcx.adaText(), "priced as usual");
+        assertEquals("$1", usdcx.usdText());
+        assertNull(prices.usdUnavailableReason());
+    }
+
     /**
      * ⛔ FAB-145 T2: paging does not affect the book. Thirty loans, twenty-eight on COLLATERAL_TOKEN; filtered
      * to it and rendered at page 2 (three rows), the book still holds all twenty-eight.
@@ -559,8 +719,9 @@ class LiquidationReadinessControllerTest {
             new AssetType("dd".repeat(28), "5553444d4f5241434c45");
 
     /** A stand-in whose {@code findEntry} answers from a fixed map — {@code findEntry} is public, so
-     * this is overridable across packages without touching {@code FluidOracleClient} at all. */
-    private static final class FakeOracleClient extends FluidOracleClient {
+     * this is overridable across packages without touching {@code FluidOracleClient} at all. Not final:
+     * the FAB-182 strip tests override {@code entries()} on it. */
+    private static class FakeOracleClient extends FluidOracleClient {
 
         private final java.util.Map<AssetType, OracleEntry> byToken;
 

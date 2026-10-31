@@ -260,11 +260,15 @@ public class LiquidationReadinessController {
      * feed the bot holds for it, plus ADA's own USD rate first. Display only: nothing decides on it.
      *
      * @param entries              the ADA entry, then one per distinct registry token, by label
+     * @param usdReference         the reference stablecoin's own label (USDCx, …), which the strip's caveat names
+     *                             so every view — the phone's included — says in words that USD is an estimate;
+     *                             null when no reference unit is configured
      * @param usdUnavailableReason why every USD cell is {@code —}; null when USD is available
      * @param serverNow            the render instant (epoch ms) every age is measured from, so the page's
      *                             script ticks from the server's clock and not the browser's
      */
-    public record PriceStrip(List<TokenPrice> entries, String usdUnavailableReason, long serverNow) {
+    public record PriceStrip(List<TokenPrice> entries, String usdReference, String usdUnavailableReason,
+                             long serverNow) {
     }
 
     /**
@@ -550,8 +554,9 @@ public class LiquidationReadinessController {
         model.addAttribute("walletDisplay", walletDisplay);
         // ⛔ FAB-182: ONE USD reference feed per render, shared by the prices strip and the book below — the
         // page shows one ADA/USD rate, never two.
-        Optional<OraclePriceFeed> usd = usdFeed(now);
-        model.addAttribute("prices", prices(usd, metadataMemo, now));
+        String usdUnit = usdReferenceUnit();
+        Optional<OraclePriceFeed> usd = usdFeed(usdUnit, now);
+        model.addAttribute("prices", prices(usd, usdUnit, metadataMemo, now));
         // ⚠ The SELECT options come from the loans actually present, never from a fixed list: an
         // option that matches nothing is a filter an operator can set and then wonder about.
         model.addAttribute("principals", all.stream().map(Row::principalUnit).distinct().sorted().toList());
@@ -575,7 +580,7 @@ public class LiquidationReadinessController {
         // ⛔ FAB-145: the book, from the FILTERED list and never the page, like the counts above. The USD
         // feed is resolved once per render; labels go through the same memo as the table's.
         model.addAttribute("book", summarise(arranged, (unit, amount) -> display(unit, amount, metadataMemo),
-                usd, usdReferenceUnit));
+                usd, usdUnit));
 
         int pages = Math.max(1, (arranged.size() + PAGE_SIZE - 1) / PAGE_SIZE);
         // ⚠ CLAMPED, not trusted. A stale ?page= from a bookmark, or one left behind when a filter
@@ -766,19 +771,28 @@ public class LiquidationReadinessController {
     }
 
     /**
+     * ⛔ The configured reference unit, trimmed ONCE, here, where it enters the controller — the book, the
+     * strip and the feed lookup all take it from this, so a padded {@code LOANS_UI_USD_REFERENCE_UNIT} cannot
+     * give the book one unit and the strip another (FAB-182 r2). Blank stays blank: USD turned off.
+     */
+    private String usdReferenceUnit() {
+        return usdReferenceUnit == null ? "" : usdReferenceUnit.trim();
+    }
+
+    /**
      * The reference stablecoin's feed — the page's one ADA/USD rate, for the book AND the prices strip —
      * loan-free at the highest usable version; empty when no reference unit is configured, no oracle client
      * is present, or the unit cannot be read. Never throws: a USD failure must not take the page down.
      */
-    private Optional<OraclePriceFeed> usdFeed(long now) {
+    private Optional<OraclePriceFeed> usdFeed(String usdUnit, long now) {
         FluidOracleClient client = oracleClient.getIfAvailable();
-        if (client == null || usdReferenceUnit == null || usdReferenceUnit.isBlank()) {
+        if (client == null || usdUnit == null || usdUnit.isBlank()) {
             return Optional.empty();
         }
         try {
-            return client.findFeed(AssetType.fromUnit(usdReferenceUnit.trim()), now);
+            return client.findFeed(AssetType.fromUnit(usdUnit), now);
         } catch (RuntimeException e) {
-            log.debug("the USD reference unit {} could not be priced: {}", usdReferenceUnit, e.toString());
+            log.debug("the USD reference unit {} could not be priced: {}", usdUnit, e.toString());
             return Optional.empty();
         }
     }
@@ -806,23 +820,26 @@ public class LiquidationReadinessController {
      * Falls back to the unit itself rather than failing the page.
      */
     private static String referenceLabel(BiFunction<String, BigInteger, AssetDisplay> display, String usdUnit) {
-        String unit = usdUnit.trim();
         try {
-            String label = display.apply(unit, BigInteger.ZERO).label();
-            return label == null || label.isBlank() ? unit : label;
+            String label = display.apply(usdUnit, BigInteger.ZERO).label();
+            return label == null || label.isBlank() ? usdUnit : label;
         } catch (RuntimeException e) {
-            return unit;
+            return usdUnit;
         }
     }
 
-    /** The strip for this render, or null when there is no oracle client or it could not be built. */
-    private PriceStrip prices(Optional<OraclePriceFeed> usd, Map<String, TokenMetadata> metadataMemo, long now) {
+    /**
+     * The strip for this render, or null when there is no oracle client or it could not be built. {@code usd}
+     * and {@code usdUnit} are the book's own — the page's one rate.
+     */
+    private PriceStrip prices(Optional<OraclePriceFeed> usd, String usdUnit, Map<String, TokenMetadata> metadataMemo,
+                              long now) {
         FluidOracleClient client = oracleClient.getIfAvailable();
         if (client == null) {
             return null;
         }
         try {
-            return priceStrip(client, unit -> metadata(unit, metadataMemo), usd, usdReferenceUnit, now);
+            return priceStrip(client, unit -> metadata(unit, metadataMemo), usd, usdUnit, now);
         } catch (RuntimeException e) {
             // ⚠ DEBUG: the strip is a convenience, and its absence is visible on the page itself.
             log.debug("the readiness prices strip could not be built: {}", e.toString());
@@ -865,7 +882,7 @@ public class LiquidationReadinessController {
         } else if (usdFeed.isEmpty()) {
             usdUnavailable = noUsdFeed(reference);
         } else {
-            TokenMetadata referenceMeta = metadataOf.apply(usdUnit.trim());
+            TokenMetadata referenceMeta = metadataOf.apply(usdUnit);
             if (!referenceMeta.hasDecimals()) {
                 usdUnavailable = usdNoDecimals(reference);
             } else {
@@ -922,7 +939,7 @@ public class LiquidationReadinessController {
                 log.debug("the prices strip left out {}: {}", labelled.getKey(), e.toString());
             }
         }
-        return new PriceStrip(List.copyOf(entries), usdUnavailable, now);
+        return new PriceStrip(List.copyOf(entries), reference, usdUnavailable, now);
     }
 
     /** ADA per {@code 10^decimals} base units: lovelace per base unit × 10^decimals ÷ 1,000,000. */
