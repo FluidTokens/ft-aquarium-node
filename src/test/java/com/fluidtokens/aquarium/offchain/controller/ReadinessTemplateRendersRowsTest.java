@@ -28,6 +28,7 @@ import java.util.regex.Pattern;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -422,7 +423,8 @@ class ReadinessTemplateRendersRowsTest {
 
     // ---- FAB-145 T2: the book above the filters ----------------------------------------------------
 
-    private static final String USDM_UNIT = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d";
+    // FAB-182: the configured reference is USDCx — the shipped default — so the book names USDCx.
+    private static final String USDCX_UNIT = "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378";
 
     /** The book element alone — never the CSS in {@code <style>}, which also says "book". */
     private static String book(String html) {
@@ -456,7 +458,7 @@ class ReadinessTemplateRendersRowsTest {
      */
     private static LiquidationReadinessController.BookSummary bookSummary(String tokenLabel, String usdReason) {
         var fldt = new TokenMetadata(FLDT_UNIT, tokenLabel, "FluidTokens", 6, TokenMetadata.Source.REGISTRY);
-        var usdm = new TokenMetadata(USDM_UNIT, "USDM", "USDM", 6, TokenMetadata.Source.REGISTRY);
+        var usdcx = new TokenMetadata(USDCX_UNIT, "USDCx", "USDCx", 6, TokenMetadata.Source.REGISTRY);
         var line = new LiquidationReadinessController.TokenTvl(FLDT_UNIT, 3,
                 AssetDisplay.of(BigInteger.valueOf(4_500_000L), fldt), BigInteger.valueOf(128_000_000L),
                 AssetDisplay.of(BigInteger.valueOf(128_000_000L), TokenMetadata.ada()), 1);
@@ -464,8 +466,8 @@ class ReadinessTemplateRendersRowsTest {
         return new LiquidationReadinessController.BookSummary(7, 2, 1, List.of(line),
                 BigInteger.valueOf(128_000_000L), 1,
                 AssetDisplay.of(BigInteger.valueOf(128_000_000L), TokenMetadata.ada()),
-                usd ? AssetDisplay.of(BigInteger.valueOf(85_333_333L), usdm) : null,
-                usd ? AssetDisplay.of(BigInteger.valueOf(666_666L), usdm) : null,
+                usd ? AssetDisplay.of(BigInteger.valueOf(85_333_333L), usdcx) : null,
+                usd ? AssetDisplay.of(BigInteger.valueOf(666_666L), usdcx) : null,
                 usdReason);
     }
 
@@ -509,7 +511,7 @@ class ReadinessTemplateRendersRowsTest {
         assertNotNull(usd, "the dollar figure renders as its own element: " + book);
         assertEquals("≈ $85.33 (estimated)", usd.text(), "the word 'estimated' is in the figure's own element");
         assertNotNull(usd.title(), "the dollar figure carries a tooltip: " + usd);
-        assertTrue(usd.title().contains("85.333333 USDM"), "the tooltip keeps the exact USDM amount: " + usd.title());
+        assertTrue(usd.title().contains("85.333333 USDCx"), "the tooltip keeps the exact USDCx amount: " + usd.title());
         assertTrue(usd.title().contains("estimate"), "the tooltip says it is an estimate: " + usd.title());
         assertTrue(usd.title().contains("not a quote"), "and not a quote: " + usd.title());
 
@@ -517,16 +519,16 @@ class ReadinessTemplateRendersRowsTest {
         assertNotNull(rate, "the rate line renders as its own element and names the method: " + book);
         String line = rate.text();
         assertTrue(line.contains("estimated"), "the rate line says estimated: " + line);
-        assertTrue(line.contains("ADA → USDM"), "the conversion's direction: " + line);
-        assertTrue(line.contains("USDM oracle"), "the price it uses: " + line);
+        assertTrue(line.contains("ADA → USDCx"), "the conversion's direction: " + line);
+        assertTrue(line.contains("USDCx oracle"), "the price it uses: " + line);
         assertTrue(line.contains("1 ADA ≈ $0.666666"), "the implied rate: " + line);
-        assertTrue(line.contains("counting 1 USDM as $1"), "the assumption that makes USDM dollars: " + line);
+        assertTrue(line.contains("counting 1 USDCx as $1"), "the assumption that makes USDCx dollars: " + line);
     }
 
     /** USD unavailable: the reason takes the figure's place, and no dollar figure renders at all. */
     @Test
     void anUnavailableUsdShowsItsReasonAndNoDollarFigure() {
-        String reason = "no usable USDM oracle price right now";
+        String reason = "no usable USDCx oracle price right now";
         String book = book(render(List.of(fullRow()), ctx -> ctx.setVariable("book", bookSummary("FLDT", reason))));
 
         assertNotNull(book);
@@ -1203,5 +1205,142 @@ class ReadinessTemplateRendersRowsTest {
         assertTrue(html.contains("rehearsing liquidations, submitting none"), "the shadow headline");
         assertFalse(html.contains("submitting nothing"), "the old headline claimed nothing is submitted");
         assertTrue(html.contains("read-only except the wallet-rebalance switch"), "the header's meta line");
+    }
+
+    // ---- FAB-182: the prices strip under the wallet ----------------------------------------------------
+
+    private static final long SERVER_NOW = 1_800_000_000_000L;
+
+    /**
+     * ADA, FLDT (live, 9m5s old) and USDCx (STALE, 1h2m old), with USD available — or every USD a dash and
+     * {@code usdReason} stated once.
+     */
+    private static LiquidationReadinessController.PriceStrip priceStrip(String usdReason) {
+        boolean usd = usdReason == null;
+        return new LiquidationReadinessController.PriceStrip(List.of(
+                new LiquidationReadinessController.TokenPrice("lovelace", "ADA", "", null,
+                        usd ? "$0.6667" : "—", false, false, null, null),
+                new LiquidationReadinessController.TokenPrice(FLDT_UNIT, "FLDT", FLDT_UNIT.substring(0, 56),
+                        "0.2345", usd ? "$0.1563" : "—", false, false, SERVER_NOW - 545_000L, "9m5s"),
+                new LiquidationReadinessController.TokenPrice(USDCX_UNIT, "USDCx", USDCX_UNIT.substring(0, 56),
+                        "1.5", usd ? "$1" : "—", false, true, SERVER_NOW - 3_720_000L, "1h2m")),
+                usdReason, SERVER_NOW);
+    }
+
+    /** The strip element alone — never the CSS in {@code <style>}, which also says "prices". */
+    private static String prices(String html) {
+        int start = html.indexOf("class=\"prices\"");
+        if (start < 0) {
+            return null;
+        }
+        return html.substring(start, html.indexOf("</div>", start));
+    }
+
+    private static int count(String haystack, String regex) {
+        Matcher m = Pattern.compile(regex).matcher(haystack);
+        int n = 0;
+        while (m.find()) {
+            n++;
+        }
+        return n;
+    }
+
+    /**
+     * ⛔ FAB-182: the strip renders directly after the wallet strip, one entry per token it is given, each
+     * with its ticker, ADA and USD price and age; the policy id is on hover and a stale entry says so.
+     */
+    @Test
+    void thePricesStripRendersAfterTheWalletWithOneEntryPerToken() {
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(null));
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        });
+
+        String strip = prices(html);
+        assertNotNull(strip, "a context with prices must render class=\"prices\"");
+        assertTrue(html.indexOf("class=\"wallet\"") < html.indexOf("class=\"prices\""), "after the wallet strip");
+        assertTrue(html.indexOf("class=\"prices\"") < html.indexOf("class=\"glance\""),
+                "directly after it: before the phone view and the book");
+        assertEquals(3, count(strip, "class=\"px(?: stale)?\""), "one entry per token: " + strip);
+        assertTrue(strip.contains(">FLDT<") && strip.contains(">0.2345 ADA<") && strip.contains(">$0.1563<"),
+                "ticker, ADA price and USD price: " + strip);
+        assertTrue(strip.contains("title=\"" + FLDT_UNIT.substring(0, 56) + "\""), "the policy id on hover");
+        assertTrue(strip.contains(">$0.6667<"), "the ADA entry's USD per ADA");
+        assertEquals(1, count(strip, "class=\"px stale\""), "the stale entry is marked: " + strip);
+        assertTrue(strip.contains("title=\"no price usable right now — showing the last one held\""),
+                "and says why on hover: " + strip);
+        assertFalse(strip.contains("USD unavailable"), "no reason beside live USD figures");
+        assertFalse(html.matches("(?s).*max-width: 700px\\)[^}]*\\.prices.*"),
+                "the strip is not hidden on the phone view");
+    }
+
+    /**
+     * Every age span carries its feed's validFrom and the strip carries the server's render instant, so the
+     * script ticks the age from the server's clock; the server-rendered age stands without JavaScript.
+     */
+    @Test
+    void eachAgeCarriesValidFromAndTheStripCarriesTheServerNow() {
+        String strip = prices(render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(null))));
+        assertNotNull(strip);
+
+        assertTrue(strip.contains("data-server-now=\"" + SERVER_NOW + "\""), "the render instant: " + strip);
+        assertTrue(strip.contains("data-valid-from=\"" + (SERVER_NOW - 545_000L) + "\">9m5s<"),
+                "FLDT's age span carries its validFrom and its server-rendered age: " + strip);
+        assertTrue(strip.contains("data-valid-from=\"" + (SERVER_NOW - 3_720_000L) + "\">1h2m<"), strip);
+        assertEquals(2, count(strip, "data-valid-from="), "every age span, and only those (ADA has no age)");
+    }
+
+    /** The script that ticks the ages reads the server's instant and makes no request. */
+    @Test
+    void theAgeTickerRunsFromTheServersInstantWithoutAnyRequest() {
+        String html = render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(null)));
+        String script = html.substring(html.lastIndexOf("<script>"), html.lastIndexOf("</script>"));
+
+        assertTrue(script.contains("getAttribute('data-server-now')"), "measured from the server's render instant");
+        assertTrue(script.contains("serverNow + (Date.now() - loadedAt)"), "plus the time since this page loaded");
+        assertTrue(script.contains("getAttribute('data-valid-from')"), "minus each feed's validFrom");
+        assertFalse(script.contains("fetch(") || script.contains("XMLHttpRequest"), "no HTTP call");
+    }
+
+    /** Lending off: no oracle client, no strip — and the page still renders. */
+    @Test
+    void withoutAnOracleClientNoStripRendersAndThePageStillDoes() {
+        String html = render(List.of(fullRow()));
+
+        assertNull(prices(html), "no prices in the model: no strip element");
+        assertTrue(html.contains(".prices"), "fixture premise: the stylesheet does mention the strip");
+        assertTrue(html.contains("class=\"wallet\"") && html.contains("</table>"), "the rest of the page renders");
+    }
+
+    /** USD unavailable: every USD cell is a dash and the reason is stated once, in the book's words. */
+    @Test
+    void anUnavailableUsdRateDashesEveryCellAndStatesTheReasonOnce() {
+        String reason = "no usable USDCx oracle price right now";
+        String strip = prices(render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(reason))));
+        assertNotNull(strip);
+
+        assertEquals(3, count(strip, ">—<"), "every USD cell, the ADA entry's included: " + strip);
+        assertEquals(1, count(strip, "USD unavailable: " + Pattern.quote(reason)), "the reason, once: " + strip);
+        assertFalse(strip.contains("$"), "no dollar figure at all: " + strip);
+    }
+
+    /**
+     * ⛔ FAB-182: one rate, USDCx. With USDCx configured, the book's USD wording names USDCx — in the figure's
+     * tooltip and on the rate line — and nothing on the rendered page says USDM.
+     */
+    @Test
+    void theBookNamesTheConfiguredReferenceAndNothingSaysUsdm() {
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(null));
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        });
+        String book = book(html);
+        assertNotNull(book);
+
+        assertTrue(span(book, "≈ $").title().contains("USDCx oracle price"), "the tooltip names USDCx: " + book);
+        assertTrue(span(book, "estimated from ").text()
+                        .contains("ADA → USDCx at the USDCx oracle price (1 ADA ≈ $0.666666), counting 1 USDCx as $1"),
+                "the rate line names USDCx: " + book);
+        assertFalse(html.contains("USDM"), "no rendered text says USDM when USDCx is the configured reference");
     }
 }

@@ -166,6 +166,19 @@
     .wallet .bal { font-variant-numeric:tabular-nums; }
     .wallet-age { margin-left:auto; font-size:.7rem; color:var(--muted); }
 
+    /* ---- FAB-182: token prices, under the wallet and in its style ------------------------------- */
+    /* Visible on the phone view too, and wrapping: every entry may break onto its own line at 360px. */
+    .prices { display:flex; flex-wrap:wrap; align-items:baseline; gap:.35rem .9rem; margin:-.4rem 0 .8rem;
+              padding:.45rem .7rem; border:1px solid var(--rule); border-radius:8px;
+              background:var(--surface); font-size:.78rem; max-width:100%; }
+    .prices .px { display:inline-flex; flex-wrap:wrap; align-items:baseline; gap:0 .4em; min-width:0;
+                  font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+    .prices .px .ticker { margin-left:0; }
+    .prices .px-usd { color:var(--ink-2); }
+    .prices .px-age { color:var(--muted); font-size:.7rem; }
+    .prices .px.stale { opacity:.55; cursor:help; }
+    .prices .px-reason { font-size:.7rem; color:var(--muted); }
+
     /* ---- the book: counts and collateral locked, above the filters ---------------------------- */
     .book { margin:0 0 .9rem; padding:.6rem .8rem; border:1px solid var(--rule); border-radius:8px;
             background:var(--surface); font-size:.82rem; }
@@ -344,6 +357,29 @@
           th:text="|as of ${walletAgeSeconds}s ago|">as of</span>
   </div>
 
+  <!--/* ⛔ FAB-182: TOKEN PRICES, from the same oracle client the bot prices with. Ticker, ADA per whole token,
+         USD, and the feed's AGE — which the script below ticks every second from the server's render instant
+         (data-server-now), never the browser's clock alone. No validity column: at ~9 minutes old a fresh
+         price is about to land, and the age says so. A muted entry has no feed usable now and shows the
+         last one held. USD is the book's one rate, through the reference stablecoin counted as $1. */-->
+  <th:block th:unless="${disabledReason}">
+  <div class="prices" th:if="${prices != null}" th:attr="data-server-now=${prices.serverNow}">
+    <span class="wallet-label">prices</span>
+    <span class="px" th:each="p : ${prices.entries}" th:classappend="${p.stale} ? 'stale'"
+          th:title="${p.stale} ? 'no price usable right now — showing the last one held' : null">
+      <span class="ticker" th:text="${p.label}" th:title="${p.policyId}">TKR</span>
+      <span th:if="${p.adaText != null}" th:text="|${p.adaText} ADA|">0 ADA</span>
+      <span th:if="${p.metadataUnknown}" class="nometa"
+            th:title="|no metadata for ${p.unit} — priced per raw, unscaled base unit|">&#10071;</span>
+      <span class="px-usd" th:text="${p.usdText}">$0</span>
+      <span class="px-age" th:if="${p.validFrom != null}" th:attr="data-valid-from=${p.validFrom}"
+            th:text="${p.ageText}">0m0s</span>
+    </span>
+    <span class="px-reason" th:if="${prices.usdUnavailableReason != null}"
+          th:text="|USD unavailable: ${prices.usdUnavailableReason}|">USD unavailable</span>
+  </div>
+  </th:block>
+
   <!-- ⛔ THE PHONE VIEW. Visible only under 700px, where the table is hidden entirely. It answers one
        question — is anything happening that needs me — and then tells you where to go. Deliberately
        NOT a reflowed table: a dense economics grid on a phone is unreadable, and acting on it from a
@@ -364,8 +400,9 @@
 
   <!-- ⛔ FAB-145: THE BOOK, on the desktop view only (the phone has the glance above). Computed from the
        FILTERED list, never the page. TVL is the COLLATERAL locked in live loans, not debt, valued at each
-       loan's own collateral oracle. USD is an ESTIMATE, never a quote: the ADA total converted at the USDM
-       oracle price, counting 1 USDM as $1 — and the figure and the line beside it say so in words. A loan
+       loan's own collateral oracle. USD is an ESTIMATE, never a quote: the ADA total converted at the
+       reference stablecoin's oracle price, counting 1 of it as $1 — and the figure and the line beside it say
+       so in words, naming the token by its own label (FAB-182: never a hard-coded ticker). A loan
        whose collateral has no usable price stays in its token's amount, is left out of every value, and is
        counted. -->
   <div class="book" th:if="${book != null}">
@@ -398,10 +435,11 @@
             th:text="|≈ ${book.totalAdaDisplay.amountText} ADA|">≈ 0 ADA</span>
       <span th:if="${book.totalAdaDisplay == null}" class="unknown">ADA total unknown</span>
       <span th:if="${book.usdDisplay != null}"
-            th:title="|exact: ${book.usdDisplay.exactText} USDM. An estimate, not a quote: the ADA total converted at the USDM oracle price.|"
+            th:title="|exact: ${book.usdDisplay.exactText} ${book.usdDisplay.label}. An estimate, not a quote: the ADA total converted at the ${book.usdDisplay.label} oracle price.|"
             th:text="'≈ $' + ${book.usdDisplay.amountText} + ' (estimated)'">≈ $0 (estimated)</span>
       <span th:if="${book.adaUsdRateDisplay != null}" class="reason"
-            th:text="'estimated from ADA → USDM at the USDM oracle price (1 ADA ≈ $' + ${book.adaUsdRateDisplay.amountText} + '), counting 1 USDM as $1'">estimated from ADA → USDM at the USDM oracle price (1 ADA ≈ $0), counting 1 USDM as $1</span>
+            th:with="ref=${book.adaUsdRateDisplay.label}"
+            th:text="'estimated from ADA → ' + ${ref} + ' at the ' + ${ref} + ' oracle price (1 ADA ≈ $' + ${book.adaUsdRateDisplay.amountText} + '), counting 1 ' + ${ref} + ' as $1'">estimated from ADA at the reference oracle price</span>
       <span th:if="${book.usdDisplay == null}" class="reason"
             th:text="|USD unavailable: ${book.usdUnavailableReason}|">USD unavailable</span>
     </div>
@@ -703,6 +741,28 @@
       if (box.checked) { start(); } else { stop(); }
     });
     if (box.checked) { start(); } else { stop(); }
+  })();
+
+  // FAB-182: the prices strip's ages count up every second, auto-refresh on or off. Measured from the
+  // server's render instant plus the time since this page loaded, never the browser's clock alone, so a
+  // skewed laptop clock cannot move an age. No HTTP call: the prices themselves change only on a reload.
+  (function () {
+    var strip = document.querySelector('.prices[data-server-now]');
+    if (!strip) { return; }
+    var serverNow = Number(strip.getAttribute('data-server-now'));
+    var loadedAt = Date.now();
+    var ages = strip.querySelectorAll('[data-valid-from]');
+    function format(ms) {
+      var s = Math.floor(Math.max(0, ms) / 1000);
+      return s < 3600 ? Math.floor(s / 60) + 'm' + (s % 60) + 's'
+                      : Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm';
+    }
+    window.setInterval(function () {
+      var now = serverNow + (Date.now() - loadedAt);
+      for (var i = 0; i < ages.length; i++) {
+        ages[i].textContent = format(now - Number(ages[i].getAttribute('data-valid-from')));
+      }
+    }, 1000);
   })();
 </script>
 </body>

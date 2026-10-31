@@ -50,6 +50,16 @@ The same release turns on Yaci's UTxO pruning (`store.utxo.pruning-enabled: true
 `store.utxo.pruning-interval: 600`): every 10 minutes it deletes rows for outputs spent more than
 2160 blocks ago. Unspent outputs are never pruned. Nothing for you to set.
 
+### 1.2 The readiness page's USD now goes through USDCx, not USDM (FAB-182)
+
+The default of `LOANS_UI_USD_REFERENCE_UNIT` moved from USDM to **USDCx**
+(`1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378`). It is the page's one ADA/USD
+rate — the summary's USD figure and the new prices strip — so after upgrading, the USD figures you see
+are priced through USDCx and the page says so by name. Display only: nothing the bot decides reads it,
+and the database is untouched. To keep USDM, set
+`LOANS_UI_USD_REFERENCE_UNIT=c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d`
+and restart.
+
 ---
 
 ## 2. The ordinary upgrade

@@ -416,6 +416,65 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
+     * ⛔ FAB-182: ONE ADA/USD rate per page. Through the real {@code readiness()} path the book and the prices
+     * strip are priced from the same reference feed — USDCx at 3/2 lovelace per base unit, 6 decimals, so
+     * 1 USDCx = 1.5 ADA and 1 ADA = $0.6666… (the book floors it to 0.666666 USDCx, the strip shows $0.6667) —
+     * and without it they give the same reason, naming USDCx.
+     */
+    @Test
+    void theBookAndThePricesStripShareOneUsdRate() {
+        String usdcxUnit = "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378";
+        AssetType usdcx = AssetType.fromUnit(usdcxUnit);
+        long now = System.currentTimeMillis();
+        var controller = pageController(pageIndex().resolver(), syncing(false),
+                COLLATERAL_TOKEN, FLDT, PRINCIPAL_TOKEN);
+        // The reference, and COLLATERAL_TOKEN 1:1 so the book has a priced total to convert.
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "oracleClient",
+                provide(new FakeOracleClient(LoanFixtures.charli3(usdcx, new AssetType("ee".repeat(28), "55534443"),
+                        "11".repeat(28), OraclePriceFeed.priceDataCharlie(usdcx, BigInteger.valueOf(3),
+                                BigInteger.TWO, now - 60_000L, now + 1_800_000L),
+                        input("22"), input("33"), input("44")),
+                        LoanFixtures.charli3(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT, "11".repeat(28),
+                                OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.ONE, BigInteger.ONE,
+                                        now - 60_000L, now + 1_800_000L),
+                                input("22"), input("33"), input("44")))));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "tokenMetadata",
+                provide(new com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService(null, null,
+                        java.time.Clock.systemUTC()) {
+                    @Override
+                    public TokenMetadata lookup(String unit) {
+                        return usdcxUnit.equals(unit)
+                                ? new TokenMetadata(unit, "USDCx", "USDCx", 6, TokenMetadata.Source.REGISTRY)
+                                : "lovelace".equals(unit) ? TokenMetadata.ada() : TokenMetadata.unknown(unit);
+                    }
+                }));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "usdReferenceUnit", usdcxUnit);
+
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+        var book = (LiquidationReadinessController.BookSummary) model.getAttribute("book");
+        var prices = (LiquidationReadinessController.PriceStrip) model.getAttribute("prices");
+
+        assertNotNull(prices, "an oracle client is present, so the strip is");
+        assertNull(book.usdUnavailableReason(), "the book has its USD rate");
+        assertNull(prices.usdUnavailableReason(), "and so does the strip");
+        assertEquals("0.666666", book.adaUsdRateDisplay().amountText());
+        assertEquals("USDCx", book.adaUsdRateDisplay().label(), "the book names the reference by its label");
+        assertEquals("ADA", prices.entries().get(0).label(), "ADA first");
+        assertEquals("$0.6667", prices.entries().get(0).usdText(), "the same rate, from the same feed");
+
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "oracleClient",
+                provide(new FakeOracleClient()));
+        var without = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(without, null, null, null, null, null);
+        var bookWithout = (LiquidationReadinessController.BookSummary) without.getAttribute("book");
+        var pricesWithout = (LiquidationReadinessController.PriceStrip) without.getAttribute("prices");
+        assertEquals("no usable USDCx oracle price right now", bookWithout.usdUnavailableReason());
+        assertEquals(bookWithout.usdUnavailableReason(), pricesWithout.usdUnavailableReason(),
+                "one rate, so one reason when it is missing");
+    }
+
+    /**
      * ⛔ FAB-145 T2: paging does not affect the book. Thirty loans, twenty-eight on COLLATERAL_TOKEN; filtered
      * to it and rendered at page 2 (three rows), the book still holds all twenty-eight.
      */
