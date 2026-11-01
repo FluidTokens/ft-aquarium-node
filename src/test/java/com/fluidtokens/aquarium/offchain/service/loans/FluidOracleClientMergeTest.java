@@ -41,15 +41,16 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * FAB-183: {@link FluidOracleClient}'s one merged, NFT-keyed snapshot, written by the API's {@code load} and by the
  * stream's {@code mergeStreamPush} / {@code streamConnected}.
  *
- * <p>Per NFT a strictly newer {@code validFrom} wins from either source and an equal one keeps the held entry
- * (Giovanni A1, 2026-10-31); an NFT stays held only while the API's last load or a CONNECTED stream's last push lists
- * it; the change listener is told once per changing write; the load listener still hears the API's own entries; and
+ * <p>Per NFT a strictly newer {@code validFrom} wins from either source, an equal one with different content replaces
+ * the held entry (a republication) and an identical one changes nothing, and an older one never wins (Giovanni A1,
+ * 2026-10-31); an NFT stays held only while the API's last load or a CONNECTED stream's last push lists it; the change listener is told once per changing write; the load listener still hears the API's own entries; and
  * two writers racing never lose an update or publish a torn snapshot.
  */
 class FluidOracleClientMergeTest {
@@ -60,6 +61,9 @@ class FluidOracleClientMergeTest {
     private static final long T0 = 1_793_000_000_000L;
     /** A 50-minute window, inside the protocol's 60-minute maximum, so every feed here is usable at {@code T0 + 1}. */
     private static final long WINDOW_MS = 3_000_000L;
+    /** The oracle UTxO an entry names, before and after a republication. */
+    private static final String REF_FIRST = "cc".repeat(32) + "#0";
+    private static final String REF_SECOND = "ee".repeat(32) + "#1";
 
     private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
     private Logger logger;
@@ -85,7 +89,7 @@ class FluidOracleClientMergeTest {
     // ======================================================================================
 
     @Test
-    void aNewerValidFromWinsFromEitherSourceAnEqualOneKeepsTheHeldEntryAndAnOlderOneIsIgnored() {
+    void aNewerValidFromWinsFromEitherSourceAnEqualOneWithDifferentContentReplacesItAndAnOlderOneIsIgnored() {
         var client = client();
         client.streamConnected(true);
         AssetType a = nft("A");
@@ -100,16 +104,16 @@ class FluidOracleClientMergeTest {
         assertHeld(client, a, T0 + 200, 20, "an older API entry is ignored");
 
         client.load(payload(entry("TOK", "A", 1, T0 + 200, 40)));
-        assertHeld(client, a, T0 + 200, 20, "an EQUAL API entry keeps the held one");
+        assertHeld(client, a, T0 + 200, 40, "an EQUAL API entry with different content replaces the held one");
 
         client.load(payload(entry("TOK", "A", 1, T0 + 300, 50)));
         assertHeld(client, a, T0 + 300, 50, "a newer API entry wins");
 
         client.mergeStreamPush(parsed(entry("TOK", "A", 1, T0 + 300, 60)), Instant.now());
-        assertHeld(client, a, T0 + 300, 50, "an EQUAL push keeps the held one");
+        assertHeld(client, a, T0 + 300, 60, "an EQUAL push with different content replaces the held one");
 
         client.mergeStreamPush(parsed(entry("TOK", "A", 1, T0 + 250, 70)), Instant.now());
-        assertHeld(client, a, T0 + 300, 50, "an older push is ignored");
+        assertHeld(client, a, T0 + 300, 60, "an older push is ignored");
         assertEquals(1, client.entries().size());
     }
 
@@ -190,12 +194,14 @@ class FluidOracleClientMergeTest {
     }
 
     /**
-     * Today's replace-on-load, reproduced: with no push ever merged and per-NFT {@code validFrom} never
-     * decreasing, every lookup after each load answers exactly what a client that loaded ONLY that payload
-     * answers — an NFT the payload leaves out included. Real registry snapshots, then synthetic ones.
+     * Today's replace-on-load, reproduced for loads that repeat IDENTICAL content at an equal {@code validFrom}: with
+     * no push ever merged and per-NFT {@code validFrom} never decreasing, every lookup after each load answers exactly
+     * what a client that loaded ONLY that payload answers — an NFT the payload leaves out included. Real registry
+     * snapshots, then synthetic ones. Equal {@code validFrom} with DIFFERENT content is
+     * {@link #apiOnlyAnEqualValidFromWithADifferentReferenceInputAndPriceReplacesExactlyAsReplaceOnLoad}.
      */
     @Test
-    void apiOnlyLoadsWithNonDecreasingValidFromReproduceTodaysReplaceSemantics() throws Exception {
+    void apiOnlyLoadsRepeatingIdenticalContentAtAnEqualValidFromReproduceTodaysReplaceSemantics() throws Exception {
         List<JsonNode> payloads = new ArrayList<>(List.of(
                 FluidOracleClientLoadPinTest.resource("/loans-v4/oracle-ws/preview-api-20261029T130505Z.json"),
                 FluidOracleClientLoadPinTest.resource("/loans-v4/oracle-ws/preview-api-20261029T130525Z.json"),
@@ -215,6 +221,109 @@ class FluidOracleClientMergeTest {
             assertSameAnswers(replaced, merged, "after payload " + i);
         }
         assertEquals(Set.of(nft("A"), nft("B")), nfts(merged), "fixture: NFTs did disappear on the way");
+    }
+
+    // ======================================================================================
+    // An equal validFrom: a republication replaces, an identical repeat changes nothing (r2)
+    // ======================================================================================
+
+    /**
+     * FluidTokens have changed an entry's content ({@code oracleVersion}, potentially the reference input) without
+     * moving its {@code validFrom}. API-only, the second load must then answer exactly as a client that loaded ONLY
+     * the second payload: the oracle UTxO a build names is the republished one, never the superseded one.
+     */
+    @Test
+    void apiOnlyAnEqualValidFromWithADifferentReferenceInputAndPriceReplacesExactlyAsReplaceOnLoad() {
+        JsonNode first = payload(entry("TOK", "TOKv1", 1, T0, 10, REF_FIRST), entry("TOK", "TOKv2", 2, T0, 10, REF_FIRST),
+                entry("TB", "B", 1, T0, 7, REF_FIRST));
+        JsonNode second = payload(entry("TOK", "TOKv1", 1, T0, 20, REF_SECOND),
+                entry("TOK", "TOKv2", 2, T0, 30, REF_SECOND), entry("TB", "B", 1, T0, 7, REF_FIRST));
+        var merged = client();
+        merged.load(first);
+
+        merged.load(second);
+
+        var replaced = client();
+        replaced.load(second);
+        assertSameAnswers(replaced, merged, "after the republication");
+        AssetType token = token("TOK");
+        for (AssetType nft : List.of(nft("TOKv1"), nft("TOKv2"), nft("B"))) {
+            assertEquals(replaced.findEntryByOracleToken(nft), merged.findEntryByOracleToken(nft), "findEntryByOracleToken");
+        }
+        assertEquals(replaced.snapshot().versionsByToken().get(token), merged.snapshot().versionsByToken().get(token),
+                "versions of TOK");
+        assertEquals(REF_SECOND, ref(merged.findEntryByOracleToken(nft("TOKv1")).orElseThrow()), "v1's new UTxO");
+        assertEquals(REF_SECOND, ref(merged.findEntryByOracleToken(nft("TOKv2")).orElseThrow()), "v2's new UTxO");
+        assertEquals(BigInteger.valueOf(20), price(merged.findFeedForLeg(token, nft("TOKv1"), T0 + 1)), "v1's new price");
+        assertEquals(BigInteger.valueOf(30), price(merged.findFeedForLeg(token, nft("TOKv2"), T0 + 1)), "v2's new price");
+        assertEquals(BigInteger.valueOf(30), merged.findEntry(token).orElseThrow().feed().priceInLovelaces(),
+                "LOAN-FREE: the highest version's new price");
+    }
+
+    /** The same republication from the stream replaces the API's entry, and is told as one STREAM change. */
+    @Test
+    void aStreamPushAtAnEqualValidFromWithDifferentContentReplacesTheApisEntry() {
+        var client = client();
+        client.streamConnected(true);
+        AssetType a = nft("A");
+        client.load(payload(entry("TA", "A", 1, T0, 10, REF_FIRST), entry("TB", "B", 1, T0, 5, REF_FIRST)));
+        OracleEntry untouched = client.findEntryByOracleToken(nft("B")).orElseThrow();
+        List<String> told = new CopyOnWriteArrayList<>();
+        client.addChangeListener((source, changed, connected) -> told.add(source + " " + units(changed)));
+
+        List<OracleEntry> push = parsed(entry("TA", "A", 1, T0, 20, REF_SECOND), entry("TB", "B", 1, T0, 5, REF_FIRST));
+        client.mergeStreamPush(push, Instant.now());
+
+        assertEquals(push.getFirst(), client.findEntryByOracleToken(a).orElseThrow(), "the push's entry is held");
+        assertEquals(REF_SECOND, ref(client.findEntryByOracleToken(a).orElseThrow()));
+        assertHeld(client, a, T0, 20, "the stream's republication");
+        assertSame(untouched, client.findEntryByOracleToken(nft("B")).orElseThrow(), "an identical entry stays as held");
+        assertEquals(List.of("STREAM " + a.toUnit()), told, "one change, the republished NFT only");
+    }
+
+    /**
+     * An equal {@code validFrom} with IDENTICAL content, from either source, changes nothing: the held entry is the
+     * very instance first held, and no listener is told.
+     */
+    @Test
+    void anEqualValidFromWithIdenticalContentFromEitherSourceChangesNothingAndTellsNoOne() {
+        var client = client();
+        client.streamConnected(true);
+        AssetType a = nft("A");
+        client.load(payload(entry("TA", "A", 1, T0, 10, REF_FIRST)));
+        OracleEntry held = client.findEntryByOracleToken(a).orElseThrow();
+        List<String> told = new CopyOnWriteArrayList<>();
+        client.addChangeListener((source, changed, connected) -> told.add(source + " " + units(changed)));
+
+        client.load(payload(entry("TA", "A", 1, T0, 10, REF_FIRST)));
+        assertSame(held, client.findEntryByOracleToken(a).orElseThrow(), "an identical API entry replaces nothing");
+        client.mergeStreamPush(parsed(entry("TA", "A", 1, T0, 10, REF_FIRST)), Instant.now());
+        assertSame(held, client.findEntryByOracleToken(a).orElseThrow(), "an identical push replaces nothing");
+        client.load(payload(entry("TA", "A", 1, T0, 10, REF_FIRST)));
+
+        assertSame(held, client.findEntryByOracleToken(a).orElseThrow(), "still the entry first held");
+        assertEquals(List.of(), told, "no write changed anything");
+    }
+
+    /** An older {@code validFrom} never replaces, whatever its content and whichever source it came from. */
+    @Test
+    void anOlderValidFromWithDifferentContentNeverReplacesFromEitherSource() {
+        var client = client();
+        client.streamConnected(true);
+        AssetType a = nft("A");
+        client.load(payload(entry("TA", "A", 1, T0 + 100, 10, REF_FIRST)));
+        OracleEntry held = client.findEntryByOracleToken(a).orElseThrow();
+        List<String> told = new CopyOnWriteArrayList<>();
+        client.addChangeListener((source, changed, connected) -> told.add(source + " " + units(changed)));
+
+        client.mergeStreamPush(parsed(entry("TA", "A", 2, T0 + 99, 20, REF_SECOND)), Instant.now());
+        assertSame(held, client.findEntryByOracleToken(a).orElseThrow(), "an older push");
+        client.load(payload(entry("TA", "A", 2, T0 + 50, 30, REF_SECOND)));
+        assertSame(held, client.findEntryByOracleToken(a).orElseThrow(), "an older API entry");
+
+        assertHeld(client, a, T0 + 100, 10, "the newest entry stays");
+        assertEquals(REF_FIRST, ref(client.findEntryByOracleToken(a).orElseThrow()));
+        assertEquals(List.of(), told, "nothing changed");
     }
 
     // ======================================================================================
@@ -482,6 +591,11 @@ class FluidOracleClientMergeTest {
         return nfts.stream().map(AssetType::toUnit).sorted().collect(Collectors.joining(","));
     }
 
+    /** An entry's oracle UTxO as the registry spells it, {@code txhash#index}. */
+    private static String ref(OracleEntry entry) {
+        return entry.referenceInput().getTransactionId() + "#" + entry.referenceInput().getIndex();
+    }
+
     private static BigInteger price(Optional<OraclePriceFeed> feed) {
         return feed.orElseThrow(() -> new AssertionError("no feed")).priceInLovelaces();
     }
@@ -500,6 +614,12 @@ class FluidOracleClientMergeTest {
 
     /** One active multisig registry entry, priced {@code price}/1000000, valid for 50 minutes from {@code validFrom}. */
     private static ObjectNode entry(String token, String nft, Integer oracleVersion, long validFrom, long price) {
+        return entry(token, nft, oracleVersion, validFrom, price, REF_FIRST);
+    }
+
+    /** As {@link #entry(String, String, Integer, long, long)}, its oracle UTxO at {@code referenceInput}. */
+    private static ObjectNode entry(String token, String nft, Integer oracleVersion, long validFrom, long price,
+                                    String referenceInput) {
         ObjectNode node = JSON.createObjectNode();
         node.put("active", true);
         node.put("preferredOracle", "multisig");
@@ -509,7 +629,7 @@ class FluidOracleClientMergeTest {
         node.putObject("token").put("policyId", TOKEN_POLICY).put("assetName", hex(token));
         node.putObject("fluidOracle").put("policyId", NFT_POLICY).put("assetName", hex(nft))
                 .put("rewardAddress", "")
-                .put("referenceInput", "cc".repeat(32) + "#0")
+                .put("referenceInput", referenceInput)
                 .put("referenceScript", "dd".repeat(32) + "#0");
         node.putObject("supportedOracle").putObject("multisig")
                 .put("tokenPriceInLovelaces", price)

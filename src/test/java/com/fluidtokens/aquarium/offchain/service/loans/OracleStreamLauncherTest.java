@@ -1000,6 +1000,77 @@ class OracleStreamLauncherTest {
         assertEquals(0.0, missedCount(registry, "connected"));
     }
 
+    /**
+     * {@code source=stream}: the server ENDS a connected session whose last push listed an NFT the API does not. The
+     * launcher forwards that close to the prices, so the stream-only NFT is dropped and the prices report the stream
+     * disconnected. Reconnects are slowed so the next session cannot reopen it before the assertions.
+     */
+    @Test
+    void sourceStreamAServerCloseDropsTheStreamOnlyNftAndThePricesReportDisconnected() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        FluidOracleClient oracle = new FluidOracleClient("http://unused.invalid");
+        AssetType streamOnly = withoutTheFirstEntryLoaded(oracle);
+        launcher = new OracleStreamLauncher(account, network("preview"), present(oracle), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.useForTest(slowReconnects(), Clock.systemUTC());
+        launcher.start();
+        OracleStreamTestServer.Session session = server.awaitSession(0, WAIT);
+        await(() -> oracle.snapshot().streamConnected(), WAIT, "the prices hear the open");
+        session.sendText(resource(PREVIEW_PUSH));
+        await(() -> oracle.findEntryByOracleToken(streamOnly).isPresent(), WAIT, "the push holds the stream-only NFT");
+        assertEquals(5, oracle.entries().size(), "fixture: the API's 4 and the stream's own");
+
+        session.close(1000);
+
+        await(() -> !oracle.snapshot().streamConnected(), WAIT, "the prices hear the close");
+        assertTrue(oracle.findEntryByOracleToken(streamOnly).isEmpty(), "the stream-only NFT is dropped");
+        assertEquals(4, oracle.entries().size(), "the API's entries stay");
+        assertEquals(Set.of(), oracle.snapshot().streamNfts());
+        assertEquals(1, server.requests(), "fixture: no reconnect reopened the stream");
+    }
+
+    /**
+     * {@code source=stream}: {@code stop()} — the client says no onClose for its own shutdown — tells the prices the
+     * stream is disconnected, so the stream-only NFT is dropped at once.
+     */
+    @Test
+    void sourceStreamStopDropsTheStreamOnlyNftAndThePricesReportDisconnected() throws Exception {
+        server = new OracleStreamTestServer().authorize(account.stakeAddress()).start();
+        FluidOracleClient oracle = new FluidOracleClient("http://unused.invalid");
+        AssetType streamOnly = withoutTheFirstEntryLoaded(oracle);
+        launcher = new OracleStreamLauncher(account, network("preview"), present(oracle), staker(), meters(), "true",
+                server.uri().toString());
+        launcher.start();
+        server.awaitSession(0, WAIT).sendText(resource(PREVIEW_PUSH));
+        await(() -> oracle.findEntryByOracleToken(streamOnly).isPresent(), WAIT, "the push holds the stream-only NFT");
+        assertTrue(oracle.snapshot().streamConnected(), "fixture: connected");
+
+        launcher.stop();
+
+        assertFalse(oracle.snapshot().streamConnected(), "the prices report the stream disconnected");
+        assertTrue(oracle.findEntryByOracleToken(streamOnly).isEmpty(), "the stream-only NFT is dropped");
+        assertEquals(4, oracle.entries().size(), "the API's entries stay");
+    }
+
+    /** Loads the preview API snapshot WITHOUT its first entry into {@code oracle}; returns that entry's NFT. */
+    private static AssetType withoutTheFirstEntryLoaded(FluidOracleClient oracle) throws IOException {
+        com.fasterxml.jackson.databind.node.ArrayNode api =
+                (com.fasterxml.jackson.databind.node.ArrayNode) new ObjectMapper().readTree(resource(PREVIEW_API));
+        AssetType first = firstNft(api);
+        api.remove(0);
+        oracle.load(api);
+        assertEquals(4, oracle.entries().size(), "fixture: the preview snapshot less one");
+        assertTrue(oracle.findEntryByOracleToken(first).isEmpty(), "fixture: the API does not list it");
+        return first;
+    }
+
+    /** Production timings with every retry delay ×1000: a closed session is not reopened within a test. */
+    private static OracleStreamClient.Timings slowReconnects() {
+        OracleStreamClient.Timings production = OracleStreamClient.Timings.PRODUCTION;
+        return new OracleStreamClient.Timings(production.tcpConnectTimeout(), production.handshakeTimeout(),
+                production.pingInterval(), production.pongTimeout(), production.proactiveReconnectAfter(), 1000);
+    }
+
     /** An unrecognised {@code loans.oracle.source} is API — the stream drives nothing — with one WARN. */
     @Test
     void anUnrecognisedSourceIsApiWithOneWarn() {

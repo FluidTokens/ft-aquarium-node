@@ -220,7 +220,8 @@ channels: every HTTP registry poll and every stream push.
 - **Missed pushes.** When an HTTP poll changes a price the stream had not pushed, the stream missed that push.
   While connected, the node says so in one `missed` line and counts it in
   `aquarium_oracle_stream_missed_total{stream="connected"}`; while not connected it only counts it, under
-  `stream="disconnected"`. A connected stream that delivers every change leaves the `connected` count at 0.
+  `stream="disconnected"`. The `connected` count also includes pushes that arrived after the HTTP poll had
+  already seen the change, so it is an upper bound on missed pushes, not an exact count.
 - The `cmp` comparison is unchanged: it always judges the stream against what the HTTP registry itself
   served, never against the merged prices.
 

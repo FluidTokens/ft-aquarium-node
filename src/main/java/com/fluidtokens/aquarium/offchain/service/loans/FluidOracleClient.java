@@ -54,10 +54,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * keyed by oracle NFT, published through one reference. It is written by the API poller's {@link #load} and —
  * when {@code loans.oracle.source} is {@code stream}, the default — by every parsed oracle-stream push
  * ({@link #mergeStreamPush}) and connection change ({@link #streamConnected}), all under one lock. Per NFT the
- * entry with the larger {@code feed.validFrom} wins and an equal one keeps the held entry (Giovanni A1,
- * 2026-10-31: newest only, never a fallback to an older version). An NFT stays held only while the API's last
- * load lists it or the last push of a CONNECTED stream lists it. With no push ever merged this is exactly the
- * old replace-on-load, for any sequence of loads whose per-NFT {@code validFrom} never decreases.
+ * entry with the larger {@code feed.validFrom} wins, an equal one with DIFFERENT content replaces the held entry
+ * (a republication: FluidTokens have changed an entry's content without moving its {@code validFrom}), and an
+ * older one never does (Giovanni A1, 2026-10-31: newest only, never a fallback to an older version). An NFT stays
+ * held only while the API's last load lists it or the last push of a CONNECTED stream lists it. With no push ever
+ * merged this is exactly the old replace-on-load, for any sequence of loads whose per-NFT {@code validFrom} never
+ * decreases.
  */
 @Service
 @Slf4j
@@ -338,8 +340,8 @@ public class FluidOracleClient {
 
     /**
      * Merges whatever parses out of a registry payload as {@link Source#API}: it becomes the API's last load, and
-     * each of its entries replaces the held one for its NFT unless that one is at least as new. The diagnostics,
-     * warnings and shape line are the payload's own, and so is what the {@link LoadListener}s are told.
+     * each of its entries replaces the held one for its NFT unless that one is newer, or as new and identical. The
+     * diagnostics, warnings and shape line are the payload's own, and so is what the {@link LoadListener}s are told.
      *
      * @return the payload's distinct priced tokens
      */
@@ -437,17 +439,19 @@ public class FluidOracleClient {
     /**
      * ⛔ Under {@link #writeLock} only. Merges {@code incoming} into {@code previous} and publishes the result.
      *
-     * <p><b>Merge:</b> an incoming entry replaces the held one for its NFT iff there is none or its
-     * {@code feed().validFrom()} is STRICTLY greater; an equal one keeps the held entry. <b>Membership:</b> then
-     * the merged map keeps exactly the API's last-load NFTs, plus the last push's NFTs while the stream is
-     * connected.
+     * <p><b>Merge:</b> an incoming entry replaces the held one for its NFT iff there is none, or its
+     * {@code feed().validFrom()} is STRICTLY greater, or it is equal and the entry differs from the held one (a
+     * republication: last writer wins). An older one never replaces, and an identical one changes nothing.
+     * <b>Membership:</b> then the merged map keeps exactly the API's last-load NFTs, plus the last push's NFTs while
+     * the stream is connected.
      */
     private Snapshot merge(Snapshot previous, Collection<OracleEntry> incoming, Instant lastRefresh,
                            Map<AssetType, OracleEntry> apiEntries, Set<AssetType> streamNfts, boolean connected) {
         var merged = new HashMap<>(previous.byOracleToken());
         for (OracleEntry entry : incoming) {
             OracleEntry held = merged.get(entry.oracleToken());
-            if (held == null || entry.feed().validFrom() > held.feed().validFrom()) {
+            if (held == null || entry.feed().validFrom() > held.feed().validFrom()
+                    || (entry.feed().validFrom() == held.feed().validFrom() && !entry.equals(held))) {
                 merged.put(entry.oracleToken(), entry);
             }
         }
