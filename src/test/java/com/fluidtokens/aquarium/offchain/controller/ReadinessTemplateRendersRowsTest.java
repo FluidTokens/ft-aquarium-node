@@ -28,6 +28,7 @@ import java.util.regex.Pattern;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -422,7 +423,8 @@ class ReadinessTemplateRendersRowsTest {
 
     // ---- FAB-145 T2: the book above the filters ----------------------------------------------------
 
-    private static final String USDM_UNIT = "c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d";
+    // FAB-182: the configured reference is USDCx — the shipped default — so the book names USDCx.
+    private static final String USDCX_UNIT = "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378";
 
     /** The book element alone — never the CSS in {@code <style>}, which also says "book". */
     private static String book(String html) {
@@ -456,7 +458,7 @@ class ReadinessTemplateRendersRowsTest {
      */
     private static LiquidationReadinessController.BookSummary bookSummary(String tokenLabel, String usdReason) {
         var fldt = new TokenMetadata(FLDT_UNIT, tokenLabel, "FluidTokens", 6, TokenMetadata.Source.REGISTRY);
-        var usdm = new TokenMetadata(USDM_UNIT, "USDM", "USDM", 6, TokenMetadata.Source.REGISTRY);
+        var usdcx = new TokenMetadata(USDCX_UNIT, "USDCx", "USDCx", 6, TokenMetadata.Source.REGISTRY);
         var line = new LiquidationReadinessController.TokenTvl(FLDT_UNIT, 3,
                 AssetDisplay.of(BigInteger.valueOf(4_500_000L), fldt), BigInteger.valueOf(128_000_000L),
                 AssetDisplay.of(BigInteger.valueOf(128_000_000L), TokenMetadata.ada()), 1);
@@ -464,8 +466,8 @@ class ReadinessTemplateRendersRowsTest {
         return new LiquidationReadinessController.BookSummary(7, 2, 1, List.of(line),
                 BigInteger.valueOf(128_000_000L), 1,
                 AssetDisplay.of(BigInteger.valueOf(128_000_000L), TokenMetadata.ada()),
-                usd ? AssetDisplay.of(BigInteger.valueOf(85_333_333L), usdm) : null,
-                usd ? AssetDisplay.of(BigInteger.valueOf(666_666L), usdm) : null,
+                usd ? AssetDisplay.of(BigInteger.valueOf(85_333_333L), usdcx) : null,
+                usd ? AssetDisplay.of(BigInteger.valueOf(666_666L), usdcx) : null,
                 usdReason);
     }
 
@@ -509,7 +511,7 @@ class ReadinessTemplateRendersRowsTest {
         assertNotNull(usd, "the dollar figure renders as its own element: " + book);
         assertEquals("≈ $85.33 (estimated)", usd.text(), "the word 'estimated' is in the figure's own element");
         assertNotNull(usd.title(), "the dollar figure carries a tooltip: " + usd);
-        assertTrue(usd.title().contains("85.333333 USDM"), "the tooltip keeps the exact USDM amount: " + usd.title());
+        assertTrue(usd.title().contains("85.333333 USDCx"), "the tooltip keeps the exact USDCx amount: " + usd.title());
         assertTrue(usd.title().contains("estimate"), "the tooltip says it is an estimate: " + usd.title());
         assertTrue(usd.title().contains("not a quote"), "and not a quote: " + usd.title());
 
@@ -517,16 +519,16 @@ class ReadinessTemplateRendersRowsTest {
         assertNotNull(rate, "the rate line renders as its own element and names the method: " + book);
         String line = rate.text();
         assertTrue(line.contains("estimated"), "the rate line says estimated: " + line);
-        assertTrue(line.contains("ADA → USDM"), "the conversion's direction: " + line);
-        assertTrue(line.contains("USDM oracle"), "the price it uses: " + line);
+        assertTrue(line.contains("ADA → USDCx"), "the conversion's direction: " + line);
+        assertTrue(line.contains("USDCx oracle"), "the price it uses: " + line);
         assertTrue(line.contains("1 ADA ≈ $0.666666"), "the implied rate: " + line);
-        assertTrue(line.contains("counting 1 USDM as $1"), "the assumption that makes USDM dollars: " + line);
+        assertTrue(line.contains("counting 1 USDCx as $1"), "the assumption that makes USDCx dollars: " + line);
     }
 
     /** USD unavailable: the reason takes the figure's place, and no dollar figure renders at all. */
     @Test
     void anUnavailableUsdShowsItsReasonAndNoDollarFigure() {
-        String reason = "no usable USDM oracle price right now";
+        String reason = "no usable USDCx oracle price right now";
         String book = book(render(List.of(fullRow()), ctx -> ctx.setVariable("book", bookSummary("FLDT", reason))));
 
         assertNotNull(book);
@@ -1203,5 +1205,406 @@ class ReadinessTemplateRendersRowsTest {
         assertTrue(html.contains("rehearsing liquidations, submitting none"), "the shadow headline");
         assertFalse(html.contains("submitting nothing"), "the old headline claimed nothing is submitted");
         assertTrue(html.contains("read-only except the wallet-rebalance switch"), "the header's meta line");
+    }
+
+    // ---- FAB-182: the prices strip under the wallet ----------------------------------------------------
+
+    private static final long SERVER_NOW = 1_800_000_000_000L;
+
+    /**
+     * ADA, FLDT (live, 9m5s old) and USDCx (STALE, 1h2m old), with USD available through USDCx — or every USD a
+     * dash and {@code usdReason} stated once.
+     */
+    private static LiquidationReadinessController.PriceStrip priceStrip(String usdReason) {
+        boolean usd = usdReason == null;
+        return new LiquidationReadinessController.PriceStrip(List.of(
+                new LiquidationReadinessController.TokenPrice("lovelace", "ADA", "", null,
+                        usd ? "$0.6667" : "—", false, false, null, null),
+                new LiquidationReadinessController.TokenPrice(FLDT_UNIT, "FLDT", FLDT_UNIT.substring(0, 56),
+                        "0.2345", usd ? "$0.1563" : "—", false, false, SERVER_NOW - 545_000L, "9m5s"),
+                new LiquidationReadinessController.TokenPrice(USDCX_UNIT, "USDCx", USDCX_UNIT.substring(0, 56),
+                        "1.5", usd ? "$1" : "—", false, true, SERVER_NOW - 3_720_000L, "1h2m")),
+                "USDCx", usdReason, SERVER_NOW);
+    }
+
+    /**
+     * Where the strip's class attribute starts — {@code class="prices"}, or {@code class="prices prices-narrow"}
+     * with a book (FAB-182-2) — or -1. Never the CSS in {@code <style>}, which also says "prices".
+     */
+    private static int stripAt(String html) {
+        Matcher m = Pattern.compile("class=\"prices[\" ]").matcher(html);
+        return m.find() ? m.start() : -1;
+    }
+
+    /** The strip element alone — never the CSS in {@code <style>}, which also says "prices". */
+    private static String prices(String html) {
+        int start = stripAt(html);
+        if (start < 0) {
+            return null;
+        }
+        return html.substring(start, html.indexOf("</div>", start));
+    }
+
+    private static int count(String haystack, String regex) {
+        Matcher m = Pattern.compile(regex).matcher(haystack);
+        int n = 0;
+        while (m.find()) {
+            n++;
+        }
+        return n;
+    }
+
+    /**
+     * ⛔ FAB-182: the strip renders directly after the wallet strip, one entry per token it is given, each
+     * with its ticker, ADA and USD price and age; the policy id is on hover and a stale entry says so.
+     */
+    @Test
+    void thePricesStripRendersAfterTheWalletWithOneEntryPerToken() {
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(null));
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        });
+
+        String strip = prices(html);
+        assertNotNull(strip, "a context with prices must render class=\"prices\"");
+        assertTrue(html.indexOf("class=\"wallet\"") < stripAt(html), "after the wallet strip");
+        assertTrue(stripAt(html) < html.indexOf("class=\"glance\""),
+                "directly after it: before the phone view and the book");
+        assertEquals(3, count(strip, "class=\"px(?: stale)?\""), "one entry per token: " + strip);
+        assertTrue(strip.contains(">FLDT<") && strip.contains(">0.2345 ADA<") && strip.contains(">$0.1563<"),
+                "ticker, ADA price and USD price: " + strip);
+        assertTrue(strip.contains("title=\"" + FLDT_UNIT.substring(0, 56) + "\""), "the policy id on hover");
+        assertTrue(strip.contains(">$0.6667<"), "the ADA entry's USD per ADA");
+        assertEquals(1, count(strip, "class=\"px stale\""), "the stale entry is marked: " + strip);
+        assertTrue(strip.contains("title=\"no price usable right now — showing the last one held\""),
+                "and says why on hover: " + strip);
+        assertFalse(strip.contains("USD unavailable"), "no reason beside live USD figures");
+        assertFalse(html.matches("(?s).*max-width: 700px\\)[^}]*\\.prices.*"),
+                "the strip is not hidden on the phone view");
+    }
+
+    /**
+     * Every age span carries its feed's validFrom and the strip carries the server's render instant, so the
+     * script ticks the age from the server's clock; the server-rendered age stands without JavaScript.
+     */
+    @Test
+    void eachAgeCarriesValidFromAndTheStripCarriesTheServerNow() {
+        String strip = prices(render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(null))));
+        assertNotNull(strip);
+
+        assertTrue(strip.contains("data-server-now=\"" + SERVER_NOW + "\""), "the render instant: " + strip);
+        assertTrue(strip.contains("data-valid-from=\"" + (SERVER_NOW - 545_000L) + "\">9m5s<"),
+                "FLDT's age span carries its validFrom and its server-rendered age: " + strip);
+        assertTrue(strip.contains("data-valid-from=\"" + (SERVER_NOW - 3_720_000L) + "\">1h2m<"), strip);
+        assertEquals(2, count(strip, "data-valid-from="), "every age span, and only those (ADA has no age)");
+    }
+
+    /** The script that ticks the ages reads the server's instant and makes no request. */
+    @Test
+    void theAgeTickerRunsFromTheServersInstantWithoutAnyRequest() {
+        String html = render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(null)));
+        String script = html.substring(html.lastIndexOf("<script>"), html.lastIndexOf("</script>"));
+
+        assertTrue(script.contains("getAttribute('data-server-now')"), "measured from the server's render instant");
+        assertTrue(script.contains("serverNow + (Date.now() - loadedAt)"), "plus the time since this page loaded");
+        assertTrue(script.contains("getAttribute('data-valid-from')"), "minus each feed's validFrom");
+        assertFalse(script.contains("fetch(") || script.contains("XMLHttpRequest"), "no HTTP call");
+    }
+
+    /** Lending off: no oracle client, no strip — and the page still renders. */
+    @Test
+    void withoutAnOracleClientNoStripRendersAndThePageStillDoes() {
+        String html = render(List.of(fullRow()));
+
+        assertNull(prices(html), "no prices in the model: no strip element");
+        assertTrue(html.contains(".prices"), "fixture premise: the stylesheet does mention the strip");
+        assertTrue(html.contains("class=\"wallet\"") && html.contains("</table>"), "the rest of the page renders");
+    }
+
+    /** USD unavailable: every USD cell is a dash and the reason is stated once, in the book's words. */
+    @Test
+    void anUnavailableUsdRateDashesEveryCellAndStatesTheReasonOnce() {
+        String reason = "no usable USDCx oracle price right now";
+        String strip = prices(render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(reason))));
+        assertNotNull(strip);
+
+        assertEquals(3, count(strip, ">—<"), "every USD cell, the ADA entry's included: " + strip);
+        assertEquals(1, count(strip, "USD unavailable: " + Pattern.quote(reason)), "the reason, once: " + strip);
+        assertFalse(strip.contains("$"), "no dollar figure at all: " + strip);
+    }
+
+    /**
+     * ⛔ FAB-182: one rate, USDCx. With USDCx configured, the book's USD wording names USDCx — in the figure's
+     * tooltip and on the rate line — and nothing on the rendered page says USDM.
+     */
+    @Test
+    void theBookNamesTheConfiguredReferenceAndNothingSaysUsdm() {
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(null));
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        });
+        String book = book(html);
+        assertNotNull(book);
+
+        assertTrue(span(book, "≈ $").title().contains("USDCx oracle price"), "the tooltip names USDCx: " + book);
+        assertTrue(span(book, "estimated from ").text()
+                        .contains("ADA → USDCx at the USDCx oracle price (1 ADA ≈ $0.666666), counting 1 USDCx as $1"),
+                "the rate line names USDCx: " + book);
+        assertFalse(html.contains("USDM"), "no rendered text says USDM when USDCx is the configured reference");
+    }
+
+    /**
+     * ⛔ FAB-182 r2 (F2): the phone view has no book and no hover, so the STRIP itself says in words that USD is
+     * an estimate through the reference stablecoin, naming it by its label — and, when USD is unavailable,
+     * says that instead and claims no conversion at all.
+     */
+    @Test
+    void theStripSaysInWordsThatUsdIsAnEstimateThroughTheReference() {
+        String html = render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(null)));
+        String strip = prices(html);
+        assertNotNull(strip);
+
+        assertEquals(1, count(strip, Pattern.quote("USD ≈ via USDCx, 1 USDCx counted as $1")),
+                "the caveat, on the strip itself and by the reference's label: " + strip);
+        assertTrue(strip.contains("class=\"px-caveat\""), "a visible span, not a tooltip: " + strip);
+        assertFalse(html.matches("(?s).*max-width: 700px\\)[^}]*\\.px-caveat.*"), "not hidden on the phone view");
+        String other = prices(render(List.of(fullRow()), ctx -> ctx.setVariable("prices",
+                new LiquidationReadinessController.PriceStrip(List.of(), "DJED", null, SERVER_NOW))));
+        assertNotNull(other);
+        assertTrue(other.contains("USD ≈ via DJED, 1 DJED counted as $1"),
+                "the label is the configured token's, never a ticker written into the template: " + other);
+
+        String reason = "no usable USDCx oracle price right now";
+        String unavailable = prices(render(List.of(fullRow()),
+                ctx -> ctx.setVariable("prices", priceStrip(reason))));
+        assertNotNull(unavailable);
+        assertFalse(unavailable.contains("counted as $1"), "no caveat without a rate: " + unavailable);
+        assertFalse(unavailable.contains("px-caveat"), unavailable);
+        assertTrue(unavailable.contains("USD unavailable: " + reason), "the reason is shown instead: " + unavailable);
+    }
+
+    // ---- FAB-182-2: the prices in the book's right half on a wide screen --------------------------------
+
+    /**
+     * The whole {@code <div>} whose opening tag carries {@code marker}, to its MATCHING {@code </div>} — nested
+     * divs counted, so a column's markup is its own and nothing after it. Null when absent.
+     */
+    private static String div(String html, String marker) {
+        int at = html.indexOf(marker);
+        if (at < 0) {
+            return null;
+        }
+        int start = html.lastIndexOf("<div", at);
+        Matcher m = Pattern.compile("<div\\b|</div>").matcher(html);
+        m.region(start, html.length());
+        int depth = 0;
+        while (m.find()) {
+            depth += m.group().equals("</div>") ? -1 : 1;
+            if (depth == 0) {
+                return html.substring(start, m.end());
+            }
+        }
+        throw new AssertionError("unclosed <div> for " + marker);
+    }
+
+    /** The book's right half, or null. */
+    private static String bookPrices(String html) {
+        return div(html, "class=\"book-prices\"");
+    }
+
+    /** One {@code <li>} per price entry of the right half, in rendered order. */
+    private static List<String> bookPriceRows(String right) {
+        Matcher m = Pattern.compile("(?s)<li class=\"book-px(?: stale)?\".*?</li>").matcher(right);
+        List<String> rows = new ArrayList<>();
+        while (m.find()) {
+            rows.add(m.group());
+        }
+        return rows;
+    }
+
+    /** The page's markup after the stylesheet — so a class named only in the CSS is not counted as rendered. */
+    private static String markup(String html) {
+        return html.substring(html.indexOf("</style>"));
+    }
+
+    /**
+     * ⛔ FAB-182-2: with a book and prices, the book splits in two. The right half carries one line per price
+     * entry, in the strip's order (ADA first): ticker with the policy id on hover, ADA price, the USD in
+     * brackets, and the age span carrying its validFrom. The left half is the FAB-145 book, every element still
+     * there — and byte-for-byte what it renders without prices.
+     */
+    @Test
+    void theBookSplitsWithOnePriceLinePerEntryOnTheRightAndTheFab145BookOnTheLeft() {
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(null));
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        });
+        String book = book(html);
+        assertNotNull(book);
+        assertTrue(book.contains("class=\"book-split\""), "the book is split when there are prices: " + book);
+
+        String right = bookPrices(html);
+        assertNotNull(right, "a book with prices must render its right half: " + book);
+        assertTrue(book.contains(right), "the right half is inside the book");
+        List<String> rows = bookPriceRows(right);
+        assertEquals(3, rows.size(), "one line per price entry: " + right);
+
+        String ada = rows.get(0);
+        assertTrue(ada.contains(">ADA<"), "ADA first: " + ada);
+        assertTrue(ada.contains(">$0.6667<"), "the ADA entry shows only its USD per ADA: " + ada);
+        assertFalse(ada.contains(" ADA<") || ada.contains("data-valid-from"), "no ADA price, no age: " + ada);
+
+        String fldt = rows.get(1);
+        assertTrue(fldt.contains(">FLDT<") && fldt.contains("title=\"" + FLDT_UNIT.substring(0, 56) + "\""),
+                "the ticker, with its policy id on hover: " + fldt);
+        assertTrue(fldt.indexOf(">FLDT<") < fldt.indexOf(">0.2345 ADA<")
+                        && fldt.indexOf(">0.2345 ADA<") < fldt.indexOf(">($0.1563)<")
+                        && fldt.indexOf(">($0.1563)<") < fldt.indexOf("data-valid-from=\"" + (SERVER_NOW - 545_000L) + "\">9m5s<"),
+                "ticker, ADA price, (USD), then the age carrying its validFrom: " + fldt);
+        assertFalse(fldt.contains("class=\"book-px stale\""), "a live entry is not muted: " + fldt);
+
+        String usdcx = rows.get(2);
+        assertTrue(usdcx.contains(">USDCx<") && usdcx.contains(">1.5 ADA<") && usdcx.contains(">($1)<"), usdcx);
+        assertTrue(usdcx.contains("data-valid-from=\"" + (SERVER_NOW - 3_720_000L) + "\">1h2m<"), usdcx);
+        assertTrue(usdcx.startsWith("<li class=\"book-px stale\""), "the stale entry is muted: " + usdcx);
+        assertTrue(usdcx.contains("title=\"no price usable right now — showing the last one held\""),
+                "and says why on hover, as the strip does: " + usdcx);
+        assertEquals(2, count(right, "data-valid-from="), "every age span, and only those: " + right);
+
+        String left = div(html, "class=\"book-main\"");
+        assertNotNull(left);
+        assertFalse(left.contains("book-px") || left.contains("Oracle prices"), "no price in the left half");
+        for (String fab145 : List.of("The book", "an estimate at oracle prices, following the filters",
+                "<b>7</b> loan(s)", "<b>2</b> liquidatable now", "<b>1</b> the bot could not process",
+                "Collateral locked (TVL)", ">FLDT<", ">4.50<", "≈ 128.00 ADA", "≈ $85.33 (estimated)",
+                "estimated from ADA → USDCx", "1 loan(s) excluded: their collateral has no usable oracle price")) {
+            assertTrue(left.contains(fab145), "the left half keeps the FAB-145 book's \"" + fab145 + "\": " + left);
+        }
+        String withoutPrices = render(List.of(fullRow()), ctx -> ctx.setVariable("book", bookSummary("FLDT", null)));
+        assertEquals(div(withoutPrices, "class=\"book-main\""), left,
+                "the left half is exactly the book a page without prices renders");
+    }
+
+    /**
+     * The right half says it is not filtered — the left half follows the filters, the prices do not — and
+     * carries the strip's USD caveat by the configured reference's label, or its unavailable reason instead.
+     */
+    @Test
+    void theRightHalfSaysItIsNotFilteredAndCarriesTheUsdCaveat() {
+        String right = bookPrices(render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(null));
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        }));
+        assertNotNull(right);
+        assertTrue(right.contains(">Oracle prices<"), "the heading: " + right);
+        assertTrue(right.contains("<span class=\"book-caveat\">all tokens — not filtered</span>"),
+                "a muted note that the prices do not follow the filters: " + right);
+        assertEquals(1, count(right, Pattern.quote("USD ≈ via USDCx, 1 USDCx counted as $1")),
+                "the caveat, by the reference's label: " + right);
+        assertFalse(right.contains("USD unavailable"), right);
+
+        String reason = "no usable USDCx oracle price right now";
+        String unavailable = bookPrices(render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(reason));
+            ctx.setVariable("book", bookSummary("FLDT", reason));
+        }));
+        assertNotNull(unavailable);
+        assertEquals(1, count(unavailable, "USD unavailable: " + Pattern.quote(reason)), "the reason, once");
+        assertFalse(unavailable.contains("counted as $1") || unavailable.contains("$"),
+                "no caveat and no dollar figure without a rate: " + unavailable);
+        assertEquals(1, count(unavailable, ">—<"), "the ADA entry's USD is a dash: " + unavailable);
+        assertEquals(2, count(unavailable, ">\\(—\\)<"), "and every token's: " + unavailable);
+    }
+
+    /**
+     * ⛔ G3: a registry-sourced label reaches the right half escaped, and an entry with no decimals carries the
+     * strip's unknown-metadata marker with its reason on hover.
+     */
+    @Test
+    void theRightHalfEscapesLabelsAndMarksAnUnscaledPrice() {
+        var hostile = new LiquidationReadinessController.PriceStrip(List.of(
+                new LiquidationReadinessController.TokenPrice(FLDT_UNIT, "<b>FLDT</b>", FLDT_UNIT.substring(0, 56),
+                        "0.000002345", "$0.0000015", true, false, SERVER_NOW - 5_000L, "0m5s")),
+                "<i>USDCx</i>", null, SERVER_NOW);
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", hostile);
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        });
+        String right = bookPrices(html);
+        assertNotNull(right);
+
+        assertTrue(right.contains("&lt;b&gt;FLDT&lt;/b&gt;"), "the label is escaped: " + right);
+        assertTrue(right.contains("USD ≈ via &lt;i&gt;USDCx&lt;/i&gt;"), "and the reference's: " + right);
+        assertFalse(html.contains("<b>FLDT</b>") || html.contains("<i>USDCx</i>"),
+                "a registry's text never reaches the page as markup");
+        assertTrue(right.contains("class=\"nometa\"")
+                        && right.contains("title=\"no metadata for " + FLDT_UNIT + " — priced per raw, unscaled base unit\""),
+                "the unknown-decimals marker, as on the strip: " + right);
+    }
+
+    /**
+     * With a book, the strip under the wallet is the NARROW view's only — a wide screen has the book's right
+     * half — and without a book it shows at every width, so the prices always show somewhere.
+     */
+    @Test
+    void withABookTheWalletStripIsNarrowOnlyAndWithoutOneItShowsAtEveryWidth() {
+        String withBook = render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(null));
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        });
+        assertTrue(withBook.contains("<div class=\"prices prices-narrow\""), "narrow-only with a book: " + prices(withBook));
+        assertTrue(withBook.matches("(?s).*@media \\(min-width: 701px\\) \\{\\s*\\.prices\\.prices-narrow \\{ display:none; }.*"),
+                "and hidden above the 700px breakpoint, where the book shows");
+        assertFalse(withBook.matches("(?s).*max-width: 700px\\)[^}]*\\.prices.*"), "never hidden on the phone view");
+
+        String noBook = render(List.of(fullRow()), ctx -> ctx.setVariable("prices", priceStrip(null)));
+        assertNotNull(prices(noBook));
+        assertTrue(noBook.contains("<div class=\"prices\""), "a plain strip without a book: " + prices(noBook));
+        assertFalse(markup(noBook).contains("prices-narrow"), "not narrow-only: it is the only place prices show");
+        assertNull(bookPrices(noBook), "and no right half, since there is no book");
+    }
+
+    /** Without prices, the book renders as it did before FAB-182-2: no split and no right half. */
+    @Test
+    void withoutPricesTheBookHasNoRightHalfAndItsLeftIsUnchanged() {
+        String html = render(List.of(fullRow()), ctx -> ctx.setVariable("book", bookSummary("FLDT", null)));
+        String book = book(html);
+        assertNotNull(book);
+
+        assertNull(bookPrices(html), "no right half without prices: " + book);
+        assertFalse(book.contains("book-split") || book.contains("Oracle prices") || book.contains("book-px"),
+                "no split and no price line: " + book);
+        String left = div(html, "class=\"book-main\"");
+        assertNotNull(left);
+        assertTrue(left.contains("<b>7</b> loan(s)") && left.contains("≈ 128.00 ADA")
+                        && left.contains("≈ $85.33 (estimated)") && left.contains("1 loan(s) excluded"),
+                "the FAB-145 content is all there: " + left);
+    }
+
+    /**
+     * ⛔ Every age on the page ticks — the strip's and the right half's — from ONE server instant: the script
+     * selects every {@code [data-valid-from]} in the document and reads a single {@code data-server-now}, which
+     * the page renders exactly once even when the prices render twice.
+     */
+    @Test
+    void theTickerCountsEveryAgeOnThePageFromOneServerInstant() {
+        String html = render(List.of(fullRow()), ctx -> {
+            ctx.setVariable("prices", priceStrip(null));
+            ctx.setVariable("book", bookSummary("FLDT", null));
+        });
+        String script = html.substring(html.lastIndexOf("<script>"), html.lastIndexOf("</script>"));
+
+        assertTrue(script.contains("document.querySelectorAll('[data-valid-from]')"),
+                "every age in the document, not one element's: " + script);
+        assertEquals(1, count(script, Pattern.quote("document.querySelector('[data-server-now]')")),
+                "one server-now source, read once");
+        assertEquals(1, count(script, Pattern.quote("getAttribute('data-server-now')")), "read once");
+        assertFalse(script.contains("querySelectorAll('[data-server-now]')"), "never several server instants");
+        assertTrue(script.contains("serverNow + (Date.now() - loadedAt)"), "the same formula");
+        assertFalse(script.contains("fetch(") || script.contains("XMLHttpRequest"), "no HTTP call");
+
+        String page = markup(html).substring(0, markup(html).lastIndexOf("<script>"));
+        assertEquals(1, count(page, "data-server-now=\""), "exactly one server instant on the page");
+        assertEquals(4, count(page, "data-valid-from=\""), "the strip's two ages and the right half's two");
     }
 }

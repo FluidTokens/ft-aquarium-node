@@ -283,8 +283,8 @@ loans:
     token-registry:
       url: ${LOANS_UI_TOKEN_REGISTRY_URL:https://tokens.cardano.org}
       timeout-seconds: ${LOANS_UI_TOKEN_REGISTRY_TIMEOUT_SECONDS:5}
-    # FAB-145: the readiness page's USD is an ESTIMATE — ADA converted at this unit's (USDM) oracle price, 1 unit counted as $1. USDM only, never another token. Empty shows "USD unavailable".
-    usd-reference-unit: ${LOANS_UI_USD_REFERENCE_UNIT:c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d}
+    # FAB-145/FAB-182: the readiness page's single ADA/USD rate (the book and the prices strip) — ADA converted at this stablecoin's oracle price, the reference stablecoin counted as $1 (an ESTIMATE). Default USDCx; the page names whatever token is set. Empty turns USD off ("USD unavailable").
+    usd-reference-unit: ${LOANS_UI_USD_REFERENCE_UNIT:1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378}
 
   # The wallet rebalancer (FAB-131): on every block, while the node is not syncing, it moves the bot
   # wallet into the FAB-130 shape with one self-send -- SIGNED AND SUBMITTED in shadow too (wallet
@@ -629,7 +629,7 @@ loans:
     stream:
       url: ${LOANS_ORACLE_STREAM_URL:wss://2tgda3mk4l.execute-api.eu-west-1.amazonaws.com/dev}
   ui:
-    # Blank: the mainnet USDM unit means nothing here, so the readiness page shows USD as unavailable.
+    # Blank: the mainnet USDCx unit means nothing here, so the readiness page shows USD as unavailable.
     usd-reference-unit: ""
   # Preview is where the bot is exercised, so the loop runs by default here — in shadow, which
   # scans, builds, prices and records and never submits a liquidation. ⚠ With an `action: ANTICIPATE`

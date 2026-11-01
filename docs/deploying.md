@@ -271,6 +271,12 @@ just moves the open door. If you want browser access from outside, terminate TLS
 
 ### The summary at the top of the page
 
+On a wide screen the prices sit in the right half of the summary below (the Book), unfiltered; on a narrow phone view,
+and whenever that summary is absent, they sit in a **prices strip** directly under the node-wallet strip.
+Either way they list every token the oracle registry prices, from the same oracle feeds the bot prices with: its price in ADA and in USD, and the
+feed's age, which counts up live between reloads (a muted entry has no price usable right now and shows the
+last one held).
+
 Above the filters, a desktop-width screen shows a summary of the loans it lists:
 
 - **Counts** — how many loans, how many are liquidatable now, and how many the bot could not process.
@@ -278,18 +284,21 @@ Above the filters, a desktop-width screen shows a summary of the loans it lists:
   Each loan's collateral is valued in ADA at that loan's own collateral oracle.
 - **A loan whose collateral has no usable oracle price** stays in its token's amount, is left out of the
   ADA and USD totals, and is counted on an "excluded" line — so a gap is said, never hidden as a zero.
-- **The USD figure is an ESTIMATE, not a quote.** It is the ADA total converted at the USDM oracle price,
-  counting 1 USDM as $1. USDM can trade off its peg and the oracle can lag; the page labels the figure
-  "estimated" and names the method on the line beside it.
+- **The USD figure is an ESTIMATE, not a quote.** It is the ADA total converted at the reference
+  stablecoin's oracle price (USDCx by default), counting 1 of it as $1. A stablecoin can trade off its peg
+  and the oracle can lag; the page labels the figure "estimated" and names the method, and the token, on
+  the line beside it.
 - **The summary follows the filters, not the page.** Narrow the list with the filters and it re-counts
   what is left, across every page; paging through the list does not change it.
 
-`LOANS_UI_USD_REFERENCE_UNIT` is the USDM token's unit; it defaults to mainnet's. **Only USDM is
-supported** — the page labels the figure as USDM-based, so another token's unit would be mislabelled,
-not converted. The setting exists to correct the USDM unit or to turn USD off: leave it unset to keep
-the default; set it empty and the summary shows "USD unavailable", with a reason naming
-`LOANS_UI_USD_REFERENCE_UNIT`. On preview it is blank, so the summary shows "USD unavailable" there too.
-It is listed, commented out, in `docker/.env.advanced.example`.
+`LOANS_UI_USD_REFERENCE_UNIT` is the page's **one ADA/USD rate** — the summary's USD and every USD price
+in the prices strip go through it. It defaults to mainnet's **USDCx**
+(`1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378`), the largest stablecoin on
+Cardano. Any USD-pegged stablecoin's unit may be set instead: the page names the figure after that
+token's own label, so it is never mislabelled. Leave it unset to keep the default; set it empty and USD
+is turned off — the summary and the strip show "USD unavailable", with a reason naming
+`LOANS_UI_USD_REFERENCE_UNIT`. On preview it is blank, so USD is unavailable there too. It is listed,
+commented out, in `docker/.env.advanced.example`.
 
 ### Wallet rebalancing on the page
 
