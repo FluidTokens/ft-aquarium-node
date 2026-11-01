@@ -2651,6 +2651,77 @@ class LiquidationSubmitVetoTest {
         assertEquals(WorkResult.AMBIGUOUS, stage.result());
     }
 
+    /**
+     * (k) SUBMITTED outranks a LATER WOULD_SUBMIT: the ada market live, the other market held at shadow,
+     * so the transmission comes first and the rehearsal after it. {@link #submittedOutranksWouldSubmit}
+     * meets them the other way round, where a result that simply took the latest outcome ends at
+     * SUBMITTED too. Here it would end at WOULD_SUBMIT, and the pipeline would run compound in the same
+     * pass right after a real liquidation went out.
+     */
+    @Test
+    void aSubmittedLiquidationOutranksALaterShadowWouldSubmit() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        var configuration = armed();
+        var market = new AppConfig.LiquidationConfiguration.Market();
+        market.setUnit(PRINCIPAL_TOKEN.toUnit());
+        market.setMode(AppConfig.LiquidationConfiguration.Mode.SHADOW);
+        market.setAction(AppConfig.LiquidationConfiguration.Action.CONVERT);
+        configuration.setMarkets(List.of(market));
+
+        StageRun stage = stage(configuration, List.of(adaScenario(), otherMarketScenario()), submitter, null,
+                SubmitFence.OPEN);
+
+        List<LiquidationDecision> oldestFirst = new ArrayList<>(stage.log().newestFirst(10));
+        java.util.Collections.reverse(oldestFirst);
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMITTED, LiquidationDecision.Outcome.WOULD_SUBMIT),
+                oldestFirst.stream().map(LiquidationDecision::outcome).toList(),
+                "the transmission is recorded BEFORE the rehearsal: " + oldestFirst);
+        assertEquals(1, submitter.submitted.size());
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /**
+     * (l) A served market's later candidate is SKIPPED and the walk goes on: the ada market's second
+     * candidate is passed over unbuilt, and the other market, ranked after it, is still liquidated.
+     */
+    @Test
+    void aServedMarketsLaterCandidateIsSkippedAndTheWalkReachesTheNextMarket() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        Scenario ada = adaScenario();
+        Scenario secondAda = secondAdaScenario();
+        Scenario other = otherMarketScenario();
+
+        StageRun stage = stage(armed(), List.of(ada, secondAda, other), submitter, null, SubmitFence.OPEN);
+
+        // The order this test depends on: the skipped candidate is ranked BETWEEN the served one and the
+        // other market. Ranked anywhere else, ending the walk at the skip would not cost the other market.
+        assertEquals(List.of(ada.loan().loan().utxoRef(), secondAda.loan().loan().utxoRef(),
+                        other.loan().loan().utxoRef()), rankedLoanRefs(stage));
+        assertEquals(2, submitter.submitted.size(), "one liquidation in each market: " + stage.log().newestFirst(10));
+        assertEquals(2, stage.log().size(), "the ada market's second candidate was never built: "
+                + stage.log().newestFirst(10));
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, ada).outcome());
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, other).outcome());
+        assertTrue(stage.log().newestFirst(10).stream()
+                        .noneMatch(row -> secondAda.loan().loan().utxoRef().equals(row.loanUtxoRef())),
+                stage.log().newestFirst(10).toString());
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /** The loan refs of the one {@code liquidation order} INFO line the call logged, in rank order. */
+    private static List<String> rankedLoanRefs(StageRun stage) {
+        String prefix = "liquidation order (most profitable first): ";
+        List<String> lines = stage.events().stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(message -> message.startsWith(prefix))
+                .toList();
+        assertEquals(1, lines.size(), stage.events().toString());
+        return java.util.Arrays.stream(lines.getFirst().substring(prefix.length()).split(", "))
+                .map(label -> label.substring(0, label.indexOf(' ')))
+                .toList();
+    }
+
     // ======================================================================================
     // the shipped defaults
     // ======================================================================================
