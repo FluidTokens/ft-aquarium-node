@@ -37,7 +37,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
@@ -57,7 +56,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -732,21 +730,9 @@ public class LiquidationExecutor {
                 + "will liquidate at a loss down to that stated floor", margin, networkName);
     }
 
-    @Scheduled(timeUnit = TimeUnit.SECONDS, fixedDelayString = "${loans.liquidation.delay-seconds}")
-    public void runCycle() {
-        // One bad cycle must not take the scheduler thread with it: a thrown exception out of a
-        // @Scheduled method cancels nothing, but it does lose the run, and any state left half
-        // written here is better reported than propagated.
-        try {
-            cycle(System.currentTimeMillis());
-        } catch (Exception e) {
-            log.warn("liquidation cycle failed", e);
-        }
-    }
-
     /**
      * One cycle, at an explicit instant so it is testable without a clock, behind a fence that never
-     * closes. Package-private: the scheduler comes in through {@link #runCycle()}.
+     * closes.
      */
     WorkResult cycle(long now) {
         return cycle(now, SubmitFence.OPEN);
@@ -762,7 +748,7 @@ public class LiquidationExecutor {
      * @return AMBIGUOUS if any submit was, else SUBMITTED if any went out, else WOULD_SUBMIT if a
      *         shadow candidate would have, else DEFINITE_FAILURE — every early return included
      */
-    WorkResult cycle(long now, SubmitFence fence) {
+    public WorkResult cycle(long now, SubmitFence fence) {
         if (configuration.getMode() == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
             return WorkResult.DEFINITE_FAILURE;
         }

@@ -21,7 +21,6 @@ import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
@@ -37,7 +36,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -227,16 +225,6 @@ public class CompoundExecutor {
         this.submitter = submitter;
     }
 
-    @Scheduled(timeUnit = TimeUnit.SECONDS, fixedDelayString = "${loans.compound.delay-seconds:60}")
-    public void runCycle() {
-        // One bad cycle must not take the scheduler thread with it.
-        try {
-            cycle();
-        } catch (Exception e) {
-            log.error("compound cycle failed: {}", e.toString(), e);
-        }
-    }
-
     /** One walk behind a fence that never closes. */
     WorkResult cycle() {
         return cycle(SubmitFence.OPEN);
@@ -249,7 +237,7 @@ public class CompoundExecutor {
      * is transmitted, the walk ends, and the summary counts the rest as {@code not reached}. It is not
      * retained after the call.
      */
-    WorkResult cycle(SubmitFence fence) {
+    public WorkResult cycle(SubmitFence fence) {
         if (refusedByLendingConfigGate("compound")) {
             return WorkResult.DEFINITE_FAILURE;
         }

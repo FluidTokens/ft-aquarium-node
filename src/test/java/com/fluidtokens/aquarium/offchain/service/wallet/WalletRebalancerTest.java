@@ -11,12 +11,12 @@ import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
-import com.bloxbean.cardano.yaci.store.events.EventMetadata;
-import com.bloxbean.cardano.yaci.store.events.internal.CommitEvent;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
+import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -169,10 +169,6 @@ class WalletRebalancerTest {
         return List.of(utxo(1_180_000, NIGHT, 15_000_000_000L), utxo(200_000_000));
     }
 
-    private static CommitEvent<?> event() {
-        return new CommitEvent<>(EventMetadata.builder().slot(1L).build(), List.of());
-    }
-
     private List<ILoggingEvent> at(Level level) {
         return logs.list.stream().filter(e -> e.getLevel() == level).toList();
     }
@@ -182,7 +178,7 @@ class WalletRebalancerTest {
     }
 
     private void assertBlocked(WalletRebalancer rebalancer, String why) {
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), why + ": a blocked gate must not read the wallet (cheapest first)");
         assertEquals(0, submits.get(), why + ": a blocked gate must not submit");
         assertEquals(0, signs.get(), why + ": a blocked gate must not sign");
@@ -190,7 +186,7 @@ class WalletRebalancerTest {
     }
 
     private void assertRebalancedOnce(WalletRebalancer rebalancer, String why) {
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(1, reads.get(), why + ": the wallet is read once");
         assertEquals(1, signs.get(), why + ": the built transaction is signed once");
         assertEquals(1, submits.get(), why + ": the built transaction is submitted once");
@@ -217,7 +213,7 @@ class WalletRebalancerTest {
 
         rebalancer.suspend();
         assertEquals(new WalletRebalancer.State(true, true, false), rebalancer.state());
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), "suspended: no wallet read");
         assertEquals(0, submits.get(), "suspended: no submission");
 
@@ -233,7 +229,7 @@ class WalletRebalancerTest {
         rebalancer.resume();
         assertEquals(new WalletRebalancer.State(false, false, false), rebalancer.state(),
                 "resume can never override env=false");
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), "resume after env=false must not read the wallet");
         assertEquals(0, submits.get(), "resume after env=false must not submit");
     }
@@ -371,7 +367,7 @@ class WalletRebalancerTest {
         assertEquals(Set.of(), WalletShape.reasons(walletContents.get(), Set.of(NIGHT), C),
                 "the fixture must already be in shape");
 
-        rebalancer(true).onCommit();
+        rebalancer(true).housekeep(SubmitFence.OPEN);
         assertEquals(1, reads.get());
         assertEquals(0, signs.get(), "a shaped wallet is not signed for");
         assertEquals(0, submits.get(), "a shaped wallet is not submitted for");
@@ -386,8 +382,8 @@ class WalletRebalancerTest {
                 WalletShape.reasons(walletContents.get(), Set.of(NIGHT), C), "the fixture's one reason");
         WalletRebalancer rebalancer = rebalancer(true);
 
-        rebalancer.onCommit();
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
+        rebalancer.housekeep(SubmitFence.OPEN);
 
         assertEquals(2, reads.get());
         assertEquals(0, signs.get(), "a refusal is never signed");
@@ -408,7 +404,7 @@ class WalletRebalancerTest {
     void theNightReproductionSubmitsTheShapedSelfSpendOfTheWholeWallet() throws Exception {
         List<Utxo> walletUtxos = walletContents.get();
         WalletRebalancer rebalancer = rebalancer(true);
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(1, submitted.size());
 
         Transaction tx = Transaction.deserialize(submitted.get(0));
@@ -441,8 +437,8 @@ class WalletRebalancerTest {
         walletFailure.set(new IllegalStateException("database down"));
         WalletRebalancer rebalancer = rebalancer(true);
 
-        assertDoesNotThrow(rebalancer::onCommit);
-        assertDoesNotThrow(() -> rebalancer.processCommit(event()));
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
 
         assertEquals(2, reads.get());
         assertEquals(0, signs.get());
@@ -458,7 +454,7 @@ class WalletRebalancerTest {
         submitterBehaviour.set(bytes -> Result.error("BadInputsUTxO"));
         WalletRebalancer rebalancer = rebalancer(true);
 
-        assertDoesNotThrow(() -> rebalancer.processCommit(event()));
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
         assertEquals(1, submits.get());
         assertEquals(1, at(Level.ERROR).size(), String.valueOf(logs.list));
         assertTrue(at(Level.ERROR).get(0).getFormattedMessage().contains("BadInputsUTxO"),
@@ -473,12 +469,53 @@ class WalletRebalancerTest {
         });
         WalletRebalancer rebalancer = rebalancer(true);
 
-        assertDoesNotThrow(() -> rebalancer.processCommit(event()));
-        assertDoesNotThrow(rebalancer::onCommit);
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
+        assertDoesNotThrow(() -> rebalancer.housekeep(SubmitFence.OPEN));
         assertEquals(2, submits.get());
         assertEquals(2, at(Level.ERROR).size(), String.valueOf(logs.list));
         assertTrue(at(Level.ERROR).get(0).getFormattedMessage().contains("connection reset"),
                 at(Level.ERROR).get(0).getFormattedMessage());
+    }
+
+    // ---- the housekeeping stage's fence and outcome (FAB-183) ---------------------------------------------------
+
+    /**
+     * A closed fence, read immediately before the submit: the shaped self-send is built and signed, nothing is
+     * submitted, one INFO says so, and the stage reports that nothing went out.
+     */
+    @Test
+    void aClosedFenceBuildsButSubmitsNothing() {
+        AtomicInteger fenceReads = new AtomicInteger();
+        WorkResult result = rebalancer(true).housekeep(() -> {
+            fenceReads.incrementAndGet();
+            return false;
+        });
+
+        assertEquals(WorkResult.DEFINITE_FAILURE, result, "a fenced stage sent nothing");
+        assertEquals(1, reads.get(), "the wallet is read");
+        assertEquals(1, signs.get(), "the shaped self-send is built and signed");
+        assertEquals(1, fenceReads.get(), "the fence is read once, before the submit");
+        assertEquals(0, submits.get(), "a closed fence submits nothing");
+        List<ILoggingEvent> info = at(Level.INFO);
+        assertEquals(1, info.size(), String.valueOf(logs.list));
+        assertEquals("[REBALANCE] fenced: nothing submitted", info.get(0).getFormattedMessage());
+        assertEquals(List.of(), atOrAbove(Level.WARN), "a fenced stage is not a failure");
+    }
+
+    @Test
+    void aSuccessfulSubmitIsSubmitted() {
+        assertEquals(WorkResult.SUBMITTED, rebalancer(true).housekeep(SubmitFence.OPEN));
+        assertEquals(1, submits.get());
+    }
+
+    /** The bytes may have reached Blockfrost before the submit threw: never reported as nothing sent. */
+    @Test
+    void aThrowingSubmitIsAmbiguous() {
+        submitterBehaviour.set(bytes -> {
+            throw new java.io.IOException("connection reset");
+        });
+        assertEquals(WorkResult.AMBIGUOUS, rebalancer(true).housekeep(SubmitFence.OPEN));
+        assertEquals(1, submits.get());
     }
 
     @Test
@@ -490,12 +527,12 @@ class WalletRebalancerTest {
                 () -> {
                     throw new IllegalStateException("markets unreadable");
                 }, effectiveMode, true);
-        assertDoesNotThrow(() -> gateFailure.processCommit(event()));
+        assertDoesNotThrow(() -> gateFailure.housekeep(SubmitFence.OPEN));
         assertTrue(at(Level.ERROR).stream().anyMatch(e -> e.getFormattedMessage().contains("markets unreadable")),
                 String.valueOf(logs.list));
 
         markets.set(List.of(anticipate(NIGHT)));
-        assertDoesNotThrow(() -> rebalancer(true).processCommit(event()));
+        assertDoesNotThrow(() -> rebalancer(true).housekeep(SubmitFence.OPEN));
         assertEquals(1, submits.get());
         assertTrue(at(Level.ERROR).stream().anyMatch(e -> e.getFormattedMessage().contains("unexpected")),
                 String.valueOf(logs.list));
@@ -529,7 +566,7 @@ class WalletRebalancerTest {
 
     /**
      * ⛔ The page and the bot read ONE evaluation. For every gate scenario above, {@code activity()} names the
-     * first closed gate, and {@code armed()} is true exactly when {@code onCommit()} goes on to read the wallet
+     * first closed gate, and {@code armed()} is true exactly when {@code housekeep()} goes on to read the wallet
      * — so the page can never say ARMED over a bot that is idle, nor idle over a bot that is acting.
      */
     @Test
@@ -577,9 +614,9 @@ class WalletRebalancerTest {
             assertEquals(s.mode(), activity.mode(), s.name() + ": the mode is the supplier's, null included");
             assertEquals(0, reads.get(), s.name() + ": activity() reads no wallet");
 
-            rebalancer.onCommit();
+            rebalancer.housekeep(SubmitFence.OPEN);
             assertEquals(activity.armed() ? 1 : 0, reads.get(),
-                    s.name() + ": armed() must be true exactly when onCommit() reads the wallet");
+                    s.name() + ": armed() must be true exactly when housekeep() reads the wallet");
             assertEquals(activity.armed() ? 1 : 0, submits.get(), s.name() + ": and submits");
         }
     }
@@ -639,7 +676,7 @@ class WalletRebalancerTest {
 
         post(page, "suspend");
         assertEquals(WalletRebalancer.Idle.SUSPENDED, rebalancer.activity().idle());
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), "suspended from the page: no wallet read");
         assertEquals(0, signs.get(), "suspended from the page: nothing signed");
         assertEquals(0, submits.get(), "suspended from the page: nothing submitted");
@@ -656,7 +693,7 @@ class WalletRebalancerTest {
         var page = readinessPage(rebalancer);
 
         post(page, "resume");
-        rebalancer.onCommit();
+        rebalancer.housekeep(SubmitFence.OPEN);
         assertEquals(0, reads.get(), "env off, resumed from the page: no wallet read");
         assertEquals(0, submits.get(), "env off, resumed from the page: nothing submitted");
         assertEquals(WalletRebalancer.Idle.ENV_DISABLED, rebalancer.activity().idle());
