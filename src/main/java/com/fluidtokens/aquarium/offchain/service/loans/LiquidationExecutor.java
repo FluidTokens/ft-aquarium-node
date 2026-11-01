@@ -41,6 +41,9 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -281,6 +284,31 @@ public class LiquidationExecutor {
 
     void setSubmitClock(java.util.function.LongSupplier submitClock) {
         this.submitClock = submitClock;
+    }
+
+    /**
+     * FAB-183: an unchanged {@code liquidation scan:} or {@code liquidation order} line is still said at
+     * INFO this often, so a quiet log is not a dead one (FAB-180's compound summary is the model).
+     */
+    private static final Duration CYCLE_LINE_HEARTBEAT = Duration.ofHours(1);
+
+    /**
+     * FAB-183: read ONLY for the two cycle-level lines' heartbeat. Nothing that scans, builds, prices or
+     * submits uses it — the cycle's {@code now} and {@link #submitClock} are those clocks.
+     */
+    Clock clock = Clock.systemUTC();
+    private String lastInfoScanLine;
+    private Instant lastInfoScanLineAt;
+    private List<String> lastInfoOrder;
+    private Instant lastInfoOrderAt;
+
+    void setClock(Clock clock) {
+        this.clock = clock;
+    }
+
+    /** Whether a cycle-level line last said at INFO at {@code lastAt} is an hour old at {@code at}. */
+    private static boolean heartbeatDue(Instant lastAt, Instant at) {
+        return Duration.between(lastAt, at).compareTo(CYCLE_LINE_HEARTBEAT) >= 0;
     }
 
     /**
@@ -745,7 +773,7 @@ public class LiquidationExecutor {
         }
 
         if (blockEventListener.getIsSyncing().get()) {
-            log.info("node is syncing, skipping...");
+            log.debug("node is syncing, skipping...");
             return WorkResult.DEFINITE_FAILURE;
         }
         // A new cycle: the convert route takes at most ONE Minswap pool snapshot from here on, shared
@@ -822,11 +850,14 @@ public class LiquidationExecutor {
         // READS ZERO. "settled" now asserts that those bonds' loans are GONE; `unreadable` is the
         // only thing that can contradict it, by showing a loan that is present and simply not
         // legible to us. The moment it is non-zero, the settled count is not trustworthy either.
-        log.info("liquidation scan: {} live bonds{}, {} buildable, exclusions {}{}",
-                liveBonds,
-                settled == 0 ? "" : " (%d settled — the bond outlives its loan)".formatted(settled),
-                buildable.size(), liveExclusions,
-                unreadable == 0
+        //
+        // FAB-183: INFO only when the line says something the last INFO scan line did not, or when that
+        // line is an hour old; DEBUG otherwise, same text. The stage runs on every block, and an
+        // unchanged world repeated three times a minute buries the lines that are news.
+        String scanLine = "liquidation scan: " + liveBonds + " live bonds"
+                + (settled == 0 ? "" : " (%d settled — the bond outlives its loan)".formatted(settled))
+                + ", " + buildable.size() + " buildable, exclusions " + liveExclusions
+                + (unreadable == 0
                         // Stated positively and only when it is true: the ABSENCE of a warning is not
                         // evidence, but an explicit zero is. It is what licenses reading the settled
                         // count as settled rather than as loans we merely cannot see.
@@ -836,6 +867,14 @@ public class LiquidationExecutor {
                         : " ⚠ %d LOAN UTXO(S) UNREADABLE — the settled count above is CONTAMINATED "
                                 .formatted(unreadable)
                                 + "and must not be read as loans that are simply gone");
+        Instant scanLineAt = clock.instant();
+        if (!scanLine.equals(lastInfoScanLine) || heartbeatDue(lastInfoScanLineAt, scanLineAt)) {
+            lastInfoScanLine = scanLine;
+            lastInfoScanLineAt = scanLineAt;
+            log.info("{}", scanLine);
+        } else {
+            log.debug("{}", scanLine);
+        }
 
         if (buildable.isEmpty()) {
             return WorkResult.DEFINITE_FAILURE;
@@ -947,7 +986,7 @@ public class LiquidationExecutor {
         final long committedSlot = blockEventListener.getLastCommittedSlot().get();
         long anchor = windowAnchorMillis(now, committedSlot, converters);
         if (anchor != now) {
-            log.info("validity window anchored to the last committed block ({} ms behind wall clock) — "
+            log.debug("validity window anchored to the last committed block ({} ms behind wall clock) — "
                     + "invalidBefore would otherwise sit ahead of the node's current slot", now - anchor);
         }
         final long validFromFloorMillis = anchor - VALID_FROM_BACKDATE_MILLIS;
@@ -1093,10 +1132,21 @@ public class LiquidationExecutor {
             rewards.put(assessment, expectedReward(assessment, client, now));
         }
         List<LiquidationAssessment> ordered = mostProfitableFirst(buildable, rewards::get);
-        log.info("liquidation order (most profitable first): {}", ordered.stream()
+        String orderLine = ordered.stream()
                 .map(assessment -> orderLabel(assessment) + rewards.get(assessment)
                         .map(reward -> " ≈" + reward + " lovelace").orElse(" unpriced"))
-                .collect(java.util.stream.Collectors.joining(", ")));
+                .collect(java.util.stream.Collectors.joining(", "));
+        // FAB-183: INFO only when the ORDER changed — the labels, in sequence; new estimates for the same
+        // order are not news — or when the last INFO order line is an hour old. DEBUG otherwise, same text.
+        List<String> order = ordered.stream().map(LiquidationExecutor::orderLabel).toList();
+        Instant orderAt = clock.instant();
+        if (!order.equals(lastInfoOrder) || heartbeatDue(lastInfoOrderAt, orderAt)) {
+            lastInfoOrder = order;
+            lastInfoOrderAt = orderAt;
+            log.info("liquidation order (most profitable first): {}", orderLine);
+        } else {
+            log.debug("liquidation order (most profitable first): {}", orderLine);
+        }
         return ordered;
     }
 

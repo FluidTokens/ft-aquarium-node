@@ -42,6 +42,9 @@ import org.springframework.beans.factory.ObjectProvider;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -4921,5 +4924,194 @@ class LiquidationExecutorTest {
                         .filter(event -> event.getLevel() == Level.ERROR)
                         .map(ILoggingEvent::getFormattedMessage).toList(),
                 "a feed window is not a machinery fault");
+    }
+
+    // ======================================================================================
+    // FAB-183: the cycle-level lines say news at INFO, and repetition at DEBUG
+    // ======================================================================================
+
+    /** The heartbeat clock's origin; unrelated to the cycle's own {@link #NOW}, which it never feeds. */
+    private static final Instant HEARTBEAT_T0 = Instant.parse("2026-11-01T00:00:00Z");
+
+    private record Line(Level level, String text) {
+    }
+
+    /**
+     * Every line {@code action} logs, at every level, in order. The executor's logger is held at DEBUG for
+     * the duration — a Spring test earlier in the same JVM may have left it at INFO — and restored after.
+     */
+    private static List<Line> linesOf(Runnable action) {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        Level previous = logger.getLevel();
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.DEBUG);
+        try {
+            action.run();
+        } finally {
+            logger.setLevel(previous);
+            logger.detachAppender(appender);
+        }
+        return appender.list.stream()
+                .map(event -> new Line(event.getLevel(), event.getFormattedMessage()))
+                .toList();
+    }
+
+    /** One cycle at {@code now}, with the heartbeat clock standing at {@code at}. */
+    private static List<Line> cycleAt(Wiring wiring, long now, Instant at) {
+        wiring.executor().setClock(Clock.fixed(at, java.time.ZoneOffset.UTC));
+        return linesOf(() -> wiring.executor().cycle(now));
+    }
+
+    /** The one line of {@code lines} starting {@code prefix}, at whatever level it was said. */
+    private static Line onlyLineStarting(List<Line> lines, String prefix) {
+        List<Line> matching = lines.stream().filter(line -> line.text().startsWith(prefix)).toList();
+        assertEquals(1, matching.size(), () -> "exactly one '" + prefix + "' line: " + lines);
+        return matching.getFirst();
+    }
+
+    private static Line scanLineOf(List<Line> lines) {
+        return onlyLineStarting(lines, "liquidation scan:");
+    }
+
+    private static Line orderLineOf(List<Line> lines) {
+        return onlyLineStarting(lines, "liquidation order (most profitable first): ");
+    }
+
+    /**
+     * FAB-183: the stage now runs on every block. An unchanged world, under a heartbeat clock that does
+     * not move, says its scan line at INFO once; the next cycle says the SAME text at DEBUG.
+     */
+    @Test
+    void anUnchangedWorldSaysItsScanLineAtInfoOnceThenAtDebugWithTheSameText() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+
+        Line first = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line second = scanLineOf(cycleAt(wiring, NOW + 20_000L, HEARTBEAT_T0));
+
+        assertEquals(Level.INFO, first.level(), "the first scan line of an executor is news");
+        assertEquals(new Line(Level.DEBUG, first.text()), second,
+                "an unchanged world is said again at DEBUG, with the same text");
+        assertTrue(first.text().contains("1 buildable"), first.text());
+    }
+
+    /** FAB-183: the heartbeat. An unchanged scan line is said at INFO again once an hour has passed — not at 59 min. */
+    @Test
+    void anUnchangedScanLineIsSaidAtInfoAgainAfterAnHourAndNotBefore() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+
+        assertEquals(Level.INFO, scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0)).level(), "the first");
+        assertEquals(Level.DEBUG, scanLineOf(cycleAt(wiring, NOW,
+                        HEARTBEAT_T0.plus(Duration.ofMinutes(59)))).level(),
+                "59 min after the last INFO scan line: not yet");
+        assertEquals(Level.INFO, scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0.plus(Duration.ofHours(1)))).level(),
+                "1 h after the last INFO scan line: the heartbeat");
+        assertEquals(Level.DEBUG, scanLineOf(cycleAt(wiring, NOW,
+                        HEARTBEAT_T0.plus(Duration.ofHours(1)).plus(Duration.ofMinutes(59)))).level(),
+                "the hour is measured from the heartbeat itself");
+    }
+
+    /** FAB-183: a new exclusion changes the scan line, and is said at INFO that very cycle. */
+    @Test
+    void aChangedExclusionIsSaidAtInfoThatCycle() {
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        List<LiquidationAssessment> scanned = new ArrayList<>(List.of(honest.assessment()));
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scanned, List.of(honest), false);
+
+        Line before = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line unchanged = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        scanned.add(LiquidationAssessment.excluded(honest.bond().bond(), honest.loan().loan(),
+                LiquidationExclusion.NOT_LIQUIDATABLE, "not late and currentLtv <= liquidationLtv"));
+        Line changed = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line again = scanLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+
+        assertEquals(Level.INFO, before.level());
+        assertEquals(Level.DEBUG, unchanged.level());
+        assertEquals(Level.INFO, changed.level(), "a new exclusion is news, with no wait for the heartbeat: "
+                + changed);
+        assertTrue(changed.text().contains("NOT_LIQUIDATABLE=1"), changed.text());
+        assertEquals(Level.DEBUG, again.level(), "and the new world, unchanged, is quiet again");
+    }
+
+    /** Two ranked candidates whose builds fail on purpose: only the order line is under test. */
+    private static Wiring rankedWiring(List<LiquidationAssessment> scanned) {
+        LiquidateTransactionBuilder builder = mock(LiquidateTransactionBuilder.class);
+        when(builder.build(any(LiquidateTransactionBuilder.Request.class)))
+                .thenThrow(new IllegalStateException("ordering probe: the build itself is not under test"));
+        List<Scenario> onChain = List.of(scenario(BigInteger.valueOf(100)), secondScenario());
+        return wiring(shadow(SMALL_MARGIN), scanned, onChain, allUnspent(onChain),
+                List.of(WALLET_UTXO, WALLET_UTXO_SMALL),
+                new CountingOracleProvider(new FakeOracleClient(List.of()), new FakeOracleClient(List.of())),
+                false, false, LoanFixtures.protocolParams(), null, builder, metrics());
+    }
+
+    /**
+     * FAB-183: the order line is news when the ORDER is. The same two refs in the same order with a new
+     * estimate for one of them — the 10-ada slice becoming a 20-ada one, still behind the 50-ada one —
+     * is said at DEBUG, with the new amounts in its text. An hour on, the same order is the heartbeat.
+     */
+    @Test
+    void theSameOrderWithNewAmountsIsSaidAtDebug() {
+        List<LiquidationAssessment> scanned = new ArrayList<>(List.of(
+                scenario(BigInteger.valueOf(100)).assessment(), secondScenario().assessment()));
+        Wiring wiring = rankedWiring(scanned);
+
+        Line first = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        scanned.set(0, scenario(BigInteger.valueOf(200)).assessment());
+        Line reprised = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line heartbeat = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0.plus(Duration.ofHours(1))));
+
+        assertEquals(new Line(Level.INFO, "liquidation order (most profitable first): "
+                + TX_LOAN_2 + "#0 ≈50000000 lovelace, " + TX_LOAN + "#0 ≈10000000 lovelace"), first);
+        assertEquals(new Line(Level.DEBUG, "liquidation order (most profitable first): "
+                        + TX_LOAN_2 + "#0 ≈50000000 lovelace, " + TX_LOAN + "#0 ≈20000000 lovelace"), reprised,
+                "same refs, same order, new amount: DEBUG, and the text still carries the new amount");
+        assertEquals(Level.INFO, heartbeat.level(), "an hour on, the unchanged order is the heartbeat");
+    }
+
+    /** FAB-183: a REORDERED order line is news, and is said at INFO that very cycle. */
+    @Test
+    void aReorderedOrderLineIsSaidAtInfo() {
+        List<LiquidationAssessment> scanned = new ArrayList<>(List.of(
+                scenario(BigInteger.valueOf(100)).assessment(), secondScenario().assessment()));
+        Wiring wiring = rankedWiring(scanned);
+
+        Line first = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        scanned.set(0, scenario(BigInteger.valueOf(900)).assessment());
+        Line reordered = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+        Line unchanged = orderLineOf(cycleAt(wiring, NOW, HEARTBEAT_T0));
+
+        assertEquals(Level.INFO, first.level());
+        assertEquals(new Line(Level.INFO, "liquidation order (most profitable first): "
+                        + TX_LOAN + "#0 ≈90000000 lovelace, " + TX_LOAN_2 + "#0 ≈50000000 lovelace"), reordered,
+                "the 90-ada slice now leads: a different order, said at INFO with no wait");
+        assertEquals(Level.DEBUG, unchanged.level(), "and the new order, unchanged, is quiet again");
+    }
+
+    /** FAB-183: the syncing line is DEBUG, same text. */
+    @Test
+    void theSyncingLineIsDebug() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), true);
+
+        List<Line> lines = cycleAt(wiring, NOW, HEARTBEAT_T0);
+
+        assertEquals(List.of(new Line(Level.DEBUG, "node is syncing, skipping...")), lines.stream()
+                        .filter(line -> line.text().equals("node is syncing, skipping...")).toList(),
+                "said once, at DEBUG: " + lines);
+    }
+
+    /** FAB-183: the anchored line is DEBUG, same text. */
+    @Test
+    void theAnchoredLineIsDebug() {
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), scenario(FAT_FEE_PER_MILLE), false);
+        wiring.blockEventListener().getLastCommittedSlot().set(slotAt(NOW - 100_000L));
+
+        Line anchored = onlyLineStarting(cycleAt(wiring, NOW, HEARTBEAT_T0),
+                "validity window anchored to the last committed block (");
+
+        assertEquals(Level.DEBUG, anchored.level(), anchored.text());
+        assertTrue(anchored.text().endsWith(" ms behind wall clock) — invalidBefore would otherwise sit "
+                + "ahead of the node's current slot"), anchored.text());
     }
 }
