@@ -49,7 +49,9 @@ import java.util.stream.Collectors;
  * A spent out-ref, an NFT the registry does not name, two entries expecting different NFTs at one out-ref,
  * an out-ref whose content is unknown, and any provider failure. Every one throws
  * {@link OracleReferenceInputNotLiveException}; nothing is held, so the candidate is probed again next cycle
- * (FAB-134 NQ: no quarantine).
+ * (FAB-134 NQ: no quarantine). The executor logs each at ERROR, except an out-ref whose content is unknown (not
+ * yet visible to this node, FAB-183): that one is marked {@code notYetVisible}, and the executor records it as a
+ * wait, REFUSED {@code ORACLE_INPUT_NOT_YET_VISIBLE} at INFO, keeping the nominated wallet utxo.
  *
  * <p>Holds a {@link UtxoService} — read-only, with no submission method — and no {@code BackendService}, so a
  * builder that holds this probe still has no path to the wire.

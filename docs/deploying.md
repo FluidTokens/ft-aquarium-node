@@ -70,13 +70,14 @@ once it has paid that fee** (about 1 ADA). Under current parameters a wallet hol
 `ANTICIPATE` token therefore needs **about 16.2 ADA**, and an ada-only wallet about 6.2 ADA; the exact
 figures move with the protocol parameters and with how many UTxOs the wallet holds (each one adds a
 little to the fee). A wallet carrying a very large bundle of other tokens can need more (§9). A wallet with less than that is not reshaped, and the node logs a
-`[REBALANCE] REFUSED: …` warning on every block until you add ada
+`[REBALANCE] REFUSED: …` warning on every pass in which the rebalancer runs until you add ada
 (an empty wallet logs `[REBALANCE] NOTHING_TO_DO: no input UTxOs…` instead).
 
 **⛔ Keep no reference-script or datum UTxO in this wallet.** A rebalance spends every UTxO the wallet
 holds, and its outputs carry no reference script and no datum — so a datum UTxO parked here is
 consumed and its datum is not recreated. A reference-script UTxO is expected to make **every**
-rebalance fail at submission instead (logged at ERROR on every block), so the wallet is never shaped.
+rebalance fail at submission instead (logged at ERROR on every pass in which the rebalancer runs), so the
+wallet is never shaped.
 
 **⛔ The wallet must hold no UTxO created before 2025-05-06.** The node reads its wallet **only from
 its own index**, and that index starts at mainnet slot `154984561` (2025-05-06). A UTxO created
@@ -299,7 +300,7 @@ never says `ARMED` while the rebalancer is idle, and it always says why it is id
 
 | state | what it means |
 |---|---|
-| `ARMED` | after each block, if the wallet has drifted out of shape, the node signs and submits one self-send of its whole wallet — in shadow as well as live |
+| `ARMED` | on each pass — after a committed block or an oracle price change — in which no liquidation or compound went out, if the wallet has drifted out of shape, the node signs and submits one self-send of its whole wallet, in shadow as well as live |
 | `IDLE` | rebalancing is allowed but nothing arms it: the liquidation mode is not shadow or live, no `action: ANTICIPATE` market has an effective mode of shadow or live, or the node is syncing. The line names which |
 | `SUSPENDED` | suspended from this page; nothing is rebalanced until it is resumed here or the node restarts |
 | `OFF` | `AQUARIUM_WALLET_REBALANCE_ENABLED` is `false`; this page cannot turn it on |
@@ -488,9 +489,13 @@ housekeeping, not liquidations.
    `mode`, capped by the node's (§9 above); an ADA-principal (`lovelace`) `ANTICIPATE` market counts;
 5. the node is not syncing (§6).
 
-Then, after every block the node commits, it reads the wallet from its index and, **if the wallet is
-out of shape, builds, signs and submits one self-send** that puts it back in shape. A node in
-`disabled` mode, or with no such market, never rebalances.
+**When it runs.** Rebalancing is the last stage of the node's wallet pipeline. A pass is triggered by a
+block the node has committed or by a change in the oracle prices, and runs **liquidation first, then
+compound, then rebalancing**, one pass at a time. A stage that sends a transaction ends the pass, so
+rebalancing runs only on a pass in which no liquidation or compound went out; otherwise it waits for the
+next trigger. On such a pass it reads the wallet from its index and, **if the wallet is out of shape,
+builds, signs and submits one self-send** that puts it back in shape. A node in `disabled` mode, or with
+no such market, never rebalances.
 
 **The shape.**
 
@@ -526,7 +531,8 @@ its own minimum ada is close to 10 ADA (around 30 spam tokens with long names), 
 refuses the build itself (`build failed: Not enough funds …`) until the change is larger than 10 ADA,
 so such a wallet still needs the old figure: the planned outputs plus a change above 10 ADA. When the wallet is short only of the change's minimum, the refusal names the exact
 shortfall (`… the wallet is short by N lovelace (N.NNNNNN ADA) for this shape; add at least that
-much`). Otherwise the self-send is not built, and the node logs a warning **on every block**:
+much`). Otherwise the self-send is not built, and the node logs a warning **on every pass in which the
+rebalancer runs**:
 
 ```
 [REBALANCE] REFUSED: … — the wallet is out of shape …; nothing signed or submitted
@@ -536,23 +542,26 @@ and **nothing is signed or submitted, so a refusal costs no fee.** The same warn
 transaction cannot be built to the exact shape — for example a bundle of other tokens so large that
 its minimum ada exceeds 10 ADA — or when it would exceed the ledger's size limits. Add ada, or remove
 the tokens that cannot be shaped, and the warnings stop. A wallet that is **empty** logs
-`[REBALANCE] NOTHING_TO_DO: no input UTxOs…` at WARN on every block instead, also submitting nothing.
+`[REBALANCE] NOTHING_TO_DO: no input UTxOs…` at WARN on every pass in which the rebalancer runs instead,
+also submitting nothing.
 
 **⛔ It spends the whole wallet.** Every UTxO under the wallet's payment key is an input — whatever
 its stake part — with no exception for reference scripts or datums, and every output goes to the
 wallet's base address carrying neither. **A datum UTxO in the bot wallet is consumed, and its datum
 is not recreated.** **A reference-script UTxO is expected to make every rebalance fail:** it is
 taken as an input, but the self-send is priced without the script's size, so the ledger is expected
-to reject it as underpriced — on every block, at ERROR — and the wallet never gets shaped. Keep both
-kinds elsewhere (§2).
+to reject it as underpriced — on every pass in which the rebalancer runs, at ERROR — and the wallet never
+gets shaped. Keep both kinds elsewhere (§2).
 
-**One rejected duplicate is expected; a rejection on every block is not.** There is no
-pending-transaction guard: if the next block still shows the old wallet, the same self-send is built
-and submitted again, and that duplicate is rejected and logged at ERROR as
-`[REBALANCE] submission rejected`. **A single such ERROR right after a successful rebalance is
-expected and harmless** — the same transaction can only be applied once. **The same ERROR on every
-block means something in the wallet is making the self-send fail** — a reference-script UTxO, for
-example — and needs your attention: suspend rebalancing, fix the wallet, resume.
+**A rejected duplicate is expected; a rejection on every pass in which the rebalancer runs is not.**
+There is no pending-transaction guard: if a later pass still reads the old wallet — the self-send has not
+yet landed in a block the node has indexed — the same self-send is built and submitted again, and that
+duplicate is rejected and logged at ERROR as `[REBALANCE] submission rejected`. **One such ERROR (or a
+few, one per pass that runs before the self-send lands) right after a successful rebalance is expected
+and harmless** — the same transaction can only be applied once. **The same ERROR on every pass in which
+the rebalancer runs, long after that, means something in the wallet is making the self-send fail** — a
+reference-script UTxO, for example — and needs your attention: suspend rebalancing, fix the wallet,
+resume.
 
 **Turning it off, or pausing it.**
 
@@ -677,7 +686,7 @@ new answer appears on the page after the next check, not when you reload it.
 To turn it off, set `AQUARIUM_VERSION_CHECK_ENABLED=false` in `docker/.env`. The node then logs one
 line at startup saying the check is off and never contacts GitHub.
 
-### The oracle stream (shadow)
+### The oracle stream
 
 On by default, the node also holds one WebSocket open to FluidTokens' oracle stream, which pushes prices
 after they change — FluidTokens checks for changes about once a minute, so a push can follow a change by up

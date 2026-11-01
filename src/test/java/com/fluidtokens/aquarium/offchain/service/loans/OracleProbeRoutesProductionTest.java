@@ -282,6 +282,8 @@ class OracleProbeRoutesProductionTest {
     private static final class PayInAdvanceRig extends Rig {
         LiquidatePayInAdvanceTransactionBuilder builder;
         OracleReferenceInputProbe probe;
+        /** Out-refs left out of the content source: this node cannot see them yet. */
+        final List<Utxo> unseen = new ArrayList<>();
 
         PayInAdvanceRig() throws Exception {
             super();
@@ -327,6 +329,7 @@ class OracleProbeRoutesProductionTest {
                     .amount(List.of(Amount.lovelace(BigInteger.valueOf(40_000_000L))))
                     .referenceScriptHash(PIA_ORACLE_SCRIPT_HASH).build());
             universe.addAll(walletUtxos);
+            universe.removeAll(unseen);
             UtxoSupplier contentHold = LoanFixtures.utxoSupplier(universe);
             ScriptSupplier noScripts = hash -> Optional.empty();
 
@@ -411,6 +414,35 @@ class OracleProbeRoutesProductionTest {
         rig.cycles(PIA_NOW, 2);
 
         assertRefusedAtErrorEveryCycle(rig, 2, PRINCIPAL_ORACLE_REF, PRINCIPAL_ORACLE_NFT);
+    }
+
+    /**
+     * FAB-183-3 audit residue (a), PIA: the principal leg's Charli3 provider out-ref ({@code 8e…#0}) is not in the
+     * content source, so its content is unknown — a fresher price announced a provider UTxO whose block this
+     * node has not stored yet. That is a WAIT: every cycle records REFUSED {@code ORACLE_INPUT_NOT_YET_VISIBLE},
+     * nothing is logged at ERROR, nothing is evaluated, and no wallet utxo is dropped.
+     */
+    @Test
+    void payInAdvanceAPrincipalProviderNotYetVisibleIsAWaitEveryCycleNeverAnError() throws Exception {
+        PayInAdvanceRig rig = new PayInAdvanceRig().allLive();
+        rig.unseen.add(PRINCIPAL_C3_UTXO);
+        rig.wire(AppConfig.LiquidationConfiguration.Mode.LIVE, List.of(ADA_WALLET, TOKEN_WALLET));
+
+        rig.cycles(PIA_NOW, 2);
+
+        List<LiquidationDecision> decisions = rig.decisions();
+        assertEquals(2, decisions.size(), "one decision per cycle: " + decisions);
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+            assertEquals("ORACLE_INPUT_NOT_YET_VISIBLE", decision.reason(), decision.detail());
+            assertTrue(decision.detail().contains(ref(PRINCIPAL_C3_REF)),
+                    "the detail names the unseen out-ref: " + decision.detail());
+        }
+        assertEquals(List.of(), rig.events.stream().filter(e -> e.getLevel() == Level.ERROR).toList(),
+                "a wait is never an ERROR");
+        assertEquals(0, rig.evaluations.get(), "nothing is evaluated");
+        assertEquals(0, rig.submissions.get(), "nor submitted");
+        assertFalse(rig.droppedAWalletUtxo(), "a wait drops no wallet utxo: " + rig.events);
     }
 
     /**

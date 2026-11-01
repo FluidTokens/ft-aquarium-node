@@ -478,6 +478,30 @@ class PreBuildRefusalProductionTest {
     }
 
     /**
+     * FAB-183-3 audit residue (b): {@code check-profitability=false} exempts the ABSOLUTE floor before the build
+     * as it does after it. Node and market LIVE, no margin, the absolute floor ON the fee slice — the boundary
+     * {@link #aCandidateWhoseFeeSliceEqualsTheAbsoluteFloorIsRefusedUnprofitableBeforeAnyCall} refuses with the
+     * check on. With it off the candidate is NOT refused UNPROFITABLE before the build: it is evaluated. Whatever
+     * the rig's post-build vetoes then say is not this test's question.
+     */
+    @Test
+    void checkProfitabilityOffExemptsTheAbsoluteFloorFromThePreBuildRefusal() throws Exception {
+        BigInteger feeSlice = plainFeeSlice();
+        assertEquals(BigInteger.valueOf(25_000_000L), feeSlice, "fixture: the plain candidate's fee slice");
+        var configuration = new AppConfig.LiquidationConfiguration(LIVE, 60, 120, 30, BigInteger.ZERO, 200, false,
+                feeSlice, LiquidateTransactionBuilder.ReferenceScripts.none());
+        configuration.setMarkets(List.of(market("lovelace", LIVE, AppConfig.LiquidationConfiguration.Action.ANTICIPATE)));
+        PlainRig rig = new PlainRig().wire(configuration);
+
+        rig.cycles(NOW, 1);
+
+        LiquidationDecision decision = rig.onlyDecision();
+        assertFalse(decision.outcome() == LiquidationDecision.Outcome.UNPROFITABLE && decision.txHash() == null,
+                "not a pre-build UNPROFITABLE: " + decision.detail());
+        assertTrue(rig.evaluations.get() >= 1, "the build was evaluated: " + decision.detail());
+    }
+
+    /**
      * (f, plain) The collateral feed's out-ref is unknown to the content source — a fresher price announced it
      * and this node has not stored its block yet. A WAIT: REFUSED ORACLE_INPUT_NOT_YET_VISIBLE on every block,
      * no ERROR, no wallet utxo dropped, and nothing evaluated.

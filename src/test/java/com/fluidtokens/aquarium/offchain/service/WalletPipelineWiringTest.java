@@ -49,9 +49,11 @@ import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayDeque;
 import java.util.Arrays;
@@ -75,6 +77,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -682,6 +685,73 @@ class WalletPipelineWiringTest {
             assertTrue(Math.abs(now.getValue() - wallClockAtCall.get()) <= 5_000L,
                     "the liquidation stage got now=" + now.getValue() + ", but the wall clock at the call read "
                             + wallClockAtCall.get());
+        });
+    }
+
+    /** A clock the test moves by hand: every read answers the instant it was last set to. */
+    static final class MutableClock extends Clock {
+
+        private volatile Instant instant;
+
+        MutableClock(Instant instant) {
+            this.instant = instant;
+        }
+
+        void advance(Duration by) {
+            instant = instant.plus(by);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return instant;
+        }
+    }
+
+    /**
+     * (k′) FAB-183-9 audit residue: the liquidation stage's {@code now} is read PER PASS, not once at construction.
+     * The service is built through its package-private {@link Clock} constructor over the container's backend and
+     * converters; between two passes the clock moves by a distinctive +7 000 ms, and each pass's {@code now} is the
+     * clock's reading at that pass. A {@code now} hoisted to construction would hand both passes the first reading,
+     * which {@link #theLiquidationStageGetsTheCurrentTime}'s 5 s tolerance cannot see.
+     */
+    @Test
+    void eachPassHandsTheLiquidationStageTheClocksReadingAtThatPass() {
+        Stages stages = new Stages(new RecordingTransactionManager());
+        MutableClock clock = new MutableClock(Instant.now());
+        runner(stages).run(context -> {
+            assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+            bind(stages, context);
+            WalletPipelineService service = new WalletPipelineService(context.getBean(BoundedBFBackendService.class),
+                    stages.liquidation, stages.compound, stages.housekeeping, context.getBean(CardanoConverters.class),
+                    context.getBeanProvider(FluidOracleClient.class), 10, 120, clock);
+            try {
+                long slot = slotAgo(context, Duration.ofMinutes(1));
+
+                long firstReading = clock.millis();
+                service.onCommit(block(slot, "e1".repeat(32)));
+                awaitCalls(stages, 3);
+                clock.advance(Duration.ofMillis(7_000));
+                long secondReading = clock.millis();
+                service.onCommit(block(slot + 1, "e2".repeat(32)));
+                awaitCalls(stages, 6);
+
+                ArgumentCaptor<Long> now = ArgumentCaptor.forClass(Long.class);
+                verify(stages.liquidation, times(2)).cycle(now.capture(), any());
+                assertEquals(List.of(firstReading, secondReading), now.getAllValues(),
+                        "each pass's now must be the clock's reading at that pass");
+            } finally {
+                service.stop();
+            }
         });
     }
 

@@ -2885,8 +2885,10 @@ class LiquidationReadinessControllerTest {
                                 "the node is syncing; rebalancing starts once it has caught up", true, false)),
                 new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW, null),
                         new LiquidationReadinessController.RebalanceView(true, false, "ARMED",
-                                "after each block, if the wallet has drifted out of shape, the node signs and "
-                                        + "submits one self-send of its whole wallet, in shadow as well as live",
+                                "on each pass — after a committed block or an oracle price change — in which "
+                                        + "no liquidation or compound went out, if the wallet has drifted out of "
+                                        + "shape, the node signs and submits one self-send of its whole wallet, in "
+                                        + "shadow as well as live",
                                 true, false)));
 
         for (Case c : cases) {

@@ -44,7 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link #processBlock} during Yaci's publish — at the chain tip that is INSIDE the block's database
  * transaction, before it commits. {@link #lastCommittedSlot} is written by {@link #processCommittedBlock}
  * only once that transaction has committed (or immediately, on the publish path that has none — see
- * {@code WalletRebalancer}'s class javadoc for both paths). The liquidation window is anchored to the
+ * {@code WalletPipelineService}'s class javadoc for both paths). The liquidation window is anchored to the
  * committed one.
  */
 @Service

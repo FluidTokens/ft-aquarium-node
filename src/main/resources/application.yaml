@@ -111,7 +111,7 @@ loans:
     source: ${LOANS_ORACLE_SOURCE:stream}
     # FluidTokens' oracle WebSocket, signed in with this wallet's stake key. Each push is parsed, compared
     # with the API and logged as one `[oracle-stream]` line; with `source: stream` it also feeds the
-    # prices (above), with `source: api` no decision reads it. On by default per Giovanni's 2026-10-29
+    # prices (above), with `source: api` nothing decides on it. On by default per Giovanni's 2026-10-29
     # ruling A2; it stays off when `loans.oracle.enabled` is false.
     stream:
       enabled: ${LOANS_ORACLE_STREAM_ENABLED:true}
@@ -291,13 +291,15 @@ loans:
     # FAB-145: the readiness page's USD is an ESTIMATE — ADA converted at this unit's (USDM) oracle price, 1 unit counted as $1. USDM only, never another token. Empty shows "USD unavailable".
     usd-reference-unit: ${LOANS_UI_USD_REFERENCE_UNIT:c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d}
 
-  # The wallet rebalancer (FAB-131): on every block, while the node is not syncing, it moves the bot
+  # The wallet rebalancer (FAB-131) is the wallet pipeline's housekeeping stage (FAB-183): on each pass
+  # in which no liquidation or compound went out, while the node is not syncing, it moves the bot
   # wallet into the FAB-130 shape with one self-send -- SIGNED AND SUBMITTED in shadow too (wallet
-  # housekeeping, not a liquidation). It runs AFTER that block's database transaction commits, never
-  # inside it. It acts only when at least one `action: ANTICIPATE` market has an EFFECTIVE mode of
-  # shadow or live -- the market's own `mode`, capped by `liquidation.mode` -- so a node at `disabled`,
-  # or one whose every ANTICIPATE market is `disabled`, does nothing, whatever this says. A wallet too
-  # small to shape is logged at WARN on every block and never submitted.
+  # housekeeping, not a liquidation). A pass is triggered by a committed block (offered only AFTER that
+  # block's database transaction commits, never inside it) or by an oracle price change. It acts only
+  # when at least one `action: ANTICIPATE` market has an EFFECTIVE mode of shadow or live -- the
+  # market's own `mode`, capped by `liquidation.mode` -- so a node at `disabled`, or one whose every
+  # ANTICIPATE market is `disabled`, does nothing, whatever this says. A wallet too small to shape is
+  # logged at WARN on every pass in which the rebalancer runs, and never submitted.
   wallet:
     rebalance:
       enabled: ${AQUARIUM_WALLET_REBALANCE_ENABLED:true}
@@ -629,7 +631,8 @@ loans:
   # collateral on the loans we index — so health is fully computable here.
   oracle:
     url: ${LOANS_ORACLE_URL:https://testapi.fluidtokens.com/get-oracle-tokens}
-    # The preview oracle WebSocket (shadow only, as in the base document; `enabled` is inherited).
+    # The preview oracle WebSocket. As in the base document, what it feeds follows `loans.oracle.source`
+    # (merged with the API's prices by default); `enabled` and `source` are inherited.
     stream:
       url: ${LOANS_ORACLE_STREAM_URL:wss://2tgda3mk4l.execute-api.eu-west-1.amazonaws.com/dev}
   ui:

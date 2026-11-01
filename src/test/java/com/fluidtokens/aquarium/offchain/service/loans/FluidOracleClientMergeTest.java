@@ -50,8 +50,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Per NFT a strictly newer {@code validFrom} wins from either source, an equal one with different content replaces
  * the held entry (a republication) and an identical one changes nothing, and an older one never wins (Giovanni A1,
- * 2026-10-31); an NFT stays held only while the API's last load or a CONNECTED stream's last push lists it; the change listener is told once per changing write; the load listener still hears the API's own entries; and
- * two writers racing never lose an update or publish a torn snapshot.
+ * 2026-10-31); an NFT stays held only while the API's last load or a CONNECTED stream's last push lists it; the
+ * change listener is told once per changing write; the load listener still hears the API's own entries; and two
+ * writers racing never lose an update or publish a torn snapshot.
  */
 class FluidOracleClientMergeTest {
 
@@ -324,6 +325,57 @@ class FluidOracleClientMergeTest {
         assertHeld(client, a, T0 + 100, 10, "the newest entry stays");
         assertEquals(REF_FIRST, ref(client.findEntryByOracleToken(a).orElseThrow()));
         assertEquals(List.of(), told, "nothing changed");
+    }
+
+    /** The mainnet NFT whose two committed registry snapshots differ only in {@code oracleVersion}. */
+    private static final AssetType REPUBLISHED_NFT =
+            new AssetType("93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b", "6f7261636c6546676c64");
+
+    /**
+     * FAB-183-1 r2 audit finding 1, on REAL registry content: between the two committed mainnet snapshots
+     * {@link #REPUBLISHED_NFT} keeps {@code validFrom} 1785332220000 and its whole feed, while {@code oracleVersion}
+     * goes from null to 1. Replayed API-only, and again with the second snapshot merged as a CONNECTED stream's push
+     * (which alone must replace the entry) before the API loads it too, the client answers as one that loaded only
+     * the second snapshot. A tie check narrowed to the feed would keep the superseded null version.
+     */
+    @Test
+    void aMainnetRepublicationThatChangesOnlyTheOracleVersionReplacesFromEitherSource() throws Exception {
+        JsonNode first = FluidOracleClientLoadPinTest.resource("/loans-v4/oracle-registry.json");
+        JsonNode second = FluidOracleClientLoadPinTest.resource("/loans-v4/mainnet-oracle-registry-2026-10-01.json");
+        var onlyFirst = client();
+        onlyFirst.load(first);
+        var fresh = client();
+        fresh.load(second);
+        OracleEntry was = onlyFirst.findEntryByOracleToken(REPUBLISHED_NFT).orElseThrow();
+        OracleEntry is = fresh.findEntryByOracleToken(REPUBLISHED_NFT).orElseThrow();
+        assertEquals(1_785_332_220_000L, was.feed().validFrom(), "fixture: the first snapshot's validFrom");
+        assertEquals(was.feed(), is.feed(), "fixture: the feed, validFrom included, does not move");
+        assertEquals(null, was.oracleVersion(), "fixture: no oracleVersion in the first snapshot");
+        assertEquals(Integer.valueOf(1), is.oracleVersion(), "fixture: oracleVersion 1 in the second");
+
+        var apiOnly = client();
+        apiOnly.load(first);
+        apiOnly.load(second);
+        assertSameAnswers(fresh, apiOnly, "API-only");
+        assertEquals(Integer.valueOf(1), apiOnly.findEntryByOracleToken(REPUBLISHED_NFT).orElseThrow().oracleVersion(),
+                "API-only: the republished oracleVersion");
+
+        var streamed = client();
+        streamed.load(first);
+        streamed.streamConnected(true);
+        streamed.mergeStreamPush(OracleRegistryParser.parse(second).entries(), Instant.now());
+        assertEquals(Integer.valueOf(1), streamed.findEntryByOracleToken(REPUBLISHED_NFT).orElseThrow().oracleVersion(),
+                "the push alone replaced the held entry");
+        for (OracleEntry e : fresh.entries()) {
+            assertEquals(fresh.findEntryByOracleToken(e.oracleToken()), streamed.findEntryByOracleToken(e.oracleToken()),
+                    "after the push: " + e.oracleToken().toUnit());
+        }
+        // The first snapshot still being the API's last load holds one NFT the second dropped; the poller's next
+        // load of the second snapshot (identical to what the push merged) is what makes the two clients comparable.
+        streamed.load(second);
+        assertSameAnswers(fresh, streamed, "stream push, then the API's load of the same snapshot");
+        assertEquals(Integer.valueOf(1), streamed.findEntryByOracleToken(REPUBLISHED_NFT).orElseThrow().oracleVersion(),
+                "stream: the republished oracleVersion");
     }
 
     // ======================================================================================

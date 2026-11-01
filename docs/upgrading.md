@@ -526,7 +526,9 @@ settings (the table above). The bot wallet now has one queue of work, a *pass*, 
 
 1. **Liquidation.** Candidates are tried most profitable first. **At most one liquidation per market
    per pass** — a market is the loan's principal asset — but several markets can each get one in the
-   same pass. A loan that fails is skipped and the market's next candidate is tried.
+   same pass. A loan that fails is skipped and the market's next candidate is tried. A submit whose
+   outcome is unknown (no definite refusal from Blockfrost) ends the liquidation stage for that pass,
+   other markets included, and compound and housekeeping wait for the next trigger.
 2. **Compound.**
 3. **Housekeeping** — the wallet rebalance described above.
 

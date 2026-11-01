@@ -36,13 +36,18 @@ import java.math.BigInteger;
  *                               veto chain, or because every veto passed and a submission was
  *                               attempted
  * @param expectedFeeLovelace    the liquidation fee slice priced through the collateral oracle;
- *                               null unless the transaction was built
+ *                               null unless the transaction was built, or the row is a pre-build
+ *                               {@code UNPROFITABLE} one (FAB-183), which carries it
  * @param txFeeLovelace          the fee the built body actually carries; null unless the
- *                               transaction was built
+ *                               transaction was built (so null on a pre-build {@code UNPROFITABLE}
+ *                               row)
  * @param marginLovelace         the configured profit margin subtracted from the fee value; null
- *                               unless the transaction was built
+ *                               unless the transaction was built, or the row is a pre-build
+ *                               {@code UNPROFITABLE} one, which carries it
  * @param expectedProfitLovelace {@code expectedFee - txFee - margin}; null unless the transaction
- *                               was built
+ *                               was built. A pre-build {@code UNPROFITABLE} row carries
+ *                               {@code feeSlice - margin} here instead: an UPPER bound, since no
+ *                               transaction fee exists to subtract
  * @param txHash                 null unless the transaction was built
  * @param txSizeBytes            serialised body+witnesses size; null unless the transaction was built
  * @param txCborHex              the whole unsigned transaction; null unless the transaction was built

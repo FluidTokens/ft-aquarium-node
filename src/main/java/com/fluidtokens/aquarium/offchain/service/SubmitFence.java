@@ -8,11 +8,15 @@ package com.fluidtokens.aquarium.offchain.service;
 public interface SubmitFence {
 
     /**
-     * @return {@code false} when the chain rolled back or the pass deadline passed, and nothing may
-     *         be transmitted
+     * @return {@code false} when the chain rolled back, the pass deadline passed, the engine is closing, or
+     *         the pass that handed out this fence is no longer the one running; nothing may then be
+     *         transmitted
      */
     boolean mayProceed();
 
-    /** Never closes: the timers' fence until the pipeline drives the stages (FAB-183-8). */
+    /**
+     * Never closes: the fence for callers outside the wallet pipeline (tests, and the {@code cycle()}
+     * conveniences of the liquidation and compound executors).
+     */
     SubmitFence OPEN = () -> true;
 }

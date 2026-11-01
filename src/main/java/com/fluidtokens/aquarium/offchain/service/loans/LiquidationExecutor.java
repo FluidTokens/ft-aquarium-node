@@ -1246,8 +1246,9 @@ public class LiquidationExecutor {
         }
 
         // ⛔ FAB-183 (A4) — REFUSALS DECIDED BEFORE THE BUILD. A build costs an oracle probe and a script
-        // evaluation on Blockfrost, and event-driven passes run far more often than the 60 s timer did, so
-        // a candidate whose refusal is already certain is refused here, before any of that is spent.
+        // evaluation on Blockfrost, and this stage now runs on every pipeline pass — per committed block and
+        // per oracle price change, no longer on a 60 s timer — so a candidate whose refusal is already
+        // certain is refused here, before any of that is spent.
         //
         // (1) A DISABLED market, plain and convert. It used to be built in full and only then vetoed S2
         // MARKET_NOT_LIVE. Pay-in-advance is excluded because MarketGate.decide already refuses it inside

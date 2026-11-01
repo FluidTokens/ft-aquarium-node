@@ -755,6 +755,13 @@ class MarketCoverageReporterTest {
                 });
     }
 
+    /** The reporter's wall clock, read off its private field: production offers no accessor for it. */
+    private static Clock clockOf(MarketCoverageReporter reporter) throws ReflectiveOperationException {
+        java.lang.reflect.Field field = MarketCoverageReporter.class.getDeclaredField("clock");
+        field.setAccessible(true);
+        return (Clock) field.get(reporter);
+    }
+
     /**
      * ⛔ <b>The WARN gate no longer reads the liquidation cadence.</b> Scans follow blocks and price
      * changes, so {@code loans.liquidation.delay-seconds} describes no interval the reporter is
@@ -790,6 +797,19 @@ class MarketCoverageReporterTest {
                     assertTrue(warnings(logged).isEmpty(),
                             () -> "the default gate is wall-clock time, and no time has passed: "
                                     + warnings(logged));
+                    // FAB-183-7 audit residue R1: the gate's clock is the system's, and it ADVANCES. A
+                    // clock frozen at construction would never see an episode outlast 80 s, and the
+                    // default unservable-market WARN would silently never fire in production.
+                    Clock clock = clockOf(context.getBean(MarketCoverageReporter.class));
+                    Instant first = clock.instant();
+                    assertTrue(Duration.between(first, Instant.now()).abs().compareTo(Duration.ofMinutes(1)) < 0,
+                            () -> "the container-built reporter's clock reads " + first + ", not now");
+                    Instant later = clock.instant();
+                    long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+                    while (!later.isAfter(first) && System.nanoTime() < deadline) {
+                        later = clock.instant();
+                    }
+                    assertTrue(later.isAfter(first), "the container-built reporter's clock advances");
                 });
 
         Constructor<?> injected = null;

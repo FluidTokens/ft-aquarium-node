@@ -1,4 +1,4 @@
-# The oracle stream (shadow)
+# The oracle stream
 
 For operators who see `[oracle-stream]` lines in their log and want to know what they are, or who want
 to turn the stream off. Nothing here needs action on a healthy node.
@@ -187,15 +187,16 @@ not that nothing happened.
 ## 9. The readiness page
 
 With the operator UI on (`LOANS_UI_ENABLED=true`, [deploying.md](deploying.md) §7), the readiness page
-shows one small grey line for the stream, ending `· no decision reads it`:
+shows one small grey line for the stream. Hovering it shows: `prices come from the stream and the API merged,
+newest per oracle wins; LOANS_ORACLE_SOURCE=api uses the API only`.
 
 | State | The line |
 |---|---|
-| off | `Oracle stream (shadow): off — <why>` |
-| connecting | `Oracle stream (shadow): connecting…` |
-| connected | `Oracle stream (shadow): connected <since> — no push yet (pushes arrive only when a price changes)`, or `… · last push <time> · <n> pushes` |
-| disconnected | `Oracle stream (shadow): disconnected (<reason>) — retrying at <time>` |
-| refused | `Oracle stream (shadow): refused <status> — <server's message> — retrying at <time>` |
+| off | `Oracle stream: off — <why>` |
+| connecting | `Oracle stream: connecting…` |
+| connected | `Oracle stream: connected <since> — no push yet (pushes arrive only when a price changes)`, or `… · last push <time> · <n> pushes` |
+| disconnected | `Oracle stream: disconnected (<reason>) — retrying at <time>` |
+| refused | `Oracle stream: refused <status> — <server's message> — retrying at <time>` |
 
 **`/healthcheck` never includes the stream.** A refused, disconnected or disabled stream cannot make the
 node report unhealthy, and nothing that restarts containers on `/healthcheck` will ever react to it.
@@ -210,8 +211,9 @@ node report unhealthy, and nothing that restarts containers on `/healthcheck` wi
 channels: every HTTP registry poll and every stream push.
 
 - **Newest wins.** For each oracle NFT, an entry replaces the one held only if its feed's `validFrom` is
-  strictly later. An entry with the same `validFrom` keeps the one already held, and an older one is ignored —
-  whichever channel it came from. There is no fallback to an older price when the newest has lapsed: that
+  strictly later, with one exception: an entry with the same `validFrom` but different content replaces the
+  one held (a republication); an identical one changes nothing; an older one is ignored — whichever channel it
+  came from. There is no fallback to an older price when the newest has lapsed: that
   oracle is then simply unusable until a newer one arrives, as before.
 - **What stays held.** An oracle stays only while the HTTP registry's last successful poll lists it, or the
   last push of a **connected** stream lists it. When the stream disconnects, an oracle only the stream listed

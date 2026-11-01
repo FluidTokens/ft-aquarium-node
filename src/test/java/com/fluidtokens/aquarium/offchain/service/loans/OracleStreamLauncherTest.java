@@ -70,12 +70,14 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * FAB-174: when the shadow oracle stream starts, and that starting it never touches production.
+ * FAB-174: when the oracle stream starts, and what its pushes may change (FAB-183-1: the default
+ * {@code loans.oracle.source=stream} merges them into the prices; {@code source=api} keeps them out).
  *
  * <p>Every OFF state says why in exactly one line and opens nothing; the one {@link FluidOracleClient} bean
- * stays the one bean and its prices and refresh time do not move while the shadow receives a push; {@code start}
- * returns at once; {@code stop} leaves no stream thread behind; and the shipped YAML and env-var binding are
- * pinned as shipped (officina {@code spring-boot-config-binding-traps} §4–§5).
+ * stays the one bean, and with {@code source=api} its prices and refresh time do not move while the stream
+ * receives a push; with {@code source=stream} a newer push changes that entry and a disconnect drops what only
+ * the stream held; {@code start} returns at once; {@code stop} leaves no stream thread behind; and the shipped
+ * YAML and env-var binding are pinned as shipped (officina {@code spring-boot-config-binding-traps} §4–§5).
  */
 class OracleStreamLauncherTest {
 

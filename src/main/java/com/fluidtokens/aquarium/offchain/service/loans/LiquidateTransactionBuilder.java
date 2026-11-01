@@ -712,8 +712,11 @@ public final class LiquidateTransactionBuilder {
         // ⛔ FAB-138: every oracle out-ref this body will reference must still be LIVE — asked once per
         // build, here, before any QuickTxBuilder build or evaluation. Spent, wrong NFT or a provider error
         // throws OracleReferenceInputNotLiveException, which the executor records REFUSED and logs at ERROR
-        // every cycle. After evaluation it would be too late: a spent feed comes back from Blockfrost as an
-        // empty ScriptFailures, which the executor reads as a spent WALLET input (CCL trap 13).
+        // every cycle. An out-ref whose content is unknown (not yet visible to this node) throws it marked
+        // notYetVisible instead: a wait, recorded REFUSED ORACLE_INPUT_NOT_YET_VISIBLE and logged at INFO,
+        // with the nominated wallet utxo kept (FAB-183). After evaluation it would be too late: a spent feed
+        // comes back from Blockfrost as an empty ScriptFailures, which the executor reads as a spent WALLET
+        // input (CCL trap 13).
         if (oracleReferenceInputProbe != null) {
             oracleReferenceInputProbe.requireLive(referencedOracles);
         }

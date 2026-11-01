@@ -1156,8 +1156,9 @@ class ReadinessTemplateRendersRowsTest {
                 com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW, null));
         String line = rebalanceLine(html);
 
-        assertTrue(text(line).contains("Wallet rebalancing: ARMED — after each block, if the wallet has drifted out of shape, the node signs "
-                + "and submits one self-send of its whole wallet, in shadow as well as live"), line);
+        assertTrue(text(line).contains("Wallet rebalancing: ARMED — on each pass — after a committed block or an oracle "
+                + "price change — in which no liquidation or compound went out, if the wallet has drifted out of shape, "
+                + "the node signs and submits one self-send of its whole wallet, in shadow as well as live"), line);
         assertTrue(line.contains("env default: on"), line);
         assertTrue(line.contains("suspended from this page: no"), line);
         assertOnlyForm(line, SUSPEND_PATH, "Suspend rebalancing");
