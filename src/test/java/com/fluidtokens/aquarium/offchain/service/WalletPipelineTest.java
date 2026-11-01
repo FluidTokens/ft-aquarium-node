@@ -451,6 +451,103 @@ class WalletPipelineTest {
         }
     }
 
+    // (h), literal: no rollback — a fence belongs to its pass, not only to its generation
+    @Test
+    void aFenceFromAnEndedPassAnswersFalseDuringTheNextPassOfTheSameGenerationWhileItsOwnAnswersTrue() throws Exception {
+        AtomicReference<SubmitFence> firstFence = new AtomicReference<>();
+        AtomicReference<Boolean> firstDuringItsOwnPass = new AtomicReference<>();
+        AtomicReference<Boolean> firstDuringSecondPass = new AtomicReference<>();
+        AtomicReference<Boolean> ownDuringSecondPass = new AtomicReference<>();
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (firstFence.compareAndSet(null, fence)) {
+                            firstDuringItsOwnPass.set(fence.mayProceed());
+                            return WorkResult.DEFINITE_FAILURE;
+                        }
+                        firstDuringSecondPass.set(firstFence.get().mayProceed());
+                        ownDuringSecondPass.set(fence.mayProceed());
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(1, "a");
+            h.awaitPasses(1);
+            h.barrier();
+            h.pipeline.offerBlock(2, "b");
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/1:a", "L 0/2:b"), h.calls());
+            assertEquals(0, h.pipeline.stateForTest().generation(), "no rollback happened");
+            assertEquals(Boolean.TRUE, firstDuringItsOwnPass.get());
+            assertEquals(Boolean.FALSE, firstDuringSecondPass.get());
+            assertEquals(Boolean.TRUE, ownDuringSecondPass.get());
+        }
+    }
+
+    @Test
+    void aPassesOwnFenceAnswersFalseOnceThePassHasEndedAndTheEngineIsIdle() throws Exception {
+        AtomicReference<SubmitFence> captured = new AtomicReference<>();
+        AtomicReference<Boolean> duringItsPass = new AtomicReference<>();
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        captured.set(fence);
+                        duringItsPass.set(fence.mayProceed());
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(1, "a");
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/1:a"), h.calls());
+            assertNull(h.pipeline.stateForTest().inFlight(), "the engine is idle");
+            assertFalse(h.pipeline.stateForTest().closed());
+            assertEquals(0, h.pipeline.stateForTest().generation(), "no rollback happened");
+            assertEquals(Boolean.TRUE, duringItsPass.get());
+            assertFalse(captured.get().mayProceed());
+        }
+    }
+
+    @Test
+    void aFenceFromAPassAnswersFalseDuringThePriceReRunOfTheSamePoint() throws Exception {
+        AtomicReference<SubmitFence> firstFence = new AtomicReference<>();
+        AtomicReference<Boolean> firstDuringReRun = new AtomicReference<>();
+        AtomicReference<Boolean> ownDuringReRun = new AtomicReference<>();
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (firstFence.compareAndSet(null, fence)) {
+                            return WorkResult.DEFINITE_FAILURE;
+                        }
+                        firstDuringReRun.set(firstFence.get().mayProceed());
+                        ownDuringReRun.set(fence.mayProceed());
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(5, "a");
+            h.awaitPasses(1);
+            h.barrier();
+            h.pipeline.offerPriceChange();
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/5:a", "L 0/5:a"), h.calls(), "the re-run is the very same point");
+            assertEquals(Boolean.FALSE, firstDuringReRun.get());
+            assertEquals(Boolean.TRUE, ownDuringReRun.get());
+        }
+    }
+
     // (i)
     @Test
     void theDeadlineExpiringJustBeforeASubmitClosesTheFenceAndOnlyTheLatestPendingPointIsKept() throws Exception {
@@ -748,6 +845,104 @@ class WalletPipelineTest {
         }
         assertTrue(server.done.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
         assertFalse(server.thread.isAlive());
+    }
+
+    // (n)
+    @Test
+    void aRollbackWhileCompoundRunsKeepsHousekeepingFromRunning() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Boolean> compoundFenceAfterRelease = new AtomicReference<>();
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> { h.record("L"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> {
+                        h.record("C");
+                        entered.countDown();
+                        assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        compoundFenceAfterRelease.set(fence.mayProceed());
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> { h.record("H"); return WorkResult.DEFINITE_FAILURE; });
+
+            h.pipeline.offerBlock(1, "a");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.rollback();
+            release.countDown();
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(Boolean.FALSE, compoundFenceAfterRelease.get());
+            assertEquals(List.of("L 0/1:a", "C 0/1:a"), h.calls(), "housekeeping never runs");
+            assertEquals(0, h.passesEnded.availablePermits());
+        }
+    }
+
+    // (o)
+    @Test
+    void theDeadlineExpiringWhileCompoundRunsKeepsHousekeepingFromRunning() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Boolean> compoundFenceAfterRelease = new AtomicReference<>();
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> { h.record("L"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> {
+                        h.record("C");
+                        entered.countDown();
+                        assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        compoundFenceAfterRelease.set(fence.mayProceed());
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> { h.record("H"); return WorkResult.DEFINITE_FAILURE; });
+
+            h.pipeline.offerBlock(1, "a");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.currentDeadline.get().expire();
+            release.countDown();
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(Boolean.FALSE, compoundFenceAfterRelease.get());
+            assertEquals(0, h.pipeline.stateForTest().generation(), "no rollback happened");
+            assertEquals(List.of("L 0/1:a", "C 0/1:a"), h.calls(), "housekeeping never runs");
+            assertEquals(0, h.passesEnded.availablePermits());
+        }
+    }
+
+    // (p)
+    @Test
+    void afterARollbackAnOlderSlotRunsBecauseOnlyACurrentGenerationInFlightPointCounts() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean first = new AtomicBoolean(true);
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (first.getAndSet(false)) {
+                            entered.countDown();
+                            assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(5, "a");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.rollback();
+            h.pipeline.offerBlock(3, "r");
+            assertEquals(new WalletPipeline.ChainPointView(1, 3, "r"), h.pipeline.stateForTest().pending(),
+                    "the old generation's in-flight slot 5 does not make slot 3 older");
+            release.countDown();
+            h.awaitPasses(2);
+            h.barrier();
+
+            assertEquals(List.of("L 0/5:a", "L 1/3:r"), h.calls());
+            assertEquals(0, h.passesEnded.availablePermits());
+            assertEquals(new WalletPipeline.ChainPointView(1, 3, "r"), h.pipeline.stateForTest().lastHandled());
+        }
     }
 
     private long count(Level level, String fragment) {

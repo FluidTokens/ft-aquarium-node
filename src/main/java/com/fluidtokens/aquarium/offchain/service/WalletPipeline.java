@@ -29,6 +29,11 @@ import java.util.function.Consumer;
  * {@code false} from then on and can never BEGIN a submit. A submit already in progress finishes,
  * and the next pass starts only after it returns, because there is one thread.</p>
  *
+ * <p>Each pass is numbered when it starts. A pass's fence reads {@code true} only while, under the
+ * lock, all four hold: its generation is current, its deadline has not expired, the engine is not
+ * closed, and it is still the pass running. So a fence that outlives its pass reads {@code false}
+ * even with no rollback — including during a price re-run of the very same point.</p>
+ *
  * <p>The deadline bounds Blockfrost calls made through {@link BoundedBFBackendService}; it cannot
  * preempt CPU work or local reads inside a stage. The hung-pass WARN is the only signal for those.</p>
  */
@@ -73,6 +78,8 @@ public final class WalletPipeline implements AutoCloseable {
     private boolean closed;
     private Instant passStartedAt;
     private boolean hungWarned;
+    private long passesStarted;
+    private long runningPass;
     private volatile Thread workerThread;
 
     public WalletPipeline(
@@ -208,6 +215,7 @@ public final class WalletPipeline implements AutoCloseable {
         workerThread = Thread.currentThread();
         while (true) {
             ChainPoint point;
+            long pass;
             synchronized (stateLock) {
                 if (closed) {
                     pending = null;
@@ -227,29 +235,32 @@ public final class WalletPipeline implements AutoCloseable {
                     return;
                 }
                 inFlight = point;
+                pass = ++passesStarted;
+                runningPass = pass;
                 passStartedAt = clock.instant();
                 hungWarned = false;
             }
 
-            runPass(point);
+            runPass(point, pass);
 
             synchronized (stateLock) {
                 if (point.generation() == generation) {
                     lastHandled = point;
                 }
                 inFlight = null;
+                runningPass = 0;
                 passStartedAt = null;
                 hungWarned = false;
             }
         }
     }
 
-    private void runPass(ChainPoint point) {
+    private void runPass(ChainPoint point, long pass) {
         log.debug("wallet pipeline: pass start at slot {} ({})", point.slot(), point.blockHash());
         try {
             deadlineScope.run(deadline -> {
                 try {
-                    runStages(point, deadline);
+                    runStages(point, pass, deadline);
                 } catch (Throwable failure) {
                     passFailed(point, failure);
                 }
@@ -260,8 +271,9 @@ public final class WalletPipeline implements AutoCloseable {
         log.debug("wallet pipeline: pass end at slot {} ({})", point.slot(), point.blockHash());
     }
 
-    private void runStages(ChainPoint point, BoundedBFBackendService.PassDeadline deadline) throws Exception {
-        SubmitFence fence = () -> mayProceed(point, deadline);
+    private void runStages(ChainPoint point, long pass, BoundedBFBackendService.PassDeadline deadline)
+            throws Exception {
+        SubmitFence fence = () -> mayProceed(point, pass, deadline);
 
         WorkResult liquidated = outcome(liquidation.run(fence));
         if (wentOut(liquidated)) {
@@ -286,9 +298,14 @@ public final class WalletPipeline implements AutoCloseable {
         housekeeping.run(fence);
     }
 
-    private boolean mayProceed(ChainPoint point, BoundedBFBackendService.PassDeadline deadline) {
+    /**
+     * A pass's fence: its generation is current, its deadline has not expired, the engine is not
+     * closed, and it is still the running pass (pass numbers start at 1; 0 means none is running).
+     */
+    private boolean mayProceed(ChainPoint point, long pass, BoundedBFBackendService.PassDeadline deadline) {
         synchronized (stateLock) {
-            return point.generation() == generation && !deadline.isExpired() && !closed;
+            return point.generation() == generation && !deadline.isExpired() && !closed
+                    && pass == runningPass;
         }
     }
 
