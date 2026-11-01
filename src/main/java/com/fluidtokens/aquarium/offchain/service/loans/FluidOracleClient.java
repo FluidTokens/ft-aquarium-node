@@ -18,10 +18,14 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -45,6 +49,15 @@ import java.util.concurrent.atomic.AtomicReference;
  * <b>Network caveat:</b> this endpoint serves <em>mainnet</em> assets. On preview most loan
  * collaterals will simply have no feed, and callers must treat a missing feed as "health
  * unknown" rather than as a zero price.
+ * <p>
+ * <b>One merged snapshot, two writers</b> (FAB-183). What every lookup reads is ONE immutable {@link Snapshot}
+ * keyed by oracle NFT, published through one reference. It is written by the API poller's {@link #load} and —
+ * when {@code loans.oracle.source} is {@code stream}, the default — by every parsed oracle-stream push
+ * ({@link #mergeStreamPush}) and connection change ({@link #streamConnected}), all under one lock. Per NFT the
+ * entry with the larger {@code feed.validFrom} wins and an equal one keeps the held entry (Giovanni A1,
+ * 2026-10-31: newest only, never a fallback to an older version). An NFT stays held only while the API's last
+ * load lists it or the last push of a CONNECTED stream lists it. With no push ever merged this is exactly the
+ * old replace-on-load, for any sequence of loads whose per-NFT {@code validFrom} never decreases.
  */
 @Service
 @Slf4j
@@ -53,15 +66,14 @@ public class FluidOracleClient {
 
     private final WebClient webClient;
 
-    private final AtomicReference<Map<AssetType, OracleEntry>> byToken = new AtomicReference<>(Map.of());
+    /**
+     * Everything a lookup reads, as of one write. ⛔ <b>Read it ONCE per call</b>: two reads of the reference can
+     * see two different writes, and their maps would then disagree.
+     */
+    private final AtomicReference<Snapshot> snapshot = new AtomicReference<>(Snapshot.EMPTY);
 
-    /** Same entries, keyed by the oracle's own NFT — the way a loan datum names its oracle. */
-    private final AtomicReference<Map<AssetType, OracleEntry>> byOracleToken = new AtomicReference<>(Map.of());
-
-    /** Every entry per priced token, for LOAN-FREE lookups that must choose among versions (A3). */
-    private final AtomicReference<Map<AssetType, List<OracleEntry>>> versionsByToken = new AtomicReference<>(Map.of());
-
-    private final AtomicReference<Instant> lastRefresh = new AtomicReference<>(Instant.EPOCH);
+    /** The three writers ({@link #load}, {@link #mergeStreamPush}, {@link #streamConnected}) take turns on it. */
+    private final Object writeLock = new Object();
 
     /** Last state warned about, per asset and warning kind — see {@link #warnOnce}. */
     private final java.util.Map<String, String> warnedStates = new java.util.concurrent.ConcurrentHashMap<>();
@@ -69,8 +81,10 @@ public class FluidOracleClient {
     /**
      * Told what every {@link #load} produced, once all of it is held. ⛔ <b>Read-only by construction</b>
      * (FAB-175): a listener receives the immutable entries and the very {@link Instant} stored as
-     * {@link #lastRefresh()}, after every map, the refresh time and the shape line are set, and each call is
+     * {@link #lastRefresh()}, after the snapshot and the shape line are set, and each call is
      * caught on its own — so a listener can neither change what the node prices with nor break the refresh.
+     * ⛔ The entries are the API payload's OWN (FAB-183), never the merged ones: after a stream push made a held
+     * entry newer, a listener still hears exactly what the API served.
      */
     @FunctionalInterface
     public interface LoadListener {
@@ -78,6 +92,49 @@ public class FluidOracleClient {
     }
 
     private final List<LoadListener> loadListeners = new CopyOnWriteArrayList<>();
+
+    /** Which writer changed the merged prices. */
+    public enum Source { API, STREAM }
+
+    /**
+     * Told after every write that changed the merged prices — an NFT added, removed or replaced — once, after the
+     * write's lock is released, on the writer's own thread, and each listener in its own catch. A write that
+     * changed nothing tells no one; a disconnect that drops stream-only NFTs reports {@link Source#STREAM}.
+     *
+     * <p>{@code streamConnected} is the stream's connection state as that write left it.
+     */
+    @FunctionalInterface
+    public interface ChangeListener {
+        void changed(Source source, Set<AssetType> changedOracleNfts, boolean streamConnected);
+    }
+
+    private final List<ChangeListener> changeListeners = new CopyOnWriteArrayList<>();
+
+    /**
+     * One write's whole state, immutable. Package-private only so a test may read it through {@link #snapshot()}.
+     *
+     * @param byOracleToken   the MERGED entries, keyed by oracle NFT — what every lookup prices from
+     * @param byToken         per priced token, the entry {@link #findEntry} returns (highest {@code oracleVersion})
+     * @param versionsByToken per priced token, every merged entry of it: API-payload order for the NFTs the API's
+     *                        last load listed, then stream-only NFTs by unit
+     * @param lastRefresh     when the API's last successful load was held; {@link Instant#EPOCH} before any
+     * @param apiEntries      the API's last successful load, its OWN parsed entries keyed by NFT, in payload order
+     * @param apiNfts         that load's NFT set
+     * @param streamNfts      the NFT set of the last parsed stream push; emptied by a disconnect
+     * @param streamConnected whether the stream is connected
+     */
+    record Snapshot(Map<AssetType, OracleEntry> byOracleToken,
+                    Map<AssetType, OracleEntry> byToken,
+                    Map<AssetType, List<OracleEntry>> versionsByToken,
+                    Instant lastRefresh,
+                    Map<AssetType, OracleEntry> apiEntries,
+                    Set<AssetType> apiNfts,
+                    Set<AssetType> streamNfts,
+                    boolean streamConnected) {
+
+        static final Snapshot EMPTY = new Snapshot(Map.of(), Map.of(), Map.of(), Instant.EPOCH, Map.of(), Set.of(),
+                Set.of(), false);
+    }
 
     public FluidOracleClient(@Value("${loans.oracle.url:https://api.fluidtokens.com/get-oracle-tokens}") String url) {
         this.webClient = WebClient.builder().baseUrl(url).build();
@@ -87,6 +144,11 @@ public class FluidOracleClient {
     /** Registers a {@link LoadListener}; listeners are told in registration order. */
     public void addLoadListener(LoadListener l) {
         loadListeners.add(l);
+    }
+
+    /** Registers a {@link ChangeListener}; listeners are told in registration order. */
+    public void addChangeListener(ChangeListener l) {
+        changeListeners.add(l);
     }
 
     @PostConstruct
@@ -120,7 +182,7 @@ public class FluidOracleClient {
         if (asset.isAda()) {
             return Optional.of(OraclePriceFeed.unit());
         }
-        List<OracleEntry> versions = versionsByToken.get().getOrDefault(asset, List.of());
+        List<OracleEntry> versions = snapshot.get().versionsByToken().getOrDefault(asset, List.of());
         if (versions.isEmpty()) {
             // Nothing loaded for it here — and the path a subclass that overrides findEntry takes.
             return findFeedIgnoringValidity(asset).filter(feed -> feed.usableAt(atMillis));
@@ -154,8 +216,9 @@ public class FluidOracleClient {
         if (token == null) {
             return Optional.empty();
         }
-        List<OracleEntry> versions = versionsByToken.get().getOrDefault(token, List.of());
-        return versions.isEmpty() ? Optional.ofNullable(byToken.get().get(token))
+        Snapshot held = snapshot.get();
+        List<OracleEntry> versions = held.versionsByToken().getOrDefault(token, List.of());
+        return versions.isEmpty() ? Optional.ofNullable(held.byToken().get(token))
                 : versions.stream().max(BY_VERSION);
     }
 
@@ -200,7 +263,7 @@ public class FluidOracleClient {
      */
     public Optional<OracleEntry> findEntryByOracleToken(AssetType oracleToken) {
         return oracleToken == null ? Optional.empty()
-                : Optional.ofNullable(byOracleToken.get().get(oracleToken));
+                : Optional.ofNullable(snapshot.get().byOracleToken().get(oracleToken));
     }
 
     /**
@@ -217,15 +280,29 @@ public class FluidOracleClient {
      * <p>Keyed by oracle NFT, so two versions of one token are two entries, which is the truth.
      */
     public Collection<OracleEntry> entries() {
-        return byOracleToken.get().values();
+        return snapshot.get().byOracleToken().values();
     }
 
+    /**
+     * ⛔ The API's OWN last successful load — its parsed entries, never merged values — for the stream's
+     * comparison, which judges the stream against what the API served.
+     */
+    Collection<OracleEntry> lastApiEntries() {
+        return snapshot.get().apiEntries().values();
+    }
+
+    /** For tests: the snapshot every lookup reads, as one write left it. */
+    Snapshot snapshot() {
+        return snapshot.get();
+    }
+
+    /** When the API's last successful load was held; {@link Instant#EPOCH} before any. */
     public Instant lastRefresh() {
-        return lastRefresh.get();
+        return snapshot.get().lastRefresh();
     }
 
     public int trackedAssets() {
-        return byToken.get().size();
+        return snapshot.get().byToken().size();
     }
 
     /**
@@ -233,7 +310,7 @@ public class FluidOracleClient {
      * this is larger than {@link #trackedAssets()} and the two must never be read as one number.
      */
     public int trackedOracles() {
-        return byOracleToken.get().size();
+        return snapshot.get().byOracleToken().size();
     }
 
     /**
@@ -259,10 +336,17 @@ public class FluidOracleClient {
         }
     }
 
-    /** Replaces the held entries with whatever parses out of a registry payload. */
+    /**
+     * Merges whatever parses out of a registry payload as {@link Source#API}: it becomes the API's last load, and
+     * each of its entries replaces the held one for its NFT unless that one is at least as new. The diagnostics,
+     * warnings and shape line are the payload's own, and so is what the {@link LoadListener}s are told.
+     *
+     * @return the payload's distinct priced tokens
+     */
     int load(JsonNode array) {
         var tokens = new HashMap<AssetType, OracleEntry>();
-        var oracleTokens = new HashMap<AssetType, OracleEntry>();
+        // In payload order, a duplicate NFT moved to where its last entry stands — the order of versionsPerToken.
+        var oracleTokens = new LinkedHashMap<AssetType, OracleEntry>();
         var versionsPerToken = new HashMap<AssetType, List<OracleEntry>>();
         array.forEach(node -> {
             // A condition the parse met is logged BEFORE this entry's own bookkeeping, so the log
@@ -280,7 +364,8 @@ public class FluidOracleClient {
 
                 // ⚠ What IS a conflict: two entries naming the SAME oracle NFT. A loan names its oracle by
                 // that NFT, so two of them make "the oracle this loan uses" ambiguous.
-                OracleEntry displaced = oracleTokens.put(entry.oracleToken(), entry);
+                OracleEntry displaced = oracleTokens.remove(entry.oracleToken());
+                oracleTokens.put(entry.oracleToken(), entry);
                 if (displaced != null) {
                     // Keep the per-token versions consistent with the NFT map (last wins): the displaced
                     // entry must not stay selectable, nor count as a second "version" (audit finding 9).
@@ -293,22 +378,141 @@ public class FluidOracleClient {
             });
         });
         warnOnVersionPriceDisagreement(versionsPerToken, System.currentTimeMillis());
-        byToken.set(Map.copyOf(tokens));
-        byOracleToken.set(Map.copyOf(oracleTokens));
-        var versions = new HashMap<AssetType, List<OracleEntry>>();
-        versionsPerToken.forEach((token, list) -> versions.put(token, List.copyOf(list)));
-        versionsByToken.set(Map.copyOf(versions));
-        Instant now = Instant.now();
-        lastRefresh.set(now);
-        reportShapeOnChange(oracleTokens.size(), tokens.size(),
-                (int) versionsPerToken.values().stream().filter(v -> v.size() > 1).count());
-        notifyLoadListeners(now);
+        Map<AssetType, OracleEntry> apiEntries = Collections.unmodifiableMap(new LinkedHashMap<>(oracleTokens));
+        Instant now;
+        Snapshot written;
+        Set<AssetType> changed;
+        synchronized (writeLock) {
+            now = Instant.now();
+            Snapshot previous = snapshot.get();
+            written = merge(previous, apiEntries.values(), now, apiEntries, previous.streamNfts(),
+                    previous.streamConnected());
+            changed = changedNfts(previous, written);
+            reportShapeOnChange(oracleTokens.size(), tokens.size(),
+                    (int) versionsPerToken.values().stream().filter(v -> v.size() > 1).count());
+        }
+        // ⛔ The API's own entries, never the merged ones: the stream's comparison judges the stream against them.
+        notifyLoadListeners(List.copyOf(apiEntries.values()), now);
+        notifyChangeListeners(Source.API, changed, written.streamConnected());
         return tokens.size();
     }
 
+    /**
+     * Merges one parsed stream push as {@link Source#STREAM}, and records its NFT set: while the stream is
+     * connected, an NFT that push lists stays held even when the API's last load does not list it.
+     *
+     * @param at when the push arrived (said for the caller's record; the merge reads only {@code validFrom})
+     */
+    void mergeStreamPush(Collection<OracleEntry> entries, Instant at) {
+        var pushed = new LinkedHashMap<AssetType, OracleEntry>();
+        entries.forEach(entry -> pushed.put(entry.oracleToken(), entry)); // the last of two for one NFT, as load()
+        Snapshot written;
+        Set<AssetType> changed;
+        synchronized (writeLock) {
+            Snapshot previous = snapshot.get();
+            written = merge(previous, pushed.values(), previous.lastRefresh(), previous.apiEntries(),
+                    Set.copyOf(pushed.keySet()), previous.streamConnected());
+            changed = changedNfts(previous, written);
+        }
+        notifyChangeListeners(Source.STREAM, changed, written.streamConnected());
+    }
+
+    /**
+     * Records the stream's connection state. ⛔ A disconnect empties the last push's NFT set, so the NFTs only
+     * the stream listed are dropped at once, and a push from a connection that has ended never holds an entry
+     * again.
+     */
+    void streamConnected(boolean connected) {
+        Snapshot written;
+        Set<AssetType> changed;
+        synchronized (writeLock) {
+            Snapshot previous = snapshot.get();
+            written = merge(previous, List.of(), previous.lastRefresh(), previous.apiEntries(),
+                    connected ? previous.streamNfts() : Set.of(), connected);
+            changed = changedNfts(previous, written);
+        }
+        notifyChangeListeners(Source.STREAM, changed, written.streamConnected());
+    }
+
+    /**
+     * ⛔ Under {@link #writeLock} only. Merges {@code incoming} into {@code previous} and publishes the result.
+     *
+     * <p><b>Merge:</b> an incoming entry replaces the held one for its NFT iff there is none or its
+     * {@code feed().validFrom()} is STRICTLY greater; an equal one keeps the held entry. <b>Membership:</b> then
+     * the merged map keeps exactly the API's last-load NFTs, plus the last push's NFTs while the stream is
+     * connected.
+     */
+    private Snapshot merge(Snapshot previous, Collection<OracleEntry> incoming, Instant lastRefresh,
+                           Map<AssetType, OracleEntry> apiEntries, Set<AssetType> streamNfts, boolean connected) {
+        var merged = new HashMap<>(previous.byOracleToken());
+        for (OracleEntry entry : incoming) {
+            OracleEntry held = merged.get(entry.oracleToken());
+            if (held == null || entry.feed().validFrom() > held.feed().validFrom()) {
+                merged.put(entry.oracleToken(), entry);
+            }
+        }
+        merged.keySet().removeIf(nft -> !apiEntries.containsKey(nft) && !(connected && streamNfts.contains(nft)));
+        Snapshot written = derive(merged, lastRefresh, apiEntries, streamNfts, connected);
+        snapshot.set(written);
+        return written;
+    }
+
+    /**
+     * The snapshot of a merged map: the per-token version lists (API-payload order for the NFTs the API listed,
+     * then stream-only NFTs by unit) and, per token, the entry {@link #findEntry} returns. Pure.
+     */
+    private static Snapshot derive(Map<AssetType, OracleEntry> merged, Instant lastRefresh,
+                           Map<AssetType, OracleEntry> apiEntries, Set<AssetType> streamNfts, boolean connected) {
+        var order = new ArrayList<AssetType>();
+        apiEntries.keySet().stream().filter(merged::containsKey).forEach(order::add);
+        merged.keySet().stream().filter(nft -> !apiEntries.containsKey(nft))
+                .sorted(java.util.Comparator.comparing(AssetType::toUnit))
+                .forEach(order::add);
+        var perToken = new LinkedHashMap<AssetType, List<OracleEntry>>();
+        order.forEach(nft -> {
+            OracleEntry entry = merged.get(nft);
+            perToken.computeIfAbsent(entry.token(), k -> new ArrayList<>()).add(entry);
+        });
+        var versions = new HashMap<AssetType, List<OracleEntry>>();
+        var tokens = new HashMap<AssetType, OracleEntry>();
+        perToken.forEach((token, list) -> {
+            versions.put(token, List.copyOf(list));
+            tokens.put(token, list.stream().max(BY_VERSION).orElseThrow());
+        });
+        return new Snapshot(Map.copyOf(merged), Map.copyOf(tokens), Map.copyOf(versions), lastRefresh, apiEntries,
+                Set.copyOf(apiEntries.keySet()), Set.copyOf(streamNfts), connected);
+    }
+
+    /** The NFTs one write added, removed or replaced. */
+    private static Set<AssetType> changedNfts(Snapshot before, Snapshot after) {
+        var changed = new HashSet<AssetType>();
+        before.byOracleToken().forEach((nft, entry) -> {
+            if (!entry.equals(after.byOracleToken().get(nft))) {
+                changed.add(nft);
+            }
+        });
+        after.byOracleToken().keySet().stream()
+                .filter(nft -> !before.byOracleToken().containsKey(nft))
+                .forEach(changed::add);
+        return Set.copyOf(changed);
+    }
+
+    /** After the lock is released, on the writer's thread; each listener in its own catch, as the load listeners. */
+    private void notifyChangeListeners(Source source, Set<AssetType> changed, boolean streamConnected) {
+        if (changed.isEmpty()) {
+            return;
+        }
+        for (ChangeListener listener : changeListeners) {
+            try {
+                listener.changed(source, changed, streamConnected);
+            } catch (RuntimeException e) {
+                log.warn("oracle change listener failed ({})", e.getClass().getSimpleName());
+            }
+        }
+    }
+
     /** Each listener in its own catch: one that throws is named by its exception's class and skipped. */
-    private void notifyLoadListeners(Instant loadedAt) {
-        Collection<OracleEntry> entries = byOracleToken.get().values();
+    private void notifyLoadListeners(Collection<OracleEntry> entries, Instant loadedAt) {
         for (LoadListener listener : loadListeners) {
             try {
                 listener.loaded(entries, loadedAt);

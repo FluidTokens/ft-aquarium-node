@@ -105,9 +105,14 @@ loans:
   oracle:
     enabled: ${LOANS_ORACLE_ENABLED:true}
     url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
-    # FluidTokens' oracle WebSocket, signed in with this wallet's stake key. SHADOW ONLY: each push is
-    # parsed and logged as one `[oracle-stream]` line, and no decision reads it. On by default per
-    # Giovanni's 2026-10-29 ruling A2; it stays off when `loans.oracle.enabled` is false.
+    # Where prices come from. `stream` (the default): stream pushes and API polls are merged, and per
+    # oracle NFT the entry with the newest `validFrom` wins. `api`: the emergency lever — API polls only,
+    # and the stream stays a shadow that nothing reads. Any other value is refused with a WARN and means `api`.
+    source: ${LOANS_ORACLE_SOURCE:stream}
+    # FluidTokens' oracle WebSocket, signed in with this wallet's stake key. Each push is parsed, compared
+    # with the API and logged as one `[oracle-stream]` line; with `source: stream` it also feeds the
+    # prices (above), with `source: api` no decision reads it. On by default per Giovanni's 2026-10-29
+    # ruling A2; it stays off when `loans.oracle.enabled` is false.
     stream:
       enabled: ${LOANS_ORACLE_STREAM_ENABLED:true}
       url: ${LOANS_ORACLE_STREAM_URL:wss://25mxd4whnj.execute-api.eu-west-1.amazonaws.com/prod}

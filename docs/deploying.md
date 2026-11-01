@@ -683,9 +683,10 @@ On by default, the node also holds one WebSocket open to FluidTokens' oracle str
 after they change — FluidTokens checks for changes about once a minute, so a push can follow a change by up
 to about 60 s. It signs in with the wallet's own stake key — it sends the stake address, the stake public
 key, the time and a signature, and no new secret is involved — and FluidTokens allows one connection per
-staking bond. It is a **shadow**: each push is only logged as an `[oracle-stream]` line, and no decision
-reads it; prices still come from the HTTP registry. To turn it off, set `LOANS_ORACLE_STREAM_ENABLED=false`
-in `docker/.env`.
+staking bond. By default prices now come from the stream and the HTTP registry merged: for each oracle the
+newer price wins, whichever channel brought it, and the node keeps polling the registry as before. To return
+to prices from the HTTP registry alone, set `LOANS_ORACLE_SOURCE=api` in `docker/.env`; the stream then
+stays a shadow that is only logged. To turn the stream off entirely, set `LOANS_ORACLE_STREAM_ENABLED=false`.
 Every log line, metric and refusal is explained in [oracle-stream.md](oracle-stream.md).
 
 ---
