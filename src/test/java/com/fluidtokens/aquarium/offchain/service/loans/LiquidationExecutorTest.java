@@ -4815,6 +4815,74 @@ class LiquidationExecutorTest {
     }
 
     /**
+     * FAB-183-2 audit residue (R1): the PRINCIPAL leg counts too. A token principal (USDM-shaped) against a
+     * token collateral, and it is the principal's feed that is the fresher one — it opened 10.5 s before the
+     * anchor, the collateral's 20.5 s before. Both sit inside the 30-second backdate, so the start must be
+     * raised to the NEWEST of them: the first whole slot at or after the principal feed's {@code validFrom}.
+     * Every other window test here lends ada, which is why dropping the principal leg from
+     * {@code nonAdaLegFeeds} used to survive the suite; here it would hand {@code anchor − 20 s} instead.
+     */
+    @Test
+    void aTokenPrincipalsFresherFeedRaisesTheStartAboveTheCollaterals() {
+        long committedSlot = slotAt(NOW - 5_000L);
+        long anchor = millisOfSlot(committedSlot);
+        long principalValidFrom = anchor - 10_500L;
+        long collateralValidFrom = anchor - 20_500L;
+
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN_2, PRINCIPAL_TOKEN_2_ORACLE_NFT,
+                BigInteger.valueOf(2_000_000L), BigInteger.ZERO,
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, ORACLE_TOKEN), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN, 0, LOAN_ID, datum, 2_000_000L,
+                List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.bondDatum(FAT_FEE_PER_MILLE, LoanFixtures.inlineKeyStakeCredential(STAKE_KEY),
+                        PRINCIPAL_TOKEN_2),
+                2_000_000L);
+        Scenario scenario = new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                principalFeed(), collateralFeed(), VALID_FROM));
+        OracleEntry freshPrincipal = LoanFixtures.charli3(PRINCIPAL_TOKEN_2, PRINCIPAL_TOKEN_2_ORACLE_NFT,
+                PRINCIPAL_TOKEN_2_CREDENTIAL, OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN_2,
+                        BigInteger.valueOf(5), BigInteger.ONE, principalValidFrom, principalValidFrom + 600_000L),
+                LoanFixtures.input(TX_PRINCIPAL_ORACLE_NFT, 0), LoanFixtures.input(TX_PRINCIPAL_ORACLE_SCRIPT, 0),
+                LoanFixtures.input(TX_PRINCIPAL_C3_PROVIDER, 0));
+
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        java.util.concurrent.atomic.AtomicReference<LiquidateTransactionBuilder.Request> handed =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        LiquidateTransactionBuilder plainBuilder = mock(LiquidateTransactionBuilder.class);
+        when(plainBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenAnswer(invocation -> {
+            handed.set(invocation.getArgument(0));
+            throw new IllegalStateException("captured the window; the build is not under test here");
+        });
+        FakeOracleClient client = new FakeOracleClient(List.of(freshPrincipal,
+                collateralOracleOpeningAt(collateralValidFrom)));
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        blockEventListener.getLastCommittedSlot().set(committedSlot);
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT,
+                new FakeScanner(List.of(scenario.assessment())),
+                new FakeResolver(allUnspent(List.of(scenario))), plainBuilder,
+                new WindowCapturingPayInAdvanceRouter(configuration, List.of(CONFIG_UTXO, LM_CONFIG_UTXO,
+                        WALLET_UTXO, loan.utxo(), bond.utxo())),
+                new WindowCapturingConvertRouter(), LoanFixtures.registry(), log, metrics(),
+                new CountingOracleProvider(client, client), previewNetwork(), LoanFixtures.protocolParams(),
+                LoanFixtures.converters(), EXPLODING_SUBMITTER);
+
+        executor.cycle(NOW);
+
+        assertNotNull(handed.get(), "the plain route was never reached: " + log.newestFirst(10));
+        long start = handed.get().validFromMillis();
+        assertEquals(anchor - 10_000L, start,
+                "the first whole slot at or after the PRINCIPAL feed's validFrom " + principalValidFrom);
+        assertTrue(start >= principalValidFrom, "the transaction must not open before the principal feed");
+        assertTrue(start <= anchor, "and must never open ahead of the chain");
+        assertNotEquals(anchor - 20_000L, start, "the collateral feed alone, as if the principal leg were dropped");
+    }
+
+    /**
      * The convert route's new window guard ({@code ConvertLiquidationRouter.FeedWindowException}) is a
      * per-block timing fact, not machinery: recorded {@code CONVERT_FEED_WINDOW} at INFO, never ERROR, and
      * reconsidered on the next cycle. The THROW side is pinned in {@code ConvertLiquidationRouterTest}.

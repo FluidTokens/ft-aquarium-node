@@ -29,6 +29,8 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.ObjectProvider;
@@ -289,6 +291,28 @@ public class LiquidationExecutor {
     @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
         this.lendingConfigGate = gate;
+    }
+
+    /**
+     * FAB-183 (A2): the ledger's rejection of a transaction whose validity interval has not opened at the
+     * validating node's slot, matched with all whitespace removed (it reaches us inside a JSON body).
+     */
+    static final String OUTSIDE_VALIDITY_INTERVAL_MARKER = "OutsideValidityInterval";
+
+    /** The counter those rejections are counted on. */
+    static final String OUTSIDE_VALIDITY_COUNTER = "aquarium.liquidation.submit.outside.validity";
+
+    /** Null without a registry. */
+    private Counter outsideValidityRejections;
+
+    /** Optional: a node without a {@link MeterRegistry} still logs every rejection, it just does not count it. */
+    @Autowired(required = false)
+    public void setMeterRegistry(MeterRegistry meterRegistry) {
+        this.outsideValidityRejections = meterRegistry == null ? null
+                : Counter.builder(OUTSIDE_VALIDITY_COUNTER)
+                        .description("liquidation submissions rejected OutsideValidityInterval, retried on the "
+                                + "next block")
+                        .register(meterRegistry);
     }
 
     /** True, and logged once, when the Lending v4 config gate is closed. */
@@ -1094,6 +1118,41 @@ public class LiquidationExecutor {
             return;
         }
 
+        // ⛔ FAB-183 (A4) — REFUSALS DECIDED BEFORE THE BUILD. A build costs an oracle probe and a script
+        // evaluation on Blockfrost, and event-driven passes run far more often than the 60 s timer did, so
+        // a candidate whose refusal is already certain is refused here, before any of that is spent.
+        //
+        // (1) A DISABLED market, plain and convert. It used to be built in full and only then vetoed S2
+        // MARKET_NOT_LIVE. Pay-in-advance is excluded because MarketGate.decide already refuses it inside
+        // its router, before that route builds anything, with its own recorded text.
+        boolean payInAdvance = isPayInAdvanceRoute(assessment);
+        AssetType principal = assessment.loan().datum().principalAsset();
+        AppConfig.LiquidationConfiguration.Mode marketMode = new MarketGate(configuration).effectiveMode(principal);
+        if (!payInAdvance && marketMode == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
+            String detail = "market %s is DISABLED (node mode %s), so the bot does nothing in it — refused before "
+                    .formatted(principal == null ? "<unknown>" : principal.toUnit(), configuration.getMode())
+                    + "any build";
+            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                    "MARKET_DISABLED", detail));
+            log.info("the liquidation of {} was refused: {}", loanUtxoRef, detail);
+            return;
+        }
+        // (2) Certainly unprofitable, plain route only, and only where S3 would certainly be reached and
+        // certainly refuse: node AND market LIVE (S1/S2 pass), ignore-profit-check off. SHADOW keeps
+        // building — it is the rehearsal — and so does every borderline candidate.
+        if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()
+                && configuration.getMode() == AppConfig.LiquidationConfiguration.Mode.LIVE
+                && marketMode == AppConfig.LiquidationConfiguration.Mode.LIVE
+                && !configuration.isIgnoreProfitCheck()) {
+            LiquidationDecision unprofitable = certainlyUnprofitable(assessment, now, oraclesByUnit);
+            if (unprofitable != null) {
+                decisionLog.record(unprofitable);
+                log.info("the liquidation of {} was refused as UNPROFITABLE: {}", loanUtxoRef,
+                        unprofitable.detail());
+                return;
+            }
+        }
+
         // ⛔ FAB-183 — THE START IS NO EARLIER THAN THE NEWEST FEED THIS TRANSACTION CARRIES.
         //
         // The validator enforces the feed window at BOTH ends (lib/fluidtokens/oracle.ak:
@@ -1287,6 +1346,12 @@ public class LiquidationExecutor {
                             loanUtxoRef, e.getMessage());
                     return;
                 } catch (Exception e) {
+                    // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
+                    OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
+                    if (wait != null) {
+                        refuseNotYetVisible(assessment, now, wait);
+                        return;
+                    }
                     // ⚠ WHAT IS LEFT HERE IS A GENUINE MACHINERY FAULT, and that is the point of the
                     // four catches above: this branch used to swallow every verdict on the convert
                     // route as well, so "the pool cannot fill the debt" and "the bot is broken" reached
@@ -1418,6 +1483,12 @@ public class LiquidationExecutor {
                         e.getMessage(), e.getMessage()));
                 return;
             } catch (Exception e) {
+                // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
+                OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
+                if (wait != null) {
+                    refuseNotYetVisible(assessment, now, wait);
+                    return;
+                }
                 // A genuine builder failure, treated exactly as the plain path's machinery-failure
                 // branch: rebuilt next cycle and logged at ERROR on every cycle (FAB-134 NQ — a
                 // candidate the bot should liquidate but cannot is a bug, and a bug that goes quiet
@@ -1508,6 +1579,12 @@ public class LiquidationExecutor {
                 }
                 return;
             } catch (Exception e) {
+                // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
+                OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
+                if (wait != null) {
+                    refuseNotYetVisible(assessment, now, wait);
+                    return;
+                }
                 // Anything else is a failure of the machinery rather than a verdict on the candidate —
                 // a Blockfrost timeout fetching protocol params, say. Rebuilt next cycle and logged at
                 // ERROR on every cycle (FAB-134 NQ). Same rule as the convert branch: surface the whole
@@ -1536,6 +1613,106 @@ public class LiquidationExecutor {
             return;
         }
         walletEffects.accept(spentInputEffect(nominated[0], verdict.get().rejection()));
+    }
+
+    /**
+     * FAB-183 (A4). The UNPROFITABLE row for a plain candidate whose fee slice already fails S3 whatever
+     * the transaction fee turns out to be, or null when it may clear — or when the bound cannot be computed,
+     * in which case the candidate is built exactly as before.
+     *
+     * <p>The bound: {@code record()}'s {@code floorProfit = feeSlice − txFee − minAdaFunded}, a balanced body's
+     * fee is at least {@code minFeeB} (so ≥ 1) and {@code minAdaFunded} is clamped at ≥ 0, so
+     * {@code floorProfit ≤ feeSlice − 1}. Hence {@code feeSlice ≤ minProfitAbsolute} makes S3(a)'s
+     * {@code floorProfit < minProfitAbsolute} certain, and {@code feeSlice − margin ≤ minExpectedProfit}
+     * makes S3(c)'s {@code floorProfit − margin ≤ minExpectedProfit} certain.
+     *
+     * <p>The row carries the fee slice and the margin, and {@code feeSlice − margin} as the expected profit:
+     * an UPPER bound, since no transaction exists whose fee could be subtracted.
+     */
+    private LiquidationDecision certainlyUnprofitable(LiquidationAssessment assessment, long now,
+                                                      Map<String, OracleEntry> oraclesByUnit) {
+        BigInteger feeSlice;
+        BigInteger margin;
+        BigInteger absoluteFloor;
+        BigInteger expectedFloor;
+        boolean refused;
+        try {
+            // The same expression record() prices the fee slice with.
+            feeSlice = LoanFinance
+                    .toLovelace(Rational.fromInt(assessment.liquidationFee()),
+                            collateralFeed(assessment, oraclesByUnit))
+                    .floor();
+            margin = configuration.getProfitMarginLovelace();
+            absoluteFloor = configuration.getMinProfitAbsoluteLovelace();
+            expectedFloor = configuration.getMinExpectedProfitLovelace();
+            refused = (configuration.isCheckProfitability() && feeSlice.compareTo(absoluteFloor) <= 0)
+                    || feeSlice.subtract(margin).compareTo(expectedFloor) <= 0;
+        } catch (RuntimeException e) {
+            // Not a refusal: a bound that cannot be computed is no evidence. The build below decides.
+            return null;
+        }
+        if (!refused) {
+            return null;
+        }
+        BigInteger upperBound = feeSlice.subtract(margin);
+        String detail = ("fee slice %s lovelace, margin %s: fee slice - margin = %s against the expected-profit "
+                + "floor %s, and fee slice against the absolute floor %s (check-profitability %s) — any "
+                + "transaction fee only lowers it — nothing built")
+                .formatted(feeSlice, margin, upperBound, expectedFloor, absoluteFloor,
+                        configuration.isCheckProfitability());
+        return new LiquidationDecision(
+                now,
+                assessment.loan().loanId(),
+                assessment.loan().utxoRef(),
+                assessment.bond().utxoRef(),
+                variantOf(assessment),
+                LiquidationDecision.Outcome.UNPROFITABLE,
+                LiquidationDecision.Outcome.UNPROFITABLE.name(),
+                detail,
+                assessment.late(),
+                assessment.remainingDebt(),
+                assessment.equity(),
+                assessment.liquidationFee(),
+                assessment.loan().datum().collateral().assetType().toUnit(),
+                feeSlice, null, margin, upperBound,
+                null, null, null,
+                null, null, null, null,
+                SubmitVeto.NOT_PROFITABLE.name());
+    }
+
+    /**
+     * FAB-183: the {@link OracleReferenceInputProbe.OracleReferenceInputNotLiveException} anywhere in
+     * {@code failure}'s cause chain that says its out-ref is NOT YET VISIBLE to this node, or null. Bounded and
+     * cycle-safe, like {@link #causeChain}.
+     */
+    static OracleReferenceInputProbe.OracleReferenceInputNotLiveException notYetVisible(Throwable failure) {
+        Throwable c = failure;
+        for (int depth = 0; c != null && depth < 12; depth++) {
+            if (c instanceof OracleReferenceInputProbe.OracleReferenceInputNotLiveException notLive
+                    && notLive.notYetVisible()) {
+                return notLive;
+            }
+            Throwable next = c.getCause();
+            if (next == c) {
+                break;
+            }
+            c = next;
+        }
+        return null;
+    }
+
+    /**
+     * FAB-183: an oracle out-ref the node cannot see yet is a WAIT — a fresher price announced a Charli3
+     * provider UTxO whose block is not stored here yet. REFUSED at INFO, retried on the next block, and the
+     * nominated wallet utxo is kept: nothing was evaluated, so nothing says it is spent.
+     */
+    private void refuseNotYetVisible(LiquidationAssessment assessment, long now,
+                                     OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait) {
+        String detail = wait.getMessage() + "; retried on the next block";
+        decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                "ORACLE_INPUT_NOT_YET_VISIBLE", detail));
+        log.info("the liquidation of {} waits for an oracle out-ref this node cannot see yet: {}",
+                assessment.loan().utxoRef(), detail);
     }
 
     // ---- failure surfacing ------------------------------------------------------------------------
@@ -2127,7 +2304,8 @@ public class LiquidationExecutor {
      * Nothing is held afterwards, whatever the outcome (FAB-134 NQ). The next cycle re-derives the
      * candidate for as long as the index still lists its loan UTxO; if this transaction landed, that
      * resubmission fails in phase 1 — free — and is logged at ERROR like any other failure. Every
-     * failure here, a definite rejection included, is logged at ERROR.
+     * failure here, a definite rejection included, is logged at ERROR — except an
+     * {@code OutsideValidityInterval} rejection (FAB-183 A2), which is expected, counted and logged at INFO.
      */
     private Verdict submit(LiquidationAssessment assessment, long now, Transaction transaction,
                            String detail) {
@@ -2153,7 +2331,19 @@ public class LiquidationExecutor {
                         detail + "; submitted as " + result.getValue(), true, null);
             }
             String response = result == null ? "no response" : result.getResponse();
-            log.error("submitting the liquidation of {} was rejected: {}", loanUtxoRef, response);
+            if (response != null && response.replaceAll("\\s", "").contains(OUTSIDE_VALIDITY_INTERVAL_MARKER)) {
+                // FAB-183 (A2): EXPECTED, not a fault. The start clamp opens a transaction at a fresh feed's
+                // validFrom, and the validating node may not have reached that slot yet. Counted, INFO, and
+                // the next block retries it; the row and the wallet effect are those of any rejection.
+                log.info("submitting the liquidation of {} was rejected OutsideValidityInterval — expected when a "
+                        + "fresh feed's validFrom is ahead of the validating node; retried on the next block: {}",
+                        loanUtxoRef, response);
+                if (outsideValidityRejections != null) {
+                    outsideValidityRejections.increment();
+                }
+            } else {
+                log.error("submitting the liquidation of {} was rejected: {}", loanUtxoRef, response);
+            }
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
                     detail + "; backend rejected it: " + response, false, response);
         } catch (Exception e) {

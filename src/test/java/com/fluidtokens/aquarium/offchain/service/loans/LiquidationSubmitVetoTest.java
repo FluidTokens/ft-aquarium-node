@@ -614,6 +614,13 @@ class LiquidationSubmitVetoTest {
         private RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         private Account account = ACCOUNT;
         private CardanoConverters executorConverters = LoanFixtures.converters();
+        private io.micrometer.core.instrument.MeterRegistry meterRegistry;
+
+        /** FAB-183: the registry {@code setMeterRegistry} is handed, as the container would; none by default. */
+        Rig meterRegistry(io.micrometer.core.instrument.MeterRegistry meterRegistry) {
+            this.meterRegistry = meterRegistry;
+            return this;
+        }
 
         Rig configuration(AppConfig.LiquidationConfiguration configuration) {
             this.configuration = configuration;
@@ -724,6 +731,9 @@ class LiquidationSubmitVetoTest {
                     networkNamed(networkName), params, executorConverters, submitter);
             long[] elapsed = {0};
             executor.setSubmitClock(() -> submitTime + elapsed[0]);
+            if (meterRegistry != null) {
+                executor.setMeterRegistry(meterRegistry);
+            }
 
             for (int cycle = 0; cycle < cycles; cycle++) {
                 elapsed[0] = cycle * 60_000L;
@@ -1003,15 +1013,24 @@ class LiquidationSubmitVetoTest {
         run.assertNothingWasSubmitted();
     }
 
-    /** A DISABLED market is not a rehearsal: it is held too, but there is nothing to analyse. */
+    /**
+     * A DISABLED market is not a rehearsal: there is nothing to analyse, so since FAB-183 (A4) nothing is
+     * built either. It is refused {@code MARKET_DISABLED} before the build, which spent a Blockfrost probe and
+     * an evaluation only to be vetoed {@code MARKET_NOT_LIVE} afterwards.
+     */
     @Test
     void s4ADisabledMarketSubmitsNothingEither() {
         Run run = new Rig().configuration(armedWithMarket(
                 AppConfig.LiquidationConfiguration.Mode.DISABLED)).run();
 
-        vetoed(run, LiquidationExecutor.SubmitVeto.MARKET_NOT_LIVE,
-                LiquidationDecision.Outcome.WOULD_SUBMIT);
         run.assertNothingWasSubmitted();
+        LiquidationDecision decision = run.onlyDecision();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertEquals("MARKET_DISABLED", decision.reason(), decision.detail());
+        assertTrue(decision.detail().contains("refused before any build"), decision.detail());
+        assertNull(decision.submitVeto(), "refused before the veto chain: " + decision.detail());
+        assertNull(decision.txHash(), "no transaction was built");
+        assertNull(decision.txCborHex(), "no transaction was built");
     }
 
     /**
@@ -1620,6 +1639,32 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
+     * FAB-183-2 audit residue (R2). The S8 shape again — the executor's converter throws — read for the window
+     * START this time. The start clamp calls that converter, fails, and must fall back to the per-cycle floor
+     * {@code anchor − 30 s} (the committed slot is unknown here, so the anchor is {@code NOW}): never later
+     * than the anchor, which would open the transaction ahead of the chain. Read off the BUILT body, whose
+     * builder converts with its own real converters.
+     */
+    @Test
+    void s8AClampWhoseConverterThrowsHandsTheRouteThePerCycleFloor() {
+        CardanoConverters broken = mock(CardanoConverters.class, RETURNS_DEEP_STUBS);
+        when(broken.slot().slotToTime(anyLong())).thenThrow(new IllegalStateException("slot conversion failed"));
+
+        Run run = new Rig().executorConverters(broken).run();
+
+        LiquidationDecision decision = run.onlyDecision();
+        assertNotNull(decision.txCborHex(), "the candidate was built from the fallback start: " + decision.detail());
+        Transaction built = assertDoesNotThrow(
+                () -> Transaction.deserialize(HexUtil.decodeHexString(decision.txCborHex())));
+        long startMillis = LoanFixtures.converters().slot()
+                .slotToTime(built.getBody().getValidityStartInterval())
+                .toInstant(java.time.ZoneOffset.UTC).toEpochMilli();
+        long anchor = NOW;
+        assertEquals(anchor - 30_000L, startMillis, "the per-cycle floor, anchor − 30 s");
+        assertTrue(startMillis <= anchor, "never later than the anchor");
+    }
+
+    /**
      * The single cause-carrying ERROR event these three sites must each produce — exactly one, never
      * zero or two. Cause-carrying because the veto's own summary line is ERROR too since FAB-134 NQ
      * (an armed node's S4–S7 veto is a failure, loud every cycle), and it carries no throwable.
@@ -1743,6 +1788,60 @@ class LiquidationSubmitVetoTest {
                 .filter(event -> event.getLevel() == Level.ERROR)
                 .filter(event -> event.getFormattedMessage().contains(text))
                 .toList();
+    }
+
+    /** The node's text for a transaction whose interval opens after the validating node's slot. */
+    private static final String OUTSIDE_VALIDITY_RESPONSE = "{\"contents\":{\"contents\":{\"contents\":{\"era\":"
+            + "\"ShelleyBasedEraConway\",\"error\":[\"ConwayUtxowFailure (UtxoFailure (OutsideValidity\n"
+            + "IntervalUTxO (ValidityInterval {invalidBefore = SJust (SlotNo 121127975), invalidHereafter = "
+            + "SJust (SlotNo 121128124)}) (SlotNo 121127848)))\"]}}}}";
+
+    /**
+     * FAB-183 (A2): an {@code OutsideValidityInterval} rejection is EXPECTED once the start clamp opens a
+     * transaction at a fresh feed's {@code validFrom} — the validating node may not have reached that slot
+     * yet. Logged at INFO, never ERROR, and counted; the row is the ordinary {@code SUBMIT_FAILED} with the
+     * backend's text, and nothing was transmitted. The marker is matched with whitespace removed, so the line
+     * break inside it here is no escape.
+     */
+    @Test
+    void anOutsideValidityIntervalRejectionIsCountedAndLoggedAtInfoNotError() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        RecordingSubmitter submitter = RecordingSubmitter.rejecting(OUTSIDE_VALIDITY_RESPONSE);
+        Run[] run = new Run[1];
+
+        List<ILoggingEvent> events = logged(new Rig().submitter(submitter).meterRegistry(registry), run);
+
+        assertEquals(1, submitter.submitted.size(), "it reached the backend");
+        LiquidationDecision decision = run[0].onlyDecision();
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, decision.outcome(), decision.detail());
+        assertTrue(decision.detail().contains("backend rejected it: " + OUTSIDE_VALIDITY_RESPONSE),
+                decision.detail());
+        assertEquals(List.of(), errorsContaining(events, "rejected"), "an expected rejection is not a fault");
+        assertEquals(List.of(), errorsContaining(events, "OutsideValidity"), "nor at ERROR under any wording");
+        assertEquals(1, events.stream()
+                        .filter(event -> event.getLevel() == Level.INFO)
+                        .filter(event -> event.getFormattedMessage().contains("rejected OutsideValidityInterval"))
+                        .filter(event -> event.getFormattedMessage().contains("retried on the next block"))
+                        .count(),
+                "one INFO line naming it: " + events);
+        assertEquals(1.0, registry.get(LiquidationExecutor.OUTSIDE_VALIDITY_COUNTER).counter().count(),
+                "counted once");
+    }
+
+    /** And every other rejection keeps its ERROR line and is not counted as one. */
+    @Test
+    void anOrdinaryRejectionIsStillLoggedAtErrorAndNotCountedAsOutsideValidity() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
+        Run[] run = new Run[1];
+
+        List<ILoggingEvent> events = logged(new Rig().submitter(submitter).meterRegistry(registry), run);
+
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, run[0].onlyDecision().outcome());
+        assertEquals(1, errorsContaining(events, "was rejected: ValueNotConservedUTxO").size(),
+                "an ordinary rejection is a fault, at ERROR: " + events);
+        assertEquals(0.0, registry.get(LiquidationExecutor.OUTSIDE_VALIDITY_COUNTER).counter().count(),
+                "not an OutsideValidityInterval rejection");
     }
 
     /**
