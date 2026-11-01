@@ -22,6 +22,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import okhttp3.OkHttpClient;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
@@ -56,6 +57,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -192,6 +194,46 @@ class CompoundExecutorTest {
     }
 
     // ---- the tests ---------------------------------------------------------------------------
+
+    @Test
+    void submissionOutcomeIsOwnedAndClassifiedByTheCommonApi() throws Exception {
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of(
+                "src/main/java/com/fluidtokens/aquarium/offchain/service/loans/CompoundExecutor.java"));
+
+        assertAll(
+                () -> {
+                    Class<?> outcome = Class.forName(
+                            "com.fluidtokens.aquarium.offchain.service.WorkResult");
+                    assertTrue(outcome.isEnum(), "the common outcome API must be an enum");
+                    assertTrue(java.lang.reflect.Modifier.isPublic(outcome.getModifiers()),
+                            "the common outcome API must be public");
+                    assertEquals(List.of("DEFINITE_FAILURE", "SUBMITTED", "WOULD_SUBMIT", "AMBIGUOUS"),
+                            Arrays.stream(outcome.getEnumConstants()).map(Object::toString).toList());
+                    assertTrue(java.lang.reflect.Modifier.isPublic(
+                            outcome.getMethod("terminal").getModifiers()));
+                    var classify = outcome.getMethod("classify", Result.class);
+                    assertTrue(java.lang.reflect.Modifier.isPublic(classify.getModifiers()));
+                    assertTrue(java.lang.reflect.Modifier.isStatic(classify.getModifiers()));
+                    assertEquals(outcome, classify.getReturnType());
+                },
+                () -> assertFalse(source.contains("enum CandidateOutcome"),
+                        "the executor must not retain a local outcome type"),
+                () -> assertAll("the executor must not retain a local provider decoder",
+                        () -> assertFalse(source.contains("isDecodedBlockfrostProviderSubmitRefusal")),
+                        () -> assertFalse(source.contains("MAX_PROVIDER_RESPONSE_LENGTH")),
+                        () -> assertFalse(source.contains("BLOCKFROST_ERROR_MAPPER")),
+                        () -> assertFalse(source.contains("JsonParser"))),
+                () -> assertAll("the executor must delegate its one result classification to WorkResult",
+                        () -> assertTrue(source.contains(
+                                "WorkResult outcome = WorkResult.classify(result);")),
+                        () -> assertEquals(source.indexOf("WorkResult.classify(result)"),
+                                source.lastIndexOf("WorkResult.classify(result)")),
+                        () -> assertFalse(source.contains("result.isSuccessful()")),
+                        () -> assertFalse(source.contains("\"WOULD_SUBMIT\".equals(result"))),
+                () -> assertEquals(WorkResult.class,
+                        CompoundExecutor.class.getDeclaredMethod("cycle").getReturnType(),
+                        "a cycle reports the outcome that ended its walk"));
+    }
 
     /**
      * ⛔ Disarmed is the default, and a READY candidate must still be reported. Silence here is the
@@ -475,6 +517,47 @@ class CompoundExecutorTest {
     void aWouldSubmitResultIsTerminalEvenWithoutATransactionHash() {
         assertResponseAttempts(Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"), 1,
                 "WOULD_SUBMIT represents a terminal intent, not a refusal");
+    }
+
+    /**
+     * {@code cycle()} returns the terminal outcome that ended the walk, and DEFINITE_FAILURE when nothing
+     * terminal happened. The submit count pins where the walk stopped, so the value cannot be right by a
+     * different route.
+     */
+    @Test
+    void aCycleReturnsTheOutcomeThatEndedItsWalk() {
+        assertCycleOutcome(bytes -> Result.<String>success("ok").withValue("deadbeef"),
+                WorkResult.SUBMITTED, 1, "a submission ends the walk");
+        assertCycleOutcome(bytes -> Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"),
+                WorkResult.WOULD_SUBMIT, 1, "a withheld submission ends the walk");
+        assertCycleOutcome(bytes -> Result.<String>error(
+                        blockfrostError(500, "Internal Server Error", "opaque")).code(500),
+                WorkResult.AMBIGUOUS, 1, "a provider 500 has unknown acceptance and ends the walk");
+        assertCycleOutcome(bytes -> {
+                    throw new java.io.IOException("acceptance unknown");
+                },
+                WorkResult.AMBIGUOUS, 1, "a transport throw has unknown acceptance and ends the walk");
+        assertCycleOutcome(bytes -> blockfrostRejection(400, "opaque"),
+                WorkResult.DEFINITE_FAILURE, 2, "every candidate refused: nothing terminal happened");
+
+        assertEquals(WorkResult.DEFINITE_FAILURE, wiring(List.of(), true, -2_000_000L).executor().cycle(),
+                "an empty scan returns before the walk");
+        Wiring disarmed = wiring(List.of(ready(0L)), false, 0L);
+        assertEquals(WorkResult.DEFINITE_FAILURE, disarmed.executor().cycle(),
+                "a disarmed walk reaches nothing terminal");
+        assertTrue(disarmed.submitted().isEmpty());
+    }
+
+    private static void assertCycleOutcome(CompoundExecutor.TransactionSubmitter response, WorkResult expected,
+                                           int expectedSubmits, String message) {
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()),
+                bytes -> {
+                    submits.incrementAndGet();
+                    return response.submit(bytes);
+                });
+        assertEquals(expected, executor.cycle(), message);
+        assertEquals(expectedSubmits, submits.get(), message + " (submits)");
     }
 
     @Test
