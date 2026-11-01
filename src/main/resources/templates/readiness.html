@@ -281,7 +281,8 @@
     </div>
   </div>
 
-  <!--/* FAB-174: the SHADOW oracle stream, one quiet line. Nothing the bot decides reads it, and the line says so;
+  <!--/* FAB-174: the oracle stream, one quiet line. Its prices are merged with the API's by default
+         (LOANS_ORACLE_SOURCE=api uses the API only), and the line's title says so;
          /healthcheck never includes it. Every value is th:text: the refusal message is server text. */-->
   <div class="note oracle-stream" th:if="${oracleStream != null}" title="prices come from the stream and the API merged, newest per oracle wins; LOANS_ORACLE_SOURCE=api uses the API only"
        style="color:var(--muted)">

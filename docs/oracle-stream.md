@@ -124,7 +124,7 @@ after a connection WARNs again.
 | `day` | INFO | `push=` `up_s=` `conn_s=` `pushes=` … `last=` | the cumulative summary at each UTC midnight, and `last=1` when the node stops — [The `day` line](#the-day-line) |
 | `push-ignored` | WARN or DEBUG | `reason=` `count=` | a message that is not a usable push: `malformed`, `unknown-type:<type>`, `oversize` (over 1,048,576 characters) or `binary`. The connection stays up; the message is counted, never echoed |
 | `refused` | WARN or DEBUG | `status=` `msg="…"` `retry_s=` | the server refused the connection (§6) |
-| `closed` | WARN, DEBUG or INFO | `reason=` `up_s=` | a connection ended, and how long it had been open. `reason` is `server-close(<code>)`, `error(<class>)`, `no-pong`, `proactive` (INFO — planned, §7) or `shutdown` (INFO — the node is stopping) |
+| `closed` | WARN, DEBUG or INFO | `reason=` `up_s=` (and `trigger=`) | a connection ended, and how long it had been open. `reason` is `server-close(<code>)`, `error(<class>)`, `no-pong`, `proactive` (INFO — planned, §7) or `shutdown` (INFO — the node is stopping). A `proactive` line ends with `trigger=push` (replaced right after a push) or `trigger=deadline` (no push came in time) |
 | `stake-changed` | DEBUG | `retry_s=0` | during a 403 hold, the node's own view of its stake changed, so it retries at once |
 | `listener-error` | WARN | `callback=` `error=` | an internal handler failed on a push; the stream carries on |
 | `task-error` | WARN | `task=` `error=` | an internal task failed; the stream carries on |
@@ -143,7 +143,7 @@ retry_s=<s>` followed by its own reading:
 | **400** | the request was malformed | nothing you can fix; it backs off (60 s, doubling to 30 min). Report it if it persists |
 | **401** | the signature was rejected — almost always the **system clock**, which must be within two minutes of real time | check NTP on the host. The first 401 after a connection is retried at once with a new signature; repeats back off (60 s, doubling to 30 min) |
 | **403** | no Aquarium staking bond for this wallet's stake key | expected on a node that is not staked. It retries hourly, and at once if the node's own staking check (the one the scheduled-transaction processor uses) changes its answer — re-checked every 5 minutes |
-| **429** | another connection on this bond is already open | expected on a standby node on the same bond. It backs off (60 s, doubling to 30 min); a successful connection resets it |
+| **429** | another connection on this bond is already open | expected on a standby node on the same bond. It backs off (60 s, doubling to 30 min); a successful connection resets it. Right after the node's own planned reconnect (§7) the server may not have released the old connection yet, so the first three 429s after it retry after 2, 4 and 8 s (±20%) before that backoff applies |
 | other | anything else, server errors included | treated like a dropped connection (§7) |
 
 ---
@@ -156,10 +156,17 @@ retry_s=<s>` followed by its own reading:
 - **Dropped connections** (`server-close`, `error`, `no-pong`, timeouts — 10 s to connect, 20 s for the
   handshake) are retried after 1, 2, 5, 10, 20, 30 and then every 60 s, each ±20%. A connection that had
   stayed open for at least 60 s starts that ladder from the beginning again.
-- **Planned reconnect.** The server closes a connection after two hours, so the node replaces it first,
-  after 115 minutes: it closes the old connection (waiting at most 1 s for the server to acknowledge),
-  and only then opens the new one with a fresh signature — never two at once, because the bond grants
-  one. Logged at INFO as `closed reason=proactive`; it is not a fault.
+- **Planned reconnect.** The server closes a connection after two hours, so the node replaces it first.
+  It closes the old connection (waiting at most 1 s for the server to acknowledge), and only then opens
+  the new one with a fresh signature — never two at once, because the bond grants one. Logged at INFO as
+  `closed reason=proactive`; it is not a fault.
+- **When it replaces it.** A push missed during the replacement would cost a liquidation a block, and
+  pushes arrive at about seconds 22–24 of a minute. So from 115 minutes the connection is only *due*:
+  the first push that arrives while it is due is delivered, and the connection is replaced right after it
+  (`trigger=push`). If no push comes by 118 minutes, it is replaced then (`trigger=deadline`) — except
+  that a deadline falling in seconds 15–35 of its minute (from :15 up to, not including, :35) waits until
+  second 40 of that minute, away from the push window. That is at most 25 s later, still under the two-hour
+  cap.
 
 ---
 

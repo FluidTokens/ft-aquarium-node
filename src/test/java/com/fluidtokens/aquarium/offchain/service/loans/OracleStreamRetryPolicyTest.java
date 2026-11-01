@@ -6,6 +6,8 @@ import com.fluidtokens.aquarium.offchain.service.loans.OracleStreamRetryPolicy.R
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.random.RandomGenerator;
@@ -13,6 +15,7 @@ import java.util.random.RandomGenerator;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -40,12 +43,42 @@ class OracleStreamRetryPolicyTest {
     @Test
     void theProductionTimingsArePinnedExactly() {
         assertEquals(new OracleStreamClient.Timings(Duration.ofSeconds(10), Duration.ofSeconds(20),
-                Duration.ofSeconds(45), Duration.ofSeconds(10), Duration.ofMinutes(115), 1.0),
+                Duration.ofSeconds(45), Duration.ofSeconds(10), Duration.ofMinutes(115), 1.0, Duration.ofMinutes(118)),
                 OracleStreamClient.Timings.PRODUCTION);
         assertEquals(Duration.ofSeconds(45), OracleStreamClient.Timings.PRODUCTION.pingInterval());
         assertEquals(Duration.ofSeconds(10), OracleStreamClient.Timings.PRODUCTION.pongTimeout());
         assertEquals(Duration.ofMinutes(115), OracleStreamClient.Timings.PRODUCTION.proactiveReconnectAfter(),
                 "1h55m: under the server's 2 h cap");
+        assertEquals(Duration.ofMinutes(118), OracleStreamClient.Timings.PRODUCTION.proactiveReconnectDeadline());
+    }
+
+    /**
+     * FAB-183-11: the production deadline, postponed as far as the push-window rule ever moves it, still closes
+     * under the server's two-hour cap.
+     */
+    @Test
+    void theProductionDeadlineAtItsLatestPostponementStaysUnderTheTwoHourCap() {
+        Instant earliestPostponed = Instant.parse("2026-10-29T12:00:15Z");
+        Duration largest = Duration.between(earliestPostponed,
+                OracleStreamClient.proactiveCloseAt(earliestPostponed, ZoneOffset.UTC));
+        assertEquals(Duration.ofSeconds(25), largest, "a deadline at second 15 waits until second 40");
+        assertTrue(OracleStreamClient.Timings.PRODUCTION.proactiveReconnectDeadline().plus(largest)
+                .compareTo(Duration.ofHours(2)) < 0, "118 min + 25 s is under 2 h");
+    }
+
+    @Test
+    void theSixArgumentTimingsHaveNoDueWindowAndADeadlineBeforeAfterIsRejected() {
+        OracleStreamClient.Timings six = new OracleStreamClient.Timings(Duration.ofSeconds(10), Duration.ofSeconds(20),
+                Duration.ofSeconds(45), Duration.ofSeconds(10), Duration.ofMinutes(115), 1.0);
+        assertEquals(Duration.ofMinutes(115), six.proactiveReconnectDeadline(), "the deadline IS the after");
+        assertThrows(IllegalArgumentException.class, () -> new OracleStreamClient.Timings(Duration.ofSeconds(10),
+                Duration.ofSeconds(20), Duration.ofSeconds(45), Duration.ofSeconds(10), Duration.ofMinutes(115), 1.0,
+                Duration.ofMinutes(114)));
+    }
+
+    @Test
+    void theFast429StepsArePinnedExactly() {
+        assertArrayEquals(new int[]{2, 4, 8}, OracleStreamRetryPolicy.FAST_429_AFTER_PLANNED_SECONDS);
     }
 
     @Test
@@ -266,6 +299,77 @@ class OracleStreamRetryPolicyTest {
             long hi = high.next(Outcome.refused(429)).delay().toMillis();
             assertTrue(hi <= Math.round(step * 1000L * 1.2) && hi > step * 1000L * 1.19, step + ": " + hi);
         }
+    }
+
+    // ======================================================================================
+    // 429 right after a planned close (FAB-183-11)
+    // ======================================================================================
+
+    @Test
+    void aProactiveEndThenFour429sWaitTwoFourEightThenTheFirst429Step() {
+        OracleStreamRetryPolicy policy = new OracleStreamRetryPolicy(MID);
+        policy.next(Outcome.proactive(SHORT));
+        List<Long> millis = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            Decision decision = policy.next(Outcome.refused(429));
+            assertEquals(Rule.BACKOFF_429, decision.rule());
+            assertEquals("refused:429", decision.stateKey());
+            millis.add(decision.delay().toMillis());
+        }
+        assertEquals(List.of(2_000L, 4_000L, 8_000L, 60_000L), millis,
+                "three fast steps, then the 429 ladder from its first step: a fast step advances no ladder");
+        assertEquals(120, policy.next(Outcome.refused(429)).delay().toSeconds(), "and it climbs from there");
+    }
+
+    @Test
+    void theFast429StepsStayWithinTwentyPercent() {
+        OracleStreamRetryPolicy low = new OracleStreamRetryPolicy(LOW);
+        OracleStreamRetryPolicy high = new OracleStreamRetryPolicy(HIGH);
+        low.next(Outcome.proactive(SHORT));
+        high.next(Outcome.proactive(SHORT));
+        for (int step : new int[]{2, 4, 8, 60}) {
+            assertEquals(Math.round(step * 1000L * 0.8), low.next(Outcome.refused(429)).delay().toMillis(), step + " s");
+            long hi = high.next(Outcome.refused(429)).delay().toMillis();
+            assertTrue(hi <= Math.round(step * 1000L * 1.2) && hi > step * 1000L * 1.19, step + ": " + hi);
+        }
+    }
+
+    @Test
+    void a429WithNoPrecedingProactiveEndWaitsSixtySeconds() {
+        assertEquals(60_000, new OracleStreamRetryPolicy(MID).next(Outcome.refused(429)).delay().toMillis());
+    }
+
+    @Test
+    void anOpenClearsThePlannedCloseRecordAndItsStep() {
+        OracleStreamRetryPolicy policy = new OracleStreamRetryPolicy(MID);
+        policy.next(Outcome.proactive(SHORT));
+        assertEquals(2_000, policy.next(Outcome.refused(429)).delay().toMillis());
+        policy.onConnected();
+        policy.next(Outcome.proactive(SHORT));
+        assertEquals(2_000, policy.next(Outcome.refused(429)).delay().toMillis(),
+                "the next planned close starts the fast steps again");
+
+        OracleStreamRetryPolicy opened = new OracleStreamRetryPolicy(MID);
+        opened.next(Outcome.proactive(SHORT));
+        opened.onConnected();
+        assertEquals(60_000, opened.next(Outcome.refused(429)).delay().toMillis(),
+                "a 429 after an open, with no planned close since, is not fast");
+    }
+
+    /** Amendment A3: any end that is neither a 429 nor proactive clears the record, so the 429 ladder applies. */
+    @Test
+    void anyOtherEndAfterAPlannedCloseClearsTheRecord() {
+        OracleStreamRetryPolicy policy = new OracleStreamRetryPolicy(MID);
+        policy.next(Outcome.proactive(SHORT));
+        transport(policy, Duration.ZERO);
+        assertEquals(60_000, policy.next(Outcome.refused(429)).delay().toMillis(),
+                "proactive, transport, 429: the 429 ladder, not 2 s");
+
+        OracleStreamRetryPolicy refused = new OracleStreamRetryPolicy(MID);
+        refused.next(Outcome.proactive(SHORT));
+        refused.next(Outcome.refused(403));
+        assertEquals(60_000, refused.next(Outcome.refused(429)).delay().toMillis(),
+                "proactive, another refusal, 429: the 429 ladder, not 2 s");
     }
 
     // ======================================================================================

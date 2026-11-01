@@ -295,7 +295,7 @@ It is listed, commented out, in `docker/.env.advanced.example`.
 ### Wallet rebalancing on the page
 
 Under the status banner, a **`Wallet rebalancing:`** line shows what the rebalancer (§9, "Wallet
-rebalancing") will do on the next block, read from the same check the rebalancer itself runs — it
+rebalancing") will do on the next pass, read from the same check the rebalancer itself runs — it
 never says `ARMED` while the rebalancer is idle, and it always says why it is idle:
 
 | state | what it means |

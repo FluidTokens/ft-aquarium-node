@@ -28,9 +28,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * FAB-174: the readiness page's one shadow-oracle-stream line, RENDERED through the same Thymeleaf setup as
- * {@link ReadinessTemplateRendersRowsTest} — one text per state, each saying that no decision reads it — and
- * the wiring that puts it there: a REQUIRED setter (optional injection would leave the line silently absent)
+ * FAB-174: the readiness page's one oracle-stream line, RENDERED through the same Thymeleaf setup as
+ * {@link ReadinessTemplateRendersRowsTest} — one text per state — and the wiring that puts it there: a REQUIRED setter (optional injection would leave the line silently absent)
  * on a launcher the container can find. And {@code /healthcheck} does not know the stream exists.
  */
 class ReadinessOracleStreamLineTest {
