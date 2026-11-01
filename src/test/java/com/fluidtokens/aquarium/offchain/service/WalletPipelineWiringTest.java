@@ -20,6 +20,7 @@ import org.cardanofoundation.conversions.CardanoConverters;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.transaction.TransactionAutoConfiguration;
@@ -61,6 +62,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -73,6 +75,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -652,5 +655,118 @@ class WalletPipelineWiringTest {
         assertEquals(List.of("onCommit", "onRollback"),
                 annotated(WalletPipelineService.class, EventListener.class).stream().sorted().toList(),
                 "the pipeline's only listeners");
+    }
+
+    // ---- (k)–(m): what the service hands the engine (FAB-183-8 audit residues) --------------------------------
+
+    /**
+     * (k) The liquidation stage gets the CURRENT time: the {@code now} the stage receives is within 5 s of the wall
+     * clock read inside that very call. It feeds the scan, so a constant here would assess every loan at that
+     * instant.
+     */
+    @Test
+    void theLiquidationStageGetsTheCurrentTime() {
+        Stages stages = new Stages(new RecordingTransactionManager());
+        AtomicLong wallClockAtCall = new AtomicLong();
+        stages.beforeLiquidation.set(() -> wallClockAtCall.set(System.currentTimeMillis()));
+        runner(stages).run(context -> {
+            assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+            bind(stages, context);
+
+            context.publishEvent(block(slotAgo(context, Duration.ofMinutes(1)), "a3".repeat(32)));
+            awaitCalls(stages, 1);
+
+            ArgumentCaptor<Long> now = ArgumentCaptor.forClass(Long.class);
+            verify(stages.liquidation).cycle(now.capture(), any());
+            assertTrue(wallClockAtCall.get() > 0, "the liquidation call did not read the wall clock");
+            assertTrue(Math.abs(now.getValue() - wallClockAtCall.get()) <= 5_000L,
+                    "the liquidation stage got now=" + now.getValue() + ", but the wall clock at the call read "
+                            + wallClockAtCall.get());
+        });
+    }
+
+    /**
+     * (l) Closing the context closes the pipeline: a committed block offered afterwards, through the service the
+     * context built, runs no stage.
+     */
+    @Test
+    void closingTheContextClosesThePipeline() {
+        Stages stages = new Stages(new RecordingTransactionManager());
+        runner(stages).run(context -> {
+            assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+            bind(stages, context);
+            WalletPipelineService service = context.getBean(WalletPipelineService.class);
+            long slot = slotAgo(context, Duration.ofMinutes(1));
+
+            context.close();
+            service.onCommit(block(slot, "a4".repeat(32)));
+
+            assertQuiet(stages, 0, "a stage ran after the context closed: the pipeline outlived it");
+        });
+    }
+
+    /**
+     * (m) The engine's hung-pass threshold IS {@code wallet-coordinator.pass-timeout-seconds}. With it at 4 s and the
+     * first pass held inside liquidation: 1.8 s in, a new trigger logs no hung WARN; 4.6 s in, one does. A threshold
+     * of 1 s fails the first half, and one that ignored the property (the 120 s default) fails the second.
+     */
+    @Test
+    void theEnginesHungThresholdIsThePassTimeout() {
+        Logger engineLogger = (Logger) LoggerFactory.getLogger(WalletPipeline.class);
+        ListAppender<ILoggingEvent> engineLogs = new ListAppender<>();
+        engineLogs.start();
+        engineLogger.addAppender(engineLogs);
+        try {
+            Stages stages = new Stages(new RecordingTransactionManager());
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            stages.beforeLiquidation.set(() -> {
+                entered.countDown();
+                try {
+                    release.await(PASS_WAIT.toMillis(), TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            runner(stages).withPropertyValues("wallet-coordinator.pass-timeout-seconds=4").run(context -> {
+                assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+                bind(stages, context);
+                assertTrue(logs.list.stream().map(ILoggingEvent::getFormattedMessage)
+                                .anyMatch(m -> m.endsWith("; no timer; pass deadline 4 s")),
+                        "the property did not reach the service: " + logs.list);
+                long slot = slotAgo(context, Duration.ofMinutes(1));
+                String hungPrefix = "wallet pipeline: the pass at slot " + slot + " has been running for ";
+                try {
+                    context.publishEvent(block(slot, "d1".repeat(32)));
+                    assertTrue(entered.await(PASS_WAIT.toMillis(), TimeUnit.MILLISECONDS), "the first pass started");
+                    long enteredAt = System.nanoTime();
+
+                    Thread.sleep(Math.max(0, Duration.ofMillis(1_800).toNanos() - (System.nanoTime() - enteredAt))
+                            / 1_000_000L);
+                    context.publishEvent(block(slot + 1, "d2".repeat(32)));
+                    assertEquals(List.of(), hungWarnings(engineLogs, hungPrefix),
+                            "1.8 s into a pass whose timeout is 4 s the engine called it hung");
+
+                    Thread.sleep(Math.max(0, Duration.ofMillis(4_600).toNanos() - (System.nanoTime() - enteredAt))
+                            / 1_000_000L);
+                    context.publishEvent(block(slot + 2, "d3".repeat(32)));
+                    assertEquals(1, hungWarnings(engineLogs, hungPrefix).size(),
+                            "4.6 s into a pass whose timeout is 4 s the engine did not call it hung: "
+                                    + engineLogs.list);
+                } finally {
+                    release.countDown();
+                }
+            });
+        } finally {
+            engineLogger.detachAppender(engineLogs);
+        }
+    }
+
+    private static List<String> hungWarnings(ListAppender<ILoggingEvent> engineLogs, String prefix) {
+        return engineLogs.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.startsWith(prefix))
+                .toList();
     }
 }

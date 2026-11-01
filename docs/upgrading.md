@@ -446,7 +446,7 @@ database is an avoidable variable.
 
 ## 7. Keys that no longer exist
 
-If you are carrying a configuration forward from an older node, **remove these.** They are ignored
+If you are carrying a configuration forward from an older node, **remove these.** Most are ignored
 in silence, which reads exactly like them working.
 
 | removed key | why, and what happens if you still pass it |
@@ -456,6 +456,8 @@ in silence, which reads exactly like them working.
 | `LOANS_ENABLED` | lending-v4 indexing is unconditional now |
 | `AQUARIUM_X_SUBMIT` / `loans.submittable-network` | a barrier that silently blocked submission while everything else was armed is a bug, not a safeguard |
 | `SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL` | a diagnostic for the 2026-09-22 tank decode failure (FAB-149). Still set, it is ignored and the tank is evaluated through Blockfrost, as on every node that never set it — see §2 |
+| `AQUARIUM_LIQUIDATION_DELAY_SECONDS` / `loans.liquidation.delay-seconds` | removed by FAB-183: liquidation no longer runs on a timer (see [below](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). Still set, it is ignored, and the node logs one WARN for it at boot |
+| `AQUARIUM_COMPOUND_DELAY_SECONDS` / `loans.compound.delay-seconds` | removed by FAB-183: compound no longer runs on a timer (see [below](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). Still set, it is ignored, and the node logs one WARN for it at boot |
 
 **The general shape is worth keeping in mind beyond this list:** an unknown environment variable is
 not an error anywhere in this stack. It is read by nothing and reported by nothing. When a setting
@@ -515,6 +517,42 @@ wallet drifts out of shape. Each one costs a transaction fee.
   suspension is held in memory: a restart resumes rebalancing.
 - **To opt out**, set `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. The readiness page
   cannot turn it back on.
+
+### Liquidation, compound and rebalancing run on blocks and prices, not timers (FAB-183)
+
+Older images ran liquidation and compound each on its own timer (`AQUARIUM_LIQUIDATION_DELAY_SECONDS`,
+`AQUARIUM_COMPOUND_DELAY_SECONDS`, both 60 s by default). **Those timers are gone**, and so are the two
+settings (the table above). The bot wallet now has one queue of work, a *pass*, and a pass runs:
+
+1. **Liquidation.** Candidates are tried most profitable first. **At most one liquidation per market
+   per pass** — a market is the loan's principal asset — but several markets can each get one in the
+   same pass. A loan that fails is skipped and the market's next candidate is tried.
+2. **Compound.**
+3. **Housekeeping** — the wallet rebalance described above.
+
+**After a liquidation that went out — submitted, or a submission whose outcome is unknown — compound
+and housekeeping wait for the next trigger.** The same rule holds between compound and housekeeping.
+In `shadow` a liquidation the node *would* have submitted sent nothing, so it does **not** hold them back.
+
+**What starts a pass**, with no timer anywhere:
+
+- a **committed block**, once the node is in sync (a node working through its initial sync starts none);
+- a change in the **merged oracle prices**.
+
+A pass already running is never joined by a second one; new triggers wait for it to finish.
+
+**The settings that govern this:**
+
+- `WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS` (default `120`) — the pass deadline. It bounds every
+  Blockfrost call made during a pass.
+- `LOANS_ORACLE_SOURCE` — where the prices come from: `stream` (the default) merges the FluidTokens
+  oracle stream with the registry API; `api` is the emergency lever, API polling only.
+
+**The Tank processor is unchanged:** it keeps its own timer, and none of the above applies to it.
+
+**Nothing is remembered between passes.** A transaction the node submitted and that is still pending
+may be built again on the next trigger; the ledger rejects the duplicate harmlessly, because the pending
+transaction already spends its inputs.
 
 ---
 

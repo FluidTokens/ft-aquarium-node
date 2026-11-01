@@ -3,6 +3,8 @@ package com.fluidtokens.aquarium.offchain.config;
 import com.bloxbean.cardano.yaci.store.starter.utxo.UtxoStoreAutoConfigProperties;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.ConfigurationPropertyName;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySource;
 import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.env.EnumerablePropertySource;
@@ -484,7 +486,6 @@ class ShippedDefaultsTest {
      */
     private static final Map<String, String> SHIPPED_LIQUIDATION_DEFAULTS = Map.ofEntries(
             Map.entry("mode", "${AQUARIUM_LIQUIDATION_MODE:disabled}"),
-            Map.entry("delay-seconds", "${AQUARIUM_LIQUIDATION_DELAY_SECONDS:60}"),
             Map.entry("validity-window-seconds", "${AQUARIUM_LIQUIDATION_VALIDITY_WINDOW_SECONDS:120}"),
             Map.entry("oracle-window-margin-seconds", "${AQUARIUM_LIQUIDATION_ORACLE_MARGIN_SECONDS:30}"),
             Map.entry("profit-margin-lovelace", "${AQUARIUM_LIQUIDATION_PROFIT_MARGIN_LOVELACE:5000000}"),
@@ -540,6 +541,32 @@ class ShippedDefaultsTest {
                 "the set of operator-facing liquidation defaults changed. A new knob must be pinned in "
                         + "SHIPPED_LIQUIDATION_DEFAULTS, and a removed one deleted from it — otherwise "
                         + "the pins above stop being exhaustive and start being a sample.");
+    }
+
+    /**
+     * ⛔ FAB-183: the liquidation and compound delays are GONE, from every document. The stages run on committed
+     * blocks and oracle price changes, so nothing reads either key; one that came back would be a setting an
+     * operator can change that changes nothing, which reads exactly like it working. {@link ObsoleteSettingsWarning}
+     * WARNs at boot when an operator still sets one, and a shipped one would make that WARN fire on every node.
+     *
+     * <p>Each document is flattened by Spring's own YAML loader and looked up both literally and through
+     * {@link ConfigurationPropertySources}, so neither a re-nesting nor a relaxed spelling ({@code delaySeconds})
+     * slips past.
+     */
+    @Test
+    void noDocumentShipsTheLiquidationOrCompoundDelay() throws IOException {
+        List<PropertySource<?>> documents = new YamlPropertySourceLoader()
+                .load(RESOURCE, new ClassPathResource(RESOURCE));
+        assertEquals(documents().size(), documents.size(), "Spring and SnakeYAML disagree on the document count");
+        for (PropertySource<?> document : documents) {
+            ConfigurationPropertySource relaxed = ConfigurationPropertySources.from(document).iterator().next();
+            for (String removed : List.of("loans.liquidation.delay-seconds", "loans.compound.delay-seconds")) {
+                assertNull(document.getProperty(removed), document.getName() + " ships " + removed
+                        + ", which FAB-183 removed: nothing reads it");
+                assertNull(relaxed.getConfigurationProperty(ConfigurationPropertyName.of(removed)),
+                        document.getName() + " ships a relaxed spelling of " + removed);
+            }
+        }
     }
 
     /**
