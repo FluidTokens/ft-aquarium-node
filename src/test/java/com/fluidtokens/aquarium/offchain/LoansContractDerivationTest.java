@@ -82,10 +82,10 @@ class LoansContractDerivationTest {
     /** Latest blueprint value (2026-10-01, new code); captured fourth-deployment preview publishes 344755c3…5c90cd. */
     private static final String POOL_BORROW_ACTION = "2ecae5102d682a7bb8f622e357b2129112b5d50a39abf0f9a3fa1f08";
     /**
-     * Latest blueprint value (2026-10-01: three parameters, the new one unread -- FluidTokens disabled
-     * selling); captured fourth-deployment preview publishes db9a5bf0…d9c56.
+     * Latest blueprint value (2026-10-26, upstream a02d4e2: back to two parameters, new code -- FAB-166);
+     * captured fourth-deployment preview publishes db9a5bf0…d9c56.
      */
-    private static final String POOL_SELL_LENDER_POSITION_ACTION = "5dcebd73c56d86ab0c8049d09748dba14a6c19734aab121eb0613d25";
+    private static final String POOL_SELL_LENDER_POSITION_ACTION = "44b4e470c9a4642b3a6cc84c481cc3b3848a85c408384accbab45c92";
     private static final String POOL_COMPOUND_ACTION = "33128ca352b5472f593104d5884ced5cba5e980b3177353eb2116c62";
     private static final String POOL_MANAGER_SPEND = "1322b6d1e7e46ac543769a8fcfb43840606f040d2e9efa2e59389d86";
     private static final String POOL_MANAGER_POLICY_ID = "c2023c909f66d50886e82ba86a03382313bbb8e994789e0aba588b3d";
@@ -115,12 +115,12 @@ class LoansContractDerivationTest {
     private static final String LM_WITHDRAW_BONDS_ACTION = "42c4a0d6f33f21ccc694c6620d6485331df6528da8b8d16acf1589fe";
     /** Latest blueprint value (2026-10-01: parameterised by the new claim); preview publishes e0a13838…9700f. */
     private static final String LM_LIQUIDATE_ACTION = "f3c7a201440b39458111ab44c26863c4d089e66e71ae847fb87233bd";
-    /** Latest blueprint value (2026-10-01, new code); captured fourth-deployment preview publishes dd47090…00457. */
-    private static final String LM_COMPOUND_ACTION = "f9be2926201f9ed40da47cc77a40db0ad8b39d21842511116ddb644d";
+    /** Latest blueprint value (2026-10-26, upstream a02d4e2 new code -- FAB-166); captured fourth-deployment preview publishes dd47090…00457. */
+    private static final String LM_COMPOUND_ACTION = "6ab215727d8af4601813859a57ead01ed09cc9a3c30e9d8c49d72ed1";
     /** Latest blueprint value (2026-10-01: parameterised by the new claim); preview publishes 00b8a30b…0034d. */
     private static final String LM_LIQUIDATE_AND_PAY_IN_ADVANCE_ACTION = "3a155105a91c371b74b96f480114ef1d4ec80389d27902426f553c99";
-    /** Latest blueprint value (2026-10-01: parameterised by the new claim); preview publishes 190a6c68…7aa12. */
-    private static final String LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION = "1760b3c462d707870b904eca90145dc48619d0e770253728412f3bf3";
+    /** Latest blueprint value (2026-10-26, upstream a02d4e2 new code -- FAB-166); preview publishes 190a6c68…7aa12. */
+    private static final String LM_LIQUIDATE_PAY_IN_ADVANCE_AND_COMPOUND_ACTION = "81fd0ba8cd906f157f4e07d92c75c8d60df4a5fb8e30eb3d0ee7b501";
     /** Unchanged across the third redeploy: the parameterless stub takes no config policy id. */
     private static final String LM_LIQUIDATE_CONVERT_AND_COMPOUND_ACTION = "435b42cc200719c3868dfe01689ee07e2eeff5f5809f25408cbe4e7d";
 

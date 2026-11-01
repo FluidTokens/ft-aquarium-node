@@ -18,12 +18,12 @@ error.
 | You added a **market**, margin, or mode | restart | untouched |
 | You enabled the **UI** | restart | untouched |
 | **FluidTokens redeployed the contracts** (new config NFTs) | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
-| FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01) | §4.8 — new image, restart | untouched |
+| FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01, 2026-10-23/26) | §4.8, §4.9 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 | Upgrading to the release that **indexes the Minswap V2 pools** (FAB-137) | §1.1 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
 | You changed `WALLET_ACCOUNT_INDEX` | §9 — restart, then re-sync **or** one self-send | ⛔ **wiped, or a self-send** |
 
-The first four are ordinary. The others are the subject of this guide (§4, §4.8, §3, §1.1, §9).
+The first four are ordinary. The others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §9).
 
 ### 1.1 ⛔ The Minswap pool release requires a database wipe (FAB-137)
 
@@ -328,10 +328,88 @@ recent registration action is `registered` (e.g. Blockfrost
 | LenderManager liquidate | `stake17x85dymnutx0w2vdpwdnh9c6sthx4zwzem40j3rqjqexcyqe9uttz` |
 | LenderManager liquidate + pay in advance | `stake17y8qqqmyl7h8uemg7uvjfzzcel2rj4q6ulht9el5nv428qq6w773h` |
 | LenderManager liquidate + convert | `stake1789l86x95shx6r6s24qdt23pqjm79x5u8fadukqa7a96waqgtc0ql` |
-| LenderManager compound (only if you enable compound) | `stake179c4zk5fl5uezekc68n2v02fsghuy6ztweuzezal87qhnqsq0fld4` |
+| LenderManager compound — the **2026-10-01** script, **superseded on 2026-10-26**: the current one is in §4.9 | `stake179c4zk5fl5uezekc68n2v02fsghuy6ztweuzezal87qhnqsq0fld4` |
 
 For a future update: the node logs every hash it derives at startup (`Derived Lending v4 contract hashes`),
 and a script's stake address is its hash under the CIP-19 script-stake header (`stake17…` on mainnet).
+
+### 4.9 When FluidTokens replace action scripts IN PLACE — the 2026-10-23/26 update
+
+The same kind of change as §4.8, done twice in four days: FluidTokens rewrote their two config datums
+**in place** again. The config NFTs are the same; three action scripts have new hashes:
+
+| when (UTC) | config output now | field | old → new | in this node |
+|---|---|---|---|---|
+| 2026-10-23 10:45, block 14,105,271 | ConfigDatum `75e459a0…#0` | [24] pool: sell lender position | `efa39cdb…` → `f43354cb…` | advisory, never invoked |
+| 2026-10-26 13:40, block 14,118,734 | LMConfigDatum `c0f0d821…#0` | [3] LenderManager compound | `71515a89…` → `4713a925…` | **enforced** |
+| 2026-10-26 13:40, block 14,118,734 | LMConfigDatum `c0f0d821…#0` | [6] LenderManager liquidate + pay in advance + compound | `cd33a2aa…` → `00e38efa…` | advisory, never invoked |
+
+The compound script is the one that matters. Its new version charges ADA pools a minimum fee of 1 ADA
+(see "The compound fee changed" below).
+
+As in §4.8, the node checks the deployment **at startup only**, so what you see depends on whether you
+restart, and on which image:
+
+- A node that is **already running** keeps the verdict it booted with. Liquidation and convert invoke none
+  of the three scripts that moved, but every compound it builds now fails evaluation at withdrawal index 3.
+- An image **from before this release** (and from the 2026-10-01 release or later), once restarted, keeps
+  scheduled payments running and closes the lending gate. That stops **liquidation and convert too**, not
+  only compound, whether or not you ever enabled compound:
+  ```
+  LENDING_CONFIG_MISMATCH … LMConfigDatum[3]
+  ```
+  It also logs advisory WARNs for `ConfigDatum[14]`, `ConfigDatum[24]` and `LMConfigDatum[6]`. Those
+  do not close the gate.
+- An image older than the 2026-10-01 release is already broken by §4.8. This release fixes both.
+
+**What to do:** pull the image built from this release and restart.
+
+- **No wipe, no re-sync.** Only action hashes moved. Every payment credential the node indexes is
+  unchanged, so the existing index is correct (`MainnetRedeploy20261026Test`).
+- **No `.env` change** if you use the shipped defaults. None of the liquidation reference-script
+  coordinates changed.
+- ⚠ If you **override** `AQUARIUM_COMPOUND_REFERENCE_SCRIPTS`, replace
+  `29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0` (the old compound script) with
+  `588695471b9f865ceac88066883fad118a5a1800c9c69a0663e5ff560d656b1a#0`, or unset the key. The other ten
+  entries are unchanged. The old output is still unspent, so nothing on chain tells you it is stale. With
+  compound enabled the node does: the stale entry is a `REFERENCE_SCRIPT_DROPPED` WARN, and the compound
+  script it should have supplied is a `REFERENCE_SCRIPT_MISSING` WARN and travels inline (FAB-108). With
+  compound off, nothing checks the list. Do **not** add `047020cf…#0`. It publishes the new liquidate + pay
+  in advance + compound script, which this node never invokes.
+
+**The compound fee changed, and with it what the shipped margin approves.** This matters only if you
+enabled compound (`AQUARIUM_COMPOUND_ENABLED=true`; the default is `false`).
+
+- A compound pays the bot a fee set by the pool owner's rate `c`, per mille of the compounded principal
+  `Q`. Since 2026-10-26 an **ADA** pool always pays `max(Q*c/1000, 1 ADA)`, so it pays at least 1 ADA even
+  at rate 0. A **token** pool still pays `Q*c/1000` raw units, which is nothing at rate 0.
+- ⚠ **So at the shipped `AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE=0`, a zero-rate ADA compound is now
+  APPROVED** whenever its transaction fee is at most 1 ADA. Before this update it earned nothing and was
+  refused. Measured on a mainnet-shaped compound: the fee was 1 ADA, the transaction fee 842,009
+  lovelace, and the bot netted +157,991 lovelace.
+- **To keep refusing them,** raise `AQUARIUM_COMPOUND_PROFIT_MARGIN_LOVELACE` in `.env` and restart. A
+  zero-rate ADA compound nets `1 ADA − transaction fee`, so `1000000` refuses every one of them. The margin
+  is shared by every compound, so it also refuses any other compound that would net less than 1 ADA.
+- A negative margin (compounding at a loss you state) behaves exactly as before.
+- Escrows written by this node's own liquidations are either compoundable under the new script or
+  refused because of their actual shape (FAB-168, `LiquidationEscrowCompoundRoundTripTest`).
+- Preview: the node derives the new compound script on every network, but preview's deployed compound
+  validator still charges `Q*c/1000`. This does not matter while the preview lending gate is closed.
+
+**The new compound script has its own reward account.** FluidTokens registered it (checked 2026-10-26).
+Check it the same way as the §4.8 table if you enable compound:
+
+| action script | stake address |
+|---|---|
+| LenderManager compound (since 2026-10-26, `4713a925…`) | `stake179r382f9xqnfypmtdphwu00gp93ujnjxgyy9y2h6euvs88qmpx069` |
+
+The other rows of the §4.8 table are unchanged and still current.
+
+**Verify exactly as §4.7.** Expect `Lending v4 config verified against chain …`, the gate open, and one
+advisory WARN, for `ConfigDatum[14]` (as in §4.8). If you still see `LENDING_CONFIG_MISMATCH …
+LMConfigDatum[3]`, the node is not running this release: compare `/actuator/info` with the tag you pinned
+(§2). With compound enabled, also expect `… reference scripts verified against chain …` and no
+`REFERENCE_SCRIPT_*` line.
 
 ---
 

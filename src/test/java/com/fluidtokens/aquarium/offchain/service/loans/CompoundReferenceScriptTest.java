@@ -77,6 +77,11 @@ class CompoundReferenceScriptTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(60_000_000L)))).build();
     }
 
+    private static Utxo collateral() {
+        return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(BOT)
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+    }
+
     private static CompoundCandidate candidate() {
         Utxo b = utxo("bond");
         return new CompoundCandidate(LOAN_ID, utxo("escrow"),
@@ -150,7 +155,7 @@ class CompoundReferenceScriptTest {
      */
     private static Built build(List<PlutusScript> referenced, boolean evaluate) throws Exception {
         List<Utxo> universe = new ArrayList<>(List.of(utxo("escrow"), utxo("bond"), utxo("pool"),
-                utxo("poolManager"), recordedConfig(), recordedLmConfig(), wallet()));
+                utxo("poolManager"), recordedConfig(), recordedLmConfig(), wallet(), collateral()));
         Map<String, TransactionInput> refs = new LinkedHashMap<>();
         String[] seeds = {"11", "22", "33", "44", "55", "66", "77", "88", "99", "aa", "bb"};
         for (int i = 0; i < referenced.size(); i++) {

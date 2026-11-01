@@ -8,10 +8,16 @@ import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.core.StreamReadConstraints;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.ProtocolParamsRejections;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
+import com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
@@ -22,13 +28,18 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigInteger;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -62,11 +73,72 @@ public class CompoundExecutor {
     /** 30 s of backdate, matching the liquidation path. Anchored to the tip, never to the clock. */
     private static final long VALID_FROM_BACKDATE_MILLIS = 30_000L;
     private static final long VALIDITY_WINDOW_MILLIS = 120_000L;
+    private static final int MAX_PROVIDER_RESPONSE_LENGTH = 131_072;
+    private static final int MAX_PROVIDER_JSON_DEPTH = 16;
+    private static final int MAX_PROVIDER_JSON_STRING_LENGTH = 65_536;
+    private static final int MAX_PROVIDER_JSON_NUMBER_LENGTH = 20;
+    private static final int MIN_PROVIDER_ROOT_MEMBERS = 3;
+    private static final int MAX_PROVIDER_ROOT_MEMBERS = 32;
+    /** FAB-180: an unchanged cycle summary is still said at INFO this often, so a quiet log is not a dead one. */
+    private static final Duration SUMMARY_HEARTBEAT = Duration.ofHours(1);
+    private static final ObjectMapper BLOCKFROST_ERROR_MAPPER = new ObjectMapper(JsonFactory.builder()
+            .streamReadConstraints(StreamReadConstraints.builder()
+                    .maxNestingDepth(MAX_PROVIDER_JSON_DEPTH)
+                    .maxStringLength(MAX_PROVIDER_JSON_STRING_LENGTH)
+                    .maxNameLength(MAX_PROVIDER_JSON_STRING_LENGTH)
+                    .maxNumberLength(MAX_PROVIDER_JSON_NUMBER_LENGTH)
+                    .build())
+            .build());
 
     /** Everything this class can do to the network: hand over bytes. */
     @FunctionalInterface
     public interface TransactionSubmitter {
         Result<String> submit(byte[] signedTransactionBytes) throws Exception;
+    }
+
+    enum CandidateOutcome {
+        DEFINITE_FAILURE,
+        SUBMITTED,
+        WOULD_SUBMIT,
+        AMBIGUOUS;
+
+        boolean terminal() {
+            return this != DEFINITE_FAILURE;
+        }
+    }
+
+    /**
+     * FAB-180: what one cycle's walk saw, for its single summary line. Counting only — nothing reads it
+     * to decide anything. {@code escrows == Σrefused + ready}, and every walk outcome counted here
+     * (not approved, not armed, not reached) is a ready candidate.
+     */
+    static final class CycleTally {
+        int escrows;
+        int priced;
+        int ready;
+        final Map<String, Integer> refused = new TreeMap<>();
+        final Map<String, Integer> notApproved = new TreeMap<>();
+        int notArmed;
+        int notReached;
+
+        void notApproved(CompoundExclusion exclusion) {
+            notApproved.merge(String.valueOf(exclusion), 1, Integer::sum);
+        }
+
+        String summary() {
+            StringBuilder line = new StringBuilder("compound scan: ")
+                    .append(escrows).append(" escrows, ")
+                    .append(priced).append(" priced, ")
+                    .append(ready).append(" ready, refused ").append(refused)
+                    .append(", not approved ").append(notApproved);
+            if (notArmed > 0) {
+                line.append(", not armed ").append(notArmed);
+            }
+            if (notReached > 0) {
+                line.append(", not reached ").append(notReached);
+            }
+            return line.toString();
+        }
     }
 
     private final AppConfig.CompoundConfiguration configuration;
@@ -89,6 +161,15 @@ public class CompoundExecutor {
      */
     private com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate;
     private volatile boolean lendingGateRefusalLogged;
+
+    /** FAB-180: read ONLY for the summary's heartbeat. Nothing that builds, prices or submits uses it. */
+    Clock clock = Clock.systemUTC();
+    private String lastInfoSummary;
+    private Instant lastInfoSummaryAt;
+
+    void setClock(Clock clock) {
+        this.clock = clock;
+    }
 
     @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
@@ -199,6 +280,16 @@ public class CompoundExecutor {
             return;
         }
 
+        CycleTally tally = new CycleTally();
+        for (CompoundCandidate candidate : scan.candidates()) {
+            tally.escrows++;
+            if (candidate.structurallyReady()) {
+                tally.ready++;
+            } else {
+                tally.refused.merge(String.valueOf(candidate.exclusion()), 1, Integer::sum);
+            }
+        }
+
         // FAB-144 — THE MOST PROFITABLE ESCROW FIRST. Only the ORDER changes: every candidate is still
         // walked exactly once, and one whose fee cannot be estimated — refused, non-ada, no amount —
         // goes last rather than missing. Guarded: ranking must never cost a compound, so a fault in it
@@ -206,57 +297,112 @@ public class CompoundExecutor {
         List<CompoundCandidate> ordered = scan.candidates();
         if (ordered.size() >= 2) {
             try {
-                ordered = mostProfitableFirstThisCycle(scan.candidates());
+                ordered = mostProfitableFirstThisCycle(scan.candidates(), tally);
             } catch (RuntimeException e) {
                 log.warn("compound: ranking this cycle's candidates failed ({}); they are walked in "
                         + "scan order", e.toString());
             }
+        } else {
+            // FAB-180: no ranking ran, so the one candidate's reward is computed here, once, and only
+            // counted. A fault leaves it unpriced; it must never cost the cycle.
+            try {
+                if (grossRecoverableLovelace(ordered.getFirst()).isPresent()) {
+                    tally.priced = 1;
+                }
+            } catch (RuntimeException e) {
+                tally.priced = 0;
+            }
         }
 
         // Every escrow is reported, refused or not: "nothing to do" and "eight things all blocked"
-        // must not look alike to an operator.
+        // must not look alike to an operator. Per escrow at DEBUG; the cycle's summary carries the counts.
+        int readyWalked = 0;
         for (CompoundCandidate candidate : ordered) {
             if (!candidate.structurallyReady()) {
-                log.info("compound REFUSED {} escrow {}: {} — {}", candidate.loanId(),
+                log.debug("compound REFUSED {} escrow {}: {} — {}", candidate.loanId(),
                         candidate.escrowRef(), candidate.exclusion(), candidate.detail());
                 continue;
             }
-            consider(candidate);
+            readyWalked++;
+            if (consider(candidate, tally).terminal()) {
+                tally.notReached = tally.ready - readyWalked;
+                logSummary(tally);
+                return;
+            }
+        }
+        logSummary(tally);
+    }
+
+    /**
+     * FAB-180: one line per walk. INFO when it says something the last INFO summary did not, or when that
+     * line is {@link #SUMMARY_HEARTBEAT} old; DEBUG otherwise, so an unchanging world is quiet.
+     */
+    private void logSummary(CycleTally tally) {
+        String summary = tally.summary();
+        Instant now = clock.instant();
+        if (!summary.equals(lastInfoSummary)
+                || Duration.between(lastInfoSummaryAt, now).compareTo(SUMMARY_HEARTBEAT) >= 0) {
+            lastInfoSummary = summary;
+            lastInfoSummaryAt = now;
+            log.info("{}", summary);
+        } else {
+            log.debug("{}", summary);
         }
     }
 
     // ---- the order a cycle walks its candidates in (FAB-144) ------------------------------------
 
-    /** {@code candidates} reordered by expected fee, each computed once, and the order logged at INFO. */
-    private List<CompoundCandidate> mostProfitableFirstThisCycle(List<CompoundCandidate> candidates) {
+    /**
+     * {@code candidates} reordered by expected fee, each computed once, and the order logged — at INFO
+     * when at least one is priced, at DEBUG when none is. The priced count goes to {@code tally} last, so
+     * a ranking that throws leaves it at zero.
+     */
+    private List<CompoundCandidate> mostProfitableFirstThisCycle(List<CompoundCandidate> candidates,
+                                                                 CycleTally tally) {
         Map<CompoundCandidate, Optional<BigInteger>> rewards = new IdentityHashMap<>();
         for (CompoundCandidate candidate : candidates) {
-            rewards.put(candidate, expectedFeeLovelace(candidate));
+            rewards.put(candidate, grossRecoverableLovelace(candidate));
         }
         List<CompoundCandidate> ordered = mostProfitableFirst(candidates, rewards::get);
-        log.info("compound order (most profitable first): {}", ordered.stream()
+        String order = ordered.stream()
                 .map(candidate -> candidate.escrowRef() + rewards.get(candidate)
-                        .map(fee -> " ≈" + fee + " lovelace").orElse(" unpriced"))
-                .collect(Collectors.joining(", ")));
+                        .map(fee -> " gross≈" + fee + " lovelace").orElse(" gross unpriced"))
+                .collect(Collectors.joining(", "));
+        int priced = (int) rewards.values().stream().filter(Optional::isPresent).count();
+        if (priced > 0) {
+            log.info("compound order (most profitable first): {}", order);
+        } else {
+            log.debug("compound order (most profitable first): {}", order);
+        }
+        tally.priced = priced;
         return ordered;
     }
 
-    /**
-     * The ranking key: {@link CompoundEconomics#expectedFee}, which is already lovelace because only an
-     * ada principal is admitted ({@code CompoundCandidateScanner}'s {@code PRINCIPAL_NOT_ADA} gate).
-     * Empty — never thrown — for a structurally unready candidate, a non-ada principal or a null amount.
-     */
+    /** Legacy ADA-only ranking helper retained for source compatibility with readiness checks. */
     static Optional<BigInteger> expectedFeeLovelace(CompoundCandidate candidate) {
         try {
             if (candidate == null || !candidate.structurallyReady() || candidate.addedLiquidity() == null
                     || !candidate.bond().datum().principalAsset().isAda()) {
                 return Optional.empty();
             }
-            return Optional.of(CompoundEconomics.expectedFee(candidate.addedLiquidity(),
-                    candidate.feePerMille()));
+            return Optional.of(CompoundEconomics.compoundingFee(candidate.addedLiquidity(),
+                    candidate.feePerMille(), candidate.bond().datum().principalAsset()));
         } catch (RuntimeException e) {
             return Optional.empty();
         }
+    }
+
+    private Optional<BigInteger> grossRecoverableLovelace(CompoundCandidate candidate) {
+        if (candidate == null || !candidate.structurallyReady() || candidate.addedLiquidity() == null
+                || candidate.bond() == null || candidate.bond().datum() == null) {
+            return Optional.empty();
+        }
+        BigInteger escrowCoin = candidate.escrow().getAmount().stream()
+                .filter(a -> "lovelace".equals(a.getUnit()))
+                .map(a -> a.getQuantity()).findFirst().orElse(BigInteger.ZERO);
+        return economics.grossRecoverableLovelace(candidate.bond().datum().principalAsset(),
+                candidate.addedLiquidity(), candidate.feePerMille(), escrowCoin,
+                System.currentTimeMillis());
     }
 
     /**
@@ -286,15 +432,16 @@ public class CompoundExecutor {
         return ordered;
     }
 
-    private void consider(CompoundCandidate candidate) {
+    private CandidateOutcome consider(CompoundCandidate candidate, CycleTally tally) {
         if (!configuration.isEnabled()) {
-            // Not a fault, and said at INFO because a ready candidate going unprocessed is exactly
-            // what an operator will ask about.
-            log.info("compound READY but NOT ARMED {} escrow {}: {} lovelace into pool {} at {}/1000 "
-                            + "— set loans.compound.enabled=true to act on it",
+            // Not a fault. Said at DEBUG per escrow (FAB-180); the cycle summary's `not armed` count is
+            // what answers an operator asking why a ready candidate went unprocessed.
+            tally.notArmed++;
+            log.debug("compound READY but NOT ARMED {} escrow {}: Q={} raw units into pool {} at "
+                            + "compoudingFeePerMille={} — set loans.compound.enabled=true to act on it",
                     candidate.loanId(), candidate.escrowRef(), candidate.addedLiquidity(),
                     candidate.poolId(), candidate.feePerMille());
-            return;
+            return CandidateOutcome.DEFINITE_FAILURE;
         }
 
         Optional<Utxo> bondUtxo = utxoResolver.resolveBondUtxo(candidate.bond());
@@ -305,12 +452,14 @@ public class CompoundExecutor {
                     bondUtxo.isEmpty() ? "the lender bond " : "",
                     configUtxo.isEmpty() ? "the config " : "",
                     lmConfigUtxo.isEmpty() ? "the lm config " : "");
-            return;
+            return CandidateOutcome.DEFINITE_FAILURE;
         }
 
         List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
-        Optional<Utxo> wallet = WalletInputSelection.largest(walletUtxos);
-        if (wallet.isEmpty()) {
+        final WalletInputSelection.CompoundFunding funding;
+        try {
+            funding = WalletInputSelection.selectForCompound(walletUtxos, BigInteger.ZERO);
+        } catch (WalletInputSelection.CompoundFundingException e) {
             // ⛔ "Nothing qualified" cannot tell an EMPTY wallet from a FULL one whose every UTxO is
             // ineligible, and those need opposite responses. Measured 2026-09-02: the wallet held
             // 9,898 ada and could not build, because its only UTxO also carried a native token —
@@ -320,16 +469,17 @@ public class CompoundExecutor {
                     .filter(a -> "lovelace".equals(a.getUnit()))
                     .mapToLong(a -> a.getQuantity().longValue()).sum();
             long multiAsset = walletUtxos.stream().filter(u -> u.getAmount().size() > 1).count();
-            log.warn("compound SKIPPED {}: no ada-only wallet utxo is nominable as input and "
-                            + "collateral. The wallet holds {} utxo(s) totalling {} lovelace, of which "
-                            + "{} carry native assets and are therefore ineligible — collateral must be "
-                            + "pure ada. This is a wallet SHAPE problem, not a shortage: split an "
-                            + "ada-only output off before expecting a compound to build.",
-                    candidate.loanId(), walletUtxos.size(), total, multiAsset);
-            return;
+            log.warn("compound SKIPPED {}: {}. Wallet has {} utxo(s), {} lovelace and {} "
+                            + "token-bearing utxo(s); ordinary compound inputs may carry safe token "
+                            + "change, while collateral must be a distinct pure-ADA UTxO",
+                    candidate.loanId(), e.reason(), walletUtxos.size(), total, multiAsset);
+            return CandidateOutcome.DEFINITE_FAILURE;
         }
 
-        BigInteger fee = CompoundEconomics.expectedFee(candidate.addedLiquidity(), candidate.feePerMille());
+        // THE validator's fee (ADA: at least 1 ADA since 2026-10-26; token: Q*c/1000). It is what the
+        // builder hands the pool owner's share to, what the pool output is reduced by, and what is priced.
+        BigInteger fee = CompoundEconomics.compoundingFee(candidate.addedLiquidity(), candidate.feePerMille(),
+                candidate.bond().datum().principalAsset());
 
         long now = System.currentTimeMillis();
         long anchor = Math.min(now, tipMillis());
@@ -340,48 +490,63 @@ public class CompoundExecutor {
                         .atZone(java.time.ZoneOffset.UTC).toLocalDateTime())
         };
 
-        Transaction transaction;
+        PricingService.Priced quote = economics.quote(
+                candidate.bond().datum().principalAsset(), fee, now);
+        if (!quote.isPriced()) {
+            CompoundExclusion exclusion = CompoundEconomics.priceExclusion(quote.refusal());
+            tally.notApproved(exclusion);
+            log.debug("compound NOT APPROVED {} escrow {}: {} — F={} raw units, quote={}",
+                    candidate.loanId(), candidate.escrowRef(), exclusion, fee, quote.refusal());
+            return CandidateOutcome.DEFINITE_FAILURE;
+        }
+
+        CompoundTransactionBuilder.Built built;
         try {
-            transaction = builder.build(new CompoundTransactionBuilder.Request(
-                    candidate, referenceScripts(), bondUtxo.get(), configUtxo.get(), lmConfigUtxo.get(), wallet.get(),
+            built = builder.buildWithFacts(new CompoundTransactionBuilder.Request(
+                    candidate, referenceScripts(), bondUtxo.get(), configUtxo.get(), lmConfigUtxo.get(),
+                    funding.ordinaryInput(),
                     account.baseAddress(), fee, slots[0], slots[1]));
         } catch (CompoundTransactionBuilder.RefusedException e) {
             log.warn("compound REFUSED BY BUILDER {} escrow {}: {}", candidate.loanId(),
                     candidate.escrowRef(), e.getMessage());
-            return;
+            return CandidateOutcome.DEFINITE_FAILURE;
         } catch (Exception e) {
             log.error("compound BUILD FAILED {} escrow {}: {}", candidate.loanId(),
                     candidate.escrowRef(), e.toString(), e);
-            return;
+            return CandidateOutcome.DEFINITE_FAILURE;
         }
 
         // ⛔ The gate runs on the BUILT transaction's own fee — measured, not estimated.
-        // The principal asset is passed honestly (never a boolean smuggling a pricing decision) —
-        // CompoundEconomics prices it via PricingService itself. Every candidate reaching here is
-        // still ada-principal (CompoundCandidateScanner's own gate, see PRINCIPAL_NOT_ADA), so this
-        // is always AssetType.ada() today, but it is spelled out in full for when that gate lifts.
-        CompoundAssessment assessment = economics.assess(true, true,
+        // The principal asset is passed honestly (never a boolean smuggling a pricing decision).
+        // The exact quote retained above and the kernel's final-body facts are the admission inputs.
+        CompoundAssessment assessment = economics.assessFinal(true, true,
                 candidate.bond().datum().principalAsset(), candidate.addedLiquidity(),
-                candidate.feePerMille(), transaction.getBody().getFee(), now);
+                candidate.feePerMille(), built.facts(), quote);
 
         if (!assessment.approved()) {
-            log.info("compound NOT APPROVED {} escrow {}: {} — escrow {} at {}/1000 earns {}, tx fee {}, "
-                            + "net {} against floor {}{}",
+            tally.notApproved(assessment.exclusion());
+            log.debug("compound NOT APPROVED {} escrow {}: {} — Q={} raw units at compoudingFeePerMille={} "
+                            + "gives F={} raw units, priced reward={} lovelace, recovered E={} lovelace, "
+                            + "final fee L={} lovelace, pool top-up T={} lovelace, net={} lovelace "
+                            + "against floor={} lovelace{}",
                     candidate.loanId(), candidate.escrowRef(), assessment.exclusion(),
-                    assessment.escrow(), assessment.feePerMille(), assessment.expectedFeeLovelace(),
-                    assessment.txFee(), assessment.net(), assessment.floor(),
+                    assessment.escrow(), assessment.feePerMille(), assessment.expectedFee(),
+                    assessment.expectedFeeLovelace(), assessment.recoveredEscrowLovelace(),
+                    assessment.txFee(), assessment.poolTopUpLovelace(), assessment.net(), assessment.floor(),
                     assessment.zeroFeePool()
-                            ? " (this pool publishes NO compounding fee; a negative floor is the only "
-                              + "way to process it, and that is the operator's call to state)"
+                            ? " (this pool publishes compoudingFeePerMille = 0: an ADA pool still pays the "
+                              + "1 ADA floor and a token pool pays nothing; this measured net requires a "
+                              + "lower operator-stated floor)"
                             : "");
-            return;
+            return CandidateOutcome.DEFINITE_FAILURE;
         }
 
-        submit(candidate, transaction, assessment);
+        return submit(candidate, built, assessment, quote, tally);
     }
 
-    private void submit(CompoundCandidate candidate, Transaction transaction,
-                        CompoundAssessment assessment) {
+    private CandidateOutcome submit(CompoundCandidate candidate, CompoundTransactionBuilder.Built built,
+                                    CompoundAssessment assessment, PricingService.Priced quote,
+                                    CycleTally tally) {
         // ⛔ THE NETWORK GATE IS GONE — `loans.submittable-network` was removed on 2026-09-04
         // (Giovanni: "a barrier that silently blocks submission even when everything else is armed
         // is a bug, not a safeguard"). `config.network` alone decides where this node acts, and it
@@ -399,30 +564,204 @@ public class CompoundExecutor {
         // considered and declined. The same day removed liquidation's own redundant second boolean,
         // for the same reason: gates that restate each other are cost without safety.
 
+        Transaction transaction = built.transaction();
+        if (!Arrays.equals(built.facts().bodyIdentity(),
+                CompoundTransactionBuilder.bodyIdentity(transaction))) {
+            log.warn("compound REFUSED {}: validated transaction body changed before signing",
+                    candidate.loanId());
+            return CandidateOutcome.DEFINITE_FAILURE;
+        }
+        CompoundExclusion observationRefusal = economics.revalidateObservation(assessment,
+                candidate.bond().datum().principalAsset(), System.currentTimeMillis());
+        if (observationRefusal != null) {
+            tally.notApproved(observationRefusal);
+            log.info("compound NOT APPROVED {} escrow {}: {} immediately before signing",
+                    candidate.loanId(), candidate.escrowRef(), observationRefusal);
+            return CandidateOutcome.DEFINITE_FAILURE;
+        }
+        CompoundAssessment finalAssessment = economics.assessFinal(true, true,
+                candidate.bond().datum().principalAsset(), candidate.addedLiquidity(),
+                candidate.feePerMille(), built.facts(), quote);
+        if (!finalAssessment.approved()) {
+            tally.notApproved(finalAssessment.exclusion());
+            log.info("compound NOT APPROVED {} escrow {}: {} on the immediate pre-sign recheck",
+                    candidate.loanId(), candidate.escrowRef(), finalAssessment.exclusion());
+            return CandidateOutcome.DEFINITE_FAILURE;
+        }
+        assessment = finalAssessment;
+
         byte[] signed;
         try {
             signed = account.sign(transaction).serialize();
+            Transaction signedTransaction = Transaction.deserialize(signed);
+            if (!Arrays.equals(built.facts().bodyIdentity(),
+                    CompoundTransactionBuilder.bodyIdentity(signedTransaction))) {
+                log.error("compound SIGN FAILED {}: signer changed the validated transaction body; "
+                        + "nothing was transmitted", candidate.loanId());
+                return CandidateOutcome.DEFINITE_FAILURE;
+            }
         } catch (Exception e) {
             log.error("compound SIGN FAILED {}: {} — nothing was transmitted",
                     candidate.loanId(), e.toString(), e);
-            return;
+            return CandidateOutcome.DEFINITE_FAILURE;
         }
 
         try {
             Result<String> result = submitter.submit(signed);
             if (result != null && result.isSuccessful()) {
-                log.info("COMPOUNDED {} escrow {}: {} lovelace into pool {}, fee earned {}, tx fee {}, "
-                                + "net {} — tx {}",
+                boolean wouldSubmit = "WOULD_SUBMIT".equals(result.getValue())
+                        || "WOULD_SUBMIT".equals(result.getResponse());
+                log.info("{} {} escrow {}: Q={} raw units into pool {}, F={} raw units, priced "
+                                + "reward={} lovelace, recovered E={} lovelace, final fee L={} lovelace, "
+                                + "pool top-up T={} lovelace, net={} lovelace — tx {}",
+                        wouldSubmit ? "WOULD_SUBMIT" : "COMPOUNDED",
                         candidate.loanId(), candidate.escrowRef(), candidate.addedLiquidity(),
-                        candidate.poolId(), assessment.expectedFeeLovelace(), assessment.txFee(),
-                        assessment.net(), result.getValue());
-                return;
+                        candidate.poolId(), assessment.expectedFee(), assessment.expectedFeeLovelace(),
+                        assessment.recoveredEscrowLovelace(), assessment.txFee(),
+                        assessment.poolTopUpLovelace(), assessment.net(), result.getValue());
+                return wouldSubmit ? CandidateOutcome.WOULD_SUBMIT : CandidateOutcome.SUBMITTED;
             }
-            log.warn("compound SUBMIT REJECTED {}: {}", candidate.loanId(),
-                    result == null ? "no response" : result.getResponse());
+            if (isDecodedBlockfrostProviderSubmitRefusal(result)) {
+                log.warn("compound SUBMIT REJECTED {} by decoded Blockfrost provider submit refusal "
+                                + "(HTTP {}): {}",
+                        candidate.loanId(), result.code(), result.getResponse());
+                return CandidateOutcome.DEFINITE_FAILURE;
+            }
+            log.error("compound SUBMIT AMBIGUOUS {}: {}", candidate.loanId(),
+                    result == null ? "no response" : result);
+            return CandidateOutcome.AMBIGUOUS;
         } catch (Exception e) {
-            log.error("compound SUBMIT THREW {}: {}", candidate.loanId(), e.toString(), e);
+            log.error("compound SUBMIT AMBIGUOUS {}: transport threw {}; candidate pass stops",
+                    candidate.loanId(), e.toString(), e);
+            return CandidateOutcome.AMBIGUOUS;
         }
+    }
+
+    /**
+     * CCL 0.7.2 exposes a Blockfrost failure only as an HTTP code plus its raw response body.
+     * Continue the candidate pass only for the complete, bounded HTTP-400 envelope documented by
+     * Blockfrost for {@code /tx/submit}. The diagnostic {@code message} is deliberately opaque: the
+     * provider publishes no Cardano/Haskell grammar for it, so its content cannot decide whether a
+     * different candidate may be submitted.
+     */
+    private static boolean isDecodedBlockfrostProviderSubmitRefusal(Result<?> result) {
+        if (result == null || result.isSuccessful() || result.code() != 400
+                || result.getResponse() == null
+                || result.getResponse().length() < 1
+                || result.getResponse().length() > MAX_PROVIDER_RESPONSE_LENGTH) {
+            return false;
+        }
+        String response = result.getResponse();
+        int start = 0;
+        int end = response.length();
+        while (start < end && isJsonWhitespace(response.charAt(start))) {
+            start++;
+        }
+        while (end > start && isJsonWhitespace(response.charAt(end - 1))) {
+            end--;
+        }
+        if (start == end || response.charAt(start) == '\uFEFF') {
+            return false;
+        }
+
+        try {
+            JsonParser parser = BLOCKFROST_ERROR_MAPPER.getFactory()
+                    .createParser(response.substring(start, end));
+            parser.enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
+            try (parser) {
+                if (parser.nextToken() != JsonToken.START_OBJECT) {
+                    return false;
+                }
+                int depth = 1;
+                int rootMembers = 0;
+                String rootField = null;
+                boolean statusSeen = false;
+                boolean statusValid = false;
+                boolean errorSeen = false;
+                boolean errorValid = false;
+                boolean messageSeen = false;
+                boolean messageValid = false;
+
+                JsonToken token;
+                while ((token = parser.nextToken()) != null) {
+                    if (depth == 0) {
+                        return false;
+                    }
+                    if (token == JsonToken.FIELD_NAME) {
+                        if (parser.currentName().length() > MAX_PROVIDER_JSON_STRING_LENGTH) {
+                            return false;
+                        }
+                        if (depth == 1) {
+                            rootMembers++;
+                            if (rootMembers > MAX_PROVIDER_ROOT_MEMBERS) {
+                                return false;
+                            }
+                            rootField = parser.currentName();
+                        }
+                        continue;
+                    }
+                    if (token == JsonToken.START_OBJECT || token == JsonToken.START_ARRAY) {
+                        if (depth == 1 && rootField != null) {
+                            if ("status_code".equals(rootField)) {
+                                statusSeen = true;
+                            } else if ("error".equals(rootField)) {
+                                errorSeen = true;
+                            } else if ("message".equals(rootField)) {
+                                messageSeen = true;
+                            }
+                            rootField = null;
+                        }
+                        depth++;
+                        if (depth > MAX_PROVIDER_JSON_DEPTH) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (token == JsonToken.END_OBJECT || token == JsonToken.END_ARRAY) {
+                        depth--;
+                        if (depth < 0) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (token == JsonToken.VALUE_STRING
+                            && parser.getText().length() > MAX_PROVIDER_JSON_STRING_LENGTH) {
+                        return false;
+                    }
+                    if ((token == JsonToken.VALUE_NUMBER_INT || token == JsonToken.VALUE_NUMBER_FLOAT)
+                            && parser.getText().length() > MAX_PROVIDER_JSON_NUMBER_LENGTH) {
+                        return false;
+                    }
+                    if (depth == 1 && rootField != null) {
+                        if ("status_code".equals(rootField)) {
+                            statusSeen = true;
+                            statusValid = token == JsonToken.VALUE_NUMBER_INT
+                                    && BigInteger.valueOf(400).equals(parser.getBigIntegerValue())
+                                    && result.code() == 400;
+                        } else if ("error".equals(rootField)) {
+                            errorSeen = true;
+                            errorValid = token == JsonToken.VALUE_STRING
+                                    && "Bad Request".equals(parser.getText());
+                        } else if ("message".equals(rootField)) {
+                            messageSeen = true;
+                            messageValid = token == JsonToken.VALUE_STRING;
+                        }
+                        rootField = null;
+                    }
+                }
+                return depth == 0
+                        && rootMembers >= MIN_PROVIDER_ROOT_MEMBERS
+                        && statusSeen && statusValid
+                        && errorSeen && errorValid
+                        && messageSeen && messageValid;
+            }
+        } catch (java.io.IOException | RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isJsonWhitespace(char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
     }
 
     /**

@@ -116,9 +116,10 @@ class LendingConfigGateTest {
 
     @Test
     void aCleanDatumLeavesTheGateOpen() throws Exception {
-        // The live datums after FluidTokens' 2026-10-01 redeploy: only the advisory recast pause differs.
+        // The live datums as FluidTokens last rewrote them (2026-10-23 / 2026-10-26): only the advisory
+        // recast pause differs.
         LoansConfigVerifier verifier = verifierServing(
-                fixture("mainnet-config-datum-2026-10-01.hex"), fixture("mainnet-lm-config-datum-2026-10-01.hex"));
+                fixture("mainnet-config-datum-2026-10-23.hex"), fixture("mainnet-lm-config-datum-2026-10-26.hex"));
 
         verifier.verify();
 

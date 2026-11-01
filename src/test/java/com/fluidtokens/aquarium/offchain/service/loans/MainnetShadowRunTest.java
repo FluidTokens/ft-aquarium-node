@@ -8,6 +8,7 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationAssessment;
 import com.fluidtokens.aquarium.offchain.model.loans.Loan;
@@ -142,6 +143,32 @@ class MainnetShadowRunTest {
             }
         }
         return Optional.empty();
+    }
+
+    /**
+     * {@code PoolDatum.commonData.principalAsset} (upstream {@code lib/fluidtokens/types/pool.ak}: field 2 is
+     * {@code commonData}, whose field 0 is {@code Asset { policyId, assetName }}). The compounding fee depends
+     * on it, so a pool whose principal cannot be read gets no fee printed rather than a guessed one.
+     */
+    private static Optional<AssetType> poolPrincipal(Utxo pool) {
+        if (pool.getInlineDatum() == null) {
+            return Optional.empty();
+        }
+        try {
+            var datum = com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData.deserialize(
+                    com.bloxbean.cardano.client.common.cbor.CborSerializationUtil.deserialize(
+                            com.bloxbean.cardano.client.util.HexUtil.decodeHexString(pool.getInlineDatum())));
+            var commonData = (com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData)
+                    datum.getData().getPlutusDataList().get(2);
+            var asset = (com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData)
+                    commonData.getData().getPlutusDataList().get(0);
+            var fields = asset.getData().getPlutusDataList();
+            return Optional.of(AssetType.fromPlutusData(
+                    ((com.bloxbean.cardano.client.plutus.spec.BytesPlutusData) fields.get(0)).getValue(),
+                    ((com.bloxbean.cardano.client.plutus.spec.BytesPlutusData) fields.get(1)).getValue()));
+        } catch (Exception e) {
+            return Optional.empty();
+        }
     }
 
     private static LoansContractRegistry mainnetRegistry() {
@@ -369,17 +396,37 @@ class MainnetShadowRunTest {
 
         // And the pool that WOULD be compounded into, read live — because the fee it publishes is what
         // decides whether the work pays at all, and it is the pool OWNER who sets it, not this node.
-        var poolManagerUtxos = new ArrayList<Utxo>();
+        //
+        // ⇑ CORRECTED 2026-10-26 (FAB-169). This used to print "pays NOTHING; refused at the shipped margin
+        // of 0" for every pool at compoudingFeePerMille = 0. Since FluidTokens' 2026-10-26 lm_compound_action
+        // (FAB-167) an ADA-principal pool pays at least 1 ADA whatever its rate, so at margin 0 such a
+        // compound is APPROVED whenever the tx fee does not exceed it. The value printed is the single fee
+        // function's at the smallest escrow (Q = 1): the fee never falls as Q grows, so it is the least any
+        // compound into that pool pays. The pool and its manager share the pool id as asset name.
         for (String poolId : liveAssetNames(registry.getPoolManagerPolicyId())) {
-            utxoHolding(registry.getPoolManagerPolicyId() + poolId).ifPresent(poolManagerUtxos::add);
-        }
-        for (Utxo poolManager : poolManagerUtxos) {
+            Optional<Utxo> held = utxoHolding(registry.getPoolManagerPolicyId() + poolId);
+            if (held.isEmpty()) {
+                continue;
+            }
+            Utxo poolManager = held.get();
             long feePerMille = CompoundCandidateScanner.compoundingFeePerMille(poolManager);
+            Optional<AssetType> principal = utxoHolding(registry.getPoolPolicyId() + poolId)
+                    .flatMap(MainnetShadowRunTest::poolPrincipal);
+            String verdict = principal.map(p -> {
+                BigInteger leastFee = CompoundEconomics.compoundingFee(BigInteger.ONE, feePerMille, p);
+                return "  principal=" + (p.isAda() ? "ada" : p.toUnit()) + "  leastCompoundingFee="
+                        + leastFee + (p.isAda() ? " lovelace" : " raw units")
+                        + (p.isAda()
+                                ? "   => pays at least 1 ADA; approved at the shipped margin of 0 when the "
+                                        + "tx fee does not exceed the fee"
+                                : leastFee.signum() == 0
+                                        ? "   => no principal fee on the smallest escrow; decided by "
+                                                + "recovered escrow ADA - tx fee - pool top-up"
+                                        : "");
+            }).orElse("  principal UNREADABLE (pool " + poolId + " not found or its datum did not decode)"
+                    + "; fee not computed");
             System.out.println("  pool manager " + poolManager.getTxHash() + "#"
-                    + poolManager.getOutputIndex() + "  compoudingFeePerMille=" + feePerMille
-                    + (feePerMille == 0
-                            ? "   => pays NOTHING; refused at the shipped margin of 0"
-                            : ""));
+                    + poolManager.getOutputIndex() + "  compoudingFeePerMille=" + feePerMille + verdict);
         }
 
         System.out.println("\n---- what a mainnet SHADOW BUILD would still need -------------------------");

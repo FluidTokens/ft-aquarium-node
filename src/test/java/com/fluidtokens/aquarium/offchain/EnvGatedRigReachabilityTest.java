@@ -309,6 +309,48 @@ class EnvGatedRigReachabilityTest {
     }
 
     /**
+     * FAB-174-4: the oracle stream's live rig signs in with the staked preview wallet, so it must be reachable
+     * by sourcing {@code .env.preview-staked} plus one deliberate opt-in, and it must never be able to reach
+     * mainnet. Its gates are exactly the mnemonic and the opt-in; its source names the preview stream's host and
+     * never the mainnet one's; the credential file, where present, supplies the mnemonic (names only, as above);
+     * and no {@code .env.*} file pre-throws the opt-in — the same reasoning as a park: a switch a credential file
+     * throws is a rig that runs, and holds the bond's one connection, every time the file is sourced.
+     */
+    @Test
+    void theOracleStreamRigGatesOnTheStakedPreviewWalletAndTalksToPreviewOnly() {
+        String source = read(testSource("OracleStreamPreviewLiveTest"));
+
+        assertEquals(Set.of("WALLET_MNEMONIC", "AQUARIUM_ORACLE_STREAM_RIG"), gateNames(source),
+                "OracleStreamPreviewLiveTest must gate on exactly the staked wallet's mnemonic and its own "
+                        + "opt-in: one gate fewer runs it by accident, one more is a switch nobody documented");
+        assertTrue(source.contains("2tgda3mk4l.execute-api.eu-west-1.amazonaws.com"),
+                "OracleStreamPreviewLiveTest no longer names the preview stream's host");
+        assertFalse(source.contains("25mxd4whnj"),
+                "OracleStreamPreviewLiveTest names the MAINNET stream's host: the rig is preview-only");
+
+        Path staked = repoRoot().resolve(".env.preview-staked");
+        if (Files.exists(staked)) {
+            assertTrue(effectivelyDefinedNames(staked).contains("WALLET_MNEMONIC"),
+                    ".env.preview-staked does not define WALLET_MNEMONIC, so sourcing it leaves the oracle "
+                            + "stream rig skipped — and a skip reads as a pass");
+        }
+
+        List<Path> envFiles;
+        try (Stream<Path> listing = Files.list(repoRoot())) {
+            envFiles = listing.filter(p -> p.getFileName().toString().startsWith(".env."))
+                    .filter(Files::isRegularFile).sorted().toList();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        for (Path envFile : envFiles) {
+            assertFalse(effectivelyDefinedNames(envFile).contains("AQUARIUM_ORACLE_STREAM_RIG"),
+                    envFile.getFileName() + " defines AQUARIUM_ORACLE_STREAM_RIG: an opt-in a credential file "
+                            + "must never throw, or sourcing it runs the live rig and takes the bond's one "
+                            + "connection from a running preview node");
+        }
+    }
+
+    /**
      * ⛔ <b>The harness guard for the two park checks below.</b> Both of them iterate {@link
      * #PARKED_RIGS}, so an empty list makes them assert <em>nothing</em> while still reporting as
      * tests that ran and passed: a zero-iteration loop in one, {@code {}} compared with {@code {}}

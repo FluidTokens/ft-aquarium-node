@@ -70,9 +70,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <h2>The fixture: recorded datums, reconstructed UTxO shells</h2>
  * Every DATUM and every script below is recorded mainnet data; the UTxO VALUES around them are
  * reconstructed (stated per constant). It is a hypothetical on purpose — <i>"had the d832b78e loan still
- * been live when the 2026-10-01 FLDT feed was signed"</i> — and it is coherent because every piece is
- * the current deployment's: the shipped mainnet registry derives exactly the 2026-10-01 config datums
- * ({@code MainnetRegistryMatchesConfigTest}).
+ * been live when the 2026-10-01 FLDT feed was signed"</i> — and it replays that 2026-10-01 scenario,
+ * config datums included. Those datums are no longer the live ones: FluidTokens rewrote ConfigDatum[24]
+ * (2026-10-23) and LMConfigDatum[3] and [6] (2026-10-26) in place, and the shipped registry derives the
+ * rewritten datums ({@code MainnetRegistryMatchesConfigTest}, {@code MainnetRedeploy20261026Test}). None
+ * of the three is a script a convert invokes, and LMConfigDatum[5] (liquidate + convert) is unchanged on
+ * 2026-10-26, so the scenario is still coherent for the convert path.
  * <ul>
  *   <li>loan and lender-bond datums: {@code mainnet-*-d832b78e.hex}, the convert-eligible candidate
  *       ({@code mainnet-convert-candidate.PROVENANCE.md}; loan id from {@code ConvertOrderPlanTest});</li>
@@ -128,7 +131,10 @@ class ConvertProductionWiringTest {
 
     // ---- the recorded coordinates ---------------------------------------------------------------------
 
-    /** The 2026-10-01 Config / LMConfig holders (ConvertLiveDryEvalTest's CONFIG_TX / LM_CONFIG_TX). */
+    /**
+     * The 2026-10-01 Config / LMConfig holders (ConvertLiveDryEvalTest's CONFIG_TX / LM_CONFIG_TX), spent by
+     * the 2026-10-23 / 2026-10-26 rewrites: recorded coordinates of the replayed scenario, not live ones.
+     */
     private static final TransactionInput CONFIG_REF = new TransactionInput(
             "3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c", 0);
     private static final TransactionInput LM_CONFIG_REF = new TransactionInput(

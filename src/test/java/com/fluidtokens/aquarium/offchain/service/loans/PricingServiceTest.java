@@ -266,6 +266,7 @@ class PricingServiceTest {
 
         assertTrue(priced.isPriced());
         assertEquals(BigInteger.valueOf(5_010_690_070L), priced.lovelace());
+        assertEquals(client.usable, priced.observation(), "the exact priced feed must travel with the quote");
     }
 
     /**
@@ -303,6 +304,19 @@ class PricingServiceTest {
 
         assertTrue(priced.isPriced());
         assertEquals(BigInteger.valueOf(3L), priced.lovelace(), "10/3 must floor to 3, not ceil to 4");
+    }
+
+    @Test
+    void aPositiveRationalMayLegitimatelyFloorTheEarnedLovelaceToZero() {
+        var client = new StubOracleClient();
+        client.usable = OraclePriceFeed.aggregated(TOKEN, BigInteger.ONE,
+                BigInteger.valueOf(1_000_000_000L), AT_MILLIS - 1_000, AT_MILLIS + 1_000);
+
+        var priced = new PricingService(client).toLovelace(TOKEN, BigInteger.ONE, AT_MILLIS);
+
+        assertTrue(priced.isPriced(), "positivity applies to n/d, not to the floored result");
+        assertEquals(BigInteger.ZERO, priced.lovelace());
+        assertEquals(client.usable, priced.observation());
     }
 
     // ---- fail-closed refusals, distinguishable from one another ---------------------------------
@@ -383,6 +397,26 @@ class PricingServiceTest {
 
         assertFalse(priced.isPriced());
         assertEquals(PricingService.RefusalReason.POOLED, priced.refusal().reason());
+    }
+
+    @Test
+    void nonPositiveAndConversionFailuresAreNamedSeparately() {
+        var nonPositiveClient = new StubOracleClient();
+        nonPositiveClient.usable = OraclePriceFeed.aggregated(TOKEN, BigInteger.ZERO, BigInteger.ONE,
+                AT_MILLIS - 1_000, AT_MILLIS + 1_000);
+        var nonPositive = new PricingService(nonPositiveClient)
+                .toLovelace(TOKEN, BigInteger.ONE, AT_MILLIS);
+        assertEquals(PricingService.RefusalReason.NON_POSITIVE, nonPositive.refusal().reason());
+
+        var failedLookup = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<OraclePriceFeed> findFeed(AssetType asset, long atMillis) {
+                throw new IllegalStateException("synthetic decode failure");
+            }
+        };
+        var conversion = new PricingService(failedLookup)
+                .toLovelace(TOKEN, BigInteger.ONE, AT_MILLIS);
+        assertEquals(PricingService.RefusalReason.CONVERSION_FAILED, conversion.refusal().reason());
     }
 
     // ---- the fail-closed property itself, as its own mutant-killing assertion -------------------

@@ -52,13 +52,17 @@ class ShippedDefaultsTest {
 
     private static final String RESOURCE = "application.yaml";
     private static final String MAINNET_CONFIG_TX =
-            "3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c"; // 2026-10-01 in-place update
-    /** lm_compound before FluidTokens' 2026-10-01 redeploy (2a8faf65…, still unspent on chain). */
-    private static final String OLD_COMPOUND_REFERENCE =
-            "ec592cc9e0dffdc1fdefa197cb353c4f60a07910c257cd4236293b844ceeabb7#0";
-    /** lm_compound since 2026-10-01: 71515a89…, the hash LMConfigDatum[3] names. */
+            "75e459a0e97d3808031d97b8360308782f197bc778471d3dbc4aa51245886dc5"; // 2026-10-23 in-place update (was 3d800e98…, 2026-10-01)
+    /**
+     * Superseded lm_compound references: 2a8faf65… (before FluidTokens' 2026-10-01 redeploy) and 71515a89…
+     * (2026-10-01 until the 2026-10-26 LMConfigDatum rewrite). Both are still unspent on chain.
+     */
+    private static final List<String> OLD_COMPOUND_REFERENCES = List.of(
+            "ec592cc9e0dffdc1fdefa197cb353c4f60a07910c257cd4236293b844ceeabb7#0",
+            "29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0");
+    /** lm_compound since 2026-10-26: 4713a925…, the hash LMConfigDatum[3] names. */
     private static final String NEW_COMPOUND_REFERENCE =
-            "29f63a1e1e7b268481df871d969b1b250b437a4d9a82aa7bfaf7b6f6252dc946#0";
+            "588695471b9f865ceac88066883fad118a5a1800c9c69a0663e5ff560d656b1a#0";
 
     /** The base document and the {@code preview}-profile document, in file order. */
     private static List<Map<String, Object>> documents() throws IOException {
@@ -216,8 +220,9 @@ class ShippedDefaultsTest {
                 "mainnet compound references must be unique");
         assertTrue(references.contains(NEW_COMPOUND_REFERENCE),
                 "the current lm_compound reference is absent");
-        assertTrue(!references.contains(OLD_COMPOUND_REFERENCE),
-                "the superseded lm_compound reference is still shipped");
+        for (String old : OLD_COMPOUND_REFERENCES) {
+            assertTrue(!references.contains(old), "a superseded lm_compound reference is still shipped: " + old);
+        }
     }
 
     @Test

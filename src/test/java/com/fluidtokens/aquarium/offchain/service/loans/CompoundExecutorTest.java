@@ -9,25 +9,53 @@ import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
+import com.bloxbean.cardano.client.transaction.spec.Transaction;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
+import com.fluidtokens.aquarium.offchain.config.BlockfrostKey;
+import com.fluidtokens.aquarium.offchain.config.BoundedBFBackendService;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import okhttp3.OkHttpClient;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.lang.reflect.Field;
 import java.math.BigInteger;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -79,9 +107,21 @@ class CompoundExecutorTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
     }
 
+    private static Utxo collateral() {
+        return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0)
+                .address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+    }
+
     private static List<Utxo> universe() {
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        return List.copyOf(universe);
+    }
+
+    private static List<Utxo> baseUniverse() {
         return List.of(utxo("escrow"), utxo("bond"), utxo("pool"), utxo("poolManager"),
-                utxo("config"), utxo("lmConfig"), wallet());
+                utxo("config"), utxo("lmConfig"), collateral());
     }
 
     private static CompoundCandidate ready(long feePerMille) {
@@ -110,11 +150,11 @@ class CompoundExecutorTest {
     }
 
     private static Wiring wiringOnNetwork(List<CompoundCandidate> candidates, String network) {
-        return wiring(candidates, true, -2_000_000L, List.of(wallet()), network);
+        return wiring(candidates, true, -2_000_000L, List.of(wallet(), collateral()), network);
     }
 
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor) {
-        return wiring(candidates, armed, floor, List.of(wallet()), "preview");
+        return wiring(candidates, armed, floor, List.of(wallet(), collateral()), "preview");
     }
 
     private static Wiring wiring(List<CompoundCandidate> candidates, boolean armed, long floor,
@@ -132,8 +172,16 @@ class CompoundExecutorTest {
             return Result.success("deadbeefcafe").withValue("deadbeefcafe");
         };
 
-        List<Utxo> universe = new java.util.ArrayList<>(universe());
-        universe.addAll(walletUtxos);
+        List<Utxo> universe = new java.util.ArrayList<>(baseUniverse());
+        walletUtxos.stream().filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
+        candidates.stream().map(CompoundCandidate::escrow)
+                .filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
         var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
         var executor = new CompoundExecutor(configuration, network, blockEventListener,
@@ -156,18 +204,23 @@ class CompoundExecutorTest {
         assertTrue(w.submitted().isEmpty(), "a disarmed loop must transmit nothing");
     }
 
-    /** ⛔ The zero-fee pool at the safe default: built, priced, and declined on the numbers. */
+    /**
+     * ⛔ A below-cost compound at the safe default: built, priced, and declined on the numbers. Since
+     * FAB-167 a zero-rate ADA pool pays the 1 ADA floor, so this is no longer "pays nothing": it is
+     * declined because this rig builds ALL-INLINE (no reference scripts), and that final fee — measured
+     * 1,270,532 lovelace — exceeds the 1 ADA the pool pays.
+     */
     @Test
     void aZeroFeePoolIsDeclinedAtTheDefaultFloor() {
         Wiring w = wiring(List.of(ready(0L)), true, 0L);
         w.executor().cycle();
         assertTrue(w.submitted().isEmpty(),
-                "expectedFee 0 minus a real tx fee is negative, and the default floor refuses it");
+                "the 1 ADA floor minus an all-inline tx fee above 1 ADA is negative, and the default floor refuses it");
     }
 
     /**
-     * ⛔ AND THE RULED CASE. The same candidate, the same zero fee, with the operator's stated
-     * negative bound — this is the transaction that will actually fire on preview.
+     * ⛔ AND THE RULED CASE (FAB-167 task 4: unchanged). The same below-cost candidate, with the
+     * operator's stated negative bound, IS compounded — a negative margin still admits a loss.
      */
     @Test
     void aStatedNegativeFloorProcessesTheZeroFeeCandidate() {
@@ -176,6 +229,384 @@ class CompoundExecutorTest {
         assertEquals(1, w.submitted().size(),
                 "with the loss stated and bounded, the armed loop compounds");
         assertTrue(w.submitted().getFirst().length > 0, "signed bytes reached the submitter");
+    }
+
+    @Test
+    void aSuccessfulSubmissionStopsTheCandidatePass() {
+        assertResponseAttempts(Result.<String>success("ok").withValue("deadbeef"), 1,
+                "a successful first submission is terminal; a second intent would violate the pass budget");
+    }
+
+    @Test
+    void anAmbiguousTransportResultStops() {
+        AtomicInteger ambiguousCalls = new AtomicInteger();
+        Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+        CompoundExecutor ambiguous = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()),
+                signingAccount, bytes -> {
+            ambiguousCalls.incrementAndGet();
+            throw new java.io.IOException("acceptance unknown");
+        });
+        ambiguous.cycle();
+        org.mockito.Mockito.verify(signingAccount, org.mockito.Mockito.times(1))
+                .sign(org.mockito.ArgumentMatchers.any(Transaction.class));
+        assertEquals(1, ambiguousCalls.get(), "transport ambiguity must end the candidate pass");
+    }
+
+    @Test
+    void boundedBackendCanonicalProviderRefusalAdvancesToTheDistinctSecondCandidate() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.PROVIDER_400_THEN_SUCCESS);
+
+        assertEquals(2, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 2);
+    }
+
+    @Test
+    void boundedBackendHttp408IsTerminalAfterTheFirstCandidate() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.HTTP_408);
+
+        assertEquals(1, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 1);
+    }
+
+    @Test
+    void boundedBackendHttp500IsTerminalAfterTheFirstCandidate() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.HTTP_500);
+
+        assertEquals(1, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 1);
+    }
+
+    @Test
+    void boundedBackendResetAfterFullBodyIsOneTerminalPostWithoutReplay() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.RESET_AFTER_BODY);
+
+        assertEquals(1, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 1);
+    }
+
+    @Test
+    void boundedBackendDecodedSuccessStopsAfterTheFirstCandidate() throws Exception {
+        BoundedWireAttempts attempts = boundedWireAttempts(WireOutcome.SUCCESS);
+
+        assertEquals(1, attempts.signs());
+        assertSubmittedCandidateOrder(attempts, 1);
+    }
+
+    @Test
+    void aProviderSubmitRefusalWithALegacyLookingMessageContinuesToTheNextCandidate() {
+        assertResponseAttempts(blockfrostRejection(400,
+                "transaction submit error ShelleyTxValidationError ShelleyBasedEraConway "
+                        + "(ApplyTxError [UtxowFailure (UtxoFailure (BadInputsUTxO "
+                        + "(fromList [TxIn deadbeef 0])))])"), 2,
+                "a complete decoded Blockfrost provider submit refusal may try the next candidate");
+    }
+
+    @Test
+    void documentedBlockfrostBadRequestContinuesToSecondCandidate() {
+        assertResponseAttempts(Result.<String>error(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":"
+                        + "\"Backend did not understand your request.\"}").code(400), 2,
+                "the documented Blockfrost submit-refusal envelope");
+    }
+
+    @Test
+    void opaqueMessageNeverDecidesProviderRefusal() {
+        for (String message : List.of(
+                "",
+                "arbitrary prose",
+                "transaction submit error arbitrary ShelleyTxValidationError text ApplyTxError",
+                "transaction submit error ShelleyTxValidationError (ApplyTxError [BadInputsUTxO])",
+                "{\"constructor\":\"ApplyTxError\",\"details\":[]}")) {
+            assertResponseAttempts(blockfrostRejection(400, message), 2,
+                    "message is opaque: " + message);
+        }
+    }
+
+    @Test
+    void schemaPermittedExtraMemberStillContinues() {
+        assertResponseAttempts(Result.<String>error(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\","
+                        + "\"provider_trace\":{\"region\":\"eu\"}}").code(400), 2,
+                "the provider schema permits additional members");
+    }
+
+    @Test
+    void resultAndEnvelopeStatusMustBothBe400() {
+        List<Result<String>> responses = List.of(
+                Result.<String>error(blockfrostError(400, "Bad Request", "opaque")).code(408),
+                Result.<String>error(blockfrostError(408, "Bad Request", "opaque")).code(400),
+                Result.<String>error("{\"status_code\":400.0,\"error\":\"Bad Request\","
+                        + "\"message\":\"opaque\"}").code(400),
+                Result.<String>error("{\"status_code\":\"400\",\"error\":\"Bad Request\","
+                        + "\"message\":\"opaque\"}").code(400));
+        for (Result<String> response : responses) {
+            assertResponseAttempts(response, 1, "both statuses must be the integral number 400");
+        }
+    }
+
+    @Test
+    void badRequestNameMustMatchRecognizedSubset() {
+        for (String body : List.of(
+                "{\"status_code\":400,\"message\":\"opaque\",\"extra\":0}",
+                "{\"status_code\":400,\"error\":400,\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":\"bad request\",\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":\"Conflict\",\"message\":\"opaque\"}")) {
+            assertResponseAttempts(Result.<String>error(body).code(400), 1,
+                    "error must be the exact recognized provider example");
+        }
+    }
+
+    @Test
+    void allRequiredFieldsAreTyped() {
+        for (String body : List.of(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"extra\":0}",
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":400}",
+                "{\"error\":\"Bad Request\",\"message\":\"opaque\",\"extra\":0}",
+                "{\"status_code\":null,\"error\":\"Bad Request\",\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":null,\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":null}",
+                "[400,\"Bad Request\",\"opaque\"]")) {
+            assertResponseAttempts(Result.<String>error(body).code(400), 1,
+                    "required fields and root must retain their documented JSON types");
+        }
+    }
+
+    @Test
+    void duplicateOrTrailingJsonIsAmbiguous() {
+        for (String body : List.of(
+                "{\"status_code\":400,\"status_code\":400,\"error\":\"Bad Request\","
+                        + "\"message\":\"opaque\"}",
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\","
+                        + "\"extra\":{\"x\":1,\"x\":2}}",
+                blockfrostError(400, "Bad Request", "opaque") + "{}",
+                blockfrostError(400, "Bad Request", "opaque") + " trailing",
+                "\uFEFF" + blockfrostError(400, "Bad Request", "opaque"))) {
+            assertResponseAttempts(Result.<String>error(body).code(400), 1,
+                    "duplicates, a BOM, and unconsumed input are ambiguous");
+        }
+    }
+
+    @Test
+    void malformedOrUnframed400IsAmbiguous() {
+        for (String body : List.of("{not-json", "Bad Request", "<html>Bad Request</html>", "", " \t\r\n")) {
+            assertResponseAttempts(Result.<String>error(body).code(400), 1,
+                    "only a complete provider JSON envelope is definite");
+        }
+    }
+
+    @Test
+    void decoderBoundsAreClosed() {
+        List<String> exactBounds = List.of(
+                exactLengthBlockfrostBody(131_072),
+                blockfrostError(400, "Bad Request", "x".repeat(65_536)),
+                escapedMessageBody(20_000),
+                longFieldNameBody(65_536),
+                nestedExtraBody(15),
+                extraNumberBody("12345678901234567890"),
+                memberCountBody(32));
+        for (int i = 0; i < exactBounds.size(); i++) {
+            assertResponseAttempts(Result.<String>error(exactBounds.get(i)).code(400), 2,
+                    "exact body/string/escaped-string/field-name/depth/number/member control " + i);
+        }
+
+        List<String> oneOverBounds = List.of(
+                exactLengthBlockfrostBody(131_073),
+                blockfrostError(400, "Bad Request", "x".repeat(65_537)),
+                longFieldNameBody(65_537),
+                nestedExtraBody(16),
+                extraNumberBody("123456789012345678901"),
+                memberCountBody(33));
+        for (int i = 0; i < oneOverBounds.size(); i++) {
+            assertResponseAttempts(Result.<String>error(oneOverBounds.get(i)).code(400), 1,
+                    "one-over body/string/field-name/depth/number/member control " + i);
+        }
+
+        assertResponseAttempts(Result.<String>error(" \t\r\n"
+                + blockfrostError(400, "Bad Request", "opaque") + "\n\t ").code(400), 2,
+                "JSON whitespace around the one complete document is allowed");
+    }
+
+    @Test
+    void http408StopsAfterExactlyOneSignAndSubmitIntent() {
+        assertResponseAttempts(Result.<String>error(blockfrostError(408, "Request Timeout",
+                        "request timed out while waiting for the backend")).code(408), 1,
+                "HTTP 408 does not establish rejection");
+    }
+
+    @Test
+    void undecodable4xxStopsAfterExactlyOneSignAndSubmitIntent() {
+        assertResponseAttempts(Result.<String>error("upstream proxy refused the request").code(429), 1,
+                "an arbitrary 4xx body does not establish rejection");
+    }
+
+    @Test
+    void nullOther4xxAnd5xxResponsesRemainTerminalAmbiguity() {
+        assertResponseAttempts(null, 1, "a null result has unknown acceptance");
+        assertResponseAttempts(Result.<String>error(null).code(400), 1,
+                "an HTTP 400 without a response body has unknown acceptance");
+        for (int status : List.of(418, 425, 429, 500, 503)) {
+            assertResponseAttempts(Result.<String>error(
+                    blockfrostError(status, "Bad Request", "opaque")).code(status), 1,
+                    "HTTP " + status + " is outside the recognized provider refusal boundary");
+        }
+    }
+
+    @Test
+    void raw400CannotMasqueradeAsProviderSubmitRefusal() {
+        assertResponseAttempts(Result.<String>error("BadInputsUTxO").code(400), 1,
+                "a status and raw ledger tag are not a decoded provider refusal");
+    }
+
+    @Test
+    void malformedJsonCannotMasqueradeAsProviderSubmitRefusal() {
+        assertResponseAttempts(Result.<String>error("{not-json").code(400), 1,
+                "malformed JSON is not a decoded provider refusal");
+    }
+
+    @Test
+    void statusMismatchedPayloadCannotMasqueradeAsProviderSubmitRefusal() {
+        assertResponseAttempts(Result.<String>error(blockfrostError(409, "Conflict",
+                        "transaction submit error ShelleyTxValidationError ShelleyBasedEraConway "
+                                + "(ApplyTxError [BadInputsUTxO])")).code(400), 1,
+                "HTTP status and payload status must agree");
+    }
+
+    @Test
+    void aWouldSubmitResultIsTerminalEvenWithoutATransactionHash() {
+        assertResponseAttempts(Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"), 1,
+                "WOULD_SUBMIT represents a terminal intent, not a refusal");
+    }
+
+    @Test
+    void evidenceNativeZeroFeeCandidateBuildsAndSubmitsWithoutAnOracleCall() {
+        var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
+        CompoundCandidate base = ready(0L);
+        BigInteger q = BigInteger.valueOf(176_000_000L);
+        Utxo escrow = Utxo.builder().txHash(base.escrow().getTxHash())
+                .outputIndex(base.escrow().getOutputIndex()).address(base.escrow().getAddress())
+                .inlineDatum(base.escrow().getInlineDatum())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(1_986_910L)),
+                        Amount.asset(token.toUnit(), q))).build();
+        LenderBond bond = new LenderBond(base.bond().txHash(), base.bond().outputIndex(), base.bond().address(),
+                base.bond().loanId(), base.bond().inlineDatum(),
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), token));
+        CompoundCandidate nativeCandidate = new CompoundCandidate(base.loanId(), escrow, base.escrowDatum(), q,
+                bond, base.poolId(), base.pool(), base.poolManager(), 0L, false, null,
+                "offline evidence-derived native candidate");
+        List<Utxo> universe = new ArrayList<>(List.of(escrow, utxo("bond"), base.pool(), base.poolManager(),
+                utxo("config"), utxo("lmConfig"), wallet(), collateral()));
+        var builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
+        var throwingClient = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed> findFeed(
+                    com.fluidtokens.aquarium.offchain.model.AssetType asset, long atMillis) {
+                throw new AssertionError("native F=0 must not consult the oracle");
+            }
+        };
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.ZERO);
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var block = new BlockEventListener(null);
+        block.getIsSyncing().set(false);
+        AtomicInteger submits = new AtomicInteger();
+        var executor = new CompoundExecutor(configuration, network, block,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(List.of(nativeCandidate)),
+                new CompoundEconomics(configuration, network, new PricingService(throwingClient)), builder,
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), bytes -> {
+                    submits.incrementAndGet();
+                    return Result.success("ok").withValue("native-offline");
+                });
+
+        executor.cycle();
+
+        assertEquals(1, submits.get(), "recovered E exceeds measured L+T at floor zero");
+    }
+
+    @Test
+    void productionSigningSubmitsTheExactKernelValidatedBody() {
+        AtomicReference<byte[]> validatedBody = new AtomicReference<>();
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        CompoundTransactionBuilder recording = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null) {
+            @Override
+            public Built buildWithFacts(Request request) {
+                Built built = super.buildWithFacts(request);
+                validatedBody.set(built.facts().bodyIdentity());
+                return built;
+            }
+        };
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(List.of(ready(0L)), recording, bytes -> {
+            submits.incrementAndGet();
+            Transaction signed = Transaction.deserialize(bytes);
+            assertArrayEquals(validatedBody.get(), CompoundTransactionBuilder.bodyIdentity(signed),
+                    "account.sign(transaction).serialize() may add witnesses but not change the body");
+            return Result.success("ok").withValue("deadbeef");
+        });
+
+        executor.cycle();
+
+        assertNotNull(validatedBody.get());
+        assertEquals(1, submits.get());
+    }
+
+    @Test
+    void bodyMutationAfterKernelValidationIsRefusedImmediatelyBeforeSigning() {
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        CompoundTransactionBuilder mutating = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null) {
+            @Override
+            public Built buildWithFacts(Request request) {
+                Built built = super.buildWithFacts(request);
+                built.transaction().getBody().setFee(built.transaction().getBody().getFee().add(BigInteger.ONE));
+                return built;
+            }
+        };
+        Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(List.of(ready(0L)), mutating, signingAccount, bytes -> {
+            submits.incrementAndGet();
+            return Result.success("unexpected");
+        });
+
+        executor.cycle();
+
+        org.mockito.Mockito.verify(signingAccount, org.mockito.Mockito.never())
+                .sign(org.mockito.ArgumentMatchers.any(Transaction.class));
+        assertEquals(0, submits.get(), "a post-validation body mutation must not reach submission");
+    }
+
+    @Test
+    void changedAndExpiredPriceObservationsAreRefusedBeforeSigning() {
+        for (CompoundExclusion refusal : List.of(CompoundExclusion.PRICE_OBSERVATION_CHANGED,
+                CompoundExclusion.PRICE_OBSERVATION_EXPIRED)) {
+            var configuration = new AppConfig.CompoundConfiguration(
+                    true, 60L, BigInteger.valueOf(-2_000_000L));
+            var network = new AppConfig.Network();
+            network.setNetworkForTest("preview");
+            CompoundEconomics economics = org.mockito.Mockito.spy(
+                    new CompoundEconomics(configuration, network, pricingService()));
+            org.mockito.Mockito.doReturn(refusal).when(economics).revalidateObservation(
+                    org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                    org.mockito.ArgumentMatchers.anyLong());
+            Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+            AtomicInteger submits = new AtomicInteger();
+            CompoundExecutor executor = executor(List.of(ready(0L)), realBuilder(), signingAccount,
+                    economics, bytes -> {
+                        submits.incrementAndGet();
+                        return Result.success("unexpected");
+                    });
+
+            executor.cycle();
+
+            org.mockito.Mockito.verify(signingAccount, org.mockito.Mockito.never())
+                    .sign(org.mockito.ArgumentMatchers.any(Transaction.class));
+            assertEquals(0, submits.get(), refusal + " must refuse before signing or submission");
+        }
     }
 
     /** A structurally refused candidate never reaches the builder. */
@@ -453,7 +884,8 @@ class CompoundExecutorTest {
         java.util.concurrent.atomic.AtomicReference<CompoundTransactionBuilder.Request> handed =
                 new java.util.concurrent.atomic.AtomicReference<>();
         CompoundTransactionBuilder recording = org.mockito.Mockito.mock(CompoundTransactionBuilder.class);
-        org.mockito.Mockito.when(recording.build(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class)))
+        org.mockito.Mockito.when(recording.buildWithFacts(
+                        org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class)))
                 .thenAnswer(invocation -> {
                     handed.set(invocation.getArgument(0));
                     throw new IllegalStateException("recorded; the transaction itself is not under test here");
@@ -481,6 +913,386 @@ class CompoundExecutorTest {
                 .referenceScriptHash(scriptHash).build();
     }
 
+    private static CompoundTransactionBuilder realBuilder() {
+        return realBuilder(List.of());
+    }
+
+    private static CompoundTransactionBuilder realBuilder(List<CompoundCandidate> candidates) {
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        candidates.stream().map(CompoundCandidate::escrow)
+                .filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
+        return new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
+    }
+
+    private static CompoundExecutor executor(List<CompoundCandidate> candidates,
+                                             CompoundTransactionBuilder builder,
+                                             CompoundExecutor.TransactionSubmitter submitter) {
+        return executor(candidates, builder, ACCOUNT, submitter);
+    }
+
+    private static CompoundExecutor executor(List<CompoundCandidate> candidates,
+                                             CompoundTransactionBuilder builder,
+                                             Account account,
+                                             CompoundExecutor.TransactionSubmitter submitter) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        return executor(candidates, builder, account,
+                new CompoundEconomics(configuration, network, pricingService()), submitter);
+    }
+
+    private static CompoundExecutor executor(List<CompoundCandidate> candidates,
+                                             CompoundTransactionBuilder builder,
+                                             Account account,
+                                             CompoundEconomics economics,
+                                             CompoundExecutor.TransactionSubmitter submitter) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        candidates.stream().map(CompoundCandidate::escrow)
+                .filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
+        return new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), account,
+                new FakeScanner(candidates), economics,
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.converters(), submitter);
+    }
+
+    private static Result<String> blockfrostRejection(int statusCode, String message) {
+        return Result.<String>error(blockfrostError(statusCode, "Bad Request", message)).code(statusCode);
+    }
+
+    private static String blockfrostError(int statusCode, String error, String message) {
+        try {
+            return new ObjectMapper().writeValueAsString(java.util.Map.of(
+                    "status_code", statusCode,
+                    "error", error,
+                    "message", message));
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new AssertionError("test-only Blockfrost response fixture must serialize", e);
+        }
+    }
+
+    private record AttemptCounts(long signs, int submits) {
+    }
+
+    private enum WireOutcome {
+        PROVIDER_400_THEN_SUCCESS,
+        HTTP_408,
+        HTTP_500,
+        RESET_AFTER_BODY,
+        SUCCESS
+    }
+
+    private record BoundedWireAttempts(long signs, List<byte[]> posts, List<String> requestLines) {
+    }
+
+    private static BoundedWireAttempts boundedWireAttempts(WireOutcome outcome) throws Exception {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+        try (CompoundSubmitServer server = new CompoundSubmitServer(outcome)) {
+            BoundedBFBackendService backend = new BoundedBFBackendService(
+                    server.baseUrl(), BlockfrostKey.of("test-key"),
+                    1, 2, 2, 2, 2, 2, 5);
+            try {
+                executorWithBackend(candidates, realBuilder(candidates), signingAccount, backend).cycle();
+                server.awaitQuiescent();
+                long signs = org.mockito.Mockito.mockingDetails(signingAccount).getInvocations().stream()
+                        .filter(invocation -> invocation.getMethod().getName().equals("sign"))
+                        .count();
+                return new BoundedWireAttempts(signs, server.posts(), server.requestLines());
+            } finally {
+                closeBackend(backend);
+            }
+        }
+    }
+
+    private static CompoundExecutor executorWithBackend(List<CompoundCandidate> candidates,
+                                                        CompoundTransactionBuilder builder,
+                                                        Account account,
+                                                        BoundedBFBackendService backend) {
+        var configuration = new AppConfig.CompoundConfiguration(
+                true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        candidates.stream().map(CompoundCandidate::escrow)
+                .filter(candidate -> universe.stream().noneMatch(existing ->
+                        existing.getTxHash().equals(candidate.getTxHash())
+                                && existing.getOutputIndex() == candidate.getOutputIndex()))
+                .forEach(universe::add);
+        return new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), account,
+                new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), backend);
+    }
+
+    private static void assertSubmittedCandidateOrder(BoundedWireAttempts attempts, int expectedPosts)
+            throws Exception {
+        assertEquals(expectedPosts, attempts.posts().size(), "exactly one POST is allowed per signed intent");
+        assertEquals(expectedPosts, attempts.requestLines().size());
+        assertTrue(attempts.requestLines().stream()
+                .allMatch("POST /api/v0/tx/submit HTTP/1.1"::equals));
+
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        for (int i = 0; i < expectedPosts; i++) {
+            Transaction submitted = Transaction.deserialize(attempts.posts().get(i));
+            TransactionInput expected = new TransactionInput(
+                    candidates.get(i).escrow().getTxHash(), candidates.get(i).escrow().getOutputIndex());
+            TransactionInput other = new TransactionInput(
+                    candidates.get(1 - i).escrow().getTxHash(), candidates.get(1 - i).escrow().getOutputIndex());
+            assertTrue(submitted.getBody().getInputs().contains(expected),
+                    "POST " + i + " must spend candidate " + candidates.get(i).escrowRef());
+            assertFalse(submitted.getBody().getInputs().contains(other),
+                    "POST " + i + " must not replay or substitute candidate "
+                            + candidates.get(1 - i).escrowRef());
+        }
+        if (expectedPosts == 2) {
+            assertFalse(Arrays.equals(attempts.posts().get(0), attempts.posts().get(1)),
+                    "the second POST must be the distinct second candidate, not a retry");
+        }
+    }
+
+    private static void closeBackend(BoundedBFBackendService backend) throws Exception {
+        Field baseClientField = BoundedBFBackendService.class.getDeclaredField("baseClient");
+        baseClientField.setAccessible(true);
+        OkHttpClient client = (OkHttpClient) baseClientField.get(backend);
+        client.dispatcher().cancelAll();
+        client.connectionPool().evictAll();
+        client.dispatcher().executorService().shutdown();
+        assertTrue(client.dispatcher().executorService().awaitTermination(3, TimeUnit.SECONDS),
+                "the bounded client dispatcher did not terminate");
+    }
+
+    private static final class CompoundSubmitServer implements AutoCloseable {
+        private static final int QUIET_ACCEPT_MILLIS = 700;
+        private static final long FIXTURE_SECONDS = 4;
+
+        private final WireOutcome outcome;
+        private final ServerSocket server;
+        private final ExecutorService handler = Executors.newSingleThreadExecutor();
+        private final CountDownLatch exited = new CountDownLatch(1);
+        private final AtomicReference<Throwable> failure = new AtomicReference<>();
+        private final List<byte[]> posts = new CopyOnWriteArrayList<>();
+        private final List<String> requestLines = new CopyOnWriteArrayList<>();
+
+        private CompoundSubmitServer(WireOutcome outcome) throws IOException {
+            this.outcome = outcome;
+            this.server = new ServerSocket(0, 4, InetAddress.getLoopbackAddress());
+            this.server.setSoTimeout((int) TimeUnit.SECONDS.toMillis(FIXTURE_SECONDS));
+            handler.submit(this::serve);
+        }
+
+        private String baseUrl() {
+            return "http://127.0.0.1:" + server.getLocalPort() + "/api/v0/";
+        }
+
+        private List<byte[]> posts() {
+            return posts.stream().map(byte[]::clone).toList();
+        }
+
+        private List<String> requestLines() {
+            return List.copyOf(requestLines);
+        }
+
+        private void serve() {
+            try {
+                while (true) {
+                    try (Socket socket = server.accept()) {
+                        socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(FIXTURE_SECONDS));
+                        RequestBody request = readRequest(socket.getInputStream());
+                        requestLines.add(request.requestLine());
+                        posts.add(request.body());
+                        server.setSoTimeout(QUIET_ACCEPT_MILLIS);
+                        if (outcome == WireOutcome.RESET_AFTER_BODY) {
+                            socket.setSoLinger(true, 0);
+                            continue;
+                        }
+                        writeResponse(socket.getOutputStream(), responseFor(posts.size()));
+                    }
+                }
+            } catch (SocketTimeoutException quiet) {
+                // The quiet accept window is the negative control for a replay or second candidate.
+            } catch (Throwable throwable) {
+                failure.compareAndSet(null, throwable);
+            } finally {
+                exited.countDown();
+            }
+        }
+
+        private HttpResponse responseFor(int postNumber) {
+            return switch (outcome) {
+                case PROVIDER_400_THEN_SUCCESS -> postNumber == 1
+                        ? new HttpResponse("400 Bad Request",
+                        "{\"status_code\":400,\"error\":\"Bad Request\","
+                                + "\"message\":\"Backend did not understand your request.\"}")
+                        : new HttpResponse("200 OK", "\"deadbeef\"");
+                case HTTP_408 -> new HttpResponse("408 Request Timeout", "{}");
+                case HTTP_500 -> new HttpResponse("500 Internal Server Error", "{}");
+                case SUCCESS -> new HttpResponse("200 OK", "\"deadbeef\"");
+                case RESET_AFTER_BODY -> throw new AssertionError("reset responses have no HTTP envelope");
+            };
+        }
+
+        private static RequestBody readRequest(InputStream input) throws IOException {
+            ByteArrayOutputStream headerBytes = new ByteArrayOutputStream();
+            int a = -1;
+            int b = -1;
+            int c = -1;
+            for (int next; (next = input.read()) != -1; ) {
+                headerBytes.write(next);
+                if (headerBytes.size() > 65_536) {
+                    throw new IOException("request headers exceed fixture bound");
+                }
+                if (a == '\r' && b == '\n' && c == '\r' && next == '\n') {
+                    break;
+                }
+                a = b;
+                b = c;
+                c = next;
+            }
+            String headers = headerBytes.toString(StandardCharsets.US_ASCII);
+            int firstLineEnd = headers.indexOf("\r\n");
+            if (firstLineEnd < 0) {
+                throw new IOException("request headers did not complete");
+            }
+            int contentLength = -1;
+            for (String line : headers.split("\r\n")) {
+                if (line.regionMatches(true, 0, "Content-Length:", 0, "Content-Length:".length())) {
+                    contentLength = Integer.parseInt(line.substring(line.indexOf(':') + 1).trim());
+                }
+            }
+            if (contentLength < 0) {
+                throw new IOException("submission request has no Content-Length");
+            }
+            byte[] body = input.readNBytes(contentLength);
+            if (body.length != contentLength) {
+                throw new IOException("submission body ended at " + body.length + " of " + contentLength);
+            }
+            return new RequestBody(headers.substring(0, firstLineEnd), body);
+        }
+
+        private static void writeResponse(OutputStream output, HttpResponse response) throws IOException {
+            byte[] body = response.body().getBytes(StandardCharsets.UTF_8);
+            output.write(("HTTP/1.1 " + response.status() + "\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: " + body.length + "\r\n"
+                    + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            output.write(body);
+            output.flush();
+        }
+
+        private void awaitQuiescent() throws Exception {
+            assertTrue(exited.await(FIXTURE_SECONDS, TimeUnit.SECONDS),
+                    "the joint submission handler did not terminate");
+            if (failure.get() != null) {
+                throw new AssertionError("joint submission fixture failed", failure.get());
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            server.close();
+            handler.shutdownNow();
+            assertTrue(handler.awaitTermination(FIXTURE_SECONDS, TimeUnit.SECONDS),
+                    "the joint submission fixture executor did not terminate");
+            if (failure.get() != null) {
+                throw new AssertionError("joint submission fixture failed", failure.get());
+            }
+        }
+
+        private record RequestBody(String requestLine, byte[] body) {
+        }
+
+        private record HttpResponse(String status, String body) {
+        }
+    }
+
+    private static AttemptCounts responseAttempts(Result<String> response) {
+        Account signingAccount = org.mockito.Mockito.spy(ACCOUNT);
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()),
+                signingAccount, bytes -> {
+                    submits.incrementAndGet();
+                    return response;
+                });
+        executor.cycle();
+        long signs = org.mockito.Mockito.mockingDetails(signingAccount).getInvocations().stream()
+                .filter(invocation -> invocation.getMethod().getName().equals("sign"))
+                .count();
+        return new AttemptCounts(signs, submits.get());
+    }
+
+    private static void assertResponseAttempts(Result<String> response, int expected, String message) {
+        AttemptCounts counts = responseAttempts(response);
+        assertEquals(expected, counts.signs(), message + " (signs)");
+        assertEquals(expected, counts.submits(), message + " (submits)");
+    }
+
+    private static String exactLengthBlockfrostBody(int targetLength) {
+        String prefix = "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"\""
+                + ",\"a\":\"";
+        String middle = "\",\"b\":\"";
+        String suffix = "\"}";
+        int firstLength = 65_536;
+        int secondLength = targetLength - prefix.length() - firstLength - middle.length() - suffix.length();
+        if (secondLength < 0 || secondLength > 65_536) {
+            throw new IllegalArgumentException("unsupported exact body length " + targetLength);
+        }
+        String body = prefix + "x".repeat(firstLength) + middle + "y".repeat(secondLength) + suffix;
+        assertEquals(targetLength, body.length(), "test fixture must isolate the body-length bound");
+        return body;
+    }
+
+    private static String nestedExtraBody(int nestedArrays) {
+        return "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\","
+                + "\"nested\":" + "[".repeat(nestedArrays) + "0" + "]".repeat(nestedArrays) + "}";
+    }
+
+    private static String escapedMessageBody(int decodedLength) {
+        return "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\""
+                + "\\u0061".repeat(decodedLength) + "\"}";
+    }
+
+    private static String longFieldNameBody(int fieldNameLength) {
+        return "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\",\""
+                + "f".repeat(fieldNameLength) + "\":null}";
+    }
+
+    private static String extraNumberBody(String numberToken) {
+        return "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\","
+                + "\"number\":" + numberToken + "}";
+    }
+
+    private static String memberCountBody(int memberCount) {
+        StringBuilder body = new StringBuilder(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\"");
+        for (int i = 3; i < memberCount; i++) {
+            body.append(",\"extra").append(i).append("\":null");
+        }
+        return body.append('}').toString();
+    }
+
+    private static List<CompoundCandidate> twoReadyCandidates() {
+        return List.of(readyAt("11".repeat(32), 0L), readyAt("12".repeat(32), 0L));
+    }
+
     /** The {@code wiring(...)} executor, with the builder stated and the universe the executor resolves against. */
     private static CompoundExecutor executorWithBuilder(AppConfig.CompoundConfiguration configuration,
                                                         CompoundTransactionBuilder builder, List<Utxo> universe) {
@@ -492,7 +1304,7 @@ class CompoundExecutorTest {
             throw new AssertionError("nothing is built, so nothing may be submitted");
         };
         return new CompoundExecutor(configuration, network, blockEventListener,
-                new FakeAppUtxoService(List.of(wallet())), ACCOUNT,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
                 new FakeScanner(List.of(ready(0L))), new CompoundEconomics(configuration, network, pricingService()),
                 builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
     }
@@ -509,52 +1321,134 @@ class CompoundExecutorTest {
                 base.principalIsAda(), base.exclusion(), base.detail());
     }
 
-    /** One disarmed cycle's INFO lines, in the order the executor logged them. */
-    private static List<String> infoLinesOfOneCycle(Wiring w) {
+    /** One logged line: its level and its formatted text. */
+    private record Line(Level level, String text) {
+    }
+
+    /**
+     * Every line {@code action} logs, at every level, in order. The executor's logger is held at DEBUG for
+     * the duration — a Spring test earlier in the same JVM may have left it at INFO — and restored after.
+     */
+    private static List<Line> linesOf(Runnable action) {
+        var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
+        Level previous = logger.getLevel();
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.DEBUG);
+        try {
+            action.run();
+        } finally {
+            logger.setLevel(previous);
+            logger.detachAppender(appender);
+        }
+        return appender.list.stream()
+                .map(event -> new Line(event.getLevel(), event.getFormattedMessage()))
+                .toList();
+    }
+
+    /** One cycle's lines, at every level, in the order the executor logged them. */
+    private static List<Line> linesOfOneCycle(Wiring w) {
+        return linesOf(() -> w.executor().cycle());
+    }
+
+    private static List<String> at(Level level, List<Line> lines) {
+        return lines.stream().filter(line -> line.level() == level).map(Line::text).toList();
+    }
+
+    /**
+     * FAB-144, cycle level. Scanned refused-first, then the 40/1000 escrow, then the 80/1000 one: the
+     * cycle must walk the 80/1000 escrow first (2,328,741 lovelace on 29,109,268), then the 40/1000
+     * (1,164,370), and the structurally refused one last — still reported, never dropped. Disarmed, so
+     * each ready candidate says READY BUT NOT ARMED and nothing is built. (FAB-167: both rates sit above
+     * the 1 ADA floor on this escrow, so the per-mille term is what ranks them.)
+     */
+    @Test
+    void aCycleWalksTheMostProfitableCompoundFirstAndARefusedOneLast() {
+        CompoundCandidate tenPerMille = readyAt("01".repeat(32), 40L);
+        CompoundCandidate twentyPerMille = readyAt("02".repeat(32), 80L);
+        String cheap = tenPerMille.escrowRef();
+        String rich = twentyPerMille.escrowRef();
+        Wiring w = wiring(List.of(refused(), tenPerMille, twentyPerMille), false, 0L);
+
+        List<Line> lines = linesOfOneCycle(w);
+        List<String> info = at(Level.INFO, lines);
+
+        // FAB-180: the per-escrow lines are at DEBUG now, text unchanged.
+        List<String> walked = at(Level.DEBUG, lines).stream()
+                .filter(line -> line.startsWith("compound READY but NOT ARMED")
+                        || line.startsWith("compound REFUSED"))
+                .toList();
+        assertEquals(3, walked.size(), "every candidate is reported, each once: " + lines);
+        assertTrue(walked.get(0).contains(rich), "the 80/1000 escrow first: " + walked);
+        assertTrue(walked.get(1).contains(cheap), "the 40/1000 escrow second: " + walked);
+        assertTrue(walked.get(2).startsWith("compound REFUSED"), "the refused one last: " + walked);
+        assertEquals(List.of("compound order (most profitable first): " + rich + " gross≈2328741 lovelace, "
+                        + cheap + " gross≈1164370 lovelace, " + refused().escrowRef() + " gross unpriced"),
+                info.stream().filter(line -> line.startsWith("compound order")).toList(),
+                "one INFO line naming the order: " + info);
+        assertTrue(w.submitted().isEmpty(), "a disarmed loop transmits nothing");
+    }
+
+    @Test
+    void nativeRankingUsesLovelaceGrossNotRawTokenQuantity() {
+        var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
+        CompoundCandidate largerRaw = nativeCandidate("31".repeat(32), token,
+                BigInteger.valueOf(1_000_000L), 100L, BigInteger.valueOf(2_000_000L));
+        CompoundCandidate smallerRaw = nativeCandidate("32".repeat(32), token,
+                BigInteger.valueOf(1_000L), 100L, BigInteger.valueOf(5_000_000L));
+        var client = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed> findFeed(
+                    com.fluidtokens.aquarium.offchain.model.AssetType asset, long atMillis) {
+                return Optional.of(com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed.aggregated(
+                        token, BigInteger.ONE, BigInteger.valueOf(1_000L), atMillis - 1, atMillis + 1));
+            }
+        };
+        var configuration = new AppConfig.CompoundConfiguration(false, 60L, BigInteger.ZERO);
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var block = new BlockEventListener(null);
+        block.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        var executor = new CompoundExecutor(configuration, network, block,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(List.of(largerRaw, smallerRaw)),
+                new CompoundEconomics(configuration, network, new PricingService(client)), realBuilder(),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                bytes -> { throw new AssertionError("disarmed"); });
         var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
         logger.addAppender(appender);
         try {
-            w.executor().cycle();
+            executor.cycle();
         } finally {
             logger.detachAppender(appender);
         }
-        return appender.list.stream()
-                .filter(event -> event.getLevel() == Level.INFO)
-                .map(ILoggingEvent::getFormattedMessage)
-                .toList();
+
+        String order = appender.list.stream().map(ILoggingEvent::getFormattedMessage)
+                .filter(line -> line.startsWith("compound order")).findFirst().orElseThrow();
+        assertTrue(order.indexOf(smallerRaw.escrowRef()) < order.indexOf(largerRaw.escrowRef()), order);
+        assertTrue(order.contains("gross≈5000000 lovelace"), order);
+        assertTrue(order.contains("gross≈2000100 lovelace"), order);
     }
 
-    /**
-     * FAB-144, cycle level. Scanned refused-first, then the 10/1000 escrow, then the 20/1000 one: the
-     * cycle must walk the 20/1000 escrow first (582,185 lovelace on 29,109,268), then the 10/1000
-     * (291,092), and the structurally refused one last — still reported, never dropped. Disarmed, so
-     * each ready candidate says READY BUT NOT ARMED and nothing is built.
-     */
-    @Test
-    void aCycleWalksTheMostProfitableCompoundFirstAndARefusedOneLast() {
-        CompoundCandidate tenPerMille = readyAt("01".repeat(32), 10L);
-        CompoundCandidate twentyPerMille = readyAt("02".repeat(32), 20L);
-        String cheap = tenPerMille.escrowRef();
-        String rich = twentyPerMille.escrowRef();
-        Wiring w = wiring(List.of(refused(), tenPerMille, twentyPerMille), false, 0L);
-
-        List<String> info = infoLinesOfOneCycle(w);
-
-        List<String> walked = info.stream()
-                .filter(line -> line.startsWith("compound READY but NOT ARMED")
-                        || line.startsWith("compound REFUSED"))
-                .toList();
-        assertEquals(3, walked.size(), "every candidate is reported, each once: " + info);
-        assertTrue(walked.get(0).contains(rich), "the 20/1000 escrow first: " + walked);
-        assertTrue(walked.get(1).contains(cheap), "the 10/1000 escrow second: " + walked);
-        assertTrue(walked.get(2).startsWith("compound REFUSED"), "the refused one last: " + walked);
-        assertEquals(List.of("compound order (most profitable first): " + rich + " ≈582185 lovelace, "
-                        + cheap + " ≈291092 lovelace, " + refused().escrowRef() + " unpriced"),
-                info.stream().filter(line -> line.startsWith("compound order")).toList(),
-                "one INFO line naming the order: " + info);
-        assertTrue(w.submitted().isEmpty(), "a disarmed loop transmits nothing");
+    private static CompoundCandidate nativeCandidate(String txHash,
+                                                      com.fluidtokens.aquarium.offchain.model.AssetType token,
+                                                      BigInteger quantity,
+                                                      long feePerMille,
+                                                      BigInteger escrowCoin) {
+        CompoundCandidate base = readyAt(txHash, feePerMille);
+        Utxo escrow = Utxo.builder().txHash(txHash).outputIndex(base.escrow().getOutputIndex())
+                .address(base.escrow().getAddress()).inlineDatum(base.escrow().getInlineDatum())
+                .amount(List.of(Amount.lovelace(escrowCoin), Amount.asset(token.toUnit(), quantity))).build();
+        LenderBond bond = new LenderBond(base.bond().txHash(), base.bond().outputIndex(), base.bond().address(),
+                base.bond().loanId(), base.bond().inlineDatum(),
+                LoanFixtures.bondDatum(BigInteger.valueOf(50), LoanFixtures.noStakeCredential(), token));
+        return new CompoundCandidate(base.loanId(), escrow, base.escrowDatum(), quantity, bond,
+                base.poolId(), base.pool(), base.poolManager(), feePerMille, false, null, "native ranking");
     }
 
     /** {@link #readyAt} with no {@code addedLiquidity} — ready on paper, but nothing to price. */
@@ -565,7 +1459,7 @@ class CompoundExecutorTest {
                 null, base.detail());
     }
 
-    /** {@link #readyAt} whose bond names a non-ada principal — the scanner refuses these today. */
+    /** {@link #readyAt} whose bond names a non-ADA principal, for the legacy ADA-only helper. */
     private static CompoundCandidate tokenPrincipalAt(String escrowTxHash) {
         CompoundCandidate base = readyAt(escrowTxHash, 20L);
         var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
@@ -578,15 +1472,19 @@ class CompoundExecutorTest {
     }
 
     /**
-     * FAB-144: the compound ranking key is {@code expectedFee} — 29,109,268 × 20 / 1000 = 582,185.36,
-     * truncated to 582,185 lovelace — and empty, never thrown, for whatever cannot be priced.
+     * FAB-144: the compound ranking key is {@code expectedFee} — 29,109,268 × 80 / 1000 = 2,328,741.44,
+     * truncated to 2,328,741 lovelace — and empty, never thrown, for whatever cannot be priced. FAB-167:
+     * it is the validator's fee, so below the crossover every ADA rate ranks at the 1 ADA floor.
      */
     @Test
     void theCompoundRankingKeyIsTheExpectedFeeAndEmptyForWhatCannotBePriced() {
-        assertEquals(Optional.of(BigInteger.valueOf(582_185L)),
-                CompoundExecutor.expectedFeeLovelace(readyAt("02".repeat(32), 20L)));
-        assertEquals(Optional.of(BigInteger.ZERO), CompoundExecutor.expectedFeeLovelace(ready(0L)),
-                "a zero-fee pool is priced at zero, not unpriced");
+        assertEquals(Optional.of(BigInteger.valueOf(2_328_741L)),
+                CompoundExecutor.expectedFeeLovelace(readyAt("02".repeat(32), 80L)));
+        assertEquals(Optional.of(BigInteger.valueOf(1_000_000L)), CompoundExecutor.expectedFeeLovelace(ready(0L)),
+                "a zero-rate ADA pool is priced at the 1 ADA floor, not at zero and not unpriced");
+        assertEquals(Optional.of(BigInteger.valueOf(1_000_000L)),
+                CompoundExecutor.expectedFeeLovelace(readyAt("02".repeat(32), 20L)),
+                "582,185 per mille on this escrow is below the floor, so 1 ADA");
         assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(refused()),
                 "structurally unready");
         assertEquals(Optional.empty(), CompoundExecutor.expectedFeeLovelace(readyWithoutAmountAt("03".repeat(32))),
@@ -606,9 +1504,9 @@ class CompoundExecutorTest {
         CompoundCandidate refused = refused();                          // fb48…#2, unpriced
         CompoundCandidate noAmount = readyWithoutAmountAt("03".repeat(32)); // unpriced
         CompoundCandidate nonAda = tokenPrincipalAt("05".repeat(32));     // unpriced
-        CompoundCandidate ten = readyAt("01".repeat(32), 10L);            // 291,092
-        CompoundCandidate twentyB = readyAt("04".repeat(32), 20L);        // 582,185
-        CompoundCandidate twentyA = readyAt("02".repeat(32), 20L);        // 582,185
+        CompoundCandidate ten = readyAt("01".repeat(32), 40L);            // 1,164,370
+        CompoundCandidate twentyB = readyAt("04".repeat(32), 80L);        // 2,328,741
+        CompoundCandidate twentyA = readyAt("02".repeat(32), 80L);        // 2,328,741
         List<CompoundCandidate> scanned = List.of(refused, noAmount, nonAda, ten, twentyB, twentyA);
 
         List<CompoundCandidate> ordered = CompoundExecutor.mostProfitableFirst(scanned,
@@ -656,7 +1554,7 @@ class CompoundExecutorTest {
     /**
      * FAB-144: a structurally unready candidate is unpriced BECAUSE it is unready. {@link #refused()}
      * cannot show that — it has no amount and no bond, so it is empty for those reasons too; this one
-     * has both and an ada principal, and would be priced at 582,185 lovelace were readiness not checked.
+     * has both and an ada principal, and would be priced at the 1 ADA floor were readiness not checked.
      */
     @Test
     void aStructurallyUnreadyCompoundIsUnpricedEvenWithAnAmountABondAndAnAdaPrincipal() {
@@ -678,16 +1576,367 @@ class CompoundExecutorTest {
     @Test
     void theCompoundOrderIsNotLoggedForOneCandidateAndLoggedExactlyOnceForTwo() {
         CompoundCandidate only = readyAt("01".repeat(32), 10L);
-        List<String> single = infoLinesOfOneCycle(wiring(List.of(only), false, 0L));
-        assertEquals(1, single.stream().filter(line -> line.startsWith("compound READY but NOT ARMED")).count(),
-                "the one candidate is still reported: " + single);
+        List<Line> singleLines = linesOfOneCycle(wiring(List.of(only), false, 0L));
+        List<String> single = at(Level.INFO, singleLines);
+        // FAB-180: the per-escrow NOT ARMED line is at DEBUG now, text unchanged.
+        assertEquals(1, at(Level.DEBUG, singleLines).stream()
+                        .filter(line -> line.startsWith("compound READY but NOT ARMED")).count(),
+                "the one candidate is still reported: " + singleLines);
         assertEquals(List.of(), single.stream().filter(line -> line.startsWith("compound order")).toList(),
                 "one candidate: no choice was made, so no order is logged");
 
-        List<String> pair = infoLinesOfOneCycle(wiring(
-                List.of(readyAt("01".repeat(32), 10L), readyAt("02".repeat(32), 20L)), false, 0L));
+        List<String> pair = at(Level.INFO, linesOfOneCycle(wiring(
+                List.of(readyAt("01".repeat(32), 10L), readyAt("02".repeat(32), 20L)), false, 0L)));
         assertEquals(1, pair.stream().filter(line -> line.startsWith("compound order")).count(),
                 "two candidates: exactly one order line: " + pair);
+    }
+
+    // ---- FAB-180: one summary per walk instead of a line per escrow ------------------------------
+
+    private static final Instant T0 = Instant.parse("2026-10-30T12:00:00Z");
+    private static final Pattern SUMMARY = Pattern.compile("compound scan: (\\d+) escrows, (\\d+) priced, "
+            + "(\\d+) ready, refused \\{([^}]*)}, not approved \\{([^}]*)}"
+            + "(?:, not armed (\\d+))?(?:, not reached (\\d+))?");
+
+    /** {@link #refused()} at its own escrow ref and with its own exclusion. */
+    private static CompoundCandidate refusedAt(String escrowTxHash, CompoundExclusion exclusion) {
+        Utxo escrow = utxo("escrow");
+        escrow.setTxHash(escrowTxHash);
+        return new CompoundCandidate(LOAN_ID, escrow, null, null, null, POOL_ID, null, null,
+                0L, true, exclusion, "refused for the test");
+    }
+
+    /** The exact per-escrow structural refusal text, as {@code cycle()} formats it. */
+    private static String refusalLine(CompoundCandidate candidate) {
+        return "compound REFUSED " + candidate.loanId() + " escrow " + candidate.escrowRef() + ": "
+                + candidate.exclusion() + " — " + candidate.detail();
+    }
+
+    /** A scanner whose world the test can change between cycles. */
+    private static final class SwitchingScanner extends FakeScanner {
+        private final AtomicReference<List<CompoundCandidate>> world;
+
+        SwitchingScanner(List<CompoundCandidate> first) {
+            super(first);
+            this.world = new AtomicReference<>(first);
+        }
+
+        @Override
+        public Scan scan() {
+            return new Scan(world.get());
+        }
+    }
+
+    /** An armed executor over {@code scanner}, which may offer nothing ready, so nothing may be submitted. */
+    private static CompoundExecutor executorOver(CompoundCandidateScanner scanner) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        return new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT, scanner,
+                new CompoundEconomics(configuration, network, pricingService()), realBuilder(),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                bytes -> { throw new AssertionError("nothing here is ready, so nothing may be submitted"); });
+    }
+
+    private static List<Line> cycleAt(CompoundExecutor executor, Instant at) {
+        executor.setClock(Clock.fixed(at, ZoneOffset.UTC));
+        return linesOf(executor::cycle);
+    }
+
+    /** The one summary line of a cycle, at whichever level it was said. */
+    private static Line summaryOf(List<Line> lines) {
+        List<Line> summaries = lines.stream().filter(line -> line.text().startsWith("compound scan:")).toList();
+        assertEquals(1, summaries.size(), "exactly one summary per walk: " + lines);
+        return summaries.getFirst();
+    }
+
+    private static int sum(String map) {
+        if (map.isEmpty()) {
+            return 0;
+        }
+        int total = 0;
+        for (String entry : map.split(", ")) {
+            total += Integer.parseInt(entry.substring(entry.indexOf('=') + 1));
+        }
+        return total;
+    }
+
+    /**
+     * The reconciliation every summary must satisfy: E = Σrefused + R, and
+     * R ≥ Σnot approved + not armed + not reached + the terminal outcomes; P ≤ E.
+     */
+    private static void assertReconciles(String summary, int terminal) {
+        Matcher m = SUMMARY.matcher(summary);
+        assertTrue(m.matches(), "the summary has the stated shape: " + summary);
+        int escrows = Integer.parseInt(m.group(1));
+        int priced = Integer.parseInt(m.group(2));
+        int ready = Integer.parseInt(m.group(3));
+        int notArmed = m.group(6) == null ? 0 : Integer.parseInt(m.group(6));
+        int notReached = m.group(7) == null ? 0 : Integer.parseInt(m.group(7));
+        assertFalse("0".equals(m.group(6)) || "0".equals(m.group(7)), "a zero count is omitted: " + summary);
+        assertEquals(escrows, sum(m.group(4)) + ready, "E = Σrefused + R: " + summary);
+        assertTrue(ready >= sum(m.group(5)) + notArmed + notReached + terminal,
+                "R ≥ Σnot approved + not armed + not reached + terminal(" + terminal + "): " + summary);
+        assertTrue(priced <= escrows, "P ≤ E: " + summary);
+    }
+
+    /**
+     * FAB-180: an all-refused world under a clock that does not move. The first cycle says its summary
+     * at INFO and nothing else at INFO; the second, unchanged, says it at DEBUG. The per-escrow lines
+     * are all still there, at DEBUG, with their text unchanged.
+     */
+    @Test
+    void anUnchangedAllRefusedWorldSaysItsSummaryAtInfoOnceThenAtDebug() {
+        CompoundCandidate a = refusedAt("a1".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        CompoundCandidate b = refusedAt("a2".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        CompoundExecutor executor = executorOver(new FakeScanner(List.of(a, b)));
+        String expected = "compound scan: 2 escrows, 0 priced, 0 ready, refused {POOL_NOT_LIVE=2}, "
+                + "not approved {}";
+
+        List<Line> first = cycleAt(executor, T0);
+        List<Line> second = cycleAt(executor, T0);
+
+        assertEquals(List.of(expected), at(Level.INFO, first), "only the summary is said at INFO: " + first);
+        assertEquals(List.of(), at(Level.INFO, second), "an unchanged world says nothing at INFO: " + second);
+        assertEquals(new Line(Level.DEBUG, expected), summaryOf(second));
+        for (List<Line> cycle : List.of(first, second)) {
+            assertTrue(at(Level.DEBUG, cycle).containsAll(List.of(refusalLine(a), refusalLine(b))),
+                    "every escrow is still reported at DEBUG, text unchanged: " + cycle);
+            assertReconciles(summaryOf(cycle).text(), 0);
+        }
+    }
+
+    /** FAB-180: the heartbeat. An unchanged summary is said at INFO again once an hour has passed — not at 59 min. */
+    @Test
+    void anUnchangedSummaryIsSaidAtInfoAgainAfterAnHourAndNotBefore() {
+        CompoundExecutor executor = executorOver(new FakeScanner(List.of(
+                refusedAt("a1".repeat(32), CompoundExclusion.POOL_NOT_LIVE),
+                refusedAt("a2".repeat(32), CompoundExclusion.BOND_NAMES_NO_POOL))));
+
+        assertEquals(Level.INFO, summaryOf(cycleAt(executor, T0)).level(), "the first summary");
+        assertEquals(Level.DEBUG, summaryOf(cycleAt(executor, T0.plus(Duration.ofMinutes(59)))).level(),
+                "59 min after the last INFO summary: not yet");
+        Line heartbeat = summaryOf(cycleAt(executor, T0.plus(Duration.ofHours(1))));
+        assertEquals(Level.INFO, heartbeat.level(), "1 h after the last INFO summary: the heartbeat");
+        assertEquals(Level.DEBUG, summaryOf(cycleAt(executor,
+                        T0.plus(Duration.ofHours(1)).plus(Duration.ofMinutes(59)))).level(),
+                "the hour is measured from the heartbeat itself");
+        assertEquals("compound scan: 2 escrows, 0 priced, 0 ready, "
+                + "refused {BOND_NAMES_NO_POOL=1, POOL_NOT_LIVE=1}, not approved {}", heartbeat.text(),
+                "maps print in sorted key order");
+        assertReconciles(heartbeat.text(), 0);
+    }
+
+    /** FAB-180: one refusal reason flipping is a change, and is said at INFO that very cycle. */
+    @Test
+    void aChangedCountIsSaidAtInfoThatCycle() {
+        CompoundCandidate a = refusedAt("a1".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        CompoundCandidate b = refusedAt("a2".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        SwitchingScanner scanner = new SwitchingScanner(List.of(a, b));
+        CompoundExecutor executor = executorOver(scanner);
+
+        Line before = summaryOf(cycleAt(executor, T0));
+        Line unchanged = summaryOf(cycleAt(executor, T0.plusSeconds(60)));
+        scanner.world.set(List.of(a, refusedAt("a2".repeat(32), CompoundExclusion.BOND_NAMES_NO_POOL)));
+        Line flipped = summaryOf(cycleAt(executor, T0.plusSeconds(120)));
+        Line again = summaryOf(cycleAt(executor, T0.plusSeconds(180)));
+
+        assertEquals(Level.INFO, before.level());
+        assertEquals(Level.DEBUG, unchanged.level());
+        assertEquals(new Line(Level.INFO, "compound scan: 2 escrows, 0 priced, 0 ready, "
+                        + "refused {BOND_NAMES_NO_POOL=1, POOL_NOT_LIVE=1}, not approved {}"), flipped,
+                "a flipped reason is a different summary, said at INFO with no wait for the heartbeat");
+        assertEquals(Level.DEBUG, again.level(), "and the new world, unchanged, is quiet again");
+        for (Line summary : List.of(before, unchanged, flipped, again)) {
+            assertReconciles(summary.text(), 0);
+        }
+    }
+
+    /**
+     * FAB-180: a walk that stops on a terminal outcome — a submission, or WOULD_SUBMIT — still says its
+     * summary, after the walk, with the ready candidate it never reached counted as {@code not reached}.
+     * The refused one walked last is counted as refused, not as unreached.
+     */
+    @Test
+    void aWalkThatStopsOnATerminalOutcomeStillSaysItsSummaryWithNotReached() {
+        for (Result<String> response : List.of(Result.<String>success("ok").withValue("deadbeef"),
+                Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"))) {
+            List<CompoundCandidate> candidates = new ArrayList<>(twoReadyCandidates());
+            candidates.add(refused());
+            AtomicInteger submits = new AtomicInteger();
+            CompoundExecutor executor = executor(candidates, realBuilder(candidates), bytes -> {
+                submits.incrementAndGet();
+                return response;
+            });
+
+            List<Line> lines = cycleAt(executor, T0);
+
+            assertEquals(1, submits.get(), "the first submission is terminal: " + response.getValue());
+            Line summary = summaryOf(lines);
+            assertEquals(new Line(Level.INFO, "compound scan: 3 escrows, 2 priced, 2 ready, "
+                    + "refused {POOL_NOT_LIVE=1}, not approved {}, not reached 1"), summary);
+            assertEquals(summary, lines.getLast(), "the summary comes AFTER the walk, so its counts are final");
+            assertReconciles(summary.text(), 1);
+        }
+    }
+
+    /** FAB-180: a disarmed node counts its ready candidates as {@code not armed} and says none of them at INFO. */
+    @Test
+    void notArmedIsCountedInTheSummaryAndNoPerEscrowLineIsInfo() {
+        CompoundCandidate forty = readyAt("01".repeat(32), 40L);
+        CompoundCandidate eighty = readyAt("02".repeat(32), 80L);
+        List<Line> lines = linesOfOneCycle(wiring(List.of(refused(), forty, eighty), false, 0L));
+
+        List<String> info = at(Level.INFO, lines);
+        assertEquals(2, info.size(), "the order line and the summary, nothing per escrow: " + info);
+        assertTrue(info.getFirst().startsWith("compound order (most profitable first): "), info.toString());
+        String summary = "compound scan: 3 escrows, 2 priced, 2 ready, refused {POOL_NOT_LIVE=1}, "
+                + "not approved {}, not armed 2";
+        assertEquals(summary, info.get(1));
+        assertTrue(at(Level.DEBUG, lines).contains("compound READY but NOT ARMED " + LOAN_ID + " escrow "
+                        + eighty.escrowRef() + ": Q=" + ESCROW + " raw units into pool " + POOL_ID
+                        + " at compoudingFeePerMille=80 — set loans.compound.enabled=true to act on it"),
+                "the per-escrow line is at DEBUG with its text unchanged: " + lines);
+        assertReconciles(summary, 0);
+    }
+
+    /** FAB-180: the order line is INFO when it prices something, and DEBUG, same text, when it prices nothing. */
+    @Test
+    void theOrderLineIsInfoWhenSomethingIsPricedAndDebugWhenNothingIs() {
+        List<Line> priced = linesOfOneCycle(wiring(
+                List.of(readyAt("01".repeat(32), 10L), readyAt("02".repeat(32), 20L)), false, 0L));
+        assertEquals(1, at(Level.INFO, priced).stream()
+                .filter(line -> line.startsWith("compound order (most profitable first): ")).count(), priced.toString());
+
+        CompoundCandidate a = refusedAt("a1".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        CompoundCandidate b = refusedAt("a2".repeat(32), CompoundExclusion.POOL_NOT_LIVE);
+        List<Line> unpriced = cycleAt(executorOver(new FakeScanner(List.of(b, a))), T0);
+        assertEquals(List.of(new Line(Level.DEBUG, "compound order (most profitable first): "
+                        + a.escrowRef() + " gross unpriced, " + b.escrowRef() + " gross unpriced")),
+                unpriced.stream().filter(line -> line.text().startsWith("compound order")).toList());
+        assertReconciles(summaryOf(priced).text(), 0);
+        assertReconciles(summaryOf(unpriced).text(), 0);
+    }
+
+    /** FAB-180: a fault keeps its level and its text — BUILD FAILED is still an ERROR — and the walk is still summarised. */
+    @Test
+    void aBuildFailureIsStillAnErrorWithItsTextUnchanged() {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        CompoundTransactionBuilder failing = org.mockito.Mockito.mock(CompoundTransactionBuilder.class);
+        org.mockito.Mockito.when(failing.buildWithFacts(
+                        org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class)))
+                .thenThrow(new IllegalStateException("kernel said no"));
+        CompoundCandidate only = ready(0L);
+        CompoundExecutor executor = executorWithBuilder(configuration, failing, universe());
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        assertTrue(lines.contains(new Line(Level.ERROR, "compound BUILD FAILED " + LOAN_ID + " escrow "
+                        + only.escrowRef() + ": java.lang.IllegalStateException: kernel said no")),
+                "BUILD FAILED stays at ERROR, text unchanged: " + lines);
+        Line summary = summaryOf(lines);
+        assertEquals(new Line(Level.INFO, "compound scan: 1 escrows, 1 priced, 1 ready, refused {}, "
+                + "not approved {}"), summary, "one candidate: priced once for the summary, no ranking");
+        assertReconciles(summary.text(), 0);
+    }
+
+    /** FAB-180: the post-build NOT APPROVED moves to DEBUG, text unchanged, and is counted by its reason. */
+    @Test
+    void aPostBuildNotApprovedIsDebugAndCounted() {
+        List<Line> lines = linesOfOneCycle(wiring(List.of(ready(0L)), true, 0L));
+
+        List<String> notApproved = lines.stream()
+                .filter(line -> line.text().startsWith("compound NOT APPROVED "))
+                .map(line -> line.level() + " " + line.text()).toList();
+        assertEquals(1, notApproved.size(), lines.toString());
+        assertTrue(notApproved.getFirst().startsWith("DEBUG compound NOT APPROVED " + LOAN_ID + " escrow "
+                + ready(0L).escrowRef() + ": NET_BELOW_FLOOR — Q=" + ESCROW + " raw units at compoudingFeePerMille=0 "
+                + "gives F=1000000 raw units, priced reward=1000000 lovelace"), notApproved.getFirst());
+        assertEquals(List.of("compound scan: 1 escrows, 1 priced, 1 ready, refused {}, "
+                + "not approved {NET_BELOW_FLOOR=1}"), at(Level.INFO, lines), "only the summary at INFO");
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /** FAB-180: an unpriced quote's NOT APPROVED moves to DEBUG, text unchanged, and is counted by its reason. */
+    @Test
+    void anUnpricedQuoteNotApprovedIsDebugAndCounted() {
+        var token = new com.fluidtokens.aquarium.offchain.model.AssetType("d0".repeat(28), "5553444d");
+        CompoundCandidate candidate = nativeCandidate("33".repeat(32), token,
+                BigInteger.valueOf(1_000_000L), 100L, BigInteger.valueOf(2_000_000L));
+        var client = new FluidOracleClient("http://unused.invalid") {
+            @Override
+            public Optional<com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed> findFeed(
+                    com.fluidtokens.aquarium.offchain.model.AssetType asset, long atMillis) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed> findFeedIgnoringValidity(
+                    com.fluidtokens.aquarium.offchain.model.AssetType asset) {
+                return Optional.empty();
+            }
+        };
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var block = new BlockEventListener(null);
+        block.getIsSyncing().set(false);
+        var executor = new CompoundExecutor(configuration, network, block,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(List.of(candidate)),
+                new CompoundEconomics(configuration, network, new PricingService(client)), realBuilder(),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                bytes -> { throw new AssertionError("an unpriced candidate must not be submitted"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        List<Line> notApproved = lines.stream()
+                .filter(line -> line.text().startsWith("compound NOT APPROVED ")).toList();
+        assertEquals(1, notApproved.size(), lines.toString());
+        assertEquals(Level.DEBUG, notApproved.getFirst().level(), "the unpriced NOT APPROVED is at DEBUG");
+        assertTrue(notApproved.getFirst().text().startsWith("compound NOT APPROVED " + LOAN_ID + " escrow "
+                        + candidate.escrowRef() + ": PRICE_NO_FEED — F=100000 raw units, quote="),
+                "text unchanged: " + notApproved);
+        assertEquals(List.of("compound scan: 1 escrows, 0 priced, 1 ready, refused {}, "
+                + "not approved {PRICE_NO_FEED=1}"), at(Level.INFO, lines), "only the summary at INFO");
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /**
+     * FAB-180: the pre-sign rechecks are NOT routine — a transaction was built and validated — so they keep
+     * their INFO level and text; their reasons count under the same {@code not approved} map.
+     */
+    @Test
+    void thePreSignRecheckStaysInfoAndCountsUnderNotApproved() {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        CompoundEconomics economics = org.mockito.Mockito.spy(
+                new CompoundEconomics(configuration, network, pricingService()));
+        org.mockito.Mockito.doReturn(CompoundExclusion.PRICE_OBSERVATION_CHANGED).when(economics)
+                .revalidateObservation(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.anyLong());
+        CompoundExecutor executor = executor(List.of(ready(0L)), realBuilder(), ACCOUNT, economics,
+                bytes -> { throw new AssertionError("refused before signing"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        assertEquals(List.of("compound NOT APPROVED " + LOAN_ID + " escrow " + ready(0L).escrowRef()
+                        + ": PRICE_OBSERVATION_CHANGED immediately before signing",
+                        "compound scan: 1 escrows, 1 priced, 1 ready, refused {}, "
+                                + "not approved {PRICE_OBSERVATION_CHANGED=1}"),
+                at(Level.INFO, lines));
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /** FAB-180: a cycle that ends before the walk — here, an empty scan — says no summary at all. */
+    @Test
+    void aCycleThatEndsBeforeTheWalkSaysNoSummary() {
+        List<Line> lines = linesOfOneCycle(wiring(List.of(), true, -2_000_000L));
+        assertEquals(List.of(), lines.stream().filter(line -> line.text().startsWith("compound scan")).toList());
     }
 
     // ---- fakes -------------------------------------------------------------------------------

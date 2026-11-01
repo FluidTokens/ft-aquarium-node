@@ -426,6 +426,18 @@ public class LiquidationReadinessController {
     }
 
     /**
+     * FAB-174: the shadow oracle stream's status, for one line on the page. The page only READS it; no decision
+     * reads the stream. Setter-injected and REQUIRED in the container; null only in a direct test construction,
+     * where no line renders.
+     */
+    private com.fluidtokens.aquarium.offchain.service.loans.OracleStreamLauncher oracleStreamLauncher;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = true)
+    public void setOracleStreamLauncher(com.fluidtokens.aquarium.offchain.service.loans.OracleStreamLauncher l) {
+        this.oracleStreamLauncher = l;
+    }
+
+    /**
      * ⚠ SORT AND FILTER ARE QUERY PARAMETERS, NOT JAVASCRIPT, and the auto-refresh is why. The page
      * re-GETs its own URL every minute, so client-side state would be silently undone on each tick —
      * and it would be invisible to the template tests, which render server-side. Params survive the
@@ -441,6 +453,7 @@ public class LiquidationReadinessController {
         model.addAttribute("network", network == null ? "unknown" : network.getNetwork());
         model.addAttribute("generatedAt", java.time.Instant.now().toString());
         model.addAttribute("version", nodeVersionCheck == null ? null : nodeVersionCheck.status());
+        model.addAttribute("oracleStream", oracleStreamLauncher == null ? null : oracleStreamLauncher.status());
         // ⛔ Shown ABOVE everything and independent of the rows: the loan view still works while the
         // gate is closed, and a page full of healthy-looking loans must not hide that the bot will
         // refuse every one of them.

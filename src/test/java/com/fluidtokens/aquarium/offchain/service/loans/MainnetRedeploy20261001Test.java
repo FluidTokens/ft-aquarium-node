@@ -36,6 +36,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  *   <li>no re-sync -- the payment credentials the node indexes did not move.</li>
  * </ul>
  * See {@code src/test/resources/loans-v4/blueprint/loans-v4-blueprint-2026-10-01.PROVENANCE.md}.
+ *
+ * <p>⚠ Historical since FAB-166: the node now ships the 2026-10-26 assembly, so "the vendored file" here is
+ * the 2026-10-01 artefact preserved byte for byte as {@code loans-v4-2026-10-01.plutus.json} -- this
+ * deployment is judged by the artefact of its time (findings §61.4). See {@code MainnetRedeploy20261026Test}.
  */
 class MainnetRedeploy20261001Test {
 
@@ -48,10 +52,12 @@ class MainnetRedeploy20261001Test {
     private static final String MS_ORDER = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
 
     private static final String BEFORE = "loans-v4-2026-09-17.plutus.json";
+    /** The artefact the node shipped for this deployment, until FAB-166. */
+    private static final String SHIPPED = "loans-v4-2026-10-01.plutus.json";
     private static final String SHIPPED_SHA256 = "a638e71ca047b668f74eeeff1b80e76695626ddfe506a9ca1d2721e9a1e72704";
 
     private static LoansContractRegistry shipped() {
-        return new LoansContractRegistry(CONFIG, LM_CONFIG, ASSET, SMART, MS_POLICY, MS_POOL, MS_ORDER);
+        return new LoansContractRegistry(SHIPPED, CONFIG, LM_CONFIG, ASSET, SMART, MS_POLICY, MS_POOL, MS_ORDER);
     }
 
     private static LoansContractRegistry before() {
@@ -85,10 +91,10 @@ class MainnetRedeploy20261001Test {
     @Test
     void theVendoredFileIsTheAssembledHybridAndMovedOnlyTheFiveRedeployedValidators() throws Exception {
         assertEquals(SHIPPED_SHA256, HexFormat.of().formatHex(
-                MessageDigest.getInstance("SHA-256").digest(resource("loans-v4.plutus.json"))),
+                MessageDigest.getInstance("SHA-256").digest(resource(SHIPPED))),
                 "the vendored blueprint is not the 2026-10-01 assembly (see assemble-2026-10-01.py)");
 
-        Map<String, String> now = hashes("loans-v4.plutus.json");
+        Map<String, String> now = hashes(SHIPPED);
         Map<String, String> was = hashes(BEFORE);
         assertEquals(was.keySet(), now.keySet(), "no validator may appear or disappear");
         Set<String> moved = new TreeSet<>();
@@ -182,7 +188,7 @@ class MainnetRedeploy20261001Test {
     @Test
     void anUnknownClaimArityIsRefusedRatherThanGuessed() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
-        JsonNode root = mapper.readTree(resource("loans-v4.plutus.json"));
+        JsonNode root = mapper.readTree(resource(SHIPPED));
         for (JsonNode v : root.get("validators")) {
             if (v.get("title").asText().startsWith("loan/loan_claim_action.") && v.has("parameters")) {
                 ((com.fasterxml.jackson.databind.node.ArrayNode) v.get("parameters")).remove(5);
@@ -206,7 +212,7 @@ class MainnetRedeploy20261001Test {
     @Test
     void anUnknownSellArityIsRefusedRatherThanGuessed() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
-        JsonNode root = mapper.readTree(resource("loans-v4.plutus.json"));
+        JsonNode root = mapper.readTree(resource(SHIPPED));
         for (JsonNode v : root.get("validators")) {
             if (v.get("title").asText().startsWith("pool/pool_sell_lender_position.") && v.has("parameters")) {
                 ((com.fasterxml.jackson.databind.node.ArrayNode) v.get("parameters"))

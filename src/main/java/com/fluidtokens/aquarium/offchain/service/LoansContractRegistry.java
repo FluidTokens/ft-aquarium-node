@@ -305,9 +305,11 @@ public class LoansContractRegistry {
 
         this.poolCancelActionScriptHash = derive("pool/pool_cancel_action.pool_cancel_action", mainCfg, name);
         this.poolBorrowActionScriptHash = derive("pool/pool_borrow_action.pool_borrow_action", mainCfg, name);
-        // THREE parameters since 2026-10-01 (was two). The new LenderManager withdraw hash is never read in
-        // the validator body: FluidTokens disabled selling a lender position (Raul, 2026-10-01). It still
-        // moves the hash, which ConfigDatum[24] publishes.
+        // The arity follows the vendored artefact. The 2026-10-01 one declares THREE parameters: the third,
+        // the LenderManager withdraw hash, is never read in the validator body (FluidTokens disabled selling a
+        // lender position, Raul, 2026-10-01) but still moves the hash. The shipped 2026-10-26 one is back to
+        // TWO (upstream 13775b1, e22e43f, 96240ad) and derives f43354cb…, which ConfigDatum[24] publishes
+        // since 2026-10-23. Both shapes are supported below; [24] is advisory either way.
         this.poolSellLenderPositionActionScriptHash =
                 arity("pool/pool_sell_lender_position.pool_sell_lender_position_action", 2, 3) == 3
                         ? derive("pool/pool_sell_lender_position.pool_sell_lender_position_action", mainCfg, name,

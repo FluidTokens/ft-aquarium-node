@@ -33,7 +33,7 @@ public class PricingService {
         this.oracleClient = oracleClient;
     }
 
-    /** Which of the three refusal cases a {@link Priced} carries. */
+    /** Which named refusal a {@link Priced} carries. */
     public enum RefusalReason {
         /** No oracle entry exists for this asset at all. */
         NO_FEED,
@@ -45,13 +45,15 @@ public class PricingService {
          * on that variant on chain (hazard: {@link OraclePriceFeed#price()} throws for it) — a
          * known, permanent property of the asset, never a transient machinery fault.
          */
-        POOLED
+        POOLED,
+        NON_POSITIVE,
+        CONVERSION_FAILED
     }
 
     /**
      * Why a {@link Priced} carries no lovelace figure — enough for an operator to act on: the asset
      * unit, the instant that was asked for, the feed's own window when a feed exists at all, its
-     * age at that instant, and which of the three cases applies.
+     * age at that instant, and which refusal applies.
      *
      * @param asset          the asset that could not be priced
      * @param atMillis       the instant pricing was requested for
@@ -68,18 +70,27 @@ public class PricingService {
     }
 
     /** Either the priced amount in lovelace, or why not — never both. */
-    public record Priced(BigInteger lovelace, PriceRefusal refusal) {
+    public record Priced(BigInteger lovelace, PriceRefusal refusal, OraclePriceFeed observation) {
+
+        /** Source-compatible form for existing non-compound callers. */
+        public Priced(BigInteger lovelace, PriceRefusal refusal) {
+            this(lovelace, refusal, null);
+        }
 
         public boolean isPriced() {
             return refusal == null;
         }
 
         static Priced priced(BigInteger lovelace) {
-            return new Priced(lovelace, null);
+            return new Priced(lovelace, null, null);
+        }
+
+        static Priced priced(BigInteger lovelace, OraclePriceFeed observation) {
+            return new Priced(lovelace, null, observation);
         }
 
         static Priced refused(PriceRefusal refusal) {
-            return new Priced(null, refusal);
+            return new Priced(null, refusal, null);
         }
     }
 
@@ -134,19 +145,39 @@ public class PricingService {
             return Priced.priced(amount);
         }
 
-        Optional<OraclePriceFeed> usable = usableLookup.get();
+        final Optional<OraclePriceFeed> usable;
+        try {
+            usable = usableLookup.get();
+        } catch (RuntimeException e) {
+            return Priced.refused(new PriceRefusal(asset, atMillis, RefusalReason.CONVERSION_FAILED,
+                    null, null, null));
+        }
         if (usable.isPresent()) {
             OraclePriceFeed feed = usable.get();
             if (feed.variant() == OraclePriceFeed.Variant.POOLED) {
                 return Priced.refused(refusalFor(asset, atMillis, RefusalReason.POOLED, feed));
             }
-            Rational lovelace = LoanFinance.toLovelace(Rational.fromInt(amount), feed);
-            return Priced.priced(lovelace.floor());
+            if (feed.priceInLovelaces() == null || feed.priceDenominator() == null
+                    || feed.priceInLovelaces().signum() <= 0 || feed.priceDenominator().signum() <= 0) {
+                return Priced.refused(refusalFor(asset, atMillis, RefusalReason.NON_POSITIVE, feed));
+            }
+            try {
+                Rational lovelace = LoanFinance.toLovelace(Rational.fromInt(amount), feed);
+                return Priced.priced(lovelace.floor(), feed);
+            } catch (RuntimeException e) {
+                return Priced.refused(refusalFor(asset, atMillis, RefusalReason.CONVERSION_FAILED, feed));
+            }
         }
 
         // Not usable at atMillis through findFeed. findFeedIgnoringValidity is used ONLY to
         // classify why — its result is never passed to LoanFinance.toLovelace.
-        Optional<OraclePriceFeed> any = anyLookup.get();
+        final Optional<OraclePriceFeed> any;
+        try {
+            any = anyLookup.get();
+        } catch (RuntimeException e) {
+            return Priced.refused(new PriceRefusal(asset, atMillis, RefusalReason.CONVERSION_FAILED,
+                    null, null, null));
+        }
         if (any.isEmpty()) {
             return Priced.refused(new PriceRefusal(asset, atMillis, RefusalReason.NO_FEED,
                     null, null, null));

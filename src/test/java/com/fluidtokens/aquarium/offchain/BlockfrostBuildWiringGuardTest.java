@@ -51,6 +51,12 @@ class BlockfrostBuildWiringGuardTest {
     private static final Path MAIN = Path.of("src/main/java");
 
     private static final String YACI_CONFIG = "com/fluidtokens/aquarium/offchain/config/YaciConfig.java";
+    private static final String BOUNDED_BACKEND =
+            "com/fluidtokens/aquarium/offchain/config/BoundedBFBackendService.java";
+
+    private static final Pattern DIRECT_BLOCKFROST_SERVICE = Pattern.compile(
+            "\\bnew\\s+(?:[A-Za-z_$][\\w$]*\\s*\\.\\s*)*BF(?:Account|Address|Asset|Block|Epoch|Metadata|"
+                    + "Network|Pool|Script|Transaction|Utxo)Service\\s*\\(");
 
     private static final List<String> BLOCKFROST_SUPPLIERS =
             List.of("DefaultUtxoSupplier", "DefaultProtocolParamsSupplier", "DefaultScriptSupplier");
@@ -80,6 +86,14 @@ class BlockfrostBuildWiringGuardTest {
                         + "its coin selection, reference inputs and protocol parameters all go back to "
                         + "Blockfrost on every build. Build it from the injected UtxoSupplier, "
                         + "ProtocolParamsSupplier and ScriptSupplier beans instead: " + fromBackend);
+    }
+
+    @Test
+    void everyDirectBlockfrostServiceIsOwnedByTheBoundedBackend() {
+        List<Site> sites = scan(DIRECT_BLOCKFROST_SERVICE);
+        assertEquals(11, sites.size(), "all eleven CCL service surfaces must be explicitly wrapped: " + sites);
+        assertTrue(sites.stream().allMatch(site -> site.file().equals(BOUNDED_BACKEND)),
+                "a direct CCL Blockfrost service bypasses the one bounded transport: " + sites);
     }
 
     @Test
