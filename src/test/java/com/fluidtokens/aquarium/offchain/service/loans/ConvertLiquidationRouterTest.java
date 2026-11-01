@@ -136,7 +136,7 @@ class ConvertLiquidationRouterTest {
         // POOL_TOO_THIN pre-check fires first, masking the seam this class exists to test.
         OraclePriceFeed feed = new OraclePriceFeed(OraclePriceFeed.Variant.AGGREGATED, FLDT,
                 BigInteger.valueOf(15_000_000L), BigInteger.valueOf(100_000_000L),
-                1_759_000_000_000L, 1_799_000_000_000L);
+                1_759_998_000_000L, 1_760_001_000_000L);
         return Map.of(LoanFixtures.NO_ORACLE.toUnit(),
                 LoanFixtures.multisig(FLDT, LoanFixtures.NO_ORACLE, "dd".repeat(28), feed,
                         null, null, java.util.List.of()));
@@ -299,6 +299,106 @@ class ConvertLiquidationRouterTest {
                         requirement -> Optional.empty(), collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertTrue(first.getMessage().startsWith("ada collateral:"), first.getMessage());
+    }
+
+    // ===== FAB-183: the feed window guard the plain and pay-in-advance routes already had =====
+
+    /** The collateral feed of {@link #collateralOracle()}, re-windowed. */
+    private static Map<String, OracleEntry> collateralOracleWindowed(long validFrom, long validTo) {
+        OracleEntry named = collateralOracle().get(LoanFixtures.NO_ORACLE.toUnit());
+        OraclePriceFeed feed = new OraclePriceFeed(OraclePriceFeed.Variant.AGGREGATED, FLDT,
+                named.feed().priceInLovelaces(), named.feed().priceDenominator(), validFrom, validTo);
+        return Map.of(LoanFixtures.NO_ORACLE.toUnit(),
+                LoanFixtures.multisig(FLDT, LoanFixtures.NO_ORACLE, "dd".repeat(28), feed,
+                        null, null, java.util.List.of()));
+    }
+
+    /**
+     * ⛔ <b>A collateral feed that opens after the body's start is refused BEFORE the wallet is asked.</b>
+     * {@code retrieve_oracle_data} requires {@code valid_from <= transactionValidFrom}; this route used to
+     * check only {@code usableForLiquidation()}, so such a feed reached the chain. The body here starts at
+     * {@code 1_760_000_000_000} and the feed opens ten seconds later.
+     *
+     * <p>The selector would answer {@code Optional.empty()} — a {@code WalletInputTooSmallException} — so
+     * a guard that ran after it, or not at all, fails this test by throwing the wrong type. The counter
+     * pins that the selector was never invoked.
+     */
+    @Test
+    void aCollateralFeedOpeningAfterTheBodysStartIsRefusedBeforeTheWalletIsAsked() {
+        int[] selectorCalls = new int[1];
+
+        var e = assertThrows(ConvertLiquidationRouter.FeedWindowException.class,
+                () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        requirement -> {
+                            selectorCalls[0]++;
+                            return Optional.empty();
+                        },
+                        collateralOracleWindowed(1_760_000_010_000L, 1_760_001_000_000L), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals(0, selectorCalls[0], "the wallet selector must not run for a body the validator refuses");
+        assertTrue(e.getMessage().contains("collateral"), "names the leg: " + e.getMessage());
+        assertTrue(e.getMessage().contains("[1760000010000,1760001000000]"),
+                "names the feed window: " + e.getMessage());
+        assertTrue(e.getMessage().contains("[1760000000000,1760000120000]"),
+                "names the transaction window, in the body's own slot times: " + e.getMessage());
+    }
+
+    /** The other end: a feed that closes before the body's end is refused the same way. */
+    @Test
+    void aCollateralFeedClosingBeforeTheBodysEndIsRefused() {
+        int[] selectorCalls = new int[1];
+
+        assertThrows(ConvertLiquidationRouter.FeedWindowException.class,
+                () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        requirement -> {
+                            selectorCalls[0]++;
+                            return Optional.empty();
+                        },
+                        collateralOracleWindowed(1_759_998_000_000L, 1_760_000_060_000L), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals(0, selectorCalls[0]);
+    }
+
+    /**
+     * The PRINCIPAL leg is guarded too when the principal is a token: a correctly named principal feed whose
+     * window does not cover the body is refused by name, while the collateral feed covers it.
+     */
+    @Test
+    void aTokenPrincipalFeedThatDoesNotCoverTheBodyIsRefusedNamingThePrincipalLeg() {
+        AssetType principal = new AssetType("c".repeat(56), "4e49474854");
+        AssetType principalNft = new AssetType("d".repeat(56), "6f7261636c65");
+        LiquidationAssessment ada = candidate();
+        LoanDatum datum = LoanFixtures.loanDatum(principal, principalNft, BigInteger.valueOf(20_000_000L),
+                BigInteger.valueOf(100L), ada.loan().datum().collateral(), 1_700_000_000_000L,
+                ada.loan().datum().liquidationMode(), ada.loan().datum().repaymentMode(), false);
+        Loan loan = new Loan("aa".repeat(32), 0, "addr_loan", "cafe",
+                BigInteger.valueOf(100_000_000L), BigInteger.valueOf(3_000_000L), datum);
+        LenderBond bond = new LenderBond("bb".repeat(32), 0, "addr_bond", "cafe", "d87980",
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50L),
+                        LoanFixtures.noStakeCredential(), principal));
+        LiquidationAssessment tokenPrincipal = LiquidationAssessment.buildable(bond, loan, "token principal",
+                BigInteger.valueOf(20_000_000L), BigInteger.ZERO, false, BigInteger.valueOf(5_000_000L));
+        OracleEntry principalOracle = LoanFixtures.multisig(principal, principalNft, "ee".repeat(28),
+                new OraclePriceFeed(OraclePriceFeed.Variant.AGGREGATED, principal, BigInteger.ONE,
+                        BigInteger.ONE, 1_760_000_030_000L, 1_760_001_000_000L),
+                null, null, java.util.List.of());
+        Map<String, OracleEntry> oracles = new java.util.HashMap<>(collateralOracle());
+        oracles.put(principalNft.toUnit(), principalOracle);
+        int[] selectorCalls = new int[1];
+
+        var e = assertThrows(ConvertLiquidationRouter.FeedWindowException.class,
+                () -> router().buildConvertLiquidation(tokenPrincipal, loanUtxo(), null, null, null,
+                        requirement -> {
+                            selectorCalls[0]++;
+                            return Optional.empty();
+                        },
+                        oracles, "addr_change", 1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals(0, selectorCalls[0]);
+        assertTrue(e.getMessage().contains("principal"), "names the leg: " + e.getMessage());
+        assertTrue(e.getMessage().contains("[1760000030000,1760001000000]"), e.getMessage());
     }
 
     // ===== the pool snapshot: ONE index query per liquidation cycle (FAB-137 T2b) =====

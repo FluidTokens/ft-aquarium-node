@@ -26,6 +26,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -244,5 +245,85 @@ class BlockEventListenerTest {
         Value value = ctor.getParameters()[1].getAnnotation(Value.class);
         assertEquals("${aquarium.syncing-threshold-minutes}", value.value(),
                 "the YAML key is the only default; an inline one would survive its deletion");
+    }
+
+    // ---- FAB-183: the COMMITTED slot, written only after the block's transaction commits -------------
+
+    /**
+     * The liquidation window is anchored to {@code lastCommittedSlot}, and only the after-commit listener
+     * writes it. It moves nothing else: the syncing flag and {@code lastAppliedSlot} stay
+     * {@link BlockEventListener#processBlock}'s.
+     */
+    @Test
+    void theCommittedListenerSetsLastCommittedSlotAndNothingElse() {
+        BlockEventListener listener = listener(10, Duration.ZERO);
+        assertEquals(0L, listener.getLastCommittedSlot().get(), "zero — unknown — until the first commit");
+
+        for (long slot : List.of(SLOT, SLOT + 20, SLOT + 41, SLOT - 600)) {
+            listener.processCommittedBlock(eventAt(slot));
+            assertEquals(slot, listener.getLastCommittedSlot().get());
+        }
+        assertEquals(0L, listener.getLastAppliedSlot().get(), "lastAppliedSlot is processBlock's alone");
+        assertTrue(listener.getIsSyncing().get(), "the syncing flag is processBlock's alone");
+    }
+
+    /**
+     * ⛔ {@code processBlock} runs INSIDE the block's database transaction at the tip, so it must not write
+     * the committed slot — otherwise a cycle could anchor to a block the index has not finished storing.
+     */
+    @Test
+    void processBlockDoesNotSetTheCommittedSlot() {
+        BlockEventListener listener = listener(10, Duration.ZERO);
+        listener.processBlock(eventAt(SLOT));
+        assertEquals(SLOT, listener.getLastAppliedSlot().get(), "the event was processed");
+        assertEquals(0L, listener.getLastCommittedSlot().get(), "but the committed slot is not processBlock's");
+
+        listener.processCommittedBlock(eventAt(SLOT));
+        listener.processBlock(eventAt(SLOT + 20));
+        assertEquals(SLOT + 20, listener.getLastAppliedSlot().get());
+        assertEquals(SLOT, listener.getLastCommittedSlot().get(),
+                "the applied slot may run ahead of the committed one; it must never drag it along");
+    }
+
+    /** On the fallback path an exception would reach Yaci's publisher, so a bad event changes nothing. */
+    @Test
+    void aBadCommittedEventNeverThrowsAndChangesNothing() {
+        BlockEventListener listener = listener(10, Duration.ZERO);
+        listener.processCommittedBlock(eventAt(SLOT));
+
+        CommitEvent<?> noMetadata = Mockito.mock(CommitEvent.class);
+        Mockito.when(noMetadata.getMetadata()).thenReturn(null);
+        assertDoesNotThrow(() -> listener.processCommittedBlock(noMetadata));
+        assertEquals(SLOT, listener.getLastCommittedSlot().get());
+
+        CommitEvent<?> throwing = Mockito.mock(CommitEvent.class);
+        Mockito.when(throwing.getMetadata()).thenThrow(new IllegalStateException("boom"));
+        assertDoesNotThrow(() -> listener.processCommittedBlock(throwing));
+        assertEquals(SLOT, listener.getLastCommittedSlot().get());
+
+        BlockEventListener fresh = listener(10, Duration.ZERO);
+        assertDoesNotThrow(() -> fresh.processCommittedBlock(noMetadata));
+        assertEquals(0L, fresh.getLastCommittedSlot().get(), "a broken event must not invent a slot");
+    }
+
+    /**
+     * The three annotation values that make the slot mean "committed", pinned by reflection because no unit
+     * test can observe a Spring transaction phase: {@code AFTER_COMMIT} (not during the publish),
+     * {@code fallbackExecution = true} (initial sync publishes with no transaction open, and without the
+     * fallback the event would be dropped there) and {@code HIGHEST_PRECEDENCE} (the slot is current before
+     * any other after-commit listener reads it).
+     */
+    @Test
+    void theCommittedListenerRunsAfterCommitWithFallbackAtHighestPrecedence() throws Exception {
+        var method = BlockEventListener.class.getMethod("processCommittedBlock", CommitEvent.class);
+
+        var listener = method.getAnnotation(org.springframework.transaction.event.TransactionalEventListener.class);
+        assertNotNull(listener, "processCommittedBlock must be a @TransactionalEventListener");
+        assertEquals(org.springframework.transaction.event.TransactionPhase.AFTER_COMMIT, listener.phase());
+        assertTrue(listener.fallbackExecution(), "fallbackExecution = true, or initial sync drops the event");
+
+        var order = method.getAnnotation(org.springframework.core.annotation.Order.class);
+        assertNotNull(order, "processCommittedBlock must carry @Order");
+        assertEquals(org.springframework.core.Ordered.HIGHEST_PRECEDENCE, order.value());
     }
 }

@@ -3774,7 +3774,7 @@ class LiquidationExecutorTest {
         // rejection (tx 8062f42d…, OutsideValidityIntervalUTxO, a 182-slot preview block gap).
         long laggingSlot = LoanFixtures.converters().time().toSlot(java.time.LocalDateTime.ofInstant(
                 java.time.Instant.ofEpochMilli(NOW - 157_000L), java.time.ZoneOffset.UTC));
-        wiring.blockEventListener().getLastAppliedSlot().set(laggingSlot);
+        wiring.blockEventListener().getLastCommittedSlot().set(laggingSlot);
 
         wiring.executor().cycle(NOW);
 
@@ -4570,5 +4570,288 @@ class LiquidationExecutorTest {
         List<ILoggingEvent> pairEvents = cyclesLogged(pair, 1);
         assertEquals(1, liquidationOrderLines(pairEvents).size(),
                 "two candidates: exactly one order line: " + pairEvents);
+    }
+
+    // ======================================================================================
+    // FAB-183: the window starts no earlier than the newest feed the transaction carries
+    // ======================================================================================
+
+    /** The preview slot whose start is {@code millis} (every instant used below is a whole second). */
+    private static long slotAt(long millis) {
+        return LoanFixtures.converters().time().toSlot(java.time.LocalDateTime.ofInstant(
+                java.time.Instant.ofEpochMilli(millis), java.time.ZoneOffset.UTC));
+    }
+
+    private static long millisOfSlot(long slot) {
+        return LoanFixtures.converters().slot().slotToTime(slot).toInstant(java.time.ZoneOffset.UTC)
+                .toEpochMilli();
+    }
+
+    /** {@link #collateralOracle()} with its feed opening at {@code validFrom} (a realistic 10-minute window). */
+    private static OracleEntry collateralOracleOpeningAt(long validFrom) {
+        return LoanFixtures.charli3(COLLATERAL_TOKEN, ORACLE_TOKEN, ORACLE_CREDENTIAL,
+                OraclePriceFeed.priceDataCharlie(COLLATERAL_TOKEN, BigInteger.valueOf(50), BigInteger.ONE,
+                        validFrom, validFrom + 600_000L),
+                LoanFixtures.input(TX_ORACLE_NFT, 0), LoanFixtures.input(TX_ORACLE_SCRIPT, 0),
+                LoanFixtures.input(TX_CHARLI3_PROVIDER, 0));
+    }
+
+    /** {@link #tokenScenario()}'s token-collateral loan behind a CONVERT bond — the two convert-bond routes. */
+    private static Scenario tokenConvertScenario() {
+        Scenario plain = tokenScenario();
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND, 0, LOAN_ID,
+                LoanFixtures.convertToPrincipalBondDatum(FAT_FEE_PER_MILLE,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
+                2_000_000L);
+        return new Scenario(plain.loan(), bond, LoanFixtures.assess(bond.bond(), plain.loan().loan(),
+                OraclePriceFeed.unit(), collateralFeed(), VALID_FROM));
+    }
+
+    /** Records the window start the pay-in-advance route is handed, then stops the build. */
+    private static final class WindowCapturingPayInAdvanceRouter extends PayInAdvanceLiquidationRouter {
+        Long validFrom;
+        Long validTo;
+        WindowCapturingPayInAdvanceRouter(AppConfig.LiquidationConfiguration configuration, List<Utxo> universe) {
+            super(LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                    new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                            LoanFixtures.utxoSupplier(universe), LoanFixtures.protocolParams()));
+        }
+        @Override
+        Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo, Utxo bondUtxo,
+                                            Utxo configUtxo, Utxo lmConfigUtxo,
+                                            Map<String, OracleEntry> oraclesByUnit, BigInteger principalBalance,
+                                            Function<BigInteger, Optional<Utxo>> walletSelector,
+                                            long validFromMillis, long validToMillis) {
+            validFrom = validFromMillis;
+            validTo = validToMillis;
+            throw new IllegalStateException("captured the window; the build is not under test here");
+        }
+    }
+
+    /** The convert route's twin of {@link WindowCapturingPayInAdvanceRouter}. */
+    private static final class WindowCapturingConvertRouter extends ConvertLiquidationRouter {
+        Long validFrom;
+        Long validTo;
+        WindowCapturingConvertRouter() {
+            super(null, null, null, null, null, null, null, null);
+        }
+        @Override
+        public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
+                                                    Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
+                                                    Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Map<String, OracleEntry> oracles,
+                                                    String changeAddress, long validFromMillis, long validToMillis) {
+            validFrom = validFromMillis;
+            validTo = validToMillis;
+            throw new IllegalStateException("captured the window; the build is not under test here");
+        }
+    }
+
+    /** What the plain builder, the pay-in-advance router and the convert router were each handed. */
+    private record WindowWiring(LiquidationExecutor executor, LiquidationDecisionLog log,
+                                BlockEventListener blockEventListener,
+                                java.util.concurrent.atomic.AtomicReference<LiquidateTransactionBuilder.Request> plain,
+                                WindowCapturingPayInAdvanceRouter payInAdvance,
+                                WindowCapturingConvertRouter convert) {
+
+        /** The window start handed to whichever route ran, or null if none was called. */
+        Long handedStart(String route) {
+            return switch (route) {
+                case "PLAIN" -> plain.get() == null ? null : plain.get().validFromMillis();
+                case "PAY_IN_ADVANCE" -> payInAdvance.validFrom;
+                case "CONVERT" -> convert.validFrom;
+                default -> throw new IllegalArgumentException(route);
+            };
+        }
+
+        Long handedEnd(String route) {
+            return switch (route) {
+                case "PLAIN" -> plain.get() == null ? null : plain.get().validToMillis();
+                case "PAY_IN_ADVANCE" -> payInAdvance.validTo;
+                case "CONVERT" -> convert.validTo;
+                default -> throw new IllegalArgumentException(route);
+            };
+        }
+
+        boolean noRouteCalled() {
+            return plain.get() == null && payInAdvance.validFrom == null && convert.validFrom == null;
+        }
+    }
+
+    /**
+     * One token-collateral candidate on {@code route}, every route a capturing fake, and the collateral feed
+     * opening at {@code feedValidFrom}. PLAIN is a plain bond; the two convert-bond routes are chosen the way
+     * an operator chooses them — the ada market listed as ANTICIPATE (pay-in-advance) or unlisted (convert).
+     */
+    private static WindowWiring windowWiring(String route, long feedValidFrom) {
+        boolean plainBond = route.equals("PLAIN");
+        AppConfig.LiquidationConfiguration configuration = route.equals("CONVERT")
+                ? new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW, 60,
+                        120, 30, SMALL_MARGIN, 200)
+                : shadow(SMALL_MARGIN);
+        Scenario scenario = plainBond ? tokenScenario() : tokenConvertScenario();
+        List<Utxo> universe = List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+                scenario.loan().utxo(), scenario.bond().utxo());
+
+        java.util.concurrent.atomic.AtomicReference<LiquidateTransactionBuilder.Request> plain =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        LiquidateTransactionBuilder plainBuilder = mock(LiquidateTransactionBuilder.class);
+        when(plainBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenAnswer(invocation -> {
+            plain.set(invocation.getArgument(0));
+            throw new IllegalStateException("captured the window; the build is not under test here");
+        });
+        WindowCapturingPayInAdvanceRouter payInAdvance = new WindowCapturingPayInAdvanceRouter(configuration,
+                universe);
+        WindowCapturingConvertRouter convert = new WindowCapturingConvertRouter();
+
+        FakeOracleClient client = new FakeOracleClient(List.of(collateralOracleOpeningAt(feedValidFrom)));
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(List.of(WALLET_UTXO)), ACCOUNT,
+                new FakeScanner(List.of(scenario.assessment())),
+                new FakeResolver(allUnspent(List.of(scenario))), plainBuilder, payInAdvance, convert,
+                LoanFixtures.registry(), log, metrics(), new CountingOracleProvider(client, client),
+                previewNetwork(), LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
+        return new WindowWiring(executor, log, blockEventListener, plain, payInAdvance, convert);
+    }
+
+    /**
+     * ⛔ <b>EACH ROUTE IS HANDED THE CLAMPED START.</b> The chain's last committed block is five seconds
+     * behind wall clock (the anchor), and the collateral feed opened 10.5 s before it — inside the 30-second
+     * backdate. The base handed every route {@code anchor − 30 s}, before the feed opened, so the validator
+     * refused the price until a block landed 30 s after it. Now the start is the first whole slot at or after
+     * the feed's {@code validFrom}: {@code anchor − 10 s}, never past the anchor. {@code validTo} is
+     * unchanged, still wall clock plus the configured window.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"PLAIN", "PAY_IN_ADVANCE", "CONVERT"})
+    void eachRouteIsHandedAStartRaisedToTheNewestFeedsFirstWholeSlot(String route) {
+        long committedSlot = slotAt(NOW - 5_000L);
+        long anchor = millisOfSlot(committedSlot);
+        long feedValidFrom = anchor - 10_500L;
+        WindowWiring wiring = windowWiring(route, feedValidFrom);
+        wiring.blockEventListener().getLastCommittedSlot().set(committedSlot);
+
+        wiring.executor().cycle(NOW);
+
+        Long handed = wiring.handedStart(route);
+        assertNotNull(handed, route + " was never reached: " + wiring.log().newestFirst(10));
+        assertEquals(anchor - 10_000L, handed.longValue(),
+                "the first whole slot at or after the feed's validFrom " + feedValidFrom);
+        assertTrue(handed >= feedValidFrom, "the transaction must not open before the feed it carries");
+        assertTrue(handed <= anchor, "and must never open ahead of the chain");
+        assertNotEquals(anchor - 30_000L, handed.longValue(), "the base's floor, which the validator refused");
+        assertEquals(NOW + 120_000L, wiring.handedEnd(route).longValue(), "validTo is unchanged");
+    }
+
+    /**
+     * ⛔ <b>A FEED NEWER THAN THE CHAIN IS NOT BUILT THIS PASS.</b> Its {@code validFrom} lies two seconds
+     * past the anchor: no start is both at or after it and at or before the chain's position. The candidate
+     * is refused {@code ORACLE_FEED_NOT_YET_VALID} at INFO — a timing fact, not a fault — and no route is
+     * called; the held price is tried again on the next block.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"PLAIN", "PAY_IN_ADVANCE", "CONVERT"})
+    void aFeedOpeningAfterTheAnchorIsRefusedNotYetValidAndNoRouteIsCalled(String route) {
+        long committedSlot = slotAt(NOW - 5_000L);
+        long anchor = millisOfSlot(committedSlot);
+        WindowWiring wiring = windowWiring(route, anchor + 2_000L);
+        wiring.blockEventListener().getLastCommittedSlot().set(committedSlot);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertTrue(wiring.noRouteCalled(), "nothing may be built for a start ahead of the chain");
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(1, decisions.size(), "exactly one decision: " + decisions);
+        LiquidationDecision decision = decisions.getFirst();
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+        assertEquals("ORACLE_FEED_NOT_YET_VALID", decision.reason());
+        assertTrue(decision.detail().contains(String.valueOf(anchor + 2_000L)), "names the validFrom: "
+                + decision.detail());
+        assertTrue(decision.detail().contains(String.valueOf(anchor)), "names the anchor: " + decision.detail());
+        assertTrue(decision.detail().contains("2000 ms"), "names the gap: " + decision.detail());
+        assertTrue(decision.detail().contains("retried on the next block"), decision.detail());
+        assertTrue(appender.list.stream().anyMatch(event -> event.getLevel() == Level.INFO
+                        && event.getFormattedMessage().contains("retried on the next block")),
+                "logged at INFO: " + appender.list);
+        assertEquals(List.of(), appender.list.stream()
+                        .filter(event -> event.getLevel() == Level.ERROR || event.getLevel() == Level.WARN)
+                        .map(ILoggingEvent::getFormattedMessage).toList(),
+                "a feed newer than the chain is not a fault");
+    }
+
+    /**
+     * ⛔ <b>THE ANCHOR FOLLOWS THE COMMITTED BLOCK, NOT THE APPLIED ONE.</b> {@code lastAppliedSlot} is
+     * written inside the block's database transaction, before it commits; {@code lastCommittedSlot} only
+     * after. Here they disagree by 60 seconds — the applied one ahead — and no feed is fresh, so the start
+     * is exactly {@code committed − 30 s}.
+     */
+    @Test
+    void theWindowIsAnchoredToTheLastCommittedSlotNotTheLastAppliedOne() {
+        long committedSlot = slotAt(NOW - 100_000L);
+        long appliedSlot = slotAt(NOW - 40_000L);
+        WindowWiring wiring = windowWiring("PLAIN", NOW - 3_000_000L);
+        wiring.blockEventListener().getLastCommittedSlot().set(committedSlot);
+        wiring.blockEventListener().getLastAppliedSlot().set(appliedSlot);
+
+        wiring.executor().cycle(NOW);
+
+        Long handed = wiring.handedStart("PLAIN");
+        assertNotNull(handed, "the plain route was never reached: " + wiring.log().newestFirst(10));
+        assertEquals(millisOfSlot(committedSlot) - 30_000L, handed.longValue(),
+                "the start must be the COMMITTED block less 30 s");
+        assertNotEquals(millisOfSlot(appliedSlot) - 30_000L, handed.longValue(),
+                "anchoring to the applied slot would open the window on a block not yet stored");
+    }
+
+    /**
+     * The convert route's new window guard ({@code ConvertLiquidationRouter.FeedWindowException}) is a
+     * per-block timing fact, not machinery: recorded {@code CONVERT_FEED_WINDOW} at INFO, never ERROR, and
+     * reconsidered on the next cycle. The THROW side is pinned in {@code ConvertLiquidationRouterTest}.
+     */
+    @Test
+    void aConvertFeedWindowRefusalIsRecordedUnderItsOwnNameAtInfo() {
+        String detail = "the collateral feed window [1760000010000,1760001000000] does not cover the "
+                + "transaction window [1760000000000,1760000120000]";
+        ConvertWiring wiring = convertWiringThrowing(new ConvertLiquidationRouter.FeedWindowException(detail));
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(NOW);
+            wiring.executor().cycle(NOW + 1_000L);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        assertEquals(2, wiring.router().calls, "reconsidered on the next cycle, not held");
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(2, decisions.size());
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome());
+            assertEquals("CONVERT_FEED_WINDOW", decision.reason(),
+                    "its own name, not the exception class the generic catch would record");
+            assertEquals(detail, decision.detail());
+        }
+        assertEquals(2, appender.list.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .filter(event -> event.getFormattedMessage().contains("CONVERT_FEED_WINDOW"))
+                .count(), "INFO on each cycle: " + appender.list);
+        assertEquals(List.of(), appender.list.stream()
+                        .filter(event -> event.getLevel() == Level.ERROR)
+                        .map(ILoggingEvent::getFormattedMessage).toList(),
+                "a feed window is not a machinery fault");
     }
 }

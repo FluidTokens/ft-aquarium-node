@@ -898,12 +898,18 @@ public class LiquidationExecutor {
         // only the START moves: validTo stays wall-clock-based so the transaction keeps its full
         // landing time, and because the oracle-window check reads validTo and is a SEPARATE
         // constraint that this must not disturb.
-        long anchor = windowAnchorMillis(now, blockEventListener.getLastAppliedSlot().get(), converters);
+        //
+        // FAB-183 — the anchor is the last COMMITTED block (written after the block's database
+        // transaction commits), not the last applied one (written inside it). And this is only the
+        // FLOOR: each candidate's start is raised to the newest validFrom among the oracle feeds its
+        // transaction carries (LiquidationStartClamp, in consider()), never past the anchor.
+        final long committedSlot = blockEventListener.getLastCommittedSlot().get();
+        long anchor = windowAnchorMillis(now, committedSlot, converters);
         if (anchor != now) {
-            log.info("validity window anchored to the last applied block ({} ms behind wall clock) — "
+            log.info("validity window anchored to the last committed block ({} ms behind wall clock) — "
                     + "invalidBefore would otherwise sit ahead of the node's current slot", now - anchor);
         }
-        final long validFromMillis = anchor - VALID_FROM_BACKDATE_MILLIS;
+        final long validFromFloorMillis = anchor - VALID_FROM_BACKDATE_MILLIS;
         final long validToMillis = now + configuration.getValidityWindowSeconds() * 1000L;
 
         // Effectively final, so the per-candidate selector lambda can close over them.
@@ -936,8 +942,8 @@ public class LiquidationExecutor {
         }
         for (LiquidationAssessment assessment : ordered) {
             try {
-                consider(assessment, now, validFromMillis, validToMillis, walletUtxos, params,
-                        configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit,
+                consider(assessment, now, committedSlot, validFromFloorMillis, validToMillis, walletUtxos,
+                        params, configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit,
                         effect -> dropFromCycle(walletUtxos, effect));
             } catch (Exception e) {
                 // consider() already turns every expected failure into a decision; this is the last
@@ -1052,7 +1058,7 @@ public class LiquidationExecutor {
     // ---- one candidate ------------------------------------------------------------------------
 
     private void consider(LiquidationAssessment assessment, long now,
-                          long validFromMillis, long validToMillis,
+                          long committedSlot, long validFromFloorMillis, long validToMillis,
                           List<Utxo> walletUtxos,
                           Optional<ProtocolParams> params, Utxo configUtxo, Utxo lmConfigUtxo,
                           Map<String, OracleEntry> oraclesByUnit,
@@ -1086,6 +1092,57 @@ public class LiquidationExecutor {
                     "loan utxo present=%s, bond utxo present=%s — spent since the scan"
                             .formatted(loanUtxo.isPresent(), bondUtxo.isPresent())));
             return;
+        }
+
+        // ⛔ FAB-183 — THE START IS NO EARLIER THAN THE NEWEST FEED THIS TRANSACTION CARRIES.
+        //
+        // The validator enforces the feed window at BOTH ends (lib/fluidtokens/oracle.ak:
+        // valid_from <= transactionValidFrom, valid_to >= transactionValidTo). A start fixed at
+        // anchor − 30 s refused every freshly pushed price until a block landed 30 s after its
+        // validFrom. Each route — plain, pay-in-advance and convert — puts the principal and the
+        // collateral feeds in its transaction (loan_claim_action retrieves both), so the start is
+        // raised to the newest of them, rounded UP to a whole slot, and never past the anchor.
+        // A missing entry contributes nothing here: the builders keep refusing it by name.
+        final long validFromMillis;
+        LiquidationStartClamp.Result start;
+        try {
+            start = LiquidationStartClamp.clamp(now, committedSlot, VALID_FROM_BACKDATE_MILLIS,
+                    nonAdaLegFeeds(assessment.loan().datum(), oraclesByUnit), converters);
+        } catch (RuntimeException e) {
+            // ⚠ THE CLAMP IS A NEW CONVERTER CALL INSIDE consider() (CCL trap 19: a computation crossing
+            // an error boundary changes a failure mode). Uncaught, a broken converter would escape to the
+            // cycle's outer catch and record NO decision for this candidate; LiquidationSubmitVetoTest S8
+            // pins the old failure mode. So it degrades to the per-cycle floor, anchor − 30 s, which is
+            // exactly what every route was handed before FAB-183. That is safe: the floor is ≤ the anchor,
+            // and a feed that opens after it is still refused by name by each route's own window check.
+            // WARN, not ERROR, and no throwable: a truly broken converter is hit again by the build that
+            // follows and reported there on its own terms — S8 expects exactly ONE cause-carrying ERROR.
+            log.warn("could not clamp the window start of {} ({}); building from the floor {}",
+                    loanUtxoRef, causeChain(e), validFromFloorMillis);
+            start = new LiquidationStartClamp.Start(validFromFloorMillis, validFromFloorMillis
+                    + VALID_FROM_BACKDATE_MILLIS, false);
+        }
+        if (start instanceof LiquidationStartClamp.NotYetValid notYet) {
+            // Not a fault and not a verdict on the loan: the price is newer than the chain's position.
+            // The held price is used again on the next block, by which time the chain has usually
+            // reached it — no margin is added (ruled 2026-10-31).
+            String detail = ("the newest oracle feed this transaction carries opens at %d, %d ms past the "
+                    + "window anchor %d (the last committed block, or now); the first whole slot at or after "
+                    + "it starts at %d, after the anchor — a transaction starting there would be ahead of "
+                    + "the chain; retried on the next block")
+                    .formatted(notYet.newestValidFromMillis(), notYet.gapMillis(), notYet.anchorMillis(),
+                            notYet.firstSlotMillis());
+            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                    "ORACLE_FEED_NOT_YET_VALID", detail));
+            log.info("the liquidation of {} waits for the chain: {}", loanUtxoRef, detail);
+            return;
+        }
+        LiquidationStartClamp.Start clamped = (LiquidationStartClamp.Start) start;
+        validFromMillis = clamped.startMillis();
+        if (clamped.raisedByFeed()) {
+            log.info("the window of {} starts at {}, raised from the floor {} to the newest oracle feed's "
+                    + "validFrom (anchor {})", loanUtxoRef, validFromMillis, validFromFloorMillis,
+                    clamped.anchorMillis());
         }
 
         Transaction transaction;
@@ -1219,6 +1276,15 @@ public class LiquidationExecutor {
                             "WALLET_INPUT_TOO_SMALL", e.getMessage()));
                     log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef,
                             e.getMessage());
+                    return;
+                } catch (ConvertLiquidationRouter.FeedWindowException e) {
+                    // FAB-183 — a feed whose window does not cover the body's is per-block feed timing,
+                    // not a machinery fault: nothing was built and no wallet utxo was spent, so nothing
+                    // is dropped from the cycle's wallet list. Reconsidered on the next block.
+                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                            "CONVERT_FEED_WINDOW", e.getMessage()));
+                    log.info("the convert liquidation of {} was refused as CONVERT_FEED_WINDOW: {}",
+                            loanUtxoRef, e.getMessage());
                     return;
                 } catch (Exception e) {
                     // ⚠ WHAT IS LEFT HERE IS A GENUINE MACHINERY FAULT, and that is the point of the
@@ -2570,6 +2636,31 @@ public class LiquidationExecutor {
         return ("(2) COLLATERAL: at least %s lovelace in TOTAL across at most %d nominable utxos, "
                 + "chosen separately from the spend input; available %s.")
                 .formatted(required, limit, available);
+    }
+
+    /**
+     * The oracle feeds of the candidate's non-ADA legs, as {@link LiquidationStartClamp} consumes them:
+     * the principal ({@code principalAsset}, {@code principalOracleAsset}) and the collateral
+     * ({@code collateral().assetType()}, {@code oracleTokenAsset()}), each resolved through
+     * {@link OracleEntry#namedForLeg}. An ADA leg, or a leg with no entry, contributes nothing.
+     */
+    static List<OraclePriceFeed> nonAdaLegFeeds(LoanDatum datum, Map<String, OracleEntry> oraclesByUnit) {
+        List<OraclePriceFeed> feeds = new ArrayList<>(2);
+        if (!datum.principalAsset().isAda()) {
+            addLegFeed(feeds, OracleEntry.namedForLeg(oraclesByUnit, datum.principalAsset(),
+                    datum.principalOracleAsset()));
+        }
+        if (!datum.collateral().isAda()) {
+            addLegFeed(feeds, OracleEntry.namedForLeg(oraclesByUnit, datum.collateral().assetType(),
+                    datum.collateral().oracleTokenAsset()));
+        }
+        return feeds;
+    }
+
+    private static void addLegFeed(List<OraclePriceFeed> feeds, OracleEntry entry) {
+        if (entry != null && entry.feed() != null) {
+            feeds.add(entry.feed());
+        }
     }
 
     /**
