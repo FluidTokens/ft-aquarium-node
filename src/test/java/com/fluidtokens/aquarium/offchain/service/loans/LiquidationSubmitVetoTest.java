@@ -25,6 +25,8 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
+import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.cardanofoundation.conversions.CardanoConverters;
@@ -216,6 +218,35 @@ class LiquidationSubmitVetoTest {
 
         static RecordingSubmitter rejecting(String response) {
             return new RecordingSubmitter(Result.error(response).code(400), null);
+        }
+
+        /**
+         * FAB-183: Blockfrost's DECODED refusal — the HTTP-400 envelope {@code /tx/submit} documents,
+         * {@code message} JSON-escaped as the provider sends it. The one non-success answer
+         * {@code WorkResult.classify} calls a DEFINITE rejection; a raw body ({@link #rejecting}) is AMBIGUOUS.
+         */
+        static RecordingSubmitter rejectingDecoded(String message) {
+            return new RecordingSubmitter(decodedRefusal(message), null);
+        }
+
+        /** {@link #acceptingThenRejecting}, with every later submission refused by the decoded envelope. */
+        static RecordingSubmitter acceptingThenRejectingDecoded(String txHash, String message) {
+            RecordingSubmitter submitter = accepting(txHash);
+            submitter.later = decodedRefusal(message);
+            return submitter;
+        }
+
+        static Result<String> decodedRefusal(String message) {
+            Map<String, Object> envelope = new LinkedHashMap<>();
+            envelope.put("status_code", 400);
+            envelope.put("error", "Bad Request");
+            envelope.put("message", message);
+            try {
+                return Result.<String>error(new com.fasterxml.jackson.databind.ObjectMapper()
+                        .writeValueAsString(envelope)).code(400);
+            } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+                throw new IllegalStateException(e);
+            }
         }
 
         static RecordingSubmitter throwing(RuntimeException e) {
@@ -1760,7 +1791,7 @@ class LiquidationSubmitVetoTest {
     /** A backend that says no. Recorded as SUBMIT_FAILED, with its response. */
     @Test
     void aRejectedSubmissionIsRecordedAsSubmitFailedWithTheBackendResponse() {
-        RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
+        RecordingSubmitter submitter = RecordingSubmitter.rejectingDecoded("ValueNotConservedUTxO");
         Run run = new Rig().submitter(submitter).run();
 
         assertEquals(1, submitter.submitted.size(), "it was transmitted");
@@ -1792,7 +1823,7 @@ class LiquidationSubmitVetoTest {
 
     /** The node's text for a transaction whose interval opens after the validating node's slot. */
     private static final String OUTSIDE_VALIDITY_RESPONSE = "{\"contents\":{\"contents\":{\"contents\":{\"era\":"
-            + "\"ShelleyBasedEraConway\",\"error\":[\"ConwayUtxowFailure (UtxoFailure (OutsideValidity\n"
+            + "\"ShelleyBasedEraConway\",\"error\":[\"ConwayUtxowFailure (UtxoFailure (OutsideValidity"
             + "IntervalUTxO (ValidityInterval {invalidBefore = SJust (SlotNo 121127975), invalidHereafter = "
             + "SJust (SlotNo 121128124)}) (SlotNo 121127848)))\"]}}}}";
 
@@ -1800,13 +1831,14 @@ class LiquidationSubmitVetoTest {
      * FAB-183 (A2): an {@code OutsideValidityInterval} rejection is EXPECTED once the start clamp opens a
      * transaction at a fresh feed's {@code validFrom} — the validating node may not have reached that slot
      * yet. Logged at INFO, never ERROR, and counted; the row is the ordinary {@code SUBMIT_FAILED} with the
-     * backend's text, and nothing was transmitted. The marker is matched with whitespace removed, so the line
-     * break inside it here is no escape.
+     * backend's text, and nothing was transmitted. FAB-183 (A4): the refusal arrives as Blockfrost's decoded
+     * envelope, inside which a line break would be the two characters {@code \n}, so the fixture's marker is
+     * unbroken — as real ledger text always is.
      */
     @Test
     void anOutsideValidityIntervalRejectionIsCountedAndLoggedAtInfoNotError() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        RecordingSubmitter submitter = RecordingSubmitter.rejecting(OUTSIDE_VALIDITY_RESPONSE);
+        RecordingSubmitter submitter = RecordingSubmitter.rejectingDecoded(OUTSIDE_VALIDITY_RESPONSE);
         Run[] run = new Run[1];
 
         List<ILoggingEvent> events = logged(new Rig().submitter(submitter).meterRegistry(registry), run);
@@ -1814,7 +1846,8 @@ class LiquidationSubmitVetoTest {
         assertEquals(1, submitter.submitted.size(), "it reached the backend");
         LiquidationDecision decision = run[0].onlyDecision();
         assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, decision.outcome(), decision.detail());
-        assertTrue(decision.detail().contains("backend rejected it: " + OUTSIDE_VALIDITY_RESPONSE),
+        assertTrue(decision.detail().contains("backend rejected it: "
+                        + RecordingSubmitter.decodedRefusal(OUTSIDE_VALIDITY_RESPONSE).getResponse()),
                 decision.detail());
         assertEquals(List.of(), errorsContaining(events, "rejected"), "an expected rejection is not a fault");
         assertEquals(List.of(), errorsContaining(events, "OutsideValidity"), "nor at ERROR under any wording");
@@ -1832,13 +1865,14 @@ class LiquidationSubmitVetoTest {
     @Test
     void anOrdinaryRejectionIsStillLoggedAtErrorAndNotCountedAsOutsideValidity() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
-        RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
+        RecordingSubmitter submitter = RecordingSubmitter.rejectingDecoded("ValueNotConservedUTxO");
         Run[] run = new Run[1];
 
         List<ILoggingEvent> events = logged(new Rig().submitter(submitter).meterRegistry(registry), run);
 
         assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, run[0].onlyDecision().outcome());
-        assertEquals(1, errorsContaining(events, "was rejected: ValueNotConservedUTxO").size(),
+        assertEquals(1, errorsContaining(events, "was rejected: "
+                        + RecordingSubmitter.decodedRefusal("ValueNotConservedUTxO").getResponse()).size(),
                 "an ordinary rejection is a fault, at ERROR: " + events);
         assertEquals(0.0, registry.get(LiquidationExecutor.OUTSIDE_VALIDITY_COUNTER).counter().count(),
                 "not an OutsideValidityInterval rejection");
@@ -1982,7 +2016,7 @@ class LiquidationSubmitVetoTest {
      */
     @Test
     void aRejectedSubmissionIsRetriedOnTheNextCycleAndLoggedAtErrorOnBoth() {
-        RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
+        RecordingSubmitter submitter = RecordingSubmitter.rejectingDecoded("ValueNotConservedUTxO");
         Run[] run = new Run[1];
         List<ILoggingEvent> events = logged(new Rig().submitter(submitter).cycles(2), run);
 
@@ -2057,7 +2091,7 @@ class LiquidationSubmitVetoTest {
      */
     @Test
     void aSubmittedLiquidationIsAttemptedAgainNextCycleAndItsRejectionIsLoggedAtError() {
-        RecordingSubmitter submitter = RecordingSubmitter.acceptingThenRejecting("ab".repeat(32),
+        RecordingSubmitter submitter = RecordingSubmitter.acceptingThenRejectingDecoded("ab".repeat(32),
                 "ConwayMempoolFailure \"All inputs are spent. Transaction has probably already been "
                         + "included\"");
         AppConfig.LiquidationConfiguration configuration = armed();
@@ -2123,17 +2157,16 @@ class LiquidationSubmitVetoTest {
      * {@code tx_input}, so the wallet utxo the first transmitted transaction spent is still listed
      * when the second candidate is built; nominating it again would fail the second at phase 1. The
      * second must be built on a different wallet input.
+     * <p>
+     * FAB-183: in TWO markets, because a submitted liquidation now serves its market for the rest of the
+     * call and a second ada candidate would never be built.
      */
     @Test
     void aSecondCandidateNeverNominatesAWalletUtxoTheFirstTransmittedTransactionSpent() throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
-        AppConfig.LiquidationConfiguration configuration = armed();
-        LiquidationDecisionLog log = new LiquidationDecisionLog(configuration);
-        LiquidationExecutor executor = armedExecutor(List.of(adaScenario(), secondAdaScenario()),
-                List.of(WALLET_UTXO, WALLET_UTXO_SMALL), log, submitter);
-        executor.setSubmitClock(() -> NOW);
-
-        executor.cycle(NOW);
+        StageRun stage = stage(armed(), List.of(adaScenario(), otherMarketScenario()), submitter, null,
+                SubmitFence.OPEN);
+        LiquidationDecisionLog log = stage.log();
 
         assertEquals(2, submitter.submitted.size(), "both candidates were submitted: " + log.newestFirst(10));
         TransactionInput small = new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0);
@@ -2169,21 +2202,24 @@ class LiquidationSubmitVetoTest {
     /**
      * FAB-134 NQ r2 (THROWN). A submission that THROWS may have gone out — a connection reset arrives
      * after the bytes as readily as before — so its inputs are treated as spent exactly like a
-     * SUBMITTED one's, and the second candidate is built on the other wallet utxo.
+     * SUBMITTED one's.
+     * <p>
+     * FAB-183: and its outcome is AMBIGUOUS, so the stage stops there. The second candidate is never
+     * built, so no wallet input of the first can be nominated again in this call.
      */
     @Test
     void aThrownSubmissionsWalletInputIsNotNominatedAgainInTheSameCycle() throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.throwing(new IllegalStateException("connection reset"));
 
-        twoArmedCandidates(submitter);
+        StageRun stage = stage(armed(), List.of(adaScenario(), secondAdaScenario()), submitter, null,
+                SubmitFence.OPEN);
 
+        assertEquals(1, submitter.submitted.size(), "one transmission, then the stage stopped");
         TransactionInput small = new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0);
         assertTrue(inputsOf(submitter.submitted.get(0)).contains(small),
                 "the fee-only selector nominates the smaller utxo first");
-        List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
-        assertFalse(second.contains(small),
-                "the second candidate reused an input of a transmission whose outcome is unknown: " + second);
-        assertTrue(second.contains(new TransactionInput(TX_WALLET, 0)), second.toString());
+        assertEquals(1, stage.log().size(), "the second candidate was never built: " + stage.log().newestFirst(10));
+        assertEquals(WorkResult.AMBIGUOUS, stage.result());
     }
 
     /**
@@ -2193,7 +2229,7 @@ class LiquidationSubmitVetoTest {
      */
     @Test
     void aBadInputsRejectionDropsTheNominatedWalletUtxoForTheRestOfTheCycle() throws Exception {
-        RecordingSubmitter submitter = RecordingSubmitter.rejecting(
+        RecordingSubmitter submitter = RecordingSubmitter.rejectingDecoded(
                 "ConwayUtxowFailure (UtxoFailure (BadInputsUTxO (fromList [TxIn ...])))");
 
         List<ILoggingEvent> events = twoArmedCandidates(submitter);
@@ -2216,13 +2252,403 @@ class LiquidationSubmitVetoTest {
     /** And an ordinary rejection keeps the input: nothing said it was spent, and nothing went out. */
     @Test
     void anOrdinaryRejectionLeavesTheWalletInputNominable() throws Exception {
-        RecordingSubmitter submitter = RecordingSubmitter.rejecting("ValueNotConservedUTxO");
+        RecordingSubmitter submitter = RecordingSubmitter.rejectingDecoded("ValueNotConservedUTxO");
 
         twoArmedCandidates(submitter);
 
         assertTrue(inputsOf(submitter.submitted.get(1))
                         .contains(new TransactionInput(WALLET_UTXO_SMALL.getTxHash(), 0)),
                 "a rejection that names no spent input must not cost the cycle a wallet utxo");
+    }
+
+    // ======================================================================================
+    // FAB-183 — the liquidation stage: one per market, the next candidate on a definite failure,
+    // a stop on ambiguity, and the fence
+    // ======================================================================================
+
+    private static final String TX_LOAN_3 = "ac".repeat(32);
+    private static final String TX_BOND_3 = "df".repeat(32);
+    private static final String LOAN_ID_3 = "c1b2c3d4e5f6a1b2";
+
+    /**
+     * {@link #tokenPrincipalScenario()} under other refs and another loan id: a candidate in a second
+     * MARKET (principal {@code PRINCIPAL_TOKEN}) beside the ada one. Needs {@link #principalOracle()}.
+     */
+    private static Scenario otherMarketScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_TOKEN,
+                BigInteger.valueOf(100_000_000), BigInteger.valueOf(1000),
+                LoanFixtures.adaCollateral(), LATE_LEND_DATE, LoanFixtures.liquidation(),
+                new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN_3, 0, LOAN_ID_3, datum,
+                COLLATERAL_LOVELACE, List.of());
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND_3, 0, LOAN_ID_3,
+                LoanFixtures.bondDatum(FAT_FEE_PER_MILLE,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), AssetType.ada()),
+                2_000_000L);
+        return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                principalFeed(), OraclePriceFeed.unit(), VALID_FROM));
+    }
+
+    /** A fence that reads open {@code opens} times, then closed for good. */
+    private static SubmitFence openFor(int opens) {
+        int[] reads = {0};
+        return () -> reads[0]++ < opens;
+    }
+
+    /** One stage call: what it returned, what it recorded and transmitted, and what it logged. */
+    private record StageRun(WorkResult result, LiquidationDecisionLog log, RecordingSubmitter submitter,
+                            List<ILoggingEvent> events) {
+    }
+
+    /**
+     * {@link #armedExecutor}, with the configuration chosen by the test, {@link #principalOracle()}
+     * served so {@link #otherMarketScenario()} can be built, and — when {@code loanRefThatThrows} is set
+     * — a resolver that throws for that loan, which escapes {@code consider()} before anything is built.
+     * Runs ONE {@code cycle(NOW, fence)} with the executor's log captured.
+     */
+    private static StageRun stage(AppConfig.LiquidationConfiguration configuration, List<Scenario> scenarios,
+                                  RecordingSubmitter submitter, String loanRefThatThrows, SubmitFence fence) {
+        return stage(configuration, scenarios, submitter, loanRefThatThrows, fence,
+                new LiquidationDecisionLog(configuration));
+    }
+
+    private static StageRun stage(AppConfig.LiquidationConfiguration configuration, List<Scenario> scenarios,
+                                  RecordingSubmitter submitter, String loanRefThatThrows, SubmitFence fence,
+                                  LiquidationDecisionLog log) {
+        List<Utxo> walletUtxos = List.of(WALLET_UTXO, WALLET_UTXO_SMALL);
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
+        universe.addAll(walletUtxos);
+        Map<String, Utxo> unspent = new LinkedHashMap<>();
+        List<LiquidationAssessment> assessments = new ArrayList<>();
+        for (Scenario scenario : scenarios) {
+            universe.add(scenario.loan().utxo());
+            universe.add(scenario.bond().utxo());
+            unspent.put(scenario.loan().loan().utxoRef(), scenario.loan().utxo());
+            unspent.put(scenario.bond().bond().utxoRef(), scenario.bond().utxo());
+            assessments.add(scenario.assessment());
+        }
+        FakeResolver stable = FakeResolver.stable(unspent);
+        LiquidationUtxoResolver resolver = new LiquidationUtxoResolver(null, null, null) {
+            @Override
+            public Optional<Utxo> resolveLoanUtxo(Loan loan) {
+                if (loan.utxoRef().equals(loanRefThatThrows)) {
+                    throw new IllegalStateException("the index could not be read for " + loan.utxoRef());
+                }
+                return stable.resolveLoanUtxo(loan);
+            }
+
+            @Override
+            public Optional<Utxo> resolveBondUtxo(LenderBond bond) {
+                return stable.resolveBondUtxo(bond);
+            }
+
+            @Override
+            public Optional<Utxo> resolveConfigUtxo() {
+                return stable.resolveConfigUtxo();
+            }
+
+            @Override
+            public Optional<Utxo> resolveLmConfigUtxo() {
+                return stable.resolveLmConfigUtxo();
+            }
+        };
+        BlockEventListener blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
+                LoanFixtures.registry(), LoanFixtures.converters(), configuration,
+                new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), protocolParams()));
+        LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, new FakeScanner(assessments), resolver,
+                new LiquidateTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
+                        LoanFixtures.converters(), LoanFixtures.utxoSupplier(universe), protocolParams()),
+                payInAdvanceRouter, LoanFixtures.registry(), log, metrics(),
+                provider(new FakeOracleClient(List.of(principalOracle()))),
+                networkNamed("preview"), protocolParams(), LoanFixtures.converters(), submitter);
+        executor.setSubmitClock(() -> NOW);
+
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        WorkResult result;
+        try {
+            result = executor.cycle(NOW, fence);
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return new StageRun(result, log, submitter, appender.list);
+    }
+
+    /** The one recorded decision for {@code scenario}'s loan, failing if there is not exactly one. */
+    private static LiquidationDecision decisionFor(StageRun stage, Scenario scenario) {
+        List<LiquidationDecision> rows = stage.log().newestFirst(10).stream()
+                .filter(decision -> scenario.loan().loan().utxoRef().equals(decision.loanUtxoRef()))
+                .toList();
+        assertEquals(1, rows.size(), "one row for " + scenario.loan().loan().utxoRef() + ": "
+                + stage.log().newestFirst(10));
+        return rows.getFirst();
+    }
+
+    /** (a) Two submittable candidates in ONE market: the first is submitted and the second is never built. */
+    @Test
+    void aMarketGetsOneLiquidationPerCallAndItsSecondCandidateIsNeverBuilt() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+
+        StageRun stage = stage(armed(), List.of(adaScenario(), secondAdaScenario()), submitter, null,
+                SubmitFence.OPEN);
+
+        assertEquals(1, submitter.submitted.size(), "exactly one liquidation in the ada market");
+        assertEquals(1, stage.log().size(), "the second candidate was never built: " + stage.log().newestFirst(10));
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, stage.log().newestFirst(1).getFirst().outcome());
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /** (b) Two markets: both liquidated in one call, on disjoint inputs. */
+    @Test
+    void twoMarketsAreBothLiquidatedInOneCallOnDisjointInputs() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+
+        StageRun stage = stage(armed(), List.of(adaScenario(), otherMarketScenario()), submitter, null,
+                SubmitFence.OPEN);
+
+        assertEquals(2, submitter.submitted.size(), "one liquidation in each market: " + stage.log().newestFirst(10));
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, adaScenario()).outcome());
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, otherMarketScenario()).outcome());
+        List<TransactionInput> first = inputsOf(submitter.submitted.get(0));
+        List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
+        assertTrue(java.util.Collections.disjoint(first, second),
+                "the two transmissions share an input: " + first + " / " + second);
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /**
+     * (c) A DECODED Blockfrost refusal is a definite failure: nothing went out, the market is still open,
+     * and its next candidate is transmitted.
+     */
+    @Test
+    void aDecodedRefusalMovesOnToTheSameMarketsNextCandidate() {
+        RecordingSubmitter submitter = new RecordingSubmitter(
+                RecordingSubmitter.decodedRefusal("ValueNotConservedUTxO"), null);
+        submitter.later = Result.success("ab".repeat(32)).withValue("ab".repeat(32));
+
+        StageRun stage = stage(armed(), List.of(adaScenario(), secondAdaScenario()), submitter, null,
+                SubmitFence.OPEN);
+
+        assertEquals(2, submitter.submitted.size(), "the market's second candidate was transmitted");
+        List<LiquidationDecision> rows = stage.log().newestFirst(10);
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMITTED, LiquidationDecision.Outcome.SUBMIT_FAILED),
+                rows.stream().map(LiquidationDecision::outcome).toList(), rows.toString());
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /**
+     * (d) The shape every ambiguous outcome shares: one transmission, then nothing — not the ada market's
+     * second candidate and not the other market's — and the call says AMBIGUOUS.
+     */
+    private static StageRun assertAmbiguousEndsTheStage(RecordingSubmitter submitter) {
+        StageRun stage = stage(armed(), List.of(adaScenario(), secondAdaScenario(), otherMarketScenario()),
+                submitter, null, SubmitFence.OPEN);
+
+        assertEquals(1, submitter.submitted.size(), "nothing after an ambiguous submit is transmitted");
+        assertEquals(1, stage.log().size(),
+                "no candidate after it, in any market, was built: " + stage.log().newestFirst(10));
+        assertEquals(WorkResult.AMBIGUOUS, stage.result());
+        return stage;
+    }
+
+    /** (d) A thrown submission: AMBIGUOUS, and its row keeps its {@code submission threw} detail (A3). */
+    @Test
+    void aThrownSubmissionEndsTheStageAsAmbiguous() {
+        StageRun stage = assertAmbiguousEndsTheStage(
+                RecordingSubmitter.throwing(new IllegalStateException("connection reset")));
+
+        LiquidationDecision row = stage.log().newestFirst(1).getFirst();
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, row.outcome());
+        assertTrue(row.detail().contains("submission threw"), row.detail());
+    }
+
+    /**
+     * (d) A raw, non-envelope 400 is not a decoded refusal: AMBIGUOUS. Its row says so, and it is logged
+     * as ONE ERROR line carrying the HTTP code and the response — not also as a rejection (A2).
+     */
+    @Test
+    void aRaw400EndsTheStageAsAmbiguousWithOneErrorLine() {
+        StageRun stage = assertAmbiguousEndsTheStage(RecordingSubmitter.rejecting("ValueNotConservedUTxO"));
+
+        LiquidationDecision row = stage.log().newestFirst(1).getFirst();
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, row.outcome());
+        assertTrue(row.detail().startsWith("ambiguous: "), row.detail());
+        List<ILoggingEvent> lines = errorsContaining(stage.events(), "submitting the liquidation of");
+        assertEquals(1, lines.size(), "exactly one ERROR line for the submission: " + stage.events());
+        String line = lines.getFirst().getFormattedMessage();
+        assertTrue(line.contains("is AMBIGUOUS: HTTP 400: ValueNotConservedUTxO — the stage stops"), line);
+    }
+
+    /** (d) An HTTP 500: AMBIGUOUS, and its row says so. */
+    @Test
+    void anHttp500EndsTheStageAsAmbiguous() {
+        StageRun stage = assertAmbiguousEndsTheStage(new RecordingSubmitter(
+                Result.<String>error("Internal Server Error").code(500), null));
+
+        LiquidationDecision row = stage.log().newestFirst(1).getFirst();
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, row.outcome());
+        assertTrue(row.detail().startsWith("ambiguous: "), row.detail());
+        assertTrue(row.detail().contains("HTTP 500: Internal Server Error"), row.detail());
+    }
+
+    /** (e) SHADOW: a WOULD_SUBMIT serves its market too — only the first candidate is built and recorded. */
+    @Test
+    void aShadowWouldSubmitServesItsMarketForTheCall() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+
+        StageRun stage = stage(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, SMALL_MARGIN,
+                PUBLISHED), List.of(adaScenario(), secondAdaScenario()), submitter, null, SubmitFence.OPEN);
+
+        assertTrue(submitter.submitted.isEmpty(), "shadow transmits nothing");
+        assertEquals(1, stage.log().size(), "only the first was built: " + stage.log().newestFirst(10));
+        LiquidationDecision row = stage.log().newestFirst(1).getFirst();
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, row.outcome(), row.detail());
+        assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(), row.submitVeto());
+        assertEquals(WorkResult.WOULD_SUBMIT, stage.result());
+    }
+
+    /** (f) A fence closed before the first candidate: nothing is built, and the call is a definite failure. */
+    @Test
+    void aFenceClosedBeforeTheFirstCandidateBuildsNothing() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+
+        StageRun stage = stage(armed(), List.of(adaScenario(), otherMarketScenario()), submitter, null,
+                () -> false);
+
+        assertTrue(submitter.submitted.isEmpty());
+        assertEquals(0, stage.log().size(), "nothing was built: " + stage.log().newestFirst(10));
+        assertEquals(WorkResult.DEFINITE_FAILURE, stage.result());
+        assertEquals(1, stage.events().stream()
+                        .filter(event -> event.getLevel() == Level.INFO)
+                        .filter(event -> event.getFormattedMessage()
+                                .equals("liquidation stage fenced: 2 candidate(s) not reached"))
+                        .count(),
+                stage.events().toString());
+    }
+
+    /** (g) A fence that closes after the first transmission: the other market's candidate is not built. */
+    @Test
+    void aFenceClosingAfterTheFirstTransmissionStopsTheStage() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+
+        StageRun stage = stage(armed(), List.of(adaScenario(), otherMarketScenario()), submitter, null,
+                () -> submitter.submitted.isEmpty());
+
+        assertEquals(1, submitter.submitted.size());
+        assertEquals(1, stage.log().size(), "the second candidate was not built: " + stage.log().newestFirst(10));
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /** (h) A fence that closes between the vetoes and the wire: nothing transmitted, a fenced SUBMIT_VETOED row. */
+    @Test
+    void aFenceClosedAtSubmitTransmitsNothingAndRecordsAFencedVeto() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+
+        StageRun stage = stage(armed(), List.of(adaScenario()), submitter, null, openFor(1));
+
+        assertTrue(submitter.submitted.isEmpty(), "a closed fence transmits nothing");
+        LiquidationDecision row = stage.log().newestFirst(1).getFirst();
+        assertEquals(1, stage.log().size());
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_VETOED, row.outcome(), row.detail());
+        assertNull(row.submitVeto(), "not one of the seven vetoes");
+        assertTrue(row.detail().contains("fenced"), row.detail());
+        assertEquals(WorkResult.DEFINITE_FAILURE, stage.result());
+    }
+
+    /** (i) SUBMITTED outranks WOULD_SUBMIT: the ada market held at shadow, the other market live. */
+    @Test
+    void submittedOutranksWouldSubmit() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+
+        StageRun stage = stage(armedWithMarket(AppConfig.LiquidationConfiguration.Mode.SHADOW),
+                List.of(adaScenario(), otherMarketScenario()), submitter, null, SubmitFence.OPEN);
+
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, decisionFor(stage, adaScenario()).outcome());
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, otherMarketScenario()).outcome());
+        assertEquals(1, submitter.submitted.size());
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /** (i) WOULD_SUBMIT outranks a definite failure. */
+    @Test
+    void wouldSubmitOutranksADefiniteFailure() {
+        RecordingSubmitter submitter = RecordingSubmitter.rejectingDecoded("ValueNotConservedUTxO");
+
+        StageRun stage = stage(armedWithMarket(AppConfig.LiquidationConfiguration.Mode.SHADOW),
+                List.of(adaScenario(), otherMarketScenario()), submitter, null, SubmitFence.OPEN);
+
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, decisionFor(stage, adaScenario()).outcome());
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED,
+                decisionFor(stage, otherMarketScenario()).outcome());
+        assertEquals(WorkResult.WOULD_SUBMIT, stage.result());
+    }
+
+    /** (i) AMBIGUOUS outranks an earlier SUBMITTED in another market. */
+    @Test
+    void ambiguousOutranksAnEarlierSubmitted() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        submitter.later = Result.<String>error("ValueNotConservedUTxO").code(400);
+
+        StageRun stage = stage(armed(), List.of(adaScenario(), otherMarketScenario()), submitter, null,
+                SubmitFence.OPEN);
+
+        assertEquals(2, submitter.submitted.size());
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMIT_FAILED, LiquidationDecision.Outcome.SUBMITTED),
+                stage.log().newestFirst(10).stream().map(LiquidationDecision::outcome).toList());
+        assertEquals(WorkResult.AMBIGUOUS, stage.result());
+    }
+
+    /**
+     * (j) A6: an exception escaping the top-ranked candidate BEFORE it reached the submitter is a definite
+     * failure — that loan is skipped with today's ERROR line and the next one is tried.
+     */
+    @Test
+    void anExceptionBeforeTheSubmitterSkipsThatCandidateAndTheNextIsTransmitted() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        Scenario first = adaScenario();
+        Scenario second = secondAdaScenario();
+
+        StageRun stage = stage(armed(), List.of(first, second), submitter, first.loan().loan().utxoRef(),
+                SubmitFence.OPEN);
+
+        assertEquals(1, errorsContaining(stage.events(),
+                        "could not consider bond " + first.bond().bond().utxoRef()).size(),
+                "the top-ranked candidate is the one that threw: " + stage.events());
+        assertEquals(1, submitter.submitted.size(), "the next candidate was transmitted");
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, second).outcome());
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /**
+     * A6, the other side: an exception escaping a candidate AFTER it reached the submitter may have
+     * escaped a transmission, so the stage stops as AMBIGUOUS. Here recording the SUBMITTED row throws.
+     */
+    @Test
+    void anExceptionAfterTheSubmitterEndsTheStageAsAmbiguous() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        AppConfig.LiquidationConfiguration configuration = armed();
+        LiquidationDecisionLog failingLog = new LiquidationDecisionLog(configuration) {
+            @Override
+            public synchronized void record(LiquidationDecision decision) {
+                if (decision.outcome() == LiquidationDecision.Outcome.SUBMITTED) {
+                    throw new IllegalStateException("the decision log is unavailable");
+                }
+                super.record(decision);
+            }
+        };
+
+        StageRun stage = stage(configuration, List.of(adaScenario(), secondAdaScenario()), submitter, null,
+                SubmitFence.OPEN, failingLog);
+
+        assertEquals(1, submitter.submitted.size(), "nothing after a possibly transmitted body goes out");
+        assertEquals(1, errorsContaining(stage.events(), "could not consider bond").size(), stage.events().toString());
+        assertEquals(WorkResult.AMBIGUOUS, stage.result());
     }
 
     // ======================================================================================

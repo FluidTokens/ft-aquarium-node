@@ -22,6 +22,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import okhttp3.OkHttpClient;
 import org.junit.jupiter.api.Test;
@@ -2020,6 +2021,110 @@ class CompoundExecutorTest {
     void aCycleThatEndsBeforeTheWalkSaysNoSummary() {
         List<Line> lines = linesOfOneCycle(wiring(List.of(), true, -2_000_000L));
         assertEquals(List.of(), lines.stream().filter(line -> line.text().startsWith("compound scan")).toList());
+    }
+
+    // ---- FAB-183: the compound stage's fence, early returns and outcome-to-log mapping ------------
+
+    /** A fence that reads open {@code opens} times, then closed for good. */
+    private static SubmitFence openFor(int opens) {
+        AtomicInteger reads = new AtomicInteger();
+        return () -> reads.getAndIncrement() < opens;
+    }
+
+    /** FAB-183: a fence closed before the walk builds nothing, and the summary counts both as not reached. */
+    @Test
+    void aFenceClosedBeforeTheWalkBuildsNothingAndCountsNotReached() {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        CompoundTransactionBuilder builder = org.mockito.Mockito.spy(realBuilder(candidates));
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(candidates, builder, bytes -> {
+            submits.incrementAndGet();
+            return Result.<String>success("ok").withValue("deadbeef");
+        });
+        WorkResult[] result = new WorkResult[1];
+
+        List<Line> lines = linesOf(() -> result[0] = executor.cycle(() -> false));
+
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.never())
+                .buildWithFacts(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class));
+        assertEquals(0, submits.get());
+        assertEquals(WorkResult.DEFINITE_FAILURE, result[0]);
+        assertTrue(summaryOf(lines).text().endsWith(", not reached 2"), summaryOf(lines).text());
+    }
+
+    /** FAB-183: a fence that closes immediately before the wire transmits nothing and says FENCED. */
+    @Test
+    void aFenceClosedAtSubmitTransmitsNothingAndSaysFenced() {
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), bytes -> {
+            submits.incrementAndGet();
+            return Result.<String>success("ok").withValue("deadbeef");
+        });
+        WorkResult[] result = new WorkResult[1];
+
+        List<Line> lines = linesOf(() -> result[0] = executor.cycle(openFor(1)));
+
+        assertEquals(0, submits.get(), "a closed fence transmits nothing");
+        assertEquals(List.of(new Line(Level.INFO, "compound FENCED " + LOAN_ID + ": nothing transmitted")),
+                lines.stream().filter(line -> line.text().startsWith("compound FENCED")).toList());
+        assertEquals(WorkResult.DEFINITE_FAILURE, result[0]);
+        assertTrue(summaryOf(lines).text().endsWith(", not reached 1"), summaryOf(lines).text());
+    }
+
+    /** An armed executor over one ready candidate, syncing or not, behind a closed lending gate or none. */
+    private static CompoundExecutor gatedExecutor(boolean syncing, boolean gateClosed) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(syncing);
+        var executor = new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet())), ACCOUNT, new FakeScanner(List.of(ready(0L))),
+                new CompoundEconomics(configuration, network, pricingService()),
+                new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
+                        LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                bytes -> { throw new AssertionError("an early return must not submit"); });
+        if (gateClosed) {
+            var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
+            gate.block("ConfigDatum[11]: derived 63b26ff9…, chain 64d9b13f…");
+            executor.setLendingConfigGate(gate);
+        }
+        return executor;
+    }
+
+    /**
+     * FAB-183-4 audit residue: the returns before the walk are DEFINITE_FAILURE. The pipeline reads this
+     * value, so a terminal one from a syncing node, or from a closed lending gate, would end the pass.
+     */
+    @Test
+    void theSyncingAndLendingGateEarlyReturnsAreDefiniteFailures() {
+        assertEquals(WorkResult.DEFINITE_FAILURE, gatedExecutor(true, false).cycle(), "the syncing return");
+        assertEquals(WorkResult.DEFINITE_FAILURE, gatedExecutor(false, true).cycle(), "the lending-gate return");
+    }
+
+    /** The level of every line {@code response} makes {@code submit} say that starts with {@code prefix}. */
+    private static List<Level> submitLineLevels(Result<String> response, String prefix) {
+        CompoundExecutor executor = executor(List.of(ready(0L)), realBuilder(), bytes -> response);
+        return linesOf(executor::cycle).stream()
+                .filter(line -> line.text().startsWith(prefix))
+                .map(Line::level)
+                .toList();
+    }
+
+    /** FAB-183-4 audit residue: {@code submit}'s outcome-to-log mapping, one assertion per outcome. */
+    @Test
+    void eachSubmitOutcomeHasItsOwnLineAtItsOwnLevel() {
+        assertEquals(List.of(Level.WARN), submitLineLevels(blockfrostRejection(400, "opaque"),
+                "compound SUBMIT REJECTED " + LOAN_ID), "a decoded refusal");
+        assertEquals(List.of(Level.ERROR), submitLineLevels(Result.<String>error(
+                        blockfrostError(500, "Internal Server Error", "opaque")).code(500),
+                "compound SUBMIT AMBIGUOUS " + LOAN_ID), "an ambiguous answer");
+        assertEquals(List.of(Level.INFO), submitLineLevels(Result.<String>success("ok").withValue("deadbeef"),
+                "COMPOUNDED " + LOAN_ID), "a submission");
+        assertEquals(List.of(Level.INFO), submitLineLevels(
+                Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"),
+                "WOULD_SUBMIT " + LOAN_ID), "the WOULD_SUBMIT sentinel");
     }
 
     // ---- fakes -------------------------------------------------------------------------------

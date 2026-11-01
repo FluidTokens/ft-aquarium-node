@@ -29,6 +29,8 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
+import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
@@ -44,6 +46,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -714,22 +717,36 @@ public class LiquidationExecutor {
     }
 
     /**
-     * One cycle, at an explicit instant so it is testable without a clock. Package-private: the
-     * scheduler comes in through {@link #runCycle()}.
+     * One cycle, at an explicit instant so it is testable without a clock, behind a fence that never
+     * closes. Package-private: the scheduler comes in through {@link #runCycle()}.
      */
-    void cycle(long now) {
+    WorkResult cycle(long now) {
+        return cycle(now, SubmitFence.OPEN);
+    }
+
+    /**
+     * The liquidation stage (FAB-183, rulings of 2026-10-31): candidates walked most profitable first,
+     * at most ONE liquidation per market — SUBMITTED, or a shadow WOULD_SUBMIT — a definite failure
+     * moving on to the market's next candidate, and an AMBIGUOUS submit ending the call. {@code fence}
+     * is read before each candidate and immediately before signing; once it reads {@code false}
+     * nothing more is transmitted. It is not retained after the call, and nothing else is either.
+     *
+     * @return AMBIGUOUS if any submit was, else SUBMITTED if any went out, else WOULD_SUBMIT if a
+     *         shadow candidate would have, else DEFINITE_FAILURE — every early return included
+     */
+    WorkResult cycle(long now, SubmitFence fence) {
         if (configuration.getMode() == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
         // ⛔ Every mode, SHADOW included: a shadow build against a script the chain no longer names
         // reports figures for a transaction that cannot exist.
         if (refusedByLendingConfigGate("liquidation")) {
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         if (blockEventListener.getIsSyncing().get()) {
             log.info("node is syncing, skipping...");
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
         // A new cycle: the convert route takes at most ONE Minswap pool snapshot from here on, shared
         // by every candidate that reaches the pool step.
@@ -821,7 +838,7 @@ public class LiquidationExecutor {
                                 + "and must not be read as loans that are simply gone");
 
         if (buildable.isEmpty()) {
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         // The wallet gate sits HERE, below the scan, and that position is the point.
@@ -840,7 +857,7 @@ public class LiquidationExecutor {
             log.warn("{} buildable candidate(s) found but no ada-only wallet utxo is available, so "
                     + "none can be built; the scan above is still a complete record of what was seen "
                     + "and priced", buildable.size());
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
         // ⛔ F3/F7 (round 2) — THE FULL WALLET, NOT THE GATE'S OWN ADA-ONLY SUBSET.
         //
@@ -945,7 +962,7 @@ public class LiquidationExecutor {
         if (configUtxo.isEmpty() || lmConfigUtxo.isEmpty()) {
             log.warn("cannot build liquidations: config utxo present={}, lm config utxo present={}",
                     configUtxo.isPresent(), lmConfigUtxo.isPresent());
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         // FAB-144 — THE MOST PROFITABLE CANDIDATE FIRST. Only the ORDER changes: every buildable
@@ -964,11 +981,30 @@ public class LiquidationExecutor {
                         causeChain(e));
             }
         }
-        for (LiquidationAssessment assessment : ordered) {
+        // FAB-183 — ONE LIQUIDATION PER MARKET PER CALL. A market is the principal asset's unit; it is
+        // served by a SUBMITTED liquidation or by a shadow WOULD_SUBMIT, and every later candidate in it
+        // is skipped unbuilt. A definite failure leaves it open for the market's next candidate. Several
+        // markets per call are fine: they are funded from disjoint inputs, because walletUtxos above
+        // loses what each transmission spent. Held for this call only — nothing persists across calls.
+        Set<String> servedMarkets = new HashSet<>();
+        WorkResult result = WorkResult.DEFINITE_FAILURE;
+        for (int i = 0; i < ordered.size(); i++) {
+            LiquidationAssessment assessment = ordered.get(i);
+            if (!fence.mayProceed()) {
+                log.info("liquidation stage fenced: {} candidate(s) not reached", ordered.size() - i);
+                return result;
+            }
+            String market = marketOf(assessment);
+            if (market != null && servedMarkets.contains(market)) {
+                log.debug("market {} already has this pass's liquidation", market);
+                continue;
+            }
+            WorkResult outcome;
+            CandidatePass pass = new CandidatePass(fence);
             try {
-                consider(assessment, now, committedSlot, validFromFloorMillis, validToMillis, walletUtxos,
-                        params, configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit,
-                        effect -> dropFromCycle(walletUtxos, effect));
+                outcome = consider(assessment, now, committedSlot, validFromFloorMillis, validToMillis,
+                        walletUtxos, params, configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit,
+                        effect -> dropFromCycle(walletUtxos, effect), pass);
             } catch (Exception e) {
                 // consider() already turns every expected failure into a decision; this is the last
                 // net, so that one unexpected candidate does not cost the rest of the cycle.
@@ -978,7 +1014,56 @@ public class LiquidationExecutor {
                 // them — dereferencing assessment.loan() here would throw out of the handler that is
                 // meant to contain it. The bond is the one thing every assessment always carries.
                 log.error("could not consider bond {}: {}", assessment.bond().utxoRef(), causeChain(e), e);
+                // FAB-183 (A6): it ENDS the stage only if this candidate reached the submitter — then what
+                // escaped may have escaped after a transmission, and a body whose inputs may be spent
+                // cannot be told apart from one that never went out. Before that, nothing went out: a
+                // definite failure, and the walk moves on.
+                if (pass.submitInvoked) {
+                    return WorkResult.AMBIGUOUS;
+                }
+                continue;
             }
+            if (outcome == WorkResult.AMBIGUOUS) {
+                return WorkResult.AMBIGUOUS;
+            }
+            if (outcome == WorkResult.SUBMITTED || outcome == WorkResult.WOULD_SUBMIT) {
+                if (market != null) {
+                    servedMarkets.add(market);
+                }
+                if (result != WorkResult.SUBMITTED) {
+                    result = outcome;
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * The market a candidate belongs to — its principal asset's unit, {@code lovelace} for ada — or
+     * null when the assessment carries no readable principal, in which case {@code consider()} meets
+     * the same fault and the outer net reports it.
+     */
+    private static String marketOf(LiquidationAssessment assessment) {
+        try {
+            AssetType principal = assessment.loan().datum().principalAsset();
+            return principal == null ? null : principal.toUnit();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * One candidate's share of a {@link #cycle(long, SubmitFence)} call (FAB-183): the call's fence,
+     * read immediately before signing, and whether this candidate reached the submitter — which is what
+     * decides whether an exception escaping {@code consider()} may have escaped a transmission (A6).
+     * Created per candidate and dropped with it; nothing in it outlives the call.
+     */
+    private static final class CandidatePass {
+        private final SubmitFence fence;
+        private boolean submitInvoked;
+
+        private CandidatePass(SubmitFence fence) {
+            this.fence = fence;
         }
     }
 
@@ -1081,12 +1166,18 @@ public class LiquidationExecutor {
 
     // ---- one candidate ------------------------------------------------------------------------
 
-    private void consider(LiquidationAssessment assessment, long now,
-                          long committedSlot, long validFromFloorMillis, long validToMillis,
-                          List<Utxo> walletUtxos,
-                          Optional<ProtocolParams> params, Utxo configUtxo, Utxo lmConfigUtxo,
-                          Map<String, OracleEntry> oraclesByUnit,
-                          Consumer<WalletEffect> walletEffects) {
+    /**
+     * One candidate, to its decision. DEFINITE_FAILURE on every path except these: SUBMITTED when it
+     * was submitted, WOULD_SUBMIT when only the node's or the market's mode withheld a candidate worth
+     * doing (S1/S2), and AMBIGUOUS when the submission threw or answered with anything but a decoded
+     * provider refusal.
+     */
+    private WorkResult consider(LiquidationAssessment assessment, long now,
+                                long committedSlot, long validFromFloorMillis, long validToMillis,
+                                List<Utxo> walletUtxos,
+                                Optional<ProtocolParams> params, Utxo configUtxo, Utxo lmConfigUtxo,
+                                Map<String, OracleEntry> oraclesByUnit,
+                                Consumer<WalletEffect> walletEffects, CandidatePass pass) {
         // Derived here rather than passed alongside, so the two can never disagree about which
         // parameters they came from.
         Optional<BigInteger> feeCeiling = params.map(LedgerCeilings::maxPossibleFee);
@@ -1115,7 +1206,7 @@ public class LiquidationExecutor {
                     LiquidationDecision.Outcome.NO_UTXO.name(),
                     "loan utxo present=%s, bond utxo present=%s — spent since the scan"
                             .formatted(loanUtxo.isPresent(), bondUtxo.isPresent())));
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
 
         // ⛔ FAB-183 (A4) — REFUSALS DECIDED BEFORE THE BUILD. A build costs an oracle probe and a script
@@ -1135,7 +1226,7 @@ public class LiquidationExecutor {
             decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                     "MARKET_DISABLED", detail));
             log.info("the liquidation of {} was refused: {}", loanUtxoRef, detail);
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
         // (2) Certainly unprofitable, plain route only, and only where S3 would certainly be reached and
         // certainly refuse: node AND market LIVE (S1/S2 pass), ignore-profit-check off. SHADOW keeps
@@ -1149,7 +1240,7 @@ public class LiquidationExecutor {
                 decisionLog.record(unprofitable);
                 log.info("the liquidation of {} was refused as UNPROFITABLE: {}", loanUtxoRef,
                         unprofitable.detail());
-                return;
+                return WorkResult.DEFINITE_FAILURE;
             }
         }
 
@@ -1194,7 +1285,7 @@ public class LiquidationExecutor {
             decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                     "ORACLE_FEED_NOT_YET_VALID", detail));
             log.info("the liquidation of {} waits for the chain: {}", loanUtxoRef, detail);
-            return;
+            return WorkResult.DEFINITE_FAILURE;
         }
         LiquidationStartClamp.Start clamped = (LiquidationStartClamp.Start) start;
         validFromMillis = clamped.startMillis();
@@ -1234,7 +1325,7 @@ public class LiquidationExecutor {
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             "CONVERT_UNAVAILABLE", why));
                     log.warn("the liquidation of {} was refused: {}", loanUtxoRef, why);
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 }
                 log.info("{} is a CONVERT liquidation (LiquidateAndConvert): the bot creates a Minswap "
                                 + "order, fronts nothing, and keeps the liquidation fee in collateral",
@@ -1270,13 +1361,13 @@ public class LiquidationExecutor {
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             "NO_MINSWAP_POOL", e.getMessage()));
                     log.info("the convert liquidation of {} was refused: {}", loanUtxoRef, e.getMessage());
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 } catch (ConvertLiquidationRouter.UnprofitableException e) {
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.UNPROFITABLE,
                             String.valueOf(e.assessment().exclusion()), e.getMessage()));
                     log.info("the convert liquidation of {} is not worth doing: {}", loanUtxoRef,
                             e.getMessage());
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 } catch (ConvertOrderPlan.RefusedException e) {
                     // ⛔ A VERDICT ABOUT THE CANDIDATE, NOT A FAULT — so it is recorded at INFO.
                     //
@@ -1294,7 +1385,7 @@ public class LiquidationExecutor {
                             e.refusal().name(), e.getMessage()));
                     log.info("the convert liquidation of {} was refused as {}: {}",
                             loanUtxoRef, e.refusal(), e.getMessage());
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 } catch (MinswapPoolResolver.RefusedException e) {
                     // ⛔ THE POOL LOOKUP REFUSED — and WHICH refusal decides whether this is a verdict
                     // or a failure to read the local pool index. They are not the same fact and must not
@@ -1316,7 +1407,7 @@ public class LiquidationExecutor {
                                         + "candidate itself was never assessed; retried next cycle",
                                 loanUtxoRef, causeChain(e), e);
                         walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
-                        return;
+                        return WorkResult.DEFINITE_FAILURE;
                     }
                     // ⛔ AMBIGUOUS_POOL: two AUTHENTIC pools for one pair in the local index. Minswap
                     // cannot produce that on chain, so it is an index-integrity fault, not a verdict
@@ -1326,7 +1417,7 @@ public class LiquidationExecutor {
                             e.refusal().name(), e.getMessage()));
                     log.error("the convert liquidation of {} was refused as {}: {}",
                             loanUtxoRef, e.refusal(), e.getMessage());
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 } catch (ConvertLiquidationRouter.WalletInputTooSmallException e) {
                     // A fact about the WALLET, not the candidate — an eligibility filter, reconsidered
                     // every cycle, and cured by a top-up. Same treatment the pay-in-advance path gives
@@ -1335,7 +1426,7 @@ public class LiquidationExecutor {
                             "WALLET_INPUT_TOO_SMALL", e.getMessage()));
                     log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef,
                             e.getMessage());
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 } catch (ConvertLiquidationRouter.FeedWindowException e) {
                     // FAB-183 — a feed whose window does not cover the body's is per-block feed timing,
                     // not a machinery fault: nothing was built and no wallet utxo was spent, so nothing
@@ -1344,13 +1435,13 @@ public class LiquidationExecutor {
                             "CONVERT_FEED_WINDOW", e.getMessage()));
                     log.info("the convert liquidation of {} was refused as CONVERT_FEED_WINDOW: {}",
                             loanUtxoRef, e.getMessage());
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 } catch (Exception e) {
                     // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
                     OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
                     if (wait != null) {
                         refuseNotYetVisible(assessment, now, wait);
-                        return;
+                        return WorkResult.DEFINITE_FAILURE;
                     }
                     // ⚠ WHAT IS LEFT HERE IS A GENUINE MACHINERY FAULT, and that is the point of the
                     // four catches above: this branch used to swallow every verdict on the convert
@@ -1361,7 +1452,7 @@ public class LiquidationExecutor {
                     log.error("building the convert liquidation of {} failed: {}", loanUtxoRef,
                             causeChain(e), e);
                     walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 }
                 // Falls through to the shared record-and-maybe-submit path below, deliberately: the
                 // seven submit vetoes, the shadow dump and the decision record are the SAME for every
@@ -1431,7 +1522,7 @@ public class LiquidationExecutor {
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         "WALLET_INPUT_TOO_SMALL", convertDetail));
                 log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, convertDetail);
-                return;
+                return WorkResult.DEFINITE_FAILURE;
             } catch (PayInAdvanceLiquidationRouter.MarketGateRefusedException e) {
                 // A POLICY refusal, not a capability gap: this market is disabled, or the principal
                 // the candidate would have us front exceeds the operator's stated cap. Recorded the
@@ -1455,7 +1546,7 @@ public class LiquidationExecutor {
                         e.getMessage(), detail));
                 log.info("the convert liquidation of {} was refused by the market gate: {}",
                         loanUtxoRef, detail);
-                return;
+                return WorkResult.DEFINITE_FAILURE;
             } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
                 // All seven construction sites describe a candidate or oracle state this route cannot
                 // build this cycle: PayInAdvanceLiquidationRouter:164 is negative equity (unreachable
@@ -1481,13 +1572,13 @@ public class LiquidationExecutor {
                         loanUtxoRef, principalUnit, e.getMessage());
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         e.getMessage(), e.getMessage()));
-                return;
+                return WorkResult.DEFINITE_FAILURE;
             } catch (Exception e) {
                 // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
                 OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
                 if (wait != null) {
                     refuseNotYetVisible(assessment, now, wait);
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 }
                 // A genuine builder failure, treated exactly as the plain path's machinery-failure
                 // branch: rebuilt next cycle and logged at ERROR on every cycle (FAB-134 NQ — a
@@ -1503,7 +1594,7 @@ public class LiquidationExecutor {
                 log.error("building the pay-in-advance liquidation of {} failed: {}",
                         loanUtxoRef, causeChain(e), e);
                 walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
-                return;
+                return WorkResult.DEFINITE_FAILURE;
             }
             }
         } else {
@@ -1526,7 +1617,7 @@ public class LiquidationExecutor {
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         "WALLET_INPUT_TOO_SMALL", detail));
                 log.warn("the liquidation of {} was refused: {}", loanUtxoRef, detail);
-                return;
+                return WorkResult.DEFINITE_FAILURE;
             }
             Utxo walletUtxo = plainWalletUtxo.get();
 
@@ -1568,7 +1659,7 @@ public class LiquidationExecutor {
                     // SCRIPT_COST_EVALUATION_FAILED is where Blockfrost's empty-failures evaluation
                     // surfaces on this route — the shape a spent input takes (CCL trap 13).
                     walletEffects.accept(spentInputEffect(nominated[0], causeChain(e.getCause())));
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 } else {
                     // Task 7 (ADDENDA). The remedy is a LEVEL, not a flood: the forty-eight causeless
                     // refusals are a verdict on the candidate, not a fault, so ERROR would bury the two
@@ -1577,13 +1668,13 @@ public class LiquidationExecutor {
                     log.info("the liquidation of {} was refused as {}: {}",
                             loanUtxoRef, e.getReason(), refusalDetail(e));
                 }
-                return;
+                return WorkResult.DEFINITE_FAILURE;
             } catch (Exception e) {
                 // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
                 OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
                 if (wait != null) {
                     refuseNotYetVisible(assessment, now, wait);
-                    return;
+                    return WorkResult.DEFINITE_FAILURE;
                 }
                 // Anything else is a failure of the machinery rather than a verdict on the candidate —
                 // a Blockfrost timeout fetching protocol params, say. Rebuilt next cycle and logged at
@@ -1594,25 +1685,36 @@ public class LiquidationExecutor {
                         rootReason(e), causeChain(e)));
                 log.error("building the liquidation of {} failed: {}", loanUtxoRef, causeChain(e), e);
                 walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
-                return;
+                return WorkResult.DEFINITE_FAILURE;
             }
         }
 
-        Optional<Verdict> verdict = record(assessment, now, transaction, oraclesByUnit);
+        Optional<Verdict> verdict = record(assessment, now, transaction, oraclesByUnit, pass);
         if (verdict.isEmpty()) {
-            return;
+            // Nothing priced to completion — or an unmeasurable body, whose WOULD_SUBMIT row carries the
+            // TX_TOO_LARGE veto and is not an intent to liquidate.
+            return WorkResult.DEFINITE_FAILURE;
         }
         if (verdict.get().transmitted()) {
-            // SUBMITTED, or the submission threw after the bytes may have gone out: either way every
-            // input of this body may already be spent, and the index cannot know it yet.
+            // SUBMITTED, or a submission whose outcome is AMBIGUOUS — it threw, or the backend's answer
+            // was not a decoded refusal — after the bytes may have gone out: either way every input of
+            // this body may already be spent, and the index cannot know it yet.
             Set<String> inputs = new LinkedHashSet<>();
             transaction.getBody().getInputs()
                     .forEach(in -> inputs.add(in.getTransactionId() + "#" + in.getIndex()));
             walletEffects.accept(new WalletEffect(inputs,
                     "an input of transmitted liquidation " + TransactionUtil.getTxHash(transaction), false));
-            return;
+            return verdict.get().outcome() == LiquidationDecision.Outcome.SUBMITTED
+                    ? WorkResult.SUBMITTED : WorkResult.AMBIGUOUS;
         }
         walletEffects.accept(spentInputEffect(nominated[0], verdict.get().rejection()));
+        // S1/S2 withheld a candidate worth doing: the shadow intent that serves its market this call.
+        if (verdict.get().outcome() == LiquidationDecision.Outcome.WOULD_SUBMIT
+                && (verdict.get().veto() == SubmitVeto.MODE_NOT_LIVE
+                    || verdict.get().veto() == SubmitVeto.MARKET_NOT_LIVE)) {
+            return WorkResult.WOULD_SUBMIT;
+        }
+        return WorkResult.DEFINITE_FAILURE;
     }
 
     /**
@@ -1818,7 +1920,7 @@ public class LiquidationExecutor {
      * may later restrict the floor to realisable ADA, which is not decided here.
      */
     private Optional<Verdict> record(LiquidationAssessment assessment, long now, Transaction transaction,
-                        Map<String, OracleEntry> oraclesByUnit) {
+                        Map<String, OracleEntry> oraclesByUnit, CandidatePass pass) {
         OraclePriceFeed collateralFeed = collateralFeed(assessment, oraclesByUnit);
         BigInteger expectedFee = LoanFinance
                 .toLovelace(Rational.fromInt(assessment.liquidationFee()), collateralFeed)
@@ -1955,7 +2057,7 @@ public class LiquidationExecutor {
         }
 
         Verdict verdict = verdict(assessment, now, transaction, oraclesByUnit, floorProfit,
-                expectedProfit, size, detail);
+                expectedProfit, size, detail, pass);
 
         decisionLog.record(new LiquidationDecision(
                 now,
@@ -2007,8 +2109,9 @@ public class LiquidationExecutor {
      * What this candidate's row says, and which veto — if any — produced it.
      *
      * @param transmitted whether the signed bytes may have reached the network: true on SUBMITTED and
-     *                    on a submission that threw, false on everything else, a definite rejection
-     *                    included. It is what tells the cycle the body's inputs may already be spent
+     *                    on an AMBIGUOUS submission (it threw, or its answer was not a decoded provider
+     *                    refusal), false on everything else, a definite rejection included. It is what
+     *                    tells the cycle the body's inputs may already be spent
      * @param rejection   the backend's response to a definite rejection, scanned for a spent-input
      *                    marker; null otherwise
      */
@@ -2033,7 +2136,7 @@ public class LiquidationExecutor {
      */
     private Verdict verdict(LiquidationAssessment assessment, long now, Transaction transaction,
                             Map<String, OracleEntry> oraclesByUnit, BigInteger floorProfit,
-                            BigInteger expectedProfit, int size, String detail) {
+                            BigInteger expectedProfit, int size, String detail, CandidatePass pass) {
         // What the row says on an unarmed node: WOULD_SUBMIT only if it would actually clear S3 (the
         // profitability gate, twice renumbered: it was S5 before the network veto and the
         // separate arming flag were removed) on an
@@ -2176,7 +2279,7 @@ public class LiquidationExecutor {
                     SubmitVeto.TRANSACTION_WINDOW_ELAPSED, detail + "; " + elapsed);
         }
 
-        return submit(assessment, now, transaction, detail);
+        return submit(assessment, now, transaction, detail, pass);
     }
 
     /**
@@ -2306,10 +2409,22 @@ public class LiquidationExecutor {
      * resubmission fails in phase 1 — free — and is logged at ERROR like any other failure. Every
      * failure here, a definite rejection included, is logged at ERROR — except an
      * {@code OutsideValidityInterval} rejection (FAB-183 A2), which is expected, counted and logged at INFO.
+     * <p>
+     * FAB-183: a closed {@code fence} signs and transmits nothing. A non-success answer is classified by
+     * {@link WorkResult#classify}: only Blockfrost's decoded refusal envelope is a DEFINITE rejection.
+     * Anything else may have been transmitted, so it is AMBIGUOUS — its row says so, its inputs are
+     * treated as spent, and the stage stops.
      */
     private Verdict submit(LiquidationAssessment assessment, long now, Transaction transaction,
-                           String detail) {
+                           String detail, CandidatePass pass) {
         String loanUtxoRef = assessment.loan().utxoRef();
+
+        // ⛔ THE LAST LOOK BEFORE THE WIRE. Not one of the seven vetoes — they ask whether this candidate
+        // may be submitted; this asks whether the pass still may — so it names no veto.
+        if (!pass.fence.mayProceed()) {
+            return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, null, detail
+                    + "; fenced: the chain rolled back or the pass deadline passed — nothing was transmitted");
+        }
 
         byte[] signed;
         try {
@@ -2324,6 +2439,8 @@ public class LiquidationExecutor {
         }
 
         try {
+            // FAB-183 (A6): from here on, anything escaping this candidate may have escaped a transmission.
+            pass.submitInvoked = true;
             Result<String> result = submitter.submit(signed);
             if (result != null && result.isSuccessful()) {
                 log.info("SUBMITTED liquidation of {}: tx {}", loanUtxoRef, result.getValue());
@@ -2331,6 +2448,19 @@ public class LiquidationExecutor {
                         detail + "; submitted as " + result.getValue(), true, null);
             }
             String response = result == null ? "no response" : result.getResponse();
+            if (WorkResult.classify(result) == WorkResult.AMBIGUOUS) {
+                // FAB-183: not Blockfrost's decoded refusal envelope — a raw body, another status, or
+                // nothing at all — so nothing shows the bytes were refused, and they may have gone out.
+                // ONE line, and not the rejection lines below: those, and the OutsideValidityInterval
+                // count, belong to a DECODED refusal, which is what Blockfrost returns for a ledger
+                // rejection. The row says so, the body's inputs are treated as spent, the stage stops.
+                String answer = "HTTP " + (result == null ? "none" : result.code()) + ": " + response;
+                log.error("the outcome of submitting the liquidation of {} is AMBIGUOUS: {} — the stage stops",
+                        loanUtxoRef, answer);
+                return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
+                        "ambiguous: " + detail + "; the backend answered " + answer
+                                + ", not a decoded refusal, so it may have been transmitted", true, null);
+            }
             if (response != null && response.replaceAll("\\s", "").contains(OUTSIDE_VALIDITY_INTERVAL_MARKER)) {
                 // FAB-183 (A2): EXPECTED, not a fault. The start clamp opens a transaction at a fresh feed's
                 // validFrom, and the validating node may not have reached that slot yet. Counted, INFO, and

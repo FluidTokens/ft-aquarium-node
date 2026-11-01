@@ -15,6 +15,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundExclusion;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 import lombok.extern.slf4j.Slf4j;
@@ -236,11 +237,19 @@ public class CompoundExecutor {
         }
     }
 
+    /** One walk behind a fence that never closes. */
+    WorkResult cycle() {
+        return cycle(SubmitFence.OPEN);
+    }
+
     /**
      * One walk. Returns the terminal outcome that ended it, or {@link WorkResult#DEFINITE_FAILURE} when
-     * nothing terminal happened — including every return before the walk.
+     * nothing terminal happened — including every return before the walk. {@code fence} is read before
+     * each ready candidate and immediately before transmitting; once it reads {@code false} nothing more
+     * is transmitted, the walk ends, and the summary counts the rest as {@code not reached}. It is not
+     * retained after the call.
      */
-    WorkResult cycle() {
+    WorkResult cycle(SubmitFence fence) {
         if (refusedByLendingConfigGate("compound")) {
             return WorkResult.DEFINITE_FAILURE;
         }
@@ -298,8 +307,14 @@ public class CompoundExecutor {
                         candidate.escrowRef(), candidate.exclusion(), candidate.detail());
                 continue;
             }
+            if (!fence.mayProceed()) {
+                // FAB-183: the chain rolled back or the pass deadline passed. Nothing more goes out.
+                tally.notReached = tally.ready - readyWalked;
+                logSummary(tally);
+                return WorkResult.DEFINITE_FAILURE;
+            }
             readyWalked++;
-            WorkResult outcome = consider(candidate, tally);
+            WorkResult outcome = consider(candidate, tally, fence);
             if (outcome.terminal()) {
                 tally.notReached = tally.ready - readyWalked;
                 logSummary(tally);
@@ -409,7 +424,7 @@ public class CompoundExecutor {
         return ordered;
     }
 
-    private WorkResult consider(CompoundCandidate candidate, CycleTally tally) {
+    private WorkResult consider(CompoundCandidate candidate, CycleTally tally, SubmitFence fence) {
         if (!configuration.isEnabled()) {
             // Not a fault. Said at DEBUG per escrow (FAB-180); the cycle summary's `not armed` count is
             // what answers an operator asking why a ready candidate went unprocessed.
@@ -518,12 +533,12 @@ public class CompoundExecutor {
             return WorkResult.DEFINITE_FAILURE;
         }
 
-        return submit(candidate, built, assessment, quote, tally);
+        return submit(candidate, built, assessment, quote, tally, fence);
     }
 
     private WorkResult submit(CompoundCandidate candidate, CompoundTransactionBuilder.Built built,
                               CompoundAssessment assessment, PricingService.Priced quote,
-                              CycleTally tally) {
+                              CycleTally tally, SubmitFence fence) {
         // ⛔ THE NETWORK GATE IS GONE — `loans.submittable-network` was removed on 2026-09-04
         // (Giovanni: "a barrier that silently blocks submission even when everything else is armed
         // is a bug, not a safeguard"). `config.network` alone decides where this node acts, and it
@@ -583,6 +598,12 @@ public class CompoundExecutor {
             return WorkResult.DEFINITE_FAILURE;
         }
 
+        // ⛔ THE LAST LOOK BEFORE THE WIRE. A definite failure, not a terminal outcome: nothing went out,
+        // and the walk's own fence check stops it before the next candidate.
+        if (!fence.mayProceed()) {
+            log.info("compound FENCED {}: nothing transmitted", candidate.loanId());
+            return WorkResult.DEFINITE_FAILURE;
+        }
         try {
             Result<String> result = submitter.submit(signed);
             WorkResult outcome = WorkResult.classify(result);
