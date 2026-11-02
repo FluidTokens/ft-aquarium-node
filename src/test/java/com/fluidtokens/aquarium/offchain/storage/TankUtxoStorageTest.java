@@ -1,9 +1,13 @@
 package com.fluidtokens.aquarium.offchain.storage;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.bloxbean.cardano.yaci.store.common.domain.AddressUtxo;
+import com.bloxbean.cardano.yaci.store.common.domain.Amt;
 import com.bloxbean.cardano.yaci.store.common.domain.TxInput;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.UtxoCache;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.AddressUtxoEntity;
@@ -21,11 +25,13 @@ import org.jooq.SQLDialect;
 import org.jooq.impl.DSL;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -89,6 +95,11 @@ class TankUtxoStorageTest {
 
     private TankUtxoStorage storage(UtxoCache cache, String minswapPoolSpendScriptHash,
                                     ObjectProvider<LoansContractRegistry> loans) {
+        return storage(cache, minswapPoolSpendScriptHash, loans, "");
+    }
+
+    private TankUtxoStorage storage(UtxoCache cache, String minswapPoolSpendScriptHash,
+                                    ObjectProvider<LoansContractRegistry> loans, String oracleNftPolicies) {
         var utxoRepository = mock(UtxoRepository.class);
         when(utxoRepository.findById(any())).thenAnswer(inv -> {
             UtxoId id = inv.getArgument(0);
@@ -104,7 +115,7 @@ class TankUtxoStorageTest {
         var tank = mock(TankContractService.class);
         when(tank.getScriptHashHex()).thenReturn("a3".repeat(28));
         return new TankUtxoStorage(utxoRepository, mock(TxInputRepository.class), dsl, cache, null,
-                account, parameters, staker, tank, loans, minswapPoolSpendScriptHash);
+                account, parameters, staker, tank, loans, minswapPoolSpendScriptHash, oracleNftPolicies);
     }
 
     private TankUtxoStorage storage() {
@@ -169,6 +180,11 @@ class TankUtxoStorageTest {
     }
 
     private static AddressUtxo output(String txHash, int index, String ownerPkh, String stakePkh, long slot) {
+        return output(txHash, index, ownerPkh, stakePkh, slot, new ArrayList<>());
+    }
+
+    private static AddressUtxo output(String txHash, int index, String ownerPkh, String stakePkh, long slot,
+                                      List<Amt> amounts) {
         return AddressUtxo.builder()
                 .txHash(txHash)
                 .outputIndex(index)
@@ -179,7 +195,7 @@ class TankUtxoStorageTest {
                 .ownerPaymentCredential(ownerPkh)
                 .ownerStakeCredential(stakePkh)
                 .lovelaceAmount(BigInteger.valueOf(2_000_000L))
-                .amounts(new ArrayList<>())
+                .amounts(amounts)
                 .build();
     }
 
@@ -455,5 +471,217 @@ class TankUtxoStorageTest {
         assertTrue(spentRow(created, 0), "spent in the block that created it: it needs a tx_input row");
         assertTrue(unspentFor(POOL_PKH).isEmpty(), "the created-and-spent pool output must not read unspent");
         assertEquals(List.of(walletTx + "#0"), unspentFor(walletPkh));
+    }
+
+    // ---- FAB-196-1: outputs holding a configured oracle NFT policy, at any address ---------------------
+
+    /** The mainnet base document's value: the Lending v4 ({@code oracleVersion} 2) feed policy. */
+    private static final String V2_FEED_POLICY = "26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26";
+    /** Mainnet v1 feed policies: deliberately NOT configured. */
+    private static final String V1_FEED_POLICY = "93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b";
+    private static final String V1_OADA_POLICY = "5b155d1986c8ff976406479d4d455e8115d4f2c4cbf2e84c426df0cf";
+    private static final String KEY = "loans.oracle.indexed-nft-policies";
+
+    private TankUtxoStorage oracleStorage(String oracleNftPolicies) {
+        return storage(new UtxoCache(), POOL_PKH, emptyLoans(), oracleNftPolicies);
+    }
+
+    private static Amt lovelace() {
+        return Amt.builder().unit("lovelace").quantity(BigInteger.valueOf(2_000_000L)).build();
+    }
+
+    /** As Yaci 0.1.7 builds it: {@code unit} = policy id + hex asset name, {@code policyId} set from the chain. */
+    private static Amt token(String policyId, String hexAssetName) {
+        return Amt.builder()
+                .unit(policyId + hexAssetName)
+                .policyId(policyId)
+                .assetName(new String(HexUtil.decodeHexString(hexAssetName), java.nio.charset.StandardCharsets.UTF_8))
+                .quantity(BigInteger.ONE)
+                .build();
+    }
+
+    private static AddressUtxo foreignHolding(String txHash, long slot, Amt... amounts) {
+        return output(txHash, 0, FOREIGN_PKH, STAKE_1, slot, new ArrayList<>(List.of(amounts)));
+    }
+
+    /** (a) A FOREIGN-credential output holding a token of the configured v2 feed policy is stored. */
+    @Test
+    void aForeignOutputHoldingAConfiguredOracleNftIsStored() {
+        var storage = oracleStorage(V2_FEED_POLICY);
+        assertFalse(storage.indexedPaymentCredentials().contains(FOREIGN_PKH), "fixture: the credential is foreign");
+        String feed = tx(501);
+
+        block(storage, List.of(), List.of(foreignHolding(feed, SLOT, lovelace(), token(V2_FEED_POLICY, "4f52434c"))));
+
+        assertTrue(indexed(feed, 0), "an output holding a configured oracle NFT is kept at any address");
+        assertEquals(List.of(feed + "#0"), unspentFor(FOREIGN_PKH));
+    }
+
+    /** (b) A foreign ada-only output, and one holding a token of an UNconfigured policy, are not stored. */
+    @Test
+    void aForeignOutputHoldingNoConfiguredOracleNftIsNotStored() {
+        var storage = oracleStorage(V2_FEED_POLICY);
+        String adaOnly = tx(511), otherToken = tx(512);
+
+        block(storage, List.of(), List.of(
+                foreignHolding(adaOnly, SLOT, lovelace()),
+                foreignHolding(otherToken, SLOT, lovelace(), token("ab".repeat(28), "4f52434c"))));
+
+        assertFalse(indexed(adaOnly, 0), "a foreign ada-only output is not ours");
+        assertFalse(indexed(otherToken, 0), "a foreign output holding another policy's token is not ours");
+    }
+
+    /** (c) The v1 oracle feed policies are deliberately absent from the mainnet value: their outputs are not kept. */
+    @Test
+    void foreignOutputsHoldingAV1OracleTokenAreNotStored() {
+        var storage = oracleStorage(V2_FEED_POLICY);
+        String fldt = tx(521), oada = tx(522);
+
+        block(storage, List.of(), List.of(
+                foreignHolding(fldt, SLOT, lovelace(), token(V1_FEED_POLICY, "6f7261636c65464c44544333")),
+                foreignHolding(oada, SLOT, lovelace(), token(V1_OADA_POLICY, "6f7261636c654f414441"))));
+
+        assertFalse(indexed(fldt, 0), "a v1 feed (93794f9b…) is not a configured oracle NFT policy");
+        assertFalse(indexed(oada, 0), "a v1 feed (5b155d19…) is not a configured oracle NFT policy");
+    }
+
+    /** (d) The credential clause is untouched: a watched credential with no token is still stored. */
+    @Test
+    void aWatchedOutputWithNoTokenIsStillStored() {
+        var storage = oracleStorage(V2_FEED_POLICY);
+        String wallet = tx(531);
+
+        block(storage, List.of(), List.of(output(wallet, 0, walletPkh, null, SLOT, new ArrayList<>(List.of(lovelace())))));
+
+        assertTrue(indexed(wallet, 0));
+        assertEquals(List.of(wallet + "#0"), unspentFor(walletPkh));
+    }
+
+    /** (e) A policy-kept foreign output created AND spent in one block carries its spend (the pendingSpends path). */
+    @Test
+    void aPolicyKeptOutputCreatedAndSpentInTheSameBlockIsRecordedSpent() {
+        var storage = oracleStorage(V2_FEED_POLICY);
+        String created = tx(541), next = tx(542);
+
+        block(storage,
+                List.of(spend(created, 0, next, SLOT)),
+                List.of(foreignHolding(created, SLOT, lovelace(), token(V2_FEED_POLICY, "4f52434c")),
+                        foreignHolding(next, SLOT, lovelace(), token(V2_FEED_POLICY, "4f52434c"))));
+
+        assertTrue(indexed(created, 0), "the policy-kept output's row is kept");
+        assertTrue(spentRow(created, 0), "spent in the block that created it: it needs a tx_input row");
+        assertEquals(List.of(next + "#0"), unspentFor(FOREIGN_PKH));
+    }
+
+    /** (f) A policy-kept foreign output spent in a LATER block carries its spend (the findById path). */
+    @Test
+    void aPolicyKeptOutputSpentInALaterBlockIsRecordedSpent() {
+        var storage = oracleStorage(V2_FEED_POLICY);
+        String created = tx(551), spender = tx(552);
+        block(storage, List.of(), List.of(foreignHolding(created, SLOT, lovelace(), token(V2_FEED_POLICY, "4f52434c"))));
+
+        block(storage, List.of(spend(created, 0, spender, SLOT + 1)), List.of());
+
+        assertTrue(spentRow(created, 0), "a later spend of a policy-kept output needs a tx_input row");
+        assertTrue(unspentFor(FOREIGN_PKH).isEmpty());
+    }
+
+    /** (g) An uppercase configured policy matches Yaci's lowercase policy id and is reported lowercase. */
+    @Test
+    void anUppercaseConfiguredPolicyIsMatchedAndReportedLowercase() {
+        var storage = oracleStorage(V2_FEED_POLICY.toUpperCase(Locale.ROOT));
+        assertEquals(Set.of(V2_FEED_POLICY), storage.indexedOracleNftPolicies());
+        String feed = tx(561);
+
+        block(storage, List.of(), List.of(foreignHolding(feed, SLOT, lovelace(), token(V2_FEED_POLICY, "4f52434c"))));
+
+        assertTrue(indexed(feed, 0));
+    }
+
+    /** (h) A lovelace {@code Amt} carries no policy id; it, and a null amounts list, must not throw. */
+    @Test
+    void aLovelaceAmountWithANullPolicyIdDoesNotThrow() {
+        var storage = oracleStorage(V2_FEED_POLICY);
+        String adaOnly = tx(571), adaThenToken = tx(572), noAmounts = tx(573);
+        assertEquals(null, lovelace().getPolicyId(), "fixture: lovelace carries no policy id");
+
+        block(storage, List.of(), List.of(
+                foreignHolding(adaOnly, SLOT, lovelace()),
+                foreignHolding(adaThenToken, SLOT, lovelace(), token(V2_FEED_POLICY, "4f52434c")),
+                output(noAmounts, 0, FOREIGN_PKH, STAKE_1, SLOT, null)));
+
+        assertFalse(indexed(adaOnly, 0));
+        assertTrue(indexed(adaThenToken, 0), "a lovelace amount before the token must not stop the scan");
+        assertFalse(indexed(noAmounts, 0));
+    }
+
+    /** (i) Blank keeps no policy: nothing foreign is kept, and the credential set is unchanged. */
+    @Test
+    void aBlankValueKeepsNoPolicy() {
+        for (String blank : java.util.Arrays.asList("", "  ", null)) {
+            var storage = oracleStorage(blank);
+            assertTrue(storage.indexedOracleNftPolicies().isEmpty(), "blank value [" + blank + "]");
+            String feed = tx(blank == null ? 581 : 581 + blank.length() + 1);
+
+            block(storage, List.of(), List.of(foreignHolding(feed, SLOT, lovelace(), token(V2_FEED_POLICY, "4f52434c"))));
+
+            assertFalse(indexed(feed, 0), "blank value [" + blank + "] must keep nothing foreign");
+        }
+        // Each construction draws a fresh wallet, so the expected set is read after it.
+        for (String policies : List.of("", V2_FEED_POLICY)) {
+            var storage = oracleStorage(policies);
+            Set<String> expected = new java.util.HashSet<>(baseSet());
+            expected.add(POOL_PKH);
+            assertEquals(expected, storage.indexedPaymentCredentials(),
+                    "the policy list never changes the credential set [" + policies + "]");
+        }
+    }
+
+    /** (j) Present but malformed is a typo, not an absence: construction fails, naming the key and the value. */
+    @Test
+    void aMalformedValueFailsConstructionNamingTheKey() {
+        for (String malformed : List.of(
+                V2_FEED_POLICY.substring(1),                              // 55 hex
+                "zz" + V2_FEED_POLICY.substring(2),                       // 56 characters, not hex
+                V2_FEED_POLICY + ",",                                     // a trailing empty element
+                V2_FEED_POLICY + ",," + V1_FEED_POLICY)) {                // an empty element in the middle
+            var e = assertThrows(IllegalStateException.class, () -> oracleStorage(malformed),
+                    "a malformed value must not start: " + malformed);
+            assertTrue(e.getMessage().contains(KEY), "the failure must name the key: " + e.getMessage());
+            assertTrue(e.getMessage().contains(malformed), "the failure must name the value: " + e.getMessage());
+        }
+    }
+
+    /** (k) The returned set cannot be changed from outside. */
+    @Test
+    void theReturnedPolicySetIsImmutable() {
+        var policies = oracleStorage(V2_FEED_POLICY + " , " + V1_FEED_POLICY).indexedOracleNftPolicies();
+        assertEquals(Set.of(V2_FEED_POLICY, V1_FEED_POLICY), policies, "elements are stripped");
+        assertThrows(UnsupportedOperationException.class, () -> policies.add("cd".repeat(28)));
+        assertThrows(UnsupportedOperationException.class, () -> policies.remove(V2_FEED_POLICY));
+    }
+
+    /** (l) Both boot lines: the credential line, then the policy line — non-blank and blank. */
+    @Test
+    void theBootLinesSayWhatIsIndexed() {
+        Logger logger = (Logger) LoggerFactory.getLogger(TankUtxoStorage.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            oracleStorage(V2_FEED_POLICY);
+            oracleStorage("");
+        } finally {
+            logger.detachAppender(appender);
+        }
+        List<String> lines = appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+
+        assertEquals(4, lines.size(), "two lines per construction: " + lines);
+        assertTrue(lines.get(0).startsWith("Indexing UTxOs for 5 payment credentials: "), lines.get(0));
+        assertEquals("Indexing outputs that hold a token of 1 oracle NFT policies, at any address: ["
+                + V2_FEED_POLICY + "]", lines.get(1));
+        assertTrue(lines.get(2).startsWith("Indexing UTxOs for 5 payment credentials: "), lines.get(2));
+        assertEquals("Indexing no oracle NFT policy (loans.oracle.indexed-nft-policies is blank): only the "
+                + "payment credentials above are kept", lines.get(3));
     }
 }

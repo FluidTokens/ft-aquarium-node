@@ -17,13 +17,14 @@ error.
 | A setting in `.env` | restart | untouched |
 | You added a **market**, margin, or mode | restart | untouched |
 | You enabled the **UI** | restart | untouched |
+| Upgrading to the release that reads **oracle liveness from the index** (FAB-196) | pull, restart — nothing else required; a re-sync with the §1.1 steps is optional ([§7](#oracle-liveness-is-read-from-the-index-first-fab-196)) | untouched, unless you choose to re-sync |
 | **FluidTokens redeployed the contracts** (new config NFTs) | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
 | FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01, 2026-10-23/26) | §4.8, §4.9 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 | Upgrading to the release that **indexes the Minswap V2 pools** (FAB-137) | §1.1 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
 | You changed `WALLET_ACCOUNT_INDEX` | §9 — restart, then re-sync **or** one self-send | ⛔ **wiped, or a self-send** |
 
-The first four are ordinary. The others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §9).
+The first five are ordinary. The others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §9).
 
 ### 1.1 ⛔ The Minswap pool release requires a database wipe (FAB-137)
 
@@ -699,6 +700,40 @@ unknown) holds the later stages back. The counts are for reading only.
 **When the line is INFO.** With `WALLET_PIPELINE_LOG_EVERY_PASS=true` (the default) every pass says it at
 INFO. With `false` it is INFO when any stage is neither `NO_OP` nor `SKIPPED`, or the pass evaluated or
 submitted anything, and DEBUG otherwise. **A pass with an `ERROR` is now INFO where it was DEBUG.**
+
+### Oracle liveness is read from the index first (FAB-196)
+
+Before every liquidation, pay-in-advance and convert build, the node checks that each oracle output the
+transaction will reference — the price feed, and for a Charli3 feed its provider — is still unspent and
+holds its NFT. Older images asked Blockfrost about every one of them. **The node now asks its own index
+first:**
+
+- an oracle output the index holds unspent, with its NFT, passes with **no Blockfrost call**;
+- one the index recorded as spent is refused **with no Blockfrost call**, naming the transaction that spent
+  it;
+- anything the index does not know is checked on Blockfrost, **exactly as before**.
+
+To have something to answer from, the index also keeps every output holding a token of the oracle NFT
+policies in `loans.oracle.indexed-nft-policies`, whatever its address. That key is shipped per network in
+the image's configuration (on mainnet, the Lending v4 feed policy) and **needs no setting**. Like every
+write-time filter in this node, it applies only to the blocks the node indexes from then on: changing it,
+or upgrading to an image that changes it, **re-indexes nothing by itself**
+([§3](#3--the-rule-that-surprises-people)).
+
+What that means depends on your node:
+
+| your node | what happens | what you do |
+|---|---|---|
+| **An existing node, not re-synced** | Oracle outputs created before the upgrade are not in its index — on mainnet that is all 16 Lending v4 feeds, created 2026-09-30 — so their checks ask Blockfrost exactly as before. Oracle outputs created after the upgrade are indexed and answered from the index. | nothing — it keeps working |
+| **Re-synced with the [§1.1](#11--the-minswap-pool-release-requires-a-database-wipe-fab-137) steps, keeping the shipped `sync-start-*`** | The index answers for every oracle output under the shipped policies: a live one costs no Blockfrost call, so the pass line's `discovery` count drops; a spent one is refused from the index. | optional — re-sync only if you want that now |
+| **A fresh install** | As a re-synced node. | nothing |
+| **A feed spent long ago** | Its rows are pruned about 2160 blocks after the spend ([§1.1](#11--the-minswap-pool-release-requires-a-database-wipe-fab-137)), so the index no longer knows it and the check goes back to Blockfrost, which reports it spent. | nothing |
+| **FluidTokens publish oracle NFTs under a new policy** | A release adds it to the shipped `loans.oracle.indexed-nft-policies`. Until you re-sync after that release, those checks ask Blockfrost, as today. | nothing required; re-sync after that release to have the index answer them |
+
+**The refusal for a spent oracle output is unchanged in effect.** Whether the index or Blockfrost says so,
+the candidate is REFUSED, the node logs one ERROR line with the reason, and the wallet UTxO is kept; the
+candidate is checked again on the next pass. Only the reason differs when the index answered: it ends
+`spent in transaction <hash>, as recorded by this node's index`.
 
 ---
 

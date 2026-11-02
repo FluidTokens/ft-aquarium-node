@@ -307,11 +307,34 @@ jobs:
       # OracleProbeRoutesProductionTest). Re-measured cold keyless on feat/fab-183-event-driven-pipeline,
       # 2026-11-02: 227 files / 2490 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 227.
       #
+      # FAB-38 (TransactionEvaluatorWiringTest: one TransactionEvaluator bean held by the four loans builders,
+      # the tank QuickTxBuilder's processor slot and the dump wrapper; plus cases in YaciConfigWiringTest,
+      # ContainerWiringTest and TankProductionWiringTest) re-measured cold keyless on
+      # feat/fab-189-composable-node, 2026-11-02: 228 files / 2542 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 228.
+      #
+      # FAB-196-1 (OracleReferenceInputProbeVerdictPinTest: the oracle probe's verdicts pinned exactly; plus
+      # cases in TankUtxoStorageTest and StorageFilterSoundnessTest for the oracle NFT policy index clause)
+      # re-measured cold keyless on feat/fab-189-composable-node, 2026-11-02: 229 files / 2571 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 229.
+      #
+      # FAB-196-2 (OracleReferenceInputProbeIndexFirstTest: the probe asks the index first -- LIVE and SPENT
+      # with no Blockfrost call, UNKNOWN exactly as before; TankUtxoStorageOracleOutRefIndexTest: the index's
+      # LIVE / SPENT / UNKNOWN on the real-JPA seam; plus four cases in OracleReferenceInputProbeVerdictPinTest)
+      # re-measured cold keyless on feat/fab-189-composable-node, 2026-11-02: 231 files / 2602 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 231.
+      #
+      # FAB-196-3 (OracleProbeIndexFirstProductionWiringTest: the probe bean over the real TankUtxoStorage and
+      # Yaci tables -- an indexed feed costs no Blockfrost call, a recorded spend is refused from the index, the
+      # rest goes to Blockfrost as before; plus a case in ContainerWiringTest) re-measured cold keyless on
+      # feat/fab-189-composable-node, 2026-11-02: 232 files / 2609 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 232.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '227'
+          RESULT_FILE_FLOOR: '232'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

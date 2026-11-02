@@ -304,8 +304,9 @@ class PreBuildRefusalProductionTest {
 
             YaciConfig yaciConfig = new YaciConfig();
             builder = yaciConfig.liquidateTransactionBuilder(LoanFixtures.registry(), network("preview"),
-                    LoanFixtures.converters(), contentHold, LoanFixtures.protocolParams(), noScripts, backend,
-                    yaciConfig.oracleReferenceInputProbe(contentHold, backend));
+                    LoanFixtures.converters(), contentHold, LoanFixtures.protocolParams(), noScripts,
+                    yaciConfig.transactionEvaluator(backend),
+                    yaciConfig.oracleReferenceInputProbe(contentHold, backend, OracleOutRefIndex.NOTHING_INDEXED));
 
             BlockEventListener blockEventListener = new BlockEventListener(null);
             blockEventListener.getIsSyncing().set(false);
@@ -663,9 +664,10 @@ class PreBuildRefusalProductionTest {
             ProtocolParamsSupplier params = EvalFixtures.protocolParams();
 
             YaciConfig yaciConfig = new YaciConfig();
-            OracleReferenceInputProbe probe = yaciConfig.oracleReferenceInputProbe(contentHold, backend);
+            OracleReferenceInputProbe probe = yaciConfig.oracleReferenceInputProbe(contentHold, backend,
+                    OracleOutRefIndex.NOTHING_INDEXED);
             ConvertTransactionBuilder builder = yaciConfig.convertTransactionBuilder(MAINNET_REGISTRY,
-                    network("mainnet"), contentHold, params, noScripts, backend, probe);
+                    network("mainnet"), contentHold, params, noScripts, yaciConfig.transactionEvaluator(backend), probe);
 
             var configuration = new AppConfig.LiquidationConfiguration(nodeMode, 60, 120, 30,
                     BigInteger.valueOf(1_500_000), 200, references);

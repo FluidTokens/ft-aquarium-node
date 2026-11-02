@@ -147,7 +147,7 @@ class TankUtxoStoragePoolRollbackTest {
             @SuppressWarnings("unchecked")
             ObjectProvider<LoansContractRegistry> noRegistry = mock(ObjectProvider.class);
             var storage = new TankUtxoStorage(utxoRepository, txInputRepository, dsl, new UtxoCache(), txManager,
-                    account, parameters, staker, tank, noRegistry, POOL_PKH);
+                    account, parameters, staker, tank, noRegistry, POOL_PKH, "");
             storage.init();
 
             String poolOut = tx(1), walletOut = tx(2), poolSpender = tx(3), walletSpender = tx(4);
