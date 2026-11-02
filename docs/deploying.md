@@ -76,8 +76,35 @@ little to the fee). A wallet carrying a very large bundle of other tokens can ne
 **A preview node runs in `shadow` by default**, so it rebalances too: if its wallet is out of shape,
 expect one self-send of the whole wallet shortly after it has synced. **Any deposit triggers a
 reshape:** funds you send arrive as a second ada-only UTxO, which puts the wallet out of shape, and
-the next pass merges it into the one ada output with a self-send — so that output is busy for about
-one block while the self-send lands.
+the next pass reshapes it with a self-send. **That self-send spends EVERY wallet UTxO** — the
+collateral UTxO C and every token UTxO included, not only the ada output — **so for about one block,
+until it lands, nothing can be liquidated or compounded.** A liquidation or compound built in that
+window is rejected by the ledger (its inputs are already being spent) and retried on the next pass. A
+reshape only runs on a pass in which no liquidation or compound went out, so this window opens after a
+pass that had nothing to do.
+
+**What liquidation needs from the wallet, by role.** Each check reads the wallet once and gives its
+UTxOs roles, and each kind of liquidation is funded from one role only (§9, "Which wallet output pays
+for what"):
+
+- **C** — the ada-only UTxO of exactly the collateral size: **5 ADA** under current protocol
+  parameters. It is the collateral the rebalancer keeps, and it is never handed to a liquidation as
+  its funding UTxO.
+- **U** — the largest other ada-only UTxO (the change, in a shaped wallet). A **plain** liquidation
+  needs U to hold the fee ceiling (the most this ledger could charge in fees, about 2.6 ADA). A
+  **convert** needs the Minswap order overhead (4 ADA) plus the fee ceiling — **about 6.6 ADA**, an
+  approximate figure derived from those two constants. An **ADA-principal anticipate** needs the
+  lender payout plus the fee ceiling plus **about 3.5 ADA of riders** (the bot's own collateral
+  output and the change's minimum ada).
+- **A token anticipate** is funded from **its own token UTxO**, never from U: the rebalancer gives
+  each `ANTICIPATE` token one, with **10 ADA** beside the token.
+- **+10 ADA** when the wallet holds any other tokens (the UTxO that bundles them).
+
+**A missing or too-small role is refused, by name.** A liquidation whose role is missing is recorded as
+`WALLET_ROLE_MISSING`, one whose role UTxO is too small as `WALLET_INPUT_TOO_SMALL` naming the UTxO,
+what it holds and what it needed; a check with no C builds nothing. The WARN names the role and **the
+wallet rebalancer's last outcome**. So anything that keeps the wallet from being shaped — a
+reference-script or datum UTxO (below) — stops liquidation too, and the WARN says why.
 
 **⛔ Keep no reference-script or datum UTxO in this wallet.** A rebalance spends every UTxO the wallet
 holds, and its outputs carry no reference script and no datum — so a datum UTxO parked here is
@@ -520,7 +547,8 @@ rebalances.
 - **every remaining lovelace in one ada-only UTxO.**
 
 Why: the bot fronts an `ANTICIPATE` principal from **one** UTxO, which must carry the token *and*
-the ada the transaction needs beside it (the fee ceiling plus 2 ADA), so each such token gets its own
+the ada the transaction needs beside it (the fee ceiling plus about 5.5 ADA of riders — under 10 ADA
+at current parameters), so each such token gets its own
 funded UTxO instead of being scattered or bundled with others. C is never below the 5 ADA the
 transaction builder selects as collateral, nor below the most collateral the ledger can require, so
 a collateral UTxO of the right size is kept ready for the bot's script transactions. And one change
@@ -584,6 +612,32 @@ resume.
 - **Paused:** **`Suspend rebalancing`** on the readiness page (§7) — do this before you move funds
   in or out of the wallet by hand, then **`Resume rebalancing`**. The suspension is held in memory, so
   a restart resumes rebalancing.
+
+### Which wallet output pays for what
+
+Each liquidation check reads the wallet **once** and gives its UTxOs roles, which do not change for
+the rest of that check:
+
+| liquidation | funded from | it must hold, before anything is built |
+|---|---|---|
+| plain | **U**, the largest ada-only UTxO that is not C | the fee ceiling |
+| convert | **U** | the Minswap order plus the fee ceiling (about 6.6 ADA when the collateral is a token) |
+| anticipate, ADA principal | **U** | the lender payout, the fee ceiling and about 3.5 ADA of riders |
+| anticipate, token principal | **the UTxO holding the most of that token** (no datum, no reference script) | the payout in the token, and the fee ceiling plus about 5.5 ADA of riders beside it |
+
+**C — the ada-only UTxO of exactly the collateral size — is never handed to a liquidation as its
+funding UTxO.** The figures are ceilings checked before the build; the build is the judge of whether
+they suffice. (The transaction builders still choose their own collateral UTxO — the largest ada-only
+one, which is U in a shaped wallet — and an anticipate or convert can still draw on further wallet
+UTxOs while balancing.)
+
+**A UTxO that went out is not used again in the same check.** After a liquidation is submitted (or
+its submission's outcome is unknown), after a `shadow` node's would-be submission, and after a failure
+that says an input was already spent, the UTxO it was funded from is marked used, and the next
+candidate funded from the same role is **skipped** — logged at INFO as `… skipped: wallet output …
+(role U) already went out in this check` — rather than funded from another UTxO. Two plain
+liquidations in different markets therefore do not both go out in one pass: they share U. A
+liquidation held back by a market in `shadow` on a `live` node marks nothing.
 
 ---
 

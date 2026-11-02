@@ -303,8 +303,11 @@ class OracleProbeRoutesProductionTest {
         }
 
         /** The same scenario with a chosen loan datum and oracle registry (FAB-135 T4 amendment 3). */
-        PayInAdvanceRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos, LoanDatum datum,
+        PayInAdvanceRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletFunds, LoanDatum datum,
                              OracleEntry... oracles) {
+            // FAB-185: role C, sized from the parameters the executor below reads, beside the funds given.
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(EvalFixtures.protocolParams(),
+                    PREVIEW_ACCOUNT.baseAddress(), walletFunds.toArray(new Utxo[0]));
             Loan loan = new Loan(PIA_LOAN_TX, 1, PIA_LOAN_ADDRESS, PIA_LOAN_ID,
                     BigInteger.valueOf(PIA_COLLATERAL_AMOUNT), BigInteger.valueOf(3_000_000L), datum);
             LenderBond bond = new LenderBond(PIA_LOAN_TX, 3, PIA_BOND_ADDRESS, PIA_LOAN_ID, PIA_BOND_DATUM_HEX,
@@ -629,7 +632,10 @@ class OracleProbeRoutesProductionTest {
             return this;
         }
 
-        ConvertRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos) throws Exception {
+        ConvertRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletFunds) throws Exception {
+            // FAB-185: role C, sized from the parameters the executor below reads, beside the funds given.
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(EvalFixtures.protocolParams(),
+                    MAINNET_ACCOUNT.baseAddress(), walletFunds.toArray(new Utxo[0]));
             String loanDatumHex = LoanFixtures.fixture("mainnet-loan-datum-d832b78e.hex");
             String bondDatumHex = LoanFixtures.fixture("mainnet-lender-bond-datum-d832b78e.hex");
             LoanDatum recorded = new LoanDatumConverter().deserialize(loanDatumHex);

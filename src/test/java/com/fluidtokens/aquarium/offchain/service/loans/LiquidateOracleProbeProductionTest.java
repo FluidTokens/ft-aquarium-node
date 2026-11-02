@@ -161,7 +161,10 @@ class LiquidateOracleProbeProductionTest {
             return this;
         }
 
-        Rig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos) {
+        Rig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletFunds) {
+            // FAB-185: role C, sized from the parameters the executor below reads, beside the funds given.
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(LoanFixtures.protocolParams(), ACCOUNT.baseAddress(),
+                    walletFunds.toArray(new Utxo[0]));
             Scenario scenario = tokenScenario();
             List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, ORACLE_NFT_UTXO,
                     C3_PROVIDER_UTXO, scenario.loanUtxo(), scenario.bondUtxo()));

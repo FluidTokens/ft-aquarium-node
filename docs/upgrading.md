@@ -574,12 +574,46 @@ because liquidation depends on a shaped wallet. See
   ada-only wallet needs about 6.2 ADA. A wallet with less is not touched: the node logs
   `[REBALANCE] REFUSED: …` at WARN on every pass in which the rebalancer runs and submits nothing.
 - **Any deposit triggers a reshape.** Funds you send arrive as a second ada-only UTxO, which puts the
-  wallet out of shape; the next pass merges it into the one ada output with a self-send, so that output
-  is busy for about one block while it lands.
+  wallet out of shape, and the next pass reshapes it with a self-send. **That self-send spends EVERY
+  wallet UTxO** — the collateral UTxO C and every token UTxO included — **so for about one block, until
+  it lands, nothing can be liquidated or compounded**; a candidate built in that window is rejected by
+  the ledger and retried on the next pass. A reshape only runs on a pass in which no liquidation or
+  compound went out.
 - **To opt out**, set `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. On a `shadow` or `live`
   node the node then logs one WARN on every pass in which the rebalancer runs,
   `[REBALANCE] ENV_DISABLED: … liquidation depends on a shaped wallet …` — and `SUSPENDED` in its place
   while rebalancing is suspended from the readiness page.
+
+### Liquidation is funded by wallet role (FAB-185)
+
+Older images picked a wallet UTxO for each liquidation from a list that shrank as the pass went on — the
+smallest one that covered the requirement — so a liquidation could be funded from whichever UTxO was
+left. **Each liquidation check now reads the wallet once and gives its UTxOs fixed roles:**
+
+- **C**, the ada-only UTxO of exactly the collateral size (5 ADA under current protocol parameters), is
+  never handed to a liquidation as its funding UTxO;
+- **U**, the largest other ada-only UTxO, pays for plain, convert and ADA-principal anticipate
+  liquidations;
+- a **token-principal anticipate** is paid for from the UTxO holding the most of that token.
+
+See [deploying.md §9, "Which wallet output pays for what"](deploying.md#which-wallet-output-pays-for-what)
+for what each role must hold.
+
+- **A UTxO that went out is not used again in the same check**, and the next candidate funded from the
+  same role is skipped (`… skipped: wallet output … (role U) already went out in this check`, at INFO)
+  rather than funded from another UTxO. **So two plain liquidations in different markets no longer both
+  go out in one pass** — they share U; the second goes on a later pass. (The FAB-183 entry above says
+  several markets can each get one per pass: that now holds only for markets funded from different
+  roles.)
+- **A missing role is refused by name.** No C: nothing is built, and one WARN names role C, its size and
+  the wallet rebalancer's last outcome. No U, or no token UTxO for a token anticipate: that candidate is
+  recorded `WALLET_ROLE_MISSING`, with one WARN per missing role per check. A role UTxO too small for
+  its candidate is recorded `WALLET_INPUT_TOO_SMALL`, naming the UTxO, what it holds and what it needed.
+- **Unreadable protocol parameters now stop the check** — one WARN naming role C and the cause — instead
+  of falling back to the largest UTxO: without them C cannot be sized.
+- **A shaped wallet is what makes this work** — keep wallet rebalancing on
+  ([FAB-188, above](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)), and keep reference
+  scripts and datum UTxOs out of the bot wallet: they keep it from being shaped, and so stop liquidation.
 
 ---
 

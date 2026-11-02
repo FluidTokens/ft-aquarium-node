@@ -290,11 +290,15 @@ jobs:
       # those four classes (one day line per midnight; every recipe FAIL reason, no-pushes and lost-lines among
       # them): re-measured cold keyless, 219 files / 2212 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
       #
+      # FAB-185-1 (WalletRolesTest: the wallet roles one liquidation check resolves; plus role cases in the
+      # liquidation executor classes) re-measured cold keyless on feat/fab-183-event-driven-pipeline, 2026-11-02:
+      # 227 files / 2470 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 227.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '226'
+          RESULT_FILE_FLOOR: '227'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

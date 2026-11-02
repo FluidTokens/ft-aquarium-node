@@ -268,6 +268,25 @@ class ExecutorContextResolutionTest {
     }
 
     /**
+     * FAB-185: every wallet-role refusal the liquidation stage records names the rebalancer's last outcome, read
+     * off the rebalancer the container hands the executor. Injection is by setter and REQUIRED, mirroring the
+     * readiness controller's pin above: optional injection would leave a container-built executor holding no
+     * rebalancer, and every missing-role refusal would say it is not wired.
+     */
+    @Test
+    void theLiquidationExecutorHasTheWalletRebalancerInjectedAndRequired() throws Exception {
+        var rebalancerType = com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class;
+        assertTrue(rebalancerType.isAnnotationPresent(Service.class),
+                "WalletRebalancer must be a scanned @Service, or a required setter fails the boot");
+        var setter = LiquidationExecutor.class.getMethod("setWalletRebalancer", rebalancerType);
+        Autowired autowired = setter.getAnnotation(Autowired.class);
+        assertNotNull(autowired, "LiquidationExecutor.setWalletRebalancer is not @Autowired — the container would "
+                + "leave it holding no rebalancer, and every wallet-role refusal would say it is not wired");
+        assertTrue(autowired.required(), "LiquidationExecutor.setWalletRebalancer must be REQUIRED: optional "
+                + "injection fails silent when the rebalancer bean is missing");
+    }
+
+    /**
      * FAB-128: the readiness page sizes the token-principal ada floor from the protocol parameters the container
      * hands the controller. Injection is by setter and REQUIRED: optional injection would leave a container-built
      * controller holding no supplier, so the floor would silently drop the fee ceiling and the page would count

@@ -290,7 +290,9 @@ class PreBuildRefusalProductionTest {
             LoanFixtures.LoanUtxo loan = plainLoan();
             LoanFixtures.BondUtxo bond = plainBond();
             LiquidationAssessment assessment = plainAssessment(loan, bond);
-            List<Utxo> walletUtxos = List.of(WALLET_A, WALLET_B);
+            // FAB-185: role C, sized from the parameters the executor below reads, beside U.
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(LoanFixtures.protocolParams(), ACCOUNT.baseAddress(),
+                    WALLET_A, WALLET_B);
             List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, C3_PROVIDER_UTXO,
                     loan.utxo(), bond.utxo()));
             if (feedContentKnown) {
@@ -649,7 +651,9 @@ class PreBuildRefusalProductionTest {
             universe.add(Utxo.builder().txHash(CV_ORACLE_SCRIPT_REF.getTransactionId()).outputIndex(0)
                     .address(CV_ORACLE_ADDRESS).amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
                     .referenceScriptHash(CV_ORACLE_CREDENTIAL).build());
-            List<Utxo> walletUtxos = List.of(CV_WALLET_A, CV_WALLET_B);
+            // FAB-185: role C, sized from the parameters the executor below reads, beside U.
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(EvalFixtures.protocolParams(),
+                    MAINNET_ACCOUNT.baseAddress(), CV_WALLET_A, CV_WALLET_B);
             universe.addAll(walletUtxos);
             var references = new LiquidateTransactionBuilder.ReferenceScripts(at.get(0), at.get(1), at.get(2),
                     at.get(3), at.get(4), null, null, null, at.get(5));

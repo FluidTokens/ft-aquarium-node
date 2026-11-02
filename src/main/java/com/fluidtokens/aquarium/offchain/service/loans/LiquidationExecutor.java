@@ -31,6 +31,9 @@ import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
@@ -56,7 +59,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
@@ -109,11 +111,12 @@ import java.util.function.Function;
  * liquidation that landed is re-derived until the index catches up, and its resubmission fails in
  * phase 1 (free) and is logged like any other failure — accepted, and preferred to a timer.
  * <p>
- * The one thing a failure DOES change is the cycle's wallet list. A wallet UTxO that was an input
- * of a transmitted transaction, or that a failure names as already spent ({@code BadInputsUTxO},
- * or Blockfrost's empty {@code "ScriptFailures":{}} evaluation), is dropped from the list for the
- * rest of that cycle, so the next candidate does not nominate an input the index still lists but
- * the ledger no longer has.
+ * The one thing a failure DOES change is the check's used marks (FAB-185). The wallet's roles — C, U
+ * and the token outputs, see {@link WalletRoles} — are resolved once per check; a role output that was
+ * an input of a transmitted transaction, or that a failure names as already spent
+ * ({@code BadInputsUTxO}, or Blockfrost's empty {@code "ScriptFailures":{}} evaluation), is used for the
+ * rest of that check, so the next candidate designated to it is skipped rather than handed an input the
+ * index still lists but the ledger no longer has — and is never quietly funded from another output.
  *
  * <h2>One transaction per candidate</h2>
  * {@link LiquidateTransactionBuilder} accepts a batch, and this loop always hands it exactly one
@@ -320,6 +323,19 @@ public class LiquidationExecutor {
     @org.springframework.beans.factory.annotation.Autowired
     public void setLendingConfigGate(com.fluidtokens.aquarium.offchain.service.LendingConfigGate gate) {
         this.lendingConfigGate = gate;
+    }
+
+    /**
+     * FAB-185: the wallet rebalancer, read for one thing only — its last outcome, which every wallet-role
+     * refusal names, because the rebalancer is what keeps C, U and the token outputs in place. Setter-injected
+     * and REQUIRED in the container, like the readiness controller's; null only in a direct test construction,
+     * where a refusal says the rebalancer is not wired.
+     */
+    private WalletRebalancer walletRebalancer;
+
+    @Autowired
+    public void setWalletRebalancer(WalletRebalancer walletRebalancer) {
+        this.walletRebalancer = walletRebalancer;
     }
 
     /**
@@ -878,73 +894,45 @@ public class LiquidationExecutor {
         // Nothing is loosened for LIVE: a liquidation still cannot be built without a wallet input,
         // and the refusal is now explicit and counted rather than a silent early return.
         List<Utxo> allWalletUtxos = appUtxoService.listWalletUtxo();
-        if (nominableWalletUtxos(allWalletUtxos).isEmpty()) {
-            log.warn("{} buildable candidate(s) found but no ada-only wallet utxo is available, so "
-                    + "none can be built; the scan above is still a complete record of what was seen "
-                    + "and priced", buildable.size());
-            return WorkResult.DEFINITE_FAILURE;
-        }
-        // ⛔ F3/F7 (round 2) — THE FULL WALLET, NOT THE GATE'S OWN ADA-ONLY SUBSET.
+        // ⛔ FAB-185 — THE WALLET'S ROLES, RESOLVED ONCE FOR THIS CHECK FROM THAT ONE READ.
         //
-        // nominableWalletUtxos() above answers ONE question — "is there an ada-only utxo to fund
-        // ANYTHING with at all" — and that gate is correct to keep: every liquidation, whatever its
-        // principal, needs one for the fee/collateral input. But before this fix its FILTERED RESULT
-        // was what got threaded through the rest of this method, and every multi-asset (token-
-        // carrying) wallet utxo was gone before nominate() or the principal-balance sum ever ran. A
-        // TOKEN-PRINCIPAL candidate's market-gate balance was therefore ALWAYS zero, and no wallet
-        // utxo the operator could ever fund would change that — the USDM-funded bot in this ticket's
-        // own motivating scenario could not have been fixed by F0 alone.
+        // C is the ada-only output of exactly WalletShape.collateralLovelace(params) — the collateral the
+        // rebalancer keeps — and it never funds a route. U, the largest other ada-only output, funds plain,
+        // convert and ADA-principal pay-in-advance; a token-principal pay-in-advance is funded from the
+        // output holding the most of its principal. The roles are never re-resolved within the check: an
+        // output that went out is marked used instead, so the next candidate it was designated for is
+        // skipped rather than quietly funded from another output.
         //
-        // WalletInputSelection's own functions each filter for their OWN purpose already —
-        // `nominable` (ada-only) for the fee/collateral path, `nominableForToken` for the
-        // token-principal one, both applied downstream (nominate(), the principal-balance sum,
-        // collateralGate, walletDiagnosis) — so handing them the UNFILTERED wallet is what makes each
-        // one see what it is actually looking for.
-        //
-        // ⛔ A MUTABLE COPY, consumed as the cycle goes (FAB-134 NQ). The index answers "unspent" from
-        // tx_input, so a utxo this cycle's own transaction just spent is still listed until its block
-        // is indexed: without the copy the next candidate would nominate the same input and fail at
-        // phase 1. dropFromCycle() removes what a transmitted transaction spent, and what a failure
-        // names as already spent.
-        List<Utxo> walletUtxos = new ArrayList<>(allWalletUtxos);
-        // T-052 — the fee ceiling every liquidation must cover regardless of its shape. The
-        // principal-repaying path adds its lender payout on top; the fee-only path needs nothing more,
-        // which is the whole point: it must not be made to demand an input sized for the other case.
-        //
-        // ⚠ OPTIONAL, AND DELIBERATELY SO. This is a remote read, and a remote read that ALL selection
-        // depends on turns a parameter outage into a liquidation outage. Worse, it would fire before
-        // anything else in the cycle and pre-empt the TX_TOO_LARGE veto — the one path whose whole job
-        // is to report an unfetchable maxTxSize (LiquidationSubmitVetoTest S4). When it cannot be had,
-        // selection degrades to the pre-T-052 behaviour, largest-nominable: never wrong, only wasteful.
-        // T-061 — the PARAMS are held, not just the fee ceiling, because a refusal has to size EVERY
-        // gate it can see and the collateral ceiling comes from the same object.
-        Optional<ProtocolParams> fetched;
+        // ⚠ The parameters are therefore REQUIRED here: without them C cannot be sized, and without C no
+        // role can be told apart. They are proven usable INSIDE this catch — the fee ceiling and C are both
+        // derived here — so a partial object is "C cannot be sized", never a later NullPointerException
+        // (CCL trap 19).
+        BigInteger feeCeiling;
+        BigInteger collateralLovelace;
         try {
             ProtocolParams fresh = protocolParamsSupplier.getProtocolParams();
-            // ⛔ PROVE IT IS USABLE HERE, INSIDE THE CATCH THAT HANDLES IT.
-            //
-            // The fetch used to be `maxPossibleFee(getProtocolParams())` — one expression, one
-            // try/catch — so a params object with null fields degraded to "unavailable" like any
-            // other failure. Holding the raw object and deriving later moved that derivation OUTSIDE
-            // this catch, and LiquidationSubmitVetoTest S4 (whose supplier returns a deliberately
-            // partial object) went from a clean veto to a NullPointerException.
-            //
-            // ⚠ THAT IS THE THIRD TIME TODAY A COMPUTATION CROSSING AN ERROR BOUNDARY CHANGED A
-            // FAILURE MODE — T-050 moved two remote reads out of complete()'s try/catch, T-052 moved
-            // one to cycle start, and this moved a derivation past its own handler. The code was
-            // correct each time; only the REPORTING broke, which is why review does not catch it and
-            // a test asserting a failure mode does.
-            //
-            // Both ceilings and every field the diagnosis reads are exercised here, so anything
-            // unusable is caught as unavailable rather than surfacing later as an NPE.
-            LedgerCeilings.maxPossibleCollateral(fresh);
-            Math.max(1, fresh.getMaxCollateralInputs());
-            fetched = Optional.of(fresh);
+            feeCeiling = LedgerCeilings.maxPossibleFee(fresh);
+            collateralLovelace = WalletShape.collateralLovelace(fresh);
         } catch (Exception e) {
-            fetched = Optional.empty();
-            log.warn("could not fetch protocol parameters to size the wallet input ({}); falling back "
-                    + "to the largest nominable utxo for this cycle", causeChain(e));
+            log.warn("{} buildable candidate(s) found but wallet role C cannot be sized: the protocol parameters "
+                    + "are unusable ({}), so no wallet output can be told apart and none is built this check",
+                    buildable.size(), causeChain(e));
+            return WorkResult.DEFINITE_FAILURE;
         }
+        WalletRoles roles = WalletRoles.resolve(allWalletUtxos, collateralLovelace);
+        if (roles.c().isEmpty()) {
+            log.warn("{} buildable candidate(s) found but the wallet holds no role C — no ada-only output of "
+                            + "exactly {} lovelace, the collateral — so none is built this check; {}; the scan "
+                            + "above is still a complete record of what was seen and priced",
+                    buildable.size(), collateralLovelace, rebalancerOutcome());
+            return WorkResult.DEFINITE_FAILURE;
+        }
+        log.info("wallet roles for this check: C {} ({} lovelace), U {}", WalletRoles.ref(roles.c().get()),
+                collateralLovelace, roles.u().map(u -> WalletRoles.ref(u) + " (" + LedgerCeilings.lovelaceOf(u)
+                        + " lovelace)").orElse("none"));
+        // Held for this call only and never retained: what went out, and which missing roles were said.
+        WalletCheck walletCheck = new WalletCheck(allWalletUtxos == null ? List.of()
+                : allWalletUtxos.stream().filter(java.util.Objects::nonNull).toList(), roles, feeCeiling);
         // ⛔ THE VALIDITY WINDOW IS ANCHORED TO THE CHAIN, NOT TO THE WALL CLOCK.
         //
         // The first live submission (2026-08-26, tx 8062f42d…) was rejected
@@ -978,10 +966,6 @@ public class LiquidationExecutor {
         final long validFromFloorMillis = anchor - VALID_FROM_BACKDATE_MILLIS;
         final long validToMillis = now + configuration.getValidityWindowSeconds() * 1000L;
 
-        // Effectively final, so the per-candidate selector lambda can close over them.
-        final Optional<ProtocolParams> params = fetched;
-        final Optional<BigInteger> feeCeiling = params.map(LedgerCeilings::maxPossibleFee);
-
         Optional<Utxo> configUtxo = utxoResolver.resolveConfigUtxo();
         Optional<Utxo> lmConfigUtxo = utxoResolver.resolveLmConfigUtxo();
         if (configUtxo.isEmpty() || lmConfigUtxo.isEmpty()) {
@@ -1009,8 +993,9 @@ public class LiquidationExecutor {
         // FAB-183 — ONE LIQUIDATION PER MARKET PER CALL. A market is the principal asset's unit; it is
         // served by a SUBMITTED liquidation or by a shadow WOULD_SUBMIT, and every later candidate in it
         // is skipped unbuilt. A definite failure leaves it open for the market's next candidate. Several
-        // markets per call are fine: they are funded from disjoint inputs, because walletUtxos above
-        // loses what each transmission spent. Held for this call only — nothing persists across calls.
+        // markets per call never share a funding output: one that went out is marked used in walletCheck
+        // (FAB-185), and a later candidate designated to it is skipped. Held for this call only — nothing
+        // persists across calls.
         Set<String> servedMarkets = new HashSet<>();
         WorkResult result = WorkResult.DEFINITE_FAILURE;
         for (int i = 0; i < ordered.size(); i++) {
@@ -1028,8 +1013,7 @@ public class LiquidationExecutor {
             CandidatePass pass = new CandidatePass(fence);
             try {
                 outcome = consider(assessment, now, committedSlot, validFromFloorMillis, validToMillis,
-                        walletUtxos, params, configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit,
-                        effect -> dropFromCycle(walletUtxos, effect), pass);
+                        walletCheck, configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit, pass);
             } catch (Exception e) {
                 // consider() already turns every expected failure into a decision; this is the last
                 // net, so that one unexpected candidate does not cost the rest of the cycle.
@@ -1210,17 +1194,16 @@ public class LiquidationExecutor {
      */
     private WorkResult consider(LiquidationAssessment assessment, long now,
                                 long committedSlot, long validFromFloorMillis, long validToMillis,
-                                List<Utxo> walletUtxos,
-                                Optional<ProtocolParams> params, Utxo configUtxo, Utxo lmConfigUtxo,
-                                Map<String, OracleEntry> oraclesByUnit,
-                                Consumer<WalletEffect> walletEffects, CandidatePass pass) {
-        // Derived here rather than passed alongside, so the two can never disagree about which
-        // parameters they came from.
-        Optional<BigInteger> feeCeiling = params.map(LedgerCeilings::maxPossibleFee);
+                                WalletCheck walletCheck, Utxo configUtxo, Utxo lmConfigUtxo,
+                                Map<String, OracleEntry> oraclesByUnit, CandidatePass pass) {
+        BigInteger feeCeiling = walletCheck.feeCeiling();
         String loanUtxoRef = assessment.loan().utxoRef();
-        // The wallet utxo this candidate nominated, whichever route asked for it — what a failure
-        // naming a spent input is about (see spentInputEffect).
+        // The wallet output this candidate's route was handed — always its designated role output — what a
+        // failure naming a spent input is about (see spentInputEffect).
         Utxo[] nominated = new Utxo[1];
+        // The designated output, and what a selector found it short of, for the WALLET_INPUT_TOO_SMALL row.
+        Utxo designated;
+        Need needed = new Need();
 
         Optional<Utxo> loanUtxo = utxoResolver.resolveLoanUtxo(assessment.loan());
         Optional<Utxo> bondUtxo = utxoResolver.resolveBondUtxo(assessment.bond());
@@ -1364,32 +1347,26 @@ public class LiquidationExecutor {
                     log.warn("the liquidation of {} was refused: {}", loanUtxoRef, why);
                     return WorkResult.DEFINITE_FAILURE;
                 }
+                // FAB-185 — funded from U, and only from U.
+                designated = designated(assessment, now, walletCheck, ROLE_U, walletCheck.roles().u());
+                if (designated == null) {
+                    return WorkResult.DEFINITE_FAILURE;
+                }
+                Utxo convertFunding = designated;
                 log.info("{} is a CONVERT liquidation (LiquidateAndConvert): the bot creates a Minswap "
                                 + "order, fronts nothing, and keeps the liquidation fee in collateral",
                         loanUtxoRef);
                 try {
                     transaction = convertRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
                             bondUtxo.get(), configUtxo, lmConfigUtxo,
-                            // ⛔ SIZED, via the sibling's selector shape — PR3's job, now done.
-                            //
-                            // This was `nominableWalletUtxos(walletUtxos).get(0)`: the first nominable
-                            // utxo, whatever its size, funding an order whose ada requirement it never
-                            // consulted. Two defects in one line. It could under-fund an ADA-collateral
-                            // convert, whose order carries the whole swappable amount plus the Minswap
-                            // overhead rather than the overhead alone. And an unsized `get(0)` over a
-                            // list is one list-semantics change away from selecting a published
-                            // REFERENCE SCRIPT — which this exact line already survived once, when
-                            // fbcf6b1 widened `walletUtxos` to the raw Blockfrost listing and turned
-                            // "first ada-only utxo" into "oldest utxo at the address" (CCL trap
-                            // 9b/26a, the 2026-08-24 incident class).
-                            //
-                            // The router now asks for what the order actually costs and this supplies
-                            // the SMALLEST nominable utxo covering that plus the fee ceiling —
-                            // `nominate()`'s ada-only branch, which filters to nominable at source. The
-                            // reference-script hazard is closed structurally, not by this call site
-                            // remembering to filter.
-                            orderLovelace -> remember(nominated, nominate(walletUtxos, feeCeiling, null,
-                                    orderLovelace, loanUtxoRef)),
+                            // ⛔ SIZED, via the sibling's selector shape. The router asks for what the
+                            // order actually costs; U is offered when it covers that plus the fee ceiling
+                            // (FAB-185), and nothing else is ever offered. U is ada-only by construction
+                            // (WalletInputSelection.nominable), so a published REFERENCE SCRIPT can never
+                            // be handed out here (CCL trap 9b/26a, the 2026-08-24 incident class).
+                            orderLovelace -> remember(nominated, sized(loanUtxoRef, ROLE_U,
+                                    convertFunding, WalletRoles.convertRequired(orderLovelace, feeCeiling),
+                                    needed)),
                             oraclesByUnit,
                             account.baseAddress(), validFromMillis, validToMillis);
                 } catch (ConvertLiquidationRouter.NoPoolException e) {
@@ -1443,7 +1420,7 @@ public class LiquidationExecutor {
                         log.error("the pool lookup for {} failed reading the local pool index: {} — the "
                                         + "candidate itself was never assessed; retried next cycle",
                                 loanUtxoRef, causeChain(e), e);
-                        walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
+                        markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e)));
                         return WorkResult.DEFINITE_FAILURE;
                     }
                     // ⛔ AMBIGUOUS_POOL: two AUTHENTIC pools for one pair in the local index. Minswap
@@ -1459,15 +1436,15 @@ public class LiquidationExecutor {
                     // A fact about the WALLET, not the candidate — an eligibility filter, reconsidered
                     // every cycle, and cured by a top-up. Same treatment the pay-in-advance path gives
                     // its own.
+                    String detail = tooSmallDetail(ROLE_U, convertFunding, null, needed, e.getMessage());
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                            "WALLET_INPUT_TOO_SMALL", e.getMessage()));
-                    log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef,
-                            e.getMessage());
+                            "WALLET_INPUT_TOO_SMALL", detail));
+                    log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, detail);
                     return WorkResult.DEFINITE_FAILURE;
                 } catch (ConvertLiquidationRouter.FeedWindowException e) {
                     // FAB-183 — a feed whose window does not cover the body's is per-block feed timing,
                     // not a machinery fault: nothing was built and no wallet utxo was spent, so nothing
-                    // is dropped from the cycle's wallet list. Reconsidered on the next block.
+                    // is marked used. Reconsidered on the next block.
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             "CONVERT_FEED_WINDOW", e.getMessage()));
                     log.info("the convert liquidation of {} was refused as CONVERT_FEED_WINDOW: {}",
@@ -1488,7 +1465,7 @@ public class LiquidationExecutor {
                             rootReason(e), causeChain(e)));
                     log.error("building the convert liquidation of {} failed: {}", loanUtxoRef,
                             causeChain(e), e);
-                    walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
+                    markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e)));
                     return WorkResult.DEFINITE_FAILURE;
                 }
                 // Falls through to the shared record-and-maybe-submit path below, deliberately: the
@@ -1503,6 +1480,17 @@ public class LiquidationExecutor {
             // rather than re-derived — the same "off the finished body" discipline the builder's own
             // index derivation uses.
             AssetType payInAdvancePrincipal = assessment.loan().datum().principalAsset();
+            // FAB-185 — an ADA principal is funded from U; a token principal from the output holding the
+            // most of that token, never from U, however much larger U is.
+            String payInAdvanceRole = payInAdvancePrincipal.isAda() ? ROLE_U
+                    : ROLE_TOKEN + payInAdvancePrincipal.toUnit();
+            designated = designated(assessment, now, walletCheck, payInAdvanceRole, payInAdvancePrincipal.isAda()
+                    ? walletCheck.roles().u()
+                    : walletCheck.roles().tokenOutput(payInAdvancePrincipal.toUnit()));
+            if (designated == null) {
+                return WorkResult.DEFINITE_FAILURE;
+            }
+            Utxo payInAdvanceFunding = designated;
             log.info("{} is a PAY-IN-ADVANCE liquidation: the bot PAYS the lender in {} and acquires "
                             + "the collateral, rather than earning a fee",
                     loanUtxoRef, payInAdvancePrincipal.isAda() ? "ada" : payInAdvancePrincipal.toUnit());
@@ -1512,33 +1500,32 @@ public class LiquidationExecutor {
             // null on the ada branch, whose count is untouched.
             WalletInputSelection.TokenHolding principalHolding = null;
             try {
-                // Part 3 — the balance MarketGate's decide() checks: the sum of the principal asset
-                // across the wallet utxos a real selection could actually spend (nominate(), below) —
-                // never a utxo the selector would refuse, or the gate would allow what the build cannot
-                // fund (T-061's "a remedy is a claim" rule).
+                // Part 3 — the balance MarketGate's decide() checks. ⚠ FAB-185 residue: it still sums the
+                // whole wallet as read at the start of this check, so a candidate it allows can still be
+                // refused below by role, by name.
                 if (!payInAdvancePrincipal.isAda()) {
-                    // ⛔ F7 (round 2) — count ONLY utxos the selector could actually pick.
-                    // nominableForToken alone says "carries the token, no datum, no reference script" —
-                    // it says NOTHING about whether the utxo also carries enough ada to fund a build, so
-                    // a 2,000 USDM + 1.4 ADA utxo passed it and inflated the balance MarketGate saw by a
-                    // candidate the wallet could never actually fund (M13). tokenPrincipalRequiredAda
-                    // is nominate()'s own formula — the same figure the SELECTOR this balance is
-                    // supposed to describe is bound by — and spendable() applies it.
-                    principalHolding = WalletInputSelection.tokenHolding(walletUtxos, payInAdvancePrincipal,
-                            WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling));
+                    // ⛔ F7 (round 2) — count ONLY utxos carrying the ada floor beside the token: a 2,000
+                    // USDM + 1.4 ADA utxo would otherwise inflate the balance MarketGate saw by a
+                    // candidate the wallet could never actually fund (M13).
+                    principalHolding = WalletInputSelection.tokenHolding(walletCheck.wallet(),
+                            payInAdvancePrincipal,
+                            WalletInputSelection.tokenPrincipalRequiredAda(Optional.of(feeCeiling)));
                 }
                 BigInteger principalBalance = payInAdvancePrincipal.isAda()
-                        ? walletUtxos.stream().filter(WalletInputSelection::nominable)
+                        ? walletCheck.wallet().stream().filter(WalletInputSelection::nominable)
                                 .map(LedgerCeilings::lovelaceOf).reduce(BigInteger.ZERO, BigInteger::add)
                         : principalHolding.spendable();
                 transaction = payInAdvanceRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
                         bondUtxo.get(), configUtxo, lmConfigUtxo, oraclesByUnit, principalBalance,
-                        // T-052 — the router knows the lender payout, this knows the wallet and the
-                        // fee ceiling, and neither has to learn the other's job. It computes the
-                        // exact amount it must repay and asks for the SMALLEST input that covers that
-                        // plus the fee.
-                        lenderPayout -> remember(nominated, nominate(walletUtxos, feeCeiling,
-                                payInAdvancePrincipal, lenderPayout, loanUtxoRef)),
+                        // The router knows the lender payout, this knows the wallet and the fee ceiling.
+                        // Only the designated output is ever offered (FAB-185), and only when it covers
+                        // the payout plus the pre-build ceilings.
+                        lenderPayout -> remember(nominated, payInAdvancePrincipal.isAda()
+                                ? sized(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
+                                        WalletRoles.adaAnticipateRequired(lenderPayout, feeCeiling), needed)
+                                : sizedToken(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
+                                        payInAdvancePrincipal.toUnit(), lenderPayout,
+                                        WalletRoles.tokenOutputRequiredAda(feeCeiling), needed)),
                         validFromMillis,
                         validToMillis);
                 // ⛔ THE AMOUNT — "PAYS the lender 1,033,850,000 c48cbb3d…0014df105553444d and
@@ -1549,13 +1536,13 @@ public class LiquidationExecutor {
                 log.info("{} pays the lender {} {} and acquires the collateral", loanUtxoRef, paid,
                         payInAdvancePrincipal.isAda() ? "lovelace" : payInAdvancePrincipal.toUnit());
             } catch (PayInAdvanceLiquidationRouter.WalletInputTooSmallException e) {
-                // T-061 — the router knows the lender payout and nothing about the wallet; THIS knows
-                // the wallet and the parameters. Neither can state every gate alone, so the message is
-                // completed here rather than left naming one of several.
-                // T-052. Same treatment as "not modelled": a clean statement about this candidate
-                // against this wallet — an eligibility filter, reconsidered every cycle, and cured by
-                // a top-up between cycles.
-                String convertDetail = e.getMessage() + " " + collateralGate(walletUtxos, params);
+                // The router knows the lender payout and nothing about the wallet; THIS knows which role
+                // output was offered and what it was found short of, so the message is completed here.
+                // A clean statement about this candidate against this wallet — an eligibility filter,
+                // reconsidered every check, and cured by a top-up.
+                String convertDetail = tooSmallDetail(payInAdvanceRole, payInAdvanceFunding,
+                        payInAdvancePrincipal.isAda() ? null : payInAdvancePrincipal.toUnit(), needed,
+                        e.getMessage());
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         "WALLET_INPUT_TOO_SMALL", convertDetail));
                 log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, convertDetail);
@@ -1573,8 +1560,7 @@ public class LiquidationExecutor {
                 if (refused != null && refused.refusal() == MarketGate.Refusal.INSUFFICIENT_BALANCE
                         && principalHolding != null) {
                     String unit = payInAdvancePrincipal.toUnit();
-                    String note = principalHolding.adaFloorNote(q -> q + " " + unit, refused.required(),
-                            feeCeiling.isPresent());
+                    String note = principalHolding.adaFloorNote(q -> q + " " + unit, refused.required(), true);
                     if (note != null) {
                         detail = e.getMessage() + "; " + note;
                     }
@@ -1630,27 +1616,24 @@ public class LiquidationExecutor {
                         rootReason(e), causeChain(e)));
                 log.error("building the pay-in-advance liquidation of {} failed: {}",
                         loanUtxoRef, causeChain(e), e);
-                walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
+                markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e)));
                 return WorkResult.DEFINITE_FAILURE;
             }
             }
         } else {
-            // T-052 — A FEE-ONLY LIQUIDATION MUST NOT BE MADE TO DEMAND A LARGE INPUT.
-            //
-            // On the plain path the bot pays no principal: the collateral it collects funds every
-            // output the transaction creates, so the only ada it must bring is the fee. Nominating
-            // the largest wallet utxo (what this did until now) is not wrong, it is wasteful in a way
-            // that compounds — the biggest input gets consumed by whichever candidate runs first, so
-            // a fee-only liquidation can spend the one input a principal-repaying candidate needed.
+            // FAB-185 — a plain liquidation fronts nothing: the collateral it collects funds every output
+            // it creates, so the only ada it brings is the fee, and it brings it from U.
+            designated = designated(assessment, now, walletCheck, ROLE_U, walletCheck.roles().u());
+            if (designated == null) {
+                return WorkResult.DEFINITE_FAILURE;
+            }
             Optional<Utxo> plainWalletUtxo = remember(nominated,
-                    nominate(walletUtxos, feeCeiling, null, BigInteger.ZERO, loanUtxoRef));
+                    sized(loanUtxoRef, ROLE_U, designated, WalletRoles.plainRequired(feeCeiling), needed));
             if (plainWalletUtxo.isEmpty()) {
                 // A refusal, not a failure: true of this candidate against this wallet, reproducible
-                // next cycle, and cured by a top-up. An eligibility filter.
-                // feeCeiling is necessarily present here: with it absent, nominate() falls back to
-                // largest-nominable, and the cycle gate above already established that at least one
-                // nominable utxo exists — so the empty branch is unreachable without a ceiling.
-                String detail = walletDiagnosis(walletUtxos, params, feeCeiling, BigInteger.ZERO);
+                // next check, and cured by a top-up. An eligibility filter, decided before any build.
+                String detail = tooSmallDetail(ROLE_U, designated, null, needed,
+                        "U cannot fund this liquidation's fee ceiling.");
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         "WALLET_INPUT_TOO_SMALL", detail));
                 log.warn("the liquidation of {} was refused: {}", loanUtxoRef, detail);
@@ -1695,7 +1678,7 @@ public class LiquidationExecutor {
                             loanUtxoRef, e.getReason(), causeChain(e.getCause()), e);
                     // SCRIPT_COST_EVALUATION_FAILED is where Blockfrost's empty-failures evaluation
                     // surfaces on this route — the shape a spent input takes (CCL trap 13).
-                    walletEffects.accept(spentInputEffect(nominated[0], causeChain(e.getCause())));
+                    markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e.getCause())));
                     return WorkResult.DEFINITE_FAILURE;
                 } else {
                     // Task 7 (ADDENDA). The remedy is a LEVEL, not a flood: the forty-eight causeless
@@ -1721,7 +1704,7 @@ public class LiquidationExecutor {
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         rootReason(e), causeChain(e)));
                 log.error("building the liquidation of {} failed: {}", loanUtxoRef, causeChain(e), e);
-                walletEffects.accept(spentInputEffect(nominated[0], causeChain(e)));
+                markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e)));
                 return WorkResult.DEFINITE_FAILURE;
             }
         }
@@ -1736,19 +1719,29 @@ public class LiquidationExecutor {
             // SUBMITTED, or a submission whose outcome is AMBIGUOUS — it threw, or the backend's answer
             // was not a decoded refusal — after the bytes may have gone out: either way every input of
             // this body may already be spent, and the index cannot know it yet.
+            // FAB-185: every ROLE output among them is used for the rest of this check.
             Set<String> inputs = new LinkedHashSet<>();
             transaction.getBody().getInputs()
                     .forEach(in -> inputs.add(in.getTransactionId() + "#" + in.getIndex()));
-            walletEffects.accept(new WalletEffect(inputs,
+            markUsed(walletCheck, new WalletEffect(inputs,
                     "an input of transmitted liquidation " + TransactionUtil.getTxHash(transaction), false));
             return verdict.get().outcome() == LiquidationDecision.Outcome.SUBMITTED
                     ? WorkResult.SUBMITTED : WorkResult.AMBIGUOUS;
         }
-        walletEffects.accept(spentInputEffect(nominated[0], verdict.get().rejection()));
+        markUsed(walletCheck, spentInputEffect(nominated[0], verdict.get().rejection()));
         // S1/S2 withheld a candidate worth doing: the shadow intent that serves its market this call.
         if (verdict.get().outcome() == LiquidationDecision.Outcome.WOULD_SUBMIT
                 && (verdict.get().veto() == SubmitVeto.MODE_NOT_LIVE
                     || verdict.get().veto() == SubmitVeto.MARKET_NOT_LIVE)) {
+            // FAB-185 (M7) — a NODE-shadow WOULD_SUBMIT stands for a transmission that a live node would
+            // have made, so its designated output is used for the rest of the check. A MARKET-shadow one,
+            // on a node that is otherwise live, marks nothing: the next market's candidate is still built.
+            if (verdict.get().veto() == SubmitVeto.MODE_NOT_LIVE) {
+                String ref = WalletRoles.ref(designated);
+                walletCheck.used().add(ref);
+                log.debug("wallet output {} is used for the rest of this check: the node-shadow WOULD_SUBMIT of {}",
+                        ref, loanUtxoRef);
+            }
             return WorkResult.WOULD_SUBMIT;
         }
         return WorkResult.DEFINITE_FAILURE;
@@ -1843,7 +1836,7 @@ public class LiquidationExecutor {
     /**
      * FAB-183: an oracle out-ref the node cannot see yet is a WAIT — a fresher price announced a Charli3
      * provider UTxO whose block is not stored here yet. REFUSED at INFO, retried on the next block, and the
-     * nominated wallet utxo is kept: nothing was evaluated, so nothing says it is spent.
+     * designated wallet output is not marked used: nothing was evaluated, so nothing says it is spent.
      */
     private void refuseNotYetVisible(LiquidationAssessment assessment, long now,
                                      OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait) {
@@ -2771,126 +2764,6 @@ public class LiquidationExecutor {
     // ---- cycle plumbing -----------------------------------------------------------------------
 
     /**
-     * The bot's fee and collateral UTxO: ada only, no reference script, <em>and no datum</em>.
-     * <p>
-     * The first two clauses are {@code ScheduledTransactionService}'s. The two datum clauses are
-     * this loop's own, and they are not belt-and-braces — they are the difference between the loop
-     * working and the loop producing nothing at all. {@link LiquidateTransactionBuilder}'s
-     * {@code WALLET_UTXO_NOT_ADA_ONLY} rejects a datum-carrying wallet UTxO, and a single-asset ada
-     * UTxO with an inline datum is entirely routine in a bot wallet (a DEX order refund, an airdrop
-     * claim). Selecting one here would refuse <em>every</em> candidate of <em>every</em> cycle for as
-     * long as it sat in the wallet — and a refusal is reconsidered every cycle, so nothing would ever
-     * break the loop out of it. Filtering it out here costs one clause; not filtering it costs the slice
-     * its entire output, with no symptom louder than a repeated refusal reason.
-     * <p>
-     * ⛔ <b>THIS IS A GATE, NOT A SELECTION LIST — its RETURN VALUE must never be threaded through the
-     * rest of a cycle (F3, round 2).</b> It used to be: {@code cycle()} called this with no argument,
-     * fetched the wallet itself, filtered to ada-only, and handed that ada-only subset to everything
-     * downstream — including the token-principal balance sum and {@code nominate()}'s token branch.
-     * Every multi-asset (token-carrying) wallet utxo was therefore gone before either ever ran, so a
-     * token-principal candidate's market-gate balance was ALWAYS zero regardless of what the wallet
-     * actually held — discovered writing the first executor-level test to fund one for real. The
-     * caller now passes the wallet in (fetched once) and keeps the UNFILTERED list for everything
-     * else; this method now answers only "is there at least one ada-only utxo to fund ANYTHING with".
-     */
-    private List<Utxo> nominableWalletUtxos(List<Utxo> walletUtxos) {
-        if (walletUtxos.isEmpty()) {
-            log.warn("No wallet UTXOs found for account: {}", account.baseAddress());
-            return List.of();
-        }
-        List<Utxo> nominable = walletUtxos.stream()
-                .filter(WalletInputSelection::nominable)
-                .toList();
-        if (nominable.isEmpty()) {
-            // Say WHAT was rejected and WHY, not just that nothing qualified. The 2026-08-24 shadow
-            // run cost a full diagnosis round to establish something this line would have stated
-            // outright: the only UTxO at the bot's address was the published loan_claim_action
-            // reference script. "No valid utxos" alone cannot tell an empty wallet apart from a
-            // wallet whose entire contents are ineligible, and those need opposite responses.
-            log.warn("no spendable wallet utxo at {} — {} candidate(s) all rejected: [{}]. The bot "
-                            + "needs at least one utxo holding ONLY ada, with no datum and no "
-                            + "reference script.",
-                    account.baseAddress(), walletUtxos.size(),
-                    walletUtxos.stream().map(LiquidationExecutor::whyNotSpendable)
-                            .collect(java.util.stream.Collectors.joining("; ")));
-        } else {
-            log.info("{} spendable wallet utxo(s) this cycle, {} lovelace in the largest — each "
-                            + "candidate nominates the SMALLEST that covers its own requirement",
-                    nominable.size(),
-                    WalletInputSelection.largestNominable(nominable).map(Object::toString).orElse("0"));
-        }
-        return nominable;
-    }
-
-    /**
-     * T-052 — nominate the wallet input for ONE candidate: the smallest that covers the fee ceiling
-     * plus whatever extra outlay this liquidation itself must pay out.
-     * <p>
-     * Part 2 of the token-principals slice — TOKEN-AWARE. When {@code principal} is a real token AND
-     * there is an outlay to fund, the nominated utxo must carry {@code extraOutlay} of THAT token
-     * (never lovelace) plus enough ada alongside it for the fee ceiling and the min-ada rider on the
-     * lender's output — {@link WalletInputSelection#smallestSufficientToken}. The ada-only path below
-     * is otherwise BYTE-IDENTICAL to before: same selection, same log shape.
-     *
-     * @param principal   the loan's principal asset; irrelevant (and may be {@code null}) when
-     *                    {@code extraOutlay} is zero — the fee-only path never reads it
-     * @param extraOutlay this transaction pays out from the bot's own wallet beyond the fee, in
-     *                    PRINCIPAL units — ada for an ada principal, the principal's own base units for
-     *                    a token one — and {@code ZERO} on the fee-only path, which is the distinction
-     *                    the whole ticket is about
-     */
-    private Optional<Utxo> nominate(List<Utxo> walletUtxos, Optional<BigInteger> feeCeiling,
-                                    AssetType principal, BigInteger extraOutlay, String loanUtxoRef) {
-        if (principal != null && !principal.isAda() && extraOutlay.signum() > 0) {
-            // ⛔ F8 (round 2) — WHICH RIDERS requiredAda COVERS, AND WHICH IT DOES NOT.
-            //
-            // requiredAda = feeCeiling + TOKEN_PRINCIPAL_MIN_ADA_CEILING covers the fee ceiling PLUS
-            // ONE rider: the min-ada on the LENDER's own converted output. It does NOT sum the S-15
-            // collateral rider (the bot's own acquired-collateral output — measured 1,176,630 lovelace
-            // on the pinned rig) or the change output's own min-ada. Measured together those riders
-            // exceed what a bare 2 ADA ceiling covers.
-            //
-            // That is a DELIBERATE reliance on CCL's balancer, not an oversight: ReferenceScriptSafe
-            // UtxoSelection's own selector (wired in LiquidatePayInAdvanceTransactionBuilder#complete)
-            // picks MORE ada-only wallet utxos automatically whenever the nominated one falls short
-            // during balancing — the exact mechanism trap 21 / T-050 already rely on for the plain
-            // path's fee. It only holds when the wallet actually CARRIES ada-only headroom besides the
-            // token-carrying utxo nominated here, so a wallet that does not is logged rather than
-            // discovered for the first time at build failure.
-            long adaOnlySpares = walletUtxos.stream().filter(WalletInputSelection::nominable).count();
-            if (adaOnlySpares < 2) {
-                log.warn("{} nominates a token-principal wallet utxo with only {} ada-only utxo(s) "
-                                + "besides it; the S-15 collateral rider and the change output's own "
-                                + "min-ada are funded by CCL's balancer picking MORE of them during "
-                                + "build, not by requiredAda here — fund at least 2 ada-only utxos "
-                                + "alongside the {} wallet utxo to be safe",
-                        loanUtxoRef, adaOnlySpares, principal.toUnit());
-            }
-            BigInteger requiredAda = WalletInputSelection.tokenPrincipalRequiredAda(feeCeiling);
-            Optional<Utxo> chosen = WalletInputSelection.smallestSufficientToken(
-                    walletUtxos, principal, extraOutlay, requiredAda);
-            chosen.ifPresent(utxo -> log.info("{} nominates wallet utxo {}#{} ({} {} + {} lovelace) for "
-                            + "a requirement of {} {} + {} lovelace (fee ceiling + min-ada rider){}",
-                    loanUtxoRef, utxo.getTxHash(), utxo.getOutputIndex(),
-                    WalletInputSelection.tokenQuantityOf(utxo, principal), principal.toUnit(),
-                    LedgerCeilings.lovelaceOf(utxo), extraOutlay, principal.toUnit(), requiredAda,
-                    feeCeiling.isPresent() ? "" : " (fee ceiling unavailable this cycle)"));
-            return chosen;
-        }
-        Optional<Utxo> chosen = feeCeiling
-                .map(ceiling -> WalletInputSelection.smallestSufficient(
-                        walletUtxos, ceiling.add(extraOutlay)))
-                .orElseGet(() -> WalletInputSelection.largest(walletUtxos));
-        chosen.ifPresent(utxo -> log.info("{} nominates wallet utxo {}#{} ({} lovelace) for a "
-                        + "requirement of {} + {} outlay{}",
-                loanUtxoRef, utxo.getTxHash(), utxo.getOutputIndex(),
-                LedgerCeilings.lovelaceOf(utxo),
-                feeCeiling.map(Object::toString).orElse("an unknown fee"), extraOutlay,
-                feeCeiling.isPresent() ? "" : " (largest, protocol params unavailable)"));
-        return chosen;
-    }
-
-    /**
      * The amount actually paid to the lender on the pay-in-advance path, MEASURED off the built
      * transaction's asset-manager outputs rather than re-derived — the announce line's source of
      * truth, so it can never disagree with what the transaction pays. For ada: the ada-only
@@ -2929,70 +2802,6 @@ public class LiquidationExecutor {
                 .filter(a -> HexUtil.encodeHexString(a.getNameAsBytes()).equalsIgnoreCase(asset.assetName()))
                 .map(Asset::getValue)
                 .reduce(BigInteger.ZERO, BigInteger::add);
-    }
-
-    /**
-     * T-061 — <b>every wallet requirement this cycle can evaluate, stated together.</b>
-     *
-     * <h2>Why this exists</h2>
-     * The refusal this replaced named ONE gate — the spend input's fee coverage — and told the
-     * operator to <i>"fund the wallet with one ada-only utxo of at least that amount"</i>. <b>Doing
-     * exactly that clears the spend gate and then fails the collateral one</b>, because T-050 made
-     * collateral inputs a separate selection with a separate ceiling. The operator spends a funding
-     * transaction and returns to the same refusal with the same confidence.
-     * <p>
-     * <b>A remedy is a claim.</b> If a message tells you what to do, doing it must be sufficient — or
-     * the message must say it is not.
-     *
-     * <h2>⚠ And it may only name gates it has actually evaluated</h2>
-     * Listing requirements this code has not checked would be a different lie, and a worse one:
-     * an operator cannot tell a computed figure from a plausible one. So each line below is
-     * <em>measured</em> here, and when the protocol parameters are unavailable the message says the
-     * gates could not be sized rather than guessing at them.
-     */
-    static String walletDiagnosis(List<Utxo> walletUtxos, Optional<ProtocolParams> params,
-                                   Optional<BigInteger> spendRequired, BigInteger extraOutlay) {
-        String largest = WalletInputSelection.largestNominable(walletUtxos)
-                .map(Object::toString).orElse("none at all");
-        if (params.isEmpty() || spendRequired.isEmpty()) {
-            return ("no ada-only wallet utxo could be nominated; largest nominable is %s. The "
-                    + "protocol parameters could not be fetched this cycle, so neither the fee nor the "
-                    + "collateral requirement could be sized — this names no figure rather than "
-                    + "guessing one.").formatted(largest);
-        }
-        BigInteger spend = spendRequired.get().add(extraOutlay);
-        return ("the wallet does not satisfy every requirement a liquidation has, and BOTH are listed "
-                + "because funding for one does not satisfy the other. (1) SPEND INPUT: one ada-only, "
-                + "datum-free, reference-script-free utxo holding at least %s lovelace (the most this "
-                + "ledger could charge in fees%s); largest nominable is %s. %s Fund the wallet so both "
-                + "hold, not just the first.")
-                .formatted(spend,
-                        extraOutlay.signum() > 0 ? " plus " + extraOutlay + " paid out" : "",
-                        largest, collateralGate(walletUtxos, params));
-    }
-
-    /**
-     * The second gate, which the spend gate masks. Collateral inputs are chosen separately from the
-     * nominated spend input (T-050) and are summed across at most {@code maxCollateralInputs} utxos,
-     * so this is a TOTAL rather than a single-utxo requirement — and an operator funding "one utxo of
-     * at least X" can satisfy the spend gate and still miss it.
-     */
-    static String collateralGate(List<Utxo> walletUtxos, Optional<ProtocolParams> params) {
-        if (params.isEmpty()) {
-            return "(2) COLLATERAL: could not be sized — protocol parameters unavailable this cycle.";
-        }
-        ProtocolParams p = params.get();
-        BigInteger required = LedgerCeilings.maxPossibleCollateral(p);
-        int limit = Math.max(1, p.getMaxCollateralInputs());
-        BigInteger available = walletUtxos.stream()
-                .filter(WalletInputSelection::nominable)
-                .map(LedgerCeilings::lovelaceOf)
-                .sorted(java.util.Comparator.reverseOrder())
-                .limit(limit)
-                .reduce(BigInteger.ZERO, BigInteger::add);
-        return ("(2) COLLATERAL: at least %s lovelace in TOTAL across at most %d nominable utxos, "
-                + "chosen separately from the spend input; available %s.")
-                .formatted(required, limit, available);
     }
 
     /**
@@ -3037,25 +2846,6 @@ public class LiquidationExecutor {
         return Math.min(nowMillis, tipMillis);
     }
 
-    /** Why one wallet candidate cannot be spent, for the operator-facing rejection list. */
-    private static String whyNotSpendable(Utxo utxo) {
-        List<String> reasons = new ArrayList<>();
-        if (utxo.getAmount().size() != 1) {
-            reasons.add("carries " + utxo.getAmount().size() + " assets, not ada alone");
-        }
-        if (utxo.getReferenceScriptHash() != null) {
-            reasons.add("carries reference script " + utxo.getReferenceScriptHash());
-        }
-        if (utxo.getInlineDatum() != null) {
-            reasons.add("carries an inline datum");
-        }
-        if (utxo.getDataHash() != null) {
-            reasons.add("carries a datum hash");
-        }
-        return utxo.getTxHash() + "#" + utxo.getOutputIndex()
-                + (reasons.isEmpty() ? " eligible" : " " + String.join(", ", reasons));
-    }
-
     /**
      * The oracle registry as it stands right now, keyed the way the builder wants it: by the oracle
      * NFT's unit, which is what a loan datum points at and what {@code retrieve_oracle_data} matches
@@ -3085,7 +2875,7 @@ public class LiquidationExecutor {
         return histogram;
     }
 
-    // ---- the cycle's wallet list ----------------------------------------------------------------
+    // ---- the check's used marks ------------------------------------------------------------------
 
     /** Ledger rejection: an input of the transaction does not exist (already spent). */
     static final String BAD_INPUTS_MARKER = "BadInputsUTxO";
@@ -3097,27 +2887,27 @@ public class LiquidationExecutor {
     static final String EMPTY_SCRIPT_FAILURES_MARKER = "\"ScriptFailures\":{}";
 
     /**
-     * What one candidate's consideration did to the cycle's wallet list: the {@code txHash#index}
-     * refs to drop from it for the rest of the cycle, and why. Handed out of {@code consider()} as a
-     * value once the candidate is finished, so its decisions stay exactly what they were and only the
-     * cycle loop's {@link #dropFromCycle} edits the list.
+     * What one candidate's consideration did to the check's wallet: the {@code txHash#index} refs that
+     * are spent for the rest of the check, and why. Handed out of {@code consider()} as a value once the
+     * candidate is finished, so its decisions stay exactly what they were and only the
+     * check's {@link #markUsed} turns it into used marks.
      */
     private record WalletEffect(Set<String> spentWalletRefs, String why, boolean warn) {
 
         static final WalletEffect NONE = new WalletEffect(Set.of(), null, false);
     }
 
-    /** Records the utxo a selector chose, so a later failure can name it. */
+    /** Records the output a route was handed, so a later failure can name it. */
     private static Optional<Utxo> remember(Utxo[] slot, Optional<Utxo> chosen) {
         chosen.ifPresent(utxo -> slot[0] = utxo);
         return chosen;
     }
 
     /**
-     * The candidate's nominated wallet utxo, when its failure says an input is already spent —
-     * {@code BadInputsUTxO}, or the empty-failures evaluation. Neither names a wallet utxo reliably
-     * (the loan utxo may be the spent one), and dropping one utxo for the rest of one cycle costs
-     * nothing, while nominating a spent one again fails the next candidate too.
+     * The candidate's designated wallet output, when its failure says an input is already spent —
+     * {@code BadInputsUTxO}, or the empty-failures evaluation. Neither names a wallet output reliably
+     * (the loan utxo may be the spent one), and marking one output used for the rest of one check costs
+     * a skipped candidate, while handing a spent one out again fails the next candidate too.
      */
     private static WalletEffect spentInputEffect(Utxo nominated, String failure) {
         if (nominated == null || failure == null) {
@@ -3134,22 +2924,135 @@ public class LiquidationExecutor {
                 marker, true);
     }
 
-    /** Applies one candidate's {@link WalletEffect} to the cycle's wallet list. */
-    private static void dropFromCycle(List<Utxo> walletUtxos, WalletEffect effect) {
-        if (effect.spentWalletRefs().isEmpty()) {
-            return;
-        }
-        walletUtxos.removeIf(utxo -> {
-            String ref = utxo.getTxHash() + "#" + utxo.getOutputIndex();
-            if (!effect.spentWalletRefs().contains(ref)) {
-                return false;
+    /**
+     * Applies one candidate's {@link WalletEffect} to the check's used marks (FAB-185): every ROLE output
+     * among its refs — C, U or a token output — is used for the rest of the check. The roles themselves are
+     * never re-resolved; a candidate designated to a used output is skipped before anything is built.
+     */
+    private static void markUsed(WalletCheck walletCheck, WalletEffect effect) {
+        for (String ref : effect.spentWalletRefs()) {
+            if (walletCheck.roles().roleOf(ref).isEmpty() || !walletCheck.used().add(ref)) {
+                continue;
             }
             if (effect.warn()) {
                 log.warn("dropped wallet utxo {} from this cycle: {}", ref, effect.why());
             } else {
                 log.info("dropped wallet utxo {} from this cycle: {}", ref, effect.why());
             }
-            return true;
-        });
+        }
+    }
+
+    // ---- the check's wallet roles (FAB-185) ------------------------------------------------------
+
+    /** The role names a refusal starts with: {@code role U}, {@code role TOKEN <unit>}. */
+    static final String ROLE_U = "U";
+    static final String ROLE_TOKEN = "TOKEN ";
+
+    /**
+     * One {@link #cycle(long, SubmitFence)} call's wallet: the read it started from, the roles resolved
+     * from it once, the fee ceiling every requirement is sized with, the outputs that went out, and the
+     * missing roles already said at WARN. Created per call and dropped with it; nothing in it outlives it.
+     */
+    private record WalletCheck(List<Utxo> wallet, WalletRoles roles, BigInteger feeCeiling, Set<String> used,
+                               Set<String> warnedMissingRoles) {
+
+        WalletCheck(List<Utxo> wallet, WalletRoles roles, BigInteger feeCeiling) {
+            this(wallet, roles, feeCeiling, new HashSet<>(), new HashSet<>());
+        }
+    }
+
+    /** What a role refusal says about the rebalancer, which is what keeps the wallet in shape. */
+    private String rebalancerOutcome() {
+        return walletRebalancer == null ? "the wallet rebalancer is not wired"
+                : "the wallet rebalancer's last outcome: " + walletRebalancer.lastOutcome();
+    }
+
+    /**
+     * The output {@code role} designates for this candidate, or null when the candidate is finished: the
+     * role is missing (a REFUSED {@code WALLET_ROLE_MISSING} row, and one WARN per role per check), or its
+     * output already went out in this check (an INFO line, no row). Either way nothing is built.
+     */
+    private Utxo designated(LiquidationAssessment assessment, long now, WalletCheck walletCheck, String role,
+                            Optional<Utxo> output) {
+        String loanUtxoRef = assessment.loan().utxoRef();
+        if (output.isEmpty()) {
+            String missing = ROLE_U.equals(role)
+                    ? "the wallet holds no ada-only output (no datum, no reference script) besides C, the "
+                            + walletCheck.roles().collateralLovelace() + "-lovelace collateral"
+                    : "no wallet output without a datum or reference script holds any "
+                            + role.substring(ROLE_TOKEN.length());
+            String detail = "role %s is missing: %s, so this liquidation has nothing to be funded from; %s"
+                    .formatted(role, missing, rebalancerOutcome());
+            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                    "WALLET_ROLE_MISSING", detail));
+            if (walletCheck.warnedMissingRoles().add(role)) {
+                log.warn("the liquidation of {} was refused: {}", loanUtxoRef, detail);
+            } else {
+                log.debug("the liquidation of {} was refused: {}", loanUtxoRef, detail);
+            }
+            return null;
+        }
+        String ref = WalletRoles.ref(output.get());
+        if (walletCheck.used().contains(ref)) {
+            log.info("liquidation of {} skipped: wallet output {} (role {}) already went out in this check",
+                    loanUtxoRef, ref, role);
+            return null;
+        }
+        return output.get();
+    }
+
+    /** What a sized offer found its output short of: the text a refusal names, and the lovelace part of it. */
+    private static final class Need {
+        private String text;
+        private BigInteger lovelace;
+    }
+
+    /** {@code output} when it holds at least {@code required} lovelace; otherwise empty, with what was needed. */
+    private static Optional<Utxo> sized(String loanUtxoRef, String role, Utxo output, BigInteger required,
+                                        Need needed) {
+        if (LedgerCeilings.lovelaceOf(output).compareTo(required) >= 0) {
+            log.info("{} is funded from wallet output {} (role {}, {} lovelace) for a requirement of {} lovelace",
+                    loanUtxoRef, WalletRoles.ref(output), role, LedgerCeilings.lovelaceOf(output), required);
+            return Optional.of(output);
+        }
+        needed.text = required + " lovelace";
+        needed.lovelace = required;
+        return Optional.empty();
+    }
+
+    /**
+     * {@code output} when it holds at least {@code payout} of {@code unit} AND at least {@code requiredAda}
+     * lovelace beside it; otherwise empty, with what was needed.
+     */
+    private static Optional<Utxo> sizedToken(String loanUtxoRef, String role, Utxo output, String unit,
+                                             BigInteger payout, BigInteger requiredAda, Need needed) {
+        if (WalletRoles.quantityOf(output, unit).compareTo(payout) >= 0
+                && LedgerCeilings.lovelaceOf(output).compareTo(requiredAda) >= 0) {
+            log.info("{} is funded from wallet output {} (role {}, {} {} + {} lovelace) for a requirement of "
+                            + "{} {} + {} lovelace", loanUtxoRef, WalletRoles.ref(output), role,
+                    WalletRoles.quantityOf(output, unit), unit, LedgerCeilings.lovelaceOf(output), payout, unit,
+                    requiredAda);
+            return Optional.of(output);
+        }
+        needed.text = payout + " " + unit + " + " + requiredAda + " lovelace";
+        needed.lovelace = requiredAda;
+        return Optional.empty();
+    }
+
+    /**
+     * The WALLET_INPUT_TOO_SMALL detail: the role, its output, what it holds and what was needed — with the
+     * lovelace shortfall when there is one — followed by {@code why}.
+     *
+     * @param unit the token the role is for, or null for an ada role
+     */
+    private static String tooSmallDetail(String role, Utxo output, String unit, Need needed, String why) {
+        BigInteger lovelace = LedgerCeilings.lovelaceOf(output);
+        String holds = unit == null ? lovelace + " lovelace"
+                : WalletRoles.quantityOf(output, unit) + " " + unit + " + " + lovelace + " lovelace";
+        String shortfall = needed.lovelace != null && needed.lovelace.compareTo(lovelace) > 0
+                ? ", short by " + needed.lovelace.subtract(lovelace) + " lovelace" : "";
+        return "role %s, wallet output %s, holds %s; needed %s%s (pre-build ceilings: the build is the judge). %s"
+                .formatted(role, WalletRoles.ref(output), holds, needed.text == null ? "more" : needed.text, shortfall,
+                        why);
     }
 }
