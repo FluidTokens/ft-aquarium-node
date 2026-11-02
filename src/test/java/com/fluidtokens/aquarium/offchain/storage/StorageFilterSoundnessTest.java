@@ -63,9 +63,11 @@ import static org.mockito.Mockito.when;
  * <h2>Why this is the epic's load-bearing pin</h2>
  * {@link TankUtxoStorage#saveUnspent} keeps only outputs whose payment credential is in
  * {@link TankUtxoStorage#indexedPaymentCredentials()}, a set built ONCE at construction
- * ({@code officina:yaci-store-index-scoping} §2). A row outside it is discarded at write time and leaves no
+ * ({@code officina:yaci-store-index-scoping} §2) — plus, at ANY address, outputs holding a token of one of
+ * {@link TankUtxoStorage#indexedOracleNftPolicies()} ({@code loans.oracle.indexed-nft-policies}, FAB-196), a
+ * second clause likewise fixed at construction. A row outside both is discarded at write time and leaves no
  * trace, so an index read for a credential outside the set answers "empty" — indistinguishable from
- * "nothing there" (§4/§4b). A narrowed set is worse than blind: {@code saveSpent} is not filtered, so an
+ * "nothing there" (§4/§4b); a policy-kept row at an unwatched credential is reachable by out-ref only. A narrowed set is worse than blind: {@code saveSpent} is not filtered, so an
  * object that moves while its credential is missing is DELETED from the index while still live on chain
  * (§2a). Three things therefore fail here:
  * <ol>
@@ -179,10 +181,15 @@ class StorageFilterSoundnessTest {
 
     private static TankUtxoStorage storage(String minswapPoolSpendScriptHash,
                                            ObjectProvider<LoansContractRegistry> loans) {
+        return storage(minswapPoolSpendScriptHash, loans, "");
+    }
+
+    private static TankUtxoStorage storage(String minswapPoolSpendScriptHash,
+                                           ObjectProvider<LoansContractRegistry> loans, String oracleNftPolicies) {
         return new TankUtxoStorage(mock(UtxoRepository.class), mock(TxInputRepository.class), mock(DSLContext.class),
                 new UtxoCache(), null, account,
                 new ParametersContractService(aquarium), new StakerContractService(aquarium),
-                new TankContractService(aquarium), loans, minswapPoolSpendScriptHash);
+                new TankContractService(aquarium), loans, minswapPoolSpendScriptHash, oracleNftPolicies);
     }
 
     @SuppressWarnings("unchecked")
@@ -249,6 +256,77 @@ class StorageFilterSoundnessTest {
 
         assertEquals(new TreeSet<>(expected), new TreeSet<>(storage(required("loans.minswap.pool-spend-script-hash"),
                 providing(unconfigured)).indexedPaymentCredentials()));
+    }
+
+    // ---- a'. the oracle NFT policy clause, per shipped document (FAB-196-1) ---------------------------
+
+    private static final String ORACLE_POLICIES_EXPRESSION = "${loans.oracle.indexed-nft-policies:}";
+
+    /** Mainnet: the Lending v4 ({@code oracleVersion} 2) feed policy, and nothing else. */
+    private static final Set<String> MAINNET_ORACLE_POLICIES =
+            Set.of("26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26");
+
+    /** Preview: the registry's feed policies ∪ its Charli3 provider policies, as read 2026-11-02. */
+    private static final Set<String> PREVIEW_ORACLE_POLICIES = Set.of(
+            "9a2ec5c92daccbb269611a9eae7a40f9788d3f9c0229661b6234286f",
+            "decfbd6bdd5c3eb1915564d414fe099db8c08d5e18037562cc7bb4b3",
+            "d618b31a27c89d9e784d2811d7bd7241582ce950c76db63570574df0",
+            "6b8679b15d01f983a1d1a1f71590f2daa3d6d83fae718915db84f800");
+
+    /** The mainnet v1 feed policies, which neither document may carry. */
+    private static final List<String> V1_ORACLE_POLICIES = List.of(
+            "93794f9b7f3dc632cb889c7aec7d334f016f532e64f16141b6895f5b",
+            "5b155d1986c8ff976406479d4d455e8115d4f2c4cbf2e84c426df0cf");
+
+    /**
+     * ⛔ The annotation carries NO inline default ({@code officina:spring-boot-config-binding-traps} §4): the
+     * value lives in each YAML document, so the preview document can override it. The expression is read off
+     * the constructor itself, resolved against the base document alone and against preview layered over base,
+     * and the storage built from each resolved value must index exactly that network's policies.
+     */
+    @Test
+    void eachShippedDocumentIndexesExactlyItsOracleNftPolicies() throws IOException {
+        var constructors = TankUtxoStorage.class.getConstructors();
+        assertEquals(1, constructors.length, "fixture: TankUtxoStorage has one constructor");
+        String expression = null;
+        for (var parameter : constructors[0].getParameters()) {
+            var value = parameter.getAnnotation(org.springframework.beans.factory.annotation.Value.class);
+            if (value != null && value.value().contains("indexed-nft-policies")) {
+                expression = value.value();
+            }
+        }
+        assertEquals(ORACLE_POLICIES_EXPRESSION, expression,
+                "the oracle NFT policy list must be read with a BLANK inline default, never a policy");
+
+        List<PropertySource<?>> docs = new YamlPropertySourceLoader()
+                .load("application.yaml", new ClassPathResource("application.yaml"));
+        assertEquals("preview", docs.get(1).getProperty("spring.config.activate.on-profile"),
+                "fixture: the second document is the preview profile");
+
+        StandardEnvironment base = hermetic();
+        base.getPropertySources().addLast(docs.get(0));
+        StandardEnvironment preview = hermetic();
+        preview.getPropertySources().addLast(docs.get(1));
+        preview.getPropertySources().addLast(docs.get(0));
+
+        Set<String> mainnet = storage("", providing(registry), base.resolvePlaceholders(expression))
+                .indexedOracleNftPolicies();
+        Set<String> previewSet = storage("", providing(registry), preview.resolvePlaceholders(expression))
+                .indexedOracleNftPolicies();
+
+        assertEquals(new TreeSet<>(MAINNET_ORACLE_POLICIES), new TreeSet<>(mainnet), "the base (mainnet) document");
+        assertEquals(new TreeSet<>(PREVIEW_ORACLE_POLICIES), new TreeSet<>(previewSet), "the preview document");
+        for (String v1 : V1_ORACLE_POLICIES) {
+            assertFalse(mainnet.contains(v1), "a v1 feed policy is indexed on mainnet: " + v1);
+            assertFalse(previewSet.contains(v1), "a v1 feed policy is indexed on preview: " + v1);
+        }
+    }
+
+    private static StandardEnvironment hermetic() {
+        StandardEnvironment env = new StandardEnvironment();
+        env.getPropertySources().remove(StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME);
+        env.getPropertySources().remove(StandardEnvironment.SYSTEM_PROPERTIES_PROPERTY_SOURCE_NAME);
+        return env;
     }
 
     // ---- b. the reader inventory --------------------------------------------------------------------

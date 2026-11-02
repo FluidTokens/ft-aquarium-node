@@ -313,11 +313,16 @@ jobs:
       # feat/fab-189-composable-node, 2026-11-02: 228 files / 2542 tests / 0 failures / 0 errors / 51 skipped,
       # 0 orphans. Floor 228.
       #
+      # FAB-196-1 (OracleReferenceInputProbeVerdictPinTest: the oracle probe's verdicts pinned exactly; plus
+      # cases in TankUtxoStorageTest and StorageFilterSoundnessTest for the oracle NFT policy index clause)
+      # re-measured cold keyless on feat/fab-189-composable-node, 2026-11-02: 229 files / 2571 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 229.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '228'
+          RESULT_FILE_FLOOR: '229'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

@@ -116,6 +116,14 @@ loans:
     stream:
       enabled: ${LOANS_ORACLE_STREAM_ENABLED:true}
       url: ${LOANS_ORACLE_STREAM_URL:wss://25mxd4whnj.execute-api.eu-west-1.amazonaws.com/prod}
+    # FAB-196: the index also keeps every output that holds a token of one of these oracle NFT policies,
+    # at ANY address — the oracle feed and Charli3 provider UTxOs a liquidation references — beside the
+    # payment credentials it watches. One comma-separated string of 56-hex policy ids (a YAML list would not
+    # resolve through @Value); blank keeps none. Mainnet: the Lending v4 (`oracleVersion` 2) feed policy only;
+    # the v1 feed policies are deliberately absent. NOT governed by `loans.oracle.enabled` — a switch that
+    # narrows a write-time filter would delete history. Changing it re-indexes nothing by itself: a stored
+    # cursor wins, so a re-sync is needed for blocks already passed.
+    indexed-nft-policies: 26e60b2083c14b849e622f8e05dd46ab01a7986fe5d72eeba8680d26
   # The auto-liquidation bot. `mode` is disabled / shadow / live, and it is the WHOLE node-level dial.
   # The bot has no timer: liquidation, compound and wallet housekeeping run on committed blocks and oracle price changes (FAB-183).
   #
@@ -637,6 +645,7 @@ loans:
     # (merged with the API's prices by default); `enabled` and `source` are inherited.
     stream:
       url: ${LOANS_ORACLE_STREAM_URL:wss://2tgda3mk4l.execute-api.eu-west-1.amazonaws.com/dev}
+    indexed-nft-policies: 9a2ec5c92daccbb269611a9eae7a40f9788d3f9c0229661b6234286f,decfbd6bdd5c3eb1915564d414fe099db8c08d5e18037562cc7bb4b3,d618b31a27c89d9e784d2811d7bd7241582ce950c76db63570574df0,6b8679b15d01f983a1d1a1f71590f2daa3d6d83fae718915db84f800
   ui:
     # Blank: the mainnet USDM unit means nothing here, so the readiness page shows USD as unavailable.
     usd-reference-unit: ""
