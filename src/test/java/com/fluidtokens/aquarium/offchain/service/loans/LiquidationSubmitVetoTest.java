@@ -793,10 +793,21 @@ class LiquidationSubmitVetoTest {
             Map<String, Utxo> unspent = new LinkedHashMap<>();
             unspent.put(scenario.loan().loan().utxoRef(), scenario.loan().utxo());
             unspent.put(scenario.bond().bond().utxoRef(), scenario.bond().utxo());
+            // FAB-185: ONE wallet list, read by the executor and resolvable by the plain builder — it pins the
+            // executor's role C as collateral, and CCL resolves a pinned collateral input by out-ref.
+            List<Utxo> walletUtxos = wallet != null ? wallet
+                    : LoanFixtures.shapedWallet(params, ACCOUNT.baseAddress(), WALLET_UTXO);
+            List<Utxo> builderUniverse = new ArrayList<>(universe);
+            for (Utxo walletUtxo : walletUtxos) {
+                if (walletUtxo != null && builderUniverse.stream().noneMatch(u -> u.getTxHash()
+                        .equals(walletUtxo.getTxHash()) && u.getOutputIndex() == walletUtxo.getOutputIndex())) {
+                    builderUniverse.add(walletUtxo);
+                }
+            }
 
             LiquidateTransactionBuilder builder = new LiquidateTransactionBuilder(
                     LoanFixtures.registry(), LoanFixtures.NETWORK, LoanFixtures.converters(),
-                    LoanFixtures.utxoSupplier(universe), protocolParams());
+                    LoanFixtures.utxoSupplier(builderUniverse), protocolParams());
 
             BlockEventListener blockEventListener = new BlockEventListener(null);
             blockEventListener.getIsSyncing().set(false);
@@ -807,8 +818,7 @@ class LiquidationSubmitVetoTest {
                     new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                             LoanFixtures.utxoSupplier(universe), protocolParams()));
             LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                    new FakeAppUtxoService(wallet != null ? wallet
-                            : LoanFixtures.shapedWallet(params, ACCOUNT.baseAddress(), WALLET_UTXO)),
+                    new FakeAppUtxoService(walletUtxos),
                     account, new FakeScanner(List.of(scenario.assessment())),
                     new FakeResolver(unspent, loanAnswersBeforeItIsGone, bondAnswersBeforeItIsGone,
                             loanThrows),

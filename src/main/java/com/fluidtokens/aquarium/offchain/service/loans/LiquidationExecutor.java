@@ -1676,7 +1676,11 @@ public class LiquidationExecutor {
                     // validator travels in the witness set instead, which is legal and much larger —
                     // with none set at all the transaction cannot fit under maxTxSize, and the
                     // TX_TOO_LARGE veto below is what says so.
-                    configuration.getReferenceScripts());
+                    configuration.getReferenceScripts(),
+                    // FAB-185 — role C, pinned by the builder as the only collateral and never spent. Present
+                    // on every check that reaches here (the check stops without C); a missing one would be
+                    // refused by name (COLLATERAL_UTXO_INVALID), never guessed at.
+                    walletCheck.roles().c().orElse(null));
 
             try {
                 transaction = builder.build(request);

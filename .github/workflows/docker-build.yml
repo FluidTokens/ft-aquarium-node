@@ -294,11 +294,16 @@ jobs:
       # liquidation executor classes) re-measured cold keyless on feat/fab-183-event-driven-pipeline, 2026-11-02:
       # 227 files / 2470 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 227.
       #
+      # FAB-185-2 (DesignatedInputUtxoSupplierTest: the view in which the wallet holds only the plain
+      # liquidation's designated input; plus cases in the plain builder and production-wiring classes)
+      # re-measured cold keyless on feat/fab-183-event-driven-pipeline, 2026-11-02:
+      # 228 files / 2484 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 228.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '227'
+          RESULT_FILE_FLOOR: '228'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

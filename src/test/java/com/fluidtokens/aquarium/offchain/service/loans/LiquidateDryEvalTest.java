@@ -26,6 +26,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
@@ -120,6 +121,9 @@ class LiquidateDryEvalTest {
             LoanFixtures.botAddress(), 50_000_000L);
     private static final Utxo BOT_SPARE_UTXO = LoanFixtures.adaUtxo(TX_BOT_SPARE, 0,
             LoanFixtures.botAddress(), 10_000_000L);
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of the rig's params. */
+    private static final Utxo COLLATERAL_UTXO = LoanFixtures.adaUtxo(repeat("c5"), 0, LoanFixtures.botAddress(),
+            WalletShape.collateralLovelace(EvalFixtures.protocolParams().getProtocolParams()).longValueExact());
 
     /** The real ledger limit. Not the rig's {@link EvalFixtures#protocolParams()} ceiling. */
     private static final int MAX_TX_SIZE = 16_384;
@@ -825,7 +829,7 @@ class LiquidateDryEvalTest {
 
     private static List<Utxo> universe(List<Scenario> scenarios) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
-                BOT_SPARE_UTXO));
+                BOT_SPARE_UTXO, COLLATERAL_UTXO));
         scenarios.forEach(scenario -> {
             universe.add(scenario.loan().utxo());
             universe.add(scenario.bond().utxo());
@@ -853,7 +857,7 @@ class LiquidateDryEvalTest {
         return new LiquidateTransactionBuilder.Request(
                 scenarios.stream().map(Scenario::toLiquidation).toList(),
                 CONFIG_UTXO, LM_CONFIG_UTXO, noOracles, WALLET_UTXO, LoanFixtures.botAddress(),
-                VALID_FROM, VALID_TO, MARGIN, refs);
+                VALID_FROM, VALID_TO, MARGIN, refs, COLLATERAL_UTXO);
     }
 
     // ---- the published reference scripts ---------------------------------------------------
