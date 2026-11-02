@@ -9,6 +9,7 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfigurati
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WalletPipelineService;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
@@ -90,13 +91,21 @@ import java.util.function.Supplier;
  * shape, a refusal to build, a failed read, a closed fence, or an exception before the submit — sent nothing
  * and is {@link WorkResult#DEFINITE_FAILURE}.
  *
+ * <h2>What the pass line is told (FAB-195)</h2>
+ * {@link #housekeep(SubmitFence, StageTally)} also counts at most one ending per pass on the stage's tally, for the
+ * pipeline's summary line only: a submit that went out (an accepted one, a rejection {@link WorkResult#classify}
+ * calls AMBIGUOUS, or a submit that threw) is {@code submitted}; a decoded rejection is {@code attempted}; a failed
+ * or null wallet read, or a failure the catch-all caught, is {@code error}; a build that was not built, or a closed
+ * fence, is {@code no-op}. A closed gate and a wallet in shape count nothing. An {@code error} the stage itself
+ * caught is said in one ERROR line with its cause chain, and its stack trace goes to DEBUG.
+ *
  * <h2>What the last pass did</h2>
  * Every ending of {@link #housekeep(SubmitFence)} is also recorded in {@link #lastOutcome()} (FAB-188), a one-line
  * text whose prefix names the ending, so another component can quote what the rebalancer last did.
  *
  * <h2>Never throws</h2>
- * The whole body sits behind a catch-all that logs at ERROR, so a failure ends this stage for this pass and
- * nothing more: the pipeline's next trigger tries again.
+ * The whole body sits behind a catch-all that logs at ERROR — one line with the cause chain, the stack trace at
+ * DEBUG — so a failure ends this stage for this pass and nothing more: the pipeline's next trigger tries again.
  */
 @Service
 @Slf4j
@@ -226,10 +235,21 @@ public class WalletRebalancer {
      *         threw, or {@link WorkResult#DEFINITE_FAILURE} for every ending that sent nothing
      */
     public WorkResult housekeep(SubmitFence fence) {
+        return housekeep(fence, new StageTally());
+    }
+
+    /**
+     * {@link #housekeep(SubmitFence)}, counting this pass's ending on {@code tally} (FAB-195) — the wallet
+     * pipeline's own call. The answer is exactly the one-argument form's.
+     */
+    public WorkResult housekeep(SubmitFence fence, StageTally tally) {
         try {
-            return rebalanceIfNeeded(fence);
+            return rebalanceIfNeeded(fence, tally);
         } catch (Exception e) {
-            logFailure(e);
+            tally.recordError();
+            log.error("[REBALANCE] failed on this block; nothing further is attempted until the next one: {}",
+                    causeChain(e));
+            log.debug("[REBALANCE] failed on this block", e);
             lastOutcome = "failed: " + e;
             return WorkResult.DEFINITE_FAILURE;
         }
@@ -238,6 +258,31 @@ public class WalletRebalancer {
     private static void logFailure(Exception e) {
         log.error("[REBALANCE] failed on this block; nothing further is attempted until the next one: {}",
                 e.toString(), e);
+    }
+
+    /**
+     * The whole cause chain, wrapper first — {@code Class: message ⇐ Class: message ⇐ …} — the form the liquidation
+     * and compound stages log theirs in. Bounded against a cyclic chain; a message-less exception still contributes
+     * its class name.
+     */
+    static String causeChain(Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        Throwable c = t;
+        for (int depth = 0; c != null && depth < 12; depth++) {
+            if (sb.length() > 0) {
+                sb.append(" ⇐ ");
+            }
+            sb.append(c.getClass().getSimpleName());
+            if (c.getMessage() != null) {
+                sb.append(": ").append(c.getMessage());
+            }
+            Throwable next = c.getCause();
+            if (next == c) {
+                break;
+            }
+            c = next;
+        }
+        return sb.toString();
     }
 
     /**
@@ -262,7 +307,7 @@ public class WalletRebalancer {
         return new Gates(state, current, null, anticipatingMarkets(markets.get()));
     }
 
-    private WorkResult rebalanceIfNeeded(SubmitFence fence) throws Exception {
+    private WorkResult rebalanceIfNeeded(SubmitFence fence, StageTally tally) throws Exception {
         Gates gates = gates();
         if (gates.idle() != null) {
             lastOutcome = "idle: " + gates.idle().name();
@@ -292,12 +337,15 @@ public class WalletRebalancer {
         try {
             wallet = walletRead.get();
         } catch (RuntimeException e) {
+            tally.recordError();
             log.error("[REBALANCE] could not read the wallet from the index; nothing built for this block: {}",
-                    e.toString(), e);
+                    causeChain(e));
+            log.debug("[REBALANCE] could not read the wallet from the index", e);
             lastOutcome = "could not read the wallet: " + e;
             return WorkResult.DEFINITE_FAILURE;
         }
         if (wallet == null) {
+            tally.recordError();
             log.error("[REBALANCE] the wallet read returned no list; nothing built for this block");
             lastOutcome = "could not read the wallet: the read returned no list";
             return WorkResult.DEFINITE_FAILURE;
@@ -315,6 +363,7 @@ public class WalletRebalancer {
             log.warn("[REBALANCE] {}: {} — the wallet is out of shape {}, relevant {}; nothing signed or submitted",
                     outcome.status(), outcome.detail(), reasons, relevant);
             lastOutcome = outcome.status() + ": " + outcome.detail();
+            tally.recordNoOp();
             return WorkResult.DEFINITE_FAILURE;
         }
 
@@ -324,6 +373,7 @@ public class WalletRebalancer {
         if (!fence.mayProceed()) {
             log.info("[REBALANCE] fenced: nothing submitted");
             lastOutcome = "fenced: nothing submitted";
+            tally.recordNoOp();
             return WorkResult.DEFINITE_FAILURE;
         }
         Result<String> result;
@@ -333,19 +383,28 @@ public class WalletRebalancer {
             // The bytes may have reached Blockfrost before it threw.
             logFailure(e);
             lastOutcome = "submission threw: " + e;
+            tally.recordSubmitted();
             return WorkResult.AMBIGUOUS;
         }
         if (result != null && result.isSuccessful()) {
             log.info("[REBALANCE] submitted {} — reasons {}, relevant {}, fee {} lovelace",
                     result.getValue(), reasons, relevant, fee);
             lastOutcome = "submitted " + result.getValue();
+            tally.recordSubmitted();
             return WorkResult.SUBMITTED;
         }
         String rejection = result == null ? "no result" : result.getResponse();
         log.error("[REBALANCE] submission rejected — reasons {}, relevant {}, fee {} lovelace: {}",
                 reasons, relevant, fee, rejection);
         lastOutcome = "submission rejected: " + rejection;
-        return WorkResult.classify(result);
+        WorkResult rejected = WorkResult.classify(result);
+        if (rejected == WorkResult.DEFINITE_FAILURE) {
+            tally.recordAttempted();
+        } else {
+            // AMBIGUOUS: no clear answer, so it may have gone out — said as submitted (a display merge only).
+            tally.recordSubmitted();
+        }
+        return rejected;
     }
 
     /**

@@ -550,10 +550,11 @@ A pass already running is never joined by a second one; new triggers wait for it
 - `LOANS_ORACLE_SOURCE` — where the prices come from: `stream` (the default) merges the FluidTokens
   oracle stream with the registry API; `api` is the emergency lever, API polling only.
 - `WALLET_PIPELINE_LOG_EVERY_PASS` (default `true`, FAB-195) — every pass ends with one INFO line:
-  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <block|price|block+price>, <k> block(s) folded in, waited <s> s, took <s> s: liquidation <result>, compound <result>, housekeeping <result>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`.
+  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <block|price|block+price>, <k> block(s) folded in, waited <s> s, took <s> s: liquidation <outcome>, compound <outcome>, housekeeping <outcome>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`.
   *Folded in* counts the blocks a newer block replaced while they waited; *waited* runs from the first
-  trigger the pass serves to its start. `false` returns to INFO only when a pass did something (the rule in
-  [Fire and forget (FAB-186)](#fire-and-forget-fab-186)), DEBUG otherwise.
+  trigger the pass serves to its start; each `<outcome>` is described in
+  [Stage outcomes on the pass line (FAB-195)](#stage-outcomes-on-the-pass-line-fab-195). `false` returns to
+  INFO only when a pass did something (the rule in that entry), DEBUG otherwise.
 
 **The Tank processor is unchanged:** it keeps its own timer, and none of the above applies to it.
 
@@ -613,8 +614,9 @@ for what each role must hold.
   the wallet rebalancer's last outcome. No U, or no token UTxO for a token anticipate: that candidate is
   recorded `WALLET_ROLE_MISSING`, with one WARN per missing role per check. A role UTxO too small for
   its candidate is recorded `WALLET_INPUT_TOO_SMALL`, naming the UTxO, what it holds and what it needed.
-- **Unreadable protocol parameters now stop the check** — one WARN naming role C and the cause — instead
-  of falling back to the largest UTxO: without them C cannot be sized.
+- **Unreadable protocol parameters now stop the check** — one line naming role C and the cause (an ERROR
+  since [FAB-195](#stage-outcomes-on-the-pass-line-fab-195); it was a WARN) — instead of falling back to the
+  largest UTxO: without them C cannot be sized.
 - **A shaped wallet is what makes this work** — keep wallet rebalancing on
   ([FAB-188, above](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)), and keep reference
   scripts and datum UTxOs out of the bot wallet: they keep it from being shaped, and so stop liquidation.
@@ -639,13 +641,54 @@ rejection (`BadInputsUTxO`, an empty `ScriptFailures`) to set a wallet UTxO asid
 - **Until our accepted transaction is in a block (about 20 s), later passes rebuild candidates on U and
   get harmless rejections** — U is already spent by the pending transaction. They cost Blockfrost calls,
   and each pass now ends with a summary line that shows them:
-  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <label>, <k> block(s) folded in, waited <w> s, took <d> s: liquidation <result>, compound <result>, housekeeping <result>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`,
-  where a stage that did not run reads `not run` and a stage that threw reads `threw`; the trigger, fold
-  and wait fields are described under `WALLET_PIPELINE_LOG_EVERY_PASS`
+  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <label>, <k> block(s) folded in, waited <w> s, took <d> s: liquidation <outcome>, compound <outcome>, housekeeping <outcome>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`,
+  where each `<outcome>`, and when the line is INFO or DEBUG, are described in
+  [Stage outcomes on the pass line (FAB-195)](#stage-outcomes-on-the-pass-line-fab-195) below; the trigger,
+  fold and wait fields are described under `WALLET_PIPELINE_LOG_EVERY_PASS`
   ([above](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). By
-  default **every pass says it at INFO**. With `WALLET_PIPELINE_LOG_EVERY_PASS=false` it is INFO only
-  when a stage threw, a stage returned anything other than `DEFINITE_FAILURE`, or the pass evaluated or
-  submitted anything, and DEBUG otherwise.
+  default **every pass says it at INFO**.
+
+### Stage outcomes on the pass line (FAB-195)
+
+Older images printed each stage of the pass line as the raw answer the stage returned — `DEFINITE_FAILURE`,
+which read like an error and only meant "nothing went out", or `not run` / `threw`. **Each stage now prints
+its outcome**, one of six:
+
+- **`NO_OP`** — nothing was sent to the network: there was nothing to do, or every candidate was refused
+  by name before submitting.
+- **`ATTEMPTED`** — built and submitted, but not accepted.
+- **`SUBMITTED`** — accepted into the mempool, not yet on chain (a transaction hash came back). A compound
+  or housekeeping submit with no clear answer — a raw or 5xx response, or a submit that threw — also prints
+  `SUBMITTED`, because nothing says it did not go out; that is a display merge only.
+- **`WOULD_SUBMIT`** — a `shadow` candidate that would have been submitted.
+- **`SKIPPED`** — the stage did not run this pass: an earlier stage sent something, the pass was fenced (a
+  rollback, the pass deadline, shutdown), or an earlier stage failed.
+- **`ERROR`** — our own error: an unexpected build failure (a builder exception, a failed index or
+  Blockfrost read, a failed script evaluation — one caused by a lost race too), or a stage that threw. Each
+  unexpected build failure is **one ERROR line** carrying the whole cause chain; its stack trace is logged
+  at DEBUG.
+
+**Precedence.** A stage prints the strongest that applies:
+`SUBMITTED > WOULD_SUBMIT > ATTEMPTED > ERROR > NO_OP`.
+
+**Counts.** The outcome is followed, in brackets, by the stage's non-zero counts, in this order:
+`submitted <n>`, `would-submit <n>`, `attempted <n>`, `error <n>`, `no-op <n>`. A stage with no count
+prints its outcome alone. For example:
+
+```
+wallet pipeline pass #12 at slot 101234567 (ab12…), trigger block, 0 block(s) folded in, waited 0.4 s, took 0.0 s: liquidation ATTEMPTED (attempted 1, error 1, no-op 3), compound NO_OP, housekeeping SKIPPED; Blockfrost calls discovery 5, evaluate 2, submit 1
+```
+
+A liquidation `ATTEMPTED` is not explained on the pass line: each of its candidates has its own
+`liquidation of <loan> via <route> on <UTxO> not accepted: HTTP …` INFO line
+([Fire and forget, above](#fire-and-forget-fab-186)).
+
+**What ends a pass is unchanged:** only a liquidation or compound that went out (or whose outcome is
+unknown) holds the later stages back. The counts are for reading only.
+
+**When the line is INFO.** With `WALLET_PIPELINE_LOG_EVERY_PASS=true` (the default) every pass says it at
+INFO. With `false` it is INFO when any stage is neither `NO_OP` nor `SKIPPED`, or the pass evaluated or
+submitted anything, and DEBUG otherwise. **A pass with an `ERROR` is now INFO where it was DEBUG.**
 
 ---
 

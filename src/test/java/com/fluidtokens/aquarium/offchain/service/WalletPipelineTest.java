@@ -946,10 +946,10 @@ class WalletPipelineTest {
     }
 
     /**
-     * FAB-186 (i): one summary line per pass — the stage results, or {@code not run}, and the Blockfrost
-     * calls the pass's deadline counted, by kind. INFO when a stage answered anything but DEFINITE_FAILURE or
+     * FAB-186 (i): one summary line per pass — the stage outcomes, or {@code SKIPPED} (FAB-195), and the Blockfrost
+     * calls the pass's deadline counted, by kind. INFO when a stage's outcome is neither NO_OP nor SKIPPED or
      * the pass evaluated or submitted anything; DEBUG for a pass that only discovered. FAB-195 (b): that rule is
-     * what {@code logEveryPass=false} keeps, unchanged.
+     * what {@code logEveryPass=false} keeps.
      */
     @Test
     void eachPassEndsWithOneSummaryLineCarryingTheStageResultsAndTheBlockfrostCalls() throws Exception {
@@ -973,26 +973,26 @@ class WalletPipelineTest {
             h.awaitPasses(1);
             h.barrier();
             assertEquals(1, count(Level.INFO, "wallet pipeline pass #1 at slot 1 (a), trigger block, 0 block(s) folded "
-                    + "in, waited 0.0 s, took 0.0 s: liquidation DEFINITE_FAILURE, "
-                    + "compound DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 3, "
+                    + "in, waited 0.0 s, took 0.0 s: liquidation NO_OP, "
+                    + "compound NO_OP, housekeeping NO_OP; Blockfrost calls discovery 3, "
                     + "evaluate 1, submit 0"), logs.list.toString());
 
-            // A liquidation SUBMITTED ends the pass: the later stages are "not run", and the line is INFO.
+            // A liquidation SUBMITTED ends the pass: the later stages are SKIPPED, and the line is INFO.
             h.pipeline.offerBlock(2, "b");
             h.awaitPasses(1);
             h.barrier();
             assertEquals(1, count(Level.INFO, "wallet pipeline pass #2 at slot 2 (b), trigger block, 0 block(s) folded "
                     + "in, waited 0.0 s, took 0.0 s: liquidation SUBMITTED, "
-                    + "compound not run, housekeeping not run; Blockfrost calls discovery 5, evaluate 2, submit 1"),
+                    + "compound SKIPPED, housekeeping SKIPPED; Blockfrost calls discovery 5, evaluate 2, submit 1"),
                     logs.list.toString());
 
-            // Nothing answered but DEFINITE_FAILURE and nothing was evaluated or submitted: DEBUG, not INFO.
+            // Every stage NO_OP and nothing was evaluated or submitted: DEBUG, not INFO.
             h.pipeline.offerBlock(3, "c");
             h.awaitPasses(1);
             h.barrier();
             String quiet = "wallet pipeline pass #3 at slot 3 (c), trigger block, 0 block(s) folded in, waited 0.0 s, "
-                    + "took 0.0 s: liquidation DEFINITE_FAILURE, compound "
-                    + "DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 4, evaluate 0, submit 0";
+                    + "took 0.0 s: liquidation NO_OP, compound "
+                    + "NO_OP, housekeeping NO_OP; Blockfrost calls discovery 4, evaluate 0, submit 0";
             assertEquals(1, count(Level.DEBUG, quiet), logs.list.toString());
             assertEquals(0, count(Level.INFO, "wallet pipeline pass #3 at slot 3"), logs.list.toString());
             assertEquals(3, logs.list.stream()
@@ -1015,7 +1015,7 @@ class WalletPipelineTest {
             h.barrier();
             assertEquals(1, count(Level.INFO, "wallet pipeline pass #1 at slot 9 (z), trigger block, 0 block(s) folded "
                     + "in, waited 0.0 s, took 0.0 s: liquidation WOULD_SUBMIT, "
-                    + "compound DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 0, "
+                    + "compound NO_OP, housekeeping NO_OP; Blockfrost calls discovery 0, "
                     + "evaluate 0, submit 0"), logs.list.toString());
         }
     }
@@ -1023,9 +1023,9 @@ class WalletPipelineTest {
     // ---- FAB-195: one line per pass, with its trigger, folds, wait and duration ------------------------------------
 
     /**
-     * FAB-195 (a): with {@code logEveryPass} on, a pass where every stage answered DEFINITE_FAILURE and nothing was
-     * evaluated or submitted still says its summary at INFO, exactly once; and a pass whose stage threw still gets its
-     * one line.
+     * FAB-195 (a): with {@code logEveryPass} on, a pass where every stage is NO_OP and nothing was evaluated or
+     * submitted still says its summary at INFO, exactly once; and a pass whose stage threw still gets its one line,
+     * the stage ERROR with one error and the later stages SKIPPED.
      */
     @Test
     void withLogEveryPassAQuietPassSaysItsSummaryAtInfoExactlyOnce() throws Exception {
@@ -1046,8 +1046,8 @@ class WalletPipelineTest {
             h.awaitPasses(1);
             h.barrier();
             assertEquals(List.of("wallet pipeline pass #1 at slot 1 (a), trigger block, 0 block(s) folded in, waited "
-                            + "0.0 s, took 0.0 s: liquidation DEFINITE_FAILURE, compound DEFINITE_FAILURE, housekeeping "
-                            + "DEFINITE_FAILURE; Blockfrost calls discovery 0, evaluate 0, submit 0"),
+                            + "0.0 s, took 0.0 s: liquidation NO_OP, compound NO_OP, housekeeping "
+                            + "NO_OP; Blockfrost calls discovery 0, evaluate 0, submit 0"),
                     summaries(Level.INFO), logs.list.toString());
             assertEquals(List.of(), summaries(Level.DEBUG), logs.list.toString());
 
@@ -1056,8 +1056,8 @@ class WalletPipelineTest {
             h.barrier();
             assertEquals(1, count(Level.ERROR, "wallet pipeline: the pass at slot 2 (b) failed"));
             assertEquals(List.of("wallet pipeline pass #2 at slot 2 (b), trigger block, 0 block(s) folded in, waited "
-                            + "0.0 s, took 0.0 s: liquidation threw, compound not run, housekeeping not run; Blockfrost "
-                            + "calls discovery 0, evaluate 0, submit 0"),
+                            + "0.0 s, took 0.0 s: liquidation ERROR (error 1), compound SKIPPED, housekeeping SKIPPED; "
+                            + "Blockfrost calls discovery 0, evaluate 0, submit 0"),
                     summaries(Level.INFO).subList(1, summaries(Level.INFO).size()), logs.list.toString());
             assertEquals(2, summaries().size(), "exactly one summary line per pass");
         }
@@ -1212,8 +1212,8 @@ class WalletPipelineTest {
             assertTrue(lines.get(0).startsWith("wallet pipeline pass #1 at slot 1 (a), trigger block, 0 block(s) "
                     + "folded in, waited 0.0 s, took 3.0 s: "), lines.get(0));
             assertEquals("wallet pipeline pass #2 at slot 2 (b), trigger block, 0 block(s) folded in, waited 3.0 s, "
-                    + "took 2.0 s: liquidation DEFINITE_FAILURE, compound DEFINITE_FAILURE, housekeeping "
-                    + "DEFINITE_FAILURE; Blockfrost calls discovery 0, evaluate 0, submit 0", lines.get(1));
+                    + "took 2.0 s: liquidation NO_OP, compound NO_OP, housekeeping "
+                    + "NO_OP; Blockfrost calls discovery 0, evaluate 0, submit 0", lines.get(1));
             assertTrue(lines.get(3).startsWith("wallet pipeline pass #4 at slot 4 (d), trigger block+price, 0 block(s) "
                     + "folded in, waited 3.0 s, took 2.0 s: "), lines.get(3));
         }
@@ -1451,6 +1451,251 @@ class WalletPipelineTest {
             assertEquals(2, lines.size(), logs.list.toString());
             assertTrue(lines.get(1).startsWith("wallet pipeline pass #2 at slot 11 (b), trigger block+price, 0 block(s) "
                     + "folded in, waited 0.0 s, took 0.0 s: "), lines.get(1));
+        }
+    }
+
+    /**
+     * FAB-195-2 residue R1: the same as (k), in the FIRST pass of a generation after a rollback — generation 1, not 0.
+     * Block 10 (generation 0) runs and ends; a rollback; block 11's pass (#2) is held inside liquidation; a price change
+     * at t, nothing pending and nothing handled in generation 1, is re-run as a {@code price} pass once #2 ends, so it
+     * starts the wait: released at t+7 s, pass #3 says {@code waited 7.0 s}. Only the in-flight pass's generation being
+     * the CURRENT one decides it, never generation 0.
+     */
+    @Test
+    void aPriceChangeDuringTheFirstPassAfterARollbackStartsTheWait() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger liquidations = new AtomicInteger();
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (liquidations.incrementAndGet() == 2) {
+                            entered.countDown();
+                            assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(10, "a");         // generation 0: runs and ends
+            h.awaitPasses(1);
+            h.barrier();
+
+            h.pipeline.rollback();
+            h.pipeline.offerBlock(11, "b");         // generation 1's first pass, #2, held
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.offerPriceChange();          // t: nothing pending, nothing handled, block 11 in flight
+            h.clock.advance(Duration.ofSeconds(7));
+            release.countDown();                    // the price pass starts at t+7 s
+            h.awaitPasses(2);
+            h.barrier();
+
+            assertEquals(List.of("L 0/10:a", "L 1/11:b", "L 1/11:b"), h.calls());
+            List<String> lines = summaries(Level.INFO);
+            assertEquals(3, lines.size(), logs.list.toString());
+            assertTrue(lines.get(2).startsWith("wallet pipeline pass #3 at slot 11 (b), trigger price, 0 block(s) "
+                    + "folded in, waited 7.0 s, took 0.0 s: "), lines.get(2));
+        }
+    }
+
+    // ---- FAB-195: stage outcomes on the pass line ------------------------------------------------------------------
+
+    /**
+     * (P1) A stage's outcome is its strongest count, then its non-zero counts in order: liquidation tallies attempted
+     * 1, error 1 and no-op 3 and answers DEFINITE_FAILURE — ATTEMPTED, ranked above ERROR; compound answers
+     * DEFINITE_FAILURE and counts nothing — a bare NO_OP; housekeeping counts no-op 1. Nothing went out, so all three
+     * stages ran: the tally never ends a pass.
+     */
+    @Test
+    void aStagesOutcomeIsItsStrongestCountFollowedByItsNonZeroCounts() throws Exception {
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        fence.tally().recordAttempted();
+                        fence.tally().recordError();
+                        fence.tally().recordNoOp();
+                        fence.tally().recordNoOp();
+                        fence.tally().recordNoOp();
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> { h.record("C"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> { h.record("H"); fence.tally().recordNoOp(); return WorkResult.DEFINITE_FAILURE; });
+
+            h.pipeline.offerBlock(1, "a");
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/1:a", "C 0/1:a", "H 0/1:a"), h.calls(), "all three stages ran");
+            assertEquals(List.of("wallet pipeline pass #1 at slot 1 (a), trigger block, 0 block(s) folded in, waited "
+                            + "0.0 s, took 0.0 s: liquidation ATTEMPTED (attempted 1, error 1, no-op 3), compound NO_OP, "
+                            + "housekeeping NO_OP (no-op 1); Blockfrost calls discovery 0, evaluate 0, submit 0"),
+                    summaries(), logs.list.toString());
+        }
+    }
+
+    /**
+     * (P2) The ladder. SUBMITTED outranks WOULD_SUBMIT and ends the pass (the later stages are SKIPPED and not
+     * called); WOULD_SUBMIT outranks ATTEMPTED and does not end it; ERROR outranks NO_OP and does not end it either.
+     */
+    @Test
+    void theOutcomeLadderAndWhichOfItsRungsEndAPass() throws Exception {
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        long slot = h.pipeline.stateForTest().inFlight().slot();
+                        if (slot == 1) {
+                            fence.tally().recordSubmitted();
+                            fence.tally().recordWouldSubmit();
+                            return WorkResult.SUBMITTED;
+                        }
+                        if (slot == 2) {
+                            fence.tally().recordWouldSubmit();
+                            fence.tally().recordAttempted();
+                            return WorkResult.WOULD_SUBMIT;
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> {
+                        h.record("C");
+                        if (h.pipeline.stateForTest().inFlight().slot() == 3) {
+                            fence.tally().recordError();
+                            fence.tally().recordNoOp();
+                            fence.tally().recordNoOp();
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> { h.record("H"); return WorkResult.DEFINITE_FAILURE; });
+
+            for (int slot = 1; slot <= 3; slot++) {
+                h.pipeline.offerBlock(slot, "abc".substring(slot - 1, slot));
+                h.awaitPasses(1);
+                h.barrier();
+            }
+
+            assertEquals(List.of("L 0/1:a", "L 0/2:b", "C 0/2:b", "H 0/2:b", "L 0/3:c", "C 0/3:c", "H 0/3:c"),
+                    h.calls());
+            List<String> lines = summaries();
+            assertEquals(3, lines.size(), logs.list.toString());
+            assertTrue(lines.get(0).endsWith("took 0.0 s: liquidation SUBMITTED (submitted 1, would-submit 1), compound "
+                    + "SKIPPED, housekeeping SKIPPED; Blockfrost calls discovery 0, evaluate 0, submit 0"), lines.get(0));
+            assertTrue(lines.get(1).endsWith("took 0.0 s: liquidation WOULD_SUBMIT (would-submit 1, attempted 1), "
+                    + "compound NO_OP, housekeeping NO_OP; Blockfrost calls discovery 0, evaluate 0, submit 0"),
+                    lines.get(1));
+            assertTrue(lines.get(2).endsWith("took 0.0 s: liquidation NO_OP, compound ERROR (error 1, no-op 2), "
+                    + "housekeeping NO_OP; Blockfrost calls discovery 0, evaluate 0, submit 0"), lines.get(2));
+        }
+    }
+
+    /**
+     * (P3) AMBIGUOUS — or a stage that answers nothing — says SUBMITTED, with no count of its own (a display merge),
+     * and still ends the pass exactly as before: compound AMBIGUOUS leaves housekeeping SKIPPED and uncalled; a
+     * liquidation answering null leaves both later stages SKIPPED.
+     */
+    @Test
+    void ambiguousAndANullAnswerSaySubmittedAndStillEndThePass() throws Exception {
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        return h.pipeline.stateForTest().inFlight().slot() == 2 ? null : WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> { h.record("C"); return WorkResult.AMBIGUOUS; },
+                    fence -> { h.record("H"); return WorkResult.DEFINITE_FAILURE; });
+
+            h.pipeline.offerBlock(1, "a");
+            h.awaitPasses(1);
+            h.barrier();
+            h.pipeline.offerBlock(2, "b");
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/1:a", "C 0/1:a", "L 0/2:b"), h.calls());
+            List<String> lines = summaries();
+            assertEquals(2, lines.size(), logs.list.toString());
+            assertTrue(lines.get(0).endsWith("took 0.0 s: liquidation NO_OP, compound SUBMITTED, housekeeping SKIPPED; "
+                    + "Blockfrost calls discovery 0, evaluate 0, submit 0"), lines.get(0));
+            assertTrue(lines.get(1).endsWith("took 0.0 s: liquidation SUBMITTED, compound SKIPPED, housekeeping SKIPPED; "
+                    + "Blockfrost calls discovery 0, evaluate 0, submit 0"), lines.get(1));
+        }
+    }
+
+    /**
+     * (P4) A stage that threw gains one error: alone it says ERROR (error 1); after tallying attempted 1 it says
+     * ATTEMPTED (attempted 1, error 1). Either way the later stages are SKIPPED.
+     */
+    @Test
+    void aStageThatThrewGainsOneError() throws Exception {
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (h.pipeline.stateForTest().inFlight().slot() == 2) {
+                            fence.tally().recordAttempted();
+                        }
+                        throw new IllegalStateException("liquidation fixture failure");
+                    },
+                    fence -> { h.record("C"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> { h.record("H"); return WorkResult.DEFINITE_FAILURE; });
+
+            h.pipeline.offerBlock(1, "a");
+            h.awaitPasses(1);
+            h.barrier();
+            h.pipeline.offerBlock(2, "b");
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/1:a", "L 0/2:b"), h.calls());
+            List<String> lines = summaries();
+            assertEquals(2, lines.size(), logs.list.toString());
+            assertTrue(lines.get(0).endsWith("took 0.0 s: liquidation ERROR (error 1), compound SKIPPED, housekeeping "
+                    + "SKIPPED; Blockfrost calls discovery 0, evaluate 0, submit 0"), lines.get(0));
+            assertTrue(lines.get(1).endsWith("took 0.0 s: liquidation ATTEMPTED (attempted 1, error 1), compound "
+                    + "SKIPPED, housekeeping SKIPPED; Blockfrost calls discovery 0, evaluate 0, submit 0"), lines.get(1));
+        }
+    }
+
+    /**
+     * (P5) With {@code logEveryPass} off, an ERROR is news: a pass whose only outcome other than NO_OP is a compound
+     * ERROR, with nothing evaluated or submitted, says its line at INFO. A pass where every stage is NO_OP — with its
+     * no-op counts — and nothing was evaluated or submitted says it at DEBUG.
+     */
+    @Test
+    void withoutLogEveryPassAnErrorIsNewsAndCountedNoOpsAreNot() throws Exception {
+        try (Harness h = new Harness()) {
+            h.logEveryPass = false;
+            h.start(
+                    fence -> { h.record("L"); fence.tally().recordNoOp(); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> {
+                        h.record("C");
+                        if (h.pipeline.stateForTest().inFlight().slot() == 1) {
+                            fence.tally().recordError();
+                        } else {
+                            fence.tally().recordNoOp();
+                            fence.tally().recordNoOp();
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> { h.record("H"); fence.tally().recordNoOp(); return WorkResult.DEFINITE_FAILURE; });
+
+            h.pipeline.offerBlock(1, "a");
+            h.awaitPasses(1);
+            h.barrier();
+            h.pipeline.offerBlock(2, "b");
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("wallet pipeline pass #1 at slot 1 (a), trigger block, 0 block(s) folded in, waited "
+                            + "0.0 s, took 0.0 s: liquidation NO_OP (no-op 1), compound ERROR (error 1), housekeeping "
+                            + "NO_OP (no-op 1); Blockfrost calls discovery 0, evaluate 0, submit 0"),
+                    summaries(Level.INFO), logs.list.toString());
+            assertEquals(List.of("wallet pipeline pass #2 at slot 2 (b), trigger block, 0 block(s) folded in, waited "
+                            + "0.0 s, took 0.0 s: liquidation NO_OP (no-op 1), compound NO_OP (no-op 2), housekeeping "
+                            + "NO_OP (no-op 1); Blockfrost calls discovery 0, evaluate 0, submit 0"),
+                    summaries(Level.DEBUG), logs.list.toString());
         }
     }
 

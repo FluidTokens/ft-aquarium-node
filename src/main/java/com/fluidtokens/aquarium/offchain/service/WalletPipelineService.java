@@ -30,11 +30,12 @@ import java.util.Objects;
  * The bot wallet's ONE spender (FAB-183): a {@link WalletPipeline} whose stages run in this order, one pass at a
  * time, on the {@code wallet-pipeline} thread —
  * <ol>
- *   <li>liquidation, {@link LiquidationExecutor#cycle(long, SubmitFence)};</li>
- *   <li>compound, {@link CompoundExecutor#cycle(SubmitFence)};</li>
- *   <li>housekeeping, {@link WalletRebalancer#housekeep(SubmitFence)}.</li>
+ *   <li>liquidation, {@link LiquidationExecutor#cycle(long, SubmitFence, StageTally)};</li>
+ *   <li>compound, {@link CompoundExecutor#cycle(SubmitFence, StageTally)};</li>
+ *   <li>housekeeping, {@link WalletRebalancer#housekeep(SubmitFence, StageTally)}.</li>
  * </ol>
- * A stage that sent something ends the pass, so the next stage waits for the next trigger.
+ * A stage that sent something ends the pass, so the next stage waits for the next trigger. Each stage counts its
+ * candidates on the tally its {@link WalletPipeline.StageFence} carries, for the pass's summary line only (FAB-195).
  *
  * <p><b>Three triggers, and no timer.</b> A committed block offers its chain point ({@link #onCommit}); a Yaci
  * {@link RollbackEvent} starts a new generation, so queued work is dropped and an older pass's fence closes
@@ -136,9 +137,9 @@ public class WalletPipelineService {
         this.passTimeoutSeconds = passTimeoutSeconds;
         this.clock = Objects.requireNonNull(clock, "clock");
         this.pipeline = new WalletPipeline(backend,
-                fence -> liquidationExecutor.cycle(this.clock.millis(), fence),
-                compoundExecutor::cycle,
-                walletRebalancer::housekeep,
+                fence -> liquidationExecutor.cycle(this.clock.millis(), fence, fence.tally()),
+                fence -> compoundExecutor.cycle(fence, fence.tally()),
+                fence -> walletRebalancer.housekeep(fence, fence.tally()),
                 Duration.ofSeconds(passTimeoutSeconds),
                 logEveryPass);
     }

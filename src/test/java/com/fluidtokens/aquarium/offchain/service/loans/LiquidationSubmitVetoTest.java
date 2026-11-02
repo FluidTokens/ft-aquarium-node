@@ -26,6 +26,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -704,6 +705,14 @@ class LiquidationSubmitVetoTest {
         private io.micrometer.core.instrument.MeterRegistry meterRegistry;
         /** FAB-185: null means {@link #WALLET_UTXO} plus C sized from {@link #params}. */
         private List<Utxo> wallet;
+        /** FAB-195: when set, every cycle counts on it (through the tally-taking {@code cycle}). */
+        private StageTally tally;
+
+        /** FAB-195: the tally the run's cycles count on. */
+        Rig tally(StageTally tally) {
+            this.tally = tally;
+            return this;
+        }
 
         /** FAB-185: the wallet stated, for a {@link #params} supplier that must not be asked an extra time. */
         Rig wallet(List<Utxo> wallet) {
@@ -845,7 +854,11 @@ class LiquidationSubmitVetoTest {
 
             for (int cycle = 0; cycle < cycles; cycle++) {
                 elapsed[0] = cycle * 60_000L;
-                executor.cycle(NOW + elapsed[0]);
+                if (tally == null) {
+                    executor.cycle(NOW + elapsed[0]);
+                } else {
+                    executor.cycle(NOW + elapsed[0], SubmitFence.OPEN, tally);
+                }
             }
             return new Run(log, submitter);
         }
@@ -1792,6 +1805,75 @@ class LiquidationSubmitVetoTest {
     }
 
     // ======================================================================================
+    // FAB-195 (V1) — what each ending tells the pass line
+    // ======================================================================================
+
+    /** submitted, would-submit, attempted, error, no-op — in the pass line's order. */
+    private static List<Integer> counts(StageTally tally) {
+        return List.of(tally.submitted(), tally.wouldSubmit(), tally.attempted(), tally.error(), tally.noOp());
+    }
+
+    /** (V1) An accepted submit counts submitted 1. */
+    @Test
+    void anAcceptedSubmitCountsOneSubmitted() {
+        StageTally tally = new StageTally();
+        Run run = new Rig().tally(tally).run();
+
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, run.onlyDecision().outcome());
+        assertEquals(List.of(1, 0, 0, 0, 0), counts(tally));
+    }
+
+    /** (V1) A decoded-400 refusal: built and submitted, not accepted — attempted 1. */
+    @Test
+    void aDecodedRefusalCountsOneAttempted() {
+        StageTally tally = new StageTally();
+        Run run = new Rig().submitter(RecordingSubmitter.rejectingDecoded("ValueNotConservedUTxO")).tally(tally).run();
+
+        assertEquals(1, run.submitter().submitted.size(), "it was transmitted");
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED, run.onlyDecision().outcome());
+        assertEquals(List.of(0, 0, 1, 0, 0), counts(tally));
+    }
+
+    /** (V1) A node-shadow WOULD_SUBMIT counts would-submit 1. */
+    @Test
+    void aNodeShadowWouldSubmitCountsOneWouldSubmit() {
+        StageTally tally = new StageTally();
+        Run run = new Rig().configuration(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                SMALL_MARGIN, PUBLISHED)).tally(tally).run();
+
+        vetoed(run, LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE, LiquidationDecision.Outcome.WOULD_SUBMIT);
+        assertEquals(List.of(0, 1, 0, 0, 0), counts(tally));
+    }
+
+    /** (V1) A STALE_UTXO veto that did not throw is a refusal by name: no-op 1. */
+    @Test
+    void aStaleUtxoVetoThatDidNotThrowCountsOneNoOp() {
+        StageTally tally = new StageTally();
+        Run run = new Rig().loanGoneAfter(1).tally(tally).run();
+
+        vetoed(run, LiquidationExecutor.SubmitVeto.STALE_UTXO, LiquidationDecision.Outcome.SUBMIT_VETOED);
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(tally));
+    }
+
+    /**
+     * (V1) A two-candidate walk: the first is not accepted, the second is — submitted 1, attempted 1, each
+     * candidate in its own bucket.
+     */
+    @Test
+    void aWalkWhoseFirstIsNotAcceptedAndSecondIsCountsOneOfEach() {
+        RecordingSubmitter submitter = new RecordingSubmitter(
+                RecordingSubmitter.decodedRefusal("ValueNotConservedUTxO"), null);
+        submitter.later = Result.success("ab".repeat(32)).withValue("ab".repeat(32));
+
+        StageRun stage = stage(armed(), List.of(adaScenario(), secondAdaScenario()), submitter, null,
+                SubmitFence.OPEN);
+
+        assertEquals(2, submitter.submitted.size(), stage.events().toString());
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+        assertEquals(List.of(1, 0, 1, 0, 0), counts(stage.tally()));
+    }
+
+    // ======================================================================================
     // S7 — the transaction's own validity window
     // ======================================================================================
 
@@ -2073,6 +2155,7 @@ class LiquidationSubmitVetoTest {
                 new java.security.KeyException("signing key rejected"));
         Account brokenSigner = spy(ACCOUNT);
         doThrow(boom).when(brokenSigner).sign(any(Transaction.class));
+        StageTally tally = new StageTally();
 
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -2080,10 +2163,13 @@ class LiquidationSubmitVetoTest {
         logger.addAppender(appender);
         Run run;
         try {
-            run = new Rig().account(brokenSigner).run();
+            run = new Rig().account(brokenSigner).tally(tally).run();
         } finally {
             logger.detachAppender(appender);
         }
+        // FAB-195 (V1): a failure of ours after the vetoes said yes — error 1, nothing else; its line below is
+        // unchanged (residue X4: it keeps the throwable at ERROR).
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1");
 
         assertEquals(0, run.submitter().submitted.size(), "signing threw, so nothing reached the wire");
         LiquidationDecision decision = run.onlyDecision();
@@ -2460,7 +2546,7 @@ class LiquidationSubmitVetoTest {
      * the plain builder was asked to build.
      */
     private record StageRun(WorkResult result, LiquidationDecisionLog log, RecordingSubmitter submitter,
-                            List<ILoggingEvent> events, int builds) {
+                            List<ILoggingEvent> events, int builds, StageTally tally) {
     }
 
     /**
@@ -2551,14 +2637,16 @@ class LiquidationSubmitVetoTest {
         appender.start();
         logger.addAppender(appender);
         WorkResult result;
+        // FAB-195: the tally-taking cycle, whose answer is exactly cycle(NOW, fence)'s.
+        StageTally tally = new StageTally();
         try {
-            result = executor.cycle(NOW, fence);
+            result = executor.cycle(NOW, fence, tally);
         } finally {
             logger.detachAppender(appender);
         }
         int builds = (int) org.mockito.Mockito.mockingDetails(builder).getInvocations().stream()
                 .filter(invocation -> invocation.getMethod().getName().equals("build")).count();
-        return new StageRun(result, log, submitter, appender.list, builds);
+        return new StageRun(result, log, submitter, appender.list, builds, tally);
     }
 
     /** The one recorded decision for {@code scenario}'s loan, failing if there is not exactly one. */

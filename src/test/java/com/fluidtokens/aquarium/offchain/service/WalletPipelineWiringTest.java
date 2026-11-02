@@ -67,6 +67,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -170,6 +171,13 @@ class WalletPipelineWiringTest {
         /** Runs inside the next liquidation call, before it records; taken once. */
         final AtomicReference<Runnable> beforeLiquidation = new AtomicReference<>();
 
+        /** FAB-195: what each stage records on the tally it receives, on every call; nothing by default. */
+        final AtomicReference<Consumer<StageTally>> liquidationTally = new AtomicReference<>(tally -> { });
+
+        final AtomicReference<Consumer<StageTally>> compoundTally = new AtomicReference<>(tally -> { });
+
+        final AtomicReference<Consumer<StageTally>> housekeepingTally = new AtomicReference<>(tally -> { });
+
         final AtomicReference<BlockEventListener> blockEventListener = new AtomicReference<>();
 
         final AtomicReference<BoundedBFBackendService> backend = new AtomicReference<>();
@@ -178,20 +186,25 @@ class WalletPipelineWiringTest {
 
         Stages(RecordingTransactionManager transactionManager) {
             this.transactionManager = transactionManager;
-            when(liquidation.cycle(anyLong(), any())).thenAnswer(invocation -> {
+            // FAB-195: stubbed on the tally-taking entry points only — the ones production wiring must call. A
+            // wiring that called an overload without the tally would reach an unstubbed method and answer null.
+            when(liquidation.cycle(anyLong(), any(), any())).thenAnswer(invocation -> {
                 Runnable before = beforeLiquidation.getAndSet(null);
                 if (before != null) {
                     before.run();
                 }
                 record("liquidation", invocation.getArgument(1), probeBackendDeadline());
+                liquidationTally.get().accept(invocation.getArgument(2));
                 return next(liquidationResults);
             });
-            when(compound.cycle(any(SubmitFence.class))).thenAnswer(invocation -> {
+            when(compound.cycle(any(SubmitFence.class), any(StageTally.class))).thenAnswer(invocation -> {
                 record("compound", invocation.getArgument(0), false);
+                compoundTally.get().accept(invocation.getArgument(1));
                 return next(compoundResults);
             });
-            when(housekeeping.housekeep(any())).thenAnswer(invocation -> {
+            when(housekeeping.housekeep(any(), any())).thenAnswer(invocation -> {
                 record("housekeeping", invocation.getArgument(0), false);
+                housekeepingTally.get().accept(invocation.getArgument(1));
                 return WorkResult.DEFINITE_FAILURE;
             });
         }
@@ -680,7 +693,7 @@ class WalletPipelineWiringTest {
             awaitCalls(stages, 1);
 
             ArgumentCaptor<Long> now = ArgumentCaptor.forClass(Long.class);
-            verify(stages.liquidation).cycle(now.capture(), any());
+            verify(stages.liquidation).cycle(now.capture(), any(), any());
             assertTrue(wallClockAtCall.get() > 0, "the liquidation call did not read the wall clock");
             assertTrue(Math.abs(now.getValue() - wallClockAtCall.get()) <= 5_000L,
                     "the liquidation stage got now=" + now.getValue() + ", but the wall clock at the call read "
@@ -746,7 +759,7 @@ class WalletPipelineWiringTest {
                 awaitCalls(stages, 6);
 
                 ArgumentCaptor<Long> now = ArgumentCaptor.forClass(Long.class);
-                verify(stages.liquidation, times(2)).cycle(now.capture(), any());
+                verify(stages.liquidation, times(2)).cycle(now.capture(), any(), any());
                 assertEquals(List.of(firstReading, secondReading), now.getAllValues(),
                         "each pass's now must be the clock's reading at that pass");
             } finally {
@@ -873,6 +886,44 @@ class WalletPipelineWiringTest {
         }
     }
 
+    /**
+     * (W1) FAB-195 ⛔ through the container: each stage counts on the tally the SPRING-WIRED pipeline hands it, and
+     * the engine's summary line says what was counted. Liquidation records attempted 1 and answers DEFINITE_FAILURE,
+     * compound records no-op 1, housekeeping records nothing: one pass, the three stages in order, and the line ends
+     * {@code liquidation ATTEMPTED (attempted 1), compound NO_OP (no-op 1), housekeeping NO_OP}. A wiring that
+     * dropped the tally (a method reference to the one-argument {@code cycle}, say) never reaches these stubs.
+     */
+    @Test
+    void eachStageCountsOnTheTallyTheWiredPipelineHandsItAndTheLineSaysIt() {
+        Logger engineLogger = (Logger) LoggerFactory.getLogger(WalletPipeline.class);
+        ListAppender<ILoggingEvent> engineLogs = new ListAppender<>();
+        engineLogs.start();
+        engineLogger.addAppender(engineLogs);
+        try {
+            Stages stages = new Stages(new RecordingTransactionManager());
+            stages.liquidationTally.set(StageTally::recordAttempted);
+            stages.compoundTally.set(StageTally::recordNoOp);
+            runner(stages).run(context -> {
+                assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+                bind(stages, context);
+                long slot = slotAgo(context, Duration.ofMinutes(1));
+                String blockHash = "f7".repeat(32);
+                context.publishEvent(block(slot, blockHash));
+                awaitCalls(stages, 3);
+                String point = " at slot " + slot + " (" + blockHash + "), ";
+                assertTrue(await(() -> summaryLines(engineLogs, point).size() == 1, PASS_WAIT),
+                        "expected one summary line for slot " + slot + ": " + summaryLines(engineLogs, point));
+                String line = summaryLines(engineLogs, point).get(0).getFormattedMessage();
+                assertTrue(line.endsWith(": liquidation ATTEMPTED (attempted 1), compound NO_OP (no-op 1), "
+                        + "housekeeping NO_OP; Blockfrost calls discovery 0, evaluate 0, submit 0"), line);
+                assertEquals(List.of("liquidation", "compound", "housekeeping"), stages.stageNames(),
+                        "an ATTEMPTED liquidation does not end the pass");
+            });
+        } finally {
+            engineLogger.detachAppender(engineLogs);
+        }
+    }
+
     /** Waits for the one summary line of the pass at this point, checks the pass was quiet, and answers its level. */
     private static Level quietSummaryLevel(ListAppender<ILoggingEvent> engineLogs, long slot, String blockHash)
             throws InterruptedException {
@@ -880,8 +931,8 @@ class WalletPipelineWiringTest {
         assertTrue(await(() -> summaryLines(engineLogs, point).size() == 1, PASS_WAIT),
                 "expected one summary line for slot " + slot + ": " + summaryLines(engineLogs, point));
         ILoggingEvent line = summaryLines(engineLogs, point).get(0);
-        assertTrue(line.getFormattedMessage().endsWith(": liquidation DEFINITE_FAILURE, compound DEFINITE_FAILURE, "
-                + "housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 0, evaluate 0, submit 0"),
+        assertTrue(line.getFormattedMessage().endsWith(": liquidation NO_OP, compound NO_OP, "
+                + "housekeeping NO_OP; Blockfrost calls discovery 0, evaluate 0, submit 0"),
                 "the pass must be a quiet one: " + line.getFormattedMessage());
         return line.getLevel();
     }

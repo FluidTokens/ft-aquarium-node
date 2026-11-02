@@ -22,6 +22,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
@@ -63,6 +64,7 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -556,6 +558,86 @@ class CompoundExecutorTest {
         assertEquals(WorkResult.DEFINITE_FAILURE, disarmed.executor().cycle(),
                 "a disarmed walk reaches nothing terminal");
         assertTrue(disarmed.submitted().isEmpty());
+    }
+
+    /**
+     * FAB-195 (K1): the {@link #aCycleReturnsTheOutcomeThatEndedItsWalk} cases through the tally — one count per
+     * ready candidate the walk reaches. AMBIGUOUS (a provider 500, or a transport throw) is counted submitted, a
+     * display merge; a decoded 400 on each of two candidates is attempted 2; a disarmed walk's ready candidate is a
+     * no-op; an empty scan counts nothing.
+     */
+    @Test
+    void eachReadyCandidateTheWalkReachesIsCountedOnce() {
+        assertCycleTally(bytes -> Result.<String>success("ok").withValue("deadbeef"),
+                List.of(1, 0, 0, 0, 0), "a submission");
+        assertCycleTally(bytes -> Result.<String>success("WOULD_SUBMIT").withValue("WOULD_SUBMIT"),
+                List.of(0, 1, 0, 0, 0), "a withheld submission");
+        assertCycleTally(bytes -> Result.<String>error(
+                        blockfrostError(500, "Internal Server Error", "opaque")).code(500),
+                List.of(1, 0, 0, 0, 0), "a provider 500 may have gone out");
+        assertCycleTally(bytes -> {
+                    throw new java.io.IOException("acceptance unknown");
+                },
+                List.of(1, 0, 0, 0, 0), "a transport throw may have gone out");
+        assertCycleTally(bytes -> blockfrostRejection(400, "opaque"),
+                List.of(0, 0, 2, 0, 0), "both candidates submitted and refused");
+
+        StageTally empty = new StageTally();
+        wiring(List.of(), true, -2_000_000L).executor().cycle(SubmitFence.OPEN, empty);
+        assertEquals(List.of(0, 0, 0, 0, 0), counts(empty), "an empty scan returns before the walk");
+        StageTally disarmed = new StageTally();
+        wiring(List.of(ready(0L)), false, 0L).executor().cycle(SubmitFence.OPEN, disarmed);
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(disarmed), "a disarmed walk's ready candidate is a no-op");
+    }
+
+    private static void assertCycleTally(CompoundExecutor.TransactionSubmitter response, List<Integer> expected,
+                                         String message) {
+        CompoundExecutor executor = executor(twoReadyCandidates(), realBuilder(twoReadyCandidates()), response);
+        StageTally tally = new StageTally();
+        executor.cycle(SubmitFence.OPEN, tally);
+        assertEquals(expected, counts(tally), message);
+    }
+
+    /**
+     * FAB-195 (K3): protocol parameters the walk cannot read are a failure of ours, not a missing role — each of
+     * the two ready candidates they refuse counts error 1 (error 2), and the walk says it in exactly ONE ERROR line,
+     * with the cause chain and no throwable; the stack trace is one DEBUG event, and the second refusal is DEBUG.
+     */
+    @Test
+    void unusableParametersCountAnErrorPerReadyCandidateInOneErrorLinePerWalk() {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(universe());
+        twoReadyCandidates().forEach(candidate -> universe.add(candidate.escrow()));
+        CompoundExecutor executor = new CompoundExecutor(configuration, network, blockEventListener,
+                new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
+                new FakeScanner(twoReadyCandidates()), new CompoundEconomics(configuration, network, pricingService()),
+                realBuilder(twoReadyCandidates()), new FakeResolver(), LoanFixtures.utxoSupplier(universe),
+                LoanFixtures.converters(),
+                () -> {
+                    throw new IllegalStateException("cannot fetch protocol parameters",
+                            new SocketTimeoutException("connect timed out"));
+                },
+                bytes -> {
+                    throw new AssertionError("C cannot be sized, so nothing may be submitted");
+                });
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = eventsOf(() -> executor.cycle(SubmitFence.OPEN, tally));
+
+        assertEquals(List.of(0, 0, 0, 2, 0), counts(tally), "error 2");
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), "one ERROR line for the walk: " + events);
+        String line = errors.getFirst().getFormattedMessage();
+        assertTrue(line.contains("role C") && line.contains("connect timed out"), line);
+        assertNull(errors.getFirst().getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, events.stream().filter(event -> event.getLevel() == Level.DEBUG)
+                        .filter(event -> event.getThrowableProxy() != null).count(),
+                "one DEBUG event carries the stack trace: " + events);
+        assertTrue(events.stream().noneMatch(event -> event.getLevel() == Level.WARN), String.valueOf(events));
     }
 
     private static void assertCycleOutcome(CompoundExecutor.TransactionSubmitter response, WorkResult expected,
@@ -1611,6 +1693,28 @@ class CompoundExecutorTest {
                 .toList();
     }
 
+    /** {@link #linesOf}, keeping the events whole — their throwables included. */
+    private static List<ILoggingEvent> eventsOf(Runnable action) {
+        var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
+        Level previous = logger.getLevel();
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.DEBUG);
+        try {
+            action.run();
+        } finally {
+            logger.setLevel(previous);
+            logger.detachAppender(appender);
+        }
+        return appender.list;
+    }
+
+    /** FAB-195: submitted, would-submit, attempted, error, no-op — in the pass line's order. */
+    private static List<Integer> counts(StageTally tally) {
+        return List.of(tally.submitted(), tally.wouldSubmit(), tally.attempted(), tally.error(), tally.noOp());
+    }
+
     /** One cycle's lines, at every level, in the order the executor logged them. */
     private static List<Line> linesOfOneCycle(Wiring w) {
         return linesOf(() -> w.executor().cycle());
@@ -2087,7 +2191,11 @@ class CompoundExecutorTest {
         assertReconciles(summaryOf(unpriced).text(), 0);
     }
 
-    /** FAB-180: a fault keeps its level and its text — BUILD FAILED is still an ERROR — and the walk is still summarised. */
+    /**
+     * FAB-180: a fault keeps its level — BUILD FAILED is still an ERROR — and the walk is still summarised.
+     * FAB-195 (K2): its text moves to the cause-chain form, with no throwable on the ERROR line; the stack trace is
+     * one DEBUG event; and it counts error 1.
+     */
     @Test
     void aBuildFailureIsStillAnErrorWithItsTextUnchanged() {
         var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
@@ -2097,12 +2205,26 @@ class CompoundExecutorTest {
                 .thenThrow(new IllegalStateException("kernel said no"));
         CompoundCandidate only = ready(0L);
         CompoundExecutor executor = executorWithBuilder(configuration, failing, universe());
+        StageTally tally = new StageTally();
 
-        List<Line> lines = cycleAt(executor, T0);
+        executor.setClock(Clock.fixed(T0, ZoneOffset.UTC));
+        List<ILoggingEvent> events = eventsOf(() -> executor.cycle(SubmitFence.OPEN, tally));
+        List<Line> lines = events.stream().map(event -> new Line(event.getLevel(), event.getFormattedMessage()))
+                .toList();
 
-        assertTrue(lines.contains(new Line(Level.ERROR, "compound BUILD FAILED " + LOAN_ID + " escrow "
-                        + only.escrowRef() + ": java.lang.IllegalStateException: kernel said no")),
-                "BUILD FAILED stays at ERROR, text unchanged: " + lines);
+        String failed = "compound BUILD FAILED " + LOAN_ID + " escrow " + only.escrowRef()
+                + ": IllegalStateException: kernel said no";
+        assertTrue(lines.contains(new Line(Level.ERROR, failed)),
+                "BUILD FAILED stays at ERROR, in the cause-chain form: " + lines);
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), "one ERROR line: " + lines);
+        assertNull(errors.getFirst().getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, events.stream().filter(event -> event.getLevel() == Level.DEBUG)
+                        .filter(event -> event.getThrowableProxy() != null)
+                        .filter(event -> event.getFormattedMessage().startsWith("compound BUILD FAILED "))
+                        .count(),
+                "one DEBUG event carries the stack trace: " + lines);
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1");
         Line summary = summaryOf(lines);
         assertEquals(new Line(Level.INFO, "compound scan: 1 escrows, 1 priced, 1 ready, refused {}, "
                 + "not approved {}"), summary, "one candidate: priced once for the summary, no ranking");

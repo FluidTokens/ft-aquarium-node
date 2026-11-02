@@ -29,6 +29,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.Rational;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer;
@@ -107,7 +108,9 @@ import java.util.function.Function;
  * ruling of 2026-10-03): once a candidate has passed the eligibility filters — its route, its
  * market, its funds — the bot attempts it on EVERY cycle. A failure past that point is a logic bug,
  * and it is logged at ERROR with its cause on every cycle it happens: no back-off, no suppression,
- * because a failure that goes quiet after its first occurrence is a failure nobody fixes. A
+ * because a failure that goes quiet after its first occurrence is a failure nobody fixes. An unexpected
+ * build failure is ONE ERROR line carrying the loan, the route ({@code via plain|convert|pay-in-advance})
+ * and the whole cause chain, with no throwable; its stack trace goes to a DEBUG line beside it (FAB-195). A
  * liquidation that landed is re-derived until the index catches up, and its resubmission fails in
  * phase 1 (free) and is logged at INFO as not accepted — accepted, and preferred to a timer.
  * <p>
@@ -118,6 +121,13 @@ import java.util.function.Function;
  * designated output, and every role output among that body's inputs) or a node-shadow WOULD_SUBMIT stands
  * for one; the next candidate designated to it is then skipped rather than quietly funded from another
  * output.
+ *
+ * <h2>What the pass line is told (FAB-195)</h2>
+ * {@link #cycle(long, SubmitFence, StageTally)} counts each candidate it walks exactly once on the stage's tally,
+ * for the wallet pipeline's summary line only, and in one place, after the candidate ends: an accepted submit is
+ * {@code submitted}, a shadow WOULD_SUBMIT {@code would-submit}, a submit that was not accepted
+ * {@code attempted}, a failure of ours {@code error}, and anything else — every refusal by name — {@code no-op}.
+ * A candidate the fence stopped counts nothing. Nothing reads the tally back.
  *
  * <h2>One transaction per candidate</h2>
  * {@link LiquidateTransactionBuilder} accepts a batch, and this loop always hands it exactly one
@@ -755,6 +765,11 @@ public class LiquidationExecutor {
         return cycle(now, SubmitFence.OPEN);
     }
 
+    /** One cycle, counted on a tally nobody reads. The answer is exactly {@link #cycle(long, SubmitFence, StageTally)}'s. */
+    public WorkResult cycle(long now, SubmitFence fence) {
+        return cycle(now, fence, new StageTally());
+    }
+
     /**
      * The liquidation stage (FAB-183; FAB-186, fire and forget): EVERY candidate is walked, most
      * profitable first, across markets. A non-accepted submit — rejected, ambiguous or thrown — is one
@@ -762,12 +777,13 @@ public class LiquidationExecutor {
      * may be built on the same output. An accepted submit uses up its output for the rest of the call.
      * {@code fence} is read before each candidate and immediately before signing; once it reads
      * {@code false} nothing more is transmitted. It is not retained after the call, and nothing else is
-     * either.
+     * either. Each walked candidate is counted once on {@code tally} (FAB-195), which nothing here reads back;
+     * unusable protocol parameters at the start count one {@code error}.
      *
      * @return SUBMITTED if any submit was accepted, else WOULD_SUBMIT if a shadow candidate would have
      *         been submitted, else DEFINITE_FAILURE — every early return included; never AMBIGUOUS
      */
-    public WorkResult cycle(long now, SubmitFence fence) {
+    public WorkResult cycle(long now, SubmitFence fence, StageTally tally) {
         if (configuration.getMode() == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
             return WorkResult.DEFINITE_FAILURE;
         }
@@ -917,9 +933,13 @@ public class LiquidationExecutor {
             feeCeiling = LedgerCeilings.maxPossibleFee(fresh);
             collateralLovelace = WalletShape.collateralLovelace(fresh);
         } catch (Exception e) {
-            log.warn("{} buildable candidate(s) found but wallet role C cannot be sized: the protocol parameters "
+            // FAB-195: a failure of ours, not a refusal — one ERROR line with the cause chain, the stack trace at
+            // DEBUG. Tied to no loan, so the line names role C and the buildable count instead.
+            tally.recordError();
+            log.error("{} buildable candidate(s) found but wallet role C cannot be sized: the protocol parameters "
                     + "are unusable ({}), so no wallet output can be told apart and none is built this check",
                     buildable.size(), causeChain(e));
+            log.debug("wallet role C cannot be sized: the protocol parameters are unusable", e);
             return WorkResult.DEFINITE_FAILURE;
         }
         WalletRoles roles = WalletRoles.resolve(allWalletUtxos, collateralLovelace);
@@ -1018,7 +1038,11 @@ public class LiquidationExecutor {
                 // did not anticipate, and a null loan on a supposedly buildable assessment is one of
                 // them — dereferencing assessment.loan() here would throw out of the handler that is
                 // meant to contain it. The bond is the one thing every assessment always carries.
-                log.error("could not consider bond {}: {}", assessment.bond().utxoRef(), causeChain(e), e);
+                // FAB-195: one ERROR line, the stack trace at DEBUG.
+                pass.error = true;
+                log.error("could not consider bond {} via {}: {}", assessment.bond().utxoRef(), pass.route,
+                        causeChain(e));
+                log.debug("could not consider bond {} via {}", assessment.bond().utxoRef(), pass.route, e);
                 // FAB-186: the walk moves on, whether or not this candidate reached the submitter. An ACCEPTED
                 // submit already marked its outputs used the instant it was accepted (submit(), r2), so a
                 // later candidate on them is still skipped; nothing else is marked. Only an ACCEPTED submit
@@ -1027,8 +1051,10 @@ public class LiquidationExecutor {
                 if (pass.accepted) {
                     result = WorkResult.SUBMITTED;
                 }
+                count(null, pass, tally);
                 continue;
             }
+            count(outcome, pass, tally);
             if (outcome == WorkResult.SUBMITTED || outcome == WorkResult.WOULD_SUBMIT) {
                 if (result != WorkResult.SUBMITTED) {
                     result = outcome;
@@ -1039,12 +1065,14 @@ public class LiquidationExecutor {
     }
 
     /**
-     * One candidate's share of a {@link #cycle(long, SubmitFence)} call (FAB-183): the call's fence, read
-     * immediately before signing; the route and the designated wallet output the non-accepted line names
+     * One candidate's share of a {@link #cycle(long, SubmitFence, StageTally)} call (FAB-183): the call's fence,
+     * read immediately before signing; the route and the designated wallet output the non-accepted line names
      * (FAB-186); whether the submitter ACCEPTED it, which is what an exception escaping
      * {@code consider()} after the answer still counts as; and the call's wallet check with the outputs an
-     * accept uses up, which {@code submit()} marks the instant the submitter accepts (FAB-186 r2). Created
-     * per candidate and dropped with it; nothing in it outlives the call.
+     * accept uses up, which {@code submit()} marks the instant the submitter accepts (FAB-186 r2). Also, for the
+     * pass line only (FAB-195), whether a submit was not accepted and whether a failure of ours ended it — read
+     * by {@link #count} and nothing else. Created per candidate and dropped with it; nothing in it outlives the
+     * call.
      */
     private static final class CandidatePass {
         private final SubmitFence fence;
@@ -1053,10 +1081,34 @@ public class LiquidationExecutor {
         private String output = "none";
         private Set<String> usedIfAccepted = Set.of();
         private boolean accepted;
+        /** FAB-195: set by {@code notAccepted()}. */
+        private boolean attempted;
+        /** FAB-195: set where a failure of ours, not a refusal by name, ends the candidate. */
+        private boolean error;
 
         private CandidatePass(SubmitFence fence, WalletCheck walletCheck) {
             this.fence = fence;
             this.walletCheck = walletCheck;
+        }
+    }
+
+    /**
+     * FAB-195: one walked candidate, into exactly one bucket — {@code outcome} is what {@code consider()} returned,
+     * or null when the outer net caught. An accept (whatever came after it) is submitted; a shadow intent is
+     * would-submit; a submit that was not accepted is attempted; a failure of ours is error; anything else, every
+     * refusal by name included, is no-op — so a site that marks nothing falls to no-op, never to error.
+     */
+    private static void count(WorkResult outcome, CandidatePass pass, StageTally tally) {
+        if (outcome == WorkResult.SUBMITTED || pass.accepted) {
+            tally.recordSubmitted();
+        } else if (outcome == WorkResult.WOULD_SUBMIT) {
+            tally.recordWouldSubmit();
+        } else if (pass.attempted) {
+            tally.recordAttempted();
+        } else if (pass.error) {
+            tally.recordError();
+        } else {
+            tally.recordNoOp();
         }
     }
 
@@ -1407,9 +1459,12 @@ public class LiquidationExecutor {
                                         + "node's own database) could not be read, which says nothing "
                                         + "about whether a pool exists, which is what NO_MINSWAP_POOL "
                                         + "reports."));
-                        log.error("the pool lookup for {} failed reading the local pool index: {} — the "
+                        pass.error = true;
+                        log.error("the pool lookup for {} via {} failed reading the local pool index: {} — the "
                                         + "candidate itself was never assessed; retried next cycle",
-                                loanUtxoRef, causeChain(e), e);
+                                loanUtxoRef, ROUTE_CONVERT, causeChain(e));
+                        log.debug("the pool lookup for {} via {} failed reading the local pool index",
+                                loanUtxoRef, ROUTE_CONVERT, e);
                         return WorkResult.DEFINITE_FAILURE;
                     }
                     // ⛔ AMBIGUOUS_POOL: two AUTHENTIC pools for one pair in the local index. Minswap
@@ -1418,8 +1473,11 @@ public class LiquidationExecutor {
                     // nothing was built, so the wallet is untouched.
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             e.refusal().name(), e.getMessage()));
-                    log.error("the convert liquidation of {} was refused as {}: {}",
-                            loanUtxoRef, e.refusal(), e.getMessage());
+                    pass.error = true;
+                    log.error("the convert liquidation of {} via {} was refused as {}: {}",
+                            loanUtxoRef, ROUTE_CONVERT, e.refusal(), causeChain(e));
+                    log.debug("the convert liquidation of {} via {} was refused as {}",
+                            loanUtxoRef, ROUTE_CONVERT, e.refusal(), e);
                     return WorkResult.DEFINITE_FAILURE;
                 } catch (ConvertLiquidationRouter.WalletInputTooSmallException e) {
                     // A fact about the WALLET, not the candidate — an eligibility filter, reconsidered
@@ -1449,11 +1507,15 @@ public class LiquidationExecutor {
                     // ⚠ WHAT IS LEFT HERE IS A GENUINE MACHINERY FAULT, and that is the point of the
                     // four catches above: this branch used to swallow every verdict on the convert
                     // route as well, so "the pool cannot fill the debt" and "the bot is broken" reached
-                    // the operator identically. Rebuilt next cycle, and loud on every one (FAB-134 NQ).
+                    // the operator identically. Rebuilt next cycle, and loud on every one (FAB-134 NQ): one
+                    // ERROR line with the whole cause chain, the stack trace at DEBUG (FAB-195).
                     decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                             rootReason(e), causeChain(e)));
-                    log.error("building the convert liquidation of {} failed: {}", loanUtxoRef,
-                            causeChain(e), e);
+                    pass.error = true;
+                    log.error("building the convert liquidation of {} via {} failed: {}", loanUtxoRef,
+                            ROUTE_CONVERT, causeChain(e));
+                    log.debug("building the convert liquidation of {} via {} failed", loanUtxoRef,
+                            ROUTE_CONVERT, e);
                     return WorkResult.DEFINITE_FAILURE;
                 }
                 // Falls through to the shared record-and-maybe-submit path below, deliberately: the
@@ -1621,13 +1683,16 @@ public class LiquidationExecutor {
                 // is a bug nobody fixes). The refusal MUST say why: the builder wraps the real
                 // fault as IllegalStateException("cannot build the pay-in-advance transaction", cause),
                 // so recording only e.getMessage() drops the cause and leaves the operator debugging
-                // blind. The detail carries the whole cause chain and the exception is logged in full at
-                // ERROR (never DEBUG, which an INFO-level node never prints) — a build failure whose
-                // cause never reaches the log hides the next one too.
+                // blind. The detail carries the whole cause chain, and so does the ONE ERROR line (FAB-195) —
+                // root message included, so an INFO-level node still reads why; the stack trace goes to DEBUG.
+                // A build failure whose cause never reaches the log hides the next one too.
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         rootReason(e), causeChain(e)));
-                log.error("building the pay-in-advance liquidation of {} failed: {}",
-                        loanUtxoRef, causeChain(e), e);
+                pass.error = true;
+                log.error("building the pay-in-advance liquidation of {} via {} failed: {}",
+                        loanUtxoRef, ROUTE_PAY_IN_ADVANCE, causeChain(e));
+                log.debug("building the pay-in-advance liquidation of {} via {} failed",
+                        loanUtxoRef, ROUTE_PAY_IN_ADVANCE, e);
                 return WorkResult.DEFINITE_FAILURE;
             }
             }
@@ -1690,8 +1755,12 @@ public class LiquidationExecutor {
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         e.getReason().name(), refusalDetail(e)));
                 if (e.getCause() != null) {
-                    log.error("the liquidation of {} was refused as {} by a failure underneath: {}",
-                            loanUtxoRef, e.getReason(), causeChain(e.getCause()), e);
+                    // FAB-195: one ERROR line with the whole cause chain, the stack trace at DEBUG.
+                    pass.error = true;
+                    log.error("the liquidation of {} via {} was refused as {} by a failure underneath: {}",
+                            loanUtxoRef, ROUTE_PLAIN, e.getReason(), causeChain(e));
+                    log.debug("the liquidation of {} via {} was refused as {} by a failure underneath",
+                            loanUtxoRef, ROUTE_PLAIN, e.getReason(), e);
                     return WorkResult.DEFINITE_FAILURE;
                 } else {
                     // Task 7 (ADDENDA). The remedy is a LEVEL, not a flood: the forty-eight causeless
@@ -1711,12 +1780,15 @@ public class LiquidationExecutor {
                 }
                 // Anything else is a failure of the machinery rather than a verdict on the candidate —
                 // a Blockfrost timeout fetching protocol params, say. Rebuilt next cycle and logged at
-                // ERROR on every cycle (FAB-134 NQ). Same rule as the convert branch: surface the whole
-                // cause chain in the detail and log the exception in full at ERROR, never at DEBUG
-                // where an INFO-level operator never sees it.
+                // ERROR on every cycle (FAB-134 NQ). Same rule as the convert branch: the whole cause chain
+                // in the detail and in the ONE ERROR line, where an INFO-level operator sees it; the stack
+                // trace at DEBUG (FAB-195).
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         rootReason(e), causeChain(e)));
-                log.error("building the liquidation of {} failed: {}", loanUtxoRef, causeChain(e), e);
+                pass.error = true;
+                log.error("building the liquidation of {} via {} failed: {}", loanUtxoRef, ROUTE_PLAIN,
+                        causeChain(e));
+                log.debug("building the liquidation of {} via {} failed", loanUtxoRef, ROUTE_PLAIN, e);
                 return WorkResult.DEFINITE_FAILURE;
             }
         }
@@ -2092,9 +2164,13 @@ public class LiquidationExecutor {
             // T-040: was WARN with e.toString() and no throwable — the nearest sibling of the three
             // silent sites and the most surprising omission, because the exception reaches NOTHING
             // else. The recorded decision carries the pricing detail, not the fault, so this line is
-            // the only place the cause can ever appear.
-            log.error("could not serialise the built liquidation of {}: {}",
-                    assessment.loan().utxoRef(), causeChain(e), e);
+            // the only place the cause can ever appear — the whole chain, in ONE ERROR line; the stack trace
+            // at DEBUG (FAB-195).
+            pass.error = true;
+            log.error("could not serialise the built liquidation of {} via {}: {}",
+                    assessment.loan().utxoRef(), pass.route, causeChain(e));
+            log.debug("could not serialise the built liquidation of {} via {}",
+                    assessment.loan().utxoRef(), pass.route, e);
             LiquidationDecision.Outcome unmeasured = wouldSubmit(floorProfit, expectedProfit)
                     ? LiquidationDecision.Outcome.WOULD_SUBMIT
                     : LiquidationDecision.Outcome.UNPROFITABLE;
@@ -2278,6 +2354,7 @@ public class LiquidationExecutor {
             // NOTHING AT ALL and interpolate e.toString() into the veto detail — which stops at the
             // outermost exception, so a transport timeout wrapped by its client showed as the wrapper
             // and the real fault was gone. A veto an operator cannot explain is a veto they cannot act on.
+            pass.error = true;
             log.error("could not fetch maxTxSize while vetting the liquidation of {}: {}",
                     assessment.loan().utxoRef(), causeChain(e), e);
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, SubmitVeto.TX_TOO_LARGE,
@@ -2304,7 +2381,7 @@ public class LiquidationExecutor {
         }
         // S6 — the two UTxOs, re-read immediately before the wire. They were unspent when the build
         // started; a block may have arrived since.
-        String staleVeto = staleUtxo(assessment);
+        String staleVeto = staleUtxo(assessment, pass);
         if (staleVeto != null) {
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, SubmitVeto.STALE_UTXO,
                     detail + "; " + staleVeto);
@@ -2314,7 +2391,7 @@ public class LiquidationExecutor {
         // the more specific reason; but reached on every candidate, including the ada/ada ones S5
         // has nothing to say about.
         String elapsed = transactionWindowElapsed(transaction, submitClock.getAsLong(),
-                assessment.loan().utxoRef());
+                assessment.loan().utxoRef(), pass);
         if (elapsed != null) {
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED,
                     SubmitVeto.TRANSACTION_WINDOW_ELAPSED, detail + "; " + elapsed);
@@ -2335,7 +2412,7 @@ public class LiquidationExecutor {
      * @return null when the window is still open, otherwise why it is not
      */
     private String transactionWindowElapsed(Transaction transaction, long submitTime,
-                                            String loanUtxoRef) {
+                                            String loanUtxoRef, CandidatePass pass) {
         Long ttlSlot = transaction.getBody().getTtl();
         if (ttlSlot == null || ttlSlot <= 0) {
             return "the built transaction carries no validity end, so it cannot be shown unexpired";
@@ -2347,6 +2424,7 @@ public class LiquidationExecutor {
         } catch (Exception e) {
             // T-040: logged nothing, and buried e.toString() in the veto detail. Same rule as the
             // maxTxSize fetch above — the whole cause chain, at ERROR, with the throwable attached.
+            pass.error = true;
             log.error("could not convert slot {} to a time while vetting the liquidation of {}: {}",
                     ttlSlot, loanUtxoRef, causeChain(e), e);
             return "slot %d could not be converted to a time (%s), so the validity end is unknown"
@@ -2415,7 +2493,7 @@ public class LiquidationExecutor {
      *
      * @return null when both are still unspent, otherwise why they are not
      */
-    private String staleUtxo(LiquidationAssessment assessment) {
+    private String staleUtxo(LiquidationAssessment assessment, CandidatePass pass) {
         try {
             if (utxoResolver.resolveLoanUtxo(assessment.loan()).isEmpty()) {
                 return "the loan utxo is no longer unspent";
@@ -2428,6 +2506,7 @@ public class LiquidationExecutor {
             // T-040: logged nothing, and buried e.toString() in the veto detail. A resolver that
             // throws is still treated exactly like a spent UTxO — the veto is unchanged — but the
             // operator now gets the whole cause chain at ERROR with the throwable attached.
+            pass.error = true;
             log.error("the utxo re-check threw while vetting the liquidation of {}: {}",
                     assessment.loan().utxoRef(), causeChain(e), e);
             return "the utxo re-check threw (" + causeChain(e)
@@ -2475,6 +2554,7 @@ public class LiquidationExecutor {
             // Not one of the seven — those are all about whether submitting is *allowed*, and this
             // is the machinery failing after they all said yes. It carries no veto name for exactly
             // that reason, and it still transmits nothing.
+            pass.error = true;
             log.error("could not sign the liquidation of {}: {}", loanUtxoRef, causeChain(e), e);
             return new Verdict(LiquidationDecision.Outcome.SUBMIT_VETOED, null,
                     detail + "; signing threw (" + causeChain(e) + "), nothing was transmitted");
@@ -2517,6 +2597,7 @@ public class LiquidationExecutor {
      */
     private Verdict notAccepted(String loanUtxoRef, String detail, CandidatePass pass, String status,
                                 String response) {
+        pass.attempted = true;
         String cut = response.length() <= NOT_ACCEPTED_RESPONSE_CHARS ? response
                 : response.substring(0, NOT_ACCEPTED_RESPONSE_CHARS - 1) + "…";
         log.info("liquidation of {} via {} on {} not accepted: HTTP {} {}", loanUtxoRef, pass.route, pass.output,
@@ -2924,7 +3005,7 @@ public class LiquidationExecutor {
     static final String ROLE_TOKEN = "TOKEN ";
 
     /**
-     * One {@link #cycle(long, SubmitFence)} call's wallet: the read it started from, the roles resolved
+     * One {@link #cycle(long, SubmitFence, StageTally)} call's wallet: the read it started from, the roles resolved
      * from it once, the fee ceiling every requirement is sized with, the outputs that went out, and the
      * missing roles already said at WARN. Created per call and dropped with it; nothing in it outlives it.
      */

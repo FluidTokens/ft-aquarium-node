@@ -30,6 +30,8 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
+import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles;
 import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
@@ -1914,6 +1916,30 @@ class LiquidationExecutorTest {
         return appender.list;
     }
 
+    /**
+     * FAB-195: {@link #cyclesLogged} with the executor's logger at DEBUG for the duration, so the DEBUG line that
+     * carries a failure's stack trace is captured too. The previous level is restored.
+     */
+    private static List<ILoggingEvent> cyclesLoggedAtDebug(Wiring wiring, int cycles) {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        try {
+            return cyclesLogged(wiring, cycles);
+        } finally {
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    /** FAB-195: the DEBUG events carrying a throwable whose message contains {@code text} — where a stack trace goes. */
+    private static List<ILoggingEvent> stackTracesAtDebug(List<ILoggingEvent> events, String text) {
+        return events.stream()
+                .filter(event -> event.getLevel() == Level.DEBUG)
+                .filter(event -> event.getThrowableProxy() != null)
+                .filter(event -> event.getFormattedMessage().contains(text))
+                .toList();
+    }
+
     private static List<ILoggingEvent> errorsContaining(List<ILoggingEvent> events, String text) {
         return events.stream()
                 .filter(event -> event.getLevel() == Level.ERROR)
@@ -1939,7 +1965,7 @@ class LiquidationExecutorTest {
                 allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false, false,
                 LoanFixtures.protocolParams(), null, brokenBuilder, metrics());
 
-        List<ILoggingEvent> events = cyclesLogged(wiring, 2);
+        List<ILoggingEvent> events = cyclesLoggedAtDebug(wiring, 2);
 
         verify(brokenBuilder, times(2)).build(any(LiquidateTransactionBuilder.Request.class));
         List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
@@ -1956,8 +1982,11 @@ class LiquidationExecutorTest {
         for (ILoggingEvent error : errors) {
             assertTrue(error.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
                     "each ERROR carries the root cause: " + error.getFormattedMessage());
-            assertNotNull(error.getThrowableProxy(), "and the exception itself");
+            // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+            assertNull(error.getThrowableProxy(), "the ERROR line carries no throwable");
         }
+        assertEquals(2, stackTracesAtDebug(events, "building the liquidation of").size(),
+                "one DEBUG event per failure carries the exception itself: " + events);
     }
 
     /**
@@ -2903,16 +2932,22 @@ class LiquidationExecutorTest {
         Wiring wiring = tokenPrincipalConvertEconomicsWiringWithExecutorParams(tokenBehindTheAdaFloorWallet(),
                 throwingParams());
 
-        List<ILoggingEvent> events = cyclesLogged(wiring, 1);
+        List<ILoggingEvent> events = cyclesLoggedAtDebug(wiring, 1);
 
         assertEquals(0, wiring.log().size(), "nothing is built and nothing is recorded per candidate: "
                 + wiring.log().newestFirst(10));
         assertEquals(1, wiring.scanner().scans, "the world is still observed");
-        List<ILoggingEvent> warns = events.stream().filter(event -> event.getLevel() == Level.WARN).toList();
-        assertEquals(1, warns.size(), "exactly one WARN: " + warns);
-        String warn = warns.getFirst().getFormattedMessage();
+        // FAB-195: a failure of ours, so ERROR rather than WARN — still exactly one line, its stack trace at DEBUG.
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), "exactly one ERROR: " + errors);
+        assertEquals(List.of(), events.stream().filter(event -> event.getLevel() == Level.WARN).toList(),
+                "and no WARN any more");
+        String warn = errors.getFirst().getFormattedMessage();
         assertTrue(warn.contains("role C") && warn.contains(BLOCKFROST_TIMEOUT),
                 "it names role C and the cause chain down to the root: " + warn);
+        assertNull(errors.getFirst().getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(events, "cannot be sized").size(),
+                "one DEBUG event carries the exception itself: " + events);
         assertFalse(events.stream().anyMatch(event -> event.getFormattedMessage().contains("PAY-IN-ADVANCE")),
                 "no route was entered: " + events);
     }
@@ -3199,6 +3234,8 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
@@ -3225,10 +3262,13 @@ class LiquidationExecutorTest {
             assertFalse(event.getFormattedMessage().contains("java.lang.NullPointerException"),
                     "causeChain uses the SIMPLE name; e.toString() qualifies it: "
                             + event.getFormattedMessage());
-            assertNotNull(event.getThrowableProxy(),
-                    "the exception itself must be attached for the stack trace, not just the message");
+            // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+            assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+            assertEquals(1, stackTracesAtDebug(appender.list, "could not consider bond").size(),
+                    "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -3352,6 +3392,8 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             // F855.NOW, not NOW: the frozen fixture's oracle feed is only valid around its own
@@ -3359,6 +3401,7 @@ class LiquidationExecutorTest {
             wiring.executor().cycle(F855.NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3385,8 +3428,10 @@ class LiquidationExecutorTest {
         assertTrue(event.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
                 "the log must surface the ROOT cause too, not just toString() of the wrapper: "
                         + event.getFormattedMessage());
-        assertNotNull(event.getThrowableProxy(),
-                "the exception itself must be attached for the stack trace, not just the message");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "building the pay-in-advance liquidation of").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
     }
 
     /**
@@ -3415,11 +3460,14 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3438,7 +3486,10 @@ class LiquidationExecutorTest {
         ILoggingEvent event = errors.getFirst();
         assertTrue(event.getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
                 "the log must surface the ROOT cause too: " + event.getFormattedMessage());
-        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "building the liquidation of").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
     }
 
     /**
@@ -3462,11 +3513,14 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         assertEquals(0, wiring.log().size(),
@@ -3486,7 +3540,10 @@ class LiquidationExecutorTest {
         assertTrue(event.getFormattedMessage().contains("index segment 000042 is corrupt"),
                 "must surface the ROOT cause, not just toString() of the wrapper: "
                         + event.getFormattedMessage());
-        assertNotNull(event.getThrowableProxy(), "the exception must be attached for the stack trace");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "could not consider bond").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
     }
 
     /**
@@ -3512,11 +3569,14 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3534,7 +3594,10 @@ class LiquidationExecutorTest {
                 "a refusal that wraps a failure gets exactly one ERROR line: " + appender.list);
         assertTrue(errors.getFirst().getFormattedMessage().contains(BLOCKFROST_TIMEOUT),
                 "which must name the root cause: " + errors.getFirst().getFormattedMessage());
-        assertNotNull(errors.getFirst().getThrowableProxy(), "with the exception attached");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(errors.getFirst().getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "by a failure underneath").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
     }
 
     /**
@@ -3624,11 +3687,14 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         LiquidationDecision decision = onlyDecision(wiring);
@@ -3645,8 +3711,205 @@ class LiquidationExecutorTest {
         // THE DISCRIMINATOR: toString() on the wrapper stops one link short of this.
         assertTrue(event.getFormattedMessage().contains("cbor writer refused a 4-byte tag"),
                 "must surface the ROOT cause, not just toString(): " + event.getFormattedMessage());
-        assertNotNull(event.getThrowableProxy(),
-                "and the throwable must be attached — the old WARN passed none");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(event.getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(1, stackTracesAtDebug(appender.list, "could not serialise").size(),
+                "one DEBUG event carries the exception itself, for the stack trace: " + appender.list);
+    }
+
+    // ======================================================================================
+    // FAB-195 — what a cycle tells the pass line, and the one-ERROR-line rule for a build failure
+    // ======================================================================================
+
+    /** A cycle on {@code executor} behind an open fence, counted on {@code tally}, with the logger at DEBUG. */
+    private static List<ILoggingEvent> cycleLoggedAtDebug(LiquidationExecutor executor, long now, StageTally tally) {
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        logger.addAppender(appender);
+        try {
+            executor.cycle(now, SubmitFence.OPEN, tally);
+        } finally {
+            logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
+        }
+        return appender.list;
+    }
+
+    /** submitted, would-submit, attempted, error, no-op — in the pass line's order. */
+    private static List<Integer> counts(StageTally tally) {
+        return List.of(tally.submitted(), tally.wouldSubmit(), tally.attempted(), tally.error(), tally.noOp());
+    }
+
+    /**
+     * FAB-195 LINE RULE: exactly one ERROR event in the cycle, naming {@code phrase}, the loan, {@code via <route>}
+     * and the root cause's message, with NO throwable; and exactly one DEBUG event, naming {@code phrase}, that
+     * carries the throwable.
+     */
+    private static void assertLineRule(List<ILoggingEvent> events, String phrase, String loanRef, String route,
+                                       String rootMessage) {
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), "exactly one ERROR event for the failure: " + events);
+        String line = errors.getFirst().getFormattedMessage();
+        assertTrue(line.contains(phrase), "the site's own phrase: " + line);
+        assertTrue(line.contains(loanRef), "the loan: " + line);
+        assertTrue(line.contains("via " + route), "the route: " + line);
+        assertTrue(line.contains(rootMessage), "the whole cause chain, down to the root: " + line);
+        assertNull(errors.getFirst().getThrowableProxy(), "no throwable on the ERROR line: " + line);
+        assertEquals(1, stackTracesAtDebug(events, phrase).size(),
+                "exactly one DEBUG event carries the throwable: " + events);
+    }
+
+    /**
+     * (L1) Plain: an unexpected build failure (the mocked builder's machinery failure) counts {@code error 1} and is
+     * said under the LINE RULE, via plain.
+     */
+    @Test
+    void anUnexpectedPlainBuildFailureCountsOneErrorInOneErrorLine() {
+        LiquidateTransactionBuilder brokenBuilder = mock(LiquidateTransactionBuilder.class);
+        when(brokenBuilder.build(any(LiquidateTransactionBuilder.Request.class))).thenThrow(
+                new IllegalStateException("cannot fetch protocol parameters",
+                        new java.net.SocketTimeoutException(BLOCKFROST_TIMEOUT)));
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), shaped(WALLET_UTXO), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, brokenBuilder, metrics());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        assertLineRule(events, "building the liquidation of", honest.loan().loan().utxoRef(),
+                LiquidationExecutor.ROUTE_PLAIN, BLOCKFROST_TIMEOUT);
+    }
+
+    /** (L1) Convert (Minswap): any other exception from the router counts {@code error 1}, via convert. */
+    @Test
+    void anUnexpectedConvertBuildFailureCountsOneErrorInOneErrorLine() {
+        ConvertWiring wiring = convertWiringThrowing(new IllegalStateException("the convert route broke",
+                new java.io.IOException("pool snapshot 0007 is truncated")));
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        assertLineRule(events, "building the convert liquidation of",
+                convertScenario(FAT_FEE_PER_MILLE).loan().loan().utxoRef(), LiquidationExecutor.ROUTE_CONVERT,
+                "pool snapshot 0007 is truncated");
+    }
+
+    /**
+     * (L1) Pay-in-advance: {@code convertWiring(throwingParams())} — the f855 loan, routed to the pay-in-advance
+     * builder by {@code shadow}'s ANTICIPATE market, whose own {@code try} wraps the throwing parameters — counts
+     * {@code error 1}, via pay-in-advance.
+     */
+    @Test
+    void anUnexpectedPayInAdvanceBuildFailureCountsOneErrorInOneErrorLine() {
+        Wiring wiring = convertWiring(throwingParams());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), F855.NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        assertLineRule(events, "building the pay-in-advance liquidation of", F855.loan().utxoRef(),
+                LiquidationExecutor.ROUTE_PAY_IN_ADVANCE, BLOCKFROST_TIMEOUT);
+    }
+
+    /** (L1) The pool lookup failing to read the local index is a failure of ours: {@code error 1}, via convert. */
+    @Test
+    void aPoolLookupThatCannotReadTheIndexCountsOneErrorInOneErrorLine() {
+        ConvertWiring wiring = convertWiringThrowing(new MinswapPoolResolver.RefusedException(
+                MinswapPoolResolver.Refusal.LOOKUP_FAILED, "the pool lookup failed: index segment 000042 is corrupt"));
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        assertLineRule(events, "failed reading the local pool index",
+                convertScenario(FAT_FEE_PER_MILLE).loan().loan().utxoRef(), LiquidationExecutor.ROUTE_CONVERT,
+                "index segment 000042 is corrupt");
+    }
+
+    /** (L2) Plain: U too small is a refusal by name — {@code no-op 1}, its WARN unchanged, no ERROR. */
+    @Test
+    void aPlainWalletTooSmallRefusalCountsOneNoOpAtItsOwnLevel() {
+        Utxo tiny = LoanFixtures.adaUtxo("77".repeat(32), 0, ACCOUNT.baseAddress(), 1_000_000L);
+        Scenario honest = scenario(FAT_FEE_PER_MILLE);
+        Wiring wiring = wiring(shadow(SMALL_MARGIN), List.of(honest.assessment()), List.of(honest),
+                allUnspent(List.of(honest)), shaped(tiny), noOracle(), false, false,
+                LoanFixtures.protocolParams(), null, mock(LiquidateTransactionBuilder.class), metrics());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(tally), "no-op 1, nothing else");
+        List<ILoggingEvent> refusals = events.stream()
+                .filter(event -> event.getFormattedMessage().contains("U cannot fund this liquidation's fee ceiling."))
+                .toList();
+        assertEquals(1, refusals.size(), String.valueOf(events));
+        assertEquals(Level.WARN, refusals.getFirst().getLevel(), "its level is unchanged");
+        assertTrue(events.stream().noneMatch(event -> event.getLevel() == Level.ERROR), String.valueOf(events));
+    }
+
+    /** (L2) Convert: a {@code ConvertOrderPlan} refusal is a verdict — {@code no-op 1} at INFO, no ERROR. */
+    @Test
+    void aConvertPlanRefusalCountsOneNoOpAtItsOwnLevel() {
+        ConvertWiring wiring = convertWiringThrowing(new ConvertOrderPlan.RefusedException(
+                ConvertOrderPlan.Refusal.POOL_TOO_THIN,
+                "swapping 22003200000 would return about 824348402, but minimum_receive is 980001429"));
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(tally), "no-op 1, nothing else");
+        List<ILoggingEvent> refusals = events.stream()
+                .filter(event -> event.getFormattedMessage().contains("was refused as POOL_TOO_THIN"))
+                .toList();
+        assertEquals(1, refusals.size(), String.valueOf(events));
+        assertEquals(Level.INFO, refusals.getFirst().getLevel(), "its level is unchanged");
+        assertTrue(events.stream().noneMatch(event -> event.getLevel() == Level.ERROR), String.valueOf(events));
+    }
+
+    /** (L2) Pay-in-advance: a market-gate refusal is policy — {@code no-op 1} at INFO, no ERROR. */
+    @Test
+    void aPayInAdvanceMarketGateRefusalCountsOneNoOpAtItsOwnLevel() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(tokenBehindTheAdaFloorWallet());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 0, 1), counts(tally), "no-op 1, nothing else");
+        List<ILoggingEvent> refusals = events.stream()
+                .filter(event -> event.getFormattedMessage().contains("was refused by the market gate"))
+                .toList();
+        assertEquals(1, refusals.size(), String.valueOf(events));
+        assertEquals(Level.INFO, refusals.getFirst().getLevel(), "its level is unchanged");
+        assertTrue(events.stream().noneMatch(event -> event.getLevel() == Level.ERROR), String.valueOf(events));
+    }
+
+    /**
+     * (L3) Protocol parameters unusable at the cycle start: {@code error 1} for the stage, in ONE ERROR line that
+     * names role C and the cause chain with no throwable, and one DEBUG event that carries it. No candidate is
+     * walked, so nothing else is counted.
+     */
+    @Test
+    void unusableParametersAtCycleStartCountOneErrorInOneErrorLine() {
+        Wiring wiring = tokenPrincipalConvertEconomicsWiringWithExecutorParams(tokenBehindTheAdaFloorWallet(),
+                throwingParams());
+        StageTally tally = new StageTally();
+
+        List<ILoggingEvent> events = cycleLoggedAtDebug(wiring.executor(), NOW, tally);
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally), "error 1, nothing else");
+        List<ILoggingEvent> errors = events.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+        assertEquals(1, errors.size(), String.valueOf(events));
+        String line = errors.getFirst().getFormattedMessage();
+        assertTrue(line.contains("role C") && line.contains("cannot be sized") && line.contains(BLOCKFROST_TIMEOUT),
+                line);
+        assertNull(errors.getFirst().getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, stackTracesAtDebug(events, "cannot be sized").size(), String.valueOf(events));
     }
 
     // ======================================================================================
@@ -4225,12 +4488,15 @@ class LiquidationExecutorTest {
         var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
         appender.start();
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
         logger.addAppender(appender);
         try {
             wiring.executor().cycle(NOW);
             wiring.executor().cycle(NOW + 60_000L);
         } finally {
             logger.detachAppender(appender);
+            logger.setLevel(previousLevel);
         }
 
         assertEquals(2, wiring.router().calls, "retried on the very next cycle, not held");
@@ -4254,7 +4520,10 @@ class LiquidationExecutorTest {
         assertEquals(2, errors.size(), "ERROR on each cycle, never WARN: " + appender.list);
         assertTrue(errors.getFirst().getFormattedMessage().contains("SocketTimeoutException"),
                 errors.getFirst().getFormattedMessage());
-        assertNotNull(errors.getFirst().getThrowableProxy(), "the exception itself is attached");
+        // FAB-195: the stack trace goes to DEBUG, never on the ERROR line.
+        assertNull(errors.getFirst().getThrowableProxy(), "the ERROR line carries no throwable");
+        assertEquals(2, stackTracesAtDebug(appender.list, "failed reading the local pool index").size(),
+                "one DEBUG event per cycle carries the exception itself: " + appender.list);
     }
 
     /**

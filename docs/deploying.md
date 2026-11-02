@@ -645,6 +645,9 @@ next candidate is tried, on the same UTxO. A liquidation held back by a market i
 node marks nothing. Until an accepted liquidation is in a block (about 20 s), later passes rebuild on U
 and get harmless rejections; the Blockfrost calls they cost appear in each pass's summary line
 (`wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <label>, <k> block(s) folded in, waited <w> s, took <d> s: liquidation …; Blockfrost calls discovery …, evaluate …, submit …`).
+Each stage on that line prints its outcome — `NO_OP`, `ATTEMPTED`, `SUBMITTED`, `WOULD_SUBMIT`, `SKIPPED`
+or `ERROR`, with its counts — as described in
+[upgrading.md §7, "Stage outcomes on the pass line"](upgrading.md#stage-outcomes-on-the-pass-line-fab-195).
 Every pass says it at INFO
 by default; `WALLET_PIPELINE_LOG_EVERY_PASS=false` returns to INFO only when something happened. See
 [upgrading.md §7, "Fire and forget"](upgrading.md#fire-and-forget-fab-186).

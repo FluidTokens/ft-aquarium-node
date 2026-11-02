@@ -15,6 +15,7 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
+import com.fluidtokens.aquarium.offchain.service.StageTally;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
@@ -40,6 +41,8 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -704,6 +707,131 @@ class WalletRebalancerTest {
                 }, effectiveMode, true);
         String failed = assertOutcome(unreadableMarkets, "failed: ");
         assertTrue(failed.contains("markets unreadable"), failed);
+    }
+
+    // ---- FAB-195: what each ending tells the pass line -------------------------------------------------------
+
+    /** submitted, would-submit, attempted, error, no-op — in the pass line's order. */
+    private static List<Integer> counts(StageTally tally) {
+        return List.of(tally.submitted(), tally.wouldSubmit(), tally.attempted(), tally.error(), tally.noOp());
+    }
+
+    /** One pass on {@code fence}, counted on a fresh tally; what it counted. */
+    private static List<Integer> countsOf(WalletRebalancer rebalancer, SubmitFence fence) {
+        StageTally tally = new StageTally();
+        rebalancer.housekeep(fence, tally);
+        return counts(tally);
+    }
+
+    /**
+     * (H1) At most one count per pass, by ending: a closed gate and a wallet in shape count nothing; a build that was
+     * not built and a closed fence are no-ops; an accepted submit is submitted; a decoded Blockfrost 400 envelope is
+     * attempted; a raw {@code Result.error} (no clear answer) and a submit that threw are submitted — a display
+     * merge of AMBIGUOUS.
+     */
+    @Test
+    void eachEndingCountsAtMostOnce() {
+        assertEquals(List.of(0, 0, 0, 0, 0), countsOf(rebalancer(false), SubmitFence.OPEN), "idle");
+
+        walletContents.set(List.of(utxo(TEN_ADA.longValueExact(), NIGHT, 15_000_000_000L),
+                utxo(C.longValueExact()), utxo(150_000_000)));
+        assertEquals(List.of(0, 0, 0, 0, 0), countsOf(rebalancer(true), SubmitFence.OPEN), "in shape");
+
+        walletContents.set(List.of(utxo(1_180_000, NIGHT, 15_000_000_000L), utxo(5_000_000)));
+        assertEquals(List.of(0, 0, 0, 0, 1), countsOf(rebalancer(true), SubmitFence.OPEN), "not built");
+
+        walletContents.set(nightWallet());
+        assertEquals(List.of(0, 0, 0, 0, 1), countsOf(rebalancer(true), () -> false), "fenced");
+        assertEquals(List.of(1, 0, 0, 0, 0), countsOf(rebalancer(true), SubmitFence.OPEN), "submitted");
+
+        submitterBehaviour.set(bytes -> Result.<String>error(
+                "{\"status_code\":400,\"error\":\"Bad Request\",\"message\":\"opaque\"}").code(400));
+        StageTally decoded = new StageTally();
+        assertEquals(WorkResult.DEFINITE_FAILURE, rebalancer(true).housekeep(SubmitFence.OPEN, decoded));
+        assertEquals(List.of(0, 0, 1, 0, 0), counts(decoded), "a decoded 400 envelope");
+
+        submitterBehaviour.set(bytes -> Result.error("BadInputsUTxO"));
+        StageTally raw = new StageTally();
+        assertEquals(WorkResult.AMBIGUOUS, rebalancer(true).housekeep(SubmitFence.OPEN, raw));
+        assertEquals(List.of(1, 0, 0, 0, 0), counts(raw), "a raw Result.error");
+
+        submitterBehaviour.set(bytes -> {
+            throw new java.io.IOException("connection reset");
+        });
+        assertEquals(List.of(1, 0, 0, 0, 0), countsOf(rebalancer(true), SubmitFence.OPEN), "submit threw");
+    }
+
+    /** Runs {@code action} with this class's logger at DEBUG, restoring its level after. */
+    private void atDebug(Runnable action) {
+        Level previous = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        try {
+            action.run();
+        } finally {
+            logger.setLevel(previous);
+        }
+    }
+
+    /** The DEBUG events carrying a throwable — where a stack trace goes. */
+    private List<ILoggingEvent> stackTracesAtDebug() {
+        return logs.list.stream().filter(e -> e.getLevel() == Level.DEBUG)
+                .filter(e -> e.getThrowableProxy() != null).toList();
+    }
+
+    /**
+     * (H2) A thrown wallet read whose root cause is distinct from its wrapper counts error 1, in ONE ERROR line that
+     * carries the whole cause chain, down to the root, with no throwable; one DEBUG event carries it.
+     */
+    @Test
+    void aThrownWalletReadCountsOneErrorInOneErrorLine() {
+        walletFailure.set(new IllegalStateException("the index is unreadable",
+                new java.io.IOException("segment 000042 is corrupt")));
+        StageTally tally = new StageTally();
+
+        atDebug(() -> rebalancer(true).housekeep(SubmitFence.OPEN, tally));
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally));
+        List<ILoggingEvent> errors = at(Level.ERROR);
+        assertEquals(1, errors.size(), String.valueOf(logs.list));
+        String line = errors.get(0).getFormattedMessage();
+        assertTrue(line.startsWith("[REBALANCE]") && line.contains("the index is unreadable")
+                && line.contains("segment 000042 is corrupt"), line);
+        assertNull(errors.get(0).getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, stackTracesAtDebug().size(), String.valueOf(logs.list));
+    }
+
+    /**
+     * (H3) The catch-all (the markets cannot be read) counts error 1 under the same rule; the submit-threw ERROR is a
+     * different site and still carries its throwable.
+     */
+    @Test
+    void theCatchAllCountsOneErrorInOneErrorLineAndASubmitThatThrewKeepsItsThrowable() {
+        WalletRebalancer unreadableMarkets = new WalletRebalancer(engine, walletContents::get, syncing::get,
+                mode::get, () -> {
+                    throw new IllegalStateException("markets unreadable",
+                            new java.io.IOException("config segment 7 is corrupt"));
+                }, effectiveMode, true);
+        StageTally tally = new StageTally();
+
+        atDebug(() -> unreadableMarkets.housekeep(SubmitFence.OPEN, tally));
+
+        assertEquals(List.of(0, 0, 0, 1, 0), counts(tally));
+        List<ILoggingEvent> errors = at(Level.ERROR);
+        assertEquals(1, errors.size(), String.valueOf(logs.list));
+        String line = errors.get(0).getFormattedMessage();
+        assertTrue(line.startsWith("[REBALANCE] failed") && line.contains("markets unreadable")
+                && line.contains("config segment 7 is corrupt"), line);
+        assertNull(errors.get(0).getThrowableProxy(), "no throwable on the ERROR line");
+        assertEquals(1, stackTracesAtDebug().size(), String.valueOf(logs.list));
+
+        logs.list.clear();
+        submitterBehaviour.set(bytes -> {
+            throw new java.io.IOException("connection reset");
+        });
+        rebalancer(true).housekeep(SubmitFence.OPEN, new StageTally());
+        List<ILoggingEvent> threw = at(Level.ERROR);
+        assertEquals(1, threw.size(), String.valueOf(logs.list));
+        assertNotNull(threw.get(0).getThrowableProxy(), "the submit-threw ERROR keeps its throwable");
     }
 
     /**

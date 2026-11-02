@@ -6,6 +6,8 @@ import lombok.extern.slf4j.Slf4j;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
@@ -40,16 +42,35 @@ import java.util.function.Consumer;
  *
  * <p>Each pass ends with one summary line (FAB-186, FAB-195): its number, its trigger ({@code block},
  * {@code price} or {@code block+price}), the blocks folded into it, how long it waited from the first trigger
- * it serves and how long it took, each stage's result and the Blockfrost calls the pass made, by kind —
- * counted by the deadline, never limited by the count. It is INFO for every pass while {@code logEveryPass}
- * is on; off, only a pass that did something says it at INFO.</p>
+ * it serves and how long it took, each stage's outcome and the Blockfrost calls the pass made, by kind —
+ * counted by the deadline, never limited by the count. A stage's outcome is the strongest of
+ * {@code SUBMITTED > WOULD_SUBMIT > ATTEMPTED > ERROR > NO_OP}, or {@code SKIPPED} for a stage that did not run,
+ * followed by its non-zero counts from the {@link StageTally} its {@link StageFence} carried. The tally feeds
+ * that line and nothing else: what ends a pass is still the stage's returned {@link WorkResult}. It is INFO for
+ * every pass while {@code logEveryPass} is on; off, only a pass that did something says it at INFO.</p>
  */
 @Slf4j
 public final class WalletPipeline implements AutoCloseable {
 
     @FunctionalInterface
     public interface Stage {
-        WorkResult run(SubmitFence fence) throws Exception;
+        WorkResult run(StageFence fence) throws Exception;
+    }
+
+    /**
+     * A stage's fence (FAB-195): the pass's one {@link SubmitFence} rule, plus the {@link StageTally} this stage
+     * counts its candidates on for the pass's summary line. Each stage of a pass gets its own, with a fresh tally.
+     */
+    public interface StageFence extends SubmitFence {
+        StageTally tally();
+    }
+
+    /** The pass's fence rule with one stage's tally beside it. */
+    private record PassStageFence(SubmitFence pass, StageTally tally) implements StageFence {
+        @Override
+        public boolean mayProceed() {
+            return pass.mayProceed();
+        }
     }
 
     @FunctionalInterface
@@ -334,9 +355,9 @@ public final class WalletPipeline implements AutoCloseable {
                            PassSummary summary) throws Exception {
         SubmitFence fence = () -> mayProceed(point, pass, deadline);
 
-        summary.liquidation = THREW;
-        WorkResult liquidated = outcome(liquidation.run(fence));
-        summary.liquidation = liquidated.name();
+        summary.liquidation.started = true;
+        WorkResult liquidated = outcome(liquidation.run(summary.liquidation.fence(fence)));
+        summary.liquidation.result = liquidated;
         if (wentOut(liquidated)) {
             log.info("wallet pipeline: liquidation {} at slot {} — compound and housekeeping wait for the next trigger",
                     liquidated, point.slot());
@@ -346,9 +367,9 @@ public final class WalletPipeline implements AutoCloseable {
             return;
         }
 
-        summary.compound = THREW;
-        WorkResult compounded = outcome(compound.run(fence));
-        summary.compound = compounded.name();
+        summary.compound.started = true;
+        WorkResult compounded = outcome(compound.run(summary.compound.fence(fence)));
+        summary.compound.result = compounded;
         if (wentOut(compounded)) {
             log.info("wallet pipeline: compound {} at slot {} — housekeeping waits for the next trigger",
                     compounded, point.slot());
@@ -358,19 +379,29 @@ public final class WalletPipeline implements AutoCloseable {
             return;
         }
 
-        summary.housekeeping = THREW;
-        summary.housekeeping = outcome(housekeeping.run(fence)).name();
+        summary.housekeeping.started = true;
+        summary.housekeeping.result = outcome(housekeeping.run(summary.housekeeping.fence(fence)));
     }
 
-    /** A stage that did not run this pass, and one that threw instead of answering. */
-    private static final String NOT_RUN = "not run";
-    private static final String THREW = "threw";
+    /**
+     * One stage's share of a pass, for the summary line (FAB-195): whether it started, what it answered (null
+     * while it has not — so a stage that started and has no answer threw), and the tally it counted on.
+     */
+    private static final class StageReport {
+        private final StageTally tally = new StageTally();
+        private boolean started;
+        private WorkResult result;
 
-    /** What one pass did, for its summary line (FAB-186): each stage's result, and its Blockfrost calls. */
+        private StageFence fence(SubmitFence pass) {
+            return new PassStageFence(pass, tally);
+        }
+    }
+
+    /** What one pass did, for its summary line (FAB-186, FAB-195): each stage's report, and its Blockfrost calls. */
     private static final class PassSummary {
-        private String liquidation = NOT_RUN;
-        private String compound = NOT_RUN;
-        private String housekeeping = NOT_RUN;
+        private final StageReport liquidation = new StageReport();
+        private final StageReport compound = new StageReport();
+        private final StageReport housekeeping = new StageReport();
         private BoundedBFBackendService.CallCounts calls = BoundedBFBackendService.CallCounts.NONE;
     }
 
@@ -386,21 +417,22 @@ public final class WalletPipeline implements AutoCloseable {
 
     /**
      * FAB-186 (m5), FAB-195: ONE summary line per pass — its number and slot, its trigger, the blocks folded into
-     * it, how long it waited from the first trigger it serves and how long it took, each stage's result or
-     * {@code not run}, and the Blockfrost calls the pass made by kind. INFO for every pass while
-     * {@code logEveryPass} is on. Off: INFO when a stage answered anything but DEFINITE_FAILURE (or threw), or
-     * when the pass evaluated or submitted anything; DEBUG for a pass that did nothing worth saying, which on a
-     * quiet node is most of them.
+     * it, how long it waited from the first trigger it serves and how long it took, each stage's outcome with its
+     * non-zero counts ({@link #rendered}), and the Blockfrost calls the pass made by kind. INFO for every pass
+     * while {@code logEveryPass} is on. Off: INFO when some stage's outcome is neither {@code NO_OP} nor
+     * {@code SKIPPED} — an {@code ERROR} included — or when the pass evaluated or submitted anything; DEBUG for a
+     * pass that did nothing worth saying, which on a quiet node is most of them.
      */
     private void logSummary(ChainPoint point, PassStart start, PassSummary summary) {
         BoundedBFBackendService.CallCounts calls = summary.calls;
-        boolean news = said(summary.liquidation) || said(summary.compound) || said(summary.housekeeping)
+        boolean news = !quiet(summary.liquidation) || !quiet(summary.compound) || !quiet(summary.housekeeping)
                 || calls.evaluation() + calls.submission() > 0;
         String line = "wallet pipeline pass #" + start.number() + " at slot " + point.slot() + " ("
                 + point.blockHash() + "), trigger " + start.trigger() + ", " + start.blocksFolded()
                 + " block(s) folded in, waited " + seconds(start.waited()) + " s, took "
                 + seconds(Duration.between(start.at(), clock.instant())) + " s: liquidation "
-                + summary.liquidation + ", compound " + summary.compound + ", housekeeping " + summary.housekeeping
+                + rendered(summary.liquidation) + ", compound " + rendered(summary.compound) + ", housekeeping "
+                + rendered(summary.housekeeping)
                 + "; Blockfrost calls discovery " + calls.discovery() + ", evaluate " + calls.evaluation()
                 + ", submit " + calls.submission();
         if (logEveryPass || news) {
@@ -415,8 +447,73 @@ public final class WalletPipeline implements AutoCloseable {
         return String.format(Locale.ROOT, "%.1f", duration.toMillis() / 1000.0);
     }
 
-    private static boolean said(String stageResult) {
-        return !NOT_RUN.equals(stageResult) && !WorkResult.DEFINITE_FAILURE.name().equals(stageResult);
+    /** The stage outcomes (FAB-195), strongest first after {@code SKIPPED}, which only a stage that did not run has. */
+    private static final String SKIPPED = "SKIPPED";
+    private static final String SUBMITTED = "SUBMITTED";
+    private static final String WOULD_SUBMIT = "WOULD_SUBMIT";
+    private static final String ATTEMPTED = "ATTEMPTED";
+    private static final String ERROR = "ERROR";
+    private static final String NO_OP = "NO_OP";
+
+    /**
+     * FAB-195: one stage's outcome. A stage that did not run is {@code SKIPPED}. Otherwise the strongest that
+     * applies: {@code SUBMITTED} (it answered SUBMITTED or AMBIGUOUS, or counted a submitted), {@code WOULD_SUBMIT}
+     * (it answered WOULD_SUBMIT, or counted one), {@code ATTEMPTED} (it counted an attempted), {@code ERROR} (it
+     * counted an error, or threw), and {@code NO_OP} otherwise.
+     */
+    private static String outcomeOf(StageReport report) {
+        if (!report.started) {
+            return SKIPPED;
+        }
+        StageTally tally = report.tally;
+        WorkResult result = report.result;
+        if (result == WorkResult.SUBMITTED || result == WorkResult.AMBIGUOUS || tally.submitted() > 0) {
+            return SUBMITTED;
+        }
+        if (result == WorkResult.WOULD_SUBMIT || tally.wouldSubmit() > 0) {
+            return WOULD_SUBMIT;
+        }
+        if (tally.attempted() > 0) {
+            return ATTEMPTED;
+        }
+        if (errors(report) > 0) {
+            return ERROR;
+        }
+        return NO_OP;
+    }
+
+    /** A stage's error count: its tally's, plus one when it threw instead of answering. */
+    private static int errors(StageReport report) {
+        return report.tally.error() + (report.started && report.result == null ? 1 : 0);
+    }
+
+    /**
+     * FAB-195: one stage as the summary line says it — {@code <OUTCOME>}, then {@code (<counts>)} when any count is
+     * non-zero: {@code submitted}, {@code would-submit}, {@code attempted}, {@code error} and {@code no-op}, in that
+     * order, non-zero ones only.
+     */
+    private static String rendered(StageReport report) {
+        StageTally tally = report.tally;
+        List<String> counts = new ArrayList<>(5);
+        count(counts, "submitted", tally.submitted());
+        count(counts, "would-submit", tally.wouldSubmit());
+        count(counts, "attempted", tally.attempted());
+        count(counts, "error", errors(report));
+        count(counts, "no-op", tally.noOp());
+        String outcome = outcomeOf(report);
+        return counts.isEmpty() ? outcome : outcome + " (" + String.join(", ", counts) + ")";
+    }
+
+    private static void count(List<String> counts, String name, int n) {
+        if (n != 0) {
+            counts.add(name + " " + n);
+        }
+    }
+
+    /** A stage that is no news on its own: it did not run, or it sent nothing and nothing failed. */
+    private static boolean quiet(StageReport report) {
+        String outcome = outcomeOf(report);
+        return outcome.equals(SKIPPED) || outcome.equals(NO_OP);
     }
 
     /**
