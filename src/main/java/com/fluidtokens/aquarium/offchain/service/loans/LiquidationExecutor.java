@@ -109,14 +109,15 @@ import java.util.function.Function;
  * and it is logged at ERROR with its cause on every cycle it happens: no back-off, no suppression,
  * because a failure that goes quiet after its first occurrence is a failure nobody fixes. A
  * liquidation that landed is re-derived until the index catches up, and its resubmission fails in
- * phase 1 (free) and is logged like any other failure — accepted, and preferred to a timer.
+ * phase 1 (free) and is logged at INFO as not accepted — accepted, and preferred to a timer.
  * <p>
- * The one thing a failure DOES change is the check's used marks (FAB-185). The wallet's roles — C, U
- * and the token outputs, see {@link WalletRoles} — are resolved once per check; a role output that was
- * an input of a transmitted transaction, or that a failure names as already spent
- * ({@code BadInputsUTxO}, or Blockfrost's empty {@code "ScriptFailures":{}} evaluation), is used for the
- * rest of that check, so the next candidate designated to it is skipped rather than handed an input the
- * index still lists but the ledger no longer has — and is never quietly funded from another output.
+ * <b>A failure changes nothing</b> (FAB-186, fire and forget): no answer's text is read to decide
+ * anything, so a rejected, ambiguous or thrown submit frees nothing, marks nothing and stops nothing.
+ * The wallet's roles — C, U and the token outputs, see {@link WalletRoles} — are resolved once per
+ * check, and a role output is used for the rest of that check only when a submit of it was ACCEPTED (its
+ * designated output, and every role output among that body's inputs) or a node-shadow WOULD_SUBMIT stands
+ * for one; the next candidate designated to it is then skipped rather than quietly funded from another
+ * output.
  *
  * <h2>One transaction per candidate</h2>
  * {@link LiquidateTransactionBuilder} accepts a batch, and this loop always hands it exactly one
@@ -755,14 +756,16 @@ public class LiquidationExecutor {
     }
 
     /**
-     * The liquidation stage (FAB-183, rulings of 2026-10-31): candidates walked most profitable first,
-     * at most ONE liquidation per market — SUBMITTED, or a shadow WOULD_SUBMIT — a definite failure
-     * moving on to the market's next candidate, and an AMBIGUOUS submit ending the call. {@code fence}
-     * is read before each candidate and immediately before signing; once it reads {@code false}
-     * nothing more is transmitted. It is not retained after the call, and nothing else is either.
+     * The liquidation stage (FAB-183; FAB-186, fire and forget): EVERY candidate is walked, most
+     * profitable first, across markets. A non-accepted submit — rejected, ambiguous or thrown — is one
+     * outcome, the candidate failed: nothing is marked used and the walk goes on, so the next candidate
+     * may be built on the same output. An accepted submit uses up its output for the rest of the call.
+     * {@code fence} is read before each candidate and immediately before signing; once it reads
+     * {@code false} nothing more is transmitted. It is not retained after the call, and nothing else is
+     * either.
      *
-     * @return AMBIGUOUS if any submit was, else SUBMITTED if any went out, else WOULD_SUBMIT if a
-     *         shadow candidate would have, else DEFINITE_FAILURE — every early return included
+     * @return SUBMITTED if any submit was accepted, else WOULD_SUBMIT if a shadow candidate would have
+     *         been submitted, else DEFINITE_FAILURE — every early return included; never AMBIGUOUS
      */
     public WorkResult cycle(long now, SubmitFence fence) {
         if (configuration.getMode() == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
@@ -990,24 +993,17 @@ public class LiquidationExecutor {
                         causeChain(e));
             }
         }
-        // FAB-183 — ONE LIQUIDATION PER MARKET PER CALL. A market is the principal asset's unit; it is
-        // served by a SUBMITTED liquidation or by a shadow WOULD_SUBMIT, and every later candidate in it
-        // is skipped unbuilt. A definite failure leaves it open for the market's next candidate. Several
-        // markets per call never share a funding output: one that went out is marked used in walletCheck
-        // (FAB-185), and a later candidate designated to it is skipped. Held for this call only — nothing
-        // persists across calls.
-        Set<String> servedMarkets = new HashSet<>();
+        // FAB-186 — FIRE AND FORGET. Every candidate is walked; no market is "served" any more. What keeps
+        // two candidates off one output is the used mark alone: an ACCEPTED submit (or a node-shadow
+        // WOULD_SUBMIT) marks its output in walletCheck (FAB-185), and a later candidate designated to it is
+        // skipped unbuilt. A non-accepted submit marks nothing and ends nothing. Held for this call only —
+        // nothing persists across calls.
         WorkResult result = WorkResult.DEFINITE_FAILURE;
         for (int i = 0; i < ordered.size(); i++) {
             LiquidationAssessment assessment = ordered.get(i);
             if (!fence.mayProceed()) {
                 log.info("liquidation stage fenced: {} candidate(s) not reached", ordered.size() - i);
                 return result;
-            }
-            String market = marketOf(assessment);
-            if (market != null && servedMarkets.contains(market)) {
-                log.debug("market {} already has this pass's liquidation", market);
-                continue;
             }
             WorkResult outcome;
             CandidatePass pass = new CandidatePass(fence);
@@ -1023,22 +1019,15 @@ public class LiquidationExecutor {
                 // them — dereferencing assessment.loan() here would throw out of the handler that is
                 // meant to contain it. The bond is the one thing every assessment always carries.
                 log.error("could not consider bond {}: {}", assessment.bond().utxoRef(), causeChain(e), e);
-                // FAB-183 (A6): it ENDS the stage only if this candidate reached the submitter — then what
-                // escaped may have escaped after a transmission, and a body whose inputs may be spent
-                // cannot be told apart from one that never went out. Before that, nothing went out: a
-                // definite failure, and the walk moves on.
-                if (pass.submitInvoked) {
-                    return WorkResult.AMBIGUOUS;
+                // FAB-186: it marks nothing and the walk moves on, whether or not this candidate reached the
+                // submitter. Only an ACCEPTED submit counts towards the result — a transaction went out, and
+                // the pipeline must still hold compound and housekeeping back.
+                if (pass.accepted) {
+                    result = WorkResult.SUBMITTED;
                 }
                 continue;
             }
-            if (outcome == WorkResult.AMBIGUOUS) {
-                return WorkResult.AMBIGUOUS;
-            }
             if (outcome == WorkResult.SUBMITTED || outcome == WorkResult.WOULD_SUBMIT) {
-                if (market != null) {
-                    servedMarkets.add(market);
-                }
                 if (result != WorkResult.SUBMITTED) {
                     result = outcome;
                 }
@@ -1048,33 +1037,27 @@ public class LiquidationExecutor {
     }
 
     /**
-     * The market a candidate belongs to — its principal asset's unit, {@code lovelace} for ada — or
-     * null when the assessment carries no readable principal, in which case {@code consider()} meets
-     * the same fault and the outer net reports it.
-     */
-    private static String marketOf(LiquidationAssessment assessment) {
-        try {
-            AssetType principal = assessment.loan().datum().principalAsset();
-            return principal == null ? null : principal.toUnit();
-        } catch (RuntimeException e) {
-            return null;
-        }
-    }
-
-    /**
-     * One candidate's share of a {@link #cycle(long, SubmitFence)} call (FAB-183): the call's fence,
-     * read immediately before signing, and whether this candidate reached the submitter — which is what
-     * decides whether an exception escaping {@code consider()} may have escaped a transmission (A6).
-     * Created per candidate and dropped with it; nothing in it outlives the call.
+     * One candidate's share of a {@link #cycle(long, SubmitFence)} call (FAB-183): the call's fence, read
+     * immediately before signing; the route and the designated wallet output the non-accepted line names
+     * (FAB-186); and whether the submitter ACCEPTED it, which is what an exception escaping
+     * {@code consider()} after the answer still counts as. Created per candidate and dropped with it;
+     * nothing in it outlives the call.
      */
     private static final class CandidatePass {
         private final SubmitFence fence;
-        private boolean submitInvoked;
+        private String route = ROUTE_PLAIN;
+        private String output = "none";
+        private boolean accepted;
 
         private CandidatePass(SubmitFence fence) {
             this.fence = fence;
         }
     }
+
+    /** The routes the non-accepted line names (FAB-186). */
+    static final String ROUTE_PLAIN = "plain";
+    static final String ROUTE_CONVERT = "convert";
+    static final String ROUTE_PAY_IN_ADVANCE = "pay-in-advance";
 
     // ---- the order a cycle walks its candidates in (FAB-144) ------------------------------------
 
@@ -1187,10 +1170,10 @@ public class LiquidationExecutor {
     // ---- one candidate ------------------------------------------------------------------------
 
     /**
-     * One candidate, to its decision. DEFINITE_FAILURE on every path except these: SUBMITTED when it
-     * was submitted, WOULD_SUBMIT when only the node's or the market's mode withheld a candidate worth
-     * doing (S1/S2), and AMBIGUOUS when the submission threw or answered with anything but a decoded
-     * provider refusal.
+     * One candidate, to its decision. DEFINITE_FAILURE on every path except these: SUBMITTED when the
+     * submitter accepted it, and WOULD_SUBMIT when only the node's or the market's mode withheld a candidate
+     * worth doing (S1/S2). Never AMBIGUOUS (FAB-186): a non-accepted submit, whatever the answer or a throw,
+     * is a definite failure of this candidate.
      */
     private WorkResult consider(LiquidationAssessment assessment, long now,
                                 long committedSlot, long validFromFloorMillis, long validToMillis,
@@ -1198,9 +1181,6 @@ public class LiquidationExecutor {
                                 Map<String, OracleEntry> oraclesByUnit, CandidatePass pass) {
         BigInteger feeCeiling = walletCheck.feeCeiling();
         String loanUtxoRef = assessment.loan().utxoRef();
-        // The wallet output this candidate's route was handed — always its designated role output — what a
-        // failure naming a spent input is about (see spentInputEffect).
-        Utxo[] nominated = new Utxo[1];
         // The designated output, and what a selector found it short of, for the WALLET_INPUT_TOO_SMALL row.
         Utxo designated;
         Need needed = new Need();
@@ -1348,10 +1328,12 @@ public class LiquidationExecutor {
                     return WorkResult.DEFINITE_FAILURE;
                 }
                 // FAB-185 — funded from U, and only from U.
+                pass.route = ROUTE_CONVERT;
                 designated = designated(assessment, now, walletCheck, ROLE_U, walletCheck.roles().u());
                 if (designated == null) {
                     return WorkResult.DEFINITE_FAILURE;
                 }
+                pass.output = WalletRoles.ref(designated);
                 Utxo convertFunding = designated;
                 log.info("{} is a CONVERT liquidation (LiquidateAndConvert): the bot creates a Minswap "
                                 + "order, fronts nothing, and keeps the liquidation fee in collateral",
@@ -1364,9 +1346,9 @@ public class LiquidationExecutor {
                             // (FAB-185), and nothing else is ever offered. U is ada-only by construction
                             // (WalletInputSelection.nominable), so a published REFERENCE SCRIPT can never
                             // be handed out here (CCL trap 9b/26a, the 2026-08-24 incident class).
-                            orderLovelace -> remember(nominated, sized(loanUtxoRef, ROLE_U,
+                            orderLovelace -> sized(loanUtxoRef, ROLE_U,
                                     convertFunding, WalletRoles.convertRequired(orderLovelace, feeCeiling),
-                                    needed)),
+                                    needed),
                             // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
                             walletCheck.roles().c().orElse(null),
                             oraclesByUnit,
@@ -1422,7 +1404,6 @@ public class LiquidationExecutor {
                         log.error("the pool lookup for {} failed reading the local pool index: {} — the "
                                         + "candidate itself was never assessed; retried next cycle",
                                 loanUtxoRef, causeChain(e), e);
-                        markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e)));
                         return WorkResult.DEFINITE_FAILURE;
                     }
                     // ⛔ AMBIGUOUS_POOL: two AUTHENTIC pools for one pair in the local index. Minswap
@@ -1467,7 +1448,6 @@ public class LiquidationExecutor {
                             rootReason(e), causeChain(e)));
                     log.error("building the convert liquidation of {} failed: {}", loanUtxoRef,
                             causeChain(e), e);
-                    markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e)));
                     return WorkResult.DEFINITE_FAILURE;
                 }
                 // Falls through to the shared record-and-maybe-submit path below, deliberately: the
@@ -1486,6 +1466,7 @@ public class LiquidationExecutor {
             // most of that token, never from U, however much larger U is.
             String payInAdvanceRole = payInAdvancePrincipal.isAda() ? ROLE_U
                     : ROLE_TOKEN + payInAdvancePrincipal.toUnit();
+            pass.route = ROUTE_PAY_IN_ADVANCE;
             // ⛔ FAB-185 r2 (F3) — A DISABLED MARKET IS REFUSED BEFORE THE ROLE LOOKUP. Pay-in-advance is
             // excluded from the pre-build MARKET_DISABLED refusal above because the router's MarketGate
             // refuses it, with its own text; looking the role up first answered an operator who had
@@ -1502,6 +1483,7 @@ public class LiquidationExecutor {
                 if (designated == null) {
                     return WorkResult.DEFINITE_FAILURE;
                 }
+                pass.output = WalletRoles.ref(designated);
             }
             Utxo payInAdvanceFunding = designated;
             log.info("{} is a PAY-IN-ADVANCE liquidation: the bot PAYS the lender in {} and acquires "
@@ -1541,12 +1523,12 @@ public class LiquidationExecutor {
                                         + " is DISABLED, so no role output was designated, yet the router "
                                         + "asked for one");
                             }
-                            return remember(nominated, payInAdvancePrincipal.isAda()
+                            return payInAdvancePrincipal.isAda()
                                     ? sized(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
                                             WalletRoles.adaAnticipateRequired(lenderPayout, feeCeiling), needed)
                                     : sizedToken(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
                                             payInAdvancePrincipal.toUnit(), lenderPayout,
-                                            WalletRoles.tokenOutputRequiredAda(feeCeiling), needed));
+                                            WalletRoles.tokenOutputRequiredAda(feeCeiling), needed);
                         },
                         // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
                         walletCheck.roles().c().orElse(null),
@@ -1640,7 +1622,6 @@ public class LiquidationExecutor {
                         rootReason(e), causeChain(e)));
                 log.error("building the pay-in-advance liquidation of {} failed: {}",
                         loanUtxoRef, causeChain(e), e);
-                markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e)));
                 return WorkResult.DEFINITE_FAILURE;
             }
             }
@@ -1651,8 +1632,9 @@ public class LiquidationExecutor {
             if (designated == null) {
                 return WorkResult.DEFINITE_FAILURE;
             }
-            Optional<Utxo> plainWalletUtxo = remember(nominated,
-                    sized(loanUtxoRef, ROLE_U, designated, WalletRoles.plainRequired(feeCeiling), needed));
+            pass.output = WalletRoles.ref(designated);
+            Optional<Utxo> plainWalletUtxo =
+                    sized(loanUtxoRef, ROLE_U, designated, WalletRoles.plainRequired(feeCeiling), needed);
             if (plainWalletUtxo.isEmpty()) {
                 // A refusal, not a failure: true of this candidate against this wallet, reproducible
                 // next check, and cured by a top-up. An eligibility filter, decided before any build.
@@ -1704,9 +1686,6 @@ public class LiquidationExecutor {
                 if (e.getCause() != null) {
                     log.error("the liquidation of {} was refused as {} by a failure underneath: {}",
                             loanUtxoRef, e.getReason(), causeChain(e.getCause()), e);
-                    // SCRIPT_COST_EVALUATION_FAILED is where Blockfrost's empty-failures evaluation
-                    // surfaces on this route — the shape a spent input takes (CCL trap 13).
-                    markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e.getCause())));
                     return WorkResult.DEFINITE_FAILURE;
                 } else {
                     // Task 7 (ADDENDA). The remedy is a LEVEL, not a flood: the forty-eight causeless
@@ -1732,7 +1711,6 @@ public class LiquidationExecutor {
                 decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
                         rootReason(e), causeChain(e)));
                 log.error("building the liquidation of {} failed: {}", loanUtxoRef, causeChain(e), e);
-                markUsed(walletCheck, spentInputEffect(nominated[0], causeChain(e)));
                 return WorkResult.DEFINITE_FAILURE;
             }
         }
@@ -1743,21 +1721,22 @@ public class LiquidationExecutor {
             // TX_TOO_LARGE veto and is not an intent to liquidate.
             return WorkResult.DEFINITE_FAILURE;
         }
-        if (verdict.get().transmitted()) {
-            // SUBMITTED, or a submission whose outcome is AMBIGUOUS — it threw, or the backend's answer
-            // was not a decoded refusal — after the bytes may have gone out: either way every input of
-            // this body may already be spent, and the index cannot know it yet.
-            // FAB-185: every ROLE output among them is used for the rest of this check.
-            Set<String> inputs = new LinkedHashSet<>();
+        if (verdict.get().outcome() == LiquidationDecision.Outcome.SUBMITTED) {
+            // ACCEPTED — the one answer that says the bytes went out. Every input of this body is spent,
+            // and the index cannot know it yet. FAB-185/186: the designated output, and every ROLE output
+            // among the body's inputs, is used for the rest of this check.
+            Set<String> spent = new LinkedHashSet<>();
+            if (designated != null) {
+                spent.add(WalletRoles.ref(designated));
+            }
             transaction.getBody().getInputs()
-                    .forEach(in -> inputs.add(in.getTransactionId() + "#" + in.getIndex()));
-            markUsed(walletCheck, new WalletEffect(inputs,
-                    "an input of transmitted liquidation " + TransactionUtil.getTxHash(transaction), false));
-            return verdict.get().outcome() == LiquidationDecision.Outcome.SUBMITTED
-                    ? WorkResult.SUBMITTED : WorkResult.AMBIGUOUS;
+                    .forEach(in -> spent.add(in.getTransactionId() + "#" + in.getIndex()));
+            markUsed(walletCheck, spent,
+                    "an input of accepted liquidation " + TransactionUtil.getTxHash(transaction));
+            return WorkResult.SUBMITTED;
         }
-        markUsed(walletCheck, spentInputEffect(nominated[0], verdict.get().rejection()));
-        // S1/S2 withheld a candidate worth doing: the shadow intent that serves its market this call.
+        // FAB-186: anything else — a veto, a rejection, an ambiguous answer, a thrown submit — marks nothing.
+        // S1/S2 withheld a candidate worth doing: the shadow intent.
         if (verdict.get().outcome() == LiquidationDecision.Outcome.WOULD_SUBMIT
                 && (verdict.get().veto() == SubmitVeto.MODE_NOT_LIVE
                     || verdict.get().veto() == SubmitVeto.MARKET_NOT_LIVE)) {
@@ -2164,21 +2143,10 @@ public class LiquidationExecutor {
     // ---- the submit vetoes --------------------------------------------------------------------
 
     /**
-     * What this candidate's row says, and which veto — if any — produced it.
-     *
-     * @param transmitted whether the signed bytes may have reached the network: true on SUBMITTED and
-     *                    on an AMBIGUOUS submission (it threw, or its answer was not a decoded provider
-     *                    refusal), false on everything else, a definite rejection included. It is what
-     *                    tells the cycle the body's inputs may already be spent
-     * @param rejection   the backend's response to a definite rejection, scanned for a spent-input
-     *                    marker; null otherwise
+     * What this candidate's row says, and which veto — if any — produced it. Only a SUBMITTED outcome says
+     * the bytes went out (FAB-186); nothing else a verdict carries decides what the check marks used.
      */
-    private record Verdict(LiquidationDecision.Outcome outcome, SubmitVeto veto, String detail,
-                           boolean transmitted, String rejection) {
-
-        Verdict(LiquidationDecision.Outcome outcome, SubmitVeto veto, String detail) {
-            this(outcome, veto, detail, false, null);
-        }
+    private record Verdict(LiquidationDecision.Outcome outcome, SubmitVeto veto, String detail) {
     }
 
     /**
@@ -2464,14 +2432,15 @@ public class LiquidationExecutor {
      * <p>
      * Nothing is held afterwards, whatever the outcome (FAB-134 NQ). The next cycle re-derives the
      * candidate for as long as the index still lists its loan UTxO; if this transaction landed, that
-     * resubmission fails in phase 1 — free — and is logged at ERROR like any other failure. Every
-     * failure here, a definite rejection included, is logged at ERROR — except an
-     * {@code OutsideValidityInterval} rejection (FAB-183 A2), which is expected, counted and logged at INFO.
+     * resubmission fails in phase 1 — free — and is logged like any other non-accepted submit.
      * <p>
-     * FAB-183: a closed {@code fence} signs and transmits nothing. A non-success answer is classified by
-     * {@link WorkResult#classify}: only Blockfrost's decoded refusal envelope is a DEFINITE rejection.
-     * Anything else may have been transmitted, so it is AMBIGUOUS — its row says so, its inputs are
-     * treated as spent, and the stage stops.
+     * FAB-183: a closed {@code fence} signs and transmits nothing.
+     * <p>
+     * FAB-186 — FIRE AND FORGET. Only an accepted submit (a tx hash returned) is SUBMITTED. Any other
+     * answer — a decoded refusal, a raw body, another status, nothing at all — or a throw is ONE outcome:
+     * the candidate failed. Its row is SUBMIT_FAILED with the answer, it is said in exactly one INFO line
+     * (never ERROR: a rejection on a bot that rebuilds on every block is the ordinary case, not a fault),
+     * and nothing in it decides anything — the {@code OutsideValidityInterval} counter is a metric only.
      */
     private Verdict submit(LiquidationAssessment assessment, long now, Transaction transaction,
                            String detail, CandidatePass pass) {
@@ -2496,50 +2465,47 @@ public class LiquidationExecutor {
                     detail + "; signing threw (" + causeChain(e) + "), nothing was transmitted");
         }
 
+        Result<String> result;
         try {
-            // FAB-183 (A6): from here on, anything escaping this candidate may have escaped a transmission.
-            pass.submitInvoked = true;
-            Result<String> result = submitter.submit(signed);
-            if (result != null && result.isSuccessful()) {
-                log.info("SUBMITTED liquidation of {}: tx {}", loanUtxoRef, result.getValue());
-                return new Verdict(LiquidationDecision.Outcome.SUBMITTED, null,
-                        detail + "; submitted as " + result.getValue(), true, null);
-            }
-            String response = result == null ? "no response" : result.getResponse();
-            if (WorkResult.classify(result) == WorkResult.AMBIGUOUS) {
-                // FAB-183: not Blockfrost's decoded refusal envelope — a raw body, another status, or
-                // nothing at all — so nothing shows the bytes were refused, and they may have gone out.
-                // ONE line, and not the rejection lines below: those, and the OutsideValidityInterval
-                // count, belong to a DECODED refusal, which is what Blockfrost returns for a ledger
-                // rejection. The row says so, the body's inputs are treated as spent, the stage stops.
-                String answer = "HTTP " + (result == null ? "none" : result.code()) + ": " + response;
-                log.error("the outcome of submitting the liquidation of {} is AMBIGUOUS: {} — the stage stops",
-                        loanUtxoRef, answer);
-                return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
-                        "ambiguous: " + detail + "; the backend answered " + answer
-                                + ", not a decoded refusal, so it may have been transmitted", true, null);
-            }
-            if (response != null && response.replaceAll("\\s", "").contains(OUTSIDE_VALIDITY_INTERVAL_MARKER)) {
-                // FAB-183 (A2): EXPECTED, not a fault. The start clamp opens a transaction at a fresh feed's
-                // validFrom, and the validating node may not have reached that slot yet. Counted, INFO, and
-                // the next block retries it; the row and the wallet effect are those of any rejection.
-                log.info("submitting the liquidation of {} was rejected OutsideValidityInterval — expected when a "
-                        + "fresh feed's validFrom is ahead of the validating node; retried on the next block: {}",
-                        loanUtxoRef, response);
-                if (outsideValidityRejections != null) {
-                    outsideValidityRejections.increment();
-                }
-            } else {
-                log.error("submitting the liquidation of {} was rejected: {}", loanUtxoRef, response);
-            }
-            return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
-                    detail + "; backend rejected it: " + response, false, response);
+            result = submitter.submit(signed);
         } catch (Exception e) {
-            // Transmitted or not — we do not know, so the cycle treats its inputs as spent.
-            log.error("submitting the liquidation of {} threw: {}", loanUtxoRef, causeChain(e), e);
-            return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
-                    detail + "; submission threw: " + causeChain(e), true, null);
+            // Transmitted or not — we do not know, and under FAB-186 it does not matter: not accepted.
+            return notAccepted(loanUtxoRef, detail, pass, "threw", causeChain(e));
         }
+        if (result != null && result.isSuccessful()) {
+            pass.accepted = true;
+            log.info("SUBMITTED liquidation of {}: tx {}", loanUtxoRef, result.getValue());
+            return new Verdict(LiquidationDecision.Outcome.SUBMITTED, null,
+                    detail + "; submitted as " + result.getValue());
+        }
+        String response = result == null ? "no response" : String.valueOf(result.getResponse());
+        // FAB-183 (A2), a METRIC only since FAB-186: the start clamp opens a transaction at a fresh feed's
+        // validFrom, and the validating node may not have reached that slot yet. Counted; it decides nothing.
+        if (response.replaceAll("\\s", "").contains(OUTSIDE_VALIDITY_INTERVAL_MARKER)
+                && outsideValidityRejections != null) {
+            outsideValidityRejections.increment();
+        }
+        return notAccepted(loanUtxoRef, detail, pass, result == null ? "none" : String.valueOf(result.code()),
+                response);
+    }
+
+    /** The most of a backend's response the non-accepted INFO line carries; the row keeps all of it. */
+    static final int NOT_ACCEPTED_RESPONSE_CHARS = 300;
+
+    /**
+     * FAB-186: a submit that was not accepted — any answer but a tx hash, or a throw ({@code status}
+     * {@code threw}, {@code response} the cause chain). ONE INFO line naming the loan, the route, the
+     * designated output and the status, with the response cut to {@link #NOT_ACCEPTED_RESPONSE_CHARS}; the
+     * row carries the whole answer.
+     */
+    private Verdict notAccepted(String loanUtxoRef, String detail, CandidatePass pass, String status,
+                                String response) {
+        String cut = response.length() <= NOT_ACCEPTED_RESPONSE_CHARS ? response
+                : response.substring(0, NOT_ACCEPTED_RESPONSE_CHARS - 1) + "…";
+        log.info("liquidation of {} via {} on {} not accepted: HTTP {} {}", loanUtxoRef, pass.route, pass.output,
+                status, cut);
+        return new Verdict(LiquidationDecision.Outcome.SUBMIT_FAILED, null,
+                detail + "; not accepted: HTTP " + status + ": " + response);
     }
 
     /**
@@ -2905,68 +2871,31 @@ public class LiquidationExecutor {
 
     // ---- the check's used marks ------------------------------------------------------------------
 
-    /** Ledger rejection: an input of the transaction does not exist (already spent). */
+    /**
+     * Ledger rejection: an input of the transaction does not exist (already spent). ⚠ Read by nothing in
+     * this class since FAB-186 — no answer's text decides anything any more. Kept because
+     * {@code OracleReferenceInputProbeTest} pins that the probe's own refusal text never carries it.
+     */
     static final String BAD_INPUTS_MARKER = "BadInputsUTxO";
 
     /**
      * Blockfrost's evaluation answer when it could not evaluate the transaction at all — most often
-     * because an input is already spent (CCL trap 13). Matched with whitespace removed.
+     * because an input is already spent (CCL trap 13). ⚠ Read by nothing in this class since FAB-186; kept
+     * for {@code OracleReferenceInputProbeTest}, like {@link #BAD_INPUTS_MARKER}.
      */
     static final String EMPTY_SCRIPT_FAILURES_MARKER = "\"ScriptFailures\":{}";
 
     /**
-     * What one candidate's consideration did to the check's wallet: the {@code txHash#index} refs that
-     * are spent for the rest of the check, and why. Handed out of {@code consider()} as a value once the
-     * candidate is finished, so its decisions stay exactly what they were and only the
-     * check's {@link #markUsed} turns it into used marks.
+     * Marks every ROLE output among {@code refs} — C, U or a token output — used for the rest of the check
+     * (FAB-185). Called ONLY for an accepted submit (FAB-186). The roles themselves are never re-resolved; a
+     * candidate designated to a used output is skipped before anything is built.
      */
-    private record WalletEffect(Set<String> spentWalletRefs, String why, boolean warn) {
-
-        static final WalletEffect NONE = new WalletEffect(Set.of(), null, false);
-    }
-
-    /** Records the output a route was handed, so a later failure can name it. */
-    private static Optional<Utxo> remember(Utxo[] slot, Optional<Utxo> chosen) {
-        chosen.ifPresent(utxo -> slot[0] = utxo);
-        return chosen;
-    }
-
-    /**
-     * The candidate's designated wallet output, when its failure says an input is already spent —
-     * {@code BadInputsUTxO}, or the empty-failures evaluation. Neither names a wallet output reliably
-     * (the loan utxo may be the spent one), and marking one output used for the rest of one check costs
-     * a skipped candidate, while handing a spent one out again fails the next candidate too.
-     */
-    private static WalletEffect spentInputEffect(Utxo nominated, String failure) {
-        if (nominated == null || failure == null) {
-            return WalletEffect.NONE;
-        }
-        String compact = failure.replaceAll("\\s", "");
-        String marker = compact.contains(BAD_INPUTS_MARKER) ? BAD_INPUTS_MARKER
-                : compact.contains(EMPTY_SCRIPT_FAILURES_MARKER) ? EMPTY_SCRIPT_FAILURES_MARKER
-                : null;
-        if (marker == null) {
-            return WalletEffect.NONE;
-        }
-        return new WalletEffect(Set.of(nominated.getTxHash() + "#" + nominated.getOutputIndex()),
-                marker, true);
-    }
-
-    /**
-     * Applies one candidate's {@link WalletEffect} to the check's used marks (FAB-185): every ROLE output
-     * among its refs — C, U or a token output — is used for the rest of the check. The roles themselves are
-     * never re-resolved; a candidate designated to a used output is skipped before anything is built.
-     */
-    private static void markUsed(WalletCheck walletCheck, WalletEffect effect) {
-        for (String ref : effect.spentWalletRefs()) {
+    private static void markUsed(WalletCheck walletCheck, Set<String> refs, String why) {
+        for (String ref : refs) {
             if (walletCheck.roles().roleOf(ref).isEmpty() || !walletCheck.used().add(ref)) {
                 continue;
             }
-            if (effect.warn()) {
-                log.warn("dropped wallet utxo {} from this cycle: {}", ref, effect.why());
-            } else {
-                log.info("dropped wallet utxo {} from this cycle: {}", ref, effect.why());
-            }
+            log.debug("wallet output {} is used for the rest of this check: {}", ref, why);
         }
     }
 

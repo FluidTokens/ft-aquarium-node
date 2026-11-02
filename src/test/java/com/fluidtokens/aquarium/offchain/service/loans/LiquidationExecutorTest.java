@@ -2046,63 +2046,59 @@ class LiquidationExecutorTest {
                 + outputRef + " (role " + role + ") already went out in this check"));
     }
 
+    /** Whether any line still says a wallet utxo was dropped — the text FAB-186 retired. */
+    private static boolean saysDropped(List<ILoggingEvent> events) {
+        return events.stream().anyMatch(event -> event.getFormattedMessage().contains("dropped wallet utxo"));
+    }
+
     /**
-     * FAB-134 NQ task 4, under FAB-185's role rules. A {@code BadInputsUTxO} says an input the bot was handed
-     * no longer exists, while the index — which answers "unspent" from {@code tx_input} — still lists it. U
-     * is marked used for the rest of the check, so the next candidate, also designated to U, is SKIPPED
-     * unbuilt — never funded from the smaller ada-only output beside it, and never handed the spent one again.
+     * FAB-134 NQ task 4, under FAB-185's role rules — rewritten by FAB-186. A {@code BadInputsUTxO} in a
+     * build failure used to mark U used, so the next candidate was skipped. That text decides nothing any
+     * more: it names an input, often the LOAN one another bot just spent, never reliably U. U stays free and
+     * the next candidate, also designated to U, is handed the SAME U — never the smaller output beside it.
      */
     @Test
-    void aBadInputsFailureMarksUUsedAndTheNextCandidateIsSkippedNotFundedFromAnother() {
+    void aBadInputsFailureMarksNothingAndTheNextCandidateIsHandedTheSameU() {
         var result = twoCandidatesFirstFailing(new IllegalStateException("submit-time evaluation failed",
                 new RuntimeException("ConwayUtxoFailure (BadInputsUTxO (fromList [TxIn ...]))")));
         List<Utxo> nominated = result.getKey();
 
-        assertEquals(List.of(WALLET_UTXO), nominated,
-                "U funds the first candidate, and the second is never built — not on U, not on the smaller utxo");
-        List<ILoggingEvent> warns = result.getValue().stream()
-                .filter(event -> event.getLevel() == Level.WARN)
-                .filter(event -> event.getFormattedMessage().equals("dropped wallet utxo "
-                        + TX_WALLET + "#0 from this cycle: BadInputsUTxO"))
-                .toList();
-        assertEquals(1, warns.size(), "the drop is logged once, naming the utxo and the marker: "
-                + result.getValue());
-        assertTrue(skippedOnUsedOutput(result.getValue(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
-                "the second candidate is skipped naming U: " + result.getValue());
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), nominated,
+                "U funds both candidates — never the smaller utxo");
+        assertFalse(saysDropped(result.getValue()), result.getValue().toString());
+        assertFalse(skippedOnUsedOutput(result.getValue(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
+                "the second candidate is not skipped: " + result.getValue());
     }
 
-    /** The same mark for Blockfrost's empty-failures evaluation — CCL trap 13's spent-input shape. */
+    /** FAB-186: the same for Blockfrost's empty-failures evaluation — it marks nothing either. */
     @Test
-    void anEmptyScriptFailuresEvaluationAlsoMarksTheDesignatedOutputUsed() {
+    void anEmptyScriptFailuresEvaluationMarksNothingEither() {
         var result = twoCandidatesFirstFailing(new IllegalStateException("evaluation failed",
                 new RuntimeException("{\"ScriptFailures\": {}}")));
 
-        assertEquals(List.of(WALLET_UTXO), result.getKey(),
-                "the second candidate must not be handed the output the first one's evaluation named spent");
-        assertTrue(skippedOnUsedOutput(result.getValue(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), result.getKey(),
+                "the second candidate is handed the same U");
+        assertFalse(skippedOnUsedOutput(result.getValue(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
                 result.getValue().toString());
     }
 
     /**
-     * FAB-134 NQ r2 (RC). The plain route's OTHER spent-input site: the builder wraps Blockfrost's
-     * empty-failures evaluation as {@code RefusedException(SCRIPT_COST_EVALUATION_FAILED, cause)} —
-     * a refusal WITH a cause, which takes its own branch rather than the machinery catch. That exact
-     * shape must drop the nominated wallet utxo too.
+     * FAB-134 NQ r2 (RC), rewritten by FAB-186. The plain route's OTHER former spent-input site: the builder
+     * wraps Blockfrost's empty-failures evaluation as {@code RefusedException(SCRIPT_COST_EVALUATION_FAILED,
+     * cause)} — a refusal WITH a cause, which takes its own branch rather than the machinery catch. That
+     * exact shape marks nothing now either.
      */
     @Test
-    void aScriptCostEvaluationRefusalWithEmptyScriptFailuresMarksTheDesignatedOutputUsed() {
+    void aScriptCostEvaluationRefusalWithEmptyScriptFailuresMarksNothing() {
         var result = twoCandidatesFirstFailing(new LiquidateTransactionBuilder.RefusedException(
                 LiquidateTransactionBuilder.Refusal.SCRIPT_COST_EVALUATION_FAILED,
                 "script cost evaluation failed",
                 new IllegalStateException("evaluate rejected",
                         new RuntimeException("{\"ScriptFailures\":{}}"))));
 
-        assertEquals(List.of(WALLET_UTXO), result.getKey(),
-                "the second candidate is skipped, not handed the output the first one's evaluation named spent");
-        assertTrue(result.getValue().stream().anyMatch(event -> event.getLevel() == Level.WARN
-                        && event.getFormattedMessage().equals("dropped wallet utxo " + TX_WALLET
-                        + "#0 from this cycle: \"ScriptFailures\":{}")),
-                "the drop is logged naming the marker: " + result.getValue());
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), result.getKey(),
+                "the second candidate is handed the same U");
+        assertFalse(saysDropped(result.getValue()), result.getValue().toString());
     }
 
     /** {@link #convertScenario(BigInteger)} again, under other refs and another loan id. */
@@ -2164,15 +2160,16 @@ class LiquidationExecutorTest {
     }
 
     /**
-     * FAB-134 NQ r2 (PIA, convert), under FAB-185's role rules. The two convert-bond routes' machinery
-     * catches carry the same spent-input mark as the plain one: two convert-bond candidates in one cycle,
-     * the first build failing with {@code BadInputsUTxO} after U was handed out — the second, also designated
-     * to U, is skipped unbuilt rather than handed another output. The route is chosen by the ada market's
-     * action: ANTICIPATE (listed) routes to pay-in-advance, an unlisted market converts.
+     * FAB-134 NQ r2 (PIA, convert), under FAB-185's role rules — rewritten by FAB-186. The two convert-bond
+     * routes' machinery catches used to carry the same spent-input mark as the plain one. They mark nothing
+     * now: two convert-bond candidates in one cycle, the first build failing with {@code BadInputsUTxO} after
+     * U was handed out — the second, also designated to U, is handed the SAME U, never another output. The
+     * route is chosen by the ada market's action: ANTICIPATE (listed) routes to pay-in-advance, an unlisted
+     * market converts.
      */
     @ParameterizedTest
     @ValueSource(strings = {"PAY_IN_ADVANCE", "CONVERT"})
-    void aBadInputsMachineryFailureOnAConvertBondRouteMarksUUsed(String route) {
+    void aBadInputsMachineryFailureOnAConvertBondRouteMarksNothing(String route) {
         boolean payInAdvance = route.equals("PAY_IN_ADVANCE");
         AppConfig.LiquidationConfiguration configuration = payInAdvance
                 ? shadow(SMALL_MARGIN)
@@ -2207,8 +2204,8 @@ class LiquidationExecutorTest {
         List<Utxo> nominated = payInAdvance ? payInAdvanceRouter.nominated : convertRouter.nominated;
         assertTrue((payInAdvance ? convertRouter.nominated : payInAdvanceRouter.nominated).isEmpty(),
                 "the candidates took the other route");
-        assertEquals(List.of(WALLET_UTXO), nominated,
-                "only the first candidate reached the " + route + " router, and it was handed U");
+        assertEquals(List.of(WALLET_UTXO, WALLET_UTXO), nominated,
+                "both candidates reached the " + route + " router, and each was handed the same U");
     }
 
     /** And an ordinary failure marks nothing: the second candidate is handed the same U. */

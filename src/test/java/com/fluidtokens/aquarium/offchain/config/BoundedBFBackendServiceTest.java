@@ -427,6 +427,72 @@ class BoundedBFBackendServiceTest {
         }
     }
 
+    /**
+     * FAB-186 (h): every call made on a pass's thread is counted by stage — through the real CCL services,
+     * not only the factory — while a call made outside any pass, or on another thread during one, is not.
+     * A new pass starts from zero, and a deadline that is not the backend's own answers zeros.
+     */
+    @Test
+    void callsInsideAPassAreCountedByStageAndCallsOutsideAPassAreNot() throws Exception {
+        try (FixedResponseServer server = new FixedResponseServer(4,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")) {
+            BoundedBFBackendService backend = bounded(server.baseUrl(), 2, 2, 2, 5);
+            Call.Factory factory = callFactory(backend);
+            Request discovery = new Request.Builder().url(server.baseUrl() + "blocks/latest").build();
+            Request evaluation = new Request.Builder().url(server.baseUrl() + "utils/txs/evaluate").build();
+            Request submission = new Request.Builder().url(server.baseUrl() + "tx/submit").build();
+            java.util.List<Call> unsent = new java.util.ArrayList<>();
+            AtomicReference<BoundedBFBackendService.CallCounts> seen = new AtomicReference<>();
+            ExecutorService helper = Executors.newSingleThreadExecutor();
+            try {
+                // Outside any pass: not counted anywhere.
+                unsent.add(factory.newCall(discovery));
+                unsent.add(factory.newCall(submission));
+
+                backend.runWithinPassDeadline(deadline -> {
+                    assertEquals(BoundedBFBackendService.CallCounts.NONE, deadline.callCounts());
+                    ignoringFailure(() -> backend.getBlockService().getLatestBlock());
+                    ignoringFailure(() -> backend.getEpochService().getLatestEpoch());
+                    ignoringFailure(() -> backend.getTransactionService().evaluateTx(new byte[]{1}));
+                    ignoringFailure(() -> backend.getTransactionService().submitTransaction(new byte[]{1}));
+                    unsent.add(factory.newCall(evaluation));
+                    try {
+                        // Another thread during the pass: not this pass's call.
+                        unsent.add(helper.submit(() -> factory.newCall(submission)).get());
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                    seen.set(deadline.callCounts());
+                });
+                assertEquals(new BoundedBFBackendService.CallCounts(2, 2, 1), seen.get());
+                assertTrue(server.completed.await(FIXTURE_BOUND.toMillis(), TimeUnit.MILLISECONDS));
+                assertEquals(4, server.requests.get(), "the four real calls reached the server");
+
+                unsent.add(factory.newCall(evaluation));
+                backend.runWithinPassDeadline(deadline -> seen.set(deadline.callCounts()));
+                assertEquals(BoundedBFBackendService.CallCounts.NONE, seen.get(), "a new pass starts from zero");
+            } finally {
+                unsent.forEach(Call::cancel);
+                helper.shutdownNow();
+                assertTrue(helper.awaitTermination(FIXTURE_BOUND.toMillis(), TimeUnit.MILLISECONDS));
+            }
+        }
+        BoundedBFBackendService.PassDeadline foreign = new BoundedBFBackendService.PassDeadline() {
+            @Override public boolean isExpired() { return false; }
+
+            @Override public long remainingNanos() { return 1; }
+        };
+        assertEquals(new BoundedBFBackendService.CallCounts(0, 0, 0), foreign.callCounts());
+    }
+
+    private static void ignoringFailure(CheckedCall call) {
+        try {
+            call.run();
+        } catch (Exception ignored) {
+            // The answer is irrelevant here; only that the call was made.
+        }
+    }
+
     private static Call.Factory callFactory(BoundedBFBackendService backend) throws Exception {
         Field retrofitField = BoundedBFBackendService.class.getDeclaredField("retrofit");
         retrofitField.setAccessible(true);

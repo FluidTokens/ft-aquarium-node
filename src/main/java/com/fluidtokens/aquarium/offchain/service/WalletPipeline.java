@@ -36,6 +36,9 @@ import java.util.function.Consumer;
  *
  * <p>The deadline bounds Blockfrost calls made through {@link BoundedBFBackendService}; it cannot
  * preempt CPU work or local reads inside a stage. The hung-pass WARN is the only signal for those.</p>
+ *
+ * <p>Each pass ends with one summary line (FAB-186): each stage's result and the Blockfrost calls the
+ * pass made, by kind — counted by the deadline, never limited by the count.</p>
  */
 @Slf4j
 public final class WalletPipeline implements AutoCloseable {
@@ -257,25 +260,31 @@ public final class WalletPipeline implements AutoCloseable {
 
     private void runPass(ChainPoint point, long pass) {
         log.debug("wallet pipeline: pass start at slot {} ({})", point.slot(), point.blockHash());
+        PassSummary summary = new PassSummary();
         try {
             deadlineScope.run(deadline -> {
                 try {
-                    runStages(point, pass, deadline);
+                    runStages(point, pass, deadline, summary);
                 } catch (Throwable failure) {
                     passFailed(point, failure);
+                } finally {
+                    summary.calls = callCountsOf(deadline);
                 }
             });
         } catch (Throwable failure) {
             passFailed(point, failure);
         }
         log.debug("wallet pipeline: pass end at slot {} ({})", point.slot(), point.blockHash());
+        logSummary(point, summary);
     }
 
-    private void runStages(ChainPoint point, long pass, BoundedBFBackendService.PassDeadline deadline)
-            throws Exception {
+    private void runStages(ChainPoint point, long pass, BoundedBFBackendService.PassDeadline deadline,
+                           PassSummary summary) throws Exception {
         SubmitFence fence = () -> mayProceed(point, pass, deadline);
 
+        summary.liquidation = THREW;
         WorkResult liquidated = outcome(liquidation.run(fence));
+        summary.liquidation = liquidated.name();
         if (wentOut(liquidated)) {
             log.info("wallet pipeline: liquidation {} at slot {} — compound and housekeeping wait for the next trigger",
                     liquidated, point.slot());
@@ -285,7 +294,9 @@ public final class WalletPipeline implements AutoCloseable {
             return;
         }
 
+        summary.compound = THREW;
         WorkResult compounded = outcome(compound.run(fence));
+        summary.compound = compounded.name();
         if (wentOut(compounded)) {
             log.info("wallet pipeline: compound {} at slot {} — housekeeping waits for the next trigger",
                     compounded, point.slot());
@@ -295,7 +306,55 @@ public final class WalletPipeline implements AutoCloseable {
             return;
         }
 
-        housekeeping.run(fence);
+        summary.housekeeping = THREW;
+        summary.housekeeping = outcome(housekeeping.run(fence)).name();
+    }
+
+    /** A stage that did not run this pass, and one that threw instead of answering. */
+    private static final String NOT_RUN = "not run";
+    private static final String THREW = "threw";
+
+    /** What one pass did, for its summary line (FAB-186): each stage's result, and its Blockfrost calls. */
+    private static final class PassSummary {
+        private String liquidation = NOT_RUN;
+        private String compound = NOT_RUN;
+        private String housekeeping = NOT_RUN;
+        private BoundedBFBackendService.CallCounts calls = BoundedBFBackendService.CallCounts.NONE;
+    }
+
+    /** The deadline's counts; zeros when it has none to give — a summary line must never fail a pass. */
+    private static BoundedBFBackendService.CallCounts callCountsOf(BoundedBFBackendService.PassDeadline deadline) {
+        try {
+            BoundedBFBackendService.CallCounts counts = deadline == null ? null : deadline.callCounts();
+            return counts == null ? BoundedBFBackendService.CallCounts.NONE : counts;
+        } catch (RuntimeException e) {
+            return BoundedBFBackendService.CallCounts.NONE;
+        }
+    }
+
+    /**
+     * FAB-186 (m5): ONE summary line per pass — its slot, each stage's result or {@code not run}, and the
+     * Blockfrost calls the pass made by kind. INFO when a stage answered anything but DEFINITE_FAILURE (or
+     * threw), or when the pass evaluated or submitted anything; DEBUG for a pass that did nothing worth
+     * saying, which on a quiet node is most of them.
+     */
+    private static void logSummary(ChainPoint point, PassSummary summary) {
+        BoundedBFBackendService.CallCounts calls = summary.calls;
+        boolean news = said(summary.liquidation) || said(summary.compound) || said(summary.housekeeping)
+                || calls.evaluation() + calls.submission() > 0;
+        String line = "wallet pipeline pass at slot " + point.slot() + " (" + point.blockHash() + "): liquidation "
+                + summary.liquidation + ", compound " + summary.compound + ", housekeeping " + summary.housekeeping
+                + "; Blockfrost calls discovery " + calls.discovery() + ", evaluate " + calls.evaluation()
+                + ", submit " + calls.submission();
+        if (news) {
+            log.info("{}", line);
+        } else {
+            log.debug("{}", line);
+        }
+    }
+
+    private static boolean said(String stageResult) {
+        return !NOT_RUN.equals(stageResult) && !WorkResult.DEFINITE_FAILURE.name().equals(stageResult);
     }
 
     /**

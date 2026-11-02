@@ -530,9 +530,9 @@ in silence.
 
 **When it runs.** Rebalancing is the last stage of the node's wallet pipeline. A pass is triggered by a
 block the node has committed or by a change in the oracle prices, and runs **liquidation first, then
-compound, then rebalancing**, one pass at a time. A stage that sends a transaction ends the pass, so
-rebalancing runs only on a pass in which no liquidation or compound went out; otherwise it waits for the
-next trigger. On such a pass it reads the wallet from its index and, **if the wallet is out of shape,
+compound, then rebalancing**, one pass at a time. A liquidation Blockfrost accepted, or a compound that
+went out (or may have), ends the pass, so rebalancing runs only on a pass in which neither happened;
+otherwise it waits for the next trigger. On such a pass it reads the wallet from its index and, **if the wallet is out of shape,
 builds, signs and submits one self-send** that puts it back in shape. A node in `disabled` mode never
 rebalances.
 
@@ -627,21 +627,25 @@ the rest of that check:
 
 **C — the ada-only UTxO of exactly the collateral size — is never handed to a liquidation as its
 funding UTxO.** The figures are ceilings checked before the build; the build is the judge of whether
-they suffice. (The transaction builders still choose their own collateral UTxO — the largest ada-only
-one, which is U in a shaped wallet — and an anticipate or convert can still draw on further wallet
-UTxOs while balancing.)
+they suffice. Every liquidation builder pins **C** as its only collateral, never spends it, and sees only
+its designated UTxO as a wallet input — it never draws on any other wallet UTxO while balancing.
 
 A **compound** is funded from **U** alone with **C** as its collateral, and its change comes back as one
 ada-only UTxO — except that a token pool's compounding fee arrives in the pool's token inside that UTxO,
 which may trigger a wallet reshape.
 
-**A UTxO that went out is not used again in the same check.** After a liquidation is submitted (or
-its submission's outcome is unknown), after a `shadow` node's would-be submission, and after a failure
-that says an input was already spent, the UTxO it was funded from is marked used, and the next
-candidate funded from the same role is **skipped** — logged at INFO as `… skipped: wallet output …
-(role U) already went out in this check` — rather than funded from another UTxO. Two plain
-liquidations in different markets therefore do not both go out in one pass: they share U. A
-liquidation held back by a market in `shadow` on a `live` node marks nothing.
+**Fire and forget: only an accepted liquidation uses up its UTxO.** Every candidate is tried, most
+profitable first, in every market. After a liquidation Blockfrost **accepted**, and after a `shadow`
+node's would-be submission, the UTxO it was funded from is marked used for the rest of the check, and the
+next candidate funded from the same role is **skipped** — logged at INFO as `… skipped: wallet output …
+(role U) already went out in this check` — rather than funded from another UTxO; two plain liquidations
+therefore do not both go out in one pass: they share U. **A rejected or unknown submit frees nothing and
+stops nothing:** it is logged once at INFO (`liquidation of … via … on … not accepted: HTTP …`), and the
+next candidate is tried, on the same UTxO. A liquidation held back by a market in `shadow` on a `live`
+node marks nothing. Until an accepted liquidation is in a block (about 20 s), later passes rebuild on U
+and get harmless rejections; the Blockfrost calls they cost appear in each pass's summary line
+(`wallet pipeline pass at slot …: …; Blockfrost calls discovery …, evaluate …, submit …`). See
+[upgrading.md §7, "Fire and forget"](upgrading.md#fire-and-forget-fab-186).
 
 ---
 

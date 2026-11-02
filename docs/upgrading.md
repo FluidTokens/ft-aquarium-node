@@ -524,17 +524,17 @@ Older images ran liquidation and compound each on its own timer (`AQUARIUM_LIQUI
 `AQUARIUM_COMPOUND_DELAY_SECONDS`, both 60 s by default). **Those timers are gone**, and so are the two
 settings (the table above). The bot wallet now has one queue of work, a *pass*, and a pass runs:
 
-1. **Liquidation.** Candidates are tried most profitable first. **At most one liquidation per market
-   per pass** — a market is the loan's principal asset — but several markets can each get one in the
-   same pass. A loan that fails is skipped and the market's next candidate is tried. A submit whose
-   outcome is unknown (no definite refusal from Blockfrost) ends the liquidation stage for that pass,
-   other markets included, and compound and housekeeping wait for the next trigger.
+1. **Liquidation.** Every candidate is tried, most profitable first, in every market. A loan whose
+   submit is rejected, or whose outcome is unknown, is skipped and the next candidate is tried — see
+   [Fire and forget (FAB-186)](#fire-and-forget-fab-186) below, which replaced this release's original
+   rules (at most one liquidation per market per pass, and an unknown outcome ending the stage).
 2. **Compound.**
 3. **Housekeeping** — the wallet rebalance described above.
 
-**After a liquidation that went out — submitted, or a submission whose outcome is unknown — compound
-and housekeeping wait for the next trigger.** The same rule holds between compound and housekeeping.
-In `shadow` a liquidation the node *would* have submitted sent nothing, so it does **not** hold them back.
+**After a liquidation that Blockfrost accepted, compound and housekeeping wait for the next trigger.**
+The same rule holds between compound and housekeeping. A liquidation that was rejected, or whose outcome
+is unknown, does not hold them back (FAB-186). In `shadow` a liquidation the node *would* have submitted
+sent nothing, so it does **not** hold them back either.
 
 **What starts a pass**, with no timer anywhere:
 
@@ -601,10 +601,9 @@ for what each role must hold.
 
 - **A UTxO that went out is not used again in the same check**, and the next candidate funded from the
   same role is skipped (`… skipped: wallet output … (role U) already went out in this check`, at INFO)
-  rather than funded from another UTxO. **So two plain liquidations in different markets no longer both
-  go out in one pass** — they share U; the second goes on a later pass. (The FAB-183 entry above says
-  several markets can each get one per pass: that now holds only for markets funded from different
-  roles.)
+  rather than funded from another UTxO. **So two plain liquidations no longer both go out in one pass**
+  — they share U; the second goes on a later pass. Several liquidations go out in one pass only when they
+  are funded from different roles. (Since FAB-186, below, "went out" means accepted by Blockfrost.)
 - **A missing role is refused by name.** No C: nothing is built, and one WARN names role C, its size and
   the wallet rebalancer's last outcome. No U, or no token UTxO for a token anticipate: that candidate is
   recorded `WALLET_ROLE_MISSING`, with one WARN per missing role per check. A role UTxO too small for
@@ -614,6 +613,30 @@ for what each role must hold.
 - **A shaped wallet is what makes this work** — keep wallet rebalancing on
   ([FAB-188, above](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)), and keep reference
   scripts and datum UTxOs out of the bot wallet: they keep it from being shaped, and so stop liquidation.
+
+### Fire and forget (FAB-186)
+
+Older images served **at most one liquidation per market per pass**, treated a submit whose outcome was
+unknown as if it had gone out — ending the liquidation stage for that pass — and read the text of a
+rejection (`BadInputsUTxO`, an empty `ScriptFailures`) to set a wallet UTxO aside. All three are gone:
+
+- **Every candidate is walked**, most profitable first, in every market.
+- **A rejected or unknown submit frees nothing and stops nothing.** A rejection, a raw or 5xx answer, no
+  answer, or a submit that threw are one outcome: that candidate failed. Nothing is set aside, and the
+  next candidate is tried — on the same UTxO if it is funded from the same role. Each one is said in
+  **one INFO line**, never ERROR:
+  `liquidation of <loan> via <plain|convert|pay-in-advance> on <UTxO> not accepted: HTTP <code|none|threw> <response>`,
+  with the response cut to 300 characters (the decision row keeps all of it). The
+  `aquarium.liquidation.submit.outside.validity` counter still counts `OutsideValidityInterval` answers;
+  it decides nothing.
+- **An accepted submit uses up its UTxO for the pass** — the next candidate funded from it is skipped,
+  as in FAB-185 — **and holds compound and housekeeping back** to the next trigger.
+- **Until our accepted transaction is in a block (about 20 s), later passes rebuild candidates on U and
+  get harmless rejections** — U is already spent by the pending transaction. They cost Blockfrost calls,
+  and each pass now ends with a summary line that shows them:
+  `wallet pipeline pass at slot <slot> (<hash>): liquidation <result>, compound <result>, housekeeping <result>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`,
+  where a stage that did not run reads `not run`. It is INFO when a stage returned anything other than
+  `DEFINITE_FAILURE` or the pass evaluated or submitted anything, and DEBUG otherwise.
 
 ---
 

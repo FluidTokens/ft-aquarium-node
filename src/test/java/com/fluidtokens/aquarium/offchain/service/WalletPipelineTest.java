@@ -945,6 +945,74 @@ class WalletPipelineTest {
         }
     }
 
+    /**
+     * FAB-186 (i): one summary line per pass — the stage results, or {@code not run}, and the Blockfrost
+     * calls the pass's deadline counted, by kind. INFO when a stage answered anything but DEFINITE_FAILURE or
+     * the pass evaluated or submitted anything; DEBUG for a pass that only discovered.
+     */
+    @Test
+    void eachPassEndsWithOneSummaryLineCarryingTheStageResultsAndTheBlockfrostCalls() throws Exception {
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        long slot = h.pipeline.stateForTest().inFlight().slot();
+                        h.currentDeadline.get().counts.set(slot == 1
+                                ? new BoundedBFBackendService.CallCounts(3, 1, 0)
+                                : slot == 2 ? new BoundedBFBackendService.CallCounts(5, 2, 1)
+                                : new BoundedBFBackendService.CallCounts(4, 0, 0));
+                        return slot == 2 ? WorkResult.SUBMITTED : WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> { h.record("C"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> { h.record("H"); return WorkResult.DEFINITE_FAILURE; });
+
+            // Every stage a definite failure, but the pass EVALUATED once: INFO.
+            h.pipeline.offerBlock(1, "a");
+            h.awaitPasses(1);
+            h.barrier();
+            assertEquals(1, count(Level.INFO, "wallet pipeline pass at slot 1 (a): liquidation DEFINITE_FAILURE, "
+                    + "compound DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 3, "
+                    + "evaluate 1, submit 0"), logs.list.toString());
+
+            // A liquidation SUBMITTED ends the pass: the later stages are "not run", and the line is INFO.
+            h.pipeline.offerBlock(2, "b");
+            h.awaitPasses(1);
+            h.barrier();
+            assertEquals(1, count(Level.INFO, "wallet pipeline pass at slot 2 (b): liquidation SUBMITTED, "
+                    + "compound not run, housekeeping not run; Blockfrost calls discovery 5, evaluate 2, submit 1"),
+                    logs.list.toString());
+
+            // Nothing answered but DEFINITE_FAILURE and nothing was evaluated or submitted: DEBUG, not INFO.
+            h.pipeline.offerBlock(3, "c");
+            h.awaitPasses(1);
+            h.barrier();
+            String quiet = "wallet pipeline pass at slot 3 (c): liquidation DEFINITE_FAILURE, compound "
+                    + "DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 4, evaluate 0, submit 0";
+            assertEquals(1, count(Level.DEBUG, quiet), logs.list.toString());
+            assertEquals(0, count(Level.INFO, "wallet pipeline pass at slot 3"), logs.list.toString());
+            assertEquals(3, logs.list.stream()
+                    .filter(e -> e.getFormattedMessage().startsWith("wallet pipeline pass at slot ")).count(),
+                    "exactly one summary line per pass");
+        }
+    }
+
+    /** FAB-186 (i): a deadline that counts nothing still gets its summary line, with zeros. */
+    @Test
+    void aDeadlineThatCountsNothingSummarisesZeroCalls() throws Exception {
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> { h.record("L"); return WorkResult.WOULD_SUBMIT; },
+                    fence -> { h.record("C"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> { h.record("H"); return WorkResult.DEFINITE_FAILURE; });
+            h.pipeline.offerBlock(9, "z");
+            h.awaitPasses(1);
+            h.barrier();
+            assertEquals(1, count(Level.INFO, "wallet pipeline pass at slot 9 (z): liquidation WOULD_SUBMIT, "
+                    + "compound DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 0, "
+                    + "evaluate 0, submit 0"), logs.list.toString());
+        }
+    }
+
     private long count(Level level, String fragment) {
         return logs.list.stream()
                 .filter(e -> e.getLevel() == level)
@@ -1045,6 +1113,9 @@ class WalletPipelineTest {
 
     private static final class MutableDeadline implements BoundedBFBackendService.PassDeadline {
         private final AtomicBoolean expired = new AtomicBoolean();
+        /** FAB-186: what this pass's Blockfrost calls are said to have been; zeros unless a stage sets them. */
+        private final AtomicReference<BoundedBFBackendService.CallCounts> counts =
+                new AtomicReference<>(BoundedBFBackendService.CallCounts.NONE);
 
         void expire() {
             expired.set(true);
@@ -1053,6 +1124,8 @@ class WalletPipelineTest {
         @Override public boolean isExpired() { return expired.get(); }
 
         @Override public long remainingNanos() { return expired.get() ? 0 : Long.MAX_VALUE / 4; }
+
+        @Override public BoundedBFBackendService.CallCounts callCounts() { return counts.get(); }
     }
 
     private static final class MutableClock extends Clock {
