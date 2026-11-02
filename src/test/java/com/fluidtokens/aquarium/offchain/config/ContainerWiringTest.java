@@ -22,6 +22,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -174,6 +175,28 @@ class ContainerWiringTest {
                             + "test about how it is built, and the caller sees null — which is how "
                             + "the convert routing was absent in production while the suite was "
                             + "green, and how the preview pod crashed in 14 seconds.");
+        });
+    }
+
+    /**
+     * ⛔ FAB-196: <b>the probe the container builds asks the container's own index</b>. Every liquidation,
+     * pay-in-advance and convert build reads oracle liveness through this bean, and its index is what lets
+     * an out-ref the node has indexed be answered with no Blockfrost call. {@code YaciConfigWiringTest} proves
+     * the bean method keeps the index it is handed; only the container proves WHICH index it is handed — the
+     * {@code TankUtxoStorage} bean, the one Yaci writes every block through, and not some other
+     * {@code OracleOutRefIndex} or {@code NOTHING_INDEXED}.
+     */
+    @Test
+    void theProbeBeanAsksTheTankUtxoStorageBean() {
+        runner().run(ctx -> {
+            assertNull(ctx.getStartupFailure(), () -> "the container did not start: " + ctx.getStartupFailure());
+            var probe = ctx.getBean(com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe.class);
+            var storage = ctx.getBean(com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage.class);
+            java.lang.reflect.Field index = probe.getClass().getDeclaredField("index");
+            index.setAccessible(true);
+            assertSame(storage, index.get(probe),
+                    "the container's oracle probe does not ask the TankUtxoStorage bean: every oracle out-ref "
+                            + "would go to Blockfrost, and a spend the index recorded would not be refused from it");
         });
     }
 

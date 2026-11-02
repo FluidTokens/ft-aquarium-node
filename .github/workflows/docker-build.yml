@@ -324,11 +324,17 @@ jobs:
       # re-measured cold keyless on feat/fab-189-composable-node, 2026-11-02: 231 files / 2602 tests /
       # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 231.
       #
+      # FAB-196-3 (OracleProbeIndexFirstProductionWiringTest: the probe bean over the real TankUtxoStorage and
+      # Yaci tables -- an indexed feed costs no Blockfrost call, a recorded spend is refused from the index, the
+      # rest goes to Blockfrost as before; plus a case in ContainerWiringTest) re-measured cold keyless on
+      # feat/fab-189-composable-node, 2026-11-02: 232 files / 2609 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 232.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '231'
+          RESULT_FILE_FLOOR: '232'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

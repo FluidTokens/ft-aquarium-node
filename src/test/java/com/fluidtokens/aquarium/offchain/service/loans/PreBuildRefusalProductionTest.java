@@ -306,7 +306,7 @@ class PreBuildRefusalProductionTest {
             builder = yaciConfig.liquidateTransactionBuilder(LoanFixtures.registry(), network("preview"),
                     LoanFixtures.converters(), contentHold, LoanFixtures.protocolParams(), noScripts,
                     yaciConfig.transactionEvaluator(backend),
-                    yaciConfig.oracleReferenceInputProbe(contentHold, backend));
+                    yaciConfig.oracleReferenceInputProbe(contentHold, backend, OracleOutRefIndex.NOTHING_INDEXED));
 
             BlockEventListener blockEventListener = new BlockEventListener(null);
             blockEventListener.getIsSyncing().set(false);
@@ -664,7 +664,8 @@ class PreBuildRefusalProductionTest {
             ProtocolParamsSupplier params = EvalFixtures.protocolParams();
 
             YaciConfig yaciConfig = new YaciConfig();
-            OracleReferenceInputProbe probe = yaciConfig.oracleReferenceInputProbe(contentHold, backend);
+            OracleReferenceInputProbe probe = yaciConfig.oracleReferenceInputProbe(contentHold, backend,
+                    OracleOutRefIndex.NOTHING_INDEXED);
             ConvertTransactionBuilder builder = yaciConfig.convertTransactionBuilder(MAINNET_REGISTRY,
                     network("mainnet"), contentHold, params, noScripts, yaciConfig.transactionEvaluator(backend), probe);
 

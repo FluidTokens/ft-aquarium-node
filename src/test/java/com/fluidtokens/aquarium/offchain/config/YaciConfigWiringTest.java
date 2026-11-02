@@ -31,6 +31,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.ConvertTransactionBuilder
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidatePayInAdvanceTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.LoanFixtures;
+import com.fluidtokens.aquarium.offchain.service.loans.OracleOutRefIndex;
 import com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe;
 import com.fluidtokens.aquarium.offchain.storage.IndexFirstUtxoSupplier;
 import com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage;
@@ -703,7 +704,7 @@ class YaciConfigWiringTest {
     /** A probe over an unreachable backend — constructing it makes no request (see the class javadoc). */
     private static OracleReferenceInputProbe offlineProbe() {
         return new YaciConfig().oracleReferenceInputProbe(LoanFixtures.utxoSupplier(List.of()),
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), OracleOutRefIndex.NOTHING_INDEXED);
     }
 
     /**
@@ -711,8 +712,9 @@ class YaciConfigWiringTest {
      * builder is unprobed by design, so this is the only thing that notices the bean losing its probe —
      * and with it, a spent feed going back to surfacing as Blockfrost's empty {@code ScriptFailures},
      * which the executor reads as a spent WALLET input. The probe holds the bean's own
-     * {@code UtxoSupplier} (the content hold, for the out-ref's address) and the backend's read-only
-     * {@code UtxoService} — never a {@code BackendService}, so the builder still holds no submission path.
+     * {@code UtxoSupplier} (the content hold, for the out-ref's address), the backend's read-only
+     * {@code UtxoService} — never a {@code BackendService}, so the builder still holds no submission path —
+     * and (FAB-196) the very {@code OracleOutRefIndex} the bean method was handed, which it asks first.
      */
     @Test
     void theLiquidateBuilderBeanHoldsAProbeOverTheBeanSupplierAndTheBackendUtxoService() throws Exception {
@@ -720,8 +722,9 @@ class YaciConfigWiringTest {
         BFBackendService backend = mock(BFBackendService.class);
         UtxoService utxoService = mock(UtxoService.class);
         when(backend.getUtxoService()).thenReturn(utxoService);
+        OracleOutRefIndex index = (outRef, nft) -> OracleOutRefIndex.Answer.unknown();
         YaciConfig config = new YaciConfig();
-        OracleReferenceInputProbe probe = config.oracleReferenceInputProbe(utxoSupplier, backend);
+        OracleReferenceInputProbe probe = config.oracleReferenceInputProbe(utxoSupplier, backend, index);
 
         LiquidateTransactionBuilder builder = config.liquidateTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(), LoanFixtures.converters(),
@@ -737,6 +740,8 @@ class YaciConfigWiringTest {
                 "the probe must read the out-ref's address through the bean's own (index-first) supplier");
         assertSame(utxoService, fieldOf(probe, "blockfrost"),
                 "the probe must ask the backend's own UtxoService");
+        assertSame(index, fieldOf(probe, "index"),
+                "the probe must ask the index the bean method was handed, not an index of its own");
         for (Field field : OracleReferenceInputProbe.class.getDeclaredFields()) {
             assertFalse(BackendService.class.isAssignableFrom(field.getType()),
                     "the probe declares a BackendService field (" + field.getName() + "): a submission path");
@@ -756,7 +761,8 @@ class YaciConfigWiringTest {
         BFBackendService backend = mock(BFBackendService.class);
         when(backend.getUtxoService()).thenReturn(mock(UtxoService.class));
         YaciConfig config = new YaciConfig();
-        OracleReferenceInputProbe probe = config.oracleReferenceInputProbe(utxoSupplier, backend);
+        OracleReferenceInputProbe probe = config.oracleReferenceInputProbe(utxoSupplier, backend,
+                OracleOutRefIndex.NOTHING_INDEXED);
 
         LiquidatePayInAdvanceTransactionBuilder payInAdvance = config.liquidatePayInAdvanceTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(), utxoSupplier, LoanFixtures.protocolParams(),

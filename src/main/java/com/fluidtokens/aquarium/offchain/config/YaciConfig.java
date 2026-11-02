@@ -25,6 +25,7 @@ import com.fluidtokens.aquarium.offchain.service.loans.ConvertLiquidationRouter;
 import com.fluidtokens.aquarium.offchain.service.loans.ConvertTransactionBuilder;
 import com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver;
 import com.fluidtokens.aquarium.offchain.service.loans.LiquidateTransactionBuilder;
+import com.fluidtokens.aquarium.offchain.service.loans.OracleOutRefIndex;
 import com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe;
 import com.fluidtokens.aquarium.offchain.storage.IndexFirstUtxoSupplier;
 import com.fluidtokens.aquarium.offchain.storage.TankUtxoStorage;
@@ -144,9 +145,12 @@ public class YaciConfig {
      *       {@link TankUtxoStorage#indexedPaymentCredentials()} watches; any other address is refused,
      *       and an empty answer is never topped up from Blockfrost.</li>
      *   <li>One output by out-ref comes from the index when it holds the row with a faithful
-     *       reference-script hash, and otherwise from Blockfrost's {@code UtxoService}. That covers the
-     *       reference inputs this node does not index (oracle feeds, scripts and Charli3 providers,
-     *       FluidTokens-published reference scripts, the tank reference input). FAB-134 B5b: a miss whose
+     *       reference-script hash — including, at any address, an oracle feed or Charli3 provider output that
+     *       holds a token of a configured oracle NFT policy (FAB-196), once the index has seen the block that
+     *       created it — and otherwise from Blockfrost's {@code UtxoService}. That covers the reference
+     *       inputs this node does not index (oracle scripts, an oracle feed or provider output holding no
+     *       token of a configured policy or created before the cursor, FluidTokens-published reference
+     *       scripts, the tank reference input). FAB-134 B5b: a miss whose
      *       out-ref is in {@link StaticReferenceInputs#current()} is read ONCE and then held by out-ref
      *       (an output's content never changes; liveness is the ledger's to judge); any other miss is one
      *       direct read, not held.</li>
@@ -194,18 +198,27 @@ public class YaciConfig {
     }
 
     /**
-     * ⛔ FAB-138: the oracle reference-input probe the production liquidation builder runs inside
-     * {@code build()}, before script-cost evaluation. It reads an out-ref's ADDRESS through the index-first
-     * {@link UtxoSupplier} above (the content hold, which says nothing about liveness) and asks Blockfrost's
-     * {@code UtxoService} — one {@code getUtxos(address, nft)} per distinct oracle out-ref — whether the
-     * out-ref is still in the live set holding its NFT. It is handed the {@code UtxoService} alone, never
-     * the {@code BFBackendService}: a {@code UtxoService} can read and cannot submit, so neither the probe
-     * nor the builder that holds it has a path to the wire.
+     * ⛔ FAB-138: the oracle reference-input probe the production liquidation, pay-in-advance and convert
+     * builders run inside {@code build()}, before script-cost evaluation. It reads an out-ref's ADDRESS
+     * through the index-first {@link UtxoSupplier} above (the content hold, which says nothing about
+     * liveness), and then asks whether the out-ref is still in the live set holding its NFT.
+     * <p>
+     * ⛔ FAB-196: <b>the node's own index answers that first</b>. The {@link OracleOutRefIndex} it is handed
+     * is the {@link TankUtxoStorage} bean: an out-ref the index holds unspent with its NFT is LIVE, and one
+     * the index recorded spent is refused naming the spending transaction — both with no Blockfrost call.
+     * Only an out-ref the index cannot answer (never seen, pruned, created before the cursor, or holding no
+     * token of a configured oracle NFT policy) reaches Blockfrost's {@code UtxoService}: one
+     * {@code getUtxos(address, nft)} for it, exactly the check this bean made before the index existed.
+     * <p>
+     * It is handed the {@code UtxoService} alone, never the {@code BFBackendService}: a {@code UtxoService}
+     * can read and cannot submit, and the index is read-only, so neither the probe nor the builder that
+     * holds it has a path to the wire.
      */
     @Bean
     public OracleReferenceInputProbe oracleReferenceInputProbe(UtxoSupplier utxoSupplier,
-                                                               BFBackendService bfBackendService) {
-        return new OracleReferenceInputProbe(utxoSupplier, bfBackendService.getUtxoService());
+                                                               BFBackendService bfBackendService,
+                                                               OracleOutRefIndex oracleOutRefIndex) {
+        return new OracleReferenceInputProbe(utxoSupplier, bfBackendService.getUtxoService(), oracleOutRefIndex);
     }
 
     /**
@@ -225,8 +238,9 @@ public class YaciConfig {
      * is not rejected by the mempool: it lands and then fails on chain, forfeiting the collateral. So the
      * armed path has to be given an evaluator, and it is given the node's one: the
      * {@link #transactionEvaluator} bean, Blockfrost's {@code /utils/txs/evaluate} (see that bean for
-     * why). Besides the oracle probe below, it is the one Blockfrost call a build still makes (with
-     * {@code getTxOutput} for reference inputs the index does not hold).
+     * why). Besides the oracle probe's check of an out-ref the index cannot answer (below), it is the one
+     * Blockfrost call a build still makes (with {@code getTxOutput} for reference inputs the index does not
+     * hold).
      * <p>
      * The bean's type is the narrowing, exactly as {@code LiquidationExecutor}'s
      * {@code TransactionSubmitter} is: {@link TransactionEvaluator} declares one operation and no submit
@@ -234,11 +248,12 @@ public class YaciConfig {
      * no {@code BFBackendService} and no {@code DefaultTransactionProcessor} — either would hand it a
      * submission path through the back door.
      * <p>
-     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} above, which asks Blockfrost —
-     * before any evaluation — whether every oracle out-ref the build references is still live: one more
-     * Blockfrost read per distinct oracle out-ref per build, on top of the evaluation. That probe holds a
-     * read-only {@code UtxoService} and nothing that can submit, so the builder still gets no submission
-     * path.
+     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} above, which checks — before any
+     * evaluation — that every oracle out-ref the build references is still live. FAB-196: the index answers
+     * first, so an out-ref it holds (live, or recorded spent) costs no Blockfrost call; each distinct out-ref
+     * the index cannot answer costs one more Blockfrost read per build, on top of the evaluation. That probe
+     * holds a read-only {@code UtxoService} and a read-only index and nothing that can submit, so the
+     * builder still gets no submission path.
      */
     @Bean
     public LiquidateTransactionBuilder liquidateTransactionBuilder(LoansContractRegistry registry,
@@ -363,11 +378,12 @@ public class YaciConfig {
      * {@code BFBackendService} — that would hand it a submission path through the back door; arming and
      * submission stay in {@code LiquidationExecutor} behind its two independent flags.
      * <p>
-     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} bean, which asks Blockfrost —
-     * once per build, before either pass is evaluated — whether the collateral oracle's out-refs (feed and,
-     * for a Charli3 feed, provider) are still live: one or two more Blockfrost reads per build. That probe
-     * holds a read-only {@code UtxoService} and nothing that can submit, so the builder still gets no
-     * submission path.
+     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} bean, which checks — once per
+     * build, before either pass is evaluated — that the collateral oracle's out-refs (feed and, for a
+     * Charli3 feed, provider) are still live. FAB-196: the index answers first, so an out-ref it holds
+     * (live, or recorded spent) costs no Blockfrost call; each out-ref the index cannot answer costs one
+     * more Blockfrost read, at most two per build. That probe holds a read-only {@code UtxoService} and a
+     * read-only index and nothing that can submit, so the builder still gets no submission path.
      */
     @Bean
     public ConvertTransactionBuilder convertTransactionBuilder(LoansContractRegistry registry,
@@ -438,12 +454,13 @@ public class YaciConfig {
      * submission path through the back door; arming and submission stay in {@code LiquidationExecutor}
      * behind its two independent flags.
      * <p>
-     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} bean, which asks Blockfrost —
-     * once per build, before any evaluation — whether every oracle out-ref the build references is still
-     * live: the collateral leg's feed and Charli3 provider, and the principal leg's too when the principal
-     * is a token — one Blockfrost read per distinct out-ref, up to four per build. That probe holds a
-     * read-only {@code UtxoService} and nothing that can submit, so the builder still gets no submission
-     * path.
+     * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} bean, which checks — once per
+     * build, before any evaluation — that every oracle out-ref the build references is still live: the
+     * collateral leg's feed and Charli3 provider, and the principal leg's too when the principal is a
+     * token. FAB-196: the index answers first, so an out-ref it holds (live, or recorded spent) costs no
+     * Blockfrost call; each distinct out-ref the index cannot answer costs one Blockfrost read, up to four
+     * per build. That probe holds a read-only {@code UtxoService} and a read-only index and nothing that
+     * can submit, so the builder still gets no submission path.
      */
     @Bean
     public LiquidatePayInAdvanceTransactionBuilder liquidatePayInAdvanceTransactionBuilder(
