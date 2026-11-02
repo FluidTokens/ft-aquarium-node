@@ -53,6 +53,7 @@ class OracleReferenceInputProbeVerdictPinTest {
     private static final AssetType FEED_NFT = new AssetType("b0".repeat(28), "4f52434c");
     private static final AssetType FEED_NFT_V2 = new AssetType("b1".repeat(28), "4f52434c");
     private static final AssetType C3_NFT = new AssetType("d0".repeat(28), "4f7261636c6546656564");
+    private static final AssetType C3_NFT_V2 = new AssetType("d1".repeat(28), "4f7261636c6546656564");
 
     private static final String FEED_TX = "9a".repeat(32);
     private static final String SCRIPT_TX = "9b".repeat(32);
@@ -72,6 +73,7 @@ class OracleReferenceInputProbeVerdictPinTest {
     private static final String FEED_UNIT = "b0".repeat(28) + "4f52434c";
     private static final String FEED_V2_UNIT = "b1".repeat(28) + "4f52434c";
     private static final String C3_UNIT = "d0".repeat(28) + "4f7261636c6546656564";
+    private static final String C3_V2_UNIT = "d1".repeat(28) + "4f7261636c6546656564";
 
     private static final Utxo FEED_UTXO = holding(FEED_REF, FEED_ADDRESS, FEED_NFT);
     private static final Utxo PROVIDER_UTXO = holding(PROVIDER_REF, PROVIDER_ADDRESS, C3_NFT);
@@ -374,6 +376,67 @@ class OracleReferenceInputProbeVerdictPinTest {
 
         assertEquals("the oracle feed names no out-ref, so its liveness cannot be checked", e.getMessage());
         assertFalse(e.notYetVisible());
+        noCallAtAll(blockfrost);
+    }
+
+    // ---- FAB-196-2 Task 1b: four more of today's verdicts, pinned before the index is consulted ---------
+
+    /** (p17) A SUCCESSFUL answer with an empty list: the NFT is nowhere live at the address. */
+    @Test
+    void aSuccessfulEmptyAnswer() throws Exception {
+        UtxoService blockfrost = mock(UtxoService.class);
+        when(blockfrost.getUtxos(FEED_ADDRESS, FEED_UNIT, 100, 1)).thenReturn(ok());
+
+        var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(multisig())));
+
+        assertEquals("oracle out-ref " + FEED_TX + "#0 (expected NFT " + FEED_UNIT + " at " + FEED_ADDRESS
+                + "): spent: the NFT now sits at []", e.getMessage());
+        assertFalse(e.notYetVisible());
+        asked(blockfrost, 1, FEED_ADDRESS, FEED_UNIT);
+        nothingElse(blockfrost);
+    }
+
+    /** (p18) A 500 whose body spells {@code Script Failures} with a space: defused to {@code Script-Failures}. */
+    @Test
+    void aServerErrorBodyContainingScriptFailures() throws Exception {
+        UtxoService blockfrost = mock(UtxoService.class);
+        when(blockfrost.getUtxos(FEED_ADDRESS, FEED_UNIT, 100, 1))
+                .thenReturn(failed(500, "{\"error\":\"Script Failures {}\"}"));
+
+        var e = refused(() -> probe(blockfrost, FEED_UTXO).requireLive(List.of(multisig())));
+
+        assertEquals("oracle out-ref " + FEED_TX + "#0 (expected NFT " + FEED_UNIT + " at " + FEED_ADDRESS
+                + "): live-UTxO check failed, provider error 500 {\"error\":\"Script-Failures {}\"}", e.getMessage());
+        assertFalse(e.notYetVisible());
+        asked(blockfrost, 1, FEED_ADDRESS, FEED_UNIT);
+        nothingElse(blockfrost);
+    }
+
+    /** (p19) Two entries expecting different NFTs at one Charli3 PROVIDER out-ref: refused with no call. */
+    @Test
+    void twoEntriesExpectingDifferentNftsAtOneProviderOutRef() throws Exception {
+        UtxoService blockfrost = mock(UtxoService.class);
+
+        var e = refused(() -> probe(blockfrost, FEED_UTXO, PROVIDER_UTXO).requireLive(List.of(
+                c3(FEED_NFT, FEED_REF, C3_NFT), c3(FEED_NFT, FEED_REF, C3_NFT_V2))));
+
+        assertEquals("Charli3 provider " + PROVIDER_TX + "#0: two oracle entries expect different NFTs there ("
+                + C3_UNIT + " and " + C3_V2_UNIT + ")", e.getMessage());
+        assertFalse(e.notYetVisible());
+        noCallAtAll(blockfrost);
+    }
+
+    /** (p20) Content present but with a null address: the same wait as no content at all, with no call. */
+    @Test
+    void contentWithANullAddressIsNotYetVisible() throws Exception {
+        UtxoService blockfrost = mock(UtxoService.class);
+        Utxo addressless = holding(FEED_REF, null, FEED_NFT);
+
+        var e = refused(() -> probe(blockfrost, addressless).requireLive(List.of(multisig())));
+
+        assertEquals("oracle out-ref " + FEED_TX + "#0 (expected NFT " + FEED_UNIT
+                + "): its address is unknown — no content for it", e.getMessage());
+        assertTrue(e.notYetVisible());
         noCallAtAll(blockfrost);
     }
 }

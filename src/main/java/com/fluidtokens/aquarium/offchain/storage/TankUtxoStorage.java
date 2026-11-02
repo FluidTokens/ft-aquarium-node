@@ -1,6 +1,7 @@
 package com.fluidtokens.aquarium.offchain.storage;
 
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.util.HexUtil;
 import com.bloxbean.cardano.yaci.store.common.domain.AddressUtxo;
 import com.bloxbean.cardano.yaci.store.common.domain.Amt;
@@ -11,10 +12,12 @@ import com.bloxbean.cardano.yaci.store.utxo.storage.impl.UtxoStorageImpl;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.model.UtxoId;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.TxInputRepository;
 import com.bloxbean.cardano.yaci.store.utxo.storage.impl.repository.UtxoRepository;
+import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.ParametersContractService;
 import com.fluidtokens.aquarium.offchain.service.StakerContractService;
 import com.fluidtokens.aquarium.offchain.service.TankContractService;
+import com.fluidtokens.aquarium.offchain.service.loans.OracleOutRefIndex;
 import lombok.extern.slf4j.Slf4j;
 import org.jooq.DSLContext;
 import org.springframework.beans.factory.ObjectProvider;
@@ -33,9 +36,12 @@ import java.util.Set;
 
 @Repository
 @Slf4j
-public class TankUtxoStorage extends UtxoStorageImpl {
+public class TankUtxoStorage extends UtxoStorageImpl implements OracleOutRefIndex {
 
     private final UtxoRepository utxoRepository;
+
+    /** Yaci's spent-output table, read by {@link #lookup} only; the writes stay {@code super}'s. */
+    private final TxInputRepository txInputRepository;
 
     private final Set<String> contractPaymentPkh;
 
@@ -63,6 +69,7 @@ public class TankUtxoStorage extends UtxoStorageImpl {
                            @Value("${loans.oracle.indexed-nft-policies:}") String oracleNftPolicies) {
         super(utxoRepository, spentOutputRepository, dsl, utxoCache, platformTransactionManager);
         this.utxoRepository = utxoRepository;
+        this.txInputRepository = spentOutputRepository;
         var pkhs = new LinkedHashSet<>(List.of(
                 account.getBaseAddress().getPaymentCredentialHash().map(HexUtil::encodeHexString).get(),
                 parametersContractService.getScriptHashHex(),
@@ -152,6 +159,48 @@ public class TankUtxoStorage extends UtxoStorageImpl {
      */
     public Set<String> indexedOracleNftPolicies() {
         return oracleNftPolicies;
+    }
+
+    /**
+     * ⛔ FAB-196: what this index knows about ONE oracle out-ref expected to hold {@code nft} — LIVE, SPENT or
+     * UNKNOWN ({@link OracleOutRefIndex}). Two repository reads by out-ref (the tx hash lowercased, as Yaci
+     * stores it), never the {@code UtxoCache}, never Blockfrost.
+     *
+     * <h2>Read order: the spend FIRST</h2>
+     * {@code address_utxo} keeps spent rows; spentness lives in {@code tx_input} ({@code officina:
+     * yaci-store-index-scoping} §4b), so an unspent-looking row alone is not "live". The spend is read first
+     * because a concurrent prune ({@code deleteBySpentAndBlockLessThan}) deletes BOTH rows in one transaction:
+     * <ul>
+     *   <li>spend first — a prune between the two reads finds the output row gone too, so "spent" can become
+     *       "unknown" but never "live";</li>
+     *   <li>output first — a prune between the reads would leave a row read as present and a spend read as
+     *       absent: "live" for an output already spent and pruned.</li>
+     * </ul>
+     * So LIVE needs both reads to agree: no spend recorded, AND a row for exactly that {@code (tx hash, index)}
+     * holding the NFT's unit.
+     *
+     * <h2>UNKNOWN is the default, on purpose</h2>
+     * Never seen, pruned, discarded by the write-time filter (§2: indistinguishable from absence), or a row that
+     * does not hold the expected NFT — all UNKNOWN. A row without the NFT is not refused here: the probe then
+     * asks Blockfrost, which gives today's verdict and today's text.
+     */
+    @Override
+    public Answer lookup(TransactionInput outRef, AssetType nft) {
+        var id = new UtxoId(outRef.getTransactionId().toLowerCase(Locale.ROOT), outRef.getIndex());
+        var spend = txInputRepository.findById(id);
+        if (spend.isPresent()) {
+            return Answer.spent(spend.get().getSpentTxHash());
+        }
+        var output = utxoRepository.findById(id);
+        if (output.isPresent() && output.get().getAmounts() != null) {
+            String unit = nft.toUnit();
+            for (Amt amount : output.get().getAmounts()) {
+                if (amount != null && unit.equalsIgnoreCase(amount.getUnit())) {
+                    return Answer.live();
+                }
+            }
+        }
+        return Answer.unknown();
     }
 
     @Override

@@ -7,6 +7,7 @@ import com.bloxbean.cardano.client.backend.api.UtxoService;
 import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
+import com.fluidtokens.aquarium.offchain.service.loans.OracleOutRefIndex.Answer;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -21,8 +22,9 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * ⛔ <b>Is every oracle out-ref a build is about to reference still LIVE?</b> (FAB-138.) Asked on Blockfrost
- * inside the production builder's {@code build()}, before any script-cost evaluation.
+ * ⛔ <b>Is every oracle out-ref a build is about to reference still LIVE?</b> (FAB-138.) Asked of this node's own
+ * index first and of Blockfrost when the index does not know (FAB-196), inside the production builder's
+ * {@code build()}, before any script-cost evaluation.
  *
  * <h2>Why before evaluation</h2>
  * A spent oracle feed does not fail as "the feed is spent". It reaches Blockfrost's
@@ -35,26 +37,46 @@ import java.util.stream.Collectors;
  * <h2>What "live" means</h2>
  * Blockfrost's {@code getTxOutput} answers a spent output forever (§12): it is not an existence check, and
  * this class never calls it. Liveness is "the out-ref is in the LIVE UTxO set at its address, holding the
- * NFT", asked as ONE {@code getUtxos(address, nftUnit)} per distinct out-ref:
+ * NFT", for each distinct out-ref:
  * <ul>
  *   <li>the feed ({@link OracleEntry#referenceInput()}) must hold {@link OracleEntry#oracleToken()};</li>
  *   <li>the Charli3 provider ({@link OracleEntry#charlieProviderReferenceInput()}), when there is one, must
  *       hold {@link OracleEntry#charlieProviderNft()}.</li>
  * </ul>
- * The out-ref's ADDRESS comes from {@code contentSource} — the content hold (FAB-134 7b), which may answer
- * from memory because an output's content never changes. It says nothing about liveness; that is this
- * class's whole job.
+ *
+ * <h2>Who answers: the index first, then Blockfrost (FAB-196)</h2>
+ * Each out-ref is first asked of the {@link OracleOutRefIndex}, with the NFT expected THERE (the c3 NFT for a
+ * provider, the feed NFT for a feed). Three answers, three rules:
+ * <ul>
+ *   <li><b>LIVE</b> — the index holds an unspent row for exactly that out-ref holding that NFT: the out-ref
+ *       passes, and Blockfrost is not called for it;</li>
+ *   <li><b>SPENT</b> — the index recorded a spend of that out-ref: a refusal naming the spending transaction,
+ *       with no Blockfrost call;</li>
+ *   <li><b>UNKNOWN</b> — the index does not know: ONE {@code getUtxos(address, nftUnit)}, exactly the check this
+ *       class made before the index existed, with the same verdicts and the same texts.</li>
+ * </ul>
+ * LIVE is only as fresh as the index (an out-ref spent in a block this node has not stored yet still reads
+ * LIVE); the opposite lag refuses, which the chain supports. An index failure is not a verdict: whatever
+ * {@code lookup} throws escapes unchanged, with no Blockfrost call. The two-argument constructor uses
+ * {@link OracleOutRefIndex#NOTHING_INDEXED}, so every out-ref is UNKNOWN and Blockfrost decides them all.
+ *
+ * <h2>Read order</h2>
+ * {@link #requireLive(Collection)} first checks every entry's out-ref and NFT, then resolves EVERY out-ref's
+ * ADDRESS, and only then asks, out-ref by out-ref in insertion order, the index and (on UNKNOWN) Blockfrost. The
+ * address comes from {@code contentSource} — the content hold (FAB-134 7b), which may answer from memory because
+ * an output's content never changes. It says nothing about liveness, and the index never decides content: an
+ * out-ref whose content is unknown is a wait however the index would have answered, and the index is not asked.
  *
  * <h2>What refuses</h2>
- * A spent out-ref, an NFT the registry does not name, two entries expecting different NFTs at one out-ref,
- * an out-ref whose content is unknown, and any provider failure. Every one throws
+ * A spent out-ref (by the index or by Blockfrost), an NFT the registry does not name, two entries expecting
+ * different NFTs at one out-ref, an out-ref whose content is unknown, and any provider failure. Every one throws
  * {@link OracleReferenceInputNotLiveException}; nothing is held, so the candidate is probed again next cycle
  * (FAB-134 NQ: no quarantine). The executor logs each at ERROR, except an out-ref whose content is unknown (not
  * yet visible to this node, FAB-183): that one is marked {@code notYetVisible}, and the executor records it as a
  * wait, REFUSED {@code ORACLE_INPUT_NOT_YET_VISIBLE} at INFO, keeping the nominated wallet utxo.
  *
  * <p>Holds a {@link UtxoService} — read-only, with no submission method — and no {@code BackendService}, so a
- * builder that holds this probe still has no path to the wire.
+ * builder that holds this probe still has no path to the wire. The index is read-only too.
  */
 public class OracleReferenceInputProbe {
 
@@ -73,15 +95,23 @@ public class OracleReferenceInputProbe {
 
     private final UtxoService blockfrost;
 
+    private final OracleOutRefIndex index;
+
+    /** A probe with no index: every out-ref is UNKNOWN, so Blockfrost decides them all, exactly as before FAB-196. */
     public OracleReferenceInputProbe(UtxoSupplier contentSource, UtxoService blockfrost) {
+        this(contentSource, blockfrost, OracleOutRefIndex.NOTHING_INDEXED);
+    }
+
+    public OracleReferenceInputProbe(UtxoSupplier contentSource, UtxoService blockfrost, OracleOutRefIndex index) {
         this.contentSource = Objects.requireNonNull(contentSource, "contentSource");
         this.blockfrost = Objects.requireNonNull(blockfrost, "blockfrost");
+        this.index = Objects.requireNonNull(index, "index");
     }
 
     /**
      * Refuses unless every oracle out-ref {@code referenced} names is live and holds its expected NFT.
-     * Exactly one {@code getUtxos} per distinct out-ref per call; none at all when a refusal can be decided
-     * without the network.
+     * One index lookup per distinct out-ref, and exactly one {@code getUtxos} for each out-ref the index answers
+     * UNKNOWN; none at all when a refusal can be decided without the network.
      *
      * @throws OracleReferenceInputNotLiveException on the first out-ref that is not provably live
      */
@@ -131,6 +161,24 @@ public class OracleReferenceInputProbe {
     }
 
     private void requireLive(TransactionInput outRef, AssetType nft, String address) {
+        Answer known = Objects.requireNonNull(index.lookup(outRef, nft),
+                "the oracle out-ref index answered null for " + ref(outRef));
+        switch (known.state()) {
+            case LIVE -> {
+                // The index holds the out-ref, unspent, holding the expected NFT: no Blockfrost call.
+            }
+            case SPENT -> {
+                String unit = nft.toUnit();
+                throw new OracleReferenceInputNotLiveException(
+                        "oracle out-ref %s (expected NFT %s at %s): spent in transaction %s, as recorded by this node's index"
+                                .formatted(ref(outRef), unit, address, known.spentTxHash()));
+            }
+            case UNKNOWN -> requireLiveOnBlockfrost(outRef, nft, address);
+        }
+    }
+
+    /** The index does not know this out-ref: Blockfrost's live UTxO set decides, exactly as before FAB-196. */
+    private void requireLiveOnBlockfrost(TransactionInput outRef, AssetType nft, String address) {
         String unit = nft.toUnit();
         Result<List<Utxo>> answer;
         try {
