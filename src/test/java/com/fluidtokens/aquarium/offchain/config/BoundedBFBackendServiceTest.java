@@ -485,6 +485,41 @@ class BoundedBFBackendServiceTest {
         assertEquals(new BoundedBFBackendService.CallCounts(0, 0, 0), foreign.callCounts());
     }
 
+    /**
+     * FAB-186 r2 (F3): a call attempted after the pass deadline expired is refused — and NOT counted, since
+     * it never went out. At every stage through the factory, and through a real CCL service; the call made
+     * before expiry stays the only one counted.
+     */
+    @Test
+    void aCallRefusedByAnExpiredPassDeadlineIsNotCounted() throws Exception {
+        AtomicLong now = new AtomicLong(10);
+        String base = "http://127.0.0.1:9/api/v0/";
+        BoundedBFBackendService backend = bounded(base, 2, 2, 2, 1, now::get);
+        Call.Factory factory = callFactory(backend);
+        Request discovery = new Request.Builder().url(base + "blocks/latest").build();
+        Request evaluation = new Request.Builder().url(base + "utils/txs/evaluate").build();
+        Request submission = new Request.Builder().url(base + "tx/submit").build();
+        AtomicReference<BoundedBFBackendService.CallCounts> seen = new AtomicReference<>();
+
+        backend.runWithinPassDeadline(deadline -> {
+            factory.newCall(discovery).cancel();
+            assertEquals(new BoundedBFBackendService.CallCounts(1, 0, 0), deadline.callCounts(),
+                    "the call made before expiry is counted");
+            now.addAndGet(1_000_000_000L);
+            assertTrue(deadline.isExpired());
+            for (Request request : java.util.List.of(discovery, evaluation, submission)) {
+                IllegalStateException refused = assertThrows(IllegalStateException.class,
+                        () -> factory.newCall(request), request.url().toString());
+                assertTrue(refused.getMessage().contains("expired"), refused.getMessage());
+            }
+            assertThrows(IllegalStateException.class, () -> backend.getBlockService().getLatestBlock());
+            seen.set(deadline.callCounts());
+        });
+
+        assertEquals(new BoundedBFBackendService.CallCounts(1, 0, 0), seen.get(),
+                "a call refused by an expired deadline is not counted");
+    }
+
     private static void ignoringFailure(CheckedCall call) {
         try {
             call.run();

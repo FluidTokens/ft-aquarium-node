@@ -635,8 +635,9 @@ rejection (`BadInputsUTxO`, an empty `ScriptFailures`) to set a wallet UTxO asid
   get harmless rejections** — U is already spent by the pending transaction. They cost Blockfrost calls,
   and each pass now ends with a summary line that shows them:
   `wallet pipeline pass at slot <slot> (<hash>): liquidation <result>, compound <result>, housekeeping <result>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`,
-  where a stage that did not run reads `not run`. It is INFO when a stage returned anything other than
-  `DEFINITE_FAILURE` or the pass evaluated or submitted anything, and DEBUG otherwise.
+  where a stage that did not run reads `not run` and a stage that threw reads `threw`. It is INFO when a
+  stage threw, a stage returned anything other than `DEFINITE_FAILURE`, or the pass evaluated or submitted
+  anything, and DEBUG otherwise.
 
 ---
 

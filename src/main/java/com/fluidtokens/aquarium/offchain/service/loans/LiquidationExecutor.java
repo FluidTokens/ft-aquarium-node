@@ -1006,7 +1006,7 @@ public class LiquidationExecutor {
                 return result;
             }
             WorkResult outcome;
-            CandidatePass pass = new CandidatePass(fence);
+            CandidatePass pass = new CandidatePass(fence, walletCheck);
             try {
                 outcome = consider(assessment, now, committedSlot, validFromFloorMillis, validToMillis,
                         walletCheck, configUtxo.get(), lmConfigUtxo.get(), oraclesByUnit, pass);
@@ -1019,9 +1019,11 @@ public class LiquidationExecutor {
                 // them — dereferencing assessment.loan() here would throw out of the handler that is
                 // meant to contain it. The bond is the one thing every assessment always carries.
                 log.error("could not consider bond {}: {}", assessment.bond().utxoRef(), causeChain(e), e);
-                // FAB-186: it marks nothing and the walk moves on, whether or not this candidate reached the
-                // submitter. Only an ACCEPTED submit counts towards the result — a transaction went out, and
-                // the pipeline must still hold compound and housekeeping back.
+                // FAB-186: the walk moves on, whether or not this candidate reached the submitter. An ACCEPTED
+                // submit already marked its outputs used the instant it was accepted (submit(), r2), so a
+                // later candidate on them is still skipped; nothing else is marked. Only an ACCEPTED submit
+                // counts towards the result — a transaction went out, and the pipeline must still hold
+                // compound and housekeeping back.
                 if (pass.accepted) {
                     result = WorkResult.SUBMITTED;
                 }
@@ -1039,18 +1041,22 @@ public class LiquidationExecutor {
     /**
      * One candidate's share of a {@link #cycle(long, SubmitFence)} call (FAB-183): the call's fence, read
      * immediately before signing; the route and the designated wallet output the non-accepted line names
-     * (FAB-186); and whether the submitter ACCEPTED it, which is what an exception escaping
-     * {@code consider()} after the answer still counts as. Created per candidate and dropped with it;
-     * nothing in it outlives the call.
+     * (FAB-186); whether the submitter ACCEPTED it, which is what an exception escaping
+     * {@code consider()} after the answer still counts as; and the call's wallet check with the outputs an
+     * accept uses up, which {@code submit()} marks the instant the submitter accepts (FAB-186 r2). Created
+     * per candidate and dropped with it; nothing in it outlives the call.
      */
     private static final class CandidatePass {
         private final SubmitFence fence;
+        private final WalletCheck walletCheck;
         private String route = ROUTE_PLAIN;
         private String output = "none";
+        private Set<String> usedIfAccepted = Set.of();
         private boolean accepted;
 
-        private CandidatePass(SubmitFence fence) {
+        private CandidatePass(SubmitFence fence, WalletCheck walletCheck) {
             this.fence = fence;
+            this.walletCheck = walletCheck;
         }
     }
 
@@ -1715,6 +1721,20 @@ public class LiquidationExecutor {
             }
         }
 
+        // What an ACCEPTED submit uses up. Every input of this body is spent once the bytes go out, and the
+        // index cannot know it yet. FAB-185/186: the designated output, and every ROLE output among the
+        // body's inputs, is used for the rest of this check. FAB-186 r2: fixed HERE, before the submit, and
+        // marked by submit() the instant the submitter accepts — ahead of the row, the log lines and
+        // everything else after the answer that can throw — so an exception escaping consider() after an
+        // accept still leaves the output used, and the next candidate designated to it is skipped unbuilt.
+        Set<String> spent = new LinkedHashSet<>();
+        if (designated != null) {
+            spent.add(WalletRoles.ref(designated));
+        }
+        transaction.getBody().getInputs()
+                .forEach(in -> spent.add(in.getTransactionId() + "#" + in.getIndex()));
+        pass.usedIfAccepted = spent;
+
         Optional<Verdict> verdict = record(assessment, now, transaction, oraclesByUnit, pass);
         if (verdict.isEmpty()) {
             // Nothing priced to completion — or an unmeasurable body, whose WOULD_SUBMIT row carries the
@@ -1722,17 +1742,7 @@ public class LiquidationExecutor {
             return WorkResult.DEFINITE_FAILURE;
         }
         if (verdict.get().outcome() == LiquidationDecision.Outcome.SUBMITTED) {
-            // ACCEPTED — the one answer that says the bytes went out. Every input of this body is spent,
-            // and the index cannot know it yet. FAB-185/186: the designated output, and every ROLE output
-            // among the body's inputs, is used for the rest of this check.
-            Set<String> spent = new LinkedHashSet<>();
-            if (designated != null) {
-                spent.add(WalletRoles.ref(designated));
-            }
-            transaction.getBody().getInputs()
-                    .forEach(in -> spent.add(in.getTransactionId() + "#" + in.getIndex()));
-            markUsed(walletCheck, spent,
-                    "an input of accepted liquidation " + TransactionUtil.getTxHash(transaction));
+            // ACCEPTED — the one answer that says the bytes went out. Its outputs are already marked used.
             return WorkResult.SUBMITTED;
         }
         // FAB-186: anything else — a veto, a rejection, an ambiguous answer, a thrown submit — marks nothing.
@@ -2131,6 +2141,11 @@ public class LiquidationExecutor {
             // a failure is loud on every cycle it happens (FAB-134 NQ).
             log.error("liquidation of {}: {} ({}), {} ({} bytes)", assessment.loan().utxoRef(),
                     verdict.outcome(), verdict.veto(), verdict.detail(), size);
+        } else if (verdict.outcome() == LiquidationDecision.Outcome.SUBMIT_FAILED) {
+            // FAB-186 r2: a non-accepted submit is said at INFO exactly once, by notAccepted()'s cut line.
+            // This summary carries the whole response, so it is DEBUG; the row keeps it too.
+            log.debug("liquidation of {}: {} ({}), {} ({} bytes)", assessment.loan().utxoRef(),
+                    verdict.outcome(), verdict.veto(), verdict.detail(), size);
         } else {
             log.info("liquidation of {}: {} ({}), {} ({} bytes)", assessment.loan().utxoRef(),
                     verdict.outcome(), verdict.veto(), verdict.detail(), size);
@@ -2474,6 +2489,8 @@ public class LiquidationExecutor {
         }
         if (result != null && result.isSuccessful()) {
             pass.accepted = true;
+            // FAB-186 r2: marked used BEFORE anything that can throw — this line, the row, the summary.
+            markUsed(pass.walletCheck, pass.usedIfAccepted, "an input of accepted liquidation " + result.getValue());
             log.info("SUBMITTED liquidation of {}: tx {}", loanUtxoRef, result.getValue());
             return new Verdict(LiquidationDecision.Outcome.SUBMITTED, null,
                     detail + "; submitted as " + result.getValue());
@@ -2887,7 +2904,8 @@ public class LiquidationExecutor {
 
     /**
      * Marks every ROLE output among {@code refs} — C, U or a token output — used for the rest of the check
-     * (FAB-185). Called ONLY for an accepted submit (FAB-186). The roles themselves are never re-resolved; a
+     * (FAB-185). Called ONLY for an accepted submit (FAB-186), by {@code submit()} the instant the submitter
+     * accepts, before anything that can throw (r2). The roles themselves are never re-resolved; a
      * candidate designated to a used output is skipped before anything is built.
      */
     private static void markUsed(WalletCheck walletCheck, Set<String> refs, String why) {

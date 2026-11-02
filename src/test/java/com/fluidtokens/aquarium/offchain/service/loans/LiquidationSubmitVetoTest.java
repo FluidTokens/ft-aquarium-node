@@ -2908,13 +2908,15 @@ class LiquidationSubmitVetoTest {
 
     /**
      * FAB-186 (e), rewriting A6's other side ("an exception after the submitter ends the stage as
-     * AMBIGUOUS"). Recording the SUBMITTED row throws AFTER the submitter answered: today's ERROR
-     * {@code could not consider bond …}, nothing marked, and the walk continues — the second candidate is
-     * built on the same U and transmitted. The call is never AMBIGUOUS: the submitter ACCEPTED both, so it
-     * is SUBMITTED, which still holds compound and housekeeping back.
+     * AMBIGUOUS"). Recording the SUBMITTED row throws AFTER the submitter accepted: today's ERROR
+     * {@code could not consider bond …}, and the walk continues. FAB-186 r2 (F2), changed: the accept marked
+     * U used BEFORE the row threw (r1 asserted "nothing was marked: the second candidate is built on the same
+     * U"), so the second candidate, designated to U, is skipped unbuilt with the used-output skip line — one
+     * build, one transmission. The call is never AMBIGUOUS: the submitter ACCEPTED, so it is SUBMITTED, which
+     * still holds compound and housekeeping back.
      */
     @Test
-    void anExceptionAfterTheSubmitterAnsweredMarksNothingAndTheWalkContinues() throws Exception {
+    void anExceptionAfterAnAcceptedSubmitStillUsesUpItsOutputAndTheWalkContinues() throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         AppConfig.LiquidationConfiguration configuration = armed();
         LiquidationDecisionLog failingLog = new LiquidationDecisionLog(configuration) {
@@ -2930,12 +2932,14 @@ class LiquidationSubmitVetoTest {
         StageRun stage = stage(configuration, List.of(adaScenario(), secondAdaScenario()), submitter, null,
                 SubmitFence.OPEN, failingLog);
 
-        assertEquals(2, submitter.submitted.size(), "the walk continued past the exception: " + stage.events());
-        assertTrue(inputsOf(submitter.submitted.get(1)).contains(new TransactionInput(TX_WALLET, 0)),
-                "nothing was marked: the second candidate is built on the same U");
+        assertEquals(1, submitter.submitted.size(), "one transmission, on U: " + stage.events());
+        assertEquals(1, stage.builds(), "the second candidate was never built: " + stage.events());
+        assertTrue(skippedOnUsedOutput(stage.events(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
+                "the walk continued past the exception, and the second is skipped for the used U: "
+                        + stage.events());
         assertEquals(1, errorsContaining(stage.events(), "could not consider bond " + TX_BOND + "#0").size(),
                 stage.events().toString());
-        assertEquals(1, errorsContaining(stage.events(), "could not consider bond " + TX_BOND_2 + "#0").size(),
+        assertEquals(0, errorsContaining(stage.events(), "could not consider bond " + TX_BOND_2 + "#0").size(),
                 stage.events().toString());
         assertEquals(WorkResult.SUBMITTED, stage.result());
     }
@@ -3103,7 +3107,9 @@ class LiquidationSubmitVetoTest {
     /**
      * FAB-186 (g) — the non-accepted INFO line. It names the loan, the route, the designated output and the
      * HTTP status; a 1000-character response appears cut to at most 300 characters (the row keeps all of
-     * it); nothing is logged at ERROR.
+     * it); nothing is logged at ERROR. FAB-186 r2 (F1), tightened: it is the ONLY INFO event that names the
+     * loan's non-acceptance — record()'s per-verdict summary for a SUBMIT_FAILED row, which carries the whole
+     * response, is DEBUG — and no INFO event carries more than 300 characters of the response.
      */
     @Test
     void theNotAcceptedLineNamesLoanRouteOutputAndStatusAndCutsTheResponse() {
@@ -3111,7 +3117,34 @@ class LiquidationSubmitVetoTest {
         RecordingSubmitter submitter = RecordingSubmitter.rejecting(THOUSAND_CHARACTER_RESPONSE);
         Run[] run = new Run[1];
 
-        List<ILoggingEvent> events = logged(new Rig().submitter(submitter), run);
+        // DEBUG captured explicitly, so the demoted summary is seen to exist rather than assumed.
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        Level previous = logger.getLevel();
+        logger.setLevel(Level.DEBUG);
+        List<ILoggingEvent> events;
+        try {
+            events = logged(new Rig().submitter(submitter), run);
+        } finally {
+            logger.setLevel(previous);
+        }
+
+        String loanRef = TX_LOAN + "#0";
+        List<ILoggingEvent> infoNamingTheNonAcceptance = events.stream()
+                .filter(event -> event.getLevel() == Level.INFO)
+                .filter(event -> event.getFormattedMessage().contains(loanRef)
+                        && event.getFormattedMessage().contains("not accepted"))
+                .toList();
+        assertEquals(1, infoNamingTheNonAcceptance.size(),
+                "exactly one INFO event names the loan's non-acceptance: " + infoNamingTheNonAcceptance);
+        assertTrue(events.stream().filter(event -> event.getLevel().isGreaterOrEqual(Level.INFO))
+                        .noneMatch(event -> event.getFormattedMessage()
+                                .contains(THOUSAND_CHARACTER_RESPONSE.substring(0, 301))),
+                "no INFO event carries more than 300 characters of the response");
+        List<ILoggingEvent> summaries = events.stream()
+                .filter(event -> event.getFormattedMessage().startsWith("liquidation of " + loanRef + ": SUBMIT_FAILED"))
+                .toList();
+        assertEquals(1, summaries.size(), events.toString());
+        assertEquals(Level.DEBUG, summaries.getFirst().getLevel(), "the SUBMIT_FAILED summary is DEBUG");
 
         String line = assertNotAcceptedAtInfo(events, 1).getFirst().getFormattedMessage();
         String prefix = "liquidation of " + TX_LOAN + "#0 via plain on " + TX_WALLET + "#0 not accepted: HTTP 400 ";
