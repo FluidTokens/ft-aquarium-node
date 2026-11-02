@@ -38,27 +38,24 @@ import java.util.function.Supplier;
  * pass; a pass is triggered by a committed block or an oracle price change. Why that trigger runs after the block's
  * transaction commits, and how initial sync is kept out, is documented on {@link WalletPipelineService}.
  *
- * <h2>The gates, cheapest first (FAB-131, as Giovanni ruled them)</h2>
+ * <h2>The gates, cheapest first (FAB-131, as Giovanni ruled them; FAB-188 removed the market gate)</h2>
  * <ol>
- *   <li><b>G1</b> {@code loans.wallet.rebalance.enabled} (env {@code AQUARIUM_WALLET_REBALANCE_ENABLED}, default
+ *   <li>{@code loans.wallet.rebalance.enabled} (env {@code AQUARIUM_WALLET_REBALANCE_ENABLED}, default
  *       {@code true});</li>
- *   <li><b>G2</b> not {@link #suspend() suspended} — in memory only; effective = G1 AND NOT suspended, so
- *       {@link #resume()} can never override G1;</li>
- *   <li><b>G3</b> {@code loans.liquidation.mode} is {@code SHADOW} or {@code LIVE}. ⚠ <b>SHADOW SUBMITS the
+ *   <li>not {@link #suspend() suspended} — in memory only; effective = enabled AND NOT suspended, so
+ *       {@link #resume()} can never override the environment;</li>
+ *   <li>{@code loans.liquidation.mode} is {@code SHADOW} or {@code LIVE}. ⚠ <b>SHADOW SUBMITS the
  *       rebalance</b>: it is wallet housekeeping, not a liquidation;</li>
- *   <li><b>G4</b> at least one configured market is {@code action: ANTICIPATE} AND can liquidate: its
- *       {@link AppConfig.LiquidationConfiguration#effectiveMode effectiveMode} — the market's own {@code mode},
- *       capped by the node's — is {@code SHADOW} or {@code LIVE}. A market with {@code mode: DISABLED} never
- *       liquidates, so it neither opens this gate nor joins the relevant set (it would otherwise tie up 10 ADA
- *       in an isolated UTxO for nothing); a market with no {@code mode} inherits the node's. An ADA-principal
- *       ({@code lovelace}) market counts, although it adds nothing to the relevant set;</li>
- *   <li><b>G5</b> the node is not syncing ({@link BlockEventListener#getIsSyncing()}).</li>
+ *   <li>the node is not syncing ({@link BlockEventListener#getIsSyncing()}).</li>
  * </ol>
- * A closed gate reads nothing and logs at DEBUG only: a node in the shipped {@code DISABLED} mode, or with no
- * {@code ANTICIPATE} market, behaves exactly as it did before this class existed.
+ * <b>The markets do not arm it</b> (FAB-188): every shadow or live node keeps its wallet shaped, because every
+ * liquidation route needs a collateral UTxO and an ada-only input, a convert-only node included. A closed gate
+ * reads nothing and logs at DEBUG only — except that an environment-disabled or suspended rebalancer on a
+ * {@code SHADOW} or {@code LIVE} node logs ONE WARN per pass, because liquidation depends on a shaped wallet.
+ * A node in the shipped {@code DISABLED} mode behaves exactly as it did before this class existed.
  *
  * <p>The readiness page reads {@link #activity()} (FAB-132), and that is the SAME private evaluation of these
- * five gates that each {@link #housekeep(SubmitFence)} acts on: {@link Activity#armed()} is true exactly when the
+ * four gates that each {@link #housekeep(SubmitFence)} acts on: {@link Activity#armed()} is true exactly when the
  * stage would go on to read the wallet, and otherwise {@link Activity#idle()} names the first closed gate. The page
  * therefore cannot say "armed" over an idle rebalancer, nor give a reason the bot does not share.
  *
@@ -66,9 +63,13 @@ import java.util.function.Supplier;
  * <ul>
  *   <li>The wallet is read from the local index ({@link AppUtxoService#listWalletUtxo()}). A read failure is an
  *       ERROR for this pass and nothing is built — never an empty wallet.</li>
- *   <li>The relevant set is {@link WalletShape#relevantUnits} over the SAME markets that opened G4 (computed
- *       once per pass): the principals of the ANTICIPATE markets that can liquidate, lower-cased, never
- *       {@code lovelace}.</li>
+ *   <li>The relevant set is {@link WalletShape#relevantUnits} over the {@code action: ANTICIPATE} markets that can
+ *       liquidate — {@link AppConfig.LiquidationConfiguration#effectiveMode effectiveMode} (the market's own
+ *       {@code mode}, capped by the node's) {@code SHADOW} or {@code LIVE} — computed once per pass, lower-cased,
+ *       never {@code lovelace}. It may be empty (no such market): the wallet is still shaped, with no
+ *       token-isolating output. A market with {@code mode: DISABLED} never liquidates, so its token is not
+ *       relevant and goes in the other-tokens bundle (it would otherwise tie up 10 ADA in an isolated UTxO for
+ *       nothing).</li>
  *   <li>No reason → nothing, at DEBUG. Otherwise {@link WalletShapeTransactions#buildShaped} spends the WHOLE
  *       wallet (no reference-script or datum filtering: the operator keeps the wallet free of them).</li>
  *   <li>Not built → WARN with the engine's detail and the reasons, <b>on every pass, unthrottled</b> (ruled:
@@ -89,6 +90,10 @@ import java.util.function.Supplier;
  * shape, a refusal to build, a failed read, a closed fence, or an exception before the submit — sent nothing
  * and is {@link WorkResult#DEFINITE_FAILURE}.
  *
+ * <h2>What the last pass did</h2>
+ * Every ending of {@link #housekeep(SubmitFence)} is also recorded in {@link #lastOutcome()} (FAB-188), a one-line
+ * text whose prefix names the ending, so another component can quote what the rebalancer last did.
+ *
  * <h2>Never throws</h2>
  * The whole body sits behind a catch-all that logs at ERROR, so a failure ends this stage for this pass and
  * nothing more: the pipeline's next trigger tries again.
@@ -105,8 +110,8 @@ public class WalletRebalancer {
     public record State(boolean envEnabled, boolean suspended, boolean effective) {
     }
 
-    /** Why the rebalancer is idle: its first closed gate, in gate order (G1 to G5). */
-    public enum Idle { ENV_DISABLED, SUSPENDED, MODE_NOT_SHADOW_OR_LIVE, NO_ANTICIPATE_MARKET, SYNCING }
+    /** Why the rebalancer is idle: its first closed gate, in gate order. */
+    public enum Idle { ENV_DISABLED, SUSPENDED, MODE_NOT_SHADOW_OR_LIVE, SYNCING }
 
     /**
      * What the rebalancer would do on the next {@link #housekeep(SubmitFence)}, as the gates read now.
@@ -123,9 +128,15 @@ public class WalletRebalancer {
         }
     }
 
-    /** One evaluation of the gates: the first closed one, or — every gate open — the markets that opened G4. */
+    /**
+     * One evaluation of the gates: the first closed one, or — every gate open — the ANTICIPATE markets that can
+     * liquidate (possibly none), the source of the relevant set.
+     */
     private record Gates(State state, Mode mode, Idle idle, List<Market> anticipating) {
     }
+
+    /** {@link #lastOutcome()} before the first {@link #housekeep(SubmitFence)}. */
+    static final String NOT_RUN_YET = "not run yet";
 
     private final WalletShapeTransactions engine;
 
@@ -142,6 +153,8 @@ public class WalletRebalancer {
     private final boolean envEnabled;
 
     private final AtomicBoolean suspended = new AtomicBoolean(false);
+
+    private volatile String lastOutcome = NOT_RUN_YET;
 
     @Autowired
     public WalletRebalancer(WalletShapeTransactions engine,
@@ -196,6 +209,17 @@ public class WalletRebalancer {
     }
 
     /**
+     * What the last {@link #housekeep(SubmitFence)} ended with, one line, never null. Its prefix names the ending:
+     * {@code not run yet}, {@code idle: <IDLE>}, {@code could not read the wallet: <cause>},
+     * {@code in shape (<n> UTxOs)}, {@code <STATUS>: <detail>} for a build that was not built,
+     * {@code fenced: nothing submitted}, {@code submitted <txHash>}, {@code submission rejected: <response>},
+     * {@code submission threw: <cause>}, or {@code failed: <cause>}.
+     */
+    public String lastOutcome() {
+        return lastOutcome;
+    }
+
+    /**
      * The housekeeping stage: one pass's worth of work, behind {@code fence}. Never throws.
      *
      * @return {@link WorkResult#SUBMITTED}, the classified refusal, {@link WorkResult#AMBIGUOUS} when the submit
@@ -206,6 +230,7 @@ public class WalletRebalancer {
             return rebalanceIfNeeded(fence);
         } catch (Exception e) {
             logFailure(e);
+            lastOutcome = "failed: " + e;
             return WorkResult.DEFINITE_FAILURE;
         }
     }
@@ -216,7 +241,7 @@ public class WalletRebalancer {
     }
 
     /**
-     * The five gates, cheapest first, stopping at the first closed one — the ONE evaluation both
+     * The four gates, cheapest first, stopping at the first closed one — the ONE evaluation both
      * {@link #activity()} and {@link #rebalanceIfNeeded(SubmitFence)} take their decision from.
      */
     private Gates gates() {
@@ -231,26 +256,31 @@ public class WalletRebalancer {
         if (current != Mode.SHADOW && current != Mode.LIVE) {
             return new Gates(state, current, Idle.MODE_NOT_SHADOW_OR_LIVE, List.of());
         }
-        List<Market> anticipating = anticipatingMarkets(markets.get());
-        if (anticipating.isEmpty()) {
-            return new Gates(state, current, Idle.NO_ANTICIPATE_MARKET, List.of());
-        }
         if (syncing.getAsBoolean()) {
             return new Gates(state, current, Idle.SYNCING, List.of());
         }
-        return new Gates(state, current, null, anticipating);
+        return new Gates(state, current, null, anticipatingMarkets(markets.get()));
     }
 
     private WorkResult rebalanceIfNeeded(SubmitFence fence) throws Exception {
         Gates gates = gates();
         if (gates.idle() != null) {
+            lastOutcome = "idle: " + gates.idle().name();
+            boolean liquidating = gates.mode() == Mode.SHADOW || gates.mode() == Mode.LIVE;
             switch (gates.idle()) {
-                case ENV_DISABLED -> log.debug("[REBALANCE] skipped: loans.wallet.rebalance.enabled is false");
-                case SUSPENDED -> log.debug("[REBALANCE] skipped: suspended");
+                case ENV_DISABLED, SUSPENDED -> {
+                    if (liquidating) {
+                        // FAB-188 (B1): the node can liquidate, and liquidation depends on a shaped wallet.
+                        log.warn("[REBALANCE] {}: wallet rebalancing is off on a {} node, and liquidation depends "
+                                + "on a shaped wallet; nothing rebalanced", gates.idle(), gates.mode());
+                    } else if (gates.idle() == Idle.ENV_DISABLED) {
+                        log.debug("[REBALANCE] skipped: loans.wallet.rebalance.enabled is false");
+                    } else {
+                        log.debug("[REBALANCE] skipped: suspended");
+                    }
+                }
                 case MODE_NOT_SHADOW_OR_LIVE -> log.debug("[REBALANCE] skipped: loans.liquidation.mode is {}",
                         gates.mode());
-                case NO_ANTICIPATE_MARKET -> log.debug(
-                        "[REBALANCE] skipped: no action: ANTICIPATE market whose effective mode is shadow or live");
                 case SYNCING -> log.debug("[REBALANCE] skipped: the node is syncing");
             }
             return WorkResult.DEFINITE_FAILURE;
@@ -264,16 +294,19 @@ public class WalletRebalancer {
         } catch (RuntimeException e) {
             log.error("[REBALANCE] could not read the wallet from the index; nothing built for this block: {}",
                     e.toString(), e);
+            lastOutcome = "could not read the wallet: " + e;
             return WorkResult.DEFINITE_FAILURE;
         }
         if (wallet == null) {
             log.error("[REBALANCE] the wallet read returned no list; nothing built for this block");
+            lastOutcome = "could not read the wallet: the read returned no list";
             return WorkResult.DEFINITE_FAILURE;
         }
 
         EnumSet<WalletShape.Reason> reasons = WalletShape.reasons(wallet, relevant, engine.collateralLovelace());
         if (reasons.isEmpty()) {
             log.debug("[REBALANCE] the wallet is in shape ({} UTxOs, relevant {})", wallet.size(), relevant);
+            lastOutcome = "in shape (" + wallet.size() + " UTxOs)";
             return WorkResult.DEFINITE_FAILURE;
         }
 
@@ -281,6 +314,7 @@ public class WalletRebalancer {
         if (!outcome.isBuilt()) {
             log.warn("[REBALANCE] {}: {} — the wallet is out of shape {}, relevant {}; nothing signed or submitted",
                     outcome.status(), outcome.detail(), reasons, relevant);
+            lastOutcome = outcome.status() + ": " + outcome.detail();
             return WorkResult.DEFINITE_FAILURE;
         }
 
@@ -289,6 +323,7 @@ public class WalletRebalancer {
         BigInteger fee = outcome.transaction().getBody().getFee();
         if (!fence.mayProceed()) {
             log.info("[REBALANCE] fenced: nothing submitted");
+            lastOutcome = "fenced: nothing submitted";
             return WorkResult.DEFINITE_FAILURE;
         }
         Result<String> result;
@@ -297,19 +332,27 @@ public class WalletRebalancer {
         } catch (Exception e) {
             // The bytes may have reached Blockfrost before it threw.
             logFailure(e);
+            lastOutcome = "submission threw: " + e;
             return WorkResult.AMBIGUOUS;
         }
         if (result != null && result.isSuccessful()) {
             log.info("[REBALANCE] submitted {} — reasons {}, relevant {}, fee {} lovelace",
                     result.getValue(), reasons, relevant, fee);
+            lastOutcome = "submitted " + result.getValue();
             return WorkResult.SUBMITTED;
         }
+        String rejection = result == null ? "no result" : result.getResponse();
         log.error("[REBALANCE] submission rejected — reasons {}, relevant {}, fee {} lovelace: {}",
-                reasons, relevant, fee, result == null ? "no result" : result.getResponse());
+                reasons, relevant, fee, rejection);
+        lastOutcome = "submission rejected: " + rejection;
         return WorkResult.classify(result);
     }
 
-    /** The {@code action: ANTICIPATE} markets that can liquidate: effective mode {@code SHADOW} or {@code LIVE}. */
+    /**
+     * The {@code action: ANTICIPATE} markets that can liquidate: effective mode {@code SHADOW} or {@code LIVE}. The
+     * source of the relevant set, never a gate: empty (or a null market list) shapes the wallet with no token
+     * isolated.
+     */
     private List<Market> anticipatingMarkets(List<Market> configured) {
         if (configured == null) {
             return List.of();

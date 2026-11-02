@@ -488,10 +488,10 @@ many minutes old.
 
 **This is a different mechanism from the startup rebalance above, and it is continuous.** The removed
 one ran once at boot; this one watches the wallet on every block. `AQUARIUM_WALLET_REBALANCE_ENABLED`
-defaults to `true`, and it acts when the node is in `shadow` or `live` **and** at least one market is
-`action: ANTICIPATE` with an effective mode of shadow or live — see
-[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-an-anticipate-market-keeps-your-wallet-in).
-A node in `disabled` mode, or with no such market, is unaffected.
+defaults to `true`, and it acts when the node is in `shadow` or `live`, whatever its markets
+([FAB-188, below](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)) — see
+[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-a-shadow-or-live-node-keeps-your-wallet-in).
+A node in `disabled` mode is unaffected.
 
 **If your node meets that condition, expect a transaction right after upgrading.** On the first block
 once the node is synced, if the wallet is not already in the target shape, the node **signs and
@@ -555,6 +555,31 @@ A pass already running is never joined by a second one; new triggers wait for it
 **Nothing is remembered between passes.** A transaction the node submitted and that is still pending
 may be built again on the next trigger; the ledger rejects the duplicate harmlessly, because the pending
 transaction already spends its inputs.
+
+### Every shadow or live node now keeps its wallet shaped (FAB-188)
+
+Older images rebalanced the wallet only when at least one market was `action: ANTICIPATE` with an
+effective mode of shadow or live. **That condition is gone.** Every node in `shadow` or `live` keeps its
+wallet shaped, whatever its markets — a node with only `CONVERT` markets, or none listed, included —
+because liquidation depends on a shaped wallet. See
+[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-a-shadow-or-live-node-keeps-your-wallet-in).
+
+- **Expect one self-send right after upgrading** on a `shadow` or `live` node whose wallet is out of
+  shape — **in `shadow` too** — for example a wallet whose ada sits in several UTxOs, or that holds no
+  ada-only UTxO of exactly the collateral size. It costs a transaction fee. A preview node runs in
+  `shadow` by default, so this applies to it.
+- **Funds.** The shape is unchanged: 10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA
+  beside the bundle of any other tokens, a 5 ADA collateral UTxO (under current protocol parameters),
+  plus the fee and a change output that still holds its own minimum ada after paying it — so an
+  ada-only wallet needs about 6.2 ADA. A wallet with less is not touched: the node logs
+  `[REBALANCE] REFUSED: …` at WARN on every pass in which the rebalancer runs and submits nothing.
+- **Any deposit triggers a reshape.** Funds you send arrive as a second ada-only UTxO, which puts the
+  wallet out of shape; the next pass merges it into the one ada output with a self-send, so that output
+  is busy for about one block while it lands.
+- **To opt out**, set `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. On a `shadow` or `live`
+  node the node then logs one WARN on every pass in which the rebalancer runs,
+  `[REBALANCE] ENV_DISABLED: … liquidation depends on a shaped wallet …` — and `SUSPENDED` in its place
+  while rebalancing is suspended from the readiness page.
 
 ---
 

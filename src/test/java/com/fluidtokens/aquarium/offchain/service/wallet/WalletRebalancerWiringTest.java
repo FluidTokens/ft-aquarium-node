@@ -330,12 +330,12 @@ class WalletRebalancerWiringTest {
     }
 
     /**
-     * The per-market mode THROUGH THE CONTAINER: the bean must consult {@code LiquidationConfiguration.effectiveMode}
-     * as bound from configuration, not a rule of its own. A shadow node whose only ANTICIPATE market says
-     * {@code mode: DISABLED} reads nothing; the same market at {@code mode: SHADOW} is the positive control.
+     * The per-market mode THROUGH THE CONTAINER. FAB-188: the markets no longer arm the rebalancer, so a shadow
+     * node whose only ANTICIPATE market says {@code mode: DISABLED} still reads its wallet and shapes it (the
+     * market's token merely stops being relevant); the same market at {@code mode: SHADOW} does the same.
      */
     @Test
-    void aMarketsOwnDisabledModeKeepsAShadowNodeFromRebalancing() {
+    void aMarketsOwnDisabledModeNoLongerKeepsAShadowNodeFromRebalancing() {
         RecordingBlockfrost blockfrost = new RecordingBlockfrost();
         AppUtxoService wallet = wallet();
         runner(blockfrost, wallet, Map.of(), "shadow", new RecordingTransactionManager())
@@ -343,10 +343,12 @@ class WalletRebalancerWiringTest {
                     assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
                     BlockEventListener listener = context.getBean(BlockEventListener.class);
                     context.publishEvent(blockAt(context.getBean(CardanoConverters.class), Duration.ofMinutes(1)));
-                    context.getBean(WalletRebalancer.class).housekeep(SubmitFence.OPEN);
+                    WalletRebalancer rebalancer = context.getBean(WalletRebalancer.class);
+                    assertTrue(rebalancer.activity().armed(), "the only ANTICIPATE market is DISABLED: still armed");
+                    rebalancer.housekeep(SubmitFence.OPEN);
                     assertFalse(listener.getIsSyncing().get(), "the block arrived and the node is not syncing");
-                    assertEquals(0, reads(wallet), "the only ANTICIPATE market is DISABLED: no wallet read");
-                    assertEquals(0, blockfrost.submitted.size(), "the only ANTICIPATE market is DISABLED: no submission");
+                    assertEquals(1, reads(wallet), "the only ANTICIPATE market is DISABLED: the wallet is read");
+                    assertEquals(1, blockfrost.submitted.size(), "the only ANTICIPATE market is DISABLED: and shaped");
                 });
 
         RecordingBlockfrost armedBlockfrost = new RecordingBlockfrost();

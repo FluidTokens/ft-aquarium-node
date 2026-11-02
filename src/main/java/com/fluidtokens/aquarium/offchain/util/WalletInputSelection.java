@@ -56,9 +56,16 @@ public final class WalletInputSelection {
     private WalletInputSelection() {
     }
 
-    /** Ada only, no reference script, no datum of either kind. */
+    /**
+     * Ada only, no reference script, no datum of either kind — the ONE ada-only predicate (FAB-188):
+     * {@code WalletShape}'s collateral and change rules use it too. Ada-only means exactly one amount entry
+     * and that entry's unit is {@code lovelace} (case-insensitive); a null amount list is not nominable.
+     */
     public static boolean nominable(Utxo utxo) {
-        return utxo.getAmount().size() == 1
+        return utxo.getAmount() != null
+                && utxo.getAmount().size() == 1
+                && utxo.getAmount().get(0) != null
+                && "lovelace".equalsIgnoreCase(utxo.getAmount().get(0).getUnit())
                 && utxo.getReferenceScriptHash() == null
                 && utxo.getInlineDatum() == null
                 && utxo.getDataHash() == null;

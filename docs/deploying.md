@@ -61,17 +61,23 @@ willing to front *if* you enable `ANTICIPATE` markets (§9). **The 30,000 FLDT d
 it is delegated to this wallet from a separate wallet, which can be cold. That separation is the
 point: the hot wallet the node signs with never has to hold the stake.
 
-**An `ANTICIPATE` market adds a funding rule of its own.** Once the bot is in `shadow` or `live` with
-such a market, wallet rebalancing keeps the wallet in a fixed shape (§9, "Wallet rebalancing"), and
-that shape costs ada: **10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA beside the
-bundle of any other tokens, and a 5 ADA collateral UTxO** (5 ADA under current protocol
-parameters), **plus the transaction fee, plus a change output that still holds its own minimum ada
+**A node in `shadow` or `live` adds a funding rule of its own.** Once the bot is in `shadow` or
+`live` — whatever its markets, `ANTICIPATE` or not — wallet rebalancing keeps the wallet in a fixed
+shape (§9, "Wallet rebalancing"), and that shape costs ada: **10 ADA beside each `ANTICIPATE` token
+the wallet holds, 10 ADA beside the bundle of any other tokens, and a 5 ADA collateral UTxO**
+(5 ADA under current protocol parameters), **plus the transaction fee, plus a change output that still holds its own minimum ada
 once it has paid that fee** (about 1 ADA). Under current parameters a wallet holding one
 `ANTICIPATE` token therefore needs **about 16.2 ADA**, and an ada-only wallet about 6.2 ADA; the exact
 figures move with the protocol parameters and with how many UTxOs the wallet holds (each one adds a
 little to the fee). A wallet carrying a very large bundle of other tokens can need more (§9). A wallet with less than that is not reshaped, and the node logs a
 `[REBALANCE] REFUSED: …` warning on every pass in which the rebalancer runs until you add ada
 (an empty wallet logs `[REBALANCE] NOTHING_TO_DO: no input UTxOs…` instead).
+
+**A preview node runs in `shadow` by default**, so it rebalances too: if its wallet is out of shape,
+expect one self-send of the whole wallet shortly after it has synced. **Any deposit triggers a
+reshape:** funds you send arrive as a second ada-only UTxO, which puts the wallet out of shape, and
+the next pass merges it into the one ada output with a self-send — so that output is busy for about
+one block while the self-send lands.
 
 **⛔ Keep no reference-script or datum UTxO in this wallet.** A rebalance spends every UTxO the wallet
 holds, and its outputs carry no reference script and no datum — so a datum UTxO parked here is
@@ -301,7 +307,7 @@ never says `ARMED` while the rebalancer is idle, and it always says why it is id
 | state | what it means |
 |---|---|
 | `ARMED` | on each pass — after a committed block or an oracle price change — in which no liquidation or compound went out, if the wallet has drifted out of shape, the node signs and submits one self-send of its whole wallet, in shadow as well as live |
-| `IDLE` | rebalancing is allowed but nothing arms it: the liquidation mode is not shadow or live, no `action: ANTICIPATE` market has an effective mode of shadow or live, or the node is syncing. The line names which |
+| `IDLE` | rebalancing is allowed but nothing arms it: the liquidation mode is not shadow or live, or the node is syncing. The line names which |
 | `SUSPENDED` | suspended from this page; nothing is rebalanced until it is resumed here or the node restarts |
 | `OFF` | `AQUARIUM_WALLET_REBALANCE_ENABLED` is `false`; this page cannot turn it on |
 
@@ -359,9 +365,8 @@ loan list looks like the chain.
 **Step 2 — `shadow`.** Set `AQUARIUM_LIQUIDATION_MODE=shadow` and restart. The bot now scans,
 prices, builds and size-checks real liquidations, and **refuses to submit every one of them.** This
 is a rehearsal against real loans at no risk to the loans. **⚠ It is not a node that submits
-nothing:** with an `action: ANTICIPATE` market configured (with an effective mode of shadow or live),
-wallet rebalancing signs and submits self-sends of the node's own wallet in shadow too, each costing
-a transaction fee — see §9, "Wallet rebalancing". Read the result:
+nothing:** whatever its markets, wallet rebalancing signs and submits self-sends of the node's own
+wallet in shadow too, each costing a transaction fee — see §9, "Wallet rebalancing". Read the result:
 
 ```bash
 curl -s http://localhost:8080/api/v1/loans/liquidations | jq .
@@ -473,7 +478,7 @@ duplicate `unit`, `ANTICIPATE` with no `cap`, or a negative `cap` on an `ANTICIP
 deliberate — a typo that quietly disabled one market would look exactly like a market with no
 liquidations in it.
 
-### Wallet rebalancing — the shape an ANTICIPATE market keeps your wallet in
+### Wallet rebalancing — the shape a shadow or live node keeps your wallet in
 
 **Wallet rebalancing is on by default** (`AQUARIUM_WALLET_REBALANCE_ENABLED=true`), and on a node as
 shipped it does nothing: it is armed only by the settings below. Once armed, **it signs and submits
@@ -485,21 +490,30 @@ housekeeping, not liquidations.
 1. `AQUARIUM_WALLET_REBALANCE_ENABLED` is `true` (the default);
 2. it is not suspended from the readiness page (§7);
 3. `AQUARIUM_LIQUIDATION_MODE` is `shadow` or `live`;
-4. at least one market is `action: ANTICIPATE` with an **effective** mode of shadow or live — its own
-   `mode`, capped by the node's (§9 above); an ADA-principal (`lovelace`) `ANTICIPATE` market counts;
-5. the node is not syncing (§6).
+4. the node is not syncing (§6).
+
+**Your markets do not arm it.** A node with only `CONVERT` markets, or none listed, keeps its wallet
+shaped too, because liquidation depends on a shaped wallet. The markets decide only which tokens get a
+UTxO of their own (below).
+That is also why, on a `shadow` or `live` node, turning rebalancing off
+(`AQUARIUM_WALLET_REBALANCE_ENABLED=false`) or suspending it from the readiness page is logged as a
+warning on every pass in which the rebalancer runs —
+`[REBALANCE] ENV_DISABLED: … liquidation depends on a shaped wallet …` (or `SUSPENDED`) — rather than
+in silence.
 
 **When it runs.** Rebalancing is the last stage of the node's wallet pipeline. A pass is triggered by a
 block the node has committed or by a change in the oracle prices, and runs **liquidation first, then
 compound, then rebalancing**, one pass at a time. A stage that sends a transaction ends the pass, so
 rebalancing runs only on a pass in which no liquidation or compound went out; otherwise it waits for the
 next trigger. On such a pass it reads the wallet from its index and, **if the wallet is out of shape,
-builds, signs and submits one self-send** that puts it back in shape. A node in `disabled` mode, or with
-no such market, never rebalances.
+builds, signs and submits one self-send** that puts it back in shape. A node in `disabled` mode never
+rebalances.
 
 **The shape.**
 
-- **One UTxO per token of those `ANTICIPATE` markets**, holding all of that token and exactly 10 ADA;
+- **One UTxO per principal token of an `ANTICIPATE` market whose effective mode is shadow or live** —
+  its own `mode`, capped by the node's (§9 above) — holding all of that token and exactly 10 ADA (none
+  at all when no market qualifies);
 - **one UTxO holding every other token**, with exactly 10 ADA — only if the wallet holds any;
 - **one ada-only collateral UTxO of exactly C**, where C is the larger of the ledger's maximum
   collateral for a transaction and 5 ADA — 5 ADA under current protocol parameters;

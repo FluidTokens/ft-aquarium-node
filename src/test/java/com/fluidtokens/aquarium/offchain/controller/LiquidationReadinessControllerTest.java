@@ -2874,11 +2874,6 @@ class LiquidationReadinessControllerTest {
                         new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
                                 "the liquidation mode is not set; rebalancing runs only in shadow or live",
                                 true, false)),
-                new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.SHADOW,
-                        com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.NO_ANTICIPATE_MARKET),
-                        new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
-                                "no action: ANTICIPATE market has an effective mode of shadow or live, so there "
-                                        + "is no token to keep ready", true, false)),
                 new Case(activity(true, false, AppConfig.LiquidationConfiguration.Mode.LIVE,
                         com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SYNCING),
                         new LiquidationReadinessController.RebalanceView(true, false, "IDLE",
@@ -2902,6 +2897,41 @@ class LiquidationReadinessControllerTest {
             assertEquals(c.activity().armed(), status.notes().contains(ARMED_NOTE),
                     "the banner's ARMED note must follow armed() exactly: " + c.activity() + " " + status.notes());
         }
+    }
+
+    /**
+     * A REAL rebalancer on a synced SHADOW node whose only markets are {@code action: CONVERT} (FAB-188: the markets
+     * no longer arm it, so this is armed). Its engine and wallet are never touched by {@code activity()}.
+     */
+    static com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer convertOnlyRebalancer() {
+        var configuration = new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                60, 120, 30, BigInteger.ZERO, 200);
+        var convert = new AppConfig.LiquidationConfiguration.Market();
+        convert.setUnit("ee".repeat(28) + "4e49474854");
+        convert.setAction(AppConfig.LiquidationConfiguration.Action.CONVERT);
+        configuration.setMarkets(new java.util.ArrayList<>(List.of(convert)));
+        var listener = new com.fluidtokens.aquarium.offchain.service.BlockEventListener(LoanFixtures.converters());
+        listener.getIsSyncing().set(false);
+        var engine = new com.fluidtokens.aquarium.offchain.service.wallet.WalletShapeTransactions(
+                new com.bloxbean.cardano.client.account.Account(Networks.testnet()), LoanFixtures.protocolParams(),
+                bytes -> com.bloxbean.cardano.client.api.model.Result.error("not in this test"));
+        return new com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer(engine,
+                org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class), listener,
+                configuration, true);
+    }
+
+    /** FAB-188: a configuration with only CONVERT markets reaches the page as ARMED, banner note included. */
+    @Test
+    void anOnlyConvertConfigurationRendersArmed() {
+        var controller = bareController();
+        controller.setWalletRebalancer(convertOnlyRebalancer());
+        var model = new org.springframework.ui.ConcurrentModel();
+        controller.readiness(model, null, null, null, null, null);
+
+        var view = (LiquidationReadinessController.RebalanceView) model.getAttribute("rebalance");
+        assertEquals("ARMED", view.state(), String.valueOf(view));
+        assertTrue(((OperationalStatus) model.getAttribute("status")).notes().contains(ARMED_NOTE),
+                "the banner's ARMED note follows the armed rebalancer");
     }
 
     /** A direct construction holds no rebalancer: no line on the page, and the banner is not armed. */

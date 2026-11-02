@@ -5,6 +5,7 @@ import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
+import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -168,8 +169,9 @@ public final class WalletShape {
         Set<String> relevant = normaliseAll(relevantUnits);
         EnumSet<Reason> reasons = EnumSet.noneOf(Reason.class);
 
-        // R1 / R2: the ADA-only UTxOs.
-        List<Utxo> adaOnly = utxos.stream().filter(WalletShape::isAdaOnly).toList();
+        // R1 / R2: the ADA-only UTxOs, by the one ada-only predicate (FAB-188): a datum- or
+        // reference-script-bearing UTxO is neither the collateral nor a fragment of the change.
+        List<Utxo> adaOnly = utxos.stream().filter(WalletInputSelection::nominable).toList();
         boolean hasCollateral = adaOnly.stream()
                 .anyMatch(utxo -> LedgerCeilings.lovelaceOf(utxo).compareTo(collateralLovelace) == 0);
         if (!hasCollateral) {
@@ -232,12 +234,6 @@ public final class WalletShape {
         }
         outputs.add(new PlannedOutput(OutputRole.COLLATERAL, collateralLovelace, Map.of()));
         return new Plan(outputs, inputLovelace);
-    }
-
-    /** ADA-only: the amount list is exactly lovelace. */
-    static boolean isAdaOnly(Utxo utxo) {
-        return utxo.getAmount() != null && utxo.getAmount().size() == 1
-                && LOVELACE.equals(normalise(utxo.getAmount().get(0).getUnit()));
     }
 
     /** Every unit across the given UTxOs, lower-cased, summed; lovelace included. */

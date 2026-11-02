@@ -105,6 +105,30 @@ class WalletInputSelectionTest {
     }
 
     /**
+     * (d3) FAB-188: ada-only means the one amount entry IS lovelace. A UTxO whose single entry is a token is not
+     * nominable, however it got that way.
+     */
+    @Test
+    void aSingleNonLovelaceAmountIsNotNominable() {
+        Utxo tokenOnly = ada("ab", 0, 90_000_000L);
+        tokenOnly.setAmount(List.of(Amount.asset("aa".repeat(28) + "41", BigInteger.valueOf(90_000_000L))));
+        assertFalse(WalletInputSelection.nominable(tokenOnly), "a single token entry is not ada-only");
+        assertTrue(WalletInputSelection.nominable(ada("ac", 0, 90_000_000L)), "positive control");
+        Utxo upperCase = ada("ad", 0, 90_000_000L);
+        upperCase.setAmount(List.of(new Amount("LOVELACE", BigInteger.valueOf(90_000_000L))));
+        assertTrue(WalletInputSelection.nominable(upperCase), "the lovelace unit is compared case-insensitively");
+    }
+
+    /** (d4) A null amount list is not nominable, and asking does not throw. */
+    @Test
+    void aNullAmountListIsNotNominableAndDoesNotThrow() {
+        Utxo noAmount = ada("ae", 0, 1L);
+        noAmount.setAmount(null);
+        assertFalse(org.junit.jupiter.api.Assertions.assertDoesNotThrow(
+                () -> WalletInputSelection.nominable(noAmount)), "a null amount list is not nominable");
+    }
+
+    /**
      * The diagnostic half: a refusal that says only "nothing qualified" cannot tell an empty wallet
      * from a wallet whose contents are all ineligible, and those need opposite operator responses.
      */

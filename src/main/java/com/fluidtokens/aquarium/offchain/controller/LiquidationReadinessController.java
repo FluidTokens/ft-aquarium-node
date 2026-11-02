@@ -284,9 +284,6 @@ public class LiquidationReadinessController {
                 case MODE_NOT_SHADOW_OR_LIVE -> new RebalanceView(env, suspended, "IDLE",
                         "the liquidation mode is " + (a.mode() == null ? "not set" : a.mode().name())
                                 + "; rebalancing runs only in shadow or live", true, false);
-                case NO_ANTICIPATE_MARKET -> new RebalanceView(env, suspended, "IDLE",
-                        "no action: ANTICIPATE market has an effective mode of shadow or live, so there is no "
-                                + "token to keep ready", true, false);
                 case SYNCING -> new RebalanceView(env, suspended, "IDLE",
                         "the node is syncing; rebalancing starts once it has caught up", true, false);
             };
