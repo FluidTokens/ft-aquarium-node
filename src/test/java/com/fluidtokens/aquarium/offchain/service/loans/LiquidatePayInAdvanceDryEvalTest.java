@@ -1189,13 +1189,23 @@ class LiquidatePayInAdvanceDryEvalTest {
     }
 
     /**
-     * (d) A token output too thin to fund the build on its own — the token and 3 ADA — REFUSES. It does not
-     * reach for U (100 ADA, right beside it) or C: nothing the build hands cardano-client-lib lists the wallet,
-     * and no body that reached the evaluator spends anything of the wallet's but the token output.
+     * (d) A token output too thin to fund the build on its own — the token and 4.5 ADA — REFUSES for want of
+     * funds ({@code Not enough funds}). It does not reach for U (100 ADA, right beside it) or C: nothing the
+     * build hands cardano-client-lib lists the wallet, and no body that reached the evaluator spends anything
+     * of the wallet's but the token output.
+     * <p>
+     * ⚠ The amount is chosen to DISCRIMINATE, and only a narrow window does (FAB-185-3 r3, measured on this
+     * constructor with this universe and C). At 3.0–3.5 ADA cardano-client-lib refuses "Multiple outputs
+     * found with same change address…" before it looks up a single input — with or without the view — so a
+     * test there stays green with no guard at all. From 5.5 ADA the token output funds the build alone and
+     * every variant builds. Between 4.0 and 5.25 ADA the build needs exactly one more input: with the view it
+     * refuses {@code Not enough funds}, and without it (the raw supplier handed to the selection strategy and
+     * selector, or no view anywhere) it BUILDS, spending the token output AND C — the very output it pins as
+     * collateral. 4.5 ADA sits inside that window.
      */
     @Test
     void aTokenOutputTooThinForTheBuildIsRefusedAndUIsNeverPulled() {
-        Utxo thin = tokenOutput(3_000_000L);
+        Utxo thin = tokenOutput(4_500_000L);
         List<Utxo> universe = rolesUniverse(thin);
         WalletListings supplier = new WalletListings(universe);
         BodyRecorder evaluator = new BodyRecorder(null);
@@ -1204,7 +1214,9 @@ class LiquidatePayInAdvanceDryEvalTest {
                 () -> productionOver(supplier, evaluator).build(rolesRequest(thin, true, COLLATERAL_UTXO)));
 
         String chain = LiquidationExecutor.causeChain(refused);
-        log.info("FAB-185-3 (d) token output of 3 ADA refused: {}", chain);
+        log.info("FAB-185-3 (d) token output of 4.5 ADA refused: {}", chain);
+        assertTrue(chain.contains("Not enough funds"),
+                "refused for want of funds in the token output, not for anything else: " + chain);
         assertEquals(0, supplier.walletListings.get(), "no seam of the build listed the wallet: " + chain);
         for (Transaction body : evaluator.bodies) {
             assertEquals(List.of(ref(thin)), walletInputs(body, universe),
@@ -1262,6 +1274,34 @@ class LiquidatePayInAdvanceDryEvalTest {
                     what + ": " + refused.getMessage());
             assertEquals(0, evaluator.bodies.size(), what + ": nothing is evaluated");
         });
+    }
+
+    /**
+     * The guard's positive boundary: C may be an output of the SAME transaction as the designated input, at a
+     * different index. "Is the designated input itself" means the same output — tx hash AND index — so this C
+     * is accepted, pinned as the only collateral, and never spent; the token output is the only wallet input.
+     */
+    @Test
+    void aCollateralFromTheDesignatedInputsOwnTransactionIsAccepted() throws Exception {
+        Utxo tokenOutput = tokenOutput(10_000_000L);
+        Utxo sibling = LoanFixtures.adaUtxo(tokenOutput.getTxHash(), tokenOutput.getOutputIndex() + 1,
+                LoanFixtures.botAddress(), COLLATERAL_UTXO.getAmount().getFirst().getQuantity().longValueExact());
+        List<Utxo> universe = new ArrayList<>(rolesUniverse(tokenOutput));
+        universe.add(sibling);
+        WalletListings supplier = new WalletListings(universe);
+        BodyRecorder evaluator = new BodyRecorder(null);
+
+        Transaction body = deserialise(productionOver(supplier, evaluator)
+                .build(rolesRequest(tokenOutput, true, sibling)));
+
+        assertEquals(List.of(ref(tokenOutput)), walletInputs(body, universe),
+                "the designated input is the only wallet input: " + body.getBody().getInputs());
+        assertEquals(List.of(ref(sibling)), collateralRefs(body),
+                "the collateral is exactly C, the designated input's sibling output");
+        assertFalse(inputRefs(body).contains(ref(sibling)), "C is never spent: " + inputRefs(body));
+        assertEquals(1, evaluator.bodies.size(), "exactly one evaluation per build");
+        assertConserved(body, universe);
+        assertEquals(0, supplier.walletListings.get(), "no seam of the build listed the wallet");
     }
 
     private static Utxo tokenOutput(long lovelace) {
