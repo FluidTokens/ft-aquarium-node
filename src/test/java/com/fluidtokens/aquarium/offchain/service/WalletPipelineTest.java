@@ -1374,6 +1374,86 @@ class WalletPipelineTest {
         }
     }
 
+    /**
+     * FAB-195-2 (k): a price change during the generation's first pass, with nothing pending and no point handled
+     * yet, is re-run as a {@code price} pass once that pass ends, so it starts the wait. The price change at t, the
+     * first pass released at t+7 s: the price pass says {@code waited 7.0 s}.
+     */
+    @Test
+    void aPriceChangeDuringTheFirstPassStartsTheWait() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean first = new AtomicBoolean(true);
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (first.getAndSet(false)) {
+                            entered.countDown();
+                            assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(10, "a");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.offerPriceChange();          // t: nothing pending, nothing handled, block 10 in flight
+            h.clock.advance(Duration.ofSeconds(7));
+            release.countDown();                    // the price pass starts at t+7 s
+            h.awaitPasses(2);
+            h.barrier();
+
+            assertEquals(List.of("L 0/10:a", "L 0/10:a"), h.calls());
+            List<String> lines = summaries(Level.INFO);
+            assertEquals(2, lines.size(), logs.list.toString());
+            assertTrue(lines.get(1).startsWith("wallet pipeline pass #2 at slot 10 (a), trigger price, 0 block(s) "
+                    + "folded in, waited 7.0 s, took 0.0 s: "), lines.get(1));
+        }
+    }
+
+    /**
+     * FAB-195-2 (l): after a rollback, the older generation's pass still in flight is never re-run, so a price change
+     * then starts no wait. Rollback and price change at t during block 10's pass; block 11 at t+60 s, released at
+     * once: block 11's pass says {@code waited 0.0 s}, counted from block 11.
+     */
+    @Test
+    void aPriceChangeDuringAnOlderGenerationsPassStartsNoWait() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean first = new AtomicBoolean(true);
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (first.getAndSet(false)) {
+                            entered.countDown();
+                            assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(10, "a");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.rollback();
+            h.pipeline.offerPriceChange();          // t: only the older generation's pass is in flight
+            h.clock.advance(Duration.ofSeconds(60));
+            h.pipeline.offerBlock(11, "b");         // t+60 s: the new generation's first trigger
+            release.countDown();                    // its pass starts at t+60 s
+            h.awaitPasses(2);
+            h.barrier();
+
+            assertEquals(List.of("L 0/10:a", "L 1/11:b"), h.calls());
+            List<String> lines = summaries(Level.INFO);
+            assertEquals(2, lines.size(), logs.list.toString());
+            assertTrue(lines.get(1).startsWith("wallet pipeline pass #2 at slot 11 (b), trigger block+price, 0 block(s) "
+                    + "folded in, waited 0.0 s, took 0.0 s: "), lines.get(1));
+        }
+    }
+
     /** The summary lines at one level, in order. */
     private List<String> summaries(Level level) {
         return logs.list.stream()

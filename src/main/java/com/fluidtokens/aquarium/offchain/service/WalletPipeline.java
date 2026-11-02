@@ -184,6 +184,10 @@ public final class WalletPipeline implements AutoCloseable {
             if (pending != null || currentLastHandledUnderLock() != null) {
                 noteTriggerUnderLock();
                 scheduleDrainUnderLock();
+            } else if (inFlight != null && inFlight.generation() == generation) {
+                // The generation's first pass is running: the drain already scheduled re-runs its point once it
+                // ends, so the wait starts now. An older generation's pass sets no lastHandled and is never re-run.
+                noteTriggerUnderLock();
             }
         }
         warn(hungWarning);
@@ -206,9 +210,11 @@ public final class WalletPipeline implements AutoCloseable {
 
     /**
      * Remembers when the first trigger not yet served by a pass arrived (FAB-195); a later one keeps it. Only a
-     * trigger that schedules work counts: a block the pipeline drops (equal or older) does not, nor does a price
-     * change with no point to re-run (at boot, or after a rollback), so the first pass after catch-up does not
-     * report the whole catch-up as its wait.
+     * trigger that leads to a pass counts: a block the pipeline drops (equal or older) does not. A price change
+     * counts when there is a point it will re-run — a pending block, a current-generation {@code lastHandled}, or a
+     * current-generation pass in flight — and not otherwise (at boot, or after a rollback, even while the older
+     * generation's pass is still running), so the first pass after catch-up does not report the whole catch-up as
+     * its wait.
      */
     private void noteTriggerUnderLock() {
         if (firstUnservedTriggerAt == null) {
