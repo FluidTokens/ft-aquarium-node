@@ -821,7 +821,7 @@ class WalletPipelineTest {
                 return WorkResult.DEFINITE_FAILURE;
             };
 
-            try (WalletPipeline pipeline = new WalletPipeline(backend, liquidation, compound, housekeeping, HUNG)) {
+            try (WalletPipeline pipeline = new WalletPipeline(backend, liquidation, compound, housekeeping, HUNG, true)) {
                 pipeline.offerBlock(1, "old");
                 assertTrue(server.alive.await(WAIT.toMillis(), TimeUnit.MILLISECONDS), "the submit reached the wire");
                 pipeline.offerBlock(2, "new");
@@ -948,11 +948,13 @@ class WalletPipelineTest {
     /**
      * FAB-186 (i): one summary line per pass — the stage results, or {@code not run}, and the Blockfrost
      * calls the pass's deadline counted, by kind. INFO when a stage answered anything but DEFINITE_FAILURE or
-     * the pass evaluated or submitted anything; DEBUG for a pass that only discovered.
+     * the pass evaluated or submitted anything; DEBUG for a pass that only discovered. FAB-195 (b): that rule is
+     * what {@code logEveryPass=false} keeps, unchanged.
      */
     @Test
     void eachPassEndsWithOneSummaryLineCarryingTheStageResultsAndTheBlockfrostCalls() throws Exception {
         try (Harness h = new Harness()) {
+            h.logEveryPass = false;
             h.start(
                     fence -> {
                         h.record("L");
@@ -970,7 +972,8 @@ class WalletPipelineTest {
             h.pipeline.offerBlock(1, "a");
             h.awaitPasses(1);
             h.barrier();
-            assertEquals(1, count(Level.INFO, "wallet pipeline pass at slot 1 (a): liquidation DEFINITE_FAILURE, "
+            assertEquals(1, count(Level.INFO, "wallet pipeline pass #1 at slot 1 (a), trigger block, 0 block(s) folded "
+                    + "in, waited 0.0 s, took 0.0 s: liquidation DEFINITE_FAILURE, "
                     + "compound DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 3, "
                     + "evaluate 1, submit 0"), logs.list.toString());
 
@@ -978,7 +981,8 @@ class WalletPipelineTest {
             h.pipeline.offerBlock(2, "b");
             h.awaitPasses(1);
             h.barrier();
-            assertEquals(1, count(Level.INFO, "wallet pipeline pass at slot 2 (b): liquidation SUBMITTED, "
+            assertEquals(1, count(Level.INFO, "wallet pipeline pass #2 at slot 2 (b), trigger block, 0 block(s) folded "
+                    + "in, waited 0.0 s, took 0.0 s: liquidation SUBMITTED, "
                     + "compound not run, housekeeping not run; Blockfrost calls discovery 5, evaluate 2, submit 1"),
                     logs.list.toString());
 
@@ -986,12 +990,13 @@ class WalletPipelineTest {
             h.pipeline.offerBlock(3, "c");
             h.awaitPasses(1);
             h.barrier();
-            String quiet = "wallet pipeline pass at slot 3 (c): liquidation DEFINITE_FAILURE, compound "
+            String quiet = "wallet pipeline pass #3 at slot 3 (c), trigger block, 0 block(s) folded in, waited 0.0 s, "
+                    + "took 0.0 s: liquidation DEFINITE_FAILURE, compound "
                     + "DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 4, evaluate 0, submit 0";
             assertEquals(1, count(Level.DEBUG, quiet), logs.list.toString());
-            assertEquals(0, count(Level.INFO, "wallet pipeline pass at slot 3"), logs.list.toString());
+            assertEquals(0, count(Level.INFO, "wallet pipeline pass #3 at slot 3"), logs.list.toString());
             assertEquals(3, logs.list.stream()
-                    .filter(e -> e.getFormattedMessage().startsWith("wallet pipeline pass at slot ")).count(),
+                    .filter(e -> e.getFormattedMessage().startsWith("wallet pipeline pass #")).count(),
                     "exactly one summary line per pass");
         }
     }
@@ -1000,6 +1005,7 @@ class WalletPipelineTest {
     @Test
     void aDeadlineThatCountsNothingSummarisesZeroCalls() throws Exception {
         try (Harness h = new Harness()) {
+            h.logEveryPass = false;
             h.start(
                     fence -> { h.record("L"); return WorkResult.WOULD_SUBMIT; },
                     fence -> { h.record("C"); return WorkResult.DEFINITE_FAILURE; },
@@ -1007,10 +1013,275 @@ class WalletPipelineTest {
             h.pipeline.offerBlock(9, "z");
             h.awaitPasses(1);
             h.barrier();
-            assertEquals(1, count(Level.INFO, "wallet pipeline pass at slot 9 (z): liquidation WOULD_SUBMIT, "
+            assertEquals(1, count(Level.INFO, "wallet pipeline pass #1 at slot 9 (z), trigger block, 0 block(s) folded "
+                    + "in, waited 0.0 s, took 0.0 s: liquidation WOULD_SUBMIT, "
                     + "compound DEFINITE_FAILURE, housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 0, "
                     + "evaluate 0, submit 0"), logs.list.toString());
         }
+    }
+
+    // ---- FAB-195: one line per pass, with its trigger, folds, wait and duration ------------------------------------
+
+    /**
+     * FAB-195 (a): with {@code logEveryPass} on, a pass where every stage answered DEFINITE_FAILURE and nothing was
+     * evaluated or submitted still says its summary at INFO, exactly once; and a pass whose stage threw still gets its
+     * one line.
+     */
+    @Test
+    void withLogEveryPassAQuietPassSaysItsSummaryAtInfoExactlyOnce() throws Exception {
+        AtomicInteger liquidations = new AtomicInteger();
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (liquidations.incrementAndGet() == 2) {
+                            throw new IllegalStateException("liquidation fixture failure");
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> { h.record("C"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> { h.record("H"); return WorkResult.DEFINITE_FAILURE; });
+
+            h.pipeline.offerBlock(1, "a");
+            h.awaitPasses(1);
+            h.barrier();
+            assertEquals(List.of("wallet pipeline pass #1 at slot 1 (a), trigger block, 0 block(s) folded in, waited "
+                            + "0.0 s, took 0.0 s: liquidation DEFINITE_FAILURE, compound DEFINITE_FAILURE, housekeeping "
+                            + "DEFINITE_FAILURE; Blockfrost calls discovery 0, evaluate 0, submit 0"),
+                    summaries(Level.INFO), logs.list.toString());
+            assertEquals(List.of(), summaries(Level.DEBUG), logs.list.toString());
+
+            h.pipeline.offerBlock(2, "b");
+            h.awaitPasses(1);
+            h.barrier();
+            assertEquals(1, count(Level.ERROR, "wallet pipeline: the pass at slot 2 (b) failed"));
+            assertEquals(List.of("wallet pipeline pass #2 at slot 2 (b), trigger block, 0 block(s) folded in, waited "
+                            + "0.0 s, took 0.0 s: liquidation threw, compound not run, housekeeping not run; Blockfrost "
+                            + "calls discovery 0, evaluate 0, submit 0"),
+                    summaries(Level.INFO).subList(1, summaries(Level.INFO).size()), logs.list.toString());
+            assertEquals(2, summaries().size(), "exactly one summary line per pass");
+        }
+    }
+
+    /**
+     * FAB-195 (c), (f): the trigger says what started the pass — a block alone {@code block}; a price change with
+     * nothing pending {@code price}, at the SAME slot; a block and a price change both queued while a pass runs
+     * {@code block+price}. The pass number goes up by one per pass.
+     */
+    @Test
+    void theTriggerSaysWhatStartedThePassAndThePassNumberCountsUp() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean block = new AtomicBoolean(false);
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (block.getAndSet(false)) {
+                            entered.countDown();
+                            assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(5, "a");
+            h.awaitPasses(1);
+            h.barrier();
+
+            h.pipeline.offerPriceChange();
+            h.awaitPasses(1);
+            h.barrier();
+
+            block.set(true);
+            h.pipeline.offerBlock(6, "b");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.offerBlock(7, "c");
+            h.pipeline.offerPriceChange();
+            release.countDown();
+            h.awaitPasses(2);
+            h.barrier();
+
+            assertEquals(List.of("L 0/5:a", "L 0/5:a", "L 0/6:b", "L 0/7:c"), h.calls());
+            assertEquals(List.of(
+                    "wallet pipeline pass #1 at slot 5 (a), trigger block, 0 block(s) folded in",
+                    "wallet pipeline pass #2 at slot 5 (a), trigger price, 0 block(s) folded in",
+                    "wallet pipeline pass #3 at slot 6 (b), trigger block, 0 block(s) folded in",
+                    "wallet pipeline pass #4 at slot 7 (c), trigger block+price, 0 block(s) folded in"), heads());
+        }
+    }
+
+    /**
+     * FAB-195 (d): three blocks offered while a pass runs fold into one pass on the newest, which says
+     * {@code 2 block(s) folded in}; an offer the pipeline drops (equal or older) is not a fold; the pass after a lone
+     * block says {@code 0}.
+     */
+    @Test
+    void theBlocksANewerBlockReplacedAreCountedAsFoldedIn() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean first = new AtomicBoolean(true);
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (first.getAndSet(false)) {
+                            entered.countDown();
+                            assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(10, "a");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.offerBlock(10, "a");   // duplicate of the in-flight point: dropped
+            h.pipeline.offerBlock(9, "x");    // older than the in-flight point: dropped
+            h.pipeline.offerBlock(11, "b");
+            h.pipeline.offerBlock(12, "c");
+            h.pipeline.offerBlock(12, "c");   // duplicate of the pending point: dropped
+            h.pipeline.offerBlock(11, "y");   // older than the pending point: dropped
+            h.pipeline.offerBlock(13, "d");
+            assertEquals(new WalletPipeline.ChainPointView(0, 13, "d"), h.pipeline.stateForTest().pending());
+            release.countDown();
+            h.awaitPasses(2);
+            h.barrier();
+
+            h.pipeline.offerBlock(14, "e");
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/10:a", "L 0/13:d", "L 0/14:e"), h.calls());
+            assertEquals(List.of(
+                    "wallet pipeline pass #1 at slot 10 (a), trigger block, 0 block(s) folded in",
+                    "wallet pipeline pass #2 at slot 13 (d), trigger block, 2 block(s) folded in",
+                    "wallet pipeline pass #3 at slot 14 (e), trigger block, 0 block(s) folded in"), heads());
+        }
+    }
+
+    /**
+     * FAB-195 (e): {@code waited} runs from the first trigger no pass has served to the pass start, and {@code took}
+     * from the pass start to its end, both on the pipeline's clock. A trigger at t, the pass starting at t+3 s and
+     * ending at t+5 s says {@code waited 3.0 s, took 2.0 s}. A price change is a trigger too, and the FIRST trigger
+     * counts, not the last.
+     */
+    @Test
+    void waitedRunsFromTheFirstUnservedTriggerAndTookIsThePassesOwnDuration() throws Exception {
+        CountDownLatch entered = new CountDownLatch(2);
+        Semaphore release = new Semaphore(0);
+        AtomicBoolean block = new AtomicBoolean(true);
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (block.getAndSet(false)) {
+                            entered.countDown();
+                            assertTrue(release.tryAcquire(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        } else {
+                            h.clock.advance(Duration.ofSeconds(2));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(1, "a");
+            await(() -> entered.getCount() == 1);
+            h.pipeline.offerBlock(2, "b");          // the trigger, at t
+            h.clock.advance(Duration.ofSeconds(3));
+            release.release();                      // the pass for it starts at t+3 s and its stage takes 2 s
+            h.awaitPasses(2);
+            h.barrier();
+
+            block.set(true);
+            h.pipeline.offerBlock(3, "c");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.offerPriceChange();          // the first trigger, at t'
+            h.clock.advance(Duration.ofSeconds(1));
+            h.pipeline.offerBlock(4, "d");          // a later one, at t'+1 s
+            h.clock.advance(Duration.ofSeconds(2));
+            release.release();                      // the pass for both starts at t'+3 s
+            h.awaitPasses(2);
+            h.barrier();
+
+            assertEquals(List.of("L 0/1:a", "L 0/2:b", "L 0/3:c", "L 0/4:d"), h.calls());
+            List<String> lines = summaries(Level.INFO);
+            assertEquals(4, lines.size(), logs.list.toString());
+            assertTrue(lines.get(0).startsWith("wallet pipeline pass #1 at slot 1 (a), trigger block, 0 block(s) "
+                    + "folded in, waited 0.0 s, took 3.0 s: "), lines.get(0));
+            assertEquals("wallet pipeline pass #2 at slot 2 (b), trigger block, 0 block(s) folded in, waited 3.0 s, "
+                    + "took 2.0 s: liquidation DEFINITE_FAILURE, compound DEFINITE_FAILURE, housekeeping "
+                    + "DEFINITE_FAILURE; Blockfrost calls discovery 0, evaluate 0, submit 0", lines.get(1));
+            assertTrue(lines.get(3).startsWith("wallet pipeline pass #4 at slot 4 (d), trigger block+price, 0 block(s) "
+                    + "folded in, waited 3.0 s, took 2.0 s: "), lines.get(3));
+        }
+    }
+
+    /**
+     * FAB-195: a rollback drops the queued work, and with it that work's fold count and first-trigger instant; the
+     * pass for the next block counts from that block alone.
+     */
+    @Test
+    void aRollbackForgetsTheFoldsAndTheWaitOfTheWorkItDropped() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean first = new AtomicBoolean(true);
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (first.getAndSet(false)) {
+                            entered.countDown();
+                            assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(1, "a");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.offerBlock(2, "b");
+            h.pipeline.offerBlock(3, "c");          // one fold
+            h.clock.advance(Duration.ofSeconds(5));
+            h.pipeline.rollback();
+            h.clock.advance(Duration.ofSeconds(1));
+            h.pipeline.offerBlock(2, "r");          // the next generation's first trigger
+            h.clock.advance(Duration.ofSeconds(2));
+            release.countDown();
+            h.awaitPasses(2);
+            h.barrier();
+
+            assertEquals(List.of("L 0/1:a", "L 1/2:r"), h.calls());
+            List<String> lines = summaries(Level.INFO);
+            assertEquals(2, lines.size(), logs.list.toString());
+            assertTrue(lines.get(1).startsWith("wallet pipeline pass #2 at slot 2 (r), trigger block, 0 block(s) "
+                    + "folded in, waited 2.0 s, took 0.0 s: "), lines.get(1));
+        }
+    }
+
+    /** The summary lines at one level, in order. */
+    private List<String> summaries(Level level) {
+        return logs.list.stream()
+                .filter(e -> e.getLevel() == level)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.startsWith("wallet pipeline pass #"))
+                .toList();
+    }
+
+    /** Every summary line, at any level, in order. */
+    private List<String> summaries() {
+        return logs.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.startsWith("wallet pipeline pass #"))
+                .toList();
+    }
+
+    /** Each summary line up to its fold count: number, slot, hash, trigger and folds. */
+    private List<String> heads() {
+        return summaries().stream().map(m -> m.substring(0, m.indexOf(", waited "))).toList();
     }
 
     private long count(Level level, String fragment) {
@@ -1041,6 +1312,8 @@ class WalletPipelineTest {
         private final MutableClock clock = new MutableClock(Instant.parse("2026-11-01T00:00:00Z"));
         private final List<String> calls = Collections.synchronizedList(new ArrayList<>());
         private final AtomicReference<Thread> worker = new AtomicReference<>();
+        /** FAB-195: what the pipeline is built with; set before {@link #start}. */
+        private boolean logEveryPass = true;
         private WalletPipeline pipeline;
 
         void start(WalletPipeline.Stage liquidation, WalletPipeline.Stage compound, WalletPipeline.Stage housekeeping) {
@@ -1068,7 +1341,7 @@ class WalletPipelineTest {
                 } finally {
                     passesEnded.release();
                 }
-            }, liquidation, compound, housekeeping, HUNG, counting, clock);
+            }, liquidation, compound, housekeeping, HUNG, counting, clock, logEveryPass);
         }
 
         String point() {

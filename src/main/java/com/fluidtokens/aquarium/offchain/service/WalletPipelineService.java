@@ -100,9 +100,10 @@ public class WalletPipelineService {
                                  CardanoConverters cardanoConverters,
                                  ObjectProvider<FluidOracleClient> oracleClient,
                                  @Value("${aquarium.syncing-threshold-minutes}") long syncingThresholdMinutes,
-                                 @Value("${wallet-coordinator.pass-timeout-seconds:120}") long passTimeoutSeconds) {
+                                 @Value("${wallet-coordinator.pass-timeout-seconds:120}") long passTimeoutSeconds,
+                                 @Value("${wallet-coordinator.log-every-pass:true}") boolean logEveryPass) {
         this(backend, liquidationExecutor, compoundExecutor, walletRebalancer, cardanoConverters, oracleClient,
-                syncingThresholdMinutes, passTimeoutSeconds, Clock.systemUTC());
+                syncingThresholdMinutes, passTimeoutSeconds, logEveryPass, Clock.systemUTC());
     }
 
     WalletPipelineService(BoundedBFBackendService backend,
@@ -113,6 +114,7 @@ public class WalletPipelineService {
                           ObjectProvider<FluidOracleClient> oracleClient,
                           long syncingThresholdMinutes,
                           long passTimeoutSeconds,
+                          boolean logEveryPass,
                           Clock clock) {
         if (syncingThresholdMinutes <= 0) {
             throw new IllegalArgumentException(
@@ -137,7 +139,8 @@ public class WalletPipelineService {
                 fence -> liquidationExecutor.cycle(this.clock.millis(), fence),
                 compoundExecutor::cycle,
                 walletRebalancer::housekeep,
-                Duration.ofSeconds(passTimeoutSeconds));
+                Duration.ofSeconds(passTimeoutSeconds),
+                logEveryPass);
     }
 
     @PostConstruct

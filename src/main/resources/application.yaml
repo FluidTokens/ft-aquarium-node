@@ -568,6 +568,7 @@ blockfrost:
 
 wallet-coordinator:
   pass-timeout-seconds: ${WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS:120}
+  log-every-pass: ${WALLET_PIPELINE_LOG_EVERY_PASS:true}
 
 store:
   cardano:

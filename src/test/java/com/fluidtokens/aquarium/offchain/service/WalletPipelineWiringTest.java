@@ -733,7 +733,7 @@ class WalletPipelineWiringTest {
             bind(stages, context);
             WalletPipelineService service = new WalletPipelineService(context.getBean(BoundedBFBackendService.class),
                     stages.liquidation, stages.compound, stages.housekeeping, context.getBean(CardanoConverters.class),
-                    context.getBeanProvider(FluidOracleClient.class), 10, 120, clock);
+                    context.getBeanProvider(FluidOracleClient.class), 10, 120, true, clock);
             try {
                 long slot = slotAgo(context, Duration.ofMinutes(1));
 
@@ -830,6 +830,72 @@ class WalletPipelineWiringTest {
         } finally {
             engineLogger.detachAppender(engineLogs);
         }
+    }
+
+    /**
+     * (n) FAB-195: {@code wallet-coordinator.log-every-pass} binds through the container from the shipped document.
+     * With no property set a quiet pass — every stage DEFINITE_FAILURE, nothing evaluated or submitted — says its
+     * summary line at INFO; with {@code wallet-coordinator.log-every-pass=false} the same pass says it at DEBUG.
+     */
+    @Test
+    void theLogEveryPassSettingDefaultsToInfoForAQuietPassAndFalseMakesItDebug() {
+        Logger engineLogger = (Logger) LoggerFactory.getLogger(WalletPipeline.class);
+        Level previousLevel = engineLogger.getLevel();
+        engineLogger.setLevel(Level.DEBUG);
+        ListAppender<ILoggingEvent> engineLogs = new ListAppender<>();
+        engineLogs.start();
+        engineLogger.addAppender(engineLogs);
+        try {
+            Stages byDefault = new Stages(new RecordingTransactionManager());
+            runner(byDefault).run(context -> {
+                assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+                bind(byDefault, context);
+                long slot = slotAgo(context, Duration.ofMinutes(1));
+                context.publishEvent(block(slot, "f5".repeat(32)));
+                awaitCalls(byDefault, 3);
+                assertEquals(Level.INFO, quietSummaryLevel(engineLogs, slot, "f5".repeat(32)),
+                        "no property set: every pass says its line at INFO");
+            });
+
+            Stages optedOut = new Stages(new RecordingTransactionManager());
+            runner(optedOut).withPropertyValues("wallet-coordinator.log-every-pass=false").run(context -> {
+                assertNull(context.getStartupFailure(), "the container did not start: " + context.getStartupFailure());
+                bind(optedOut, context);
+                long slot = slotAgo(context, Duration.ofMinutes(1));
+                context.publishEvent(block(slot, "f6".repeat(32)));
+                awaitCalls(optedOut, 3);
+                assertEquals(Level.DEBUG, quietSummaryLevel(engineLogs, slot, "f6".repeat(32)),
+                        "log-every-pass=false: a quiet pass says its line at DEBUG");
+            });
+        } finally {
+            engineLogger.detachAppender(engineLogs);
+            engineLogger.setLevel(previousLevel);
+        }
+    }
+
+    /** Waits for the one summary line of the pass at this point, checks the pass was quiet, and answers its level. */
+    private static Level quietSummaryLevel(ListAppender<ILoggingEvent> engineLogs, long slot, String blockHash)
+            throws InterruptedException {
+        String point = " at slot " + slot + " (" + blockHash + "), ";
+        assertTrue(await(() -> summaryLines(engineLogs, point).size() == 1, PASS_WAIT),
+                "expected one summary line for slot " + slot + ": " + summaryLines(engineLogs, point));
+        ILoggingEvent line = summaryLines(engineLogs, point).get(0);
+        assertTrue(line.getFormattedMessage().endsWith(": liquidation DEFINITE_FAILURE, compound DEFINITE_FAILURE, "
+                + "housekeeping DEFINITE_FAILURE; Blockfrost calls discovery 0, evaluate 0, submit 0"),
+                "the pass must be a quiet one: " + line.getFormattedMessage());
+        return line.getLevel();
+    }
+
+    /** The engine's summary lines for one point; the appender is read under its own lock, as logback writes it. */
+    private static List<ILoggingEvent> summaryLines(ListAppender<ILoggingEvent> engineLogs, String point) {
+        List<ILoggingEvent> events;
+        synchronized (engineLogs) {
+            events = List.copyOf(engineLogs.list);
+        }
+        return events.stream()
+                .filter(e -> e.getFormattedMessage().startsWith("wallet pipeline pass #"))
+                .filter(e -> e.getFormattedMessage().contains(point))
+                .toList();
     }
 
     private static List<String> hungWarnings(ListAppender<ILoggingEvent> engineLogs, String prefix) {

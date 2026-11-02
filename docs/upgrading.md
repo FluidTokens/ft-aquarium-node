@@ -549,6 +549,11 @@ A pass already running is never joined by a second one; new triggers wait for it
   Blockfrost call made during a pass.
 - `LOANS_ORACLE_SOURCE` — where the prices come from: `stream` (the default) merges the FluidTokens
   oracle stream with the registry API; `api` is the emergency lever, API polling only.
+- `WALLET_PIPELINE_LOG_EVERY_PASS` (default `true`, FAB-195) — every pass ends with one INFO line:
+  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <block|price|block+price>, <k> block(s) folded in, waited <s> s, took <s> s: liquidation <result>, compound <result>, housekeeping <result>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`.
+  *Folded in* counts the blocks a newer block replaced while they waited; *waited* runs from the first
+  trigger the pass serves to its start. `false` returns to INFO only when a pass did something (the rule in
+  [Fire and forget (FAB-186)](#fire-and-forget-fab-186)), DEBUG otherwise.
 
 **The Tank processor is unchanged:** it keeps its own timer, and none of the above applies to it.
 

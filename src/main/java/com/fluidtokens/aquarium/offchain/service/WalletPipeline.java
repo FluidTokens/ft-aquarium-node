@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -37,8 +38,11 @@ import java.util.function.Consumer;
  * <p>The deadline bounds Blockfrost calls made through {@link BoundedBFBackendService}; it cannot
  * preempt CPU work or local reads inside a stage. The hung-pass WARN is the only signal for those.</p>
  *
- * <p>Each pass ends with one summary line (FAB-186): each stage's result and the Blockfrost calls the
- * pass made, by kind — counted by the deadline, never limited by the count.</p>
+ * <p>Each pass ends with one summary line (FAB-186, FAB-195): its number, its trigger ({@code block},
+ * {@code price} or {@code block+price}), the blocks folded into it, how long it waited from the first trigger
+ * it serves and how long it took, each stage's result and the Blockfrost calls the pass made, by kind —
+ * counted by the deadline, never limited by the count. It is INFO for every pass while {@code logEveryPass}
+ * is on; off, only a pass that did something says it at INFO.</p>
  */
 @Slf4j
 public final class WalletPipeline implements AutoCloseable {
@@ -63,6 +67,9 @@ public final class WalletPipeline implements AutoCloseable {
 
     private static final Duration CLOSE_GRACE = Duration.ofSeconds(10);
 
+    /** How a pass started, for its summary line (FAB-195): what triggered it and how long that waited. */
+    private record PassStart(long number, String trigger, long blocksFolded, Duration waited, Instant at) {}
+
     private final Object stateLock = new Object();
     private final DeadlineScope deadlineScope;
     private final Stage liquidation;
@@ -71,6 +78,7 @@ public final class WalletPipeline implements AutoCloseable {
     private final Duration hungAfter;
     private final ExecutorService worker;
     private final Clock clock;
+    private final boolean logEveryPass;
 
     private long generation;
     private ChainPoint inFlight;
@@ -83,6 +91,10 @@ public final class WalletPipeline implements AutoCloseable {
     private boolean hungWarned;
     private long passesStarted;
     private long runningPass;
+    /** FAB-195: when the first trigger no pass has served yet arrived; null when none is waiting. */
+    private Instant firstUnservedTriggerAt;
+    /** FAB-195: how many queued blocks a newer block has replaced since a pass last took one. */
+    private long blocksFolded;
     private volatile Thread workerThread;
 
     public WalletPipeline(
@@ -90,7 +102,8 @@ public final class WalletPipeline implements AutoCloseable {
             Stage liquidation,
             Stage compound,
             Stage housekeeping,
-            Duration hungAfter) {
+            Duration hungAfter,
+            boolean logEveryPass) {
         this(Objects.requireNonNull(backend, "backend")::runWithinPassDeadline,
                 liquidation, compound, housekeeping, hungAfter,
                 Executors.newSingleThreadExecutor(runnable -> {
@@ -98,7 +111,7 @@ public final class WalletPipeline implements AutoCloseable {
                     thread.setDaemon(true);
                     return thread;
                 }),
-                Clock.systemUTC());
+                Clock.systemUTC(), logEveryPass);
     }
 
     WalletPipeline(
@@ -108,7 +121,8 @@ public final class WalletPipeline implements AutoCloseable {
             Stage housekeeping,
             Duration hungAfter,
             ExecutorService worker,
-            Clock clock) {
+            Clock clock,
+            boolean logEveryPass) {
         this.deadlineScope = Objects.requireNonNull(deadlineScope, "deadlineScope");
         this.liquidation = Objects.requireNonNull(liquidation, "liquidation");
         this.compound = Objects.requireNonNull(compound, "compound");
@@ -119,6 +133,7 @@ public final class WalletPipeline implements AutoCloseable {
         }
         this.worker = Objects.requireNonNull(worker, "worker");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.logEveryPass = logEveryPass;
     }
 
     /** A committed chain point. Records it and returns; no stage runs on the calling thread. */
@@ -146,7 +161,11 @@ public final class WalletPipeline implements AutoCloseable {
         // pending is always current-generation (rollback drops it) and highWater covers it, so a
         // surviving offer is never older than pending: the latest wins, and a different hash at the
         // same slot replaces it.
+        if (pending != null) {
+            blocksFolded++;
+        }
         pending = offered;
+        noteTriggerUnderLock();
         scheduleDrainUnderLock();
     }
 
@@ -162,6 +181,7 @@ public final class WalletPipeline implements AutoCloseable {
             }
             hungWarning = hungWarningUnderLock();
             priceDirty = true;
+            noteTriggerUnderLock();
             if (pending != null || currentLastHandledUnderLock() != null) {
                 scheduleDrainUnderLock();
             }
@@ -179,6 +199,15 @@ public final class WalletPipeline implements AutoCloseable {
             pending = null;
             lastHandled = null;
             priceDirty = false;
+            firstUnservedTriggerAt = null;
+            blocksFolded = 0;
+        }
+    }
+
+    /** Remembers when the first trigger not yet served by a pass arrived (FAB-195); a later one keeps it. */
+    private void noteTriggerUnderLock() {
+        if (firstUnservedTriggerAt == null) {
+            firstUnservedTriggerAt = clock.instant();
         }
     }
 
@@ -218,7 +247,7 @@ public final class WalletPipeline implements AutoCloseable {
         workerThread = Thread.currentThread();
         while (true) {
             ChainPoint point;
-            long pass;
+            PassStart start;
             synchronized (stateLock) {
                 if (closed) {
                     pending = null;
@@ -226,25 +255,36 @@ public final class WalletPipeline implements AutoCloseable {
                     return;
                 }
                 ChainPoint handled = currentLastHandledUnderLock();
+                String trigger;
+                long folded;
                 if (pending != null) {
                     point = pending;
+                    trigger = priceDirty ? "block+price" : "block";
+                    folded = blocksFolded;
                     pending = null;
                     priceDirty = false;
+                    blocksFolded = 0;
                 } else if (priceDirty && handled != null) {
                     point = handled;
+                    trigger = "price";
+                    folded = 0;
                     priceDirty = false;
                 } else {
                     drainScheduled = false;
                     return;
                 }
                 inFlight = point;
-                pass = ++passesStarted;
+                long pass = ++passesStarted;
                 runningPass = pass;
                 passStartedAt = clock.instant();
                 hungWarned = false;
+                Duration waited = firstUnservedTriggerAt == null
+                        ? Duration.ZERO : Duration.between(firstUnservedTriggerAt, passStartedAt);
+                firstUnservedTriggerAt = null;
+                start = new PassStart(pass, trigger, folded, waited, passStartedAt);
             }
 
-            runPass(point, pass);
+            runPass(point, start);
 
             synchronized (stateLock) {
                 if (point.generation() == generation) {
@@ -258,7 +298,8 @@ public final class WalletPipeline implements AutoCloseable {
         }
     }
 
-    private void runPass(ChainPoint point, long pass) {
+    private void runPass(ChainPoint point, PassStart start) {
+        long pass = start.number();
         log.debug("wallet pipeline: pass start at slot {} ({})", point.slot(), point.blockHash());
         PassSummary summary = new PassSummary();
         try {
@@ -275,7 +316,7 @@ public final class WalletPipeline implements AutoCloseable {
             passFailed(point, failure);
         }
         log.debug("wallet pipeline: pass end at slot {} ({})", point.slot(), point.blockHash());
-        logSummary(point, summary);
+        logSummary(point, start, summary);
     }
 
     private void runStages(ChainPoint point, long pass, BoundedBFBackendService.PassDeadline deadline,
@@ -333,24 +374,34 @@ public final class WalletPipeline implements AutoCloseable {
     }
 
     /**
-     * FAB-186 (m5): ONE summary line per pass — its slot, each stage's result or {@code not run}, and the
-     * Blockfrost calls the pass made by kind. INFO when a stage answered anything but DEFINITE_FAILURE (or
-     * threw), or when the pass evaluated or submitted anything; DEBUG for a pass that did nothing worth
-     * saying, which on a quiet node is most of them.
+     * FAB-186 (m5), FAB-195: ONE summary line per pass — its number and slot, its trigger, the blocks folded into
+     * it, how long it waited from the first trigger it serves and how long it took, each stage's result or
+     * {@code not run}, and the Blockfrost calls the pass made by kind. INFO for every pass while
+     * {@code logEveryPass} is on. Off: INFO when a stage answered anything but DEFINITE_FAILURE (or threw), or
+     * when the pass evaluated or submitted anything; DEBUG for a pass that did nothing worth saying, which on a
+     * quiet node is most of them.
      */
-    private static void logSummary(ChainPoint point, PassSummary summary) {
+    private void logSummary(ChainPoint point, PassStart start, PassSummary summary) {
         BoundedBFBackendService.CallCounts calls = summary.calls;
         boolean news = said(summary.liquidation) || said(summary.compound) || said(summary.housekeeping)
                 || calls.evaluation() + calls.submission() > 0;
-        String line = "wallet pipeline pass at slot " + point.slot() + " (" + point.blockHash() + "): liquidation "
+        String line = "wallet pipeline pass #" + start.number() + " at slot " + point.slot() + " ("
+                + point.blockHash() + "), trigger " + start.trigger() + ", " + start.blocksFolded()
+                + " block(s) folded in, waited " + seconds(start.waited()) + " s, took "
+                + seconds(Duration.between(start.at(), clock.instant())) + " s: liquidation "
                 + summary.liquidation + ", compound " + summary.compound + ", housekeeping " + summary.housekeeping
                 + "; Blockfrost calls discovery " + calls.discovery() + ", evaluate " + calls.evaluation()
                 + ", submit " + calls.submission();
-        if (news) {
+        if (logEveryPass || news) {
             log.info("{}", line);
         } else {
             log.debug("{}", line);
         }
+    }
+
+    /** Seconds with one decimal, whatever the default locale. */
+    private static String seconds(Duration duration) {
+        return String.format(Locale.ROOT, "%.1f", duration.toMillis() / 1000.0);
     }
 
     private static boolean said(String stageResult) {
