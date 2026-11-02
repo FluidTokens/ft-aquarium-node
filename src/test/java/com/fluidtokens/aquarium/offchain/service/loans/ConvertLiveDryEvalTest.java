@@ -408,6 +408,14 @@ class ConvertLiveDryEvalTest {
         List<Utxo> universe = new ArrayList<>(List.of(loanUtxo, bondUtxo, configUtxo, lmConfigUtxo,
                 poolUtxo));
         universe.addAll(walletUtxos);
+        // FAB-185 — wallet role C, pinned as the only collateral. Synthetic in both wallet modes, at the bot
+        // address and sized as the executor's WalletShape sizes it: this rig never submits, and the builder
+        // resolves a pinned collateral by out-ref, so C must be in the universe it builds over.
+        Utxo roleC = LoanFixtures.adaUtxo("c5".repeat(32), 0, botAddress,
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(
+                        new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(
+                                backend.getEpochService()).getProtocolParams()).longValueExact());
+        universe.add(roleC);
         for (TransactionInput in : referenceScripts(registry).values()) {
             universe.add(output(backend, in.getTransactionId(), in.getIndex()));
         }
@@ -456,7 +464,7 @@ class ConvertLiveDryEvalTest {
         var request = new ConvertTransactionBuilder.Request(loanUtxo, bondUtxo, poolUtxo, entry,
                 configUtxo, lmConfigUtxo, walletUtxos.get(walletUtxos.size() - 1), referenceScripts(registry), plan, claim, FLDT, lenderBond,
                 loan.repaymentReceipts(), orderAddress(registry, bond), botAddress,
-                validFromSlot, validToSlot);
+                validFromSlot, validToSlot, roleC);
 
         return new Built(builder.build(request), universe, oracleScript, plan, equity);
     }

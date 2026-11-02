@@ -1367,6 +1367,8 @@ public class LiquidationExecutor {
                             orderLovelace -> remember(nominated, sized(loanUtxoRef, ROLE_U,
                                     convertFunding, WalletRoles.convertRequired(orderLovelace, feeCeiling),
                                     needed)),
+                            // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
+                            walletCheck.roles().c().orElse(null),
                             oraclesByUnit,
                             account.baseAddress(), validFromMillis, validToMillis);
                 } catch (ConvertLiquidationRouter.NoPoolException e) {

@@ -60,6 +60,8 @@ class ConvertTransactionBuilderGuardTest {
     private static final String BOND_ADDRESS = "addr_test1wq" + "0".repeat(50);
     private static final String ORDER_ADDRESS = "addr_test1wz" + "1".repeat(50);
     private static final String BOT = "addr_test1vq" + "2".repeat(50);
+    /** FAB-185 — wallet role C: ada only, no datum, no script, a different output from U. */
+    private static final Utxo ROLE_C = LoanFixtures.adaUtxo("c5".repeat(32), 0, BOT, 5_000_000L);
 
     /**
      * ⛔ <b>THE INVARIANT OF THIS CLASS, asserted structurally rather than trusted.</b>
@@ -164,7 +166,7 @@ class ConvertTransactionBuilderGuardTest {
                 base.poolRefUtxo(), base.collateralOracle(), base.configUtxo(), base.lmConfigUtxo(),
                 base.walletUtxo(), base.referenceScripts(), base.plan(), withEquity, base.collateral(),
                 base.lenderBondAsset(), base.repaymentReceipts(), base.orderAddress(),
-                base.changeAddress(), base.validFromSlot(), base.validToSlot());
+                base.changeAddress(), base.validFromSlot(), base.validToSlot(), base.collateralUtxo());
     }
 
     /** The address the equity output must reach — derived exactly as the builder derives it. */
@@ -211,7 +213,7 @@ class ConvertTransactionBuilderGuardTest {
                         BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO,
                         new AuthorizationMethod.CardanoSignature("aa".repeat(28)),
                         BigInteger.ZERO, "6c6f616e", BigInteger.valueOf(20_000_000L)),
-                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C);
     }
 
     private static TransactionOutput out(String address, long lovelace, PlutusData datum,
@@ -416,7 +418,7 @@ class ConvertTransactionBuilderGuardTest {
         ConvertOrderPlan p = plan();
         var noOracle = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
                 null, null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
-                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C);
 
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
                 () -> builder().build(noOracle));
@@ -439,7 +441,7 @@ class ConvertTransactionBuilderGuardTest {
         assertTrue(wrongToken.usableForLiquidation(), "usable, so only the token can be what refuses it");
         var req = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
                 wrongToken, null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
-                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C);
 
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class, () -> builder().build(req));
         assertEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_ORACLE_MISSING, e.reason());
@@ -454,7 +456,7 @@ class ConvertTransactionBuilderGuardTest {
         ConvertOrderPlan p = plan();
         var req = new ConvertTransactionBuilder.Request(null, bondUtxo(bondDatumHex()), null,
                 oracle(), null, null, null, Map.of(), p, request(p, bondDatumHex()).claim(),
-                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L);
+                FLDT, LENDER_BOND, false, ORDER_ADDRESS, BOT, 0L, 0L, ROLE_C);
 
         try {
             builder().build(req);
@@ -579,11 +581,39 @@ class ConvertTransactionBuilderGuardTest {
                 base.poolRefUtxo(), base.collateralOracle(), base.configUtxo(), base.lmConfigUtxo(),
                 base.walletUtxo(), base.referenceScripts(), base.plan(), base.claim(),
                 base.collateral(), base.lenderBondAsset(), true, base.orderAddress(),
-                base.changeAddress(), base.validFromSlot(), base.validToSlot());
+                base.changeAddress(), base.validFromSlot(), base.validToSlot(), base.collateralUtxo());
 
         var e = assertThrows(ConvertTransactionBuilder.RefusedException.class,
                 () -> builder().build(withReceipts));
         assertEquals(ConvertTransactionBuilder.Refusal.REPAYMENT_RECEIPTS_NOT_MODELLED, e.reason());
+    }
+
+    /**
+     * ⛔ FAB-185: C is pinned as the transaction's only collateral and never spent, so a missing C, a C that is
+     * not pure ada (here: it carries a token), and a C that IS the designated wallet input are each refused by
+     * name — before the oracle probe and before either pass is assembled.
+     */
+    @Test
+    void anInvalidCollateralUtxoIsRefusedByNameBeforeAnythingIsBuilt() {
+        ConvertOrderPlan p = plan();
+        var base = request(p, bondDatumHex());
+        Utxo withToken = LoanFixtures.utxo("c6".repeat(32), 0, BOT, List.of(
+                com.bloxbean.cardano.client.api.model.Amount.lovelace(BigInteger.valueOf(5_000_000L)),
+                com.bloxbean.cardano.client.api.model.Amount.asset(FLDT.toUnit(), BigInteger.ONE)), null);
+        Utxo u = LoanFixtures.adaUtxo("e0".repeat(32), 0, BOT, 50_000_000L);
+        for (Object[] scenario : new Object[][]{{"missing", null, null}, {"token-bearing", null, withToken},
+                {"the wallet utxo itself", u, u}}) {
+            var req = new ConvertTransactionBuilder.Request(base.loanUtxo(), base.bondUtxo(),
+                    base.poolRefUtxo(), base.collateralOracle(), base.configUtxo(), base.lmConfigUtxo(),
+                    (Utxo) scenario[1], base.referenceScripts(), base.plan(), base.claim(), base.collateral(),
+                    base.lenderBondAsset(), false, base.orderAddress(), base.changeAddress(),
+                    base.validFromSlot(), base.validToSlot(), (Utxo) scenario[2]);
+
+            var e = assertThrows(ConvertTransactionBuilder.RefusedException.class, () -> builder().build(req),
+                    scenario[0] + " C must be refused");
+            assertEquals(ConvertTransactionBuilder.Refusal.COLLATERAL_UTXO_INVALID, e.reason(),
+                    scenario[0] + ": " + e.getMessage());
+        }
     }
 
     /**

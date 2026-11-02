@@ -365,12 +365,23 @@ public class ConvertLiquidationRouter {
         return list.get(0);
     }
 
+    /**
+     * Assembles and builds the convert liquidation for one already-resolved candidate, or refuses it.
+     *
+     * @param walletSelector  asked for U with the lovelace the order actually costs; the one wallet output the
+     *                        build may spend (FAB-185)
+     * @param collateralUtxo  ⛔ FAB-185 — the executor's wallet role C, handed to the builder UNCHANGED as the
+     *                        transaction's only collateral. This router never chooses, substitutes or
+     *                        inspects it; the builder refuses an invalid one by name
+     *                        ({@code COLLATERAL_UTXO_INVALID}).
+     */
     public Transaction buildConvertLiquidation(LiquidationAssessment assessment,
                                                Utxo loanUtxo,
                                                Utxo bondUtxo,
                                                Utxo configUtxo,
                                                Utxo lmConfigUtxo,
                                                Function<BigInteger, Optional<Utxo>> walletSelector,
+                                               Utxo collateralUtxo,
                                                Map<String, OracleEntry> oraclesByOracleTokenUnit,
                                                String changeAddress,
                                                long validFromMillis,
@@ -531,7 +542,7 @@ public class ConvertLiquidationRouter {
         Transaction transaction = builder.build(new ConvertTransactionBuilder.Request(
                 loanUtxo, bondUtxo, pool.utxo(), collateralOracle, configUtxo, lmConfigUtxo, walletUtxo,
                 referenceScripts(), plan, claim, collateral, lenderBond, loan.repaymentReceipts(),
-                orderAddress(assessment.bond()), changeAddress, slots[0], slots[1]));
+                orderAddress(assessment.bond()), changeAddress, slots[0], slots[1], collateralUtxo));
 
         BigInteger txFee = transaction.getBody().getFee();
         ConvertAssessment verdict = economics.assess(

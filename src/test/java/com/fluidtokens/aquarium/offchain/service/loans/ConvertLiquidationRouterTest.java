@@ -98,6 +98,12 @@ class ConvertLiquidationRouterTest {
         };
     }
 
+    /**
+     * FAB-185 — wallet role C, which the router hands to the builder untouched. These tests refuse before any
+     * build, so it is never read; it is a well-formed C so that no refusal here can be about it.
+     */
+    private static final Utxo ROLE_C = LoanFixtures.adaUtxo("c5".repeat(32), 0, "addr_change", 5_000_000L);
+
     private static ConvertLiquidationRouter router() {
         AppConfig.LoansConfiguration loans = configuredForMinswap();
         return new ConvertLiquidationRouter(LoanFixtures.registry(), loans, null,
@@ -164,7 +170,7 @@ class ConvertLiquidationRouterTest {
         var e = assertThrows(ConvertLiquidationRouter.WalletInputTooSmallException.class,
                 () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
                         requirement -> Optional.empty(),
-                        collateralOracle(), "addr_change",
+                        ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertTrue(e.getMessage().contains("4000000"),
@@ -192,7 +198,7 @@ class ConvertLiquidationRouterTest {
                             asked[0] = requirement;
                             return Optional.empty();
                         },
-                        collateralOracle(), "addr_change",
+                        ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertEquals(ConvertEconomics.MINSWAP_ORDER_OVERHEAD, asked[0],
@@ -217,7 +223,7 @@ class ConvertLiquidationRouterTest {
         var e = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
                         requirement -> Optional.empty(),
-                        Map.of(LoanFixtures.NO_ORACLE.toUnit(), wrongToken), "addr_change",
+                        ROLE_C, Map.of(LoanFixtures.NO_ORACLE.toUnit(), wrongToken), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertTrue(e.getMessage().contains("pricing " + FLDT.toUnit()), e.getMessage());
@@ -252,7 +258,7 @@ class ConvertLiquidationRouterTest {
 
         var e = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(tokenPrincipal, loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), oracles, "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, oracles, "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertTrue(e.getMessage().contains("pricing " + principal.toUnit()), e.getMessage());
@@ -280,7 +286,7 @@ class ConvertLiquidationRouterTest {
 
         var e = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(adaCollateral, loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertTrue(e.getMessage().startsWith("ada collateral:"), e.getMessage());
 
@@ -296,7 +302,7 @@ class ConvertLiquidationRouterTest {
                 new FixedPoolResolver(), null, null, LoanFixtures.converters(), LoanFixtures.NETWORK);
         var first = assertThrows(IllegalStateException.class,
                 () -> unconfigured.buildConvertLiquidation(adaCollateral, loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertTrue(first.getMessage().startsWith("ada collateral:"), first.getMessage());
     }
@@ -333,7 +339,7 @@ class ConvertLiquidationRouterTest {
                             selectorCalls[0]++;
                             return Optional.empty();
                         },
-                        collateralOracleWindowed(1_760_000_010_000L, 1_760_001_000_000L), "addr_change",
+                        ROLE_C, collateralOracleWindowed(1_760_000_010_000L, 1_760_001_000_000L), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertEquals(0, selectorCalls[0], "the wallet selector must not run for a body the validator refuses");
@@ -355,7 +361,7 @@ class ConvertLiquidationRouterTest {
                             selectorCalls[0]++;
                             return Optional.empty();
                         },
-                        collateralOracleWindowed(1_759_998_000_000L, 1_760_000_060_000L), "addr_change",
+                        ROLE_C, collateralOracleWindowed(1_759_998_000_000L, 1_760_000_060_000L), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertEquals(0, selectorCalls[0]);
@@ -394,7 +400,7 @@ class ConvertLiquidationRouterTest {
                             selectorCalls[0]++;
                             return Optional.empty();
                         },
-                        oracles, "addr_change", 1_760_000_000_000L, 1_760_000_120_000L));
+                        ROLE_C, oracles, "addr_change", 1_760_000_000_000L, 1_760_000_120_000L));
 
         assertEquals(0, selectorCalls[0]);
         assertTrue(e.getMessage().contains("principal"), "names the leg: " + e.getMessage());
@@ -450,7 +456,7 @@ class ConvertLiquidationRouterTest {
     private static void buildOnce(ConvertLiquidationRouter router) {
         try {
             router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
-                    requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                    requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                     1_760_000_000_000L, 1_760_000_120_000L);
         } catch (RuntimeException expected) {
             // Whatever the outcome past the pool step: this test counts index queries, not verdicts.
@@ -485,7 +491,7 @@ class ConvertLiquidationRouterTest {
 
         var e = assertThrows(ConvertLiquidationRouter.NoPoolException.class,
                 () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
 
         assertEquals("no Minswap pool for " + FLDT.toUnit() + "/lovelace is indexed — not indexed (pools "
@@ -506,7 +512,7 @@ class ConvertLiquidationRouterTest {
 
         var e = assertThrows(MinswapPoolResolver.RefusedException.class,
                 () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
-                        requirement -> Optional.empty(), collateralOracle(), "addr_change",
+                        requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertEquals(MinswapPoolResolver.Refusal.LOOKUP_FAILED, e.refusal());
     }

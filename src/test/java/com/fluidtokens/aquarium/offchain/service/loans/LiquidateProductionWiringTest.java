@@ -49,6 +49,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -149,9 +150,14 @@ class LiquidateProductionWiringTest {
     /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's params. */
     private static final Utxo COLLATERAL_UTXO = LoanFixtures.adaUtxo("c5".repeat(32), 0, LoanFixtures.botAddress(),
             WalletShape.collateralLovelace(EvalFixtures.protocolParams().getProtocolParams()).longValueExact());
-    /** FAB-185 — the shaped wallet's other outputs: a 30-ADA ada-only output and a token output. */
+    /**
+     * FAB-185 — the shaped wallet's other outputs: a 100-ADA ada-only output and a token output. The spare is
+     * LARGER than C (68,526,272 lovelace under this rig's parameters) — and C is larger than U — so a
+     * collateral chooser going largest-first would land on the spare, never on C by coincidence, and (b)'s
+     * {@code collateral == [C]} assertion catches it (FAB-185-2 audit residue).
+     */
     private static final Utxo SPARE_ADA_UTXO = LoanFixtures.adaUtxo("e3".repeat(32), 0,
-            LoanFixtures.botAddress(), 30_000_000L);
+            LoanFixtures.botAddress(), 100_000_000L);
     private static final Utxo TOKEN_UTXO = LoanFixtures.utxo("e4".repeat(32), 0, LoanFixtures.botAddress(),
             List.of(Amount.lovelace(BigInteger.valueOf(10_000_000L)), LoanFixtures.token(COLLATERAL, 5_000_000L)),
             null);
@@ -422,7 +428,7 @@ class LiquidateProductionWiringTest {
     }
 
     /**
-     * (b) ⛔ FAB-185, through the PRODUCTION constructor: a shaped wallet — C, U, a 30-ADA ada-only output, a
+     * (b) ⛔ FAB-185, through the PRODUCTION constructor: a shaped wallet — C, U, a 100-ADA ada-only output, a
      * token output and the six published reference scripts all at the bot's address. Off the DESERIALISED
      * built body: the wallet-credential inputs are exactly {U}, U appears once, the collateral is exactly [C],
      * and every redeemer carries the recording evaluator's ex-units. The injected supplier is never asked to
@@ -431,6 +437,8 @@ class LiquidateProductionWiringTest {
     @Test
     void aShapedWalletSpendsExactlyUAndPledgesExactlyC() throws Exception {
         List<Utxo> universe = shapedUniverse(WALLET_UTXO);
+        assertTrue(lovelaceOf(SPARE_ADA_UTXO).compareTo(lovelaceOf(COLLATERAL_UTXO)) > 0,
+                "fixture: the spare is larger than C, so a largest-first collateral chooser cannot land on C");
         ListingRecorder injected = new ListingRecorder(LoanFixtures.utxoSupplier(universe));
         Recording evaluator = new Recording(aiken(universe));
 
@@ -464,7 +472,7 @@ class LiquidateProductionWiringTest {
 
     /**
      * (c) ⛔ FAB-185: the same shaped wallet with a U too small for the build. The build refuses — it never
-     * pulls the 30-ADA output, C, the token output or a published script to make up the difference — and no
+     * pulls the 100-ADA output, C, the token output or a published script to make up the difference — and no
      * body the evaluator was ever shown carries a wallet input other than U. Three sizes, measured on this rig
      * (fee 871,809; 4 ADA builds): 0.3 ADA is below the fee itself and fails before any evaluation; 2 and 3
      * ADA are evaluated once and then cannot be balanced, so the "no other wallet input in any attempt" check
@@ -499,13 +507,43 @@ class LiquidateProductionWiringTest {
         assertTrue(attempts > 0, "no attempted body was ever evaluated, so the per-attempt check proved nothing");
     }
 
-    /** The shaped wallet of (b) and (c): C, {@code u}, a 30-ADA output, a token output, the published scripts. */
+    /**
+     * (d) ⛔ FAB-185 (m3), the FAB-185-2 audit residue: (b)'s shaped wallet with a C of 1,000,000 lovelace. C is
+     * the ONLY collateral, and 1 ADA cannot reach {@code fee × collateral_percent}, so the plain build refuses
+     * {@code INSUFFICIENT_COLLATERAL} naming C's out-ref — and not U's, which is not the collateral. Neither
+     * shipped with a negative collateral return (CCL trap 16) nor rescued by another wallet output.
+     */
+    @Test
+    void aCollateralTooSmallForTheFeeIsRefusedInsufficientCollateralNamingCNotU() throws Exception {
+        Utxo smallC = LoanFixtures.adaUtxo("c5".repeat(32), 0, LoanFixtures.botAddress(), 1_000_000L);
+        List<Utxo> universe = shapedUniverse(WALLET_UTXO, smallC);
+
+        LiquidateTransactionBuilder.RefusedException refused = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> production(universe, new HashCheckedScriptSupplier(rigScripts()), new Recording(aiken(universe)))
+                        .build(request(WALLET_UTXO, REFERENCE_SCRIPTS, smallC)));
+        log.info("FAB-185 plain C of 1 ADA refused: reason={} {}", refused.getReason(), refused.getMessage());
+
+        assertEquals(LiquidateTransactionBuilder.Refusal.INSUFFICIENT_COLLATERAL, refused.getReason(),
+                refused.getMessage());
+        assertTrue(refused.getMessage().contains(smallC.getTxHash() + "#" + smallC.getOutputIndex()),
+                "the refusal names C's out-ref: " + refused.getMessage());
+        assertFalse(refused.getMessage().contains(WALLET_UTXO.getTxHash()),
+                "and not U's, which is not the collateral: " + refused.getMessage());
+    }
+
+    /** The shaped wallet of (b) and (c): C, {@code u}, a 100-ADA output, a token output, the published scripts. */
     private static List<Utxo> shapedUniverse(Utxo u) {
-        List<Utxo> universe = new ArrayList<>(universe(u, LoanFixtures.botAddress()));
+        return shapedUniverse(u, COLLATERAL_UTXO);
+    }
+
+    /** As above, with C stated. */
+    private static List<Utxo> shapedUniverse(Utxo u, Utxo collateral) {
+        List<Utxo> universe = new ArrayList<>(universe(u, LoanFixtures.botAddress(), collateral));
         universe.add(SPARE_ADA_UTXO);
         universe.add(TOKEN_UTXO);
         assertEquals(10, universe.stream().filter(x -> atWalletCredential(x.getAddress())).count(),
-                "C, U, the 30-ADA output, the token output and six published scripts at the bot address");
+                "C, U, the 100-ADA output, the token output and six published scripts at the bot address");
         return universe;
     }
 
@@ -527,6 +565,10 @@ class LiquidateProductionWiringTest {
 
     private static TransactionInput refOf(Utxo utxo) {
         return new TransactionInput(utxo.getTxHash(), utxo.getOutputIndex());
+    }
+
+    private static BigInteger lovelaceOf(Utxo utxo) {
+        return com.fluidtokens.aquarium.offchain.util.LedgerCeilings.lovelaceOf(utxo);
     }
 
     /** (vi) The production constructor has no null-evaluator form (CCL trap 8). */
@@ -647,6 +689,12 @@ class LiquidateProductionWiringTest {
 
     private static LiquidateTransactionBuilder.Request request(Utxo wallet,
                                                                LiquidateTransactionBuilder.ReferenceScripts scripts) {
+        return request(wallet, scripts, COLLATERAL_UTXO);
+    }
+
+    private static LiquidateTransactionBuilder.Request request(Utxo wallet,
+                                                               LiquidateTransactionBuilder.ReferenceScripts scripts,
+                                                               Utxo collateral) {
         LoanDatum datum = new LoanDatumConverter().deserialize(LOAN_DATUM_HEX);
         LenderManagerDatum bondDatum = new LenderManagerDatumConverter().deserialize(BOND_DATUM_HEX);
         Loan loan = new Loan(LOAN_TX, LOAN_OUTPUT_INDEX, LOAN_ADDRESS, LOAN_ID,
@@ -660,7 +708,7 @@ class LiquidateProductionWiringTest {
         return new LiquidateTransactionBuilder.Request(
                 List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loanUtxo(), bondUtxo())),
                 CONFIG_UTXO, LM_CONFIG_UTXO, Map.of(ORACLE_NFT.toUnit(), oracle), wallet,
-                LoanFixtures.botAddress(), VALID_FROM, VALID_TO, MARGIN, scripts, COLLATERAL_UTXO);
+                LoanFixtures.botAddress(), VALID_FROM, VALID_TO, MARGIN, scripts, collateral);
     }
 
     private static Utxo loanUtxo() {
@@ -690,7 +738,12 @@ class LiquidateProductionWiringTest {
      *                               each at its own script's enterprise address
      */
     private static List<Utxo> universe(Utxo wallet, String referenceScriptAddress) {
-        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, wallet, COLLATERAL_UTXO,
+        return universe(wallet, referenceScriptAddress, COLLATERAL_UTXO);
+    }
+
+    /** As above, with C stated. */
+    private static List<Utxo> universe(Utxo wallet, String referenceScriptAddress, Utxo collateral) {
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, wallet, collateral,
                 loanUtxo(), bondUtxo()));
         universe.add(LoanFixtures.utxo(ORACLE_REF_INPUT.getTransactionId(), ORACLE_REF_INPUT.getIndex(),
                 ORACLE_ADDRESS, List.of(Amount.lovelace(BigInteger.valueOf(1_038_710L)),

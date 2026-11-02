@@ -366,6 +366,7 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oraclesByOracleTokenUnit,
                                                     String changeAddress, long validFromMillis,
                                                     long validToMillis) {
@@ -2154,6 +2155,7 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oracles,
                                                     String changeAddress, long validFromMillis, long validToMillis) {
             nominated.add(walletSelector.apply(BigInteger.valueOf(4_000_000L)).orElse(null));
@@ -4006,6 +4008,7 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oracles,
                                                     String changeAddress, long validFromMillis, long validToMillis) {
             reached = true;
@@ -4136,6 +4139,7 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oracles,
                                                     String changeAddress, long validFromMillis, long validToMillis) {
             calls++;
@@ -4713,6 +4717,7 @@ class LiquidationExecutorTest {
         public Transaction buildConvertLiquidation(LiquidationAssessment assessment, Utxo loanUtxo,
                                                     Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
                                                     Function<BigInteger, Optional<Utxo>> walletSelector,
+                                                    Utxo collateralUtxo,
                                                     Map<String, OracleEntry> oracles,
                                                     String changeAddress, long validFromMillis, long validToMillis) {
             validFrom = validFromMillis;
