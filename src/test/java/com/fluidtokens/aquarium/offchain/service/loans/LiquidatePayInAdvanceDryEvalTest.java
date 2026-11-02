@@ -3,6 +3,8 @@ package com.fluidtokens.aquarium.offchain.service.loans;
 import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.api.common.OrderEnum;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.Result;
@@ -12,6 +14,7 @@ import com.bloxbean.cardano.client.plutus.blueprint.PlutusBlueprintUtil;
 import com.bloxbean.cardano.client.plutus.blueprint.model.PlutusVersion;
 import com.bloxbean.cardano.client.plutus.spec.BigIntPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.ConstrPlutusData;
+import com.bloxbean.cardano.client.plutus.spec.ExUnits;
 import com.bloxbean.cardano.client.plutus.spec.ListPlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusData;
 import com.bloxbean.cardano.client.plutus.spec.PlutusScript;
@@ -222,6 +225,13 @@ class LiquidatePayInAdvanceDryEvalTest {
     private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 60_000_000L);
+    /**
+     * FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's parameters,
+     * pinned by the builder as the only collateral and in {@link #universe} so it resolves by out-ref.
+     */
+    static final Utxo COLLATERAL_UTXO = LoanFixtures.adaUtxo("c5".repeat(32), 0, LoanFixtures.botAddress(),
+            com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(
+                    EvalFixtures.protocolParams().getProtocolParams()).longValueExact());
 
     private static final int MAX_TX_SIZE = 16_384;
 
@@ -420,7 +430,7 @@ class LiquidatePayInAdvanceDryEvalTest {
                         base.validToSlot(), base.changeAddress(),
                         new LiquidateTransactionBuilder.ReferenceScripts(
                                 null, null, null, null, LOAN_CLAIM_ACTION_REF, null, null),
-                        base.oracleWindowMarginMillis());
+                        base.oracleWindowMarginMillis(), base.collateralUtxo());
 
         // The chain must resolve the referenced script: publish it at the coord, min-ada carrier only —
         // mirrors the oracle ref-script UTxO above.
@@ -912,7 +922,7 @@ class LiquidatePayInAdvanceDryEvalTest {
         return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
                 r.bondUtxo(), wallet, r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.principalOracle(),
                 r.validFromMillis(), r.validToMillis(), r.validFromSlot(), r.validToSlot(), r.changeAddress(),
-                PRODUCTION_REFERENCE_SCRIPTS, r.oracleWindowMarginMillis());
+                PRODUCTION_REFERENCE_SCRIPTS, r.oracleWindowMarginMillis(), r.collateralUtxo());
     }
 
     private static String hashOf(PlutusScript script) {
@@ -1034,54 +1044,42 @@ class LiquidatePayInAdvanceDryEvalTest {
                 LoanFixtures.adaUtxo(TX_WALLET, 0, LoanFixtures.botAddress(), lovelace),
                 r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.principalOracle(), r.validFromMillis(), r.validToMillis(),
                 r.validFromSlot(), r.validToSlot(), r.changeAddress(), r.referenceScripts(),
-                r.oracleWindowMarginMillis());
+                r.oracleWindowMarginMillis(), r.collateralUtxo());
     }
 
     /**
-     * Defect (b), and the positive half of (a). The wallet utxo cannot cover the 28-ada principal, so
-     * balancing MUST add an input — which is the only way to reach either defect. The build has to
-     * succeed, take the ordinary utxo, and leave the published reference script alone.
-     * <p>
-     * Before T-051 this guarded the layout probe, which ran without an evaluator: removing
-     * {@code LayoutProbeEvaluator} made it fail with "Transaction evaluator is not set". The probe is
-     * gone and so is that class; what this now pins is that the single priced assembly survives a
-     * balancing input and still leaves the published reference script alone. That is the failure
-     * Giovanni's first funded attempt would have hit.
+     * ⛔ INVERTED by FAB-185-3 (was {@code aBuildThatNeedsABalancingInputSucceedsAndSpendsAnOrdinaryUtxo}).
+     * The wallet utxo cannot cover the 28-ada principal, so balancing would have to add an input. Until
+     * FAB-185 it did: this test pinned that the build SUCCEEDED by spending an ordinary 100-ADA wallet utxo
+     * beside the thin one, leaving only the published reference script alone. The designated input is now
+     * the ONLY wallet output the build can see ({@link DesignatedInputUtxoSupplier}), so a designated input
+     * too small for the build REFUSES and adds no wallet input — not the ordinary utxo, not the published
+     * script — and nothing the build hands cardano-client-lib ever lists the wallet to look for one.
      */
     @Test
-    void aBuildThatNeedsABalancingInputSucceedsAndSpendsAnOrdinaryUtxo() {
+    void aBuildThatNeedsABalancingInputIsRefusedAndAddsNoWalletInput() {
         Fixture fixture = fixture();
         String ordinaryTx = "aa".repeat(32);
         Utxo ordinary = LoanFixtures.adaUtxo(ordinaryTx, 0, LoanFixtures.botAddress(), 100_000_000L);
         List<Utxo> universe = universeWithThinWallet(fixture, 2_000_000L,
                 List.of(publishedScriptUtxo(100_000_000L), ordinary));
+        WalletListings supplier = new WalletListings(universe);
+        BodyRecorder evaluator = new BodyRecorder(offlineEvaluator(universe));
 
-        Transaction tx = new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
-                LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(),
-                offlineEvaluator(universe))
-                .build(thinWalletRequest(fixture, 2_000_000L));
+        var builder = new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK, supplier,
+                EvalFixtures.protocolParams(), evaluator);
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> builder.build(thinWalletRequest(fixture, 2_000_000L)));
 
-        List<String> inputs = tx.getBody().getInputs().stream()
-                .map(in -> in.getTransactionId() + "#" + in.getIndex())
-                .toList();
-        assertTrue(inputs.contains(ordinaryTx + "#0"),
-                "a balancing input MUST have been added, or neither defect is exercised: " + inputs);
-        assertFalse(inputs.contains(
-                        "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0"),
-                "the published reference script must never be spent: " + inputs);
-
-        // COLLATERAL is selected by a DIFFERENT mechanism — QuickTxBuilder.buildCollateralOutput
-        // constructs its OWN DefaultUtxoSelectionStrategyImpl (:507) instead of reading the one on
-        // the context — so neither guard above can reach it. Collateral is consumed on a phase-2
-        // failure, which makes it the more dangerous of the two paths.
-        List<String> collateral = tx.getBody().getCollateral() == null ? List.<String>of()
-                : tx.getBody().getCollateral().stream()
-                        .map(in -> in.getTransactionId() + "#" + in.getIndex())
-                        .toList();
-        assertFalse(collateral.contains(
-                        "48c102c0034b04558c640df211045fdd7511dc7046b55942ca5909372eab24cd#0"),
-                "the published reference script must never be pledged as COLLATERAL either — a "
-                        + "phase-2 failure would consume it: " + collateral);
+        String chain = LiquidationExecutor.causeChain(refused);
+        assertTrue(chain.contains("Not enough funds"),
+                "refused for want of funds in the designated input, not for anything else: " + chain);
+        assertEquals(0, supplier.walletListings.get(),
+                "no seam of the build listed the wallet, so no second wallet output could be added: " + chain);
+        for (Transaction body : evaluator.bodies) {
+            assertEquals(List.of(TX_WALLET + "#0"), walletInputs(body, universe),
+                    "a body that reached the evaluator spends the thin designated input alone: " + body);
+        }
     }
 
     /**
@@ -1105,6 +1103,347 @@ class LiquidatePayInAdvanceDryEvalTest {
         assertTrue(chain.contains("Not enough funds"),
                 "must fail for want of SPENDABLE funds, not by consuming the reference script "
                         + "and not for want of an evaluator: " + chain);
+    }
+
+    // ======================================================================================
+    // ⛔ FAB-185-3: collateral is exactly C, and the designated input is the ONLY wallet input
+    //
+    // The wallet below holds every shape FAB-185's roles name — C (ada only, exactly
+    // WalletShape.collateralLovelace), U (100 ADA, ada only), a token output (the principal token + ada) and a
+    // published reference script at the bot's own address — and each build is handed ONE of them as its
+    // wallet input and C as its collateral. Every assertion reads the DESERIALISED body. Before FAB-185 the
+    // token-principal shape relied on cardano-client-lib's balancer quietly pulling ada-only wallet outputs
+    // (U, or C itself) for the fee and the min-ada riders (CCL trap 6); a test whose wallet held only ada
+    // would never have seen it (trap 26), which is why U and C sit beside the token output here.
+    // ======================================================================================
+
+    /** A synthetic token principal priced 1:1 by its own Charli3 deployment — {@code PayInAdvanceLiquidationRouterTest}'s. */
+    private static final AssetType TOKEN_PRINCIPAL = new AssetType("cc".repeat(28), "0014df105553444d");
+    private static final AssetType TOKEN_PRINCIPAL_ORACLE_NFT = new AssetType("8a".repeat(28), "8a".repeat(10));
+    private static final String TOKEN_PRINCIPAL_ORACLE_CREDENTIAL = "8b".repeat(28);
+    private static final TransactionInput TOKEN_PRINCIPAL_ORACLE_REF_INPUT = LoanFixtures.input("fe".repeat(32), 0);
+    private static final TransactionInput TOKEN_PRINCIPAL_ORACLE_REF_SCRIPT = LoanFixtures.input("8d".repeat(32), 0);
+    private static final TransactionInput TOKEN_PRINCIPAL_C3_PROVIDER = LoanFixtures.input("8e".repeat(32), 0);
+
+    /** Wallet role U: the largest ada-only output that is not C. */
+    private static final Utxo ROLE_U = LoanFixtures.adaUtxo("e2".repeat(32), 0, LoanFixtures.botAddress(),
+            100_000_000L);
+
+    /** The redeemer cost {@link BodyRecorder} prices every redeemer at when it has no delegate. */
+    private static final ExUnits FIXED_COST = new ExUnits(BigInteger.valueOf(400_000), BigInteger.valueOf(150_000_000));
+
+    /**
+     * (b) TOKEN principal, through the production constructor: the wallet spends exactly its token output —
+     * once, and nothing else of the wallet's — the collateral is exactly [C], and every redeemer carries the
+     * evaluator's ex-units, not cardano-client-lib's placeholder. The token output alone (token + 10 ADA)
+     * funds the fee, the lender's and the bot's min-ada riders and the change's min-ada; U and C sit unspent
+     * beside it.
+     */
+    @Test
+    void aTokenPrincipalSpendsExactlyItsTokenOutputWithCollateralExactlyC() throws Exception {
+        Utxo tokenOutput = tokenOutput(10_000_000L);
+        List<Utxo> universe = rolesUniverse(tokenOutput);
+        WalletListings supplier = new WalletListings(universe);
+        BodyRecorder evaluator = new BodyRecorder(null);
+
+        Transaction body = deserialise(productionOver(supplier, evaluator)
+                .build(rolesRequest(tokenOutput, true, COLLATERAL_UTXO)));
+
+        assertEquals(List.of(ref(tokenOutput)), walletInputs(body, universe),
+                "the wallet funds a token principal with its token output alone, spent once: " + body.getBody().getInputs());
+        assertEquals(List.of(ref(COLLATERAL_UTXO)), collateralRefs(body), "the collateral is exactly C");
+        for (Utxo adaOnly : List.of(COLLATERAL_UTXO, ROLE_U, publishedScriptUtxo(20_000_000L))) {
+            assertFalse(inputRefs(body).contains(ref(adaOnly)),
+                    "no ada-only wallet output is an input, " + ref(adaOnly) + " included: " + inputRefs(body));
+        }
+        assertEquals(1, evaluator.bodies.size(), "exactly one evaluation per build");
+        List<Redeemer> redeemers = body.getWitnessSet().getRedeemers();
+        assertFalse(redeemers.isEmpty(), "a pay-in-advance liquidation has redeemers");
+        for (Redeemer redeemer : redeemers) {
+            String key = redeemer.getTag() + "#" + redeemer.getIndex();
+            assertEquals(FIXED_COST.getMem(), redeemer.getExUnits().getMem(), key + " mem is not the evaluator's");
+            assertEquals(FIXED_COST.getSteps(), redeemer.getExUnits().getSteps(), key + " steps are not the evaluator's");
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    key + " carries CCL's 10000-mem placeholder: the evaluator was not load-bearing");
+        }
+        assertConserved(body, universe);
+        assertEquals(0, supplier.walletListings.get(), "no seam of the build listed the wallet");
+    }
+
+    /**
+     * (c) ADA principal, through the production constructor and the real PlutusV3 machine: the wallet spends
+     * exactly U, and the collateral is exactly [C] — the token output, C and the published script stay put.
+     */
+    @Test
+    void anAdaPrincipalSpendsExactlyUWithCollateralExactlyC() throws Exception {
+        List<Utxo> universe = rolesUniverse(tokenOutput(10_000_000L));
+        BodyRecorder evaluator = new BodyRecorder(aiken(universe));
+
+        Transaction body = deserialise(productionOver(new WalletListings(universe), evaluator)
+                .build(rolesRequest(ROLE_U, false, COLLATERAL_UTXO)));
+
+        assertEquals(List.of(ref(ROLE_U)), walletInputs(body, universe),
+                "the wallet funds an ada principal with U alone, spent once: " + body.getBody().getInputs());
+        assertEquals(List.of(ref(COLLATERAL_UTXO)), collateralRefs(body), "the collateral is exactly C");
+        assertConserved(body, universe);
+    }
+
+    /**
+     * (d) A token output too thin to fund the build on its own — the token and 3 ADA — REFUSES. It does not
+     * reach for U (100 ADA, right beside it) or C: nothing the build hands cardano-client-lib lists the wallet,
+     * and no body that reached the evaluator spends anything of the wallet's but the token output.
+     */
+    @Test
+    void aTokenOutputTooThinForTheBuildIsRefusedAndUIsNeverPulled() {
+        Utxo thin = tokenOutput(3_000_000L);
+        List<Utxo> universe = rolesUniverse(thin);
+        WalletListings supplier = new WalletListings(universe);
+        BodyRecorder evaluator = new BodyRecorder(null);
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> productionOver(supplier, evaluator).build(rolesRequest(thin, true, COLLATERAL_UTXO)));
+
+        String chain = LiquidationExecutor.causeChain(refused);
+        log.info("FAB-185-3 (d) token output of 3 ADA refused: {}", chain);
+        assertEquals(0, supplier.walletListings.get(), "no seam of the build listed the wallet: " + chain);
+        for (Transaction body : evaluator.bodies) {
+            assertEquals(List.of(ref(thin)), walletInputs(body, universe),
+                    "a body that reached the evaluator spends the token output alone, never U: " + chain);
+        }
+    }
+
+    /**
+     * (e) Coverage (m3). C is the ONLY collateral, so its lovelace is the whole capacity: a 1-ADA C cannot
+     * cover {@code ceil(fee × collateral_percent)}, and the build refuses {@code INSUFFICIENT_COLLATERAL},
+     * naming C, rather than return a body whose collateral return is negative — the unparseable artefact of
+     * CCL trap 16.
+     */
+    @Test
+    void aCollateralTooSmallForTheFeeIsRefusedInsufficientCollateralNamingC() {
+        Fixture fixture = fixture();
+        Utxo smallC = LoanFixtures.adaUtxo("c6".repeat(32), 0, LoanFixtures.botAddress(), 1_000_000L);
+        List<Utxo> universe = new ArrayList<>(universe(fixture));
+        universe.add(smallC);
+        var r = fixture.request();
+        var request = new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
+                r.bondUtxo(), r.walletUtxo(), r.configUtxo(), r.lmConfigUtxo(), r.oracle(), r.principalOracle(),
+                r.validFromMillis(), r.validToMillis(), r.validFromSlot(), r.validToSlot(), r.changeAddress(),
+                r.referenceScripts(), r.oracleWindowMarginMillis(), smallC);
+
+        LiquidateTransactionBuilder.RefusedException refused = assertThrows(
+                LiquidateTransactionBuilder.RefusedException.class,
+                () -> new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK,
+                        LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams()).build(request));
+
+        String chain = LiquidationExecutor.causeChain(refused);
+        assertTrue(chain.contains("INSUFFICIENT_COLLATERAL"), chain);
+        assertTrue(chain.contains(ref(smallC)), "the refusal names C: " + chain);
+    }
+
+    /**
+     * Task 1's guard: a collateral that is missing, is not ada-only (here it carries the principal token), or
+     * IS the designated wallet input is refused by name — {@code COLLATERAL_UTXO_INVALID} — before anything is
+     * priced, and nothing is evaluated.
+     */
+    @Test
+    void anInvalidCollateralIsRefusedByNameBeforeAnythingIsPriced() {
+        Utxo tokenOutput = tokenOutput(10_000_000L);
+        List<Utxo> universe = rolesUniverse(tokenOutput);
+        java.util.Map<String, Utxo> invalid = new java.util.LinkedHashMap<>();
+        invalid.put("missing", null);
+        invalid.put("not ada-only", tokenOutput);
+        invalid.put("the designated input itself", ROLE_U);
+        invalid.forEach((what, collateral) -> {
+            BodyRecorder evaluator = new BodyRecorder(null);
+            IllegalStateException refused = assertThrows(IllegalStateException.class,
+                    () -> productionOver(new WalletListings(universe), evaluator)
+                            .build(rolesRequest(ROLE_U, false, collateral)), what);
+            assertTrue(refused.getMessage().startsWith("COLLATERAL_UTXO_INVALID"),
+                    what + ": " + refused.getMessage());
+            assertEquals(0, evaluator.bodies.size(), what + ": nothing is evaluated");
+        });
+    }
+
+    private static Utxo tokenOutput(long lovelace) {
+        return LoanFixtures.utxo("e1".repeat(32), 0, LoanFixtures.botAddress(), List.of(
+                Amount.lovelace(BigInteger.valueOf(lovelace)),
+                Amount.asset(LoanFixtures.unit(TOKEN_PRINCIPAL), BigInteger.valueOf(50_000_000L))), null);
+    }
+
+    /**
+     * The fixture universe with the funded wallet utxo replaced by the role-shaped wallet — C (already in
+     * {@link #universe}), U, {@code tokenOutput} and a published reference script at the bot's address — plus
+     * the token principal oracle's feed and Charli3 provider outputs.
+     */
+    private static List<Utxo> rolesUniverse(Utxo tokenOutput) {
+        List<Utxo> universe = new ArrayList<>(universe(fixture()).stream()
+                .filter(u -> !(u.getTxHash().equals(TX_WALLET) && u.getOutputIndex() == 0))
+                .toList());
+        universe.addAll(List.of(ROLE_U, tokenOutput, publishedScriptUtxo(20_000_000L)));
+        universe.add(LoanFixtures.utxo(TOKEN_PRINCIPAL_ORACLE_REF_INPUT.getTransactionId(),
+                TOKEN_PRINCIPAL_ORACLE_REF_INPUT.getIndex(), LoanFixtures.entAddress(TOKEN_PRINCIPAL_ORACLE_CREDENTIAL),
+                List.of(Amount.lovelace(BigInteger.valueOf(1_038_710L)),
+                        Amount.asset(LoanFixtures.unit(TOKEN_PRINCIPAL_ORACLE_NFT), BigInteger.ONE)), null));
+        universe.add(LoanFixtures.utxo(TOKEN_PRINCIPAL_C3_PROVIDER.getTransactionId(),
+                TOKEN_PRINCIPAL_C3_PROVIDER.getIndex(), LoanFixtures.entAddress("8c".repeat(28)),
+                List.of(Amount.lovelace(BigInteger.valueOf(2_000_000L))), null));
+        return universe;
+    }
+
+    /** The fixture request with {@code walletUtxo}, {@code collateralUtxo} and, if asked, the token principal. */
+    private static LiquidatePayInAdvanceTransactionBuilder.Request rolesRequest(Utxo walletUtxo, boolean tokenPrincipal,
+                                                                                Utxo collateralUtxo) {
+        var r = fixture().request();
+        Loan loan = r.loan();
+        if (tokenPrincipal) {
+            LoanDatum ada = loan.datum();
+            LoanDatum token = new LoanDatum(ada.doneRecasts(), ada.principalAmount(), ada.lendDate(),
+                    ada.repaidInstallments(), ada.interestRate(), ada.totalInstallments(), TOKEN_PRINCIPAL,
+                    TOKEN_PRINCIPAL_ORACLE_NFT, ada.installmentPeriod(), ada.initialGracePeriod(),
+                    ada.liquidationMode(), ada.repaymentMode(), ada.repaymentTimeWindow(),
+                    ada.penaltyFeeForLateRepayment(), ada.repaymentReceipts(), ada.originId(), ada.collateral());
+            loan = new Loan(LOAN_TX, LOAN_OUTPUT_INDEX, LOAN_ADDRESS, LOAN_ID, BigInteger.valueOf(COLLATERAL_AMOUNT),
+                    BigInteger.valueOf(LOAN_LOVELACE), token);
+        }
+        OracleEntry principalOracle = !tokenPrincipal ? null : LoanFixtures.charli3(TOKEN_PRINCIPAL,
+                TOKEN_PRINCIPAL_ORACLE_NFT, TOKEN_PRINCIPAL_ORACLE_CREDENTIAL,
+                OraclePriceFeed.priceDataCharlie(TOKEN_PRINCIPAL, BigInteger.ONE, BigInteger.ONE,
+                        FEED_VALID_FROM, FEED_VALID_TO),
+                TOKEN_PRINCIPAL_ORACLE_REF_INPUT, TOKEN_PRINCIPAL_ORACLE_REF_SCRIPT, TOKEN_PRINCIPAL_C3_PROVIDER);
+        return new LiquidatePayInAdvanceTransactionBuilder.Request(loan, r.loanUtxo(), r.bond(), r.bondUtxo(),
+                walletUtxo, r.configUtxo(), r.lmConfigUtxo(), r.oracle(), principalOracle, r.validFromMillis(),
+                r.validToMillis(), r.validFromSlot(), r.validToSlot(), r.changeAddress(), r.referenceScripts(),
+                r.oracleWindowMarginMillis(), collateralUtxo);
+    }
+
+    /** The production constructor — the one YaciConfig calls — over {@code supplier}. */
+    private static LiquidatePayInAdvanceTransactionBuilder productionOver(UtxoSupplier supplier,
+                                                                          TransactionEvaluator evaluator) {
+        return new LiquidatePayInAdvanceTransactionBuilder(REGISTRY, LoanFixtures.NETWORK, supplier,
+                EvalFixtures.protocolParams(), new HashCheckedScriptSupplier(rigScripts()), evaluator);
+    }
+
+    private static String ref(Utxo utxo) {
+        return utxo.getTxHash() + "#" + utxo.getOutputIndex();
+    }
+
+    private static List<String> inputRefs(Transaction body) {
+        return body.getBody().getInputs().stream().map(in -> in.getTransactionId() + "#" + in.getIndex()).toList();
+    }
+
+    private static List<String> collateralRefs(Transaction body) {
+        return body.getBody().getCollateral() == null ? List.of() : body.getBody().getCollateral().stream()
+                .map(in -> in.getTransactionId() + "#" + in.getIndex()).toList();
+    }
+
+    /** The refs of {@code body}'s inputs whose output, in {@code universe}, is at the bot's payment credential. */
+    private static List<String> walletInputs(Transaction body, List<Utxo> universe) {
+        String wallet = paymentCredentialOf(LoanFixtures.botAddress());
+        List<String> spent = new ArrayList<>();
+        for (String input : inputRefs(body)) {
+            universe.stream().filter(u -> ref(u).equals(input)).findFirst()
+                    .filter(u -> wallet.equals(paymentCredentialOf(u.getAddress())))
+                    .ifPresent(u -> spent.add(input));
+        }
+        return spent;
+    }
+
+    /**
+     * CCL trap 26: for every unit, inputs (+ mint) == outputs (+ fee), and no output holds a negative quantity.
+     * Every input must resolve in {@code universe} — an input the rig does not know is a failure, not a skip.
+     */
+    private static void assertConserved(Transaction body, List<Utxo> universe) {
+        java.util.Map<String, BigInteger> supply = new java.util.HashMap<>();
+        for (String input : inputRefs(body)) {
+            Utxo utxo = universe.stream().filter(u -> ref(u).equals(input)).findFirst()
+                    .orElseThrow(() -> new AssertionError("an input the universe does not hold: " + input));
+            utxo.getAmount().forEach(amount -> supply.merge(amount.getUnit(), amount.getQuantity(), BigInteger::add));
+        }
+        if (body.getBody().getMint() != null) {
+            body.getBody().getMint().forEach(multiAsset -> multiAsset.getAssets().forEach(asset -> supply.merge(
+                    multiAsset.getPolicyId() + HexUtil.encodeHexString(asset.getNameAsBytes()), asset.getValue(),
+                    BigInteger::add)));
+        }
+        java.util.Map<String, BigInteger> demand = new java.util.HashMap<>();
+        demand.merge(AssetType.LOVELACE, body.getBody().getFee(), BigInteger::add);
+        for (TransactionOutput output : body.getBody().getOutputs()) {
+            assertTrue(output.getValue().getCoin().signum() >= 0, "an output holds negative ada: " + output);
+            demand.merge(AssetType.LOVELACE, output.getValue().getCoin(), BigInteger::add);
+            if (output.getValue().getMultiAssets() != null) {
+                output.getValue().getMultiAssets().forEach(multiAsset -> multiAsset.getAssets().forEach(asset -> {
+                    assertTrue(asset.getValue().signum() >= 0, "an output holds a negative quantity: " + output);
+                    demand.merge(multiAsset.getPolicyId() + HexUtil.encodeHexString(asset.getNameAsBytes()),
+                            asset.getValue(), BigInteger::add);
+                }));
+            }
+        }
+        supply.values().removeIf(v -> v.signum() == 0);
+        demand.values().removeIf(v -> v.signum() == 0);
+        assertEquals(supply, demand, "inputs (+ mint) must equal outputs (+ fee), per unit");
+    }
+
+    /**
+     * The injected supplier, counting every listing of the bot's wallet address made through it — the
+     * listing coin selection makes to find a balancing input. The builder hands cardano-client-lib only a
+     * {@link DesignatedInputUtxoSupplier} view, which answers for the wallet itself, so a build over this
+     * supplier lists the wallet here ZERO times; a count above zero is a seam that can reach a second wallet
+     * output.
+     */
+    private static final class WalletListings implements UtxoSupplier {
+        final UtxoSupplier delegate;
+        final AtomicInteger walletListings = new AtomicInteger();
+
+        WalletListings(List<Utxo> universe) {
+            this.delegate = LoanFixtures.utxoSupplier(universe);
+        }
+
+        @Override
+        public List<Utxo> getPage(String address, Integer nrOfItems, Integer page, OrderEnum order) {
+            if (LoanFixtures.botAddress().equals(address)) {
+                walletListings.incrementAndGet();
+            }
+            return delegate.getPage(address, nrOfItems, page, order);
+        }
+
+        @Override
+        public Optional<Utxo> getTxOutput(String txHash, int outputIndex) {
+            return delegate.getTxOutput(txHash, outputIndex);
+        }
+    }
+
+    /**
+     * Records every body handed to it, deserialised, then answers through {@code delegate} — or, with none,
+     * prices every redeemer the body carries at {@link #FIXED_COST}.
+     */
+    private static final class BodyRecorder implements TransactionEvaluator {
+        final TransactionEvaluator delegate;
+        final List<Transaction> bodies = new ArrayList<>();
+
+        BodyRecorder(TransactionEvaluator delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Result<List<EvaluationResult>> evaluateTx(byte[] cbor, Set<Utxo> inputUtxos)
+                throws com.bloxbean.cardano.client.api.exception.ApiException {
+            Transaction body;
+            try {
+                body = Transaction.deserialize(cbor);
+            } catch (Exception e) {
+                throw new AssertionError("the evaluator was handed bytes that do not deserialise", e);
+            }
+            bodies.add(body);
+            if (delegate != null) {
+                return delegate.evaluateTx(cbor, inputUtxos);
+            }
+            List<EvaluationResult> costs = new ArrayList<>();
+            for (Redeemer redeemer : body.getWitnessSet().getRedeemers()) {
+                costs.add(new EvaluationResult(redeemer.getTag(), redeemer.getIndex().intValue(), FIXED_COST));
+            }
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Result<List<EvaluationResult>> ok = (Result<List<EvaluationResult>>) Result.success("ok").withValue(costs);
+            return ok;
+        }
     }
 
 
@@ -1137,7 +1476,7 @@ class LiquidatePayInAdvanceDryEvalTest {
         return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
                 r.bondUtxo(), r.walletUtxo(), r.configUtxo(), r.lmConfigUtxo(), narrowed, r.principalOracle(),
                 r.validFromMillis(), r.validToMillis(), r.validFromSlot(), r.validToSlot(),
-                r.changeAddress(), r.referenceScripts(), r.oracleWindowMarginMillis());
+                r.changeAddress(), r.referenceScripts(), r.oracleWindowMarginMillis(), r.collateralUtxo());
     }
 
     /**
@@ -1243,12 +1582,14 @@ class LiquidatePayInAdvanceDryEvalTest {
                         validToMillis, slots[0], slots[1], LoanFixtures.botAddress(),
                         // All-inline shape: every validator travels in the witness set.
                         LiquidateTransactionBuilder.ReferenceScripts.none(),
-                        ORACLE_WINDOW_MARGIN_MILLIS);
+                        ORACLE_WINDOW_MARGIN_MILLIS,
+                        // FAB-185 — role C, the only collateral.
+                        COLLATERAL_UTXO);
         return new Fixture(loan, loanUtxo, bond, bondUtxo, oracle, request);
     }
 
     static List<Utxo> universe(Fixture fixture) {
-        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO, COLLATERAL_UTXO,
                 fixture.loanUtxo(), fixture.bondUtxo()));
         universe.add(LoanFixtures.utxo(ORACLE_REF_INPUT.getTransactionId(), ORACLE_REF_INPUT.getIndex(),
                 ORACLE_ADDRESS, List.of(Amount.lovelace(BigInteger.valueOf(1_038_710L)),

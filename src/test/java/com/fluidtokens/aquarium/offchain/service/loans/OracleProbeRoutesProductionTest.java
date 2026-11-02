@@ -65,6 +65,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -522,15 +523,26 @@ class OracleProbeRoutesProductionTest {
     }
 
     /**
-     * FAB-185 r2 (F2), PIA: the token-principal pay-in-advance, built by {@code YaciConfig}'s own builder
-     * bean, SPENDS exactly its TOKEN output from the wallet — not U, and never C. Read off the body the bean
-     * handed to the evaluator. The collateral field is not asserted: the builders still pick their own
-     * collateral until FAB-185-2..4.
+     * FAB-185 r2 (F2) and FAB-185-3 (f), PIA: the token-principal pay-in-advance, through the executor's cycle
+     * and {@code YaciConfig}'s own builder bean, SPENDS exactly its TOKEN output from the wallet — once, not
+     * U, and never C — and pins exactly [C] as its collateral. Read twice: off the body the bean handed to the
+     * evaluator, and off the bytes the executor recorded for the candidate ({@code txCborHex}: the shadow
+     * rehearsal of exactly what LIVE would sign and submit), whose every redeemer carries the mocked
+     * Blockfrost evaluator's ex-units.
+     * <p>
+     * The wallet is the production shape: U holds the working capital and is LARGER than C. With
+     * {@link #ADA_WALLET} (60 ADA) in its place, C would be the largest ada-only output, so a builder that
+     * chose its own collateral largest-first ({@code collateralInputsFor}) would land on C by coincidence and
+     * this test could not tell pinning from choosing.
      */
     @Test
     void payInAdvanceATokenPrincipalSpendsExactlyItsTokenOutputAndNeverC() throws Exception {
+        Utxo u = LoanFixtures.adaUtxo("e2".repeat(32), 0, PREVIEW_ACCOUNT.baseAddress(), 1_000_000_000L);
         PayInAdvanceRig rig = new PayInAdvanceRig().allLive()
-                .wire(AppConfig.LiquidationConfiguration.Mode.SHADOW, List.of(ADA_WALLET, TOKEN_WALLET));
+                .wire(AppConfig.LiquidationConfiguration.Mode.SHADOW, List.of(u, TOKEN_WALLET));
+        assertTrue(u.getAmount().getFirst().getQuantity()
+                        .compareTo(rig.roleC().getAmount().getFirst().getQuantity()) > 0,
+                "fixture: U is larger than C, as in production");
 
         rig.cycles(PIA_NOW, 1);
 
@@ -538,6 +550,27 @@ class OracleProbeRoutesProductionTest {
         assertEquals(Set.of(ref(TOKEN_WALLET)), rig.walletInputs(body),
                 "the wallet funds this build with its TOKEN output alone: " + Rig.inputs(body));
         assertFalse(Rig.inputs(body).contains(ref(rig.roleC())), "C is never spent: " + Rig.inputs(body));
+        assertFalse(Rig.inputs(body).contains(ref(u)), "nor U: " + Rig.inputs(body));
+
+        List<LiquidationDecision> decisions = rig.decisions();
+        assertEquals(1, decisions.size(), decisions.toString());
+        assertNotNull(decisions.getFirst().txCborHex(), "the executor recorded the built bytes: " + decisions);
+        Transaction built = Transaction.deserialize(HexUtil.decodeHexString(decisions.getFirst().txCborHex()));
+        List<String> spent = built.getBody().getInputs().stream().map(OracleProbeRoutesProductionTest::ref).toList();
+        assertEquals(Set.of(ref(TOKEN_WALLET)), rig.walletInputs(built),
+                "the recorded bytes spend the TOKEN output alone from the wallet: " + spent);
+        assertEquals(1, spent.stream().filter(ref(TOKEN_WALLET)::equals).count(), "spent once: " + spent);
+        assertFalse(spent.contains(ref(rig.roleC())), "C is never spent: " + spent);
+        assertFalse(spent.contains(ref(u)), "nor U: " + spent);
+        assertEquals(List.of(ref(rig.roleC())),
+                built.getBody().getCollateral().stream().map(OracleProbeRoutesProductionTest::ref).toList(),
+                "the collateral is exactly C");
+        assertFalse(built.getWitnessSet().getRedeemers().isEmpty(), "a pay-in-advance liquidation has redeemers");
+        for (Redeemer redeemer : built.getWitnessSet().getRedeemers()) {
+            assertEquals(new ExUnits(BigInteger.valueOf(400_000), BigInteger.valueOf(150_000_000)),
+                    redeemer.getExUnits(), redeemer.getTag() + "#" + redeemer.getIndex()
+                            + " carries the mocked evaluator's ex-units, never CCL's placeholder");
+        }
     }
 
     /** (3) PIA: SHADOW probes too, and refuses on a spent provider. */

@@ -793,8 +793,9 @@ class LiquidationSubmitVetoTest {
             Map<String, Utxo> unspent = new LinkedHashMap<>();
             unspent.put(scenario.loan().loan().utxoRef(), scenario.loan().utxo());
             unspent.put(scenario.bond().bond().utxoRef(), scenario.bond().utxo());
-            // FAB-185: ONE wallet list, read by the executor and resolvable by the plain builder — it pins the
-            // executor's role C as collateral, and CCL resolves a pinned collateral input by out-ref.
+            // FAB-185: ONE wallet list, read by the executor and resolvable by the plain AND pay-in-advance
+            // builders — each pins the executor's role C as collateral, and CCL resolves a pinned collateral
+            // input by out-ref.
             List<Utxo> walletUtxos = wallet != null ? wallet
                     : LoanFixtures.shapedWallet(params, ACCOUNT.baseAddress(), WALLET_UTXO);
             List<Utxo> builderUniverse = new ArrayList<>(universe);
@@ -816,7 +817,7 @@ class LiquidationSubmitVetoTest {
             PayInAdvanceLiquidationRouter payInAdvanceRouter = new PayInAdvanceLiquidationRouter(
                     LoanFixtures.registry(), LoanFixtures.converters(), configuration,
                     new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
-                            LoanFixtures.utxoSupplier(universe), protocolParams()));
+                            LoanFixtures.utxoSupplier(builderUniverse), protocolParams()));
             LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                     new FakeAppUtxoService(walletUtxos),
                     account, new FakeScanner(List.of(scenario.assessment())),

@@ -504,10 +504,19 @@ class LiquidatePayInAdvanceLiveDryEvalTest {
                                 + " alongside >= " + requiredAda + " lovelace (fee ceiling + min-ada rider) — "
                                 + "this is a wallet-funding gap, not a rig or validator defect"));
 
+        // FAB-185 — role C, resolved from the REAL wallet exactly as the executor resolves it, and already in
+        // the universe above (the full wallet set): the builder pins it as the only collateral.
+        Utxo collateralUtxo = com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles.resolve(walletUtxos,
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(liveParams))
+                .c()
+                .orElseThrow(() -> new AssertionError("no role-C output at " + realWallet + " — no ada-only "
+                        + "output of exactly the collateral amount; this is a wallet-shape gap, not a rig or "
+                        + "validator defect"));
+
         var request = new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond, bondUtxo,
                 walletUtxo, configUtxo, lmConfigUtxo, fldtEntry, usdmEntry,
                 validFromMillis, validToMillis, slots[0], slots[1],
-                walletUtxo.getAddress(), scripts, ORACLE_WINDOW_MARGIN_MILLIS);
+                walletUtxo.getAddress(), scripts, ORACLE_WINDOW_MARGIN_MILLIS, collateralUtxo);
 
         Transaction transaction = builder.build(request);
         return new Built(transaction, universe, List.of(fldtOracleScript, usdmOracleScript), request, numbers,

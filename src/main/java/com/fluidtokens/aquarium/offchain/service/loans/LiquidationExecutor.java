@@ -1546,6 +1546,8 @@ public class LiquidationExecutor {
                                             payInAdvancePrincipal.toUnit(), lenderPayout,
                                             WalletRoles.tokenOutputRequiredAda(feeCeiling), needed));
                         },
+                        // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
+                        walletCheck.roles().c().orElse(null),
                         validFromMillis,
                         validToMillis);
                 // ⛔ THE AMOUNT — "PAYS the lender 1,033,850,000 c48cbb3d…0014df105553444d and

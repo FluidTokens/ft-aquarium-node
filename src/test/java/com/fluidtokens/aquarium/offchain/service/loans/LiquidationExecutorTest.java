@@ -963,10 +963,20 @@ class LiquidationExecutorTest {
      */
     private static Wiring convertWiring(ProtocolParamsSupplier payInAdvanceParams,
                                         LiquidationAssessment assessment) {
-        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        return convertWiring(payInAdvanceParams, assessment, shadow(SMALL_MARGIN), shaped(WALLET_UTXO));
+    }
 
-        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
-                F855.loanUtxo(), F855.bondUtxo()));
+    /**
+     * As above, with the configuration and the executor's wallet list made explicit too — FAB-185-3 (g) runs
+     * the f855 ada-principal loan against a DISABLED {@code lovelace} market and a wallet of {C} alone.
+     */
+    private static Wiring convertWiring(ProtocolParamsSupplier payInAdvanceParams, LiquidationAssessment assessment,
+                                        AppConfig.LiquidationConfiguration configuration, List<Utxo> walletUtxos) {
+        // FAB-185: ONE wallet list, read by the executor and resolvable by the builders — the pay-in-advance
+        // builder pins the executor's role C as collateral, and CCL resolves a pinned collateral input by out-ref.
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
+        universe.addAll(walletUtxos);
+        universe.addAll(List.of(F855.loanUtxo(), F855.bondUtxo()));
         universe.addAll(F855.oracleUniverse());
 
         LiquidateTransactionBuilder builder = new LiquidateTransactionBuilder(LoanFixtures.registry(),
@@ -993,7 +1003,7 @@ class LiquidationExecutorTest {
                         LoanFixtures.utxoSupplier(universe), payInAdvanceParams));
 
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
-                new FakeAppUtxoService(shaped(WALLET_UTXO)), ACCOUNT, scanner, resolver, builder,
+                new FakeAppUtxoService(walletUtxos), ACCOUNT, scanner, resolver, builder,
                 router, LoanFixtures.registry(), log, metrics(), oracles, previewNetwork(),
                 LoanFixtures.protocolParams(), LoanFixtures.converters(), EXPLODING_SUBMITTER);
         return new Wiring(executor, log, scanner, resolver, oracles, blockEventListener);
@@ -2128,7 +2138,7 @@ class LiquidationExecutorTest {
                                             Utxo configUtxo, Utxo lmConfigUtxo,
                                             Map<String, OracleEntry> oraclesByUnit, BigInteger principalBalance,
                                             Function<BigInteger, Optional<Utxo>> walletSelector,
-                                            long validFromMillis, long validToMillis) {
+                                            Utxo collateralUtxo, long validFromMillis, long validToMillis) {
             nominated.add(walletSelector.apply(BigInteger.valueOf(4_000_000L)).orElse(null));
             throw nominated.size() == 1 ? badInputs() : new IllegalStateException("second build, irrelevant");
         }
@@ -2841,6 +2851,46 @@ class LiquidationExecutorTest {
                         .filter(event -> event.getFormattedMessage().contains("refused by the market gate"))
                         .filter(event -> event.getFormattedMessage().contains("MARKET_DISABLED")).count(),
                 "the router's gate refusal, at INFO, once per check: " + events);
+    }
+
+    /**
+     * FAB-185-3 (g), the FAB-185-1 r2 audit residue: the ADA-principal twin of the test above. A DISABLED
+     * {@code lovelace} ANTICIPATE market, the f855 pay-in-advance loan, and a wallet of {C} alone — no U, the
+     * role an ada principal is funded from. The market is the answer, not the missing U: exactly one
+     * {@code MARKET_DISABLED} row naming {@code lovelace}, no {@code WALLET_ROLE_MISSING} row and no WARN
+     * naming a wallet role, because a DISABLED market is refused before the role lookup on an ada principal
+     * as much as on a token one.
+     */
+    @Test
+    void aDisabledAdaAnticipateMarketWithNoUIsRefusedMarketDisabledBeforeTheRoleLookup() {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        AppConfig.LiquidationConfiguration.Market disabled = anticipateMarket("lovelace", 1_000_000_000_000L);
+        disabled.setMode(AppConfig.LiquidationConfiguration.Mode.DISABLED);
+        configuration.setMarkets(List.of(disabled));
+        List<Utxo> onlyC = shaped();
+        assertEquals(1, onlyC.size(), "fixture: the wallet is role C alone, with no U: " + onlyC);
+        Wiring wiring = convertWiring(LoanFixtures.protocolParams(), F855.assessment(), configuration, onlyC);
+
+        // F855.NOW, not NOW: the frozen fixture's oracle feed is only valid around its own instant.
+        var logger = (Logger) LoggerFactory.getLogger(LiquidationExecutor.class);
+        var appender = new ListAppender<ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            wiring.executor().cycle(F855.NOW);
+        } finally {
+            logger.detachAppender(appender);
+        }
+        List<ILoggingEvent> events = appender.list;
+
+        LiquidationDecision decision = onlyDecision(wiring);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+        assertTrue(decision.reason().startsWith("MARKET_DISABLED"), decision.reason());
+        assertTrue(decision.reason().contains("market lovelace is DISABLED"), decision.reason());
+        assertFalse("WALLET_ROLE_MISSING".equals(decision.reason()), decision.toString());
+        List<ILoggingEvent> roleWarns = events.stream().filter(event -> event.getLevel() == Level.WARN)
+                .filter(event -> event.getFormattedMessage().contains("role ")).toList();
+        assertEquals(List.of(), roleWarns, "no WARN names a wallet role");
     }
 
     /**
@@ -4645,7 +4695,7 @@ class LiquidationExecutorTest {
                                             Utxo configUtxo, Utxo lmConfigUtxo,
                                             Map<String, OracleEntry> oraclesByUnit, BigInteger principalBalance,
                                             Function<BigInteger, Optional<Utxo>> walletSelector,
-                                            long validFromMillis, long validToMillis) {
+                                            Utxo collateralUtxo, long validFromMillis, long validToMillis) {
             validFrom = validFromMillis;
             validTo = validToMillis;
             throw new IllegalStateException("captured the window; the build is not under test here");
@@ -5162,7 +5212,7 @@ class LiquidationExecutorTest {
                                             Utxo configUtxo, Utxo lmConfigUtxo,
                                             Map<String, OracleEntry> oraclesByUnit, BigInteger principalBalance,
                                             Function<BigInteger, Optional<Utxo>> walletSelector,
-                                            long validFromMillis, long validToMillis) {
+                                            Utxo collateralUtxo, long validFromMillis, long validToMillis) {
             handed.add(walletSelector.apply(payout).orElse(null));
             throw new IllegalStateException("captured the wallet input; nothing past this point is under test");
         }

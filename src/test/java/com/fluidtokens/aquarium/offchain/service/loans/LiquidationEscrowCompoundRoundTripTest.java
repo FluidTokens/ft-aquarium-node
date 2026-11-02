@@ -200,7 +200,7 @@ class LiquidationEscrowCompoundRoundTripTest {
         var request = new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond, bondUtxo, wallet,
                 base.configUtxo(), base.lmConfigUtxo(), base.oracle(), principalOracle, base.validFromMillis(),
                 base.validToMillis(), base.validFromSlot(), base.validToSlot(), base.changeAddress(),
-                base.referenceScripts(), base.oracleWindowMarginMillis());
+                base.referenceScripts(), base.oracleWindowMarginMillis(), base.collateralUtxo());
         Transaction produced = new LiquidatePayInAdvanceTransactionBuilder(PREVIEW, LoanFixtures.NETWORK,
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams()).build(request);
 

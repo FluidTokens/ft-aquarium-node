@@ -254,12 +254,24 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
         var walletPage = backend.getUtxoService().getUtxos(bot.baseAddress(), 100, 1);
         assumeTrue(walletPage.isSuccessful() && walletPage.getValue() != null,
                 "could not read the bot's wallet utxos from Blockfrost");
-        // The production filter, verbatim: ada only, no datum, no reference script.
+        // FAB-185 — role C, resolved exactly as the executor resolves it (WalletRoles, sized from the LIVE
+        // parameters): the builder pins it as the only collateral, so it must exist and is never the input.
+        Utxo collateralUtxo = com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles.resolve(
+                        walletPage.getValue(),
+                        com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(
+                                new com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier(
+                                        backend.getEpochService()).getProtocolParams()))
+                .c()
+                .orElseGet(() -> skip("no role-C output at " + bot.baseAddress() + " — the wallet holds no "
+                        + "ada-only output of exactly the collateral amount; let the node's rebalancer shape it"));
+        // The production filter, verbatim: ada only, no datum, no reference script — and not C.
         Utxo walletUtxo = walletPage.getValue().stream()
                 .filter(u -> u.getAmount().size() == 1
                         && u.getReferenceScriptHash() == null
                         && u.getInlineDatum() == null
                         && u.getDataHash() == null)
+                .filter(u -> !(u.getTxHash().equals(collateralUtxo.getTxHash())
+                        && u.getOutputIndex() == collateralUtxo.getOutputIndex()))
                 .findFirst()
                 .orElseGet(() -> skip("no spendable utxo at " + bot.baseAddress() + " — "
                         + walletPage.getValue().size() + " present, none of them ada-only AND "
@@ -305,7 +317,7 @@ class LiquidatePayInAdvanceProductionWiringLiveTest {
                 null,   // ada principal — see the Request javadoc
                 now, now + 120_000L,
                 slotOf(now - 60_000L), slotOf(now + 120_000L), bot.baseAddress(),
-                referenceScripts(), 30_000L);
+                referenceScripts(), 30_000L, collateralUtxo);
 
         // THE POINT OF THE TEST: the production constructor. Backend-supplied script supplier,
         // Blockfrost evaluator, real ledger fee.

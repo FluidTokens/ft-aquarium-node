@@ -37,6 +37,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -157,6 +158,14 @@ class PayInAdvanceLiquidationRouterTest {
     private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 60_000_000L);
+    /**
+     * FAB-185 — wallet role C, handed to the router as the executor hands it: ada-only, exactly
+     * {@code WalletShape.collateralLovelace} of this rig's parameters, and in {@link #universe()} so the
+     * builder's pinned collateral resolves by out-ref.
+     */
+    private static final Utxo COLLATERAL_UTXO = LoanFixtures.adaUtxo("c5".repeat(32), 0, LoanFixtures.botAddress(),
+            com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(
+                    EvalFixtures.protocolParams().getProtocolParams()).longValueExact());
 
     /**
      * Part 3's {@code principalBalance} argument — "ample" for every test in this class that is not
@@ -185,7 +194,7 @@ class PayInAdvanceLiquidationRouterTest {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
 
         Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS);
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS);
 
         // The parent LenderManager redeemer carries LiquidateAndPayInAdvance (constructor index 3).
         String parentReward = LoanFixtures.rewardAddress(REGISTRY.getLenderManagerWithdrawScriptHash());
@@ -246,7 +255,7 @@ class PayInAdvanceLiquidationRouterTest {
         LiquidationAssessment assessment = convertAssessment(BigInteger.ZERO, equityZeroLoanDatum());
 
         Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS);
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS);
 
         // Exactly ONE asset-manager output at equity 0: the lender's paid-in-advance principal, and no
         // borrower compensation output at all — loan_claim_action never reads one for this loan.
@@ -276,7 +285,7 @@ class PayInAdvanceLiquidationRouterTest {
         PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException refusal = assertThrows(
                 PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS));
+                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS));
         assertEquals("pay-in-advance not yet modelled for a negative equity", refusal.getMessage());
     }
 
@@ -294,7 +303,7 @@ class PayInAdvanceLiquidationRouterTest {
         // needs this same principal oracle.
         IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS));
+                        CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS));
         assertTrue(refusal.getMessage().contains("no oracle entry for principal oracle asset"),
                 refusal.getMessage());
     }
@@ -311,7 +320,7 @@ class PayInAdvanceLiquidationRouterTest {
                         new RepaymentMode.InterestOnRemainingPrincipal(BigInteger.ZERO), false));
         IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(), CONFIG_UTXO,
-                        LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS));
+                        LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS));
         assertTrue(refusal.getMessage().startsWith("ada collateral:"), refusal.getMessage());
     }
 
@@ -334,7 +343,7 @@ class PayInAdvanceLiquidationRouterTest {
         IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(), CONFIG_UTXO,
                         LM_CONFIG_UTXO, Map.of(named.oracleToken().toUnit(), wrongToken), AMPLE_BALANCE,
-                        anyWallet(), NOW, VALID_TO_MILLIS));
+                        anyWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS));
         assertTrue(refusal.getMessage().contains("pricing " + named.token().toUnit()), refusal.getMessage());
     }
 
@@ -359,7 +368,7 @@ class PayInAdvanceLiquidationRouterTest {
         // needs this same principal oracle.
         IllegalStateException refusal = assertThrows(IllegalStateException.class,
                 () -> tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                        CONFIG_UTXO, LM_CONFIG_UTXO, byUnit, AMPLE_BALANCE, tokenWallet(), NOW, VALID_TO_MILLIS));
+                        CONFIG_UTXO, LM_CONFIG_UTXO, byUnit, AMPLE_BALANCE, tokenWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS));
         assertTrue(refusal.getMessage().contains("pricing " + TOKEN_PRINCIPAL.toUnit()), refusal.getMessage());
     }
 
@@ -463,7 +472,7 @@ class PayInAdvanceLiquidationRouterTest {
                 PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException.class,
                 () -> tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
                         CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnitWithNarrowWindowPrincipal(),
-                        AMPLE_BALANCE, tokenWallet(), NOW, VALID_TO_MILLIS));
+                        AMPLE_BALANCE, tokenWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS));
         assertTrue(refusal.getMessage().contains("principal oracle feed window"), refusal.getMessage());
     }
 
@@ -483,7 +492,7 @@ class PayInAdvanceLiquidationRouterTest {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY), datum);
         Transaction tx = tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
                 CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnitWithTokenPrincipal(), AMPLE_BALANCE, tokenWallet(),
-                NOW, VALID_TO_MILLIS);
+                COLLATERAL_UTXO, NOW, VALID_TO_MILLIS);
 
         LiquidatePayInAdvanceTransactionBuilder builder = new LiquidatePayInAdvanceTransactionBuilder(
                 REGISTRY, LoanFixtures.NETWORK, LoanFixtures.utxoSupplier(tokenPrincipalUniverse()),
@@ -493,7 +502,7 @@ class PayInAdvanceLiquidationRouterTest {
         LiquidatePayInAdvanceTransactionBuilder.Request request = new LiquidatePayInAdvanceTransactionBuilder.Request(
                 loan(datum), loanUtxo(), bond(), bondUtxo(), TOKEN_WALLET_UTXO, CONFIG_UTXO, LM_CONFIG_UTXO,
                 oracle(), tokenPrincipalOracle(), NOW, VALID_TO_MILLIS, 0L, 0L,
-                TOKEN_WALLET_UTXO.getAddress(), configuration().getReferenceScripts(), 30_000L);
+                TOKEN_WALLET_UTXO.getAddress(), configuration().getReferenceScripts(), 30_000L, COLLATERAL_UTXO);
         long lenderBondOutputIndex = OutputLayout.CCL_PREPENDED_OUTPUTS;
         long assetOutputIndex = numbers.equity().signum() > 0 ? 1L : 0L;
 
@@ -539,12 +548,16 @@ class PayInAdvanceLiquidationRouterTest {
                 all.lmLiquidateAndConvertAction());
         configuration.narrowReferenceScripts(narrowed);
         router.buildConvertLiquidation(convertAssessment(BigInteger.valueOf(EQUITY)), loanUtxo(), bondUtxo(),
-                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS);
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS);
 
         assertTrue(handed.get() != null, "the router never reached the builder, so this test says nothing");
         assertEquals(narrowed, handed.get().referenceScripts(),
                 "the builder must be handed the scripts as narrowed at boot — loan-claim-action dropped — "
                         + "not the set the router saw when it was constructed");
+        // FAB-185 — and the collateral it was handed is the caller's C, passed through untouched: the router
+        // never chooses, substitutes or copies it.
+        assertSame(COLLATERAL_UTXO, handed.get().collateralUtxo(),
+                "the router must pass the executor's role C through to the builder unchanged");
     }
 
     /** {@link #configuration()} with all nine reference-script slots at distinct fake coordinates. */
@@ -635,7 +648,7 @@ class PayInAdvanceLiquidationRouterTest {
         // -29,109,347 USDM unbalanced-change bug this replaces).
         Transaction tx = tokenPrincipalRouter().buildConvertLiquidation(assessment, loanUtxo(),
                 bondUtxo(), CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnitWithTokenPrincipal(),
-                AMPLE_BALANCE, tokenWallet(), NOW, VALID_TO_MILLIS);
+                AMPLE_BALANCE, tokenWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS);
 
         // F3 — BALANCE, on the built body: no negative quantity in any output, and inputs (+ mint)
         // equal outputs (+ fee) for every asset unit. This is exactly the assertion the old fixture
@@ -812,7 +825,7 @@ class PayInAdvanceLiquidationRouterTest {
     }
 
     private static List<Utxo> universe() {
-        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO, COLLATERAL_UTXO,
                 loanUtxo(), bondUtxo()));
         universe.add(LoanFixtures.utxo(ORACLE_REF_INPUT.getTransactionId(), ORACLE_REF_INPUT.getIndex(),
                 ORACLE_ADDRESS, List.of(Amount.lovelace(BigInteger.valueOf(1_038_710L)),
@@ -975,7 +988,7 @@ class PayInAdvanceLiquidationRouterTest {
                     asked.add(payout);
                     return Optional.of(WALLET_UTXO);
                 },
-                NOW, VALID_TO_MILLIS);
+                COLLATERAL_UTXO, NOW, VALID_TO_MILLIS);
 
         assertEquals(1, asked.size(), "the selector must be consulted exactly once");
         // Re-derived from the BUILT body rather than from the router's own arithmetic: the lender's
@@ -1006,7 +1019,7 @@ class PayInAdvanceLiquidationRouterTest {
                 PayInAdvanceLiquidationRouter.WalletInputTooSmallException.class,
                 () -> router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
                         CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE,
-                        payout -> Optional.empty(), NOW, VALID_TO_MILLIS));
+                        payout -> Optional.empty(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS));
 
         assertTrue(refusal.getMessage().contains("repays the lender"),
                 "the refusal must say what the wallet was short of, not merely that it was short: "
@@ -1023,7 +1036,7 @@ class PayInAdvanceLiquidationRouterTest {
         LiquidationAssessment assessment = convertAssessment(BigInteger.valueOf(EQUITY));
 
         Transaction tx = router().buildConvertLiquidation(assessment, loanUtxo(), bondUtxo(),
-                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), NOW, VALID_TO_MILLIS);
+                CONFIG_UTXO, LM_CONFIG_UTXO, oraclesByUnit(), AMPLE_BALANCE, anyWallet(), COLLATERAL_UTXO, NOW, VALID_TO_MILLIS);
 
         assertTrue(tx.getBody().getInputs().stream()
                         .anyMatch(i -> i.getTransactionId().equals(WALLET_UTXO.getTxHash())
