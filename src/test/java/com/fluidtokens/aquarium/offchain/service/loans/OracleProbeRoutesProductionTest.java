@@ -385,7 +385,7 @@ class OracleProbeRoutesProductionTest {
             YaciConfig yaciConfig = new YaciConfig();
             probe = yaciConfig.oracleReferenceInputProbe(contentHold, backend);
             builder = yaciConfig.liquidatePayInAdvanceTransactionBuilder(PREVIEW_REGISTRY, network("preview"),
-                    contentHold, EvalFixtures.protocolParams(), noScripts, backend, probe);
+                    contentHold, EvalFixtures.protocolParams(), noScripts, yaciConfig.transactionEvaluator(backend), probe);
 
             AppConfig.LiquidationConfiguration configuration = liquidationConfiguration(mode,
                     LiquidateTransactionBuilder.ReferenceScripts.none(),
@@ -800,7 +800,7 @@ class OracleProbeRoutesProductionTest {
             YaciConfig yaciConfig = new YaciConfig();
             probe = yaciConfig.oracleReferenceInputProbe(contentHold, backend);
             builder = yaciConfig.convertTransactionBuilder(MAINNET_REGISTRY, network("mainnet"), contentHold, params,
-                    noScripts, backend, probe);
+                    noScripts, yaciConfig.transactionEvaluator(backend), probe);
 
             AppConfig.LiquidationConfiguration configuration = liquidationConfiguration(mode, references,
                     market("lovelace", AppConfig.LiquidationConfiguration.Action.CONVERT));
@@ -1118,9 +1118,10 @@ class OracleProbeRoutesProductionTest {
             YaciConfig yaciConfig = new YaciConfig();
             OracleReferenceInputProbe probe = yaciConfig.oracleReferenceInputProbe(contentHold, backend);
             ConvertTransactionBuilder convertBuilder = yaciConfig.convertTransactionBuilder(MAINNET_REGISTRY,
-                    network("mainnet"), contentHold, params, noScripts, backend, probe);
+                    network("mainnet"), contentHold, params, noScripts, yaciConfig.transactionEvaluator(backend), probe);
             LiquidatePayInAdvanceTransactionBuilder piaBuilder = yaciConfig.liquidatePayInAdvanceTransactionBuilder(
-                    MAINNET_REGISTRY, network("mainnet"), contentHold, params, noScripts, backend, probe);
+                    MAINNET_REGISTRY, network("mainnet"), contentHold, params, noScripts,
+                    yaciConfig.transactionEvaluator(backend), probe);
 
             BigInteger statedLoss = BigInteger.valueOf(-1_000_000_000_000L);
             var configuration = new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.LIVE,

@@ -4,10 +4,14 @@ import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.api.TransactionProcessor;
+import com.bloxbean.cardano.client.api.exception.ApiException;
+import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.backend.api.BackendService;
+import com.bloxbean.cardano.client.backend.api.TransactionService;
 import com.bloxbean.cardano.client.backend.api.UtxoService;
 import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
@@ -88,7 +92,7 @@ class YaciConfigWiringTest {
                 LoanFixtures.utxoSupplier(List.of()),
                 LoanFixtures.protocolParams(),
                 hash -> Optional.empty(),
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"),
+                new YaciConfig().transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")),
                 offlineProbe());
 
         Field field = LiquidateTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
@@ -121,7 +125,7 @@ class YaciConfigWiringTest {
                 LoanFixtures.utxoSupplier(List.of()),
                 LoanFixtures.protocolParams(),
                 hash -> Optional.empty(),
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                new YaciConfig().transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")));
 
         Field field = CompoundTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
         field.setAccessible(true);
@@ -154,7 +158,7 @@ class YaciConfigWiringTest {
         CompoundTransactionBuilder builder = new YaciConfig().compoundTransactionBuilder(
                 LoanFixtures.shippedPreviewRegistry(), previewNetwork(),
                 utxoSupplier, protocolParamsSupplier, scriptSupplier,
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                new YaciConfig().transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")));
 
         assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
                 "the compound builder does not hold the injected (index-first) UtxoSupplier");
@@ -193,7 +197,7 @@ class YaciConfigWiringTest {
                 LoanFixtures.utxoSupplier(List.of()),
                 LoanFixtures.protocolParams(),
                 hash -> Optional.empty(),
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"),
+                new YaciConfig().transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")),
                 offlineProbe());
 
         Field field = LiquidateTransactionBuilder.class.getDeclaredField("scriptCostEvaluator");
@@ -210,7 +214,7 @@ class YaciConfigWiringTest {
     /**
      * ⛔ FAB-134 B3b-5: the tank processor's {@code QuickTxBuilder} bean is built from the three injected
      * suppliers — the index-first {@link UtxoSupplier}, the per-epoch {@link ProtocolParamsSupplier} and
-     * the byte-serving {@link ScriptSupplier} — and a REAL {@code DefaultTransactionProcessor}.
+     * the byte-serving {@link ScriptSupplier} — and a REAL processor.
      * <p>
      * The processor is not optional here, unlike in the loans builders: the tank path SUBMITS
      * ({@code context.complete()}), and the same slot is cardano-client-lib's default script-cost
@@ -218,15 +222,25 @@ class YaciConfigWiringTest {
      * accepted by the mempool, failed in phase 2, collateral forfeit — and then fail to submit it.
      * Reverting the bean to {@code new QuickTxBuilder(bfBackendService)} turns the first three
      * assertions red: CCL builds its own Blockfrost suppliers from the backend.
+     * <p>
+     * ⛔ FAB-38: the slot is an {@code EvaluatingTransactionProcessor} — submission through Blockfrost's
+     * {@code DefaultTransactionProcessor}, evaluation through the injected evaluator bean and never through
+     * the backend's own {@code evaluateTx}. Both halves are driven, not just inspected: a processor that
+     * only submitted would ship placeholder ex-units, and one that evaluated through the backend would
+     * bypass the one evaluator every other path holds.
      */
     @Test
     void theTankQuickTxBuilderHoldsTheInjectedSuppliersAndARealProcessor() throws Exception {
         UtxoSupplier utxoSupplier = LoanFixtures.utxoSupplier(List.of());
         ProtocolParamsSupplier protocolParamsSupplier = LoanFixtures.protocolParams();
         ScriptSupplier scriptSupplier = hash -> Optional.empty();
+        BFBackendService backend = mock(BFBackendService.class);
+        TransactionService transactionService = mock(TransactionService.class);
+        when(backend.getTransactionService()).thenReturn(transactionService);
+        TransactionEvaluator evaluator = mock(TransactionEvaluator.class);
 
         QuickTxBuilder builder = new YaciConfig().quickTxBuilder(utxoSupplier, protocolParamsSupplier,
-                scriptSupplier, new BFBackendService(OFFLINE_BLOCKFROST, "dummy"));
+                scriptSupplier, backend, evaluator);
 
         assertSame(utxoSupplier, quickTxBuilderField(builder, "utxoSupplier"),
                 "the tank QuickTxBuilder does not hold the injected (index-first) UtxoSupplier: its coin "
@@ -235,10 +249,67 @@ class YaciConfigWiringTest {
                 "the tank QuickTxBuilder does not hold the injected (per-epoch) ProtocolParamsSupplier");
         assertSame(scriptSupplier, quickTxBuilderField(builder, "backendScriptSupplier"),
                 "the tank QuickTxBuilder does not hold the injected (hash-checked) ScriptSupplier");
-        assertInstanceOf(com.bloxbean.cardano.client.backend.api.DefaultTransactionProcessor.class,
+        YaciConfig.EvaluatingTransactionProcessor slot = assertInstanceOf(
+                YaciConfig.EvaluatingTransactionProcessor.class,
                 quickTxBuilderField(builder, "transactionProcessor"),
-                "the tank QuickTxBuilder has no DefaultTransactionProcessor: it can neither submit nor — the "
-                        + "same slot being the default evaluator — measure ex-units (CCL trap 8)");
+                "the tank QuickTxBuilder's processor is not the EvaluatingTransactionProcessor: it can neither "
+                        + "be trusted to submit nor — the same slot being the default evaluator — to measure "
+                        + "ex-units through the evaluator bean (CCL trap 8)");
+        assertInstanceOf(com.bloxbean.cardano.client.backend.api.DefaultTransactionProcessor.class,
+                fieldOf(slot, "submitter"),
+                "the tank processor does not submit through Blockfrost's DefaultTransactionProcessor");
+        assertSame(evaluator, fieldOf(slot, "evaluator"),
+                "the tank processor does not hold the evaluator bean it was given");
+
+        byte[] submitted = {1, 2, 3};
+        TransactionProcessor processor = slot;
+        processor.submitTransaction(submitted);
+        verify(transactionService, times(1)).submitTransaction(submitted);
+
+        byte[] evaluated = {4, 5, 6};
+        processor.evaluateTx(evaluated, Set.of());
+        verify(evaluator, times(1)).evaluateTx(evaluated, Set.of());
+        verify(transactionService, never()).evaluateTx(org.mockito.ArgumentMatchers.any(byte[].class));
+    }
+
+    /**
+     * ⛔ FAB-38: the node's one evaluator bean is exactly Blockfrost's {@code /utils/txs/evaluate} through
+     * the given backend — the expression each of the six former sites used — and nothing more. The inputs
+     * are ignored (Blockfrost resolves them itself), the backend's {@code Result} reaches the caller
+     * untouched, an {@code ApiException} propagates unchanged, and the bean cannot submit: every builder
+     * that holds it must still have no path to the wire.
+     */
+    @Test
+    void theEvaluatorBeanIsBlockfrostEvaluateThroughTheGivenBackend() throws Exception {
+        BFBackendService backend = mock(BFBackendService.class);
+        TransactionService transactionService = mock(TransactionService.class);
+        when(backend.getTransactionService()).thenReturn(transactionService);
+        Set<Utxo> inputs = Set.of(Utxo.builder().txHash("ab".repeat(32)).outputIndex(0).build());
+
+        byte[] cbor = {7, 8, 9};
+        @SuppressWarnings("unchecked")
+        Result<List<EvaluationResult>> answer = Result.success("evaluated");
+        when(transactionService.evaluateTx(cbor)).thenReturn(answer);
+
+        TransactionEvaluator bean = new YaciConfig().transactionEvaluator(backend);
+
+        assertSame(answer, bean.evaluateTx(cbor, inputs),
+                "the evaluator bean did not hand back Blockfrost's own Result unchanged");
+        verify(transactionService, times(1)).evaluateTx(cbor);
+
+        byte[] failing = {10, 11};
+        ApiException boom = new ApiException("boom");
+        when(transactionService.evaluateTx(failing)).thenThrow(boom);
+        assertSame(boom, org.junit.jupiter.api.Assertions.assertThrows(ApiException.class,
+                        () -> bean.evaluateTx(failing, inputs)),
+                "an ApiException from Blockfrost must reach cardano-client-lib unchanged");
+
+        assertFalse(bean instanceof TransactionProcessor,
+                "the evaluator bean is a TransactionProcessor: every builder holding it could submit");
+        for (java.lang.reflect.Method method : bean.getClass().getMethods()) {
+            assertFalse(method.getName().toLowerCase().contains("submit"),
+                    "the evaluator bean exposes " + method.getName() + ": a submission path through the back door");
+        }
     }
 
     private static Object quickTxBuilderField(QuickTxBuilder builder, String name) throws Exception {
@@ -270,7 +341,8 @@ class YaciConfigWiringTest {
      * The tank processor reads protocol parameters through the injected supplier bean, not through a
      * Blockfrost supplier it builds for itself. Driven through {@code processPayments()} with an empty
      * tank set and an empty wallet, which reaches the params read and then returns before anything is
-     * built: the counting supplier must be asked exactly once, and the backend's epoch service never.
+     * built: the counting supplier must be asked exactly once. (FAB-38: no backend reaches the processor
+     * any more — its fifth collaborator is the evaluator bean — so there is no epoch service left to watch.)
      */
     @Test
     void theTankProcessorReadsProtocolParamsThroughTheInjectedSupplier() {
@@ -278,7 +350,6 @@ class YaciConfigWiringTest {
                 .transactionId("0000000000000000000000000000000000000000000000000000000000000000")
                 .index(0).build();
 
-        BFBackendService backend = mock(BFBackendService.class);
         BlockEventListener blockEventListener = mock(BlockEventListener.class);
         when(blockEventListener.getIsSyncing()).thenReturn(new AtomicBoolean(false));
         StakerService stakerService = mock(StakerService.class);
@@ -301,7 +372,7 @@ class YaciConfigWiringTest {
                 aquarium,
                 mock(Account.class),
                 mock(QuickTxBuilder.class),
-                backend,
+                mock(TransactionEvaluator.class),
                 injected,
                 mock(UtxoSupplier.class),
                 mock(UtxoRepository.class),
@@ -316,7 +387,6 @@ class YaciConfigWiringTest {
 
         assertEquals(1, calls.get(),
                 "the tank processor did not read protocol parameters through the injected supplier");
-        verify(backend, never()).getEpochService();
     }
 
     /**
@@ -396,7 +466,8 @@ class YaciConfigWiringTest {
         LiquidateTransactionBuilder builder = new YaciConfig().liquidateTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(), LoanFixtures.converters(),
                 utxoSupplier, protocolParamsSupplier, scriptSupplier,
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), offlineProbe());
+                new YaciConfig().transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")),
+                offlineProbe());
 
         assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
                 "the builder does not hold the injected (index-first) UtxoSupplier");
@@ -427,7 +498,8 @@ class YaciConfigWiringTest {
         LiquidatePayInAdvanceTransactionBuilder builder = new YaciConfig().liquidatePayInAdvanceTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(),
                 utxoSupplier, protocolParamsSupplier, scriptSupplier,
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), offlineProbe());
+                new YaciConfig().transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")),
+                offlineProbe());
 
         assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
                 "the pay-in-advance builder does not hold the injected (index-first) UtxoSupplier");
@@ -469,7 +541,8 @@ class YaciConfigWiringTest {
         ConvertTransactionBuilder builder = new YaciConfig().convertTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(),
                 utxoSupplier, protocolParamsSupplier, scriptSupplier,
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), offlineProbe());
+                new YaciConfig().transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")),
+                offlineProbe());
 
         assertSame(utxoSupplier, fieldOf(builder, "utxoSupplier"),
                 "the convert builder does not hold the injected (index-first) UtxoSupplier");
@@ -653,7 +726,7 @@ class YaciConfigWiringTest {
         LiquidateTransactionBuilder builder = config.liquidateTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(), LoanFixtures.converters(),
                 utxoSupplier, LoanFixtures.protocolParams(), hash -> Optional.empty(),
-                new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), probe);
+                config.transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")), probe);
 
         assertNotNull(fieldOf(builder, "oracleReferenceInputProbe"),
                 "the production liquidation builder carries NO oracle probe: a spent feed would reach "
@@ -687,10 +760,12 @@ class YaciConfigWiringTest {
 
         LiquidatePayInAdvanceTransactionBuilder payInAdvance = config.liquidatePayInAdvanceTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(), utxoSupplier, LoanFixtures.protocolParams(),
-                hash -> Optional.empty(), new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), probe);
+                hash -> Optional.empty(),
+                config.transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")), probe);
         ConvertTransactionBuilder convert = config.convertTransactionBuilder(
                 LoanFixtures.registry(), previewNetwork(), utxoSupplier, LoanFixtures.protocolParams(),
-                hash -> Optional.empty(), new BFBackendService(OFFLINE_BLOCKFROST, "dummy"), probe);
+                hash -> Optional.empty(),
+                config.transactionEvaluator(new BFBackendService(OFFLINE_BLOCKFROST, "dummy")), probe);
 
         assertNotNull(fieldOf(payInAdvance, "oracleReferenceInputProbe"),
                 "the production pay-in-advance builder carries NO oracle probe");

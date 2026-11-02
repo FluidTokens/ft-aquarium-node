@@ -178,7 +178,8 @@ class LiquidateOracleProbeProductionTest {
 
             YaciConfig yaciConfig = new YaciConfig();
             builder = yaciConfig.liquidateTransactionBuilder(LoanFixtures.registry(), previewNetwork(),
-                    LoanFixtures.converters(), contentHold, LoanFixtures.protocolParams(), noScripts, backend,
+                    LoanFixtures.converters(), contentHold, LoanFixtures.protocolParams(), noScripts,
+                    yaciConfig.transactionEvaluator(backend),
                     yaciConfig.oracleReferenceInputProbe(contentHold, backend));
 
             AppConfig.LiquidationConfiguration configuration = config(mode);

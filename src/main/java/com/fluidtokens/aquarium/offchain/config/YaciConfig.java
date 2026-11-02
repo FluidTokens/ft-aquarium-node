@@ -3,7 +3,12 @@ package com.fluidtokens.aquarium.offchain.config;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.api.TransactionProcessor;
 import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.api.exception.ApiException;
+import com.bloxbean.cardano.client.api.model.EvaluationResult;
+import com.bloxbean.cardano.client.api.model.Result;
+import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.backend.api.DefaultProtocolParamsSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultScriptSupplier;
 import com.bloxbean.cardano.client.backend.api.DefaultTransactionProcessor;
@@ -29,15 +34,44 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.time.Clock;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 
 @Configuration
 @Slf4j
 public class YaciConfig {
 
     /**
+     * ⛔ FAB-38: <b>the node's ONE script-cost evaluator</b>, and the only place in {@code src/main} that
+     * asks Blockfrost's {@code /utils/txs/evaluate} for ex-units. Every path that prices a script
+     * transaction holds this instance: the four loans builders (liquidate, compound, convert,
+     * pay-in-advance) as their {@code scriptCostEvaluator}, the tank {@code QuickTxBuilder} through its
+     * processor slot ({@link EvaluatingTransactionProcessor}), and {@code ScheduledTransactionService}'s
+     * dump-mode wrapper. Replacing this bean replaces evaluation for all of them at once.
+     * <p>
+     * It evaluates against the chain's own protocol parameters and cost models, so "is our pinned cost
+     * model still the chain's?" cannot arise, and Blockfrost resolves the transaction's inputs itself
+     * (they are real on-chain UTxOs in production) — so {@code inputUtxos} is ignored, as
+     * cardano-client-lib's {@link DefaultTransactionProcessor} ignores it too. It runs on the caller's
+     * thread through the {@link BFBackendService} bean, so the bounded backend's evaluation-stage timeout
+     * and per-pass deadline apply exactly as they did when each site made this call itself.
+     * <p>
+     * ⛔ <b>An evaluator, never a processor.</b> {@link TransactionEvaluator} declares one operation and
+     * no submit method, so every holder of this bean can price a transaction and nothing else; the loans
+     * builders keep having no path to the wire. Submission exists only inside the tank builder's
+     * processor, which is not a bean.
+     */
+    @Bean
+    public TransactionEvaluator transactionEvaluator(BFBackendService bfBackendService) {
+        return (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
+    }
+
+    /**
      * The tank processor's builder ({@code ScheduledTransactionService}, by injection — the one
      * {@code QuickTxBuilder} in this node with no {@code new} at its call site). FAB-134 B3b-5: built from
-     * the three injected suppliers below and Blockfrost's transaction processor, and from nothing else.
+     * the three injected suppliers below, Blockfrost's transaction submission and the
+     * {@link #transactionEvaluator} bean, and from nothing else.
      * <ul>
      *   <li>{@link UtxoSupplier} — the index-first bean: coin selection, the pinned collateral and the
      *       parameters and staker reference inputs come from the local index; only out-refs the index
@@ -51,9 +85,10 @@ public class YaciConfig {
      * builders, the tank path submits ({@code context.complete()}), so it needs a processor; and
      * cardano-client-lib uses that same slot as the default script-cost evaluator (CCL trap 8). A null
      * here would not make the tank "safely submit-incapable": it would build every tank transaction on
-     * placeholder ex-units. {@link DefaultTransactionProcessor} is both Blockfrost's
-     * {@code /tx/submit} and its {@code /utils/txs/evaluate} — the two Blockfrost calls a tank build
-     * still makes by design.
+     * placeholder ex-units. So the slot holds an {@link EvaluatingTransactionProcessor}: submission is
+     * {@link DefaultTransactionProcessor}'s Blockfrost {@code /tx/submit}, and evaluation is the
+     * {@link #transactionEvaluator} bean — the same instance every loans builder holds — never a
+     * processor-local evaluation.
      * <p>
      * Never {@code new QuickTxBuilder(bfBackendService)}: that form builds its own Blockfrost UTxO,
      * protocol-params and script suppliers and bypasses all three beans ({@code BlockfrostBuildWiringGuardTest}).
@@ -62,9 +97,43 @@ public class YaciConfig {
     public QuickTxBuilder quickTxBuilder(UtxoSupplier utxoSupplier,
                                          ProtocolParamsSupplier protocolParamsSupplier,
                                          ScriptSupplier scriptSupplier,
-                                         BFBackendService bfBackendService) {
+                                         BFBackendService bfBackendService,
+                                         TransactionEvaluator transactionEvaluator) {
         return new QuickTxBuilder(utxoSupplier, protocolParamsSupplier, scriptSupplier,
-                new DefaultTransactionProcessor(bfBackendService.getTransactionService()));
+                new EvaluatingTransactionProcessor(
+                        new DefaultTransactionProcessor(bfBackendService.getTransactionService()),
+                        transactionEvaluator));
+    }
+
+    /**
+     * ⛔ FAB-38: the tank {@code QuickTxBuilder}'s processor — submission from one object, evaluation from
+     * another. cardano-client-lib's {@link TransactionProcessor} is both (it extends
+     * {@link TransactionEvaluator}), and {@code QuickTxBuilder} uses it as the evaluator whenever a build
+     * sets none (CCL trap 8), so a processor that only submitted would ship placeholder ex-units.
+     * {@code submitTransaction} goes to {@code submitter}; {@code evaluateTx(byte[], Set<Utxo>)} — which the
+     * interface's two default overloads ({@code byte[]} alone, and {@code Transaction}) route to — goes to
+     * {@code evaluator}, the {@link YaciConfig#transactionEvaluator} bean. Not a bean itself: the context
+     * holds no {@code TransactionProcessor}, so nothing can inject a submission path.
+     */
+    static final class EvaluatingTransactionProcessor implements TransactionProcessor {
+
+        private final TransactionProcessor submitter;
+        private final TransactionEvaluator evaluator;
+
+        EvaluatingTransactionProcessor(TransactionProcessor submitter, TransactionEvaluator evaluator) {
+            this.submitter = Objects.requireNonNull(submitter, "submitter");
+            this.evaluator = Objects.requireNonNull(evaluator, "evaluator");
+        }
+
+        @Override
+        public Result<String> submitTransaction(byte[] cborData) throws ApiException {
+            return submitter.submitTransaction(cborData);
+        }
+
+        @Override
+        public Result<List<EvaluationResult>> evaluateTx(byte[] cbor, Set<Utxo> inputUtxos) throws ApiException {
+            return evaluator.evaluateTx(cbor, inputUtxos);
+        }
     }
 
     /**
@@ -140,8 +209,8 @@ public class YaciConfig {
     }
 
     /**
-     * The production liquidation builder (FAB-134 B3b): built from the three injected suppliers and a
-     * real script-cost evaluator, and holding nothing else.
+     * The production liquidation builder (FAB-134 B3b): built from the three injected suppliers and
+     * the {@link #transactionEvaluator} bean, and holding nothing else.
      * <ul>
      *   <li>{@link UtxoSupplier} — the index-first bean above: coin selection, collateral and every
      *       indexed reference input come from the local index; only out-refs the index cannot hold
@@ -154,18 +223,16 @@ public class YaciConfig {
      * Without an evaluator, cardano-client-lib leaves every redeemer holding placeholder ex-units — 10000
      * mem against a measured 2.26M for one ada/ada liquidation — and a transaction that under-declares
      * is not rejected by the mempool: it lands and then fails on chain, forfeiting the collateral. So the
-     * armed path has to be given an evaluator, and Blockfrost's {@code /utils/txs/evaluate} is the one
-     * to give it: it evaluates against the chain's own protocol parameters and cost models, so the
-     * question "is our pinned cost model still the chain's?" cannot arise, and it resolves the
-     * transaction's inputs itself because in production they are real on-chain UTxOs. Besides the oracle
-     * probe below, it is the one Blockfrost call a build still makes (with {@code getTxOutput} for reference
-     * inputs the index does not hold).
+     * armed path has to be given an evaluator, and it is given the node's one: the
+     * {@link #transactionEvaluator} bean, Blockfrost's {@code /utils/txs/evaluate} (see that bean for
+     * why). Besides the oracle probe below, it is the one Blockfrost call a build still makes (with
+     * {@code getTxOutput} for reference inputs the index does not hold).
      * <p>
-     * The lambda is the narrowing, exactly as {@code LiquidationExecutor}'s {@code TransactionSubmitter}
-     * is: {@link TransactionEvaluator} declares one operation and no submit method, so what the builder
-     * holds can price a transaction and nothing else. The builder is handed no {@code BFBackendService}
-     * and no {@code DefaultTransactionProcessor} — either would hand it a submission path through the
-     * back door.
+     * The bean's type is the narrowing, exactly as {@code LiquidationExecutor}'s
+     * {@code TransactionSubmitter} is: {@link TransactionEvaluator} declares one operation and no submit
+     * method, so what the builder holds can price a transaction and nothing else. The builder is handed
+     * no {@code BFBackendService} and no {@code DefaultTransactionProcessor} — either would hand it a
+     * submission path through the back door.
      * <p>
      * ⛔ FAB-138: it is also handed the {@link OracleReferenceInputProbe} above, which asks Blockfrost —
      * before any evaluation — whether every oracle out-ref the build references is still live: one more
@@ -180,15 +247,13 @@ public class YaciConfig {
                                                                    UtxoSupplier utxoSupplier,
                                                                    ProtocolParamsSupplier protocolParamsSupplier,
                                                                    ScriptSupplier scriptSupplier,
-                                                                   BFBackendService bfBackendService,
+                                                                   TransactionEvaluator transactionEvaluator,
                                                                    OracleReferenceInputProbe oracleReferenceInputProbe) {
-        TransactionEvaluator scriptCostEvaluator =
-                (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
-        // The three injected suppliers and the evaluator lambda — never the BackendService itself. The
+        // The three injected suppliers and the evaluator bean — never the BackendService itself. The
         // builder constructs QuickTxBuilder from the suppliers with a null processor, so it can price a
         // transaction (evaluator + script bytes) and has nothing that could submit one.
         return new LiquidateTransactionBuilder(registry, network.getCardanoNetwork(), cardanoConverters,
-                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator,
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, transactionEvaluator,
                 oracleReferenceInputProbe);
     }
 
@@ -202,7 +267,8 @@ public class YaciConfig {
      * the deployment operators run, while passing every test (the third-site hazard of CCL trap 9b,
      * one layer up).
      *
-     * <p>The evaluator is Blockfrost's {@code /utils/txs/evaluate}, narrowed to a lambda so what the
+     * <p>The evaluator is the {@link #transactionEvaluator} bean — Blockfrost's
+     * {@code /utils/txs/evaluate}, typed as the one-method {@link TransactionEvaluator} so what the
      * builder holds can price a transaction and nothing else. <b>The operator's whole risk case for
      * arming this path — "exposure is the transaction fee per execution" — is true only while the
      * ex-units are measured</b>: placeholder ex-units move the exposure to the collateral (CCL trap 8).
@@ -221,12 +287,10 @@ public class YaciConfig {
                                                                  UtxoSupplier utxoSupplier,
                                                                  ProtocolParamsSupplier protocolParamsSupplier,
                                                                  ScriptSupplier scriptSupplier,
-                                                                 BFBackendService bfBackendService) {
-        TransactionEvaluator scriptCostEvaluator =
-                (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
-        // The three injected suppliers and the evaluator lambda — never the BackendService itself.
+                                                                 TransactionEvaluator transactionEvaluator) {
+        // The three injected suppliers and the evaluator bean — never the BackendService itself.
         return new CompoundTransactionBuilder(registry, network.getCardanoNetwork(),
-                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator);
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, transactionEvaluator);
     }
 
     /**
@@ -280,8 +344,8 @@ public class YaciConfig {
      * and for the same reason: <b>the operator's whole risk case for this path — "exposure is the
      * transaction fee per execution" — is true only while the ex-units are MEASURED.</b> Placeholder
      * ex-units move the exposure to the collateral (CCL trap 8), and this class has no constructor that
-     * permits them. Built from the three injected suppliers and a real script-cost evaluator, and holding
-     * nothing else:
+     * permits them. Built from the three injected suppliers and the {@link #transactionEvaluator} bean,
+     * and holding nothing else:
      * <ul>
      *   <li>{@link UtxoSupplier} — the index-first bean: coin selection, collateral and every indexed
      *       reference input come from the local index; only out-refs the index cannot hold reach
@@ -293,8 +357,8 @@ public class YaciConfig {
      *       scripts, which cardano-client-lib prices INSTEAD of asking a supplier — leaving the oracle's
      *       bytes unpriced, the shape of the 2026-08-24 {@code FeeTooSmallUTxO}.</li>
      * </ul>
-     * The evaluator is Blockfrost's {@code /utils/txs/evaluate}, narrowed to the one-method
-     * {@link TransactionEvaluator}: it is the one Blockfrost call a build still makes (with
+     * The evaluator is the {@link #transactionEvaluator} bean — Blockfrost's {@code /utils/txs/evaluate},
+     * typed as the one-method {@link TransactionEvaluator}: it is the one Blockfrost call a build still makes (with
      * {@code getTxOutput} for reference inputs the index does not hold). The builder is handed no
      * {@code BFBackendService} — that would hand it a submission path through the back door; arming and
      * submission stay in {@code LiquidationExecutor} behind its two independent flags.
@@ -311,13 +375,11 @@ public class YaciConfig {
                                                                UtxoSupplier utxoSupplier,
                                                                ProtocolParamsSupplier protocolParamsSupplier,
                                                                ScriptSupplier scriptSupplier,
-                                                               BFBackendService bfBackendService,
+                                                               TransactionEvaluator transactionEvaluator,
                                                                OracleReferenceInputProbe oracleReferenceInputProbe) {
-        TransactionEvaluator scriptCostEvaluator =
-                (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
-        // The three injected suppliers and the evaluator lambda — never the BackendService itself.
+        // The three injected suppliers and the evaluator bean — never the BackendService itself.
         return new ConvertTransactionBuilder(registry, network.getCardanoNetwork(),
-                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator,
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, transactionEvaluator,
                 oracleReferenceInputProbe);
     }
 
@@ -354,8 +416,8 @@ public class YaciConfig {
     /**
      * The production pay-in-advance liquidation builder (FAB-134 B3b-2) — the mirror of
      * {@code liquidateTransactionBuilder} above, wired identically (T-043: fixes that land in one
-     * sibling only). Built from the three injected suppliers and a real script-cost evaluator, and
-     * holding nothing else:
+     * sibling only). Built from the three injected suppliers and the {@link #transactionEvaluator} bean,
+     * and holding nothing else:
      * <ul>
      *   <li>{@link UtxoSupplier} — the index-first bean: coin selection, collateral and every indexed
      *       reference input come from the local index; only out-refs the index cannot hold reach
@@ -367,10 +429,10 @@ public class YaciConfig {
      * <p>
      * Without an evaluator, cardano-client-lib leaves every redeemer holding placeholder ex-units, and a
      * transaction that under-declares is not rejected by the mempool: it lands and then fails on chain,
-     * forfeiting the collateral. So this path is given the same Blockfrost {@code /utils/txs/evaluate}
-     * evaluator the plain builder's bean uses — its protocol parameters and cost models are the chain's
-     * by construction — narrowed to the one-method {@link TransactionEvaluator} so the builder can price
-     * a transaction and nothing else. It is the one Blockfrost call a build still makes (with
+     * forfeiting the collateral. So this path is given the same {@link #transactionEvaluator} bean the
+     * plain builder holds — Blockfrost's {@code /utils/txs/evaluate}, whose protocol parameters and cost
+     * models are the chain's by construction — typed as the one-method {@link TransactionEvaluator} so
+     * the builder can price a transaction and nothing else. It is the one Blockfrost call a build still makes (with
      * {@code getTxOutput} for reference inputs the index does not hold). The builder is handed no
      * {@code BFBackendService} and no {@code DefaultTransactionProcessor} — either would hand it a
      * submission path through the back door; arming and submission stay in {@code LiquidationExecutor}
@@ -390,13 +452,11 @@ public class YaciConfig {
             UtxoSupplier utxoSupplier,
             ProtocolParamsSupplier protocolParamsSupplier,
             ScriptSupplier scriptSupplier,
-            BFBackendService bfBackendService,
+            TransactionEvaluator transactionEvaluator,
             OracleReferenceInputProbe oracleReferenceInputProbe) {
-        TransactionEvaluator scriptCostEvaluator =
-                (cbor, inputUtxos) -> bfBackendService.getTransactionService().evaluateTx(cbor);
-        // The three injected suppliers and the evaluator lambda — never the BackendService itself.
+        // The three injected suppliers and the evaluator bean — never the BackendService itself.
         return new LiquidatePayInAdvanceTransactionBuilder(registry, network.getCardanoNetwork(),
-                utxoSupplier, protocolParamsSupplier, scriptSupplier, scriptCostEvaluator,
+                utxoSupplier, protocolParamsSupplier, scriptSupplier, transactionEvaluator,
                 oracleReferenceInputProbe);
     }
 

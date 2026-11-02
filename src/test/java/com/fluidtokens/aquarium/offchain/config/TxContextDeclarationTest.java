@@ -187,9 +187,10 @@ class TxContextDeclarationTest {
                 //
                 // ⚠ CONDITIONAL, and it ships OFF: set only when
                 // scheduling.transaction-processor.dump-cbor is true, and then only to WRAP the same
-                // backend evaluator so the bytes it is handed reach the log -- the answer is the
-                // backend's, untouched, and that mode builds and never submits. Unset, the tank is
-                // evaluated by the bean's DefaultTransactionProcessor (YaciConfig.quickTxBuilder).
+                // evaluator bean so the bytes it is handed reach the log -- the answer is the
+                // bean's, untouched, and that mode builds and never submits. Unset, the tank is
+                // evaluated by the evaluator bean (YaciConfig.transactionEvaluator) through the
+                // QuickTxBuilder bean's processor slot (YaciConfig.quickTxBuilder, FAB-38).
                 TANK, Entry.set())));
 
         // ---- signing: the liquidation builders must NOT be able to submit ---------------------

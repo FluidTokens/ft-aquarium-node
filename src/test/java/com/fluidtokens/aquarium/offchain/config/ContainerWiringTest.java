@@ -81,7 +81,8 @@ class ContainerWiringTest {
                 ConvertTransactionBuilder.class,
                 ConvertLiquidationRouter.class,
                 LiquidatePayInAdvanceTransactionBuilder.class,
-                com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe.class);
+                com.fluidtokens.aquarium.offchain.service.loans.OracleReferenceInputProbe.class,
+                com.bloxbean.cardano.client.api.TransactionEvaluator.class);
     }
 
     /**
@@ -89,7 +90,7 @@ class ContainerWiringTest {
      * objects, not mocks: a mock would satisfy the wiring while telling us nothing about whether the
      * real types are constructible together.
      */
-    private static ApplicationContextRunner runner() {
+    static ApplicationContextRunner runner() {
         var network = new AppConfig.Network();
         network.setNetworkForTest("preview");
 

@@ -307,11 +307,17 @@ jobs:
       # OracleProbeRoutesProductionTest). Re-measured cold keyless on feat/fab-183-event-driven-pipeline,
       # 2026-11-02: 227 files / 2490 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 227.
       #
+      # FAB-38 (TransactionEvaluatorWiringTest: one TransactionEvaluator bean held by the four loans builders,
+      # the tank QuickTxBuilder's processor slot and the dump wrapper; plus cases in YaciConfigWiringTest,
+      # ContainerWiringTest and TankProductionWiringTest) re-measured cold keyless on
+      # feat/fab-189-composable-node, 2026-11-02: 228 files / 2542 tests / 0 failures / 0 errors / 51 skipped,
+      # 0 orphans. Floor 228.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '227'
+          RESULT_FILE_FLOOR: '228'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
