@@ -639,10 +639,13 @@ rejection (`BadInputsUTxO`, an empty `ScriptFailures`) to set a wallet UTxO asid
 - **Until our accepted transaction is in a block (about 20 s), later passes rebuild candidates on U and
   get harmless rejections** — U is already spent by the pending transaction. They cost Blockfrost calls,
   and each pass now ends with a summary line that shows them:
-  `wallet pipeline pass at slot <slot> (<hash>): liquidation <result>, compound <result>, housekeeping <result>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`,
-  where a stage that did not run reads `not run` and a stage that threw reads `threw`. It is INFO when a
-  stage threw, a stage returned anything other than `DEFINITE_FAILURE`, or the pass evaluated or submitted
-  anything, and DEBUG otherwise.
+  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <label>, <k> block(s) folded in, waited <w> s, took <d> s: liquidation <result>, compound <result>, housekeeping <result>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`,
+  where a stage that did not run reads `not run` and a stage that threw reads `threw`; the trigger, fold
+  and wait fields are described under `WALLET_PIPELINE_LOG_EVERY_PASS`
+  ([above](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). By
+  default **every pass says it at INFO**. With `WALLET_PIPELINE_LOG_EVERY_PASS=false` it is INFO only
+  when a stage threw, a stage returned anything other than `DEFINITE_FAILURE`, or the pass evaluated or
+  submitted anything, and DEBUG otherwise.
 
 ---
 

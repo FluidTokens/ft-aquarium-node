@@ -181,8 +181,8 @@ public final class WalletPipeline implements AutoCloseable {
             }
             hungWarning = hungWarningUnderLock();
             priceDirty = true;
-            noteTriggerUnderLock();
             if (pending != null || currentLastHandledUnderLock() != null) {
+                noteTriggerUnderLock();
                 scheduleDrainUnderLock();
             }
         }
@@ -204,7 +204,12 @@ public final class WalletPipeline implements AutoCloseable {
         }
     }
 
-    /** Remembers when the first trigger not yet served by a pass arrived (FAB-195); a later one keeps it. */
+    /**
+     * Remembers when the first trigger not yet served by a pass arrived (FAB-195); a later one keeps it. Only a
+     * trigger that schedules work counts: a block the pipeline drops (equal or older) does not, nor does a price
+     * change with no point to re-run (at boot, or after a rollback), so the first pass after catch-up does not
+     * report the whole catch-up as its wait.
+     */
     private void noteTriggerUnderLock() {
         if (firstUnservedTriggerAt == null) {
             firstUnservedTriggerAt = clock.instant();

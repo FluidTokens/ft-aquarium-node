@@ -644,7 +644,9 @@ stops nothing:** it is logged once at INFO (`liquidation of … via … on … n
 next candidate is tried, on the same UTxO. A liquidation held back by a market in `shadow` on a `live`
 node marks nothing. Until an accepted liquidation is in a block (about 20 s), later passes rebuild on U
 and get harmless rejections; the Blockfrost calls they cost appear in each pass's summary line
-(`wallet pipeline pass at slot …: …; Blockfrost calls discovery …, evaluate …, submit …`). See
+(`wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <label>, <k> block(s) folded in, waited <w> s, took <d> s: liquidation …; Blockfrost calls discovery …, evaluate …, submit …`).
+Every pass says it at INFO
+by default; `WALLET_PIPELINE_LOG_EVERY_PASS=false` returns to INFO only when something happened. See
 [upgrading.md §7, "Fire and forget"](upgrading.md#fire-and-forget-fab-186).
 
 ---

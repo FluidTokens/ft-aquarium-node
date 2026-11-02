@@ -1262,6 +1262,118 @@ class WalletPipelineTest {
         }
     }
 
+    /**
+     * FAB-195 r2 (h): a price change before any point is known schedules nothing, so it is no trigger for the wait.
+     * Price changes at t and t+3600 s, then the first block at t+3605 s whose pass starts at once: {@code waited 0.0
+     * s}, counted from the block. The price changes still mark the pass {@code block+price} — today's priceDirty
+     * carry-over, asserted so a change to it is visible.
+     */
+    @Test
+    void aPriceChangeBeforeAnyPointStartsNoWait() throws Exception {
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> { h.record("L"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerPriceChange();          // t
+            h.clock.advance(Duration.ofSeconds(3600));
+            h.pipeline.offerPriceChange();          // t+3600 s
+            h.clock.advance(Duration.ofSeconds(5));
+            h.barrier();
+            assertEquals(0, h.executes.get(), "a price change with no known point schedules nothing");
+
+            h.pipeline.offerBlock(1, "a");          // t+3605 s, and its pass starts at once
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/1:a"), h.calls());
+            List<String> lines = summaries(Level.INFO);
+            assertEquals(1, lines.size(), logs.list.toString());
+            assertTrue(lines.get(0).startsWith("wallet pipeline pass #1 at slot 1 (a), trigger block+price, 0 block(s) "
+                    + "folded in, waited 0.0 s, took 0.0 s: "), lines.get(0));
+        }
+    }
+
+    /**
+     * FAB-195 r2 (i): the same after a rollback — no point of the new generation is known, so price changes at t and
+     * t+3600 s schedule nothing and the next generation's first block, at t+3605 s, says {@code waited 0.0 s}.
+     */
+    @Test
+    void aPriceChangeAfterARollbackStartsNoWait() throws Exception {
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> { h.record("L"); return WorkResult.DEFINITE_FAILURE; },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(5, "a");
+            h.awaitPasses(1);
+            h.barrier();
+            int executes = h.executes.get();
+
+            h.pipeline.rollback();
+            h.pipeline.offerPriceChange();          // t
+            h.clock.advance(Duration.ofSeconds(3600));
+            h.pipeline.offerPriceChange();          // t+3600 s
+            h.clock.advance(Duration.ofSeconds(5));
+            h.barrier();
+            assertEquals(executes, h.executes.get(), "a price change after a rollback schedules nothing");
+
+            h.pipeline.offerBlock(4, "r");          // t+3605 s, and its pass starts at once
+            h.awaitPasses(1);
+            h.barrier();
+
+            assertEquals(List.of("L 0/5:a", "L 1/4:r"), h.calls());
+            List<String> lines = summaries(Level.INFO);
+            assertEquals(2, lines.size(), logs.list.toString());
+            assertTrue(lines.get(1).startsWith("wallet pipeline pass #2 at slot 4 (r), trigger block+price, 0 block(s) "
+                    + "folded in, waited 0.0 s, took 0.0 s: "), lines.get(1));
+        }
+    }
+
+    /**
+     * FAB-195 r2 (j): an offer the pipeline drops (a duplicate of the in-flight point, or an older slot) is not a
+     * trigger, so it does not start the wait. Both are offered at t while a pass runs; the real newer block comes at
+     * t+5 s and its pass starts at t+7 s, which says {@code waited 2.0 s}, not 7.0 s.
+     */
+    @Test
+    void droppedOffersDoNotStartTheWait() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean first = new AtomicBoolean(true);
+        try (Harness h = new Harness()) {
+            h.start(
+                    fence -> {
+                        h.record("L");
+                        if (first.getAndSet(false)) {
+                            entered.countDown();
+                            assertTrue(release.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+                        }
+                        return WorkResult.DEFINITE_FAILURE;
+                    },
+                    fence -> WorkResult.DEFINITE_FAILURE,
+                    fence -> WorkResult.DEFINITE_FAILURE);
+
+            h.pipeline.offerBlock(10, "a");
+            assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS));
+            h.pipeline.offerBlock(10, "a");         // t: duplicate of the in-flight point, dropped
+            h.pipeline.offerBlock(9, "x");          // t: older than the in-flight point, dropped
+            h.clock.advance(Duration.ofSeconds(5));
+            h.pipeline.offerBlock(11, "b");         // t+5 s: the real trigger
+            h.clock.advance(Duration.ofSeconds(2));
+            release.countDown();                    // its pass starts at t+7 s
+            h.awaitPasses(2);
+            h.barrier();
+
+            assertEquals(List.of("L 0/10:a", "L 0/11:b"), h.calls());
+            List<String> lines = summaries(Level.INFO);
+            assertEquals(2, lines.size(), logs.list.toString());
+            assertTrue(lines.get(1).startsWith("wallet pipeline pass #2 at slot 11 (b), trigger block, 0 block(s) "
+                    + "folded in, waited 2.0 s, took 0.0 s: "), lines.get(1));
+        }
+    }
+
     /** The summary lines at one level, in order. */
     private List<String> summaries(Level level) {
         return logs.list.stream()
