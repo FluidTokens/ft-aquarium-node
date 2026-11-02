@@ -14,6 +14,12 @@ import java.util.function.Function;
 /**
  * <b>Which wallet UTxO to nominate as a transaction's own input — smallest that suffices.</b>
  *
+ * <p>⚑ FAB-185: no ada path nominates through this class any more. Liquidation and compound are funded
+ * by wallet role ({@code WalletRoles}: C, U and the token outputs), so the ada selectors and the
+ * compound-funding API that lived here are gone. What remains is the ONE ada-only predicate
+ * {@link #nominable}, the token-principal rules and the token-holding diagnostics; the reasoning below
+ * still applies to {@link #smallestSufficientToken}.
+ *
  * <h2>Why an amount has to come in from outside</h2>
  * Giovanni's rule 5: <i>"the amount of ada a liquidator might spend might be little, just tx fee or
  * something, so a 5 ada utxo would be perfect, but if this is a loan whose principal needs to be
@@ -71,116 +77,6 @@ public final class WalletInputSelection {
                 && utxo.getDataHash() == null;
     }
 
-    /**
-     * The smallest nominable UTxO holding at least {@code requiredLovelace}, or empty when none does.
-     *
-     * @param requiredLovelace what this transaction needs the nominated input to cover on its own —
-     *                         a ceiling, not an estimate; see the class javadoc on why
-     *                         under-estimating is the dangerous direction
-     */
-    public static Optional<Utxo> smallestSufficient(List<Utxo> utxos, BigInteger requiredLovelace) {
-        return utxos.stream()
-                .filter(WalletInputSelection::nominable)
-                .filter(utxo -> LedgerCeilings.lovelaceOf(utxo).compareTo(requiredLovelace) >= 0)
-                .min(Comparator.comparing(LedgerCeilings::lovelaceOf));
-    }
-
-    /**
-     * The largest nominable UTxO — <b>the fallback when the requirement cannot be computed at all.</b>
-     * <p>
-     * The requirement depends on live protocol parameters, and a parameter fetch can fail. When it
-     * does, this is what the loop did before T-052 and it is never <em>wrong</em>, only wasteful:
-     * the largest input covers the transaction wherever the wallet can cover it at all. Degrading to
-     * it keeps a parameter outage from turning into a liquidation outage — and, specifically, keeps
-     * the {@code TX_TOO_LARGE} veto path reachable, which is where an unfetchable {@code maxTxSize}
-     * is supposed to be reported.
-     */
-    public static Optional<Utxo> largest(List<Utxo> utxos) {
-        return utxos.stream()
-                .filter(WalletInputSelection::nominable)
-                .max(Comparator.comparing(LedgerCeilings::lovelaceOf));
-    }
-
-    /**
-     * The largest nominable holding, for diagnostics. A refusal that says only "nothing qualified"
-     * cannot tell an empty wallet from a wallet whose entire contents are ineligible, and those need
-     * opposite responses from an operator.
-     */
-    public static Optional<BigInteger> largestNominable(List<Utxo> utxos) {
-        return utxos.stream()
-                .filter(WalletInputSelection::nominable)
-                .map(LedgerCeilings::lovelaceOf)
-                .max(BigInteger::compareTo);
-    }
-
-    public enum CompoundFundingFailure {
-        MISSING_SAFE_ORDINARY_INPUT,
-        MISSING_DISTINCT_PURE_ADA_COLLATERAL
-    }
-
-    public record CompoundFunding(Utxo ordinaryInput, Utxo collateralInput) {
-        public CompoundFunding {
-            if (ordinaryInput == null || collateralInput == null
-                    || ordinaryInput.getTxHash().equals(collateralInput.getTxHash())
-                    && ordinaryInput.getOutputIndex() == collateralInput.getOutputIndex()) {
-                throw new IllegalArgumentException("compound ordinary input and collateral must be distinct");
-            }
-        }
-    }
-
-    public static final class CompoundFundingException extends RuntimeException {
-        private final CompoundFundingFailure reason;
-
-        public CompoundFundingException(CompoundFundingFailure reason) {
-            super(reason.name());
-            this.reason = reason;
-        }
-
-        public CompoundFundingFailure reason() {
-            return reason;
-        }
-    }
-
-    /**
-     * Compound-only nomination. Ordinary funding may carry reusable token inventory; collateral is
-     * a separate datum-free, reference-script-free pure-ADA UTxO. This does not alter the legacy
-     * ADA-only, liquidation or Tank selectors above.
-     */
-    public static CompoundFunding selectForCompound(List<Utxo> utxos, BigInteger requiredOrdinaryAda) {
-        List<Utxo> ordinary = utxos.stream()
-                .filter(WalletInputSelection::safeOrdinaryCompoundInput)
-                .filter(u -> LedgerCeilings.lovelaceOf(u).compareTo(requiredOrdinaryAda) >= 0)
-                // Reuse token-bearing change before consuming a pure-ADA UTxO needed for collateral.
-                .sorted(Comparator.comparing((Utxo u) -> u.getAmount().size() == 1)
-                        .thenComparing(LedgerCeilings::lovelaceOf, Comparator.reverseOrder()))
-                .toList();
-        if (ordinary.isEmpty()) {
-            throw new CompoundFundingException(CompoundFundingFailure.MISSING_SAFE_ORDINARY_INPUT);
-        }
-        for (Utxo input : ordinary) {
-            Optional<Utxo> collateral = utxos.stream()
-                    .filter(WalletInputSelection::nominable)
-                    .filter(u -> !sameOutRef(u, input))
-                    .max(Comparator.comparing(LedgerCeilings::lovelaceOf));
-            if (collateral.isPresent()) {
-                return new CompoundFunding(input, collateral.get());
-            }
-        }
-        throw new CompoundFundingException(CompoundFundingFailure.MISSING_DISTINCT_PURE_ADA_COLLATERAL);
-    }
-
-    private static boolean safeOrdinaryCompoundInput(Utxo utxo) {
-        return utxo != null && utxo.getAmount() != null && !utxo.getAmount().isEmpty()
-                && utxo.getReferenceScriptHash() == null
-                && utxo.getInlineDatum() == null
-                && utxo.getDataHash() == null;
-    }
-
-    private static boolean sameOutRef(Utxo left, Utxo right) {
-        return left.getOutputIndex() == right.getOutputIndex()
-                && java.util.Objects.equals(left.getTxHash(), right.getTxHash());
-    }
-
     // ---- token-principal nomination (ADDITIVE — Part 2 of the token-principals slice) -------------
     //
     // A pay-in-advance liquidation on a TOKEN principal must front that token, not ada, so the utxo
@@ -222,8 +118,8 @@ public final class WalletInputSelection {
     /**
      * The smallest {@link #nominableForToken} UTxO holding at least {@code requiredPrincipal} of
      * {@code principal} AND at least {@code requiredAda} lovelace alongside it, or empty when none
-     * does. Ordered by the PRINCIPAL quantity — the scarcer resource on this path — the same
-     * smallest-that-suffices rule {@link #smallestSufficient} applies to ada.
+     * does. Ordered by the PRINCIPAL quantity — the scarcer resource on this path — smallest that
+     * suffices.
      *
      * @param requiredAda a CEILING (fee ceiling plus the min-ada rider), never an estimate — see the
      *                    class javadoc on why under-estimating is the dangerous direction

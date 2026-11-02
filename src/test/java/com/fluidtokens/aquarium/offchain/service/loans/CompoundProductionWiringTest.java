@@ -1,8 +1,11 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.aiken.AikenTransactionEvaluator;
+import com.bloxbean.cardano.client.address.Address;
 import com.bloxbean.cardano.client.api.ScriptSupplier;
 import com.bloxbean.cardano.client.api.TransactionEvaluator;
+import com.bloxbean.cardano.client.api.UtxoSupplier;
+import com.bloxbean.cardano.client.api.common.OrderEnum;
 import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.EvaluationResult;
 import com.bloxbean.cardano.client.api.model.ProtocolParams;
@@ -29,6 +32,8 @@ import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.LoansReferenceScriptVerifier;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -45,7 +50,9 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
@@ -456,7 +463,8 @@ class CompoundProductionWiringTest {
     /** Only the configuration and the UTxO supplier: {@code referenceScripts()} reads nothing else. */
     private static CompoundExecutor executor(AppConfig.CompoundConfiguration configuration, List<Utxo> universe) {
         return new CompoundExecutor(configuration, null, null, null, null, null, null, null, null,
-                LoanFixtures.utxoSupplier(universe), null, null);
+                LoanFixtures.utxoSupplier(universe), null, EvalFixtures.protocolParams(),
+                (CompoundExecutor.TransactionSubmitter) null);
     }
 
     /** A failed evaluation on the production path refuses the build, never placeholder ex-units. */
@@ -531,7 +539,7 @@ class CompoundProductionWiringTest {
      *       for a 3.0–4.5 ADA wallet before {@code withCollateralInputs} was wired (FAB-134 B3b-4).</li>
      * </ul>
      * For every wallet value, under every {@link Ordering}, the build either refuses or neither spends nor
-     * pledges a published script.
+     * pledges a published script — and, since FAB-185, pledges exactly [C].
      */
     @Test
     void aShortWalletNeverSpendsAPublishedReferenceScriptHeldAtTheBotAddress() throws Exception {
@@ -563,6 +571,8 @@ class CompoundProductionWiringTest {
                 }
                 List<TransactionInput> collateral = reread.getBody().getCollateral() == null
                         ? List.of() : reread.getBody().getCollateral();
+                assertEquals(List.of(refOf(collateral())), collateral, ordering + ", wallet " + lovelace
+                        + " lovelace: the collateral must be exactly the pinned C (FAB-185)");
                 for (TransactionInput input : collateral) {
                     assertFalse(published.contains(input), ordering + ", wallet " + lovelace + " lovelace: the "
                             + "build pledges the published reference-script utxo " + input.getTransactionId() + "#"
@@ -613,6 +623,183 @@ class CompoundProductionWiringTest {
         }
     }
 
+    /**
+     * (a) ⛔ FAB-185, through the PRODUCTION constructor: a shaped wallet — C, U, a token output and the eleven
+     * published compound reference scripts, all at the bot's address. Off the DESERIALISED body: the
+     * wallet-credential inputs are exactly {U}, U appears once, the collateral is exactly [C], every redeemer
+     * carries the evaluator's ex-units (above CCL's placeholder), and this ADA-principal pool's compound
+     * leaves the bot exactly ONE output, ada-only. Nothing lists a wallet address on the injected supplier:
+     * only the designated-input view may.
+     */
+    @Test
+    void aShapedWalletSpendsExactlyUPledgesExactlyCAndGetsOneAdaOnlyOutputBack() throws Exception {
+        Fixture f = shaped(LARGE_U);
+        // U is the production shape — the working capital, LARGER than C — so a collateral chooser going
+        // largest-first would land on U, never on C by coincidence.
+        assertTrue(LedgerCeilings.lovelaceOf(LARGE_U).compareTo(LedgerCeilings.lovelaceOf(collateral())) > 0,
+                "fixture: U is larger than C, as in production");
+        assertTrue(f.request().candidate().principalIsAda(), "fixture: an ADA-principal pool");
+        ListingRecorder injected = new ListingRecorder(LoanFixtures.utxoSupplier(f.universe()));
+        Recording evaluator = new Recording(aiken(f.universe()));
+
+        Transaction built = production(injected, new HashCheckedScriptSupplier(rigScripts()), evaluator)
+                .build(f.request());
+        Transaction reread = Transaction.deserialize(built.serialize());
+        log.info("FAB-185 compound shaped wallet: fee {}, inputs {}, collateral {}, listings {}",
+                reread.getBody().getFee(), reread.getBody().getInputs().size(), reread.getBody().getCollateral(),
+                injected.listed);
+
+        assertEquals(List.of(refOf(LARGE_U)), walletInputs(reread, f.universe()),
+                "the wallet-credential inputs must be exactly {U}, U once");
+        assertEquals(List.of(refOf(collateral())), reread.getBody().getCollateral(),
+                "the collateral must be exactly [C]");
+        List<Redeemer> redeemers = reread.getWitnessSet().getRedeemers();
+        assertEquals(11, redeemers.size(), "four general_spend spends and seven withdraw-0 invocations");
+        for (Redeemer redeemer : redeemers) {
+            String key = redeemer.getTag() + "#" + redeemer.getIndex();
+            EvaluationResult costing = evaluator.last.get().stream()
+                    .filter(r -> r.getRedeemerTag() == redeemer.getTag()
+                            && r.getIndex() == redeemer.getIndex().intValue())
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("no evaluation for " + key));
+            assertEquals(costing.getExUnits().getMem(), redeemer.getExUnits().getMem(), "declared mem for " + key);
+            assertEquals(costing.getExUnits().getSteps(), redeemer.getExUnits().getSteps(),
+                    "declared steps for " + key);
+            assertTrue(redeemer.getExUnits().getMem().compareTo(PLACEHOLDER_MEM) > 0,
+                    key + " carries CCL's 10000-mem placeholder: the evaluator was not load-bearing");
+        }
+        List<TransactionOutput> botOutputs = reread.getBody().getOutputs().stream()
+                .filter(o -> atWalletCredential(o.getAddress())).toList();
+        assertEquals(1, botOutputs.size(), "an ADA-pool compound leaves the bot exactly ONE output: " + botOutputs);
+        assertTrue(botOutputs.getFirst().getValue().getMultiAssets() == null
+                        || botOutputs.getFirst().getValue().getMultiAssets().isEmpty(),
+                "and it is ada-only — the token output was never an input, so nothing carries a token back");
+        assertEquals(List.of(), injected.walletListings(),
+                "the build listed a wallet address on the injected supplier, past the designated-input view");
+    }
+
+    /**
+     * (b) ⛔ FAB-185: the same shaped wallet with a U too small for the fee. The build refuses — it never
+     * pulls C, the token output, a published script or anything else at the bot's address to make up the
+     * difference: no wallet address is ever listed on the injected supplier, and no body the evaluator was
+     * shown carries a wallet input other than U (so the token output is never an input). The sizes are below
+     * any compound fee on this rig; (a) is the control that a U which suffices builds.
+     */
+    @Test
+    void aUTooSmallForTheFeeRefusesAndNeverPullsAnotherWalletOutput() throws Exception {
+        int attempts = 0;
+        for (long lovelace : new long[]{500_000L, 1_000_000L, 1_500_000L}) {
+            Utxo smallU = wallet(lovelace);
+            Fixture f = shaped(smallU);
+            ListingRecorder injected = new ListingRecorder(LoanFixtures.utxoSupplier(f.universe()));
+            Recording evaluator = new Recording(aiken(f.universe()));
+
+            RuntimeException refused = assertThrows(RuntimeException.class,
+                    () -> production(injected, new HashCheckedScriptSupplier(rigScripts()), evaluator)
+                            .build(f.request()),
+                    "a U of " + lovelace + " lovelace must refuse, not pull another wallet output");
+            String chain = LiquidationExecutor.causeChain(refused);
+            log.info("FAB-185 compound U of {} lovelace refused after {} evaluated attempt(s): {}", lovelace,
+                    evaluator.attempts.size(), chain);
+            assertTrue(chain.contains("Not enough funds") || chain.contains("Insufficient"),
+                    "U of " + lovelace + ": refused for want of funds in the designated input, not for "
+                            + "anything else: " + chain);
+            for (byte[] attempt : evaluator.attempts) {
+                assertEquals(List.of(refOf(smallU)), walletInputs(Transaction.deserialize(attempt), f.universe()),
+                        "U of " + lovelace + ": an attempted body carries a wallet input other than U");
+                attempts++;
+            }
+            assertEquals(List.of(), injected.walletListings(), "U of " + lovelace + ": the build listed a "
+                    + "wallet address on the injected supplier, past the designated-input view");
+        }
+        assertTrue(attempts > 0, "no attempted body was ever evaluated, so the per-attempt check proved nothing");
+    }
+
+    /** (a)'s U: the production shape, larger than C. */
+    private static final Utxo LARGE_U = wallet(100_000_000L);
+
+    /** A token output at the bot's address: 10 ADA beside a token. Never an input to a compound. */
+    private static final Utxo TOKEN_UTXO = Utxo.builder().txHash("e4".repeat(32)).outputIndex(0).address(BOT)
+            .amount(List.of(Amount.lovelace(BigInteger.valueOf(10_000_000L)),
+                    Amount.asset("ab".repeat(28) + "01", BigInteger.valueOf(5_000_000L)))).build();
+
+    /**
+     * The shaped wallet of (a) and (b): C, {@code u}, the token output and the eleven published compound
+     * reference scripts, all at the bot's address.
+     */
+    private static Fixture shaped(Utxo u) {
+        Fixture f = fixture(u, BOT);
+        List<Utxo> universe = new ArrayList<>(f.universe());
+        universe.add(TOKEN_UTXO);
+        assertEquals(14, universe.stream().filter(x -> atWalletCredential(x.getAddress())).count(),
+                "C, U, the token output and the eleven published scripts at the bot address");
+        return new Fixture(universe, f.request());
+    }
+
+    /** The body's inputs whose UTxO sits at the wallet's payment credential, in body order. */
+    private static List<TransactionInput> walletInputs(Transaction transaction, List<Utxo> universe) {
+        List<TransactionInput> atWallet = new ArrayList<>();
+        for (TransactionInput input : transaction.getBody().getInputs()) {
+            Utxo utxo = universe.stream()
+                    .filter(u -> u.getTxHash().equals(input.getTransactionId())
+                            && u.getOutputIndex() == input.getIndex())
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("an input outside the universe: " + input));
+            if (atWalletCredential(utxo.getAddress())) {
+                atWallet.add(input);
+            }
+        }
+        return atWallet;
+    }
+
+    private static TransactionInput refOf(Utxo utxo) {
+        return new TransactionInput(utxo.getTxHash(), utxo.getOutputIndex());
+    }
+
+    /** True when {@code address}'s payment credential is the bot wallet's. */
+    private static boolean atWalletCredential(String address) {
+        try {
+            return Arrays.equals(new Address(address).getPaymentCredentialHash().orElse(null),
+                    new Address(BOT).getPaymentCredentialHash().orElseThrow());
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * FAB-185 — the injected supplier, recording every address anything lists through {@code getPage} or
+     * {@code getAll}. The builder must never list a wallet address on it: only its designated-input view may.
+     */
+    private static final class ListingRecorder implements UtxoSupplier {
+        final UtxoSupplier delegate;
+        final List<String> listed = new CopyOnWriteArrayList<>();
+
+        ListingRecorder(UtxoSupplier delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public List<Utxo> getPage(String address, Integer nrOfItems, Integer page, OrderEnum order) {
+            listed.add(address);
+            return delegate.getPage(address, nrOfItems, page, order);
+        }
+
+        @Override
+        public List<Utxo> getAll(String address) {
+            listed.add(address);
+            return delegate.getAll(address);
+        }
+
+        @Override
+        public Optional<Utxo> getTxOutput(String txHash, int outputIndex) {
+            return delegate.getTxOutput(txHash, outputIndex);
+        }
+
+        List<String> walletListings() {
+            return listed.stream().filter(CompoundProductionWiringTest::atWalletCredential).toList();
+        }
+    }
+
     /** The production constructor has no null-evaluator form (CCL trap 8). */
     @Test
     void theProductionConstructorRefusesANullEvaluator() {
@@ -629,7 +816,12 @@ class CompoundProductionWiringTest {
     /** The production constructor, exactly the one YaciConfig calls. */
     private static CompoundTransactionBuilder production(List<Utxo> universe, ScriptSupplier scripts,
                                                          TransactionEvaluator evaluator) {
-        return new CompoundTransactionBuilder(REGISTRY, Networks.preview(), LoanFixtures.utxoSupplier(universe),
+        return production(LoanFixtures.utxoSupplier(universe), scripts, evaluator);
+    }
+
+    private static CompoundTransactionBuilder production(UtxoSupplier injected, ScriptSupplier scripts,
+                                                         TransactionEvaluator evaluator) {
+        return new CompoundTransactionBuilder(REGISTRY, Networks.preview(), injected,
                 EvalFixtures.protocolParams(), scripts, evaluator);
     }
 
@@ -720,12 +912,13 @@ class CompoundProductionWiringTest {
         return referenced;
     }
 
-    /** Records how often it was asked and what it last returned. */
+    /** Records how often it was asked, every body it was asked about, and what it last returned. */
     private static final class Recording implements TransactionEvaluator {
         final TransactionEvaluator delegate;
         final AtomicInteger calls = new AtomicInteger();
         final AtomicReference<List<EvaluationResult>> last = new AtomicReference<>();
         final AtomicReference<byte[]> lastCbor = new AtomicReference<>();
+        final List<byte[]> attempts = new CopyOnWriteArrayList<>();
 
         Recording(TransactionEvaluator delegate) {
             this.delegate = delegate;
@@ -736,6 +929,7 @@ class CompoundProductionWiringTest {
                 throws com.bloxbean.cardano.client.api.exception.ApiException {
             calls.incrementAndGet();
             lastCbor.set(cbor.clone());
+            attempts.add(cbor.clone());
             Result<List<EvaluationResult>> result = delegate.evaluateTx(cbor, inputUtxos);
             last.set(result.getValue());
             return result;
@@ -771,7 +965,7 @@ class CompoundProductionWiringTest {
 
     private static CompoundTransactionBuilder.Request request(Map<String, TransactionInput> refs, Utxo wallet) {
         return new CompoundTransactionBuilder.Request(candidate(), refs, utxo("bond"), config(), lmConfig(),
-                wallet, BOT, BigInteger.ZERO, VALID_FROM_SLOT, VALID_TO_SLOT);
+                wallet, BOT, BigInteger.ZERO, VALID_FROM_SLOT, VALID_TO_SLOT, collateral());
     }
 
     /** The bot's ordinary fee-paying funds. */
@@ -780,10 +974,14 @@ class CompoundProductionWiringTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(lovelace)))).build();
     }
 
-    /** A distinct pure-ADA UTxO reserved for collateral and excluded from balancing. */
+    /**
+     * FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's params,
+     * pinned as the Request's collateral and hidden from balancing.
+     */
     private static Utxo collateral() {
         return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(BOT)
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(WalletShape.collateralLovelace(
+                        EvalFixtures.protocolParams().getProtocolParams())))).build();
     }
 
     private static Utxo utxo(String key) {

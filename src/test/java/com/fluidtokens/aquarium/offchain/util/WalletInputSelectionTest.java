@@ -13,16 +13,15 @@ import java.util.function.Function;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * T-052 — the wallet input is chosen to cover the transaction, smallest that suffices.
  *
- * <p>Giovanni's rule 5: <i>"a 5 ada utxo would be perfect, but if this is a loan whose principal
- * needs to be repaid by the liquidator, then you will need a larger ada amount."</i> Both halves of
- * that are asserted below, against the same wallet.
+ * <p>⚑ FAB-185: the ada selectors ({@code smallestSufficient}, {@code largest}, {@code largestNominable}) and
+ * the compound-funding API are deleted with their tests — ada funding is by wallet role now
+ * ({@code WalletRolesTest}). What is pinned here is the ada-only predicate, the token-principal rules and the
+ * token-holding split.
  */
 class WalletInputSelectionTest {
 
@@ -32,55 +31,6 @@ class WalletInputSelectionTest {
         utxo.setOutputIndex(ix);
         utxo.setAmount(List.of(Amount.lovelace(BigInteger.valueOf(lovelace))));
         return utxo;
-    }
-
-    private static BigInteger ada(long whole) {
-        return BigInteger.valueOf(whole).multiply(BigInteger.valueOf(1_000_000L));
-    }
-
-    /** The 2026-08-24 wallet shape: a small utxo first in the list, larger ones behind it. */
-    private static List<Utxo> wallet() {
-        return List.of(ada("aa", 0, 5_000_000L), ada("bb", 1, 58_000_000L), ada("cc", 2, 38_000_000L));
-    }
-
-    /**
-     * ⇒ THE FEE-ONLY HALF. A plain liquidation brings only the fee, so the 5-ada utxo is exactly
-     * right — and taking it leaves the 38 and 58 for a candidate that needs them.
-     */
-    @Test
-    void aFeeOnlyRequirementTakesTheSmallSufficientUtxo() {
-        Optional<Utxo> chosen = WalletInputSelection.smallestSufficient(wallet(), ada(2));
-        assertTrue(chosen.isPresent());
-        assertEquals("aa", chosen.get().getTxHash(), "a fee-only liquidation must not consume a large input");
-    }
-
-    /**
-     * ⇒ THE PRINCIPAL-REPAYING HALF. The same wallet, a requirement the small utxo cannot meet:
-     * the smallest that DOES is taken, not the largest and not the first.
-     */
-    @Test
-    void aPrincipalRepayingRequirementSkipsTheOnesThatCannotFundIt() {
-        Optional<Utxo> chosen = WalletInputSelection.smallestSufficient(wallet(), ada(30));
-        assertTrue(chosen.isPresent());
-        assertEquals("cc", chosen.get().getTxHash(),
-                "38 ada covers 30; picking 58 wastes the larger input and picking 5 cannot fund it");
-    }
-
-    /**
-     * ⚠ The failure that motivated the whole ticket: nominating a utxo that cannot cover the
-     * transaction. It must be refused HERE, where the reason is sayable, rather than at evaluation
-     * where Blockfrost reports an empty ScriptFailures map that reads as "a script said no".
-     */
-    @Test
-    void nothingSufficientIsEmptyRatherThanTheClosestThing() {
-        assertTrue(WalletInputSelection.smallestSufficient(wallet(), ada(100)).isEmpty());
-    }
-
-    @Test
-    void anExactMatchCounts() {
-        assertTrue(WalletInputSelection.smallestSufficient(wallet(), ada(5)).isPresent(),
-                "the requirement is a floor the utxo must reach, not exceed");
-        assertEquals("aa", WalletInputSelection.smallestSufficient(wallet(), ada(5)).get().getTxHash());
     }
 
     /** The four clauses, each rejected on its own so no single one can silently stop mattering. */
@@ -98,8 +48,6 @@ class WalletInputSelectionTest {
 
         for (Utxo bad : List.of(twoAssets, refScript, inlineDatum, datumHash)) {
             assertFalse(WalletInputSelection.nominable(bad), bad.getTxHash() + " must not be nominable");
-            assertTrue(WalletInputSelection.smallestSufficient(List.of(bad), ada(1)).isEmpty(),
-                    bad.getTxHash() + " must never be selected, however large it is");
         }
         assertTrue(WalletInputSelection.nominable(ada("aa", 0, 5_000_000L)));
     }
@@ -126,30 +74,6 @@ class WalletInputSelectionTest {
         noAmount.setAmount(null);
         assertFalse(org.junit.jupiter.api.Assertions.assertDoesNotThrow(
                 () -> WalletInputSelection.nominable(noAmount)), "a null amount list is not nominable");
-    }
-
-    /**
-     * The diagnostic half: a refusal that says only "nothing qualified" cannot tell an empty wallet
-     * from a wallet whose contents are all ineligible, and those need opposite operator responses.
-     */
-    @Test
-    void largestNominableReportsWhatIsActuallyThere() {
-        assertEquals(Optional.of(BigInteger.valueOf(58_000_000L)),
-                WalletInputSelection.largestNominable(wallet()));
-        Utxo refScript = ada("ee", 0, 90_000_000L);
-        refScript.setReferenceScriptHash("deadbeef");
-        assertTrue(WalletInputSelection.largestNominable(List.of(refScript)).isEmpty(),
-                "an ineligible utxo must not be reported as available headroom");
-        assertTrue(WalletInputSelection.largestNominable(List.of()).isEmpty());
-    }
-
-    /** Positive control: the requirement actually discriminates. */
-    @Test
-    void theRequirementChangesTheAnswer() {
-        String small = WalletInputSelection.smallestSufficient(wallet(), ada(2)).orElseThrow().getTxHash();
-        String large = WalletInputSelection.smallestSufficient(wallet(), ada(45)).orElseThrow().getTxHash();
-        assertFalse(small.equals(large),
-                "if the requirement does not change which utxo is chosen, it is not being applied");
     }
 
     // ---- token-principal nomination (Part 2, token-principals slice) -------------------------------
@@ -234,39 +158,6 @@ class WalletInputSelectionTest {
         Utxo usdmAndAda = token("usdm1", 0, 1_100_000_000L, 1_400_000L);
         assertEquals(BigInteger.valueOf(1_100_000_000L), WalletInputSelection.tokenQuantityOf(usdmAndAda, USDM));
         assertEquals(BigInteger.ZERO, WalletInputSelection.tokenQuantityOf(ada("aa", 0, 5_000_000L), USDM));
-    }
-
-    @Test
-    void compoundSelectionAcceptsTokenChangeAndReservesDistinctPureAdaCollateral() throws Exception {
-        Utxo priorCompoundChange = token("change", 0, 5_000L, 8_000_000L);
-        Utxo collateral = ada("collateral", 1, 5_000_000L);
-        try {
-            var method = WalletInputSelection.class.getMethod("selectForCompound", List.class, BigInteger.class);
-            Object result = method.invoke(null, List.of(priorCompoundChange, collateral), BigInteger.ZERO);
-            var ordinary = result.getClass().getMethod("ordinaryInput").invoke(result);
-            var reserved = result.getClass().getMethod("collateralInput").invoke(result);
-            assertEquals(priorCompoundChange, ordinary);
-            assertEquals(collateral, reserved);
-            assertFalse(ordinary.equals(reserved));
-        } catch (NoSuchMethodException e) {
-            fail("compound-specific ordinary/collateral selection is missing", e);
-        }
-    }
-
-    @Test
-    void compoundSelectionNamesMissingOrdinaryAndMissingDistinctCollateralSeparately() {
-        Utxo unsafe = ada("datum", 0, 9_000_000L);
-        unsafe.setInlineDatum("d87980");
-        var noOrdinary = assertThrows(WalletInputSelection.CompoundFundingException.class,
-                () -> WalletInputSelection.selectForCompound(List.of(unsafe), BigInteger.ZERO));
-        assertEquals(WalletInputSelection.CompoundFundingFailure.MISSING_SAFE_ORDINARY_INPUT,
-                noOrdinary.reason());
-
-        Utxo only = ada("only", 0, 9_000_000L);
-        var noCollateral = assertThrows(WalletInputSelection.CompoundFundingException.class,
-                () -> WalletInputSelection.selectForCompound(List.of(only), BigInteger.ZERO));
-        assertEquals(WalletInputSelection.CompoundFundingFailure.MISSING_DISTINCT_PURE_ADA_COLLATERAL,
-                noCollateral.reason());
     }
 
     // ---- FAB-128 — the token the balance gate does NOT count, and why ------------------------------

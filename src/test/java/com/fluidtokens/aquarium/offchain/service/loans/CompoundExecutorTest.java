@@ -24,6 +24,7 @@ import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import okhttp3.OkHttpClient;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
@@ -104,16 +105,23 @@ class CompoundExecutorTest {
         }
     }
 
+    /**
+     * Wallet role U: the largest ada-only output that is not C. FAB-185: it must hold the fee ceiling of the
+     * executor's parameters ({@code LedgerCeilings.maxPossibleFee}, 45,684,181 lovelace under
+     * {@link EvalFixtures#protocolParams()}), so it is 100 ADA.
+     */
     private static Utxo wallet() {
         return Utxo.builder().txHash("9e".repeat(32)).outputIndex(0)
                 .address(ACCOUNT.baseAddress())
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(100_000_000L)))).build();
     }
 
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's params. */
     private static Utxo collateral() {
         return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0)
                 .address(ACCOUNT.baseAddress())
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(WalletShape.collateralLovelace(
+                        EvalFixtures.protocolParams().getProtocolParams())))).build();
     }
 
     private static List<Utxo> universe() {
@@ -190,7 +198,8 @@ class CompoundExecutorTest {
         var executor = new CompoundExecutor(configuration, network, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT,
                 new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
-                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), submitter);
         return new Wiring(executor, submitted);
     }
 
@@ -598,7 +607,8 @@ class CompoundExecutorTest {
                 new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
                 new FakeScanner(List.of(nativeCandidate)),
                 new CompoundEconomics(configuration, network, new PricingService(throwingClient)), builder,
-                new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), bytes -> {
+                new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), bytes -> {
                     submits.incrementAndGet();
                     return Result.success("ok").withValue("native-offline");
                 });
@@ -732,6 +742,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("a syncing node must not submit"); });
 
         executor.cycle();
@@ -761,6 +772,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("a closed lending gate must not submit"); });
 
         var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
@@ -793,6 +805,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> com.bloxbean.cardano.client.api.model.Result.<String>success("ok").withValue("deadbeef"));
 
         // FAB-115 audit finding 3: the control. An OPEN gate must not stop compound — a condition
@@ -825,6 +838,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("a closed lending gate must not submit"); });
 
         var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
@@ -875,10 +889,10 @@ class CompoundExecutorTest {
     }
 
     /**
-     * ⚠ And the LARGEST nominable is taken, not the first. A 1 ada utxo cannot cover the collateral
-     * the ledger requires (150% of a ~0.84 ada fee), and nominating it produces a NEGATIVE collateral
-     * return — trap 16, a transaction the node cannot even parse. Picking first-in-list would have
-     * done exactly that here.
+     * ⚠ And the LARGEST ada-only output that is not C is taken, not the first: that is role U (FAB-185). A
+     * 1 ada utxo cannot fund a compound, and since the builder sees the wallet holding its designated input
+     * alone, nominating it would refuse the candidate outright. Picking first-in-list would have done exactly
+     * that here.
      */
     @Test
     void theLargestAdaOnlyUtxoIsNominatedNotTheFirst() {
@@ -887,15 +901,180 @@ class CompoundExecutorTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(1_000_000L)))).build();
         Utxo ample = Utxo.builder().txHash("02".repeat(32)).outputIndex(0)
                 .address(ACCOUNT.baseAddress())
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(100_000_000L)))).build();
 
-        // tiny FIRST in the list — first-in-list selection would take it and fail on collateral.
-        Wiring w = wiringWithWallet(List.of(ready(0L)), List.of(tiny, ample));
+        // tiny FIRST in the list — first-in-list selection would take it and refuse.
+        Wiring w = wiringWithWallet(List.of(ready(0L)), List.of(tiny, ample, collateral()));
         w.executor().cycle();
 
         assertEquals(1, w.submitted().size(),
-                "the ample utxo must be nominated; taking the 1 ada one first would produce a "
-                        + "negative collateral return and an unparseable transaction");
+                "the ample utxo must be nominated; taking the 1 ada one first could not fund the compound");
+        assertTrue(inputsOf(w.submitted().getFirst()).contains(refOf(ample)), "funded from the ample utxo, U");
+    }
+
+    // ---- FAB-185: funded from U, with collateral C, roles resolved once per walk ----------------
+
+    /** A token output at the bot's address, larger than U: the old compound selector preferred it. */
+    private static Utxo largerTokenOutput() {
+        return Utxo.builder().txHash("7e".repeat(32)).outputIndex(0).address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(500_000_000L)),
+                        Amount.asset("ab".repeat(28) + "01", BigInteger.valueOf(1_000L)))).build();
+    }
+
+    private static TransactionInput refOf(Utxo utxo) {
+        return new TransactionInput(utxo.getTxHash(), utxo.getOutputIndex());
+    }
+
+    private static List<TransactionInput> inputsOf(byte[] signed) {
+        try {
+            return Transaction.deserialize(signed).getBody().getInputs();
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static List<TransactionInput> collateralOf(byte[] signed) {
+        try {
+            return Transaction.deserialize(signed).getBody().getCollateral();
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /**
+     * (c) FAB-185: every candidate is funded from U even when a LARGER token-bearing output sits in the wallet
+     * — and sits first in the list. The pre-FAB-185 selector preferred exactly that output. Off the submitted
+     * body: U is an input, the token output is not, and the collateral is exactly [C].
+     */
+    @Test
+    void aCompoundIsFundedFromUEvenWhenALargerTokenOutputExists() {
+        Utxo token = largerTokenOutput();
+        Wiring w = wiringWithWallet(List.of(ready(0L)), List.of(token, wallet(), collateral()));
+
+        w.executor().cycle();
+
+        assertEquals(1, w.submitted().size(), "the compound is built and submitted");
+        List<TransactionInput> inputs = inputsOf(w.submitted().getFirst());
+        assertTrue(inputs.contains(refOf(wallet())), "funded from U: " + inputs);
+        assertFalse(inputs.contains(refOf(token)), "the larger token output is never an input: " + inputs);
+        assertEquals(List.of(refOf(collateral())), collateralOf(w.submitted().getFirst()),
+                "the collateral is exactly [C]");
+    }
+
+    /** An armed executor over {@code candidates} and {@code walletUtxos}, with the builder and the rebalancer stated. */
+    private static CompoundExecutor executorOverWallet(List<CompoundCandidate> candidates,
+                                                       CompoundTransactionBuilder builder,
+                                                       FakeAppUtxoService wallet,
+                                                       CompoundExecutor.TransactionSubmitter submitter) {
+        var configuration = new AppConfig.CompoundConfiguration(true, 60L, BigInteger.valueOf(-2_000_000L));
+        var network = new AppConfig.Network();
+        network.setNetworkForTest("preview");
+        var blockEventListener = new BlockEventListener(null);
+        blockEventListener.getIsSyncing().set(false);
+        List<Utxo> universe = new ArrayList<>(baseUniverse());
+        universe.add(wallet());
+        var executor = new CompoundExecutor(configuration, network, blockEventListener, wallet, ACCOUNT,
+                new FakeScanner(candidates), new CompoundEconomics(configuration, network, pricingService()),
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), submitter);
+        var rebalancer = org.mockito.Mockito.mock(
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class);
+        org.mockito.Mockito.when(rebalancer.lastOutcome()).thenReturn(REBALANCER_OUTCOME);
+        executor.setWalletRebalancer(rebalancer);
+        return executor;
+    }
+
+    /** What the mocked rebalancer says its last outcome was; every role refusal must name it. */
+    private static final String REBALANCER_OUTCOME = "in shape (FAB-185 marker)";
+
+    /** The WARN lines of a walk that name {@code role}. */
+    private static List<String> roleWarnings(List<Line> lines, String role) {
+        return at(Level.WARN, lines).stream().filter(line -> line.contains(role)).toList();
+    }
+
+    /**
+     * (c) FAB-185, B1: a wallet with no U — C and a token output only — builds nothing, and says so ONCE for
+     * the walk at WARN, naming {@code role U} and the rebalancer's last outcome, however many candidates are
+     * ready. The FAB-180 summary is still said.
+     */
+    @Test
+    void aMissingUIsOneWarnNamingTheRoleAndTheRebalancerAndNothingIsBuilt() {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        CompoundTransactionBuilder builder = org.mockito.Mockito.spy(realBuilder(candidates));
+        CompoundExecutor executor = executorOverWallet(candidates, builder,
+                new FakeAppUtxoService(List.of(collateral(), largerTokenOutput())),
+                bytes -> { throw new AssertionError("nothing is built, so nothing may be submitted"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        List<String> warnings = roleWarnings(lines, "role U");
+        assertEquals(1, warnings.size(), "one WARN for the walk, not one per candidate: " + lines);
+        assertTrue(warnings.getFirst().contains(REBALANCER_OUTCOME), "it names the rebalancer's last outcome: "
+                + warnings.getFirst());
+        assertEquals(List.of(), roleWarnings(lines, "role C"), "C is present, so it is not said missing");
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.never())
+                .buildWithFacts(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class));
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /** (c) FAB-185, B1: the same for a wallet with no C — U alone — naming {@code role C}. */
+    @Test
+    void aMissingCIsOneWarnNamingTheRoleAndTheRebalancerAndNothingIsBuilt() {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        CompoundTransactionBuilder builder = org.mockito.Mockito.spy(realBuilder(candidates));
+        CompoundExecutor executor = executorOverWallet(candidates, builder,
+                new FakeAppUtxoService(List.of(wallet())),
+                bytes -> { throw new AssertionError("nothing is built, so nothing may be submitted"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        List<String> warnings = roleWarnings(lines, "role C");
+        assertEquals(1, warnings.size(), "one WARN for the walk, not one per candidate: " + lines);
+        assertTrue(warnings.getFirst().contains(REBALANCER_OUTCOME), "it names the rebalancer's last outcome: "
+                + warnings.getFirst());
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.never())
+                .buildWithFacts(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class));
+        assertReconciles(summaryOf(lines).text(), 0);
+    }
+
+    /**
+     * (c) FAB-185: the roles are resolved ONCE per walk. Two ready candidates are both built and submitted —
+     * the first submission is refused by the provider, so the walk goes on to the second — from ONE wallet
+     * read. The pre-FAB-185 executor read the wallet once per candidate.
+     */
+    @Test
+    void theRolesAreResolvedOncePerWalkFromOneWalletRead() {
+        List<CompoundCandidate> candidates = twoReadyCandidates();
+        FakeAppUtxoService wallet = new FakeAppUtxoService(List.of(wallet(), collateral()));
+        AtomicInteger submits = new AtomicInteger();
+        CompoundExecutor executor = executorOverWallet(candidates, realBuilder(candidates), wallet, bytes -> {
+            submits.incrementAndGet();
+            return blockfrostRejection(400, "opaque");
+        });
+
+        assertEquals(WorkResult.DEFINITE_FAILURE, executor.cycle());
+
+        assertEquals(2, submits.get(), "both ready candidates were built and submitted");
+        assertEquals(1, wallet.reads.get(), "one wallet read for the walk, not one per candidate");
+    }
+
+    /** FAB-185: a U below the fee ceiling refuses the candidate at WARN, naming role U as too small. */
+    @Test
+    void aUBelowTheFeeCeilingIsSkippedAsTooSmall() {
+        Utxo smallU = Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(ACCOUNT.baseAddress())
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(10_000_000L)))).build();
+        CompoundTransactionBuilder builder = org.mockito.Mockito.spy(realBuilder(List.of(ready(0L))));
+        CompoundExecutor executor = executorOverWallet(List.of(ready(0L)), builder,
+                new FakeAppUtxoService(List.of(smallU, collateral())),
+                bytes -> { throw new AssertionError("nothing is built, so nothing may be submitted"); });
+
+        List<Line> lines = cycleAt(executor, T0);
+
+        assertEquals(1, at(Level.WARN, lines).stream()
+                        .filter(line -> line.startsWith("compound SKIPPED " + LOAN_ID + ": role U")
+                                && line.contains("too small")).count(), lines.toString());
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.never())
+                .buildWithFacts(org.mockito.ArgumentMatchers.any(CompoundTransactionBuilder.Request.class));
     }
 
     /**
@@ -1051,7 +1230,7 @@ class CompoundExecutorTest {
                 new FakeAppUtxoService(List.of(wallet(), collateral())), account,
                 new FakeScanner(candidates), economics,
                 builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe),
-                LoanFixtures.converters(), submitter);
+                LoanFixtures.converters(), EvalFixtures.protocolParams(), submitter);
     }
 
     private static Result<String> blockfrostRejection(int statusCode, String message) {
@@ -1390,7 +1569,8 @@ class CompoundExecutorTest {
         return new CompoundExecutor(configuration, network, blockEventListener,
                 new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT,
                 new FakeScanner(List.of(ready(0L))), new CompoundEconomics(configuration, network, pricingService()),
-                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(), submitter);
+                builder, new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(), submitter);
     }
 
     // ---- FAB-144: the most profitable compound first ------------------------------------------
@@ -1501,6 +1681,7 @@ class CompoundExecutorTest {
                 new FakeScanner(List.of(largerRaw, smallerRaw)),
                 new CompoundEconomics(configuration, network, new PricingService(client)), realBuilder(),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("disarmed"); });
         var logger = (Logger) LoggerFactory.getLogger(CompoundExecutor.class);
         var appender = new ListAppender<ILoggingEvent>();
@@ -1722,6 +1903,7 @@ class CompoundExecutorTest {
                 new FakeAppUtxoService(List.of(wallet(), collateral())), ACCOUNT, scanner,
                 new CompoundEconomics(configuration, network, pricingService()), realBuilder(),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("nothing here is ready, so nothing may be submitted"); });
     }
 
@@ -1973,6 +2155,7 @@ class CompoundExecutorTest {
                 new FakeScanner(List.of(candidate)),
                 new CompoundEconomics(configuration, network, new PricingService(client)), realBuilder(),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("an unpriced candidate must not be submitted"); });
 
         List<Line> lines = cycleAt(executor, T0);
@@ -2084,6 +2267,7 @@ class CompoundExecutorTest {
                 new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                         LoanFixtures.utxoSupplier(universe()), EvalFixtures.protocolParams(), null),
                 new FakeResolver(), LoanFixtures.utxoSupplier(universe()), LoanFixtures.converters(),
+                EvalFixtures.protocolParams(),
                 bytes -> { throw new AssertionError("an early return must not submit"); });
         if (gateClosed) {
             var gate = new com.fluidtokens.aquarium.offchain.service.LendingConfigGate();
@@ -2166,6 +2350,8 @@ class CompoundExecutorTest {
 
     private static final class FakeAppUtxoService extends AppUtxoService {
         private final List<Utxo> utxos;
+        /** FAB-185: how often the wallet was read. */
+        final AtomicInteger reads = new AtomicInteger();
 
         FakeAppUtxoService(List<Utxo> utxos) {
             super(null, null);
@@ -2174,6 +2360,7 @@ class CompoundExecutorTest {
 
         @Override
         public List<Utxo> listWalletUtxo() {
+            reads.incrementAndGet();
             return utxos;
         }
     }

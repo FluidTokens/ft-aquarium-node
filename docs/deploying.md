@@ -631,6 +631,10 @@ they suffice. (The transaction builders still choose their own collateral UTxO �
 one, which is U in a shaped wallet — and an anticipate or convert can still draw on further wallet
 UTxOs while balancing.)
 
+A **compound** is funded from **U** alone with **C** as its collateral, and its change comes back as one
+ada-only UTxO — except that a token pool's compounding fee arrives in the pool's token inside that UTxO,
+which may trigger a wallet reshape.
+
 **A UTxO that went out is not used again in the same check.** After a liquidation is submitted (or
 its submission's outcome is unknown), after a `shadow` node's would-be submission, and after a failure
 that says an input was already spent, the UTxO it was funded from is marked used, and the next

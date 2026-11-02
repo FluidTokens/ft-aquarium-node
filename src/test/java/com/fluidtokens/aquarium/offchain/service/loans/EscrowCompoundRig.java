@@ -34,6 +34,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import org.cardanofoundation.conversions.ClasspathConversionsFactory;
 import org.cardanofoundation.conversions.domain.NetworkType;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -287,8 +288,10 @@ final class EscrowCompoundRig {
                 fixture("mainnet-lm-config-datum-2026-10-26.hex"));
         Utxo wallet = Utxo.builder().txHash("9e".repeat(32)).outputIndex(0).address(bot)
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
+        // FAB-185 — wallet role C: exactly WalletShape.collateralLovelace of this rig's params (5 ADA here).
         Utxo collateral = Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(bot)
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(WalletShape.collateralLovelace(
+                        LoanFixtures.protocolParams().getProtocolParams())))).build();
 
         List<Utxo> universe = new ArrayList<>(List.of(escrow, bond, pool, poolManager, config, lmConfig,
                 wallet, collateral));
@@ -377,7 +380,7 @@ final class EscrowCompoundRig {
                             }
                         })),
                 builder, resolver, utxoSupplier,
-                ClasspathConversionsFactory.createConverters(NetworkType.MAINNET),
+                ClasspathConversionsFactory.createConverters(NetworkType.MAINNET), LoanFixtures.protocolParams(),
                 bytes -> {
                     submitted.add(bytes);
                     return Result.success("rig").withValue("rig");

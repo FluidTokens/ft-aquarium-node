@@ -1,6 +1,7 @@
 package com.fluidtokens.aquarium.offchain.service.loans;
 
 import com.bloxbean.cardano.client.account.Account;
+import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.backend.blockfrost.service.BFBackendService;
@@ -17,7 +18,10 @@ import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
 import com.fluidtokens.aquarium.offchain.service.BlockEventListener;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
-import com.fluidtokens.aquarium.offchain.util.WalletInputSelection;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletRoles;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
+import com.fluidtokens.aquarium.offchain.util.LedgerCeilings;
 import lombok.extern.slf4j.Slf4j;
 import org.cardanofoundation.conversions.CardanoConverters;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -30,11 +34,13 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -60,6 +66,15 @@ import java.util.stream.Collectors;
  * An operator asking "why did it not compound?" must find the answer in the log rather than in the
  * source. Structural refusals come from {@link CompoundCandidateScanner}, economic ones from
  * {@link CompoundEconomics}, and both are printed with the arithmetic that produced them.
+ *
+ * <h2>⛔ Funded from U, with collateral C (FAB-185)</h2>
+ * The wallet is read ONCE per walk, after the scan and only when an armed walk has a ready candidate, and
+ * its roles are resolved from that read ({@link WalletRoles}): C, the ada-only output of exactly
+ * {@code WalletShape.collateralLovelace(params)}, and U, the largest other ada-only output. Every candidate
+ * of the walk is funded from U and pins C as its only collateral; the builder sees the wallet holding U
+ * alone, so no compound can spend C, a token output or a published reference script. A missing C or U is
+ * said ONCE per role per walk at WARN, naming the role and the wallet rebalancer's last outcome — the
+ * rebalancer is what keeps C and U in place — and nothing is built.
  */
 @Service
 @Slf4j
@@ -122,7 +137,22 @@ public class CompoundExecutor {
     private final LiquidationUtxoResolver utxoResolver;
     private final UtxoSupplier utxoSupplier;
     private final CardanoConverters converters;
+    /** FAB-185: sizes C ({@code WalletShape.collateralLovelace}) and U's fee ceiling, once per walk. */
+    private final ProtocolParamsSupplier protocolParamsSupplier;
     private final TransactionSubmitter submitter;
+
+    /**
+     * FAB-185: the wallet rebalancer, read for one thing only — its last outcome, which every wallet-role
+     * refusal names, because the rebalancer is what keeps C and U in place. Setter-injected and REQUIRED in
+     * the container, like the liquidation executor's; null only in a direct test construction, where a
+     * refusal says the rebalancer is not wired.
+     */
+    private WalletRebalancer walletRebalancer;
+
+    @Autowired
+    public void setWalletRebalancer(WalletRebalancer walletRebalancer) {
+        this.walletRebalancer = walletRebalancer;
+    }
 
     /**
      * ⛔ Closed by {@code LoansConfigVerifier} when the live Lending v4 config does not match what this
@@ -188,7 +218,7 @@ public class CompoundExecutor {
                             ProtocolParamsSupplier protocolParamsSupplier,
                             BFBackendService backendService) {
         this(configuration, network, blockEventListener, appUtxoService, account, scanner, economics,
-                builder, utxoResolver, utxoSupplier, converters,
+                builder, utxoResolver, utxoSupplier, converters, protocolParamsSupplier,
                 bytes -> {
                     // FAB-134 B5a: a rejection naming the parameters refreshes them; the result itself
                     // is returned untouched (nothing retried, no outcome changed).
@@ -198,7 +228,10 @@ public class CompoundExecutor {
                 });
     }
 
-    /** The same loop with the submitter stated, so a test can watch exactly what reaches the wire. */
+    /**
+     * The same loop with the submitter stated, so a test can watch exactly what reaches the wire. The
+     * protocol parameters are stated too (FAB-185): they size the wallet's roles C and U.
+     */
     public CompoundExecutor(AppConfig.CompoundConfiguration configuration,
                             AppConfig.Network network,
                             BlockEventListener blockEventListener,
@@ -210,6 +243,7 @@ public class CompoundExecutor {
                             LiquidationUtxoResolver utxoResolver,
                             UtxoSupplier utxoSupplier,
                             CardanoConverters converters,
+                            ProtocolParamsSupplier protocolParamsSupplier,
                             TransactionSubmitter submitter) {
         this.configuration = configuration;
         this.network = network;
@@ -222,6 +256,7 @@ public class CompoundExecutor {
         this.utxoResolver = utxoResolver;
         this.utxoSupplier = utxoSupplier;
         this.converters = converters;
+        this.protocolParamsSupplier = protocolParamsSupplier;
         this.submitter = submitter;
     }
 
@@ -286,6 +321,13 @@ public class CompoundExecutor {
             }
         }
 
+        // ⛔ FAB-185 — THE WALLET'S ROLES, RESOLVED ONCE FOR THIS WALK FROM ONE READ.
+        //
+        // Below the scan and the ranking, and only when an ARMED walk has a ready candidate: a disarmed walk
+        // builds nothing and never needed the wallet, so it still does not read it. Every candidate of the
+        // walk is funded from U with C as its collateral; a missing role is said once per role per walk.
+        WalletCheck walletCheck = configuration.isEnabled() && tally.ready > 0 ? walletCheck() : null;
+
         // Every escrow is reported, refused or not: "nothing to do" and "eight things all blocked"
         // must not look alike to an operator. Per escrow at DEBUG; the cycle's summary carries the counts.
         int readyWalked = 0;
@@ -302,7 +344,7 @@ public class CompoundExecutor {
                 return WorkResult.DEFINITE_FAILURE;
             }
             readyWalked++;
-            WorkResult outcome = consider(candidate, tally, fence);
+            WorkResult outcome = consider(candidate, tally, fence, walletCheck);
             if (outcome.terminal()) {
                 tally.notReached = tally.ready - readyWalked;
                 logSummary(tally);
@@ -412,7 +454,8 @@ public class CompoundExecutor {
         return ordered;
     }
 
-    private WorkResult consider(CompoundCandidate candidate, CycleTally tally, SubmitFence fence) {
+    private WorkResult consider(CompoundCandidate candidate, CycleTally tally, SubmitFence fence,
+                                WalletCheck walletCheck) {
         if (!configuration.isEnabled()) {
             // Not a fault. Said at DEBUG per escrow (FAB-180); the cycle summary's `not armed` count is
             // what answers an operator asking why a ready candidate went unprocessed.
@@ -435,26 +478,14 @@ public class CompoundExecutor {
             return WorkResult.DEFINITE_FAILURE;
         }
 
-        List<Utxo> walletUtxos = appUtxoService.listWalletUtxo();
-        final WalletInputSelection.CompoundFunding funding;
-        try {
-            funding = WalletInputSelection.selectForCompound(walletUtxos, BigInteger.ZERO);
-        } catch (WalletInputSelection.CompoundFundingException e) {
-            // ⛔ "Nothing qualified" cannot tell an EMPTY wallet from a FULL one whose every UTxO is
-            // ineligible, and those need opposite responses. Measured 2026-09-02: the wallet held
-            // 9,898 ada and could not build, because its only UTxO also carried a native token —
-            // CCL trap 17, where a successful transaction's change output disables the next one.
-            long total = walletUtxos.stream()
-                    .flatMap(u -> u.getAmount().stream())
-                    .filter(a -> "lovelace".equals(a.getUnit()))
-                    .mapToLong(a -> a.getQuantity().longValue()).sum();
-            long multiAsset = walletUtxos.stream().filter(u -> u.getAmount().size() > 1).count();
-            log.warn("compound SKIPPED {}: {}. Wallet has {} utxo(s), {} lovelace and {} "
-                            + "token-bearing utxo(s); ordinary compound inputs may carry safe token "
-                            + "change, while collateral must be a distinct pure-ADA UTxO",
-                    candidate.loanId(), e.reason(), walletUtxos.size(), total, multiAsset);
+        // ⛔ FAB-185: funded from U, the walk's ONE ordinary wallet input, with C as the only collateral —
+        // both resolved once for the walk, never re-read here. A missing role or a U below the fee ceiling
+        // refuses this candidate; nothing is built from another wallet output instead.
+        Utxo fundingUtxo = designatedU(candidate, walletCheck);
+        if (fundingUtxo == null) {
             return WorkResult.DEFINITE_FAILURE;
         }
+        Utxo collateralUtxo = walletCheck.roles().c().orElseThrow();
 
         // THE validator's fee (ADA: at least 1 ADA since 2026-10-26; token: Q*c/1000). It is what the
         // builder hands the pool owner's share to, what the pool output is reduced by, and what is priced.
@@ -484,8 +515,8 @@ public class CompoundExecutor {
         try {
             built = builder.buildWithFacts(new CompoundTransactionBuilder.Request(
                     candidate, referenceScripts(), bondUtxo.get(), configUtxo.get(), lmConfigUtxo.get(),
-                    funding.ordinaryInput(),
-                    account.baseAddress(), fee, slots[0], slots[1]));
+                    fundingUtxo,
+                    account.baseAddress(), fee, slots[0], slots[1], collateralUtxo));
         } catch (CompoundTransactionBuilder.RefusedException e) {
             log.warn("compound REFUSED BY BUILDER {} escrow {}: {}", candidate.loanId(),
                     candidate.escrowRef(), e.getMessage());
@@ -622,6 +653,95 @@ public class CompoundExecutor {
                     candidate.loanId(), e.toString(), e);
             return WorkResult.AMBIGUOUS;
         }
+    }
+
+    // ---- the walk's wallet roles (FAB-185) -------------------------------------------------------
+
+    /** The role names a refusal starts with: {@code role C}, {@code role U}. */
+    static final String ROLE_C = "C";
+    static final String ROLE_U = "U";
+
+    /**
+     * One walk's wallet: the roles resolved from its one read and the fee ceiling U is sized against — or,
+     * when the protocol parameters could not size C, neither, with why — and the missing roles already said
+     * at WARN. Created per {@link #cycle(SubmitFence)} call and dropped with it; nothing in it outlives it.
+     */
+    private record WalletCheck(WalletRoles roles, BigInteger feeCeiling, String unsizable,
+                               Set<String> warnedMissingRoles) {
+    }
+
+    /**
+     * Reads the wallet once and resolves its roles. ⚠ The parameters are REQUIRED: without them C cannot be
+     * sized, and without C no role can be told apart. They are proven usable INSIDE the catch — the fee
+     * ceiling and C are both derived there — so a partial object is "C cannot be sized", never a later
+     * NullPointerException (CCL trap 19).
+     */
+    private WalletCheck walletCheck() {
+        List<Utxo> wallet = appUtxoService.listWalletUtxo();
+        BigInteger feeCeiling;
+        BigInteger collateralLovelace;
+        try {
+            ProtocolParams params = protocolParamsSupplier.getProtocolParams();
+            feeCeiling = LedgerCeilings.maxPossibleFee(params);
+            collateralLovelace = WalletShape.collateralLovelace(params);
+        } catch (Exception e) {
+            return new WalletCheck(null, null, "the protocol parameters are unusable (" + e + "), so C cannot "
+                    + "be sized and no wallet output can be told apart", new HashSet<>());
+        }
+        WalletRoles roles = WalletRoles.resolve(wallet, collateralLovelace);
+        log.debug("compound wallet roles for this walk: C {}, U {}",
+                roles.c().map(c -> WalletRoles.ref(c) + " (" + collateralLovelace + " lovelace)").orElse("none"),
+                roles.u().map(u -> WalletRoles.ref(u) + " (" + LedgerCeilings.lovelaceOf(u) + " lovelace)")
+                        .orElse("none"));
+        return new WalletCheck(roles, feeCeiling, null, new HashSet<>());
+    }
+
+    /**
+     * U, when this walk has both roles and U holds at least the fee ceiling; otherwise null, said: a missing
+     * role at WARN once per role per walk (DEBUG after), a U that is too small at WARN for this candidate.
+     */
+    private Utxo designatedU(CompoundCandidate candidate, WalletCheck walletCheck) {
+        if (walletCheck.roles() == null) {
+            missingRole(candidate, walletCheck, ROLE_C, walletCheck.unsizable());
+            return null;
+        }
+        WalletRoles roles = walletCheck.roles();
+        if (roles.c().isEmpty()) {
+            missingRole(candidate, walletCheck, ROLE_C, "the wallet holds no ada-only output (no datum, no "
+                    + "reference script) of exactly " + roles.collateralLovelace() + " lovelace, the collateral");
+            return null;
+        }
+        if (roles.u().isEmpty()) {
+            missingRole(candidate, walletCheck, ROLE_U, "the wallet holds no ada-only output (no datum, no "
+                    + "reference script) besides C, the " + roles.collateralLovelace() + "-lovelace collateral");
+            return null;
+        }
+        Utxo u = roles.u().get();
+        BigInteger holds = LedgerCeilings.lovelaceOf(u);
+        if (holds.compareTo(walletCheck.feeCeiling()) < 0) {
+            log.warn("compound SKIPPED {}: role U, wallet output {}, holds {} lovelace — too small for the fee "
+                            + "ceiling of {} lovelace (a pre-build ceiling: the build is the judge); {}",
+                    candidate.loanId(), WalletRoles.ref(u), holds, walletCheck.feeCeiling(), rebalancerOutcome());
+            return null;
+        }
+        return u;
+    }
+
+    /** Says a missing {@code role} for {@code candidate}: at WARN the first time in this walk, at DEBUG after. */
+    private void missingRole(CompoundCandidate candidate, WalletCheck walletCheck, String role, String why) {
+        String detail = "role %s is missing: %s, so this compound has nothing to be funded from; %s"
+                .formatted(role, why, rebalancerOutcome());
+        if (walletCheck.warnedMissingRoles().add(role)) {
+            log.warn("compound SKIPPED {}: {}", candidate.loanId(), detail);
+        } else {
+            log.debug("compound SKIPPED {}: {}", candidate.loanId(), detail);
+        }
+    }
+
+    /** What a role refusal says about the rebalancer, which is what keeps the wallet in shape. */
+    private String rebalancerOutcome() {
+        return walletRebalancer == null ? "the wallet rebalancer is not wired"
+                : "the wallet rebalancer's last outcome: " + walletRebalancer.lastOutcome();
     }
 
     /**
