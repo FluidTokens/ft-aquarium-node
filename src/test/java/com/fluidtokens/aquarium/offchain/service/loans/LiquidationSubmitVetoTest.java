@@ -6,6 +6,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.bloxbean.cardano.client.account.Account;
 import com.bloxbean.cardano.client.api.ProtocolParamsSupplier;
+import com.bloxbean.cardano.client.api.model.Amount;
 import com.bloxbean.cardano.client.api.model.ProtocolParams;
 import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
@@ -368,6 +369,36 @@ class LiquidationSubmitVetoTest {
         @Override
         public Collection<OracleEntry> entries() {
             return entries;
+        }
+    }
+
+    /**
+     * FAB-185 r2: {@link FakeOracleClient} that also answers the two lookups a pay-in-advance's economics
+     * price its legs through — by the oracle NFT the loan's datum names, and by the priced asset — so a
+     * pay-in-advance candidate can be priced to a verdict. Only the tests that build one use it.
+     */
+    private static final class LegPricingOracleClient extends FluidOracleClient {
+
+        private final List<OracleEntry> entries;
+
+        LegPricingOracleClient(List<OracleEntry> entries) {
+            super("http://unused.invalid");
+            this.entries = entries;
+        }
+
+        @Override
+        public Collection<OracleEntry> entries() {
+            return entries;
+        }
+
+        @Override
+        public Optional<OracleEntry> findEntry(AssetType token) {
+            return entries.stream().filter(e -> e.token().equals(token)).findFirst();
+        }
+
+        @Override
+        public Optional<OracleEntry> findEntryByOracleToken(AssetType oracleToken) {
+            return entries.stream().filter(e -> e.oracleToken().equals(oracleToken)).findFirst();
         }
     }
 
@@ -2298,6 +2329,71 @@ class LiquidationSubmitVetoTest {
                 principalFeed(), OraclePriceFeed.unit(), VALID_FROM));
     }
 
+    private static final String TX_LOAN_4 = "ad".repeat(32);
+    private static final String TX_BOND_4 = "de".repeat(32);
+    private static final String LOAN_ID_4 = "d1b2c3d4e5f6a1b2";
+    private static final String TX_TOKEN_WALLET = "e7".repeat(32);
+
+    /**
+     * FAB-185 r2: a TOKEN-PRINCIPAL PAY-IN-ADVANCE candidate in a second market (principal
+     * {@code PRINCIPAL_TOKEN}), funded from its own TOKEN output — never from U — so it can follow a plain
+     * candidate that went out on U in the same call. 1,000,000 TOK of collateral at 50 lovelace (50 ADA)
+     * against 100,000,000 PRI of debt at 1 lovelace (100 ADA): under water, equity zero. The bond converts
+     * to principal at the fat 500 per mille, so the bot fronts the lender's half of the collateral in PRI
+     * and acquires all of it — comfortably profitable, so its verdict is the market's, not S3's. Needs
+     * {@link #principalOracle()} and {@link #collateralOracle()}, and {@link #payInAdvanceMarket} to route it.
+     */
+    private static Scenario tokenPrincipalPayInAdvanceScenario() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, PRINCIPAL_ORACLE_TOKEN,
+                BigInteger.valueOf(100_000_000), BigInteger.valueOf(1000),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, ORACLE_TOKEN), LATE_LEND_DATE,
+                LoanFixtures.liquidation(), new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo(TX_LOAN_4, 0, LOAN_ID_4, datum, 2_000_000L,
+                List.of(LoanFixtures.token(COLLATERAL_TOKEN, 1_000_000L)));
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo(TX_BOND_4, 0, LOAN_ID_4,
+                LoanFixtures.convertToPrincipalBondDatum(FAT_FEE_PER_MILLE,
+                        LoanFixtures.inlineKeyStakeCredential(STAKE_KEY), PRINCIPAL_TOKEN),
+                2_000_000L);
+        return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                principalFeed(), collateralFeed(), VALID_FROM));
+    }
+
+    /** The pay-in-advance candidate's TOKEN output: ample PRI for the lender payout, and ada for its floor. */
+    private static final Utxo TOKEN_WALLET_UTXO = LoanFixtures.utxo(TX_TOKEN_WALLET, 0, ACCOUNT.baseAddress(),
+            List.of(Amount.lovelace(BigInteger.valueOf(60_000_000L)),
+                    Amount.asset(PRINCIPAL_TOKEN.toUnit(),
+                            BigInteger.valueOf(100_000_000L))),
+            null);
+
+    /** {@link #armed()} with the pay-in-advance action published too, so its body fits under maxTxSize. */
+    private static AppConfig.LiquidationConfiguration armedForPayInAdvance(
+            AppConfig.LiquidationConfiguration.Mode payInAdvanceMarketMode) {
+        var cfg = configuration(AppConfig.LiquidationConfiguration.Mode.LIVE, SMALL_MARGIN,
+                new LiquidateTransactionBuilder.ReferenceScripts(
+                        new TransactionInput(TX_REF_SCRIPTS, 0),
+                        new TransactionInput(TX_REF_SCRIPTS, 1),
+                        new TransactionInput(TX_REF_SCRIPTS, 2),
+                        new TransactionInput(TX_REF_SCRIPTS, 3),
+                        new TransactionInput(TX_REF_SCRIPTS, 4),
+                        new TransactionInput(TX_REF_SCRIPTS, 5),
+                        null,
+                        new TransactionInput(TX_REF_SCRIPTS, 6),
+                        null));
+        cfg.setMarkets(List.of(payInAdvanceMarket(payInAdvanceMarketMode)));
+        return cfg;
+    }
+
+    /** The {@code PRINCIPAL_TOKEN} market: ANTICIPATE, capped well above the payout, at {@code mode}. */
+    private static AppConfig.LiquidationConfiguration.Market payInAdvanceMarket(
+            AppConfig.LiquidationConfiguration.Mode mode) {
+        var market = new AppConfig.LiquidationConfiguration.Market();
+        market.setUnit(PRINCIPAL_TOKEN.toUnit());
+        market.setMode(mode);
+        market.setAction(AppConfig.LiquidationConfiguration.Action.ANTICIPATE);
+        market.setCap(BigInteger.valueOf(1_000_000_000L));
+        return market;
+    }
+
     /** A fence that reads open {@code opens} times, then closed for good. */
     private static SubmitFence openFor(int opens) {
         int[] reads = {0};
@@ -2334,6 +2430,14 @@ class LiquidationSubmitVetoTest {
     private static StageRun stage(AppConfig.LiquidationConfiguration configuration, List<Scenario> scenarios,
                                   RecordingSubmitter submitter, String loanRefThatThrows, SubmitFence fence,
                                   LiquidationDecisionLog log, List<Utxo> walletUtxos) {
+        return stage(configuration, scenarios, submitter, loanRefThatThrows, fence, log, walletUtxos,
+                new FakeOracleClient(List.of(principalOracle())));
+    }
+
+    /** As above, with the oracle client the stage serves made explicit. */
+    private static StageRun stage(AppConfig.LiquidationConfiguration configuration, List<Scenario> scenarios,
+                                  RecordingSubmitter submitter, String loanRefThatThrows, SubmitFence fence,
+                                  LiquidationDecisionLog log, List<Utxo> walletUtxos, FluidOracleClient oracles) {
         List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO));
         universe.addAll(walletUtxos);
         Map<String, Utxo> unspent = new LinkedHashMap<>();
@@ -2383,7 +2487,7 @@ class LiquidationSubmitVetoTest {
         LiquidationExecutor executor = new LiquidationExecutor(configuration, blockEventListener,
                 new FakeAppUtxoService(walletUtxos), ACCOUNT, new FakeScanner(assessments), resolver,
                 builder, payInAdvanceRouter, LoanFixtures.registry(), log, metrics(),
-                provider(new FakeOracleClient(List.of(principalOracle()))),
+                provider(oracles),
                 networkNamed("preview"), protocolParams(), LoanFixtures.converters(), submitter);
         executor.setSubmitClock(() -> NOW);
 
@@ -2777,6 +2881,80 @@ class LiquidationSubmitVetoTest {
                 "the later candidate is skipped for sharing U: " + stage.events());
         assertEquals(1, submitter.submitted.size());
         assertEquals(WorkResult.SUBMITTED, stage.result());
+    }
+
+    /**
+     * (k) SUBMITTED outranks a LATER WOULD_SUBMIT: the ada market live, the other market held at shadow,
+     * so the transmission comes first and the rehearsal after it. {@link #submittedOutranksWouldSubmit}
+     * meets them the other way round, where a result that simply took the latest outcome ends at
+     * SUBMITTED too. Here it would end at WOULD_SUBMIT, and the pipeline would run compound in the same
+     * pass right after a real liquidation went out.
+     * <p>
+     * FAB-185 r2: the later candidate is a token-principal PAY-IN-ADVANCE, funded from its own TOKEN output
+     * rather than the U the first one spent, so it is still built — the case two plain candidates can no
+     * longer reach ({@link #aSubmittedLiquidationIsWhatTheCallReportsWhenALaterMarketIsHeldAtShadow}).
+     */
+    @Test
+    void aSubmittedLiquidationOutranksALaterShadowWouldSubmit() {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        var configuration = armedForPayInAdvance(AppConfig.LiquidationConfiguration.Mode.SHADOW);
+
+        StageRun stage = stage(configuration, List.of(adaScenario(), tokenPrincipalPayInAdvanceScenario()),
+                submitter, null, SubmitFence.OPEN, new LiquidationDecisionLog(configuration),
+                shaped(WALLET_UTXO, TOKEN_WALLET_UTXO),
+                new LegPricingOracleClient(List.of(principalOracle(), collateralOracle())));
+
+        List<LiquidationDecision> oldestFirst = new ArrayList<>(stage.log().newestFirst(10));
+        java.util.Collections.reverse(oldestFirst);
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMITTED, LiquidationDecision.Outcome.WOULD_SUBMIT),
+                oldestFirst.stream().map(LiquidationDecision::outcome).toList(),
+                "the transmission is recorded BEFORE the rehearsal: " + oldestFirst);
+        assertEquals(1, submitter.submitted.size());
+        assertEquals(WorkResult.SUBMITTED, stage.result());
+        // The shape the ranking depends on: the rehearsal is the pay-in-advance, held by its MARKET, and
+        // funded from its TOKEN output — never from the U the transmission spent.
+        LiquidationDecision rehearsal = decisionFor(stage, tokenPrincipalPayInAdvanceScenario());
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, rehearsal.outcome(), rehearsal.detail());
+        assertEquals(LiquidationExecutor.SubmitVeto.MARKET_NOT_LIVE.name(), rehearsal.submitVeto());
+        assertTrue(fundedFromTokenOutput(stage.events(), TX_LOAN_4 + "#0"), stage.events().toString());
+    }
+
+    /**
+     * (i) AMBIGUOUS outranks an earlier SUBMITTED in another market.
+     * <p>
+     * FAB-185 r2: the second market's candidate is a token-principal PAY-IN-ADVANCE, funded from its own
+     * TOKEN output, so it is built and transmitted after the first went out on U — and its raw 400 answer is
+     * AMBIGUOUS. ({@link #ambiguousOutranksAnEarlierDefiniteFailure} keeps r1's plain-only pair.)
+     */
+    @Test
+    void ambiguousOutranksAnEarlierSubmitted() throws Exception {
+        RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
+        submitter.later = Result.<String>error("ValueNotConservedUTxO").code(400);
+        var configuration = armedForPayInAdvance(AppConfig.LiquidationConfiguration.Mode.LIVE);
+
+        StageRun stage = stage(configuration, List.of(adaScenario(), tokenPrincipalPayInAdvanceScenario()),
+                submitter, null, SubmitFence.OPEN, new LiquidationDecisionLog(configuration),
+                shaped(WALLET_UTXO, TOKEN_WALLET_UTXO),
+                new LegPricingOracleClient(List.of(principalOracle(), collateralOracle())));
+
+        assertEquals(2, submitter.submitted.size());
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMIT_FAILED, LiquidationDecision.Outcome.SUBMITTED),
+                stage.log().newestFirst(10).stream().map(LiquidationDecision::outcome).toList());
+        assertEquals(WorkResult.AMBIGUOUS, stage.result());
+        // The shape the ranking depends on: the AMBIGUOUS transmission is the pay-in-advance's, funded from
+        // its TOKEN output.
+        assertEquals(LiquidationDecision.Outcome.SUBMIT_FAILED,
+                decisionFor(stage, tokenPrincipalPayInAdvanceScenario()).outcome());
+        assertTrue(fundedFromTokenOutput(stage.events(), TX_LOAN_4 + "#0"), stage.events().toString());
+        assertTrue(inputsOf(submitter.submitted.get(1)).contains(new TransactionInput(TX_TOKEN_WALLET, 0)),
+                "the second transmission spends the TOKEN output");
+    }
+
+    /** The INFO line naming {@link #TOKEN_WALLET_UTXO} as the funding of {@code loanRef}, under role TOKEN. */
+    private static boolean fundedFromTokenOutput(List<ILoggingEvent> events, String loanRef) {
+        return events.stream().anyMatch(event -> event.getFormattedMessage().contains(loanRef)
+                && event.getFormattedMessage().contains("is funded from wallet output " + TX_TOKEN_WALLET
+                + "#0 (role TOKEN " + PRINCIPAL_TOKEN.toUnit()));
     }
 
     /**

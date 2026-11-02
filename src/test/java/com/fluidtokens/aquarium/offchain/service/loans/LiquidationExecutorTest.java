@@ -2805,6 +2805,45 @@ class LiquidationExecutorTest {
     }
 
     /**
+     * FAB-185 r2 (F3): an ANTICIPATE token market the operator DISABLED, and a wallet {C, U} holding none of
+     * that token. The market is the answer, not the wallet: every check refuses it {@code MARKET_DISABLED} by
+     * the router's own gate — the row and INFO line it had before wallet roles existed — and the role lookup
+     * is never reached, so there is no {@code WALLET_ROLE_MISSING} row and no WARN about a role the bot is
+     * not to use in that market.
+     */
+    @Test
+    void aDisabledAnticipateMarketIsRefusedMarketDisabledBeforeTheRoleLookup() {
+        AppConfig.LiquidationConfiguration configuration = shadow(SMALL_MARGIN);
+        AppConfig.LiquidationConfiguration.Market disabled = anticipateMarket(PRINCIPAL_TOKEN_2.toUnit(),
+                1_500_000_000L);
+        disabled.setMode(AppConfig.LiquidationConfiguration.Mode.DISABLED);
+        configuration.setMarkets(List.of(disabled));
+        Wiring wiring = tokenPrincipalConvertEconomicsWiring(shaped(WALLET_UTXO),
+                List.of(decoyVersion(collateralOracle(), 77), decoyVersion(principalOracle(), 9),
+                        collateralOracle(), principalOracle()), configuration);
+
+        List<ILoggingEvent> events = cyclesLogged(wiring, 2);
+
+        List<LiquidationDecision> decisions = wiring.log().newestFirst(10);
+        assertEquals(2, decisions.size(), "one row per check: " + decisions);
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+            assertTrue(decision.reason().startsWith("MARKET_DISABLED"), decision.reason());
+            assertTrue(decision.reason().contains("is DISABLED"), decision.reason());
+            assertEquals(decision.reason(), decision.detail(), "recorded exactly as the router's gate records it");
+        }
+        assertEquals(0, decisions.stream().filter(d -> "WALLET_ROLE_MISSING".equals(d.reason())).count(),
+                decisions.toString());
+        List<ILoggingEvent> roleWarns = events.stream().filter(event -> event.getLevel() == Level.WARN)
+                .filter(event -> event.getFormattedMessage().contains("role ")).toList();
+        assertEquals(List.of(), roleWarns, "no WARN names a wallet role");
+        assertEquals(2, events.stream().filter(event -> event.getLevel() == Level.INFO)
+                        .filter(event -> event.getFormattedMessage().contains("refused by the market gate"))
+                        .filter(event -> event.getFormattedMessage().contains("MARKET_DISABLED")).count(),
+                "the router's gate refusal, at INFO, once per check: " + events);
+    }
+
+    /**
      * (g), under FAB-185 (task 6 f, replacing "an ada-floor note without a fee ceiling"): a check whose
      * protocol parameters cannot be read cannot size C, so it builds NOTHING — no row, no router call — and
      * says so in exactly ONE WARN naming role C and the cause chain. The old degraded path (a 2 ADA floor

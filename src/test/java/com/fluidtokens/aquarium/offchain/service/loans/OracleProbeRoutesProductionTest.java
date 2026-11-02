@@ -57,8 +57,10 @@ import java.lang.reflect.Field;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -107,8 +109,12 @@ class OracleProbeRoutesProductionTest {
         final AtomicInteger evaluations = new AtomicInteger();
         final AtomicInteger submissions = new AtomicInteger();
         final List<ILoggingEvent> events = new ArrayList<>();
+        /** FAB-185 r2: every body handed to the evaluator, deserialised — the transaction the bean built. */
+        final List<Transaction> evaluated = new ArrayList<>();
         LiquidationExecutor executor;
         LiquidationDecisionLog log;
+        /** The wallet the executor lists — the funds given, then role C ({@link LoanFixtures#shapedWallet}). */
+        List<Utxo> wallet;
 
         Rig() throws Exception {
             when(backend.getUtxoService()).thenReturn(utxoService);
@@ -117,6 +123,7 @@ class OracleProbeRoutesProductionTest {
             when(transactionService.evaluateTx(any(byte[].class))).thenAnswer(invocation -> {
                 evaluations.incrementAndGet();
                 Transaction tx = Transaction.deserialize(invocation.getArgument(0));
+                evaluated.add(tx);
                 List<EvaluationResult> costs = new ArrayList<>();
                 for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
                     costs.add(new EvaluationResult(redeemer.getTag(), redeemer.getIndex().intValue(),
@@ -160,6 +167,43 @@ class OracleProbeRoutesProductionTest {
         List<LiquidationDecision> decisions() {
             return log.newestFirst(10);
         }
+
+        /** The one body the bean handed to the evaluator. */
+        Transaction evaluatedBody() {
+            assertEquals(1, evaluated.size(), "exactly one body reached the evaluator: " + events);
+            return evaluated.getFirst();
+        }
+
+        /** Role C — the output {@link LoanFixtures#shapedWallet} appends last, at {@code c5…c5#0}. */
+        Utxo roleC() {
+            Utxo c = wallet.getLast();
+            assertEquals("c5".repeat(32), c.getTxHash(), "the fixture's C: " + wallet);
+            return c;
+        }
+
+        /** The refs of {@code body}'s inputs that are this wallet's outputs. */
+        Set<String> walletInputs(Transaction body) {
+            Set<String> walletRefs = new HashSet<>();
+            wallet.forEach(utxo -> walletRefs.add(utxo.getTxHash() + "#" + utxo.getOutputIndex()));
+            Set<String> spent = new HashSet<>();
+            for (TransactionInput input : body.getBody().getInputs()) {
+                if (walletRefs.contains(ref(input))) {
+                    spent.add(ref(input));
+                }
+            }
+            return spent;
+        }
+
+        /** Every input of {@code body}, as refs. */
+        static Set<String> inputs(Transaction body) {
+            Set<String> refs = new HashSet<>();
+            body.getBody().getInputs().forEach(input -> refs.add(ref(input)));
+            return refs;
+        }
+    }
+
+    private static String ref(Utxo utxo) {
+        return utxo.getTxHash() + "#" + utxo.getOutputIndex();
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -308,6 +352,7 @@ class OracleProbeRoutesProductionTest {
             // FAB-185: role C, sized from the parameters the executor below reads, beside the funds given.
             List<Utxo> walletUtxos = LoanFixtures.shapedWallet(EvalFixtures.protocolParams(),
                     PREVIEW_ACCOUNT.baseAddress(), walletFunds.toArray(new Utxo[0]));
+            wallet = walletUtxos;
             Loan loan = new Loan(PIA_LOAN_TX, 1, PIA_LOAN_ADDRESS, PIA_LOAN_ID,
                     BigInteger.valueOf(PIA_COLLATERAL_AMOUNT), BigInteger.valueOf(3_000_000L), datum);
             LenderBond bond = new LenderBond(PIA_LOAN_TX, 3, PIA_BOND_ADDRESS, PIA_LOAN_ID, PIA_BOND_DATUM_HEX,
@@ -476,6 +521,25 @@ class OracleProbeRoutesProductionTest {
         assertEquals(0, rig.submissions.get(), "shadow never submits");
     }
 
+    /**
+     * FAB-185 r2 (F2), PIA: the token-principal pay-in-advance, built by {@code YaciConfig}'s own builder
+     * bean, SPENDS exactly its TOKEN output from the wallet — not U, and never C. Read off the body the bean
+     * handed to the evaluator. The collateral field is not asserted: the builders still pick their own
+     * collateral until FAB-185-2..4.
+     */
+    @Test
+    void payInAdvanceATokenPrincipalSpendsExactlyItsTokenOutputAndNeverC() throws Exception {
+        PayInAdvanceRig rig = new PayInAdvanceRig().allLive()
+                .wire(AppConfig.LiquidationConfiguration.Mode.SHADOW, List.of(ADA_WALLET, TOKEN_WALLET));
+
+        rig.cycles(PIA_NOW, 1);
+
+        Transaction body = rig.evaluatedBody();
+        assertEquals(Set.of(ref(TOKEN_WALLET)), rig.walletInputs(body),
+                "the wallet funds this build with its TOKEN output alone: " + Rig.inputs(body));
+        assertFalse(Rig.inputs(body).contains(ref(rig.roleC())), "C is never spent: " + Rig.inputs(body));
+    }
+
     /** (3) PIA: SHADOW probes too, and refuses on a spent provider. */
     @Test
     void payInAdvanceAShadowBuildIsProbedAndRefusedOnASpentProvider() throws Exception {
@@ -636,6 +700,7 @@ class OracleProbeRoutesProductionTest {
             // FAB-185: role C, sized from the parameters the executor below reads, beside the funds given.
             List<Utxo> walletUtxos = LoanFixtures.shapedWallet(EvalFixtures.protocolParams(),
                     MAINNET_ACCOUNT.baseAddress(), walletFunds.toArray(new Utxo[0]));
+            wallet = walletUtxos;
             String loanDatumHex = LoanFixtures.fixture("mainnet-loan-datum-d832b78e.hex");
             String bondDatumHex = LoanFixtures.fixture("mainnet-lender-bond-datum-d832b78e.hex");
             LoanDatum recorded = new LoanDatumConverter().deserialize(loanDatumHex);
@@ -771,6 +836,24 @@ class OracleProbeRoutesProductionTest {
         verify(rig.utxoService, never()).getTxOutput(anyString(), anyInt());
         verifyNoMoreInteractions(rig.utxoService);
         assertEquals(0, rig.submissions.get(), "shadow never submits");
+    }
+
+    /**
+     * FAB-185 r2 (F2), convert: the convert liquidation, built by {@code YaciConfig}'s own builder bean,
+     * SPENDS exactly U from the wallet — the largest ada-only output that is not C — and never C. Read off
+     * the body the bean handed to the evaluator; the collateral field is not asserted (FAB-185-2..4).
+     */
+    @Test
+    void convertSpendsExactlyUAndNeverC() throws Exception {
+        ConvertRig rig = new ConvertRig().prepare().allLive().wire(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                List.of(CV_WALLET_A, CV_WALLET_B));
+
+        rig.cycles(CV_NOW, 1);
+
+        Transaction body = rig.evaluatedBody();
+        assertEquals(Set.of(ref(CV_WALLET_A)), rig.walletInputs(body),
+                "the wallet funds this build with U alone: " + Rig.inputs(body));
+        assertFalse(Rig.inputs(body).contains(ref(rig.roleC())), "C is never spent: " + Rig.inputs(body));
     }
 
     /** (3) convert: SHADOW probes too, and refuses on a spent feed. */

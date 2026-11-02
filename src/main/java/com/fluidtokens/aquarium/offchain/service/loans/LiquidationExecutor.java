@@ -1484,11 +1484,22 @@ public class LiquidationExecutor {
             // most of that token, never from U, however much larger U is.
             String payInAdvanceRole = payInAdvancePrincipal.isAda() ? ROLE_U
                     : ROLE_TOKEN + payInAdvancePrincipal.toUnit();
-            designated = designated(assessment, now, walletCheck, payInAdvanceRole, payInAdvancePrincipal.isAda()
-                    ? walletCheck.roles().u()
-                    : walletCheck.roles().tokenOutput(payInAdvancePrincipal.toUnit()));
-            if (designated == null) {
-                return WorkResult.DEFINITE_FAILURE;
+            // ⛔ FAB-185 r2 (F3) — A DISABLED MARKET IS REFUSED BEFORE THE ROLE LOOKUP. Pay-in-advance is
+            // excluded from the pre-build MARKET_DISABLED refusal above because the router's MarketGate
+            // refuses it, with its own text; looking the role up first answered an operator who had
+            // disabled the market with WALLET_ROLE_MISSING and a WARN about a wallet the bot is not to use
+            // there. So a DISABLED market designates nothing and goes straight to the router, whose gate
+            // refuses it before the selector is ever asked — the row and level it always had.
+            if (marketMode == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
+                designated = null;
+            } else {
+                designated = designated(assessment, now, walletCheck, payInAdvanceRole,
+                        payInAdvancePrincipal.isAda()
+                                ? walletCheck.roles().u()
+                                : walletCheck.roles().tokenOutput(payInAdvancePrincipal.toUnit()));
+                if (designated == null) {
+                    return WorkResult.DEFINITE_FAILURE;
+                }
             }
             Utxo payInAdvanceFunding = designated;
             log.info("{} is a PAY-IN-ADVANCE liquidation: the bot PAYS the lender in {} and acquires "
@@ -1520,12 +1531,21 @@ public class LiquidationExecutor {
                         // The router knows the lender payout, this knows the wallet and the fee ceiling.
                         // Only the designated output is ever offered (FAB-185), and only when it covers
                         // the payout plus the pre-build ceilings.
-                        lenderPayout -> remember(nominated, payInAdvancePrincipal.isAda()
-                                ? sized(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
-                                        WalletRoles.adaAnticipateRequired(lenderPayout, feeCeiling), needed)
-                                : sizedToken(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
-                                        payInAdvancePrincipal.toUnit(), lenderPayout,
-                                        WalletRoles.tokenOutputRequiredAda(feeCeiling), needed)),
+                        lenderPayout -> {
+                            if (payInAdvanceFunding == null) {
+                                // Unreachable while the router's gate reads this same configuration: it
+                                // refuses a DISABLED market before asking. Loud if that ever stops holding.
+                                throw new IllegalStateException("market " + payInAdvancePrincipal.toUnit()
+                                        + " is DISABLED, so no role output was designated, yet the router "
+                                        + "asked for one");
+                            }
+                            return remember(nominated, payInAdvancePrincipal.isAda()
+                                    ? sized(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
+                                            WalletRoles.adaAnticipateRequired(lenderPayout, feeCeiling), needed)
+                                    : sizedToken(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
+                                            payInAdvancePrincipal.toUnit(), lenderPayout,
+                                            WalletRoles.tokenOutputRequiredAda(feeCeiling), needed));
+                        },
                         validFromMillis,
                         validToMillis);
                 // ⛔ THE AMOUNT — "PAYS the lender 1,033,850,000 c48cbb3d…0014df105553444d and
