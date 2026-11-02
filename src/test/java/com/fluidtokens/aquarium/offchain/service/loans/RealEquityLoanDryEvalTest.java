@@ -30,6 +30,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.OracleEntry;
 import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
 import com.fluidtokens.aquarium.offchain.service.TransactionInputComparator;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
@@ -277,6 +278,9 @@ class RealEquityLoanDryEvalTest {
     private static final Utxo LM_CONFIG_UTXO = LoanFixtures.syntheticLatestLmConfigUtxo(TX_LM_CONFIG, 0);
     private static final Utxo WALLET_UTXO = LoanFixtures.adaUtxo(TX_WALLET, 0,
             LoanFixtures.botAddress(), 50_000_000L);
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of the rig's params. */
+    private static final Utxo COLLATERAL_UTXO = LoanFixtures.adaUtxo("c5".repeat(32), 0, LoanFixtures.botAddress(),
+            WalletShape.collateralLovelace(EvalFixtures.protocolParams().getProtocolParams()).longValueExact());
 
     /**
      * Six synthetic reference-script coordinates. FluidTokens has published none for the current
@@ -634,7 +638,7 @@ class RealEquityLoanDryEvalTest {
      * reference-script UTxOs carrying the freshly derived loans-v4 script hashes.
      */
     private static List<Utxo> universe(Fixture fixture) {
-        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO,
+        List<Utxo> universe = new ArrayList<>(List.of(CONFIG_UTXO, LM_CONFIG_UTXO, WALLET_UTXO, COLLATERAL_UTXO,
                 fixture.loanUtxo(), fixture.bondUtxo()));
 
         universe.add(LoanFixtures.utxo(ORACLE_REF_INPUT.getTransactionId(), ORACLE_REF_INPUT.getIndex(),
@@ -675,7 +679,8 @@ class RealEquityLoanDryEvalTest {
                 .build(new LiquidateTransactionBuilder.Request(
                         List.of(fixture.toLiquidation()), CONFIG_UTXO, LM_CONFIG_UTXO,
                         Map.of(ORACLE_NFT.toUnit(), fixture.oracle()), WALLET_UTXO,
-                        LoanFixtures.botAddress(), VALID_FROM, VALID_TO, MARGIN, REFERENCE_SCRIPTS));
+                        LoanFixtures.botAddress(), VALID_FROM, VALID_TO, MARGIN, REFERENCE_SCRIPTS,
+                        COLLATERAL_UTXO));
         assertNotNull(tx);
         return tx;
     }

@@ -687,6 +687,21 @@ public final class LoanFixtures {
                 List.of(Amount.lovelace(BigInteger.valueOf(lovelace))), null);
     }
 
+    /**
+     * FAB-185 — a wallet the liquidation stage can resolve its roles from: {@code others}, in order, then role
+     * C — an ada-only output of EXACTLY {@code WalletShape.collateralLovelace} of {@code executorParams}, the
+     * parameters the executor under test reads. Derived from them, never hard-coded, so a change to the
+     * fixture parameters moves C with it. C is {@code c5…c5#0}; U is whichever of {@code others} is the
+     * largest ada-only output.
+     */
+    public static List<Utxo> shapedWallet(ProtocolParamsSupplier executorParams, String address, Utxo... others) {
+        BigInteger collateral = com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(
+                executorParams.getProtocolParams());
+        List<Utxo> wallet = new ArrayList<>(List.of(others));
+        wallet.add(adaUtxo("c5".repeat(32), 0, address, collateral.longValueExact()));
+        return wallet;
+    }
+
     // ---- the two config reference inputs, with the datums the chain really carries ------------
 
     /**

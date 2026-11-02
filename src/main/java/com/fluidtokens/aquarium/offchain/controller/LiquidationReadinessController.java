@@ -304,8 +304,9 @@ public class LiquidationReadinessController {
             boolean suspended = a.state().suspended();
             if (a.armed()) {
                 return new RebalanceView(env, suspended, "ARMED",
-                        "after each block, if the wallet has drifted out of shape, the node signs and submits "
-                                + "one self-send of its whole wallet, in shadow as well as live", true, false);
+                        "on each pass — after a committed block or an oracle price change — in which no liquidation "
+                                + "or compound went out, if the wallet has drifted out of shape, the node signs and "
+                                + "submits one self-send of its whole wallet, in shadow as well as live", true, false);
             }
             return switch (a.idle()) {
                 case ENV_DISABLED -> new RebalanceView(env, suspended, "OFF",
@@ -317,9 +318,6 @@ public class LiquidationReadinessController {
                 case MODE_NOT_SHADOW_OR_LIVE -> new RebalanceView(env, suspended, "IDLE",
                         "the liquidation mode is " + (a.mode() == null ? "not set" : a.mode().name())
                                 + "; rebalancing runs only in shadow or live", true, false);
-                case NO_ANTICIPATE_MARKET -> new RebalanceView(env, suspended, "IDLE",
-                        "no action: ANTICIPATE market has an effective mode of shadow or live, so there is no "
-                                + "token to keep ready", true, false);
                 case SYNCING -> new RebalanceView(env, suspended, "IDLE",
                         "the node is syncing; rebalancing starts once it has caught up", true, false);
             };
@@ -461,9 +459,9 @@ public class LiquidationReadinessController {
     }
 
     /**
-     * FAB-174: the shadow oracle stream's status, for one line on the page. The page only READS it; no decision
-     * reads the stream. Setter-injected and REQUIRED in the container; null only in a direct test construction,
-     * where no line renders.
+     * FAB-174: the oracle stream's status, for one line on the page. The page only READS it; by default
+     * ({@code loans.oracle.source=stream}) the bot's prices merge the stream's pushes in {@code FluidOracleClient}.
+     * Setter-injected and REQUIRED in the container; null only in a direct test construction, where no line renders.
      */
     private com.fluidtokens.aquarium.offchain.service.loans.OracleStreamLauncher oracleStreamLauncher;
 

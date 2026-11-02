@@ -200,7 +200,7 @@ class LiquidationEscrowCompoundRoundTripTest {
         var request = new LiquidatePayInAdvanceTransactionBuilder.Request(loan, loanUtxo, bond, bondUtxo, wallet,
                 base.configUtxo(), base.lmConfigUtxo(), base.oracle(), principalOracle, base.validFromMillis(),
                 base.validToMillis(), base.validFromSlot(), base.validToSlot(), base.changeAddress(),
-                base.referenceScripts(), base.oracleWindowMarginMillis());
+                base.referenceScripts(), base.oracleWindowMarginMillis(), base.collateralUtxo());
         Transaction produced = new LiquidatePayInAdvanceTransactionBuilder(PREVIEW, LoanFixtures.NETWORK,
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams()).build(request);
 
@@ -625,13 +625,17 @@ class LiquidationEscrowCompoundRoundTripTest {
         Utxo lmConfig = LoanFixtures.syntheticLatestLmConfigUtxo("f2".repeat(32), 0);
         Utxo wallet = LoanFixtures.adaUtxo("e0".repeat(32), 0, LoanFixtures.botAddress(), 50_000_000L);
         Utxo spare = LoanFixtures.adaUtxo("e1".repeat(32), 0, LoanFixtures.botAddress(), 10_000_000L);
-        List<Utxo> universe = List.of(config, lmConfig, wallet, spare, loan.utxo(), bond.utxo());
+        // FAB-185 — wallet role C, pinned as the plain build's only collateral; in the universe so it resolves.
+        Utxo collateralC = LoanFixtures.adaUtxo("c5".repeat(32), 0, LoanFixtures.botAddress(),
+                com.fluidtokens.aquarium.offchain.service.wallet.WalletShape.collateralLovelace(
+                        EvalFixtures.protocolParams().getProtocolParams()).longValueExact());
+        List<Utxo> universe = List.of(config, lmConfig, wallet, spare, collateralC, loan.utxo(), bond.utxo());
         Transaction tx = new LiquidateTransactionBuilder(PREVIEW, LoanFixtures.NETWORK, LoanFixtures.converters(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams())
                 .build(new LiquidateTransactionBuilder.Request(
                         List.of(new LiquidateTransactionBuilder.LoanLiquidation(assessment, loan.utxo(), bond.utxo())),
                         config, lmConfig, oracles, wallet, LoanFixtures.botAddress(), now, now + 120_000L, 300_000L,
-                        LiquidateTransactionBuilder.ReferenceScripts.none()));
+                        LiquidateTransactionBuilder.ReferenceScripts.none(), collateralC));
         Transaction body = Transaction.deserialize(tx.serialize());
         return new Plain(tx, TransactionUtil.getTxHash(body), loanId, escrowOf(tx, CLAIMED_COLLATERAL, loanId),
                 bond.utxo(), universe);

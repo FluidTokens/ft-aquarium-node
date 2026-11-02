@@ -48,6 +48,19 @@ public final class BoundedBFBackendService extends BFBackendService {
         boolean isExpired();
 
         long remainingNanos();
+
+        /** The Blockfrost calls made on the pass's thread so far, by stage (FAB-186); zeros by default. */
+        default CallCounts callCounts() {
+            return CallCounts.NONE;
+        }
+    }
+
+    /**
+     * Blockfrost calls made during one pass, by stage (FAB-186). Counted, never limited: the counts change
+     * no timeout.
+     */
+    public record CallCounts(long discovery, long evaluation, long submission) {
+        public static final CallCounts NONE = new CallCounts(0, 0, 0);
     }
 
     private enum Stage { DISCOVERY, EVALUATION, SUBMISSION }
@@ -254,13 +267,12 @@ public final class BoundedBFBackendService extends BFBackendService {
         return Stage.DISCOVERY;
     }
 
-    private long timeoutFor(Stage stage) {
+    private long timeoutFor(Stage stage, Deadline deadline) {
         long stageNanos = switch (stage) {
             case DISCOVERY -> discoveryNanos;
             case EVALUATION -> evaluationNanos;
             case SUBMISSION -> submissionNanos;
         };
-        Deadline deadline = activePass.get();
         if (deadline == null) {
             return stageNanos;
         }
@@ -275,20 +287,43 @@ public final class BoundedBFBackendService extends BFBackendService {
         @Override
         public Call newCall(Request request) {
             Stage stage = stage(request);
-            long timeoutNanos = timeoutFor(stage);
+            Deadline deadline = activePass.get();
+            long timeoutNanos = timeoutFor(stage, deadline);
             Call call = (stage == Stage.SUBMISSION ? submissionClient : baseClient).newCall(request);
             call.timeout().timeout(timeoutNanos, TimeUnit.NANOSECONDS);
+            // FAB-186: counted once the call exists — one refused by an expired deadline never went out.
+            // Only the pass's own thread sees its deadline, so a call from any other thread is not counted.
+            if (deadline != null) {
+                deadline.count(stage);
+            }
             return call;
         }
     }
 
     private final class Deadline implements PassDeadline {
         private final long deadlineNanos;
+        // Touched only by the thread the pass runs on: the deadline is reached through a ThreadLocal.
+        private long discoveryCalls;
+        private long evaluationCalls;
+        private long submissionCalls;
 
         private Deadline(long startedNanos, long durationNanos) {
             // nanoTime is a wrapping counter. Modular addition/subtraction is overflow-safe while
             // durations remain below half its range (startup validation keeps ours far below it).
             this.deadlineNanos = startedNanos + durationNanos;
+        }
+
+        private void count(Stage stage) {
+            switch (stage) {
+                case DISCOVERY -> discoveryCalls++;
+                case EVALUATION -> evaluationCalls++;
+                case SUBMISSION -> submissionCalls++;
+            }
+        }
+
+        @Override
+        public CallCounts callCounts() {
+            return new CallCounts(discoveryCalls, evaluationCalls, submissionCalls);
         }
 
         @Override

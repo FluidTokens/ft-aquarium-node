@@ -18,6 +18,7 @@ import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;
@@ -26,7 +27,6 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -45,6 +45,9 @@ class CompoundLedgerValidationTest {
     private static final String UNRELATED = "cd".repeat(28) + "02";
     private static final BigInteger Q = BigInteger.valueOf(1_000_000L);
     private static final BigInteger F = BigInteger.valueOf(5_000L);
+    /** FAB-185 — wallet role C's size: exactly {@code WalletShape.collateralLovelace} of this rig's params. */
+    private static final BigInteger COLLATERAL_LOVELACE =
+            WalletShape.collateralLovelace(EvalFixtures.protocolParams().getProtocolParams());
 
     @Test
     void tokenPrincipalIsAddedInRawUnitsWithoutChangingPoolAda() {
@@ -308,17 +311,17 @@ class CompoundLedgerValidationTest {
         assertTrue(reread.getBody().getWithdrawals().stream().allMatch(w -> w.getCoin().signum() == 0));
         assertTrue(reread.getBody().getCollateral().stream()
                 .noneMatch(new HashSet<>(reread.getBody().getInputs())::contains));
-        assertEquals(Set.of("9f".repeat(32)), reread.getBody().getCollateral().stream()
-                .map(TransactionInput::getTransactionId).collect(java.util.stream.Collectors.toSet()));
-        BigInteger capacity = BigInteger.valueOf(5_000_000L);
+        assertEquals(List.of(new TransactionInput("9f".repeat(32), 0)), reread.getBody().getCollateral(),
+                "FAB-185: the collateral is exactly the Request's C");
+        // FAB-185: C is the role-C size, exactly WalletShape.collateralLovelace of these params — the
+        // protocol ceiling. The 5-ADA below-the-ceiling control that stood here pinned the deleted
+        // collateralInputsFor's preference order; nothing in the builder chooses a collateral any more.
+        BigInteger capacity = COLLATERAL_LOVELACE;
         BigInteger actualRequired = reread.getBody().getFee()
                 .multiply(EvalFixtures.protocolParams().getProtocolParams().getCollateralPercent().toBigIntegerExact())
                 .add(BigInteger.valueOf(99L)).divide(BigInteger.valueOf(100L));
         assertTrue(capacity.compareTo(actualRequired) >= 0,
-                "5 ADA covers the final measured fee's collateral requirement");
-        assertTrue(capacity.compareTo(LiquidateTransactionBuilder.maxPossibleCollateral(
-                EvalFixtures.protocolParams().getProtocolParams())) < 0,
-                "this control must stay below the protocol-wide ceiling or it cannot kill the over-refusal");
+                "C covers the final measured fee's collateral requirement");
         MinAdaCalculator minAda = new MinAdaCalculator(EvalFixtures.protocolParams().getProtocolParams());
         assertTrue(reread.getBody().getOutputs().stream()
                 .allMatch(o -> o.getValue().getCoin().compareTo(minAda.calculateMinAda(o)) >= 0));
@@ -337,7 +340,9 @@ class CompoundLedgerValidationTest {
     void collateralBelowTheActualFinalFeeRequirementIsRefused() {
         Fixture fixture = tokenFixture();
         Transaction tx = fixture.builder().build(fixture.request());
-        BigInteger raisedFee = BigInteger.valueOf(4_000_000L);
+        // FAB-185: one ADA past the fee whose collateral requirement (150%) is exactly C's capacity.
+        BigInteger raisedFee = COLLATERAL_LOVELACE.multiply(BigInteger.valueOf(100L))
+                .divide(BigInteger.valueOf(150L)).add(BigInteger.valueOf(1_000_000L));
         BigInteger delta = raisedFee.subtract(tx.getBody().getFee());
         TransactionOutput wallet = walletOutput(tx);
         wallet.getValue().setCoin(wallet.getValue().getCoin().subtract(delta));
@@ -460,7 +465,7 @@ class CompoundLedgerValidationTest {
     private static Fixture fixture(CompoundCandidate candidate, Utxo bondUtxo, Utxo pool,
                                    BigInteger fee, List<Utxo> extras, Utxo wallet) {
         Utxo collateral = Utxo.builder().txHash("9f".repeat(32)).outputIndex(0).address(BOT)
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(COLLATERAL_LOVELACE))).build();
         Utxo config = config();
         Utxo lmConfig = lmConfig();
         List<Utxo> universe = new ArrayList<>(List.of(candidate.escrow(), bondUtxo, pool,
@@ -469,7 +474,7 @@ class CompoundLedgerValidationTest {
         CompoundTransactionBuilder builder = new CompoundTransactionBuilder(REGISTRY, Networks.preview(),
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), null);
         var request = new CompoundTransactionBuilder.Request(candidate, Map.of(), bondUtxo, config,
-                lmConfig, wallet, BOT, fee, 70_000_000L, 70_000_300L);
+                lmConfig, wallet, BOT, fee, 70_000_000L, 70_000_300L, collateral);
         return new Fixture(builder, request, pool, bondUtxo, List.copyOf(universe));
     }
 

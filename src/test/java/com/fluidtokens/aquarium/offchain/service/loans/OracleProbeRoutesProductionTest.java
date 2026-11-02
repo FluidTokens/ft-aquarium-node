@@ -57,12 +57,15 @@ import java.lang.reflect.Field;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -107,8 +110,12 @@ class OracleProbeRoutesProductionTest {
         final AtomicInteger evaluations = new AtomicInteger();
         final AtomicInteger submissions = new AtomicInteger();
         final List<ILoggingEvent> events = new ArrayList<>();
+        /** FAB-185 r2: every body handed to the evaluator, deserialised — the transaction the bean built. */
+        final List<Transaction> evaluated = new ArrayList<>();
         LiquidationExecutor executor;
         LiquidationDecisionLog log;
+        /** The wallet the executor lists — the funds given, then role C ({@link LoanFixtures#shapedWallet}). */
+        List<Utxo> wallet;
 
         Rig() throws Exception {
             when(backend.getUtxoService()).thenReturn(utxoService);
@@ -117,6 +124,7 @@ class OracleProbeRoutesProductionTest {
             when(transactionService.evaluateTx(any(byte[].class))).thenAnswer(invocation -> {
                 evaluations.incrementAndGet();
                 Transaction tx = Transaction.deserialize(invocation.getArgument(0));
+                evaluated.add(tx);
                 List<EvaluationResult> costs = new ArrayList<>();
                 for (Redeemer redeemer : tx.getWitnessSet().getRedeemers()) {
                     costs.add(new EvaluationResult(redeemer.getTag(), redeemer.getIndex().intValue(),
@@ -160,6 +168,43 @@ class OracleProbeRoutesProductionTest {
         List<LiquidationDecision> decisions() {
             return log.newestFirst(10);
         }
+
+        /** The one body the bean handed to the evaluator. */
+        Transaction evaluatedBody() {
+            assertEquals(1, evaluated.size(), "exactly one body reached the evaluator: " + events);
+            return evaluated.getFirst();
+        }
+
+        /** Role C — the output {@link LoanFixtures#shapedWallet} appends last, at {@code c5…c5#0}. */
+        Utxo roleC() {
+            Utxo c = wallet.getLast();
+            assertEquals("c5".repeat(32), c.getTxHash(), "the fixture's C: " + wallet);
+            return c;
+        }
+
+        /** The refs of {@code body}'s inputs that are this wallet's outputs. */
+        Set<String> walletInputs(Transaction body) {
+            Set<String> walletRefs = new HashSet<>();
+            wallet.forEach(utxo -> walletRefs.add(utxo.getTxHash() + "#" + utxo.getOutputIndex()));
+            Set<String> spent = new HashSet<>();
+            for (TransactionInput input : body.getBody().getInputs()) {
+                if (walletRefs.contains(ref(input))) {
+                    spent.add(ref(input));
+                }
+            }
+            return spent;
+        }
+
+        /** Every input of {@code body}, as refs. */
+        static Set<String> inputs(Transaction body) {
+            Set<String> refs = new HashSet<>();
+            body.getBody().getInputs().forEach(input -> refs.add(ref(input)));
+            return refs;
+        }
+    }
+
+    private static String ref(Utxo utxo) {
+        return utxo.getTxHash() + "#" + utxo.getOutputIndex();
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -282,6 +327,8 @@ class OracleProbeRoutesProductionTest {
     private static final class PayInAdvanceRig extends Rig {
         LiquidatePayInAdvanceTransactionBuilder builder;
         OracleReferenceInputProbe probe;
+        /** Out-refs left out of the content source: this node cannot see them yet. */
+        final List<Utxo> unseen = new ArrayList<>();
 
         PayInAdvanceRig() throws Exception {
             super();
@@ -301,8 +348,12 @@ class OracleProbeRoutesProductionTest {
         }
 
         /** The same scenario with a chosen loan datum and oracle registry (FAB-135 T4 amendment 3). */
-        PayInAdvanceRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos, LoanDatum datum,
+        PayInAdvanceRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletFunds, LoanDatum datum,
                              OracleEntry... oracles) {
+            // FAB-185: role C, sized from the parameters the executor below reads, beside the funds given.
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(EvalFixtures.protocolParams(),
+                    PREVIEW_ACCOUNT.baseAddress(), walletFunds.toArray(new Utxo[0]));
+            wallet = walletUtxos;
             Loan loan = new Loan(PIA_LOAN_TX, 1, PIA_LOAN_ADDRESS, PIA_LOAN_ID,
                     BigInteger.valueOf(PIA_COLLATERAL_AMOUNT), BigInteger.valueOf(3_000_000L), datum);
             LenderBond bond = new LenderBond(PIA_LOAN_TX, 3, PIA_BOND_ADDRESS, PIA_LOAN_ID, PIA_BOND_DATUM_HEX,
@@ -327,6 +378,7 @@ class OracleProbeRoutesProductionTest {
                     .amount(List.of(Amount.lovelace(BigInteger.valueOf(40_000_000L))))
                     .referenceScriptHash(PIA_ORACLE_SCRIPT_HASH).build());
             universe.addAll(walletUtxos);
+            universe.removeAll(unseen);
             UtxoSupplier contentHold = LoanFixtures.utxoSupplier(universe);
             ScriptSupplier noScripts = hash -> Optional.empty();
 
@@ -414,6 +466,35 @@ class OracleProbeRoutesProductionTest {
     }
 
     /**
+     * FAB-183-3 audit residue (a), PIA: the principal leg's Charli3 provider out-ref ({@code 8e…#0}) is not in the
+     * content source, so its content is unknown — a fresher price announced a provider UTxO whose block this
+     * node has not stored yet. That is a WAIT: every cycle records REFUSED {@code ORACLE_INPUT_NOT_YET_VISIBLE},
+     * nothing is logged at ERROR, nothing is evaluated, and no wallet utxo is dropped.
+     */
+    @Test
+    void payInAdvanceAPrincipalProviderNotYetVisibleIsAWaitEveryCycleNeverAnError() throws Exception {
+        PayInAdvanceRig rig = new PayInAdvanceRig().allLive();
+        rig.unseen.add(PRINCIPAL_C3_UTXO);
+        rig.wire(AppConfig.LiquidationConfiguration.Mode.LIVE, List.of(ADA_WALLET, TOKEN_WALLET));
+
+        rig.cycles(PIA_NOW, 2);
+
+        List<LiquidationDecision> decisions = rig.decisions();
+        assertEquals(2, decisions.size(), "one decision per cycle: " + decisions);
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.REFUSED, decision.outcome(), decision.detail());
+            assertEquals("ORACLE_INPUT_NOT_YET_VISIBLE", decision.reason(), decision.detail());
+            assertTrue(decision.detail().contains(ref(PRINCIPAL_C3_REF)),
+                    "the detail names the unseen out-ref: " + decision.detail());
+        }
+        assertEquals(List.of(), rig.events.stream().filter(e -> e.getLevel() == Level.ERROR).toList(),
+                "a wait is never an ERROR");
+        assertEquals(0, rig.evaluations.get(), "nothing is evaluated");
+        assertEquals(0, rig.submissions.get(), "nor submitted");
+        assertFalse(rig.droppedAWalletUtxo(), "a wait drops no wallet utxo: " + rig.events);
+    }
+
+    /**
      * (2) and (4) PIA, live: the build proceeds to evaluation exactly as before, and each of the two legs'
      * out-refs — feed and Charli3 provider, collateral and principal — is asked exactly once per build. Run
      * in both wallet-list orders, because the fixture supplier returns list order while production sorts.
@@ -439,6 +520,57 @@ class OracleProbeRoutesProductionTest {
         verify(rig.utxoService, never()).getTxOutput(anyString(), anyInt());
         verifyNoMoreInteractions(rig.utxoService);
         assertEquals(0, rig.submissions.get(), "shadow never submits");
+    }
+
+    /**
+     * FAB-185 r2 (F2) and FAB-185-3 (f), PIA: the token-principal pay-in-advance, through the executor's cycle
+     * and {@code YaciConfig}'s own builder bean, SPENDS exactly its TOKEN output from the wallet — once, not
+     * U, and never C — and pins exactly [C] as its collateral. Read twice: off the body the bean handed to the
+     * evaluator, and off the bytes the executor recorded for the candidate ({@code txCborHex}: the shadow
+     * rehearsal of exactly what LIVE would sign and submit), whose every redeemer carries the mocked
+     * Blockfrost evaluator's ex-units.
+     * <p>
+     * The wallet is the production shape: U holds the working capital and is LARGER than C. With
+     * {@link #ADA_WALLET} (60 ADA) in its place, C would be the largest ada-only output, so a builder that
+     * chose its own collateral largest-first ({@code collateralInputsFor}) would land on C by coincidence and
+     * this test could not tell pinning from choosing.
+     */
+    @Test
+    void payInAdvanceATokenPrincipalSpendsExactlyItsTokenOutputAndNeverC() throws Exception {
+        Utxo u = LoanFixtures.adaUtxo("e2".repeat(32), 0, PREVIEW_ACCOUNT.baseAddress(), 1_000_000_000L);
+        PayInAdvanceRig rig = new PayInAdvanceRig().allLive()
+                .wire(AppConfig.LiquidationConfiguration.Mode.SHADOW, List.of(u, TOKEN_WALLET));
+        assertTrue(u.getAmount().getFirst().getQuantity()
+                        .compareTo(rig.roleC().getAmount().getFirst().getQuantity()) > 0,
+                "fixture: U is larger than C, as in production");
+
+        rig.cycles(PIA_NOW, 1);
+
+        Transaction body = rig.evaluatedBody();
+        assertEquals(Set.of(ref(TOKEN_WALLET)), rig.walletInputs(body),
+                "the wallet funds this build with its TOKEN output alone: " + Rig.inputs(body));
+        assertFalse(Rig.inputs(body).contains(ref(rig.roleC())), "C is never spent: " + Rig.inputs(body));
+        assertFalse(Rig.inputs(body).contains(ref(u)), "nor U: " + Rig.inputs(body));
+
+        List<LiquidationDecision> decisions = rig.decisions();
+        assertEquals(1, decisions.size(), decisions.toString());
+        assertNotNull(decisions.getFirst().txCborHex(), "the executor recorded the built bytes: " + decisions);
+        Transaction built = Transaction.deserialize(HexUtil.decodeHexString(decisions.getFirst().txCborHex()));
+        List<String> spent = built.getBody().getInputs().stream().map(OracleProbeRoutesProductionTest::ref).toList();
+        assertEquals(Set.of(ref(TOKEN_WALLET)), rig.walletInputs(built),
+                "the recorded bytes spend the TOKEN output alone from the wallet: " + spent);
+        assertEquals(1, spent.stream().filter(ref(TOKEN_WALLET)::equals).count(), "spent once: " + spent);
+        assertFalse(spent.contains(ref(rig.roleC())), "C is never spent: " + spent);
+        assertFalse(spent.contains(ref(u)), "nor U: " + spent);
+        assertEquals(List.of(ref(rig.roleC())),
+                built.getBody().getCollateral().stream().map(OracleProbeRoutesProductionTest::ref).toList(),
+                "the collateral is exactly C");
+        assertFalse(built.getWitnessSet().getRedeemers().isEmpty(), "a pay-in-advance liquidation has redeemers");
+        for (Redeemer redeemer : built.getWitnessSet().getRedeemers()) {
+            assertEquals(new ExUnits(BigInteger.valueOf(400_000), BigInteger.valueOf(150_000_000)),
+                    redeemer.getExUnits(), redeemer.getTag() + "#" + redeemer.getIndex()
+                            + " carries the mocked evaluator's ex-units, never CCL's placeholder");
+        }
     }
 
     /** (3) PIA: SHADOW probes too, and refuses on a spent provider. */
@@ -597,7 +729,11 @@ class OracleProbeRoutesProductionTest {
             return this;
         }
 
-        ConvertRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletUtxos) throws Exception {
+        ConvertRig wire(AppConfig.LiquidationConfiguration.Mode mode, List<Utxo> walletFunds) throws Exception {
+            // FAB-185: role C, sized from the parameters the executor below reads, beside the funds given.
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(EvalFixtures.protocolParams(),
+                    MAINNET_ACCOUNT.baseAddress(), walletFunds.toArray(new Utxo[0]));
+            wallet = walletUtxos;
             String loanDatumHex = LoanFixtures.fixture("mainnet-loan-datum-d832b78e.hex");
             String bondDatumHex = LoanFixtures.fixture("mainnet-lender-bond-datum-d832b78e.hex");
             LoanDatum recorded = new LoanDatumConverter().deserialize(loanDatumHex);
@@ -735,6 +871,27 @@ class OracleProbeRoutesProductionTest {
         assertEquals(0, rig.submissions.get(), "shadow never submits");
     }
 
+    /**
+     * FAB-185 r2 (F2) and FAB-185-4, convert: the convert liquidation, built by {@code YaciConfig}'s own builder
+     * bean, SPENDS exactly U from the wallet — the largest ada-only output that is not C — and never C, and
+     * pins exactly [C] as its collateral. Read off the body the bean handed to the evaluator.
+     */
+    @Test
+    void convertSpendsExactlyUAndNeverC() throws Exception {
+        ConvertRig rig = new ConvertRig().prepare().allLive().wire(AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                List.of(CV_WALLET_A, CV_WALLET_B));
+
+        rig.cycles(CV_NOW, 1);
+
+        Transaction body = rig.evaluatedBody();
+        assertEquals(Set.of(ref(CV_WALLET_A)), rig.walletInputs(body),
+                "the wallet funds this build with U alone: " + Rig.inputs(body));
+        assertFalse(Rig.inputs(body).contains(ref(rig.roleC())), "C is never spent: " + Rig.inputs(body));
+        assertEquals(List.of(ref(rig.roleC())),
+                body.getBody().getCollateral().stream().map(OracleProbeRoutesProductionTest::ref).toList(),
+                "the collateral is exactly C");
+    }
+
     /** (3) convert: SHADOW probes too, and refuses on a spent feed. */
     @Test
     void convertAShadowBuildIsProbedAndRefusedOnASpentFeed() throws Exception {
@@ -814,6 +971,250 @@ class OracleProbeRoutesProductionTest {
         ConvertRig convert = new ConvertRig().prepare().wire(AppConfig.LiquidationConfiguration.Mode.SHADOW,
                 List.of(CV_WALLET_A));
         assertSame(convert.probe, fieldOf(convert.builder, "oracleReferenceInputProbe"));
+    }
+
+    // ======================================================================================
+    // TWO ROUTES, ONE CHECK — FAB-185-4 (d): a convert and a token-principal pay-in-advance, both submitted
+    // ======================================================================================
+
+    /** (d)'s U: ada only, the working capital, LARGER than C — the production shape. */
+    private static final Utxo TWO_ROUTES_U = LoanFixtures.adaUtxo("e2".repeat(32), 0, MAINNET_ACCOUNT.baseAddress(),
+            1_000_000_000L);
+    /** (d)'s token output: the pay-in-advance principal plus the ada that funds that build alone. */
+    private static final Utxo TWO_ROUTES_TOKEN_OUTPUT = LoanFixtures.utxo("e1".repeat(32), 0,
+            MAINNET_ACCOUNT.baseAddress(), List.of(Amount.lovelace(BigInteger.valueOf(60_000_000L)),
+                    Amount.asset(TOKEN_PRINCIPAL.toUnit(), BigInteger.valueOf(50_000_000L))), null);
+
+    /**
+     * ⛔ FAB-185-4 (d): ONE executor check over {@code YaciConfig}'s own convert and pay-in-advance builder
+     * beans, with two LIVE candidates in different markets — the convert route's ada-principal loan (the
+     * recorded d832b78e convert, {@code lovelace} market, CONVERT) and the token-principal pay-in-advance
+     * ({@code TOKEN_PRINCIPAL} market, ANTICIPATE). One network, one registry, one pair of config UTxOs and one
+     * wallet — {C, U, the token output} — as the epic's own scenario has them. Neither builder decodes a config
+     * datum, so the pay-in-advance loan and bond sit at the MAINNET registry's scripts beside the convert's.
+     *
+     * <p>The configuration states a loss floor (profit margin and margin-adjusted floor far below zero, the
+     * absolute floor off), which mainnet permits, because both fixtures are priced for the WIRING and the
+     * question here is what goes out, not whether it pays. The submit clock is the cycle's own instant.
+     */
+    private static final class TwoRoutesRig extends Rig {
+        final UtxoRepository poolIndex = mock(UtxoRepository.class);
+        /** The signed bytes the executor handed the wire, in order. */
+        final List<byte[]> submitted = new ArrayList<>();
+
+        TwoRoutesRig() throws Exception {
+            super();
+        }
+
+        TwoRoutesRig wire() throws Exception {
+            List<Utxo> walletUtxos = LoanFixtures.shapedWallet(EvalFixtures.protocolParams(),
+                    MAINNET_ACCOUNT.baseAddress(), TWO_ROUTES_U, TWO_ROUTES_TOKEN_OUTPUT);
+            wallet = walletUtxos;
+            String loanAddress = scriptAddress(MAINNET_REGISTRY.getLoanSpendScriptHash(), MAINNET);
+            String bondAddress = scriptAddress(MAINNET_REGISTRY.getLenderManagerSpendScriptHash(), MAINNET);
+            Utxo configUtxo = LoanFixtures.utxo("3d800e98a4da21dc9abcce30c145729406fef7db4d5cd3b4ecd6813aa228a75c", 0,
+                    scriptAddress(CONFIG_POLICY_ID, MAINNET), List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)),
+                            Amount.asset(CONFIG_POLICY_ID + CONFIG_ASSET_NAME, BigInteger.ONE)),
+                    LoanFixtures.fixture("mainnet-config-datum-2026-10-01.hex"));
+            Utxo lmConfigUtxo = LoanFixtures.utxo("ab3e3aafe7ea0e6fec24d9ac9249e01edb242dee55aeaa2399da097a21177620",
+                    0, scriptAddress(LM_CONFIG_POLICY_ID, MAINNET),
+                    List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)),
+                            Amount.asset(LM_CONFIG_POLICY_ID + CONFIG_ASSET_NAME, BigInteger.ONE)),
+                    LoanFixtures.fixture("mainnet-lm-config-datum-2026-10-01.hex"));
+
+            // ---- the CONVERT candidate: ConvertRig's mainnet multisig shape ---------------------------------
+            String cvLoanDatumHex = LoanFixtures.fixture("mainnet-loan-datum-d832b78e.hex");
+            String cvBondDatumHex = LoanFixtures.fixture("mainnet-lender-bond-datum-d832b78e.hex");
+            LoanDatum cvDatum = new LoanDatumConverter().deserialize(cvLoanDatumHex);
+            OracleEntry cvOracle = LoanFixtures.multisig(FLDT, cvDatum.collateral().oracleTokenAsset(),
+                    CV_ORACLE_CREDENTIAL, new OraclePriceFeed(OraclePriceFeed.Variant.AGGREGATED, FLDT,
+                            BigInteger.valueOf(15_000_000L), BigInteger.valueOf(100_000_000L), CV_NOW - 60_000L,
+                            CV_NOW + 600_000L),
+                    CV_ORACLE_REF, CV_ORACLE_SCRIPT_REF, List.of(new OracleSignature(0, "5a".repeat(64))));
+            Utxo cvOracleUtxo = LoanFixtures.utxo(CV_ORACLE_REF.getTransactionId(), 0, CV_ORACLE_ADDRESS,
+                    List.of(Amount.lovelace(BigInteger.valueOf(2_000_000L)),
+                            LoanFixtures.token(cvOracle.oracleToken(), 1)), null);
+            Loan cvLoan = new Loan(CV_LOAN_TX, 1, loanAddress, CV_LOAN_ID, BigInteger.valueOf(CV_COLLATERAL_AMOUNT),
+                    BigInteger.valueOf(2_000_000L), cvDatum);
+            LenderBond cvBond = new LenderBond(CV_LOAN_TX, 3, bondAddress, CV_LOAN_ID, cvBondDatumHex,
+                    new LenderManagerDatumConverter().deserialize(cvBondDatumHex));
+            Utxo cvLoanUtxo = LoanFixtures.utxo(CV_LOAN_TX, 1, loanAddress, List.of(
+                    Amount.lovelace(BigInteger.valueOf(2_000_000L)),
+                    Amount.asset(FLDT.toUnit(), BigInteger.valueOf(CV_COLLATERAL_AMOUNT)),
+                    Amount.asset(MAINNET_REGISTRY.getLoanPolicyId() + CV_LOAN_ID, BigInteger.ONE)), cvLoanDatumHex);
+            Utxo cvBondUtxo = LoanFixtures.utxo(CV_LOAN_TX, 3, bondAddress, List.of(
+                    Amount.lovelace(BigInteger.valueOf(2_000_000L)),
+                    Amount.asset(MAINNET_REGISTRY.getLenderBondPolicyId() + CV_LOAN_ID, BigInteger.ONE)),
+                    cvBondDatumHex);
+            LiquidationAssessment convert = LiquidationAssessment.buildable(cvBond, cvLoan, "two routes: convert",
+                    LoanFinance.remainingDebt(cvDatum, CV_NOW), BigInteger.ZERO, false, BigInteger.valueOf(5_000_000L));
+
+            // ---- the PAY-IN-ADVANCE candidate: the token-principal scenario, at the mainnet registry's scripts
+            long piaFeedFrom = CV_NOW - 35_555L;
+            OracleEntry piaCollateral = withProviderNft(LoanFixtures.charli3(PIA_COLLATERAL, PIA_ORACLE_NFT,
+                    PIA_ORACLE_SCRIPT_HASH, OraclePriceFeed.priceDataCharlie(PIA_COLLATERAL, BigInteger.valueOf(338163),
+                            BigInteger.valueOf(1_000_000), piaFeedFrom, piaFeedFrom + 600_000L),
+                    PIA_ORACLE_REF, PIA_ORACLE_SCRIPT_REF, PIA_C3_REF), PIA_C3_NFT);
+            OracleEntry piaPrincipal = withProviderNft(LoanFixtures.charli3(TOKEN_PRINCIPAL, PRINCIPAL_ORACLE_NFT,
+                    PRINCIPAL_ORACLE_CREDENTIAL, OraclePriceFeed.priceDataCharlie(TOKEN_PRINCIPAL, BigInteger.ONE,
+                            BigInteger.ONE, piaFeedFrom, piaFeedFrom + 600_000L),
+                    PRINCIPAL_ORACLE_REF, PRINCIPAL_ORACLE_SCRIPT_REF, PRINCIPAL_C3_REF), PRINCIPAL_C3_NFT);
+            Loan piaLoan = new Loan(PIA_LOAN_TX, 1, loanAddress, PIA_LOAN_ID,
+                    BigInteger.valueOf(PIA_COLLATERAL_AMOUNT), BigInteger.valueOf(3_000_000L), piaLoanDatum());
+            LenderBond piaBond = new LenderBond(PIA_LOAN_TX, 3, bondAddress, PIA_LOAN_ID, PIA_BOND_DATUM_HEX,
+                    new LenderManagerDatumConverter().deserialize(PIA_BOND_DATUM_HEX));
+            Utxo piaLoanUtxo = LoanFixtures.utxo(PIA_LOAN_TX, 1, loanAddress, List.of(
+                    Amount.lovelace(BigInteger.valueOf(3_000_000L)),
+                    Amount.asset(PIA_COLLATERAL.toUnit(), BigInteger.valueOf(PIA_COLLATERAL_AMOUNT)),
+                    Amount.asset(MAINNET_REGISTRY.getLoanPolicyId() + PIA_LOAN_ID, BigInteger.ONE)),
+                    PIA_LOAN_DATUM_HEX);
+            Utxo piaBondUtxo = LoanFixtures.utxo(PIA_LOAN_TX, 3, bondAddress, List.of(
+                    Amount.lovelace(BigInteger.valueOf(1_810_200L)),
+                    Amount.asset(MAINNET_REGISTRY.getLenderBondPolicyId() + PIA_LOAN_ID, BigInteger.ONE)),
+                    PIA_BOND_DATUM_HEX);
+            LiquidationAssessment payInAdvance = LiquidationAssessment.buildable(piaBond, piaLoan,
+                    "two routes: pay-in-advance", BigInteger.valueOf(28_000_147L), BigInteger.valueOf(8_919_184L),
+                    false, BigInteger.valueOf(5_000_000L));
+
+            // every oracle out-ref of both candidates answers live
+            answers(CV_ORACLE_ADDRESS, cvOracle.oracleToken(), live(cvOracleUtxo));
+            answers(PIA_ORACLE_ADDRESS, PIA_ORACLE_NFT, live(PIA_ORACLE_UTXO));
+            answers(PIA_C3_ADDRESS, PIA_C3_NFT, live(PIA_C3_UTXO));
+            answers(PRINCIPAL_ORACLE_ADDRESS, PRINCIPAL_ORACLE_NFT, live(PRINCIPAL_ORACLE_UTXO));
+            answers(PRINCIPAL_C3_ADDRESS, PRINCIPAL_C3_NFT, live(PRINCIPAL_C3_UTXO));
+
+            // ---- the universe: both candidates, every reference input, the published scripts, the wallet ----
+            List<PlutusScript> scripts = List.of(MAINNET_REGISTRY.getLoanScript(),
+                    MAINNET_REGISTRY.getLoanSpendScript(), MAINNET_REGISTRY.getLenderManagerScript(),
+                    MAINNET_REGISTRY.getLenderManagerSpendScript(), MAINNET_REGISTRY.getLoanClaimActionScript(),
+                    MAINNET_REGISTRY.getLmLiquidateAndConvertActionScript());
+            List<TransactionInput> at = new ArrayList<>();
+            List<Utxo> universe = new ArrayList<>(List.of(configUtxo, lmConfigUtxo, cvLoanUtxo, cvBondUtxo,
+                    cvOracleUtxo, piaLoanUtxo, piaBondUtxo, PIA_ORACLE_UTXO, PIA_C3_UTXO, PRINCIPAL_ORACLE_UTXO,
+                    PRINCIPAL_C3_UTXO));
+            for (int i = 0; i < scripts.size(); i++) {
+                String hash = HexUtil.encodeHexString(scripts.get(i).getScriptHash());
+                TransactionInput input = new TransactionInput(String.format("a%d", i + 1).repeat(32), 0);
+                at.add(input);
+                universe.add(Utxo.builder().txHash(input.getTransactionId()).outputIndex(0)
+                        .address(scriptAddress(hash, MAINNET))
+                        .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                        .referenceScriptHash(hash).build());
+            }
+            universe.add(Utxo.builder().txHash(CV_ORACLE_SCRIPT_REF.getTransactionId()).outputIndex(0)
+                    .address(CV_ORACLE_ADDRESS).amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L))))
+                    .referenceScriptHash(CV_ORACLE_CREDENTIAL).build());
+            universe.add(Utxo.builder().txHash(PIA_ORACLE_SCRIPT_REF.getTransactionId())
+                    .outputIndex(PIA_ORACLE_SCRIPT_REF.getIndex()).address(PIA_ORACLE_ADDRESS)
+                    .amount(List.of(Amount.lovelace(BigInteger.valueOf(40_000_000L))))
+                    .referenceScriptHash(PIA_ORACLE_SCRIPT_HASH).build());
+            universe.addAll(walletUtxos);
+            var references = new LiquidateTransactionBuilder.ReferenceScripts(at.get(0), at.get(1), at.get(2),
+                    at.get(3), at.get(4), null, null, null, at.get(5));
+
+            UtxoSupplier contentHold = LoanFixtures.utxoSupplier(universe);
+            ScriptSupplier noScripts = hash -> Optional.empty();
+            ProtocolParamsSupplier params = EvalFixtures.protocolParams();
+            YaciConfig yaciConfig = new YaciConfig();
+            OracleReferenceInputProbe probe = yaciConfig.oracleReferenceInputProbe(contentHold, backend);
+            ConvertTransactionBuilder convertBuilder = yaciConfig.convertTransactionBuilder(MAINNET_REGISTRY,
+                    network("mainnet"), contentHold, params, noScripts, backend, probe);
+            LiquidatePayInAdvanceTransactionBuilder piaBuilder = yaciConfig.liquidatePayInAdvanceTransactionBuilder(
+                    MAINNET_REGISTRY, network("mainnet"), contentHold, params, noScripts, backend, probe);
+
+            BigInteger statedLoss = BigInteger.valueOf(-1_000_000_000_000L);
+            var configuration = new AppConfig.LiquidationConfiguration(AppConfig.LiquidationConfiguration.Mode.LIVE,
+                    60, 120, 30, statedLoss, 200, false, BigInteger.ZERO, statedLoss, references);
+            configuration.setMarkets(List.of(
+                    market("lovelace", AppConfig.LiquidationConfiguration.Action.CONVERT),
+                    market(TOKEN_PRINCIPAL.toUnit(), AppConfig.LiquidationConfiguration.Action.ANTICIPATE)));
+            log = new LiquidationDecisionLog(configuration);
+            when(poolIndex.findUnspentByOwnerPaymentCredential(eq(MS_POOL_SPEND), any()))
+                    .thenReturn(Optional.of(List.of(adaFldtPool())));
+            ConvertLiquidationRouter convertRouter = new ConvertLiquidationRouter(MAINNET_REGISTRY,
+                    minswapConfigured(), configuration, new MinswapPoolResolver(poolIndex, MS_POOL_SPEND,
+                    MS_POOL_POLICY), new ConvertEconomics(new AppConfig.ConvertConfiguration(), configuration,
+                    network("mainnet")), convertBuilder, MAINNET_CONVERTERS, MAINNET);
+            PayInAdvanceLiquidationRouter piaRouter = new PayInAdvanceLiquidationRouter(MAINNET_REGISTRY,
+                    MAINNET_CONVERTERS, configuration, piaBuilder);
+            executor = new LiquidationExecutor(configuration, notSyncing(), new FakeAppUtxoService(walletUtxos),
+                    MAINNET_ACCOUNT, new FakeScanner(convert, payInAdvance),
+                    new ByRefResolver(configUtxo, lmConfigUtxo, cvLoanUtxo, cvBondUtxo, piaLoanUtxo, piaBondUtxo),
+                    new LiquidateTransactionBuilder(MAINNET_REGISTRY, MAINNET, MAINNET_CONVERTERS, contentHold, params),
+                    piaRouter, convertRouter, MAINNET_REGISTRY, log,
+                    new MarketCoverageReporter(new SimpleMeterRegistry()),
+                    new FixedOracles(cvOracle, piaCollateral, piaPrincipal), network("mainnet"), params,
+                    MAINNET_CONVERTERS,
+                    bytes -> {
+                        submissions.incrementAndGet();
+                        submitted.add(bytes);
+                        @SuppressWarnings({"unchecked", "rawtypes"})
+                        Result<String> accepted = (Result<String>) Result.success("ok").code(200)
+                                .withValue("accepted-" + submissions.get());
+                        return accepted;
+                    });
+            executor.setSubmitClock(() -> CV_NOW);
+            return this;
+        }
+
+        /** The one submitted body that spends {@code loanTx#1}. */
+        Transaction submittedSpending(String loanTx) throws Exception {
+            List<Transaction> matching = new ArrayList<>();
+            for (byte[] bytes : submitted) {
+                Transaction tx = Transaction.deserialize(bytes);
+                if (inputs(tx).contains(loanTx + "#1")) {
+                    matching.add(tx);
+                }
+            }
+            assertEquals(1, matching.size(), "exactly one submitted body spends " + loanTx + "#1");
+            return matching.getFirst();
+        }
+    }
+
+    /**
+     * ⛔ FAB-185-4 (d), the epic's own scenario off the SUBMITTED bodies: a convert and a token-principal
+     * pay-in-advance go out in ONE check. Their wallet inputs are {U} and {the token output} — disjoint, each
+     * spent once — their collateral is [C] in both, C is spent by neither, and every redeemer of both carries
+     * the mocked Blockfrost evaluator's ex-units, never CCL's placeholder.
+     */
+    @Test
+    void aConvertAndATokenPayInAdvanceGoOutInOneCheckWithDisjointWalletInputsAndCollateralCInBoth()
+            throws Exception {
+        TwoRoutesRig rig = new TwoRoutesRig().wire();
+
+        rig.cycles(CV_NOW, 1);
+
+        List<LiquidationDecision> decisions = rig.decisions();
+        assertEquals(2, decisions.size(), "one decision per candidate: " + decisions);
+        for (LiquidationDecision decision : decisions) {
+            assertEquals(LiquidationDecision.Outcome.SUBMITTED, decision.outcome(), decision.detail());
+        }
+        assertEquals(2, rig.submitted.size(), "both went to the wire: " + decisions);
+
+        Transaction convert = rig.submittedSpending(CV_LOAN_TX);
+        Transaction payInAdvance = rig.submittedSpending(PIA_LOAN_TX);
+        Utxo c = rig.roleC();
+        assertEquals(Set.of(ref(TWO_ROUTES_U)), rig.walletInputs(convert),
+                "the convert spends U alone from the wallet: " + Rig.inputs(convert));
+        assertEquals(Set.of(ref(TWO_ROUTES_TOKEN_OUTPUT)), rig.walletInputs(payInAdvance),
+                "the pay-in-advance spends its token output alone from the wallet: " + Rig.inputs(payInAdvance));
+        Set<String> both = new HashSet<>(rig.walletInputs(convert));
+        both.retainAll(rig.walletInputs(payInAdvance));
+        assertEquals(Set.of(), both, "the two routes' wallet inputs are disjoint");
+        for (Transaction body : List.of(convert, payInAdvance)) {
+            List<String> spent = body.getBody().getInputs().stream().map(OracleProbeRoutesProductionTest::ref).toList();
+            assertEquals(spent.size(), new HashSet<>(spent).size(), "no input is spent twice: " + spent);
+            assertFalse(spent.contains(ref(c)), "C is never spent: " + spent);
+            assertEquals(List.of(ref(c)),
+                    body.getBody().getCollateral().stream().map(OracleProbeRoutesProductionTest::ref).toList(),
+                    "the collateral is exactly C");
+            assertFalse(body.getWitnessSet().getRedeemers().isEmpty(), "a liquidation has redeemers");
+            for (Redeemer redeemer : body.getWitnessSet().getRedeemers()) {
+                assertEquals(new ExUnits(BigInteger.valueOf(400_000), BigInteger.valueOf(150_000_000)),
+                        redeemer.getExUnits(), redeemer.getTag() + "#" + redeemer.getIndex()
+                                + " carries the mocked evaluator's ex-units, never CCL's placeholder");
+            }
+        }
     }
 
     // ======================================================================================
@@ -915,16 +1316,16 @@ class OracleProbeRoutesProductionTest {
     }
 
     private static final class FakeScanner extends LiquidationCandidateScanner {
-        private final LiquidationAssessment assessment;
+        private final List<LiquidationAssessment> assessments;
 
-        FakeScanner(LiquidationAssessment assessment) {
+        FakeScanner(LiquidationAssessment... assessments) {
             super(null, null, null);
-            this.assessment = assessment;
+            this.assessments = List.of(assessments);
         }
 
         @Override
         public Scan scan(long atTimeMillis) {
-            return new Scan(List.of(assessment), new LoanService.Census(List.of(), 1, 0, 0));
+            return new Scan(assessments, new LoanService.Census(List.of(), assessments.size(), 0, 0));
         }
     }
 
@@ -950,6 +1351,42 @@ class OracleProbeRoutesProductionTest {
         @Override
         public Optional<Utxo> resolveBondUtxo(LenderBond bond) {
             return Optional.of(bondUtxo);
+        }
+
+        @Override
+        public Optional<Utxo> resolveConfigUtxo() {
+            return Optional.of(configUtxo);
+        }
+
+        @Override
+        public Optional<Utxo> resolveLmConfigUtxo() {
+            return Optional.of(lmConfigUtxo);
+        }
+    }
+
+    /** FAB-185-4 (d): several candidates in one check — each loan and bond resolved by its own out-ref. */
+    private static final class ByRefResolver extends LiquidationUtxoResolver {
+        private final java.util.Map<String, Utxo> byRef = new java.util.HashMap<>();
+        private final Utxo configUtxo;
+        private final Utxo lmConfigUtxo;
+
+        ByRefResolver(Utxo configUtxo, Utxo lmConfigUtxo, Utxo... loansAndBonds) {
+            super(null, null, null);
+            this.configUtxo = configUtxo;
+            this.lmConfigUtxo = lmConfigUtxo;
+            for (Utxo utxo : loansAndBonds) {
+                byRef.put(ref(utxo), utxo);
+            }
+        }
+
+        @Override
+        public Optional<Utxo> resolveLoanUtxo(Loan loan) {
+            return Optional.ofNullable(byRef.get(loan.utxoRef()));
+        }
+
+        @Override
+        public Optional<Utxo> resolveBondUtxo(LenderBond bond) {
+            return Optional.ofNullable(byRef.get(bond.utxoRef()));
         }
 
         @Override

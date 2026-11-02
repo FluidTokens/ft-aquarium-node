@@ -290,11 +290,28 @@ jobs:
       # those four classes (one day line per midnight; every recipe FAIL reason, no-pushes and lost-lines among
       # them): re-measured cold keyless, 219 files / 2212 tests / 0 failures / 0 errors / 51 skipped, 0 orphans.
       #
+      # FAB-185-1 (WalletRolesTest: the wallet roles one liquidation check resolves; plus role cases in the
+      # liquidation executor classes) re-measured cold keyless on feat/fab-183-event-driven-pipeline, 2026-11-02:
+      # 227 files / 2470 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 227.
+      #
+      # FAB-185-2 (DesignatedInputUtxoSupplierTest: the view in which the wallet holds only the plain
+      # liquidation's designated input; plus cases in the plain builder and production-wiring classes)
+      # re-measured cold keyless on feat/fab-183-event-driven-pipeline, 2026-11-02:
+      # 228 files / 2484 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 228.
+      #
+      # FAB-185-4 DELETED CollateralSelectionTest with the static collateralInputsFor it tested: no liquidation
+      # builder chooses collateral any more, each pins wallet role C (compound keeps its own private rule until
+      # FAB-185-5). Its properties are now pinned by
+      # WalletRolesTest (how C is selected) and by each builder's built-collateral tests (collateral == [C] off the
+      # built body: LiquidateProductionWiringTest, LiquidatePayInAdvanceDryEvalTest, ConvertProductionWiringTest,
+      # OracleProbeRoutesProductionTest). Re-measured cold keyless on feat/fab-183-event-driven-pipeline,
+      # 2026-11-02: 227 files / 2490 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 227.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '219'
+          RESULT_FILE_FLOOR: '227'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET

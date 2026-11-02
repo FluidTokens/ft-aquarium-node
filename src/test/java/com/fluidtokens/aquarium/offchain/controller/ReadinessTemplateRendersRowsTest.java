@@ -1065,6 +1065,30 @@ class ReadinessTemplateRendersRowsTest {
         return engine().process("readiness", context);
     }
 
+    /** The same render, over a REAL rebalancer instead of a Mockito one that reads a given activity. */
+    private static String renderedWith(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer rebalancer) {
+        var beans = new org.springframework.beans.factory.support.DefaultListableBeanFactory();
+        var controller = new LiquidationReadinessController(
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LiquidationCandidateScanner.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LoanService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.LoanHealthService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.FluidOracleClient.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.MinswapPoolResolver.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.loans.TokenMetadataService.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.LoansContractRegistry.class),
+                beans.getBeanProvider(com.fluidtokens.aquarium.offchain.service.AppUtxoService.class),
+                new com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration(
+                        com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW,
+                        60, 120, 30, BigInteger.ZERO, 200),
+                null);
+        controller.setWalletRebalancer(rebalancer);
+        var model = new org.springframework.ui.ConcurrentModel();
+        assertEquals("readiness", controller.readiness(model, null, null, null, null, null));
+        var context = new Context();
+        context.setVariables(model.asMap());
+        return engine().process("readiness", context);
+    }
+
     private static com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Activity activity(
             boolean env, boolean suspended, com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode mode,
             com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle idle) {
@@ -1158,8 +1182,9 @@ class ReadinessTemplateRendersRowsTest {
                 com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode.SHADOW, null));
         String line = rebalanceLine(html);
 
-        assertTrue(text(line).contains("Wallet rebalancing: ARMED — after each block, if the wallet has drifted out of shape, the node signs "
-                + "and submits one self-send of its whole wallet, in shadow as well as live"), line);
+        assertTrue(text(line).contains("Wallet rebalancing: ARMED — on each pass — after a committed block or an oracle "
+                + "price change — in which no liquidation or compound went out, if the wallet has drifted out of shape, "
+                + "the node signs and submits one self-send of its whole wallet, in shadow as well as live"), line);
         assertTrue(line.contains("env default: on"), line);
         assertTrue(line.contains("suspended from this page: no"), line);
         assertOnlyForm(line, SUSPEND_PATH, "Suspend rebalancing");
@@ -1173,8 +1198,6 @@ class ReadinessTemplateRendersRowsTest {
         Map<com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle, String> details = new LinkedHashMap<>();
         details.put(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.MODE_NOT_SHADOW_OR_LIVE,
                 "the liquidation mode is DISABLED; rebalancing runs only in shadow or live");
-        details.put(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.NO_ANTICIPATE_MARKET,
-                "no action: ANTICIPATE market has an effective mode of shadow or live, so there is no token to keep ready");
         details.put(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.Idle.SYNCING,
                 "the node is syncing; rebalancing starts once it has caught up");
         for (var e : details.entrySet()) {
@@ -1194,6 +1217,18 @@ class ReadinessTemplateRendersRowsTest {
             assertFalse(line.contains("ARMED"), e.getKey() + ": idle never reads armed: " + line);
             assertFalse(html.contains("wallet rebalancing is ARMED"), e.getKey() + ": nor does the banner");
         }
+    }
+
+    /** FAB-188: a real rebalancer whose only markets are CONVERT renders ARMED — the markets arm nothing. */
+    @Test
+    void anOnlyConvertConfigurationRendersArmed() {
+        String html = renderedWith(LiquidationReadinessControllerTest.convertOnlyRebalancer());
+        String line = rebalanceLine(html);
+
+        assertTrue(text(line).contains("Wallet rebalancing: ARMED — "), line);
+        assertFalse(line.contains("IDLE"), line);
+        assertOnlyForm(line, SUSPEND_PATH, "Suspend rebalancing");
+        assertTrue(html.contains("wallet rebalancing is ARMED"), "the banner's ARMED note is on the page");
     }
 
     /** ⛔ The shadow banner no longer says shadow submits nothing: it submits no liquidation. */

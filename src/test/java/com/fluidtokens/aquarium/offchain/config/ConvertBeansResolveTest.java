@@ -135,7 +135,7 @@ class ConvertBeansResolveTest {
         assertTrue(branch.contains("CONVERT_UNAVAILABLE"),
                 "the guard no longer records a named reason, so the refusal is indistinguishable from "
                         + "a market that simply had no candidates");
-        assertTrue(branch.contains("return;"),
+        assertTrue(java.util.regex.Pattern.compile("return( WorkResult\\.DEFINITE_FAILURE)?;").matcher(branch).find(),
                 "the guard no longer returns, so control falls through to the pay-in-advance branch");
     }
 }

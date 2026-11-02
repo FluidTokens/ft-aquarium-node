@@ -83,6 +83,17 @@ public class ConvertLiquidationRouter {
         }
     }
 
+    /**
+     * An oracle feed's window does not cover the body's validity interval (FAB-183), so
+     * {@code retrieve_oracle_data} would refuse it on chain. Raised before the order plan and the wallet
+     * selector run, so nothing is nominated for a transaction that cannot be accepted.
+     */
+    public static final class FeedWindowException extends RuntimeException {
+        public FeedWindowException(String message) {
+            super(message);
+        }
+    }
+
     private final LoansContractRegistry registry;
     private final AppConfig.LoansConfiguration loansConfiguration;
     private final AppConfig.LiquidationConfiguration liquidationConfiguration;
@@ -231,6 +242,18 @@ public class ConvertLiquidationRouter {
         return entry.feed();
     }
 
+    /** {@code feed.usableOver(from, to)}, or a {@link FeedWindowException} naming the leg and both windows. */
+    private static void requireFeedCovers(String leg, OraclePriceFeed feed, long slotFromMillis,
+                                          long slotToMillis) {
+        if (!feed.usableOver(slotFromMillis, slotToMillis)) {
+            throw new FeedWindowException(("the %s feed window [%d,%d] does not cover the transaction window "
+                    + "[%d,%d] (the oracle validator requires valid_from <= the transaction's start, "
+                    + "valid_to >= its end, and a feed window of at most %d ms)")
+                    .formatted(leg, feed.validFrom(), feed.validTo(), slotFromMillis, slotToMillis,
+                            OraclePriceFeed.MAX_VALIDITY_RANGE_MILLIS));
+        }
+    }
+
     private static void put(Map<String, TransactionInput> into, String scriptHash,
                             TransactionInput coordinate) {
         if (scriptHash != null && !scriptHash.isBlank() && coordinate != null) {
@@ -342,12 +365,23 @@ public class ConvertLiquidationRouter {
         return list.get(0);
     }
 
+    /**
+     * Assembles and builds the convert liquidation for one already-resolved candidate, or refuses it.
+     *
+     * @param walletSelector  asked for U with the lovelace the order actually costs; the one wallet output the
+     *                        build may spend (FAB-185)
+     * @param collateralUtxo  ⛔ FAB-185 — the executor's wallet role C, handed to the builder UNCHANGED as the
+     *                        transaction's only collateral. This router never chooses, substitutes or
+     *                        inspects it; the builder refuses an invalid one by name
+     *                        ({@code COLLATERAL_UTXO_INVALID}).
+     */
     public Transaction buildConvertLiquidation(LiquidationAssessment assessment,
                                                Utxo loanUtxo,
                                                Utxo bondUtxo,
                                                Utxo configUtxo,
                                                Utxo lmConfigUtxo,
                                                Function<BigInteger, Optional<Utxo>> walletSelector,
+                                               Utxo collateralUtxo,
                                                Map<String, OracleEntry> oraclesByOracleTokenUnit,
                                                String changeAddress,
                                                long validFromMillis,
@@ -437,6 +471,18 @@ public class ConvertLiquidationRouter {
         OraclePriceFeed principalFeed = loan.principalAsset().isAda()
                 ? OraclePriceFeed.unit()
                 : feedOf(oraclesByOracleTokenUnit, loan.principalAsset(), loan.principalOracleAsset());
+
+        // ⛔ FAB-183 — THE WINDOW GUARD THE OTHER TWO ROUTES ALREADY HAVE. The plain builder (V3) and the
+        // pay-in-advance builder both require usableOver for each feed; this route checked only
+        // usableForLiquidation(), so a feed that opens after the body's start, or closes before its end,
+        // reached the chain. Checked against the body's OWN slot times, before the plan and the wallet
+        // selector, so nothing is nominated for a transaction the validator would refuse.
+        long slotFromMillis = figuresAtMillis;
+        long slotToMillis = millisOf(converters.slot().slotToTime(slots[1]));
+        requireFeedCovers("collateral", collateralOracle.feed(), slotFromMillis, slotToMillis);
+        if (!loan.principalAsset().isAda()) {
+            requireFeedCovers("principal", principalFeed, slotFromMillis, slotToMillis);
+        }
         BigInteger equity = LoanFinance.redeemerEquity(
                 (LiquidationMode.Liquidation) loan.liquidationMode(),
                 Rational.fromInt(assessment.loan().collateralAmount()),
@@ -496,7 +542,7 @@ public class ConvertLiquidationRouter {
         Transaction transaction = builder.build(new ConvertTransactionBuilder.Request(
                 loanUtxo, bondUtxo, pool.utxo(), collateralOracle, configUtxo, lmConfigUtxo, walletUtxo,
                 referenceScripts(), plan, claim, collateral, lenderBond, loan.repaymentReceipts(),
-                orderAddress(assessment.bond()), changeAddress, slots[0], slots[1]));
+                orderAddress(assessment.bond()), changeAddress, slots[0], slots[1], collateralUtxo));
 
         BigInteger txFee = transaction.getBody().getFee();
         ConvertAssessment verdict = economics.assess(

@@ -62,6 +62,9 @@ class ExecutorContextResolutionTest {
                 .withPropertyValues("loans.enabled=true")
                 .withUserConfiguration(StubCollaborators.class)
                 .withBean(com.fluidtokens.aquarium.offchain.service.LendingConfigGate.class)
+                // FAB-185: CompoundExecutor.setWalletRebalancer is required, so the container must hold one.
+                .withBean(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class,
+                        () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class))
                 .withBean(CompoundExecutor.class)
                 .run(context -> {
                     assertTrue(context.getStartupFailure() == null,
@@ -117,6 +120,9 @@ class ExecutorContextResolutionTest {
                         () -> new com.fluidtokens.aquarium.offchain.service.LoansConfigVerifier(
                                 new LoansContractRegistry(config, lmConfig, asset, smart, null, null, null),
                                 smart, mainnet, bf, false))
+                // FAB-185: CompoundExecutor.setWalletRebalancer is required, so the container must hold one.
+                .withBean(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class,
+                        () -> org.mockito.Mockito.mock(com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class))
                 .withBean(CompoundExecutor.class)
                 .run(context -> {
                     assertTrue(context.getStartupFailure() == null,
@@ -265,6 +271,44 @@ class ExecutorContextResolutionTest {
                 + "the container would leave it holding no rebalancer, and the page could neither show nor suspend it");
         assertTrue(autowired.required(), "LiquidationReadinessController.setWalletRebalancer must be "
                 + "REQUIRED: optional injection fails silent when the rebalancer bean is missing");
+    }
+
+    /**
+     * FAB-185: every wallet-role refusal the liquidation stage records names the rebalancer's last outcome, read
+     * off the rebalancer the container hands the executor. Injection is by setter and REQUIRED, mirroring the
+     * readiness controller's pin above: optional injection would leave a container-built executor holding no
+     * rebalancer, and every missing-role refusal would say it is not wired.
+     */
+    @Test
+    void theLiquidationExecutorHasTheWalletRebalancerInjectedAndRequired() throws Exception {
+        var rebalancerType = com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class;
+        assertTrue(rebalancerType.isAnnotationPresent(Service.class),
+                "WalletRebalancer must be a scanned @Service, or a required setter fails the boot");
+        var setter = LiquidationExecutor.class.getMethod("setWalletRebalancer", rebalancerType);
+        Autowired autowired = setter.getAnnotation(Autowired.class);
+        assertNotNull(autowired, "LiquidationExecutor.setWalletRebalancer is not @Autowired — the container would "
+                + "leave it holding no rebalancer, and every wallet-role refusal would say it is not wired");
+        assertTrue(autowired.required(), "LiquidationExecutor.setWalletRebalancer must be REQUIRED: optional "
+                + "injection fails silent when the rebalancer bean is missing");
+    }
+
+    /**
+     * FAB-185 (B1): every wallet-role refusal the compound stage logs names the rebalancer's last outcome, read
+     * off the rebalancer the container hands the executor. Injection is by setter and REQUIRED, like the
+     * liquidation executor's above: optional injection would leave a container-built executor holding no
+     * rebalancer, and every missing-role WARN would say it is not wired.
+     */
+    @Test
+    void theCompoundExecutorHasTheWalletRebalancerInjectedAndRequired() throws Exception {
+        var rebalancerType = com.fluidtokens.aquarium.offchain.service.wallet.WalletRebalancer.class;
+        assertTrue(rebalancerType.isAnnotationPresent(Service.class),
+                "WalletRebalancer must be a scanned @Service, or a required setter fails the boot");
+        var setter = CompoundExecutor.class.getMethod("setWalletRebalancer", rebalancerType);
+        Autowired autowired = setter.getAnnotation(Autowired.class);
+        assertNotNull(autowired, "CompoundExecutor.setWalletRebalancer is not @Autowired — the container would "
+                + "leave it holding no rebalancer, and every wallet-role WARN would say it is not wired");
+        assertTrue(autowired.required(), "CompoundExecutor.setWalletRebalancer must be REQUIRED: optional "
+                + "injection fails silent when the rebalancer bean is missing");
     }
 
     /**

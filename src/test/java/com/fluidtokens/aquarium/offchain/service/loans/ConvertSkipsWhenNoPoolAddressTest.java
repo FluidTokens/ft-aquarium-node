@@ -71,7 +71,7 @@ class ConvertSkipsWhenNoPoolAddressTest {
         ConvertLiquidationRouter router = routerWithNoPoolAddress();
 
         var e = assertThrows(ConvertLiquidationRouter.NoPoolException.class,
-                () -> router.buildConvertLiquidation(candidate(), null, null, null, null, null,
+                () -> router.buildConvertLiquidation(candidate(), null, null, null, null, null, null,
                         java.util.Map.of(), "addr_change", 0L, 1L),
                 "a blank pool address must SKIP the candidate; a NullPointerException here means the "
                         + "provider was called first, which is the defect");

@@ -97,10 +97,14 @@ class CompoundDryEvalTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(20_000_000L)))).build();
     }
 
-    /** A distinct pure-ADA UTxO reserved for collateral and never available to balancing. */
+    /**
+     * FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's params,
+     * pinned as the Request's collateral and never available to balancing.
+     */
     private static Utxo collateral() {
         return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(BOT)
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(WalletShape.collateralLovelace(
+                        EvalFixtures.protocolParams().getProtocolParams())))).build();
     }
 
     private static List<Utxo> universe() {
@@ -161,7 +165,7 @@ class CompoundDryEvalTest {
     private static CompoundTransactionBuilder.Request request(BigInteger fee) {
         return new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
                 recordedConfig(), recordedLmConfig(), wallet(), BOT, fee,
-                VALID_FROM_SLOT, VALID_TO_SLOT);
+                VALID_FROM_SLOT, VALID_TO_SLOT, collateral());
     }
 
     // ---- the proof ---------------------------------------------------------------------------
@@ -256,11 +260,37 @@ class CompoundDryEvalTest {
 
         var request = new CompoundTransactionBuilder.Request(excluded, java.util.Map.of(), utxo("bond"),
                 recordedConfig(), recordedLmConfig(), wallet(), BOT, FEE,
-                VALID_FROM_SLOT, VALID_TO_SLOT);
+                VALID_FROM_SLOT, VALID_TO_SLOT, collateral());
 
         var e = assertThrows(CompoundTransactionBuilder.RefusedException.class,
                 () -> builder().build(request));
         assertEquals(CompoundTransactionBuilder.Refusal.CANDIDATE_NOT_READY, e.getReason());
+    }
+
+    /**
+     * FAB-185: the Request's collateral C is refused by name before anything is built when it is missing, is
+     * not ada-only with no datum (a token-bearing output; the escrow, which carries a datum), or is an input the
+     * build spends (U itself).
+     */
+    @Test
+    void anInvalidCollateralIsRefusedBeforeAnythingIsBuilt() {
+        Utxo tokenBearing = Utxo.builder().txHash("c1".repeat(32)).outputIndex(0).address(BOT)
+                .amount(List.of(Amount.lovelace(BigInteger.valueOf(10_000_000L)),
+                        Amount.asset("ab".repeat(28) + "01", BigInteger.ONE))).build();
+        java.util.Map<String, Utxo> invalid = new java.util.LinkedHashMap<>();
+        invalid.put("missing", null);
+        invalid.put("token-bearing", tokenBearing);
+        invalid.put("U itself", wallet());
+        invalid.put("datum-bearing (the escrow)", utxo("escrow"));
+        for (var entry : invalid.entrySet()) {
+            var request = new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
+                    recordedConfig(), recordedLmConfig(), wallet(), BOT, FEE, VALID_FROM_SLOT, VALID_TO_SLOT,
+                    entry.getValue());
+            var e = assertThrows(CompoundTransactionBuilder.RefusedException.class, () -> builder().build(request),
+                    "a " + entry.getKey() + " C must be refused");
+            assertEquals(CompoundTransactionBuilder.Refusal.COLLATERAL_NOT_DISTINCT_PURE_ADA, e.getReason(),
+                    entry.getKey() + ": " + e.getMessage());
+        }
     }
 
     /**
@@ -362,7 +392,8 @@ class CompoundDryEvalTest {
         List<Utxo> universe = List.of(utxo("escrow"), utxo("bond"), utxo("pool"), utxo("poolManager"),
                 recordedConfig(), recordedLmConfig(), exactCollateral, change);
         var request = new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
-                recordedConfig(), recordedLmConfig(), change, BOT, FEE, VALID_FROM_SLOT, VALID_TO_SLOT);
+                recordedConfig(), recordedLmConfig(), change, BOT, FEE, VALID_FROM_SLOT, VALID_TO_SLOT,
+                exactCollateral);
         Transaction tx = evaluatingBuilder(universe).build(request);
 
         // The wallet afterwards: what it held, minus what the body spent, plus what the body pays it.

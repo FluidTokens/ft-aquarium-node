@@ -370,7 +370,12 @@ public class AppConfig {
             this.modeName = modeName;
         }
 
-        @Value("${loans.liquidation.delay-seconds:60}")
+        /**
+         * Obsolete since FAB-183 and read by nothing: the liquidation stage runs on committed blocks and oracle
+         * price changes, never on a timer, so its delay setting is no longer bound or shipped
+         * ({@link ObsoleteSettingsWarning} WARNs at boot if it is set). The field is retained only for
+         * the existing constructors that take it.
+         */
         private long delaySeconds;
 
         /** How far past "now" the built transaction's validity interval extends. */
@@ -1046,7 +1051,12 @@ public class AppConfig {
         @Value("${loans.compound.enabled:false}")
         private boolean enabled;
 
-        @Value("${loans.compound.delay-seconds:60}")
+        /**
+         * Obsolete since FAB-183 and read by nothing: the compound stage runs on committed blocks and oracle
+         * price changes, never on a timer, so its delay setting is no longer bound or shipped
+         * ({@link ObsoleteSettingsWarning} WARNs at boot if it is set). The field is retained only for
+         * the existing constructors that take it.
+         */
         private long delaySeconds;
 
         /**

@@ -1,4 +1,4 @@
-# The oracle stream (shadow)
+# The oracle stream
 
 For operators who see `[oracle-stream]` lines in their log and want to know what they are, or who want
 to turn the stream off. Nothing here needs action on a healthy node.
@@ -10,18 +10,19 @@ to turn the stream off. Nothing here needs action on a healthy node.
 FluidTokens publishes oracle prices on two channels: the HTTP registry the node has always polled
 (`api.fluidtokens.com/get-oracle-tokens`), and a WebSocket that **pushes** the same registry after it
 changes. FluidTokens checks for changes about once a minute, so a push can follow a price change by up to
-about 60 s; that timing is theirs, not the node's. The node connects to the WebSocket and listens — **as a
-shadow**:
+about 60 s; that timing is theirs, not the node's. The node connects to the WebSocket and listens:
 
-- **No decision reads it.** Every push is parsed, compared with the HTTP registry and written to the log as
-  one `cmp` line, and that is all. No liquidation, price, health figure or readiness verdict changes because of it.
-- **The HTTP registry stays the source of truth.** The node keeps polling it exactly as before; the stream
-  neither replaces nor corrects it.
-- It exists so that every operator's log shows how the stream behaves — how promptly pushes arrive, how
-  often the connection drops, what the server refuses — before anything is allowed to depend on it.
+- **By default the stream feeds the prices.** Every push is merged with what the HTTP registry serves, and
+  for each oracle the newer price wins — [What the stream drives](#what-the-stream-drives).
+  `LOANS_ORACLE_SOURCE=api` turns that off and makes the stream a shadow again: prices from the HTTP
+  registry alone, and no decision reads the stream.
+- **The node keeps polling the HTTP registry** every 30 s exactly as before, either way.
+- Every push is also compared with the HTTP registry and written to the log as one `cmp` line, so every
+  operator's log shows how the stream behaves — how promptly pushes arrive, how often the connection drops,
+  what the server refuses.
 
-A stream that is refused, disconnected or off costs the node nothing: liquidations, scheduled transactions
-and `/healthcheck` carry on unchanged.
+A stream that is refused, disconnected or off costs the node nothing it had before: prices still come from
+the HTTP registry, and liquidations, scheduled transactions and `/healthcheck` carry on.
 
 ---
 
@@ -111,17 +112,19 @@ after a connection WARNs again.
 
 | Event | Level | Fields | Meaning |
 |---|---|---|---|
-| `on` | INFO | `network=` `host=` `node_ver=` | at startup: the stream is starting, where it connects, and the `X-FT-Node-Version` it sends (`-` for none, §4) |
+| `on` | INFO | `network=` `host=` `node_ver=` `source=` | at startup: the stream is starting, where it connects, the `X-FT-Node-Version` it sends (`-` for none, §4), and where prices come from — `stream` or `api` ([What the stream drives](#what-the-stream-drives)) |
+| `source` | WARN | `reason=unrecognised` `value=` | at startup: `LOANS_ORACLE_SOURCE` is neither `stream` nor `api`, so the node uses `api` |
 | `off` | INFO or WARN | `reason=` (and `value=`, `network=`, `host=` where relevant) | at startup: the stream is off, and why (§2, §3). WARN when a setting of yours is wrong; also `reason=internal-error(<class>)` if the stream itself failed to start — the rest of the node is unaffected |
 | `connecting` | DEBUG | `attempt=` | an attempt is starting |
 | `connected` | INFO | `attempt=` `handshake_ms=` | the connection is open; `attempt` counts the attempts it took |
 | `push` | DEBUG | `push=` `n=` `chars=` `ts=` `rcv=` `dly_ms=` `xfer_ms=` | a push arrived and parsed: its sequence number, entries, size, the server's timestamp, when it arrived, how many ms after that timestamp it arrived, and how long its frames took ([Measuring delivery](#measuring-delivery)). DEBUG because its `cmp` line says the same push at INFO |
 | `cmp` | INFO, or WARN for `MISMATCH` and `API_AHEAD` | `push=` `out=` `n=` `h=`, then the outcome's own, then — on a line about a push — `gap_s=` `dly_ms=` `ts=` `rcv=` `xfer_ms=` | the one verdict on a push compared with the API (or, with `push=-`, on an API change no push carried) — [Comparing the stream with the API](#comparing-the-stream-with-the-api) |
 | `cmp-detail` | WARN or DEBUG | `push=` `out=` `only_ws=` `only_api=` `differ=` (and `api_is_push=`) | after a `MISMATCH` or `API_AHEAD`: which oracle NFTs differ. WARN when the set differs from the last one said, DEBUG while it repeats |
+| `missed` | INFO | `n=` `units=` | with `source=stream`, while connected: an HTTP registry load changed `n` oracles' prices that no push had carried — the stream missed those pushes. `units` names at most 5 oracle NFTs. Not said while disconnected (only counted, §8) |
 | `day` | INFO | `push=` `up_s=` `conn_s=` `pushes=` … `last=` | the cumulative summary at each UTC midnight, and `last=1` when the node stops — [The `day` line](#the-day-line) |
 | `push-ignored` | WARN or DEBUG | `reason=` `count=` | a message that is not a usable push: `malformed`, `unknown-type:<type>`, `oversize` (over 1,048,576 characters) or `binary`. The connection stays up; the message is counted, never echoed |
 | `refused` | WARN or DEBUG | `status=` `msg="…"` `retry_s=` | the server refused the connection (§6) |
-| `closed` | WARN, DEBUG or INFO | `reason=` `up_s=` | a connection ended, and how long it had been open. `reason` is `server-close(<code>)`, `error(<class>)`, `no-pong`, `proactive` (INFO — planned, §7) or `shutdown` (INFO — the node is stopping) |
+| `closed` | WARN, DEBUG or INFO | `reason=` `up_s=` (and `trigger=`) | a connection ended, and how long it had been open. `reason` is `server-close(<code>)`, `error(<class>)`, `no-pong`, `proactive` (INFO — planned, §7) or `shutdown` (INFO — the node is stopping). A `proactive` line ends with `trigger=push` (replaced right after a push) or `trigger=deadline` (no push came in time) |
 | `stake-changed` | DEBUG | `retry_s=0` | during a 403 hold, the node's own view of its stake changed, so it retries at once |
 | `listener-error` | WARN | `callback=` `error=` | an internal handler failed on a push; the stream carries on |
 | `task-error` | WARN | `task=` `error=` | an internal task failed; the stream carries on |
@@ -140,7 +143,7 @@ retry_s=<s>` followed by its own reading:
 | **400** | the request was malformed | nothing you can fix; it backs off (60 s, doubling to 30 min). Report it if it persists |
 | **401** | the signature was rejected — almost always the **system clock**, which must be within two minutes of real time | check NTP on the host. The first 401 after a connection is retried at once with a new signature; repeats back off (60 s, doubling to 30 min) |
 | **403** | no Aquarium staking bond for this wallet's stake key | expected on a node that is not staked. It retries hourly, and at once if the node's own staking check (the one the scheduled-transaction processor uses) changes its answer — re-checked every 5 minutes |
-| **429** | another connection on this bond is already open | expected on a standby node on the same bond. It backs off (60 s, doubling to 30 min); a successful connection resets it |
+| **429** | another connection on this bond is already open | expected on a standby node on the same bond. It backs off (60 s, doubling to 30 min); a successful connection resets it. Right after the node's own planned reconnect (§7) the server may not have released the old connection yet, so the first three 429s after it retry after 2, 4 and 8 s (±20%) before that backoff applies |
 | other | anything else, server errors included | treated like a dropped connection (§7) |
 
 ---
@@ -153,10 +156,17 @@ retry_s=<s>` followed by its own reading:
 - **Dropped connections** (`server-close`, `error`, `no-pong`, timeouts — 10 s to connect, 20 s for the
   handshake) are retried after 1, 2, 5, 10, 20, 30 and then every 60 s, each ±20%. A connection that had
   stayed open for at least 60 s starts that ladder from the beginning again.
-- **Planned reconnect.** The server closes a connection after two hours, so the node replaces it first,
-  after 115 minutes: it closes the old connection (waiting at most 1 s for the server to acknowledge),
-  and only then opens the new one with a fresh signature — never two at once, because the bond grants
-  one. Logged at INFO as `closed reason=proactive`; it is not a fault.
+- **Planned reconnect.** The server closes a connection after two hours, so the node replaces it first.
+  It closes the old connection (waiting at most 1 s for the server to acknowledge), and only then opens
+  the new one with a fresh signature — never two at once, because the bond grants one. Logged at INFO as
+  `closed reason=proactive`; it is not a fault.
+- **When it replaces it.** A push missed during the replacement would cost a liquidation a block, and
+  pushes arrive at about seconds 22–24 of a minute. So from 115 minutes the connection is only *due*:
+  the first push that arrives while it is due is delivered, and the connection is replaced right after it
+  (`trigger=push`). If no push comes by 118 minutes, it is replaced then (`trigger=deadline`) — except
+  that a deadline falling in seconds 15–35 of its minute (from :15 up to, not including, :35) waits until
+  second 40 of that minute, away from the push window. That is at most 25 s later, still under the two-hour
+  cap.
 
 ---
 
@@ -174,6 +184,7 @@ On `/actuator/prometheus`, alongside the node's other metrics:
 | `aquarium_oracle_stream_comparison_total{outcome}` | counter | `cmp` lines, by `outcome`: `matched`, `superseded`, `mismatch`, `api_ahead`, `uncovered` |
 | `aquarium_oracle_stream_comparison_lag_seconds` | gauge | the `lag_s` of the last first-time `MATCHED` push (`rep=0`); NaN before any |
 | `aquarium_oracle_stream_connected_seconds_total` | counter | seconds a connection has been open since startup, the open one included |
+| `aquarium_oracle_stream_missed_total{stream}` | counter | with `source=stream` only: oracles an HTTP registry load changed that no push had carried, by `stream`: `connected` (each also said as a `missed` line) or `disconnected` |
 
 Every series exists from startup at 0 (the lag gauge at NaN), so an absent series means the stream is off,
 not that nothing happened.
@@ -183,18 +194,53 @@ not that nothing happened.
 ## 9. The readiness page
 
 With the operator UI on (`LOANS_UI_ENABLED=true`, [deploying.md](deploying.md) §7), the readiness page
-shows one small grey line for the stream, ending `· no decision reads it`:
+shows one small grey line for the stream. Hovering it shows: `prices come from the stream and the API merged,
+newest per oracle wins; LOANS_ORACLE_SOURCE=api uses the API only`.
 
 | State | The line |
 |---|---|
-| off | `Oracle stream (shadow): off — <why>` |
-| connecting | `Oracle stream (shadow): connecting…` |
-| connected | `Oracle stream (shadow): connected <since> — no push yet (pushes arrive only when a price changes)`, or `… · last push <time> · <n> pushes` |
-| disconnected | `Oracle stream (shadow): disconnected (<reason>) — retrying at <time>` |
-| refused | `Oracle stream (shadow): refused <status> — <server's message> — retrying at <time>` |
+| off | `Oracle stream: off — <why>` |
+| connecting | `Oracle stream: connecting…` |
+| connected | `Oracle stream: connected <since> — no push yet (pushes arrive only when a price changes)`, or `… · last push <time> · <n> pushes` |
+| disconnected | `Oracle stream: disconnected (<reason>) — retrying at <time>` |
+| refused | `Oracle stream: refused <status> — <server's message> — retrying at <time>` |
 
 **`/healthcheck` never includes the stream.** A refused, disconnected or disabled stream cannot make the
 node report unhealthy, and nothing that restarts containers on `/healthcheck` will ever react to it.
+
+---
+
+## What the stream drives
+
+`LOANS_ORACLE_SOURCE` (`loans.oracle.source`) decides it. The `on` line says which is in use (`source=`).
+
+**`stream` — the default.** The node holds one set of prices, one entry per oracle NFT, written by both
+channels: every HTTP registry poll and every stream push.
+
+- **Newest wins.** For each oracle NFT, an entry replaces the one held only if its feed's `validFrom` is
+  strictly later, with one exception: an entry with the same `validFrom` but different content replaces the
+  one held (a republication); an identical one changes nothing; an older one is ignored — whichever channel it
+  came from. There is no fallback to an older price when the newest has lapsed: that
+  oracle is then simply unusable until a newer one arrives, as before.
+- **What stays held.** An oracle stays only while the HTTP registry's last successful poll lists it, or the
+  last push of a **connected** stream lists it. When the stream disconnects, an oracle only the stream listed
+  is dropped at once.
+- The v1 and v2 oracles of one token stay apart, each under its own NFT, as before.
+- **Missed pushes.** When an HTTP poll changes a price the stream had not pushed, the stream missed that push.
+  While connected, the node says so in one `missed` line and counts it in
+  `aquarium_oracle_stream_missed_total{stream="connected"}`; while not connected it only counts it, under
+  `stream="disconnected"`. The `connected` count also includes pushes that arrived after the HTTP poll had
+  already seen the change, so it is an upper bound on missed pushes, not an exact count.
+- The `cmp` comparison is unchanged: it always judges the stream against what the HTTP registry itself
+  served, never against the merged prices.
+
+A node with no stream — refused, disconnected, or `LOANS_ORACLE_STREAM_ENABLED=false` — keeps the HTTP
+registry's prices.
+
+**`api` — the emergency lever.** Prices come from the HTTP registry alone, exactly as before the stream existed,
+and the stream is a shadow: it is still compared and logged, and nothing reads it. Set
+`LOANS_ORACLE_SOURCE=api` in `docker/.env` and restart. Any value other than `stream`, `api` or blank is
+refused with a `source` WARN and means `api`.
 
 ---
 

@@ -49,7 +49,9 @@ import java.util.stream.Collectors;
  * A spent out-ref, an NFT the registry does not name, two entries expecting different NFTs at one out-ref,
  * an out-ref whose content is unknown, and any provider failure. Every one throws
  * {@link OracleReferenceInputNotLiveException}; nothing is held, so the candidate is probed again next cycle
- * (FAB-134 NQ: no quarantine).
+ * (FAB-134 NQ: no quarantine). The executor logs each at ERROR, except an out-ref whose content is unknown (not
+ * yet visible to this node, FAB-183): that one is marked {@code notYetVisible}, and the executor records it as a
+ * wait, REFUSED {@code ORACLE_INPUT_NOT_YET_VISIBLE} at INFO, keeping the nominated wallet utxo.
  *
  * <p>Holds a {@link UtxoService} — read-only, with no submission method — and no {@code BackendService}, so a
  * builder that holds this probe still has no path to the wire.
@@ -119,9 +121,11 @@ public class OracleReferenceInputProbe {
     private String addressOf(TransactionInput outRef, AssetType nft) {
         Optional<Utxo> content = contentSource.getTxOutput(outRef.getTransactionId(), outRef.getIndex());
         if (content.isEmpty() || content.get().getAddress() == null) {
+            // FAB-183: the one NOT-YET-VISIBLE branch. A fresher price can announce an out-ref (a Charli3
+            // provider UTxO) whose creating block this node has not stored yet — a wait, not a fault.
             throw new OracleReferenceInputNotLiveException(
                     "oracle out-ref %s (expected NFT %s): its address is unknown — no content for it"
-                            .formatted(ref(outRef), nft.toUnit()));
+                            .formatted(ref(outRef), nft.toUnit()), true);
         }
         return content.get().getAddress();
     }
@@ -209,11 +213,29 @@ public class OracleReferenceInputProbe {
      * {@link LiquidateTransactionBuilder.RefusedException}: it is a fact about the world the build depends
      * on, logged at ERROR every cycle by the executor's machinery-failure catch, and its message never
      * carries the spent-input markers that catch reads as a spent wallet utxo.
+     *
+     * <p>FAB-183: the one exception is {@link #notYetVisible()} — an out-ref whose content the node cannot
+     * see yet. The executor records that as a wait at INFO and keeps the nominated wallet utxo.
      */
     public static final class OracleReferenceInputNotLiveException extends RuntimeException {
 
+        private final boolean notYetVisible;
+
         public OracleReferenceInputNotLiveException(String message) {
+            this(message, false);
+        }
+
+        OracleReferenceInputNotLiveException(String message, boolean notYetVisible) {
             super(message);
+            this.notYetVisible = notYetVisible;
+        }
+
+        /**
+         * True ONLY for an out-ref whose content is unknown to the content source — not yet visible to this
+         * node. Spent, 404, wrong or missing NFT, missing out-ref and provider errors are all false.
+         */
+        public boolean notYetVisible() {
+            return notYetVisible;
         }
     }
 }

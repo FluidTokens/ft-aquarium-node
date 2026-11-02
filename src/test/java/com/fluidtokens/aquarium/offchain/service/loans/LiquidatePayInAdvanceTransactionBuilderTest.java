@@ -281,7 +281,7 @@ class LiquidatePayInAdvanceTransactionBuilderTest {
         return new LiquidatePayInAdvanceTransactionBuilder.Request(r.loan(), r.loanUtxo(), r.bond(),
                 r.bondUtxo(), r.walletUtxo(), r.configUtxo(), r.lmConfigUtxo(), oracle, principal,
                 r.validFromMillis(), r.validToMillis(), r.validFromSlot(), r.validToSlot(),
-                r.changeAddress(), r.referenceScripts(), r.oracleWindowMarginMillis());
+                r.changeAddress(), r.referenceScripts(), r.oracleWindowMarginMillis(), r.collateralUtxo());
     }
 
     /**
@@ -291,7 +291,7 @@ class LiquidatePayInAdvanceTransactionBuilderTest {
      */
     private static Transaction build(LiquidatePayInAdvanceTransactionBuilder.Request request) {
         List<Utxo> universe = new ArrayList<>(List.of(request.configUtxo(), request.lmConfigUtxo(),
-                request.walletUtxo(), request.loanUtxo(), request.bondUtxo()));
+                request.walletUtxo(), request.collateralUtxo(), request.loanUtxo(), request.bondUtxo()));
         return new LiquidatePayInAdvanceTransactionBuilder(LoanFixtures.registry(), LoanFixtures.NETWORK,
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams())
                 .build(request);

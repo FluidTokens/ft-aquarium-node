@@ -312,25 +312,25 @@
     </div>
   </div>
 
-  <!--/* FAB-174: the SHADOW oracle stream, one quiet line. Nothing the bot decides reads it, and the line says so;
+  <!--/* FAB-174: the oracle stream, one quiet line. Its prices are merged with the API's by default
+         (LOANS_ORACLE_SOURCE=api uses the API only), and the line's title says so;
          /healthcheck never includes it. Every value is th:text: the refusal message is server text. */-->
-  <div class="note oracle-stream" th:if="${oracleStream != null}" title="shadow only — no decision reads it"
+  <div class="note oracle-stream" th:if="${oracleStream != null}" title="prices come from the stream and the API merged, newest per oracle wins; LOANS_ORACLE_SOURCE=api uses the API only"
        style="color:var(--muted)">
     <th:block th:switch="${oracleStream.state.name()}">
-      <span th:case="'OFF'" th:text="|Oracle stream (shadow): off — ${oracleStream.detail}|">off</span>
-      <span th:case="'CONNECTING'">Oracle stream (shadow): connecting…</span>
+      <span th:case="'OFF'" th:text="|Oracle stream: off — ${oracleStream.detail}|">off</span>
+      <span th:case="'CONNECTING'">Oracle stream: connecting…</span>
       <th:block th:case="'CONNECTED'">
         <span th:if="${oracleStream.lastPushAt == null}"
-              th:text="|Oracle stream (shadow): connected ${oracleStream.since} — no push yet (pushes arrive only when a price changes)|">connected</span>
+              th:text="|Oracle stream: connected ${oracleStream.since} — no push yet (pushes arrive only when a price changes)|">connected</span>
         <span th:if="${oracleStream.lastPushAt != null}"
-              th:text="|Oracle stream (shadow): connected ${oracleStream.since} · last push ${oracleStream.lastPushAt} · ${oracleStream.pushes} pushes|">connected</span>
+              th:text="|Oracle stream: connected ${oracleStream.since} · last push ${oracleStream.lastPushAt} · ${oracleStream.pushes} pushes|">connected</span>
       </th:block>
       <span th:case="'RETRYING'"
-            th:text="|Oracle stream (shadow): disconnected (${oracleStream.detail}) — retrying at ${oracleStream.nextAttemptAt}|">disconnected</span>
+            th:text="|Oracle stream: disconnected (${oracleStream.detail}) — retrying at ${oracleStream.nextAttemptAt}|">disconnected</span>
       <span th:case="'REFUSED'"
-            th:text="|Oracle stream (shadow): refused ${oracleStream.refusalStatus} — ${oracleStream.refusalMessage} — retrying at ${oracleStream.nextAttemptAt}|">refused</span>
+            th:text="|Oracle stream: refused ${oracleStream.refusalStatus} — ${oracleStream.refusalMessage} — retrying at ${oracleStream.nextAttemptAt}|">refused</span>
     </th:block>
-    <span>· no decision reads it</span>
   </div>
 
   <!-- ⛔ FAB-115: a Lending v4 config mismatch no longer stops the node; it closes the lending gate.

@@ -93,6 +93,32 @@ class WalletShapeTest {
         assertEquals(EnumSet.of(Reason.NO_EXACT_COLLATERAL, Reason.NON_RELEVANT_NOT_ONE_EXACT_UTXO), reasons(utxos));
     }
 
+    /**
+     * (d1) FAB-188: R1/R2 use the one ada-only predicate, {@code WalletInputSelection.nominable}. A datum-bearing
+     * UTxO of exactly C lovelace is not a collateral the bot could nominate, so R1 still fires.
+     */
+    @Test
+    void r1_aDatumBearingAdaOnlyUtxoOfExactlyCIsNotCollateral() {
+        Utxo datumC = utxo(C);
+        datumC.setInlineDatum("d87980");
+        List<Utxo> utxos = List.of(utxo(TEN_ADA, UNIT_A, 500L), utxo(TEN_ADA, JUNK_1, 7L, JUNK_2, 9L), datumC,
+                utxo(ada(100)));
+        assertEquals(EnumSet.of(Reason.NO_EXACT_COLLATERAL), reasons(utxos));
+    }
+
+    /**
+     * (d2) ... and a reference-script UTxO carrying only ada is not a fragment of the change: beside C and one
+     * change it does not fire ADA_FRAGMENTED.
+     */
+    @Test
+    void r2_aReferenceScriptAdaOnlyUtxoIsNotAFragment() {
+        Utxo refScript = utxo(ada(30));
+        refScript.setReferenceScriptHash("ab".repeat(28));
+        List<Utxo> utxos = new ArrayList<>(shaped());
+        utxos.add(refScript);
+        assertEquals(EnumSet.noneOf(Reason.class), reasons(utxos));
+    }
+
     @Test
     void r2_twoAdaOnlyUtxosBesidesCollateral() {
         List<Utxo> utxos = new ArrayList<>(shaped());

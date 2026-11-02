@@ -4,7 +4,6 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
-import com.fluidtokens.aquarium.offchain.config.AppConfig;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
@@ -21,19 +20,22 @@ import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.actuate.autoconfigure.metrics.CompositeMeterRegistryAutoConfiguration;
 import org.springframework.boot.actuate.autoconfigure.metrics.MetricsAutoConfiguration;
 import org.springframework.boot.actuate.autoconfigure.metrics.export.prometheus.PrometheusMetricsExportAutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
-import org.springframework.scheduling.annotation.Scheduled;
 
 import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.math.BigInteger;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
@@ -324,28 +326,45 @@ class MarketCoverageReporterTest {
     }
 
     /**
-     * ⛔ The cycle runs every minute forever. A WARN per cycle would bury the line that matters
-     * under thousands of identical ones, so the log carries TRANSITIONS and the gauge carries the
-     * state — which is the division of labour Giovanni described ("a WARN in the logs would be a
-     * good starting point" for the human; "a prometheus metric … trigger paging" for the alert).
+     * ⛔ The stage scans on every block and every price change, forever. A WARN per scan would bury
+     * the line that matters under thousands of identical ones, so the log carries TRANSITIONS and the
+     * gauge carries the state — which is the division of labour Giovanni described ("a WARN in the
+     * logs would be a good starting point" for the human; "a prometheus metric … trigger paging" for
+     * the alert).
+     *
+     * <p>Wall-clock form: scans every 20 s, the block cadence, up to 80 s say nothing; the scan at
+     * 81 s — strictly more than {@link MarketCoverageReporter#MAX_BLACKOUT_SECONDS} — says it once,
+     * and the scans after it say nothing more.
      *
      * <p>⚠ The assertion is on the WARN's <b>content</b>, not only on the count. A count alone stays
      * green when the transition WARN is entirely absent and some other WARN — the cardinality bound's,
      * say — happens to fire once instead, which is a way for this mechanism to disappear silently.
      */
     @Test
-    void theWarnFiresOnceTheConditionHoldsAndNotOnEveryCycle() {
-        MarketCoverageReporter reporter = new MarketCoverageReporter(new SimpleMeterRegistry());
+    void anUnservableMarketWarnsOnceAtEightyOneSecondsAndNotOnEveryScan() {
+        MutableClock clock = new MutableClock(T0);
+        MarketCoverageReporter reporter = wallClockReporter(new SimpleMeterRegistry(), clock);
         List<ILoggingEvent> logged = capture();
 
         LiquidationAssessment blind = excluded(USDM_UNIT,
                 LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE, "principal leg: oracle client disabled");
-        for (int cycle = 0; cycle < CYCLES_TO_WARN + 5; cycle++) {
+        for (int second = 0; second <= 80; second += 20) {
+            clock.set(T0.plusSeconds(second));
             reporter.report(List.of(blind));
         }
+        assertTrue(warnings(logged).isEmpty(),
+                () -> "80 s is not MORE than the 80 s blackout ceiling: " + warnings(logged));
 
+        clock.set(T0.plusSeconds(81));
+        reporter.report(List.of(blind));
+        assertEquals(1, warnings(logged).size(), () -> "81 s: exactly one WARN: " + warnings(logged));
+
+        for (int second = 100; second <= 300; second += 20) {
+            clock.set(T0.plusSeconds(second));
+            reporter.report(List.of(blind));
+        }
         assertEquals(1, warnings(logged).size(),
-                () -> (CYCLES_TO_WARN + 5) + " cycles, one episode, one WARN: " + warnings(logged));
+                () -> "one episode, one WARN, however many scans follow: " + warnings(logged));
         assertTrue(warnings(logged).get(0).startsWith("⛔ UNSERVABLE MARKET"),
                 () -> "it must be the UNSERVABLE MARKET line itself, not some other WARN that "
                         + "happens to fire once: " + warnings(logged));
@@ -354,21 +373,21 @@ class MarketCoverageReporterTest {
     /**
      * ⛔ <b>A SINGLE ORACLE BLACKOUT SAYS NOTHING AT ALL.</b>
      *
-     * <p>Preview has a real ~60–80 s price blackout every five minutes, upstream of us, and
-     * {@code loans.liquidation.delay-seconds} defaults to 60 — so a blackout spans one or two
-     * consecutive cycles and happens ~288 times a day per non-ada market. A WARN on each transition
-     * would turn Giovanni's floor into noise on the first network the bot runs on, and the recovery
-     * INFO would double it.
+     * <p>Preview has a real ~60–80 s price blackout every five minutes, upstream of us, and it happens
+     * ~288 times a day per non-ada market. At the block cadence (~20 s) an 80 s blackout is seen by
+     * FIVE consecutive scans — the count the old cadence-derived gate would have needed rethinking
+     * for. A WARN on each transition would turn Giovanni's floor into noise on the first network the
+     * bot runs on, and the recovery INFO would double it.
      *
      * <p>So the gauge — the continuously-true thing, which an alert rule can hold with its own
-     * {@code for:} clause — goes to 1 on the first cycle, and the log says nothing until the
-     * condition has held for {@link MarketCoverageReporter#DEFAULT_WARN_AFTER_CYCLES} consecutive
-     * cycles.
+     * {@code for:} clause — goes to 1 on the first scan, and the log says nothing until the condition
+     * has held for more than {@link MarketCoverageReporter#MAX_BLACKOUT_SECONDS} of wall-clock time.
      */
     @Test
-    void aSingleOracleBlackoutProducesNoWarnAndNoInfo() {
+    void anEightySecondBlackoutSeenEveryTwentySecondsProducesNoWarnAndNoInfo() {
+        MutableClock clock = new MutableClock(T0);
         PrometheusMeterRegistry registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
-        MarketCoverageReporter reporter = new MarketCoverageReporter(registry);
+        MarketCoverageReporter reporter = wallClockReporter(registry, clock);
         List<ILoggingEvent> logged = capture();
 
         LiquidationAssessment blacked = excluded(USDM_UNIT,
@@ -376,16 +395,20 @@ class MarketCoverageReporterTest {
                 "principal leg: oracle feed for " + USDM_UNIT
                         + " is outside its validity window at 1757500000000");
 
-        // the blackout: 80s of it, which at the default 60s cycle is two consecutive cycles
+        // the blackout: 80 s of it, observed at 0, 20, 40, 60 and 80
         reporter.report(List.of(blacked));
         assertTrue(registry.scrape().contains(
                         "loans_market_unservable{leg=\"principal\",market=\"" + USDM_UNIT
                                 + "\",reason=\"PRINCIPAL_ORACLE_UNUSABLE\"} 1.0"),
                 () -> "the GAUGE is the continuously-true thing and must not wait; scrape was:\n"
                         + registry.scrape());
-        reporter.report(List.of(blacked));
+        for (int second = 20; second <= 80; second += 20) {
+            clock.set(T0.plusSeconds(second));
+            reporter.report(List.of(blacked));
+        }
 
         // the feed comes back
+        clock.set(T0.plusSeconds(100));
         reporter.report(List.of(buildable(USDM_UNIT)));
 
         assertTrue(warnings(logged).isEmpty(),
@@ -395,94 +418,157 @@ class MarketCoverageReporterTest {
     }
 
     /**
-     * At a 30 s cadence, an 80 s blackout can be observed on three consecutive cycles. The WARN
-     * gate must therefore be derived from that cadence instead of retaining the default-cadence
-     * value of three.
+     * The gate is TIME, not a count of scans. Ten scans inside five seconds — a burst of price changes
+     * landing together — is ten scans the old count would have warned on long before; it is five
+     * seconds of evidence, and says nothing. The next scan, at +90 s, is the one that warns.
      */
     @Test
-    void anEightySecondBlackoutAtThirtySecondCadenceDoesNotWarn() {
-        new ApplicationContextRunner()
-                .withConfiguration(AutoConfigurations.of(MetricsAutoConfiguration.class,
-                        CompositeMeterRegistryAutoConfiguration.class,
-                        PrometheusMetricsExportAutoConfiguration.class))
-                .withUserConfiguration(MarketCoverageReporter.class)
-                .withPropertyValues("loans.liquidation.delay-seconds=30")
-                .run(context -> {
-                    List<ILoggingEvent> logged = capture();
-                    MarketCoverageReporter reporter = context.getBean(MarketCoverageReporter.class);
-                    LiquidationAssessment blacked = excluded(USDM_UNIT,
-                            LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE,
-                            "principal leg: oracle feed for " + USDM_UNIT
-                                    + " is outside its validity window at 1757500000000");
+    void irregularlySpacedScansWarnOnlyOnceTheEpisodeOutlastsEightySeconds() {
+        MutableClock clock = new MutableClock(T0);
+        MarketCoverageReporter reporter = wallClockReporter(new SimpleMeterRegistry(), clock);
+        List<ILoggingEvent> logged = capture();
 
-                    // Observations at t=0, 30 and 60 all fit inside the 80-second blackout.
-                    reporter.report(List.of(blacked));
-                    reporter.report(List.of(blacked));
-                    reporter.report(List.of(blacked));
+        LiquidationAssessment blind = excluded(USDM_UNIT,
+                LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE, "principal leg: oracle client disabled");
+        for (int scan = 0; scan < 10; scan++) {
+            clock.set(T0.plusMillis(scan * 500L));
+            reporter.report(List.of(blind));
+        }
+        assertTrue(warnings(logged).isEmpty(),
+                () -> "ten scans within 5 s are five seconds of evidence, not ten: " + warnings(logged));
 
-                    assertTrue(warnings(logged).isEmpty(),
-                            () -> "an 80 s blackout at a 30 s cadence must not WARN; emitted: "
-                                    + warnings(logged));
-                });
+        clock.set(T0.plusSeconds(90));
+        reporter.report(List.of(blind));
+        assertEquals(1, warnings(logged).size(),
+                () -> "the +90 s scan is the first past the ceiling and warns, once: " + warnings(logged));
     }
 
     /**
-     * ⛔ <b>The positive half of the test above, and the reason it has to exist.</b>
-     *
-     * <p>Its sibling proves the gate does not fire <em>too early</em> at 30 s. Nothing proved it
-     * fires <em>at all</em> below the default cadence — and a derivation that over-returns is the
-     * natural shape of a future change trying to be conservative about blackouts. Returning
-     * {@code Integer.MAX_VALUE} for any sub-60 s cadence would switch an operator's market alerting
-     * off entirely and, without this test, leave the suite green while doing it.
-     *
-     * <p>Asserted through the <b>emitted WARN</b> rather than through
-     * {@link MarketCoverageReporter#warnAfterCyclesFor(long)}'s return value: comparing the int
-     * re-states the arithmetic, where the thing under test is the gate the arithmetic feeds. And
-     * <b>exactly one</b>, not "at least one" — the {@code warned} latch is what stops a WARN per
-     * cycle thereafter, and "at least one" would pass with that latch deleted.
+     * A servable scan ENDS the episode, and the next one starts its own clock. Unservable at 0,
+     * servable at 50, unservable again from 60: at 140 the second episode is 80 s old and says
+     * nothing — measured from the first episode it would be 140 s and would have warned — and at 141
+     * it is 81 s old and warns.
      */
     @Test
-    void theWarnStillFiresAtThirtySecondCadenceOnceTheDerivedGateIsReached() {
-        new ApplicationContextRunner()
-                .withConfiguration(AutoConfigurations.of(MetricsAutoConfiguration.class,
-                        CompositeMeterRegistryAutoConfiguration.class,
-                        PrometheusMetricsExportAutoConfiguration.class))
-                .withUserConfiguration(MarketCoverageReporter.class)
-                .withPropertyValues("loans.liquidation.delay-seconds=30")
-                .run(context -> {
-                    List<ILoggingEvent> logged = capture();
-                    MarketCoverageReporter reporter = context.getBean(MarketCoverageReporter.class);
-                    LiquidationAssessment blacked = excluded(USDM_UNIT,
-                            LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE,
-                            "principal leg: oracle feed for " + USDM_UNIT
-                                    + " is outside its validity window at 1757500000000");
+    void aServableScanStartsANewEpisodeWithItsOwnClock() {
+        MutableClock clock = new MutableClock(T0);
+        MarketCoverageReporter reporter = wallClockReporter(new SimpleMeterRegistry(), clock);
+        List<ILoggingEvent> logged = capture();
 
-                    // floor(80/30) + 2 = 4. Three is inside the blackout; the fourth is past it.
-                    reporter.report(List.of(blacked));
-                    reporter.report(List.of(blacked));
-                    reporter.report(List.of(blacked));
-                    assertTrue(warnings(logged).isEmpty(),
-                            () -> "three cycles is still inside an 80 s blackout at 30 s; emitted: "
-                                    + warnings(logged));
+        LiquidationAssessment blind = excluded(USDM_UNIT,
+                LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE, "principal leg: oracle client disabled");
+        reporter.report(List.of(blind));
+        clock.set(T0.plusSeconds(50));
+        reporter.report(List.of(buildable(USDM_UNIT)));
+        for (int second : new int[] {60, 100, 140}) {
+            clock.set(T0.plusSeconds(second));
+            reporter.report(List.of(blind));
+        }
+        assertTrue(warnings(logged).isEmpty(),
+                () -> "the second episode is 80 s old at 140; the first one is over: " + warnings(logged));
 
-                    reporter.report(List.of(blacked));
-                    assertEquals(1, warnings(logged).size(),
-                            () -> "a market unservable for four consecutive 30 s cycles has "
-                                    + "outlasted any single blackout and MUST warn exactly once; "
-                                    + "emitted: " + warnings(logged));
-
-                    reporter.report(List.of(blacked));
-                    assertEquals(1, warnings(logged).size(),
-                            () -> "the warned latch must suppress every later cycle; emitted: "
-                                    + warnings(logged));
-                });
+        clock.set(T0.plusSeconds(141));
+        reporter.report(List.of(blind));
+        assertEquals(1, warnings(logged).size(),
+                () -> "81 s into the second episode: one WARN: " + warnings(logged));
     }
 
+    /**
+     * The recovery INFO exists only as the closing half of a WARN. An episode that never warned
+     * recovers silently; one that did says "servable again" exactly once.
+     */
     @Test
-    void theDefaultCadenceDerivationPreservesTheExistingWarnGate() {
-        assertEquals(MarketCoverageReporter.DEFAULT_WARN_AFTER_CYCLES,
-                MarketCoverageReporter.warnAfterCyclesFor(60),
-                "the 60 s production default must continue to require exactly three cycles");
+    void theRecoveryInfoFollowsOnlyAnEpisodeThatWarned() {
+        MutableClock clock = new MutableClock(T0);
+        PrometheusMeterRegistry registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+        MarketCoverageReporter reporter = wallClockReporter(registry, clock);
+        List<ILoggingEvent> logged = capture();
+
+        LiquidationAssessment blind = excluded(USDM_UNIT,
+                LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE, "principal leg: oracle client disabled");
+
+        // a short episode: never warned, so its end is not news
+        reporter.report(List.of(blind));
+        clock.set(T0.plusSeconds(60));
+        reporter.report(List.of(blind));
+        clock.set(T0.plusSeconds(70));
+        reporter.report(List.of(buildable(USDM_UNIT)));
+        assertTrue(warnings(logged).isEmpty(), () -> warnings(logged).toString());
+        assertTrue(recoveries(logged).isEmpty(),
+                () -> "a recovery from something never warned about is not news: " + infos(logged));
+
+        // a long one: warned at 181 (81 s after 100), so its end IS news
+        for (int second : new int[] {100, 140, 181}) {
+            clock.set(T0.plusSeconds(second));
+            reporter.report(List.of(blind));
+        }
+        assertEquals(1, warnings(logged).size(), () -> warnings(logged).toString());
+        clock.set(T0.plusSeconds(200));
+        reporter.report(List.of(buildable(USDM_UNIT)));
+
+        assertEquals(1, recoveries(logged).size(), () -> "recovery says so once: " + infos(logged));
+        assertTrue(recoveries(logged).get(0).startsWith("market " + USDM_UNIT + " (principal leg) is "
+                + "servable again"), () -> recoveries(logged).get(0));
+        assertTrue(registry.scrape().contains(
+                        "loans_market_unservable{leg=\"principal\",market=\"" + USDM_UNIT
+                                + "\",reason=\"PRINCIPAL_ORACLE_UNUSABLE\"} 0.0"),
+                () -> "and the gauge is back to 0; scrape was:\n" + registry.scrape());
+    }
+
+    /**
+     * The override at 1 makes the log follow the gauge exactly, on a network with no blackout: the
+     * first unservable scan warns, the first servable one recovers, and the next unservable one warns
+     * again — with a clock that never moves, so time plays no part.
+     */
+    @Test
+    void anOverrideOfOneMakesTheLogFollowTheGauge() {
+        MutableClock clock = new MutableClock(T0);
+        PrometheusMeterRegistry registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+        MarketCoverageReporter reporter = new MarketCoverageReporter(registry, 1, clock);
+        List<ILoggingEvent> logged = capture();
+        String series = "loans_market_unservable{leg=\"principal\",market=\"" + USDM_UNIT
+                + "\",reason=\"PRINCIPAL_ORACLE_UNUSABLE\"} ";
+
+        LiquidationAssessment blind = excluded(USDM_UNIT,
+                LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE, "principal leg: oracle client disabled");
+        reporter.report(List.of(blind));
+        assertTrue(registry.scrape().contains(series + "1.0"), registry::scrape);
+        assertEquals(1, warnings(logged).size(), () -> "the gauge went to 1, so does the log: "
+                + warnings(logged));
+
+        reporter.report(List.of(buildable(USDM_UNIT)));
+        assertTrue(registry.scrape().contains(series + "0.0"), registry::scrape);
+        assertEquals(1, recoveries(logged).size(), () -> "the gauge fell to 0, the log says so: "
+                + infos(logged));
+
+        reporter.report(List.of(blind));
+        assertEquals(2, warnings(logged).size(), () -> "a new episode, a new WARN: " + warnings(logged));
+    }
+
+    /**
+     * The override above zero keeps the consecutive-scan count EXACTLY, whatever the clock says: an
+     * hour between the first and second scans is not a reason to warn on the second, and a clock that
+     * then stands still is not a reason to withhold the WARN on the third.
+     */
+    @Test
+    void anOverrideOfThreeCountsScansWhateverTheClockSays() {
+        MutableClock clock = new MutableClock(T0);
+        MarketCoverageReporter reporter = new MarketCoverageReporter(new SimpleMeterRegistry(), 3, clock);
+        List<ILoggingEvent> logged = capture();
+
+        LiquidationAssessment blind = excluded(USDM_UNIT,
+                LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE, "principal leg: oracle client disabled");
+        reporter.report(List.of(blind));
+        clock.set(T0.plus(Duration.ofHours(1)));
+        reporter.report(List.of(blind));
+        assertTrue(warnings(logged).isEmpty(),
+                () -> "two scans are two, however far apart: " + warnings(logged));
+
+        reporter.report(List.of(blind));
+        assertEquals(1, warnings(logged).size(),
+                () -> "the third consecutive scan warns, with no time passing: " + warnings(logged));
+        reporter.report(List.of(blind));
+        assertEquals(1, warnings(logged).size(), () -> "once per episode: " + warnings(logged));
     }
 
     // =====================================================================================
@@ -659,89 +745,95 @@ class MarketCoverageReporterTest {
                                     "loans_market_unservable{leg=\"collateral\",market=\"" + SNEK_UNIT
                                             + "\",reason=\"COLLATERAL_ORACLE_UNUSABLE\"} 1.0"),
                             "the container-built reporter must publish onto the scraped registry");
-                    // ONE cycle warned, so the property above was really bound: the constant default
-                    // is 3 and would have said nothing here. A misspelt property name fails nowhere
-                    // else — it simply reverts the node to the default, silently.
+                    // ONE scan warned, so the property above was really bound: the default gate waits
+                    // for more than 80 s of wall-clock time and would have said nothing here. A
+                    // misspelt property name fails nowhere else — it simply reverts the node to the
+                    // default, silently.
                     assertEquals(1, warnings(logged).size(),
                             () -> "the container must bind " + MarketCoverageReporter
                                     .WARN_AFTER_CYCLES_PROPERTY + ": " + warnings(logged));
                 });
     }
 
-    /**
-     * The reporter must derive from the exact cadence property that schedules its caller, and this
-     * test reaches <b>both</b> holders of that property: {@code AppConfig.LiquidationConfiguration},
-     * a sibling consumer, and the {@code @Scheduled} annotation on
-     * {@code LiquidationExecutor.runCycle()} that actually sets the interval.
-     *
-     * <p>⚠ Reaching the second one is the point. An earlier version of this test asserted
-     * byte-identity with "the scheduler's source" while touching only the first — a guard whose
-     * message named a mechanism it never exercised, which is the same defect as a false javadoc
-     * wearing a green tick.
-     */
-    @Test
-    void theWarnGateDerivesFromTheLiquidationCadenceProperty()
-            throws NoSuchFieldException, NoSuchMethodException {
-        Constructor<?> injected = null;
-        for (Constructor<?> candidate : MarketCoverageReporter.class.getDeclaredConstructors()) {
-            if (candidate.getParameterCount() == 3) {
-                injected = candidate;
-            }
-        }
-        assertTrue(injected != null, "the three-argument constructor is the one Spring uses");
-
-        Parameter gate = injected.getParameters()[1];
-        Value gateValue = gate.getAnnotation(Value.class);
-        assertTrue(gateValue != null, "the WARN gate must be configurable, per the blackout finding");
-        assertEquals("${" + MarketCoverageReporter.WARN_AFTER_CYCLES_PROPERTY + ":0}",
-                gateValue.value(), "zero is the sentinel that enables cadence-derived debounce");
-
-        Parameter reporterCadence = injected.getParameters()[2];
-        Value reporterCadenceValue = reporterCadence.getAnnotation(Value.class);
-        assertTrue(reporterCadenceValue != null,
-                "the reporter must receive the cadence at which it is called");
-
-        Field configuredCadence = AppConfig.LiquidationConfiguration.class
-                .getDeclaredField("delaySeconds");
-        Value configuredCadenceValue = configuredCadence.getAnnotation(Value.class);
-        assertTrue(configuredCadenceValue != null,
-                "the liquidation configuration must declare its cadence property");
-        assertEquals(configuredCadenceValue.value(), reporterCadenceValue.value(),
-                "the reporter and AppConfig.LiquidationConfiguration must read the SAME property "
-                        + "with the SAME default; these are two consumers of one value and a "
-                        + "divergence between them is silent");
-
-        // ⛔ THE LEG THAT ACTUALLY REACHES THE SCHEDULER. The assertion above pins a sibling
-        // CONSUMER of the property, not the thing that sets the cadence. What schedules the
-        // reporter's caller is the annotation below: rename its key and every assertion above
-        // still passes while the bot scans at a cadence the reporter has never heard of — which
-        // is the exact defect this test exists to prevent.
-        Method scheduledCycle = LiquidationExecutor.class.getDeclaredMethod("runCycle");
-        Scheduled schedule = scheduledCycle.getAnnotation(Scheduled.class);
-        assertTrue(schedule != null,
-                "LiquidationExecutor.runCycle() must still be the @Scheduled method; it is the one "
-                        + "that calls MarketCoverageReporter.report(...), so its cadence IS the "
-                        + "reporter's observation interval");
-        assertEquals(propertyKeyOf(reporterCadenceValue.value()),
-                propertyKeyOf(schedule.fixedDelayString()),
-                "the reporter must derive from the SAME property key that schedules the cycle "
-                        + "calling it. Byte-identity is impossible here and is deliberately not "
-                        + "asserted: the scheduler's string carries no default, the reporter's "
-                        + "carries :60. The KEY is the coupling; the default is not.");
+    /** The reporter's wall clock, read off its private field: production offers no accessor for it. */
+    private static Clock clockOf(MarketCoverageReporter reporter) throws ReflectiveOperationException {
+        java.lang.reflect.Field field = MarketCoverageReporter.class.getDeclaredField("clock");
+        field.setAccessible(true);
+        return (Clock) field.get(reporter);
     }
 
     /**
-     * The bare property name inside a {@code ${...}} placeholder, with any {@code :default}
-     * stripped. Exists because the scheduler and the reporter legitimately differ on the default
-     * and must not differ on the key.
+     * ⛔ <b>The WARN gate no longer reads the liquidation cadence.</b> Scans follow blocks and price
+     * changes, so {@code loans.liquidation.delay-seconds} describes no interval the reporter is
+     * called at, and a gate derived from it would be measuring nothing.
+     *
+     * <p>Two halves. The container builds the reporter with NO {@code delay-seconds} property at all —
+     * the property is due to leave the YAML, and the reporter must not be what stops the node booting
+     * when it does — and on the default (wall-clock) gate one scan raises the gauge and says nothing.
+     * And no constructor's {@code @Value} list names the property: the Spring constructor's names
+     * exactly the operator override and nothing else.
      */
-    private static String propertyKeyOf(String placeholder) {
-        String inner = placeholder;
-        if (inner.startsWith("${") && inner.endsWith("}")) {
-            inner = inner.substring(2, inner.length() - 1);
+    @Test
+    void theContainerBuildsTheReporterWithNoCadencePropertyAndNoConstructorReadsIt() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(MetricsAutoConfiguration.class,
+                        CompositeMeterRegistryAutoConfiguration.class,
+                        PrometheusMetricsExportAutoConfiguration.class))
+                .withUserConfiguration(MarketCoverageReporter.class)
+                .run(context -> {
+                    assertFalse(context.getStartupFailure() != null,
+                            () -> "context failed to start: " + context.getStartupFailure());
+                    assertFalse(context.getEnvironment().containsProperty(CADENCE_PROPERTY),
+                            "the instrument: this context really carries no cadence property");
+                    List<ILoggingEvent> logged = capture();
+                    context.getBean(MarketCoverageReporter.class)
+                            .report(List.of(excluded(USDM_UNIT,
+                                    LiquidationExclusion.PRINCIPAL_ORACLE_UNUSABLE,
+                                    "principal leg: oracle client disabled")));
+                    assertTrue(context.getBean(PrometheusMeterRegistry.class).scrape().contains(
+                                    "loans_market_unservable{leg=\"principal\",market=\"" + USDM_UNIT
+                                            + "\",reason=\"PRINCIPAL_ORACLE_UNUSABLE\"} 1.0"),
+                            "the gauge goes to 1 on the first scan");
+                    assertTrue(warnings(logged).isEmpty(),
+                            () -> "the default gate is wall-clock time, and no time has passed: "
+                                    + warnings(logged));
+                    // FAB-183-7 audit residue R1: the gate's clock is the system's, and it ADVANCES. A
+                    // clock frozen at construction would never see an episode outlast 80 s, and the
+                    // default unservable-market WARN would silently never fire in production.
+                    Clock clock = clockOf(context.getBean(MarketCoverageReporter.class));
+                    Instant first = clock.instant();
+                    assertTrue(Duration.between(first, Instant.now()).abs().compareTo(Duration.ofMinutes(1)) < 0,
+                            () -> "the container-built reporter's clock reads " + first + ", not now");
+                    Instant later = clock.instant();
+                    long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+                    while (!later.isAfter(first) && System.nanoTime() < deadline) {
+                        later = clock.instant();
+                    }
+                    assertTrue(later.isAfter(first), "the container-built reporter's clock advances");
+                });
+
+        Constructor<?> injected = null;
+        for (Constructor<?> candidate : MarketCoverageReporter.class.getDeclaredConstructors()) {
+            for (Parameter parameter : candidate.getParameters()) {
+                Value value = parameter.getAnnotation(Value.class);
+                assertTrue(value == null || !value.value().contains(CADENCE_PROPERTY),
+                        () -> candidate + " still reads " + CADENCE_PROPERTY + ": " + value.value());
+            }
+            if (candidate.isAnnotationPresent(Autowired.class)) {
+                injected = candidate;
+            }
         }
-        int colon = inner.indexOf(':');
-        return colon < 0 ? inner : inner.substring(0, colon);
+        assertTrue(injected != null, "the @Autowired constructor is the one Spring uses");
+        List<String> values = new ArrayList<>();
+        for (Parameter parameter : injected.getParameters()) {
+            Value value = parameter.getAnnotation(Value.class);
+            if (value != null) {
+                values.add(value.value());
+            }
+        }
+        assertEquals(List.of("${" + MarketCoverageReporter.WARN_AFTER_CYCLES_PROPERTY + ":0}"), values,
+                "the Spring constructor reads the operator override, with zero as the sentinel that "
+                        + "selects the wall-clock gate, and nothing else");
     }
 
     // =====================================================================================
@@ -750,8 +842,50 @@ class MarketCoverageReporterTest {
 
     private static final String UNSERVABLE_METRIC = "loans_market_unservable{";
 
-    /** How many consecutive unservable cycles the default gate needs before it says anything. */
-    private static final int CYCLES_TO_WARN = MarketCoverageReporter.DEFAULT_WARN_AFTER_CYCLES;
+    /**
+     * How many consecutive unservable scans the {@code (MeterRegistry)} seam's count gate needs before
+     * it says anything. The tests built on that seam are about what is said, not when.
+     */
+    private static final int CYCLES_TO_WARN = 3;
+
+    /** The property the WARN gate used to derive from, and must no longer read. */
+    private static final String CADENCE_PROPERTY = "loans.liquidation.delay-seconds";
+
+    private static final Instant T0 = Instant.parse("2026-11-01T00:00:00Z");
+
+    /** The production gate — the override absent, so wall-clock time decides — on {@code clock}. */
+    private static MarketCoverageReporter wallClockReporter(MeterRegistry registry, Clock clock) {
+        return new MarketCoverageReporter(registry, 0, clock);
+    }
+
+    /** A clock that stands still until told where to be. */
+    private static final class MutableClock extends Clock {
+
+        private Instant now;
+
+        MutableClock(Instant start) {
+            this.now = start;
+        }
+
+        void set(Instant instant) {
+            now = instant;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+    }
 
     /** An excluded assessment whose bond names {@code marketUnit} as its principal. */
     private static LiquidationAssessment excluded(String marketUnit, LiquidationExclusion reason,
@@ -840,5 +974,10 @@ class MarketCoverageReporterTest {
                 .filter(event -> event.getLevel() == Level.INFO)
                 .map(ILoggingEvent::getFormattedMessage)
                 .toList();
+    }
+
+    /** The "servable again" INFO lines only. */
+    private static List<String> recoveries(List<ILoggingEvent> events) {
+        return infos(events).stream().filter(info -> info.contains("is servable again")).toList();
     }
 }

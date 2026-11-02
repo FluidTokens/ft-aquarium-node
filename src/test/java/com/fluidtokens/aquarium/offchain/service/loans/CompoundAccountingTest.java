@@ -7,13 +7,13 @@ import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.common.model.Networks;
 import com.bloxbean.cardano.client.common.model.SlotConfigs;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
-import com.bloxbean.cardano.client.transaction.spec.TransactionInput;
 import com.bloxbean.cardano.client.transaction.spec.TransactionOutput;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -44,6 +45,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * assumption held by accident. <b>The fixture supplied what production has to earn</b> — this repo's
  * own recorded failure shape, arriving again in a new place. These tests therefore run the wallet
  * <em>thin</em>, which is what a real bot wallet looks like after it has been paying fees.
+ *
+ * <p>⚑ FAB-185: since the builder sees the wallet holding U alone, a thin U is now REFUSED rather than
+ * topped up from further wallet inputs — the two multi-input tests below are inverted to say so, and the
+ * accounting identity is pinned on the single-input shape the builder can now produce.
  *
  * <p>The candidate JSON remains the captured preview transaction shape. Its two config inputs are
  * explicitly synthetic copies with only the latest blueprint's changed action credentials, so the
@@ -79,6 +84,12 @@ class CompoundAccountingTest {
     private static Utxo walletUtxo(String seed, long lovelace) {
         return Utxo.builder().txHash(seed.repeat(32)).outputIndex(0).address(BOT)
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(lovelace)))).build();
+    }
+
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's params. */
+    private static Utxo collateral() {
+        return walletUtxo("c0", WalletShape.collateralLovelace(EvalFixtures.protocolParams().getProtocolParams())
+                .longValueExact());
     }
 
     private static CompoundCandidate candidate() {
@@ -128,11 +139,11 @@ class CompoundAccountingTest {
 
     private static Transaction build(List<Utxo> walletUtxos) {
         List<Utxo> completeWallet = new ArrayList<>(walletUtxos);
-        completeWallet.add(walletUtxo("c0", 5_000_000L));
-        return build(completeWallet, walletUtxos.getFirst());
+        completeWallet.add(collateral());
+        return build(completeWallet, walletUtxos.getFirst(), collateral());
     }
 
-    private static Transaction build(List<Utxo> walletUtxos, Utxo nominated) {
+    private static Transaction build(List<Utxo> walletUtxos, Utxo nominated, Utxo collateral) {
         List<Utxo> universe = new ArrayList<>(List.of(utxo("escrow"), utxo("bond"), utxo("pool"),
                 utxo("poolManager"), recordedConfig(), recordedLmConfig()));
         universe.addAll(walletUtxos);
@@ -143,62 +154,47 @@ class CompoundAccountingTest {
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), evaluator);
         return builder.build(new CompoundTransactionBuilder.Request(candidate(), java.util.Map.of(), utxo("bond"),
                 recordedConfig(), recordedLmConfig(), nominated, BOT,
-                BigInteger.ZERO, 70_000_000L, 70_000_300L));
+                BigInteger.ZERO, 70_000_000L, 70_000_300L, collateral));
     }
 
     /**
-     * ⛔ THE PRODUCTION SHAPE. A thin wallet forces cardano-client-lib to select more than the
-     * nominated input — which is exactly what refused a correct transaction on 2026-09-02.
+     * ⛔ FAB-185 INVERTED. This used to require that a thin wallet made cardano-client-lib select MORE than
+     * the nominated input — the 2026-09-02 production shape, where the extra wallet inputs were the bot's
+     * own money returning as change. The builder now sees the wallet holding U alone, so a thin U cannot be
+     * topped up from the rest of the wallet: it is REFUSED for want of funds, never built from a second
+     * wallet output. The accounting identity is still pinned below, on a U that suffices.
      */
     @Test
-    void aThinWalletForcesExtraInputsAndTheAccountingStillHolds() {
+    void aThinUIsRefusedRatherThanToppedUpFromTheRestOfTheWallet() {
         List<Utxo> thin = List.of(walletUtxo("a1", 2_000_000L), walletUtxo("a2", 3_804_491L),
                 walletUtxo("a3", 5_000_000L), walletUtxo("a4", 5_000_000L),
                 walletUtxo("a5", 5_000_000L));
 
-        Transaction tx = build(thin);
-
-        long botInputs = tx.getBody().getInputs().stream()
-                .filter(i -> thin.stream().anyMatch(u -> u.getTxHash().equals(i.getTransactionId())))
-                .count();
-        assertTrue(botInputs > 1,
-                "this fixture must actually exercise multi-input selection, or it re-proves nothing "
-                        + "— the rig that missed the production defect had exactly one wallet input");
-        assertTrue(!tx.getBody().getCollateral().isEmpty(),
-                "the build must select explicit pure-ADA collateral");
-        assertTrue(tx.getBody().getCollateral().stream().noneMatch(tx.getBody().getInputs()::contains),
-                "the balancing shortfall selector must not reuse reserved collateral as an ordinary input");
-        log.info("thin wallet: {} bot inputs selected, fee {}", botInputs, tx.getBody().getFee());
+        RuntimeException refused = assertThrows(RuntimeException.class, () -> build(thin),
+                "a 2 ADA U must refuse, not pull the four other thin outputs");
+        String chain = LiquidationExecutor.causeChain(refused);
+        log.info("thin U refused: {}", chain);
+        assertTrue(chain.contains("Not enough funds") || chain.contains("Insufficient"),
+                "refused for want of funds in U, not for anything else: " + chain);
     }
 
     /**
-     * The selector-first late-balancing path in CCL 0.7.2. The nominated input is too thin, the
-     * reserved 5 ADA collateral appears before a free 10 ADA input in the supplier, and both are
-     * strictly large enough for {@code ChangeOutputAdjustments.findFirst}. With the production
-     * exclusion wrapper the free input is spent and collateral remains disjoint. Removing only that
-     * wrapper makes the selector consume the reserved input first and the final disjointness guard
-     * refuses the build.
+     * ⛔ FAB-185 INVERTED. This used to pin CCL 0.7.2's selector-first late-balancing path taking a free
+     * 10 ADA wallet output beside the reserved collateral. That free output is now invisible to every
+     * supplier the build holds, and so is C: a 1 ADA U beside both refuses, and takes neither.
      */
     @Test
-    void selectorFirstBalancingSkipsReservedCollateralAndUsesTheFreeAdaInput() {
+    void aOneAdaUBesideAFreeOutputAndCIsRefusedAndTakesNeither() {
         Utxo nominated = walletUtxo("b1", 1_000_000L);
-        Utxo collateral = walletUtxo("b2", 5_000_000L);
+        Utxo collateral = walletUtxo("b2", collateral().getAmount().getFirst().getQuantity().longValueExact());
         Utxo free = walletUtxo("b3", 10_000_000L);
 
-        Transaction tx = build(List.of(nominated, collateral, free), nominated);
-        TransactionInput collateralInput = new TransactionInput(collateral.getTxHash(), collateral.getOutputIndex());
-        TransactionInput freeInput = new TransactionInput(free.getTxHash(), free.getOutputIndex());
-
-        assertEquals(List.of(collateralInput), tx.getBody().getCollateral(),
-                "the 5 ADA actual-sufficient candidate is reserved alone, below the protocol ceiling");
-        assertTrue(tx.getBody().getInputs().contains(freeInput),
-                "the selector-first shortfall path must take the separate free balancing input");
-        assertTrue(!tx.getBody().getInputs().contains(collateralInput),
-                "the selector-first path must not consume the reserved collateral");
-        assertTrue(BigInteger.valueOf(5_000_000L).compareTo(
-                LiquidateTransactionBuilder.maxPossibleCollateral(
-                        EvalFixtures.protocolParams().getProtocolParams())) < 0,
-                "the control must remain below the protocol-wide ceiling");
+        RuntimeException refused = assertThrows(RuntimeException.class,
+                () -> build(List.of(nominated, collateral, free), nominated, collateral),
+                "a 1 ADA U must refuse, not take the free 10 ADA output or C");
+        String chain = LiquidationExecutor.causeChain(refused);
+        assertTrue(chain.contains("Not enough funds") || chain.contains("Insufficient"),
+                "refused for want of funds in U, not for anything else: " + chain);
     }
 
     /** The identity, on the single-input shape, stated as arithmetic rather than as a passing build. */

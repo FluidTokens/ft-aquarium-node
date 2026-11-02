@@ -456,7 +456,7 @@ database is an avoidable variable.
 
 ## 7. Keys that no longer exist
 
-If you are carrying a configuration forward from an older node, **remove these.** They are ignored
+If you are carrying a configuration forward from an older node, **remove these.** Most are ignored
 in silence, which reads exactly like them working.
 
 | removed key | why, and what happens if you still pass it |
@@ -466,6 +466,8 @@ in silence, which reads exactly like them working.
 | `LOANS_ENABLED` | lending-v4 indexing is unconditional now |
 | `AQUARIUM_X_SUBMIT` / `loans.submittable-network` | a barrier that silently blocked submission while everything else was armed is a bug, not a safeguard |
 | `SCHEDULING_TRANSACTION_PROCESSOR_OGMIOS_URL` | a diagnostic for the 2026-09-22 tank decode failure (FAB-149). Still set, it is ignored and the tank is evaluated through Blockfrost, as on every node that never set it — see §2 |
+| `AQUARIUM_LIQUIDATION_DELAY_SECONDS` / `loans.liquidation.delay-seconds` | removed by FAB-183: liquidation no longer runs on a timer (see [below](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). Still set, it is ignored, and the node logs one WARN for it at boot |
+| `AQUARIUM_COMPOUND_DELAY_SECONDS` / `loans.compound.delay-seconds` | removed by FAB-183: compound no longer runs on a timer (see [below](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). Still set, it is ignored, and the node logs one WARN for it at boot |
 
 **The general shape is worth keeping in mind beyond this list:** an unknown environment variable is
 not an error anywhere in this stack. It is read by nothing and reported by nothing. When a setting
@@ -496,10 +498,10 @@ many minutes old.
 
 **This is a different mechanism from the startup rebalance above, and it is continuous.** The removed
 one ran once at boot; this one watches the wallet on every block. `AQUARIUM_WALLET_REBALANCE_ENABLED`
-defaults to `true`, and it acts when the node is in `shadow` or `live` **and** at least one market is
-`action: ANTICIPATE` with an effective mode of shadow or live — see
-[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-an-anticipate-market-keeps-your-wallet-in).
-A node in `disabled` mode, or with no such market, is unaffected.
+defaults to `true`, and it acts when the node is in `shadow` or `live`, whatever its markets
+([FAB-188, below](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)) — see
+[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-a-shadow-or-live-node-keeps-your-wallet-in).
+A node in `disabled` mode is unaffected.
 
 **If your node meets that condition, expect a transaction right after upgrading.** On the first block
 once the node is synced, if the wallet is not already in the target shape, the node **signs and
@@ -525,6 +527,178 @@ wallet drifts out of shape. Each one costs a transaction fee.
   suspension is held in memory: a restart resumes rebalancing.
 - **To opt out**, set `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. The readiness page
   cannot turn it back on.
+
+### Liquidation, compound and rebalancing run on blocks and prices, not timers (FAB-183)
+
+Older images ran liquidation and compound each on its own timer (`AQUARIUM_LIQUIDATION_DELAY_SECONDS`,
+`AQUARIUM_COMPOUND_DELAY_SECONDS`, both 60 s by default). **Those timers are gone**, and so are the two
+settings (the table above). The bot wallet now has one queue of work, a *pass*, and a pass runs:
+
+1. **Liquidation.** Every candidate is tried, most profitable first, in every market. A loan whose
+   submit is rejected, or whose outcome is unknown, is skipped and the next candidate is tried — see
+   [Fire and forget (FAB-186)](#fire-and-forget-fab-186) below, which replaced this release's original
+   rules (at most one liquidation per market per pass, and an unknown outcome ending the stage).
+2. **Compound.**
+3. **Housekeeping** — the wallet rebalance described above.
+
+**After a liquidation that Blockfrost accepted, compound and housekeeping wait for the next trigger.**
+The same rule holds between compound and housekeeping. A liquidation that was rejected, or whose outcome
+is unknown, does not hold them back (FAB-186). In `shadow` a liquidation the node *would* have submitted
+sent nothing, so it does **not** hold them back either.
+
+**What starts a pass**, with no timer anywhere:
+
+- a **committed block**, once the node is in sync (a node working through its initial sync starts none);
+- a change in the **merged oracle prices**.
+
+A pass already running is never joined by a second one; new triggers wait for it to finish.
+
+**The settings that govern this:**
+
+- `WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS` (default `120`) — the pass deadline. It bounds every
+  Blockfrost call made during a pass.
+- `LOANS_ORACLE_SOURCE` — where the prices come from: `stream` (the default) merges the FluidTokens
+  oracle stream with the registry API; `api` is the emergency lever, API polling only.
+- `WALLET_PIPELINE_LOG_EVERY_PASS` (default `true`, FAB-195) — every pass ends with one INFO line:
+  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <block|price|block+price>, <k> block(s) folded in, waited <s> s, took <s> s: liquidation <outcome>, compound <outcome>, housekeeping <outcome>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`.
+  *Folded in* counts the blocks a newer block replaced while they waited; *waited* runs from the first
+  trigger the pass serves to its start; each `<outcome>` is described in
+  [Stage outcomes on the pass line (FAB-195)](#stage-outcomes-on-the-pass-line-fab-195). `false` returns to
+  INFO only when a pass did something (the rule in that entry), DEBUG otherwise.
+
+**The Tank processor is unchanged:** it keeps its own timer, and none of the above applies to it.
+
+**Nothing is remembered between passes.** A transaction the node submitted and that is still pending
+may be built again on the next trigger; the ledger rejects the duplicate harmlessly, because the pending
+transaction already spends its inputs.
+
+### Every shadow or live node now keeps its wallet shaped (FAB-188)
+
+Older images rebalanced the wallet only when at least one market was `action: ANTICIPATE` with an
+effective mode of shadow or live. **That condition is gone.** Every node in `shadow` or `live` keeps its
+wallet shaped, whatever its markets — a node with only `CONVERT` markets, or none listed, included —
+because liquidation depends on a shaped wallet. See
+[deploying.md §9, "Wallet rebalancing"](deploying.md#wallet-rebalancing--the-shape-a-shadow-or-live-node-keeps-your-wallet-in).
+
+- **Expect one self-send right after upgrading** on a `shadow` or `live` node whose wallet is out of
+  shape — **in `shadow` too** — for example a wallet whose ada sits in several UTxOs, or that holds no
+  ada-only UTxO of exactly the collateral size. It costs a transaction fee. A preview node runs in
+  `shadow` by default, so this applies to it.
+- **Funds.** The shape is unchanged: 10 ADA beside each `ANTICIPATE` token the wallet holds, 10 ADA
+  beside the bundle of any other tokens, a 5 ADA collateral UTxO (under current protocol parameters),
+  plus the fee and a change output that still holds its own minimum ada after paying it — so an
+  ada-only wallet needs about 6.2 ADA. A wallet with less is not touched: the node logs
+  `[REBALANCE] REFUSED: …` at WARN on every pass in which the rebalancer runs and submits nothing.
+- **Any deposit triggers a reshape.** Funds you send arrive as a second ada-only UTxO, which puts the
+  wallet out of shape, and the next pass reshapes it with a self-send. **That self-send spends EVERY
+  wallet UTxO** — the collateral UTxO C and every token UTxO included — **so for about one block, until
+  it lands, nothing can be liquidated or compounded**; a candidate built in that window is rejected by
+  the ledger and retried on the next pass. A reshape only runs on a pass in which no liquidation or
+  compound went out.
+- **To opt out**, set `AQUARIUM_WALLET_REBALANCE_ENABLED=false` and restart. On a `shadow` or `live`
+  node the node then logs one WARN on every pass in which the rebalancer runs,
+  `[REBALANCE] ENV_DISABLED: … liquidation depends on a shaped wallet …` — and `SUSPENDED` in its place
+  while rebalancing is suspended from the readiness page.
+
+### Liquidation is funded by wallet role (FAB-185)
+
+Older images picked a wallet UTxO for each liquidation from a list that shrank as the pass went on — the
+smallest one that covered the requirement — so a liquidation could be funded from whichever UTxO was
+left. **Each liquidation check now reads the wallet once and gives its UTxOs fixed roles:**
+
+- **C**, the ada-only UTxO of exactly the collateral size (5 ADA under current protocol parameters), is
+  never handed to a liquidation as its funding UTxO;
+- **U**, the largest other ada-only UTxO, pays for plain, convert and ADA-principal anticipate
+  liquidations;
+- a **token-principal anticipate** is paid for from the UTxO holding the most of that token.
+
+See [deploying.md §9, "Which wallet output pays for what"](deploying.md#which-wallet-output-pays-for-what)
+for what each role must hold.
+
+- **A UTxO that went out is not used again in the same check**, and the next candidate funded from the
+  same role is skipped (`… skipped: wallet output … (role U) already went out in this check`, at INFO)
+  rather than funded from another UTxO. **So two plain liquidations no longer both go out in one pass**
+  — they share U; the second goes on a later pass. Several liquidations go out in one pass only when they
+  are funded from different roles. (Since FAB-186, below, "went out" means accepted by Blockfrost.)
+- **A missing role is refused by name.** No C: nothing is built, and one WARN names role C, its size and
+  the wallet rebalancer's last outcome. No U, or no token UTxO for a token anticipate: that candidate is
+  recorded `WALLET_ROLE_MISSING`, with one WARN per missing role per check. A role UTxO too small for
+  its candidate is recorded `WALLET_INPUT_TOO_SMALL`, naming the UTxO, what it holds and what it needed.
+- **Unreadable protocol parameters now stop the check** — one line naming role C and the cause (an ERROR
+  since [FAB-195](#stage-outcomes-on-the-pass-line-fab-195); it was a WARN) — instead of falling back to the
+  largest UTxO: without them C cannot be sized.
+- **A shaped wallet is what makes this work** — keep wallet rebalancing on
+  ([FAB-188, above](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)), and keep reference
+  scripts and datum UTxOs out of the bot wallet: they keep it from being shaped, and so stop liquidation.
+
+### Fire and forget (FAB-186)
+
+Older images served **at most one liquidation per market per pass**, treated a submit whose outcome was
+unknown as if it had gone out — ending the liquidation stage for that pass — and read the text of a
+rejection (`BadInputsUTxO`, an empty `ScriptFailures`) to set a wallet UTxO aside. All three are gone:
+
+- **Every candidate is walked**, most profitable first, in every market.
+- **A rejected or unknown submit frees nothing and stops nothing.** A rejection, a raw or 5xx answer, no
+  answer, or a submit that threw are one outcome: that candidate failed. Nothing is set aside, and the
+  next candidate is tried — on the same UTxO if it is funded from the same role. Each one is said in
+  **one INFO line**, never ERROR:
+  `liquidation of <loan> via <plain|convert|pay-in-advance> on <UTxO> not accepted: HTTP <code|none|threw> <response>`,
+  with the response cut to 300 characters (the decision row keeps all of it). The
+  `aquarium.liquidation.submit.outside.validity` counter still counts `OutsideValidityInterval` answers;
+  it decides nothing.
+- **An accepted submit uses up its UTxO for the pass** — the next candidate funded from it is skipped,
+  as in FAB-185 — **and holds compound and housekeeping back** to the next trigger.
+- **Until our accepted transaction is in a block (about 20 s), later passes rebuild candidates on U and
+  get harmless rejections** — U is already spent by the pending transaction. They cost Blockfrost calls,
+  and each pass now ends with a summary line that shows them:
+  `wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <label>, <k> block(s) folded in, waited <w> s, took <d> s: liquidation <outcome>, compound <outcome>, housekeeping <outcome>; Blockfrost calls discovery <n>, evaluate <n>, submit <n>`,
+  where each `<outcome>`, and when the line is INFO or DEBUG, are described in
+  [Stage outcomes on the pass line (FAB-195)](#stage-outcomes-on-the-pass-line-fab-195) below; the trigger,
+  fold and wait fields are described under `WALLET_PIPELINE_LOG_EVERY_PASS`
+  ([above](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)). By
+  default **every pass says it at INFO**.
+
+### Stage outcomes on the pass line (FAB-195)
+
+Older images printed each stage of the pass line as the raw answer the stage returned — `DEFINITE_FAILURE`,
+which read like an error and only meant "nothing went out", or `not run` / `threw`. **Each stage now prints
+its outcome**, one of six:
+
+- **`NO_OP`** — nothing was sent to the network: there was nothing to do, or every candidate was refused
+  by name before submitting.
+- **`ATTEMPTED`** — built and submitted, but not accepted.
+- **`SUBMITTED`** — accepted into the mempool, not yet on chain (a transaction hash came back). A compound
+  or housekeeping submit with no clear answer — a raw or 5xx response, or a submit that threw — also prints
+  `SUBMITTED`, because nothing says it did not go out; that is a display merge only.
+- **`WOULD_SUBMIT`** — a `shadow` candidate that would have been submitted.
+- **`SKIPPED`** — the stage did not run this pass: an earlier stage sent something, the pass was fenced (a
+  rollback, the pass deadline, shutdown), or an earlier stage failed.
+- **`ERROR`** — our own error: an unexpected build failure (a builder exception, a failed index or
+  Blockfrost read, a failed script evaluation — one caused by a lost race too), or a stage that threw. Each
+  unexpected build failure is **one ERROR line** carrying the whole cause chain; its stack trace is logged
+  at DEBUG.
+
+**Precedence.** A stage prints the strongest that applies:
+`SUBMITTED > WOULD_SUBMIT > ATTEMPTED > ERROR > NO_OP`.
+
+**Counts.** The outcome is followed, in brackets, by the stage's non-zero counts, in this order:
+`submitted <n>`, `would-submit <n>`, `attempted <n>`, `error <n>`, `no-op <n>`. A stage with no count
+prints its outcome alone. For example:
+
+```
+wallet pipeline pass #12 at slot 101234567 (ab12…), trigger block, 0 block(s) folded in, waited 0.4 s, took 0.0 s: liquidation ATTEMPTED (attempted 1, error 1, no-op 3), compound NO_OP, housekeeping SKIPPED; Blockfrost calls discovery 5, evaluate 2, submit 1
+```
+
+A liquidation `ATTEMPTED` is not explained on the pass line: each of its candidates has its own
+`liquidation of <loan> via <route> on <UTxO> not accepted: HTTP …` INFO line
+([Fire and forget, above](#fire-and-forget-fab-186)).
+
+**What ends a pass is unchanged:** only a liquidation or compound that went out (or whose outcome is
+unknown) holds the later stages back. The counts are for reading only.
+
+**When the line is INFO.** With `WALLET_PIPELINE_LOG_EVERY_PASS=true` (the default) every pass says it at
+INFO. With `false` it is INFO when any stage is neither `NO_OP` nor `SKIPPED`, or the pass evaluated or
+submitted anything, and DEBUG otherwise. **A pass with an `ERROR` is now INFO where it was DEBUG.**
 
 ---
 

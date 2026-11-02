@@ -15,6 +15,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fluidtokens.aquarium.offchain.model.loans.CompoundCandidate;
 import com.fluidtokens.aquarium.offchain.model.loans.LenderBond;
 import com.fluidtokens.aquarium.offchain.service.LoansContractRegistry;
+import com.fluidtokens.aquarium.offchain.service.wallet.WalletShape;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 
@@ -77,9 +78,11 @@ class CompoundReferenceScriptTest {
                 .amount(List.of(Amount.lovelace(BigInteger.valueOf(60_000_000L)))).build();
     }
 
+    /** FAB-185 — wallet role C: ada-only, exactly {@code WalletShape.collateralLovelace} of this rig's params. */
     private static Utxo collateral() {
         return Utxo.builder().txHash("c0".repeat(32)).outputIndex(0).address(BOT)
-                .amount(List.of(Amount.lovelace(BigInteger.valueOf(5_000_000L)))).build();
+                .amount(List.of(Amount.lovelace(WalletShape.collateralLovelace(
+                        EvalFixtures.protocolParams().getProtocolParams())))).build();
     }
 
     private static CompoundCandidate candidate() {
@@ -173,7 +176,7 @@ class CompoundReferenceScriptTest {
                 LoanFixtures.utxoSupplier(universe), EvalFixtures.protocolParams(), evaluator);
         Transaction tx = builder.build(new CompoundTransactionBuilder.Request(candidate(), refs,
                 utxo("bond"), recordedConfig(), recordedLmConfig(), wallet(), BOT,
-                BigInteger.ZERO, 70_000_000L, 70_000_300L));
+                BigInteger.ZERO, 70_000_000L, 70_000_300L, collateral()));
         return new Built(tx, tx.serialize().length);
     }
 

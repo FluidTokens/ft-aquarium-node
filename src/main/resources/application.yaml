@@ -105,13 +105,19 @@ loans:
   oracle:
     enabled: ${LOANS_ORACLE_ENABLED:true}
     url: ${LOANS_ORACLE_URL:https://api.fluidtokens.com/get-oracle-tokens}
-    # FluidTokens' oracle WebSocket, signed in with this wallet's stake key. SHADOW ONLY: each push is
-    # parsed and logged as one `[oracle-stream]` line, and no decision reads it. On by default per
-    # Giovanni's 2026-10-29 ruling A2; it stays off when `loans.oracle.enabled` is false.
+    # Where prices come from. `stream` (the default): stream pushes and API polls are merged, and per
+    # oracle NFT the entry with the newest `validFrom` wins. `api`: the emergency lever — API polls only,
+    # and the stream stays a shadow that nothing reads. Any other value is refused with a WARN and means `api`.
+    source: ${LOANS_ORACLE_SOURCE:stream}
+    # FluidTokens' oracle WebSocket, signed in with this wallet's stake key. Each push is parsed, compared
+    # with the API and logged as one `[oracle-stream]` line; with `source: stream` it also feeds the
+    # prices (above), with `source: api` nothing decides on it. On by default per Giovanni's 2026-10-29
+    # ruling A2; it stays off when `loans.oracle.enabled` is false.
     stream:
       enabled: ${LOANS_ORACLE_STREAM_ENABLED:true}
       url: ${LOANS_ORACLE_STREAM_URL:wss://25mxd4whnj.execute-api.eu-west-1.amazonaws.com/prod}
   # The auto-liquidation bot. `mode` is disabled / shadow / live, and it is the WHOLE node-level dial.
+  # The bot has no timer: liquidation, compound and wallet housekeeping run on committed blocks and oracle price changes (FAB-183).
   #
   # ⛔ `liquidation.enabled` IS GONE (2026-09-04). It was a second arming boolean that had to agree
   # with the mode, justified as "one switch is too easy to flip by accident". Giovanni: "it's
@@ -136,7 +142,6 @@ loans:
   # A different action from every `liquidation:` key above -- see docs/lending-v4-findings.md section 20.
   compound:
     enabled: ${AQUARIUM_COMPOUND_ENABLED:false}
-    delay-seconds: ${AQUARIUM_COMPOUND_DELAY_SECONDS:60}
     # What the final measured net must reach, in lovelace, for a compound to be submitted. For an
     # ADA principal that is `F - L`. For a native principal it is `floor(F*n/d) + E - L - T`, where
     # F is the raw-token fee, n/d its positive oracle price per raw unit, E is escrow ADA recovered
@@ -286,20 +291,22 @@ loans:
     # FAB-145/FAB-182: the readiness page's single ADA/USD rate (the book and the prices strip) — ADA converted at this stablecoin's oracle price, the reference stablecoin counted as $1 (an ESTIMATE). Default USDCx; the page names whatever token is set. Empty turns USD off ("USD unavailable").
     usd-reference-unit: ${LOANS_UI_USD_REFERENCE_UNIT:1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e345553444378}
 
-  # The wallet rebalancer (FAB-131): on every block, while the node is not syncing, it moves the bot
+  # The wallet rebalancer (FAB-131) is the wallet pipeline's housekeeping stage (FAB-183): on each pass
+  # in which no liquidation or compound went out, while the node is not syncing, it moves the bot
   # wallet into the FAB-130 shape with one self-send -- SIGNED AND SUBMITTED in shadow too (wallet
-  # housekeeping, not a liquidation). It runs AFTER that block's database transaction commits, never
-  # inside it. It acts only when at least one `action: ANTICIPATE` market has an EFFECTIVE mode of
-  # shadow or live -- the market's own `mode`, capped by `liquidation.mode` -- so a node at `disabled`,
-  # or one whose every ANTICIPATE market is `disabled`, does nothing, whatever this says. A wallet too
-  # small to shape is logged at WARN on every block and never submitted.
+  # housekeeping, not a liquidation). A pass is triggered by a committed block (offered only AFTER that
+  # block's database transaction commits, never inside it) or by an oracle price change. It acts
+  # whenever `liquidation.mode` is shadow or live, WHATEVER THE MARKETS (FAB-188), so a node at
+  # `disabled` does nothing, whatever this says. Only an `action: ANTICIPATE` market with an EFFECTIVE
+  # mode of shadow or live -- the market's own `mode`, capped by `liquidation.mode` -- gets its token a
+  # UTxO of its own. A wallet too small to shape is logged at WARN on every pass in which the
+  # rebalancer runs, and never submitted.
   wallet:
     rebalance:
       enabled: ${AQUARIUM_WALLET_REBALANCE_ENABLED:true}
 
   liquidation:
     mode: ${AQUARIUM_LIQUIDATION_MODE:disabled}
-    delay-seconds: ${AQUARIUM_LIQUIDATION_DELAY_SECONDS:60}
     # The two window values are one piece of arithmetic, so read them together. A preview Charli3
     # feed publishes a 600 s window (measured, design §6.7), and the builder's V3 demands
     #     feed.validTo - tx.validTo >= oracle-window-margin-seconds
@@ -561,6 +568,7 @@ blockfrost:
 
 wallet-coordinator:
   pass-timeout-seconds: ${WALLET_COORDINATOR_PASS_TIMEOUT_SECONDS:120}
+  log-every-pass: ${WALLET_PIPELINE_LOG_EVERY_PASS:true}
 
 store:
   cardano:
@@ -625,16 +633,17 @@ loans:
   # collateral on the loans we index — so health is fully computable here.
   oracle:
     url: ${LOANS_ORACLE_URL:https://testapi.fluidtokens.com/get-oracle-tokens}
-    # The preview oracle WebSocket (shadow only, as in the base document; `enabled` is inherited).
+    # The preview oracle WebSocket. As in the base document, what it feeds follows `loans.oracle.source`
+    # (merged with the API's prices by default); `enabled` and `source` are inherited.
     stream:
       url: ${LOANS_ORACLE_STREAM_URL:wss://2tgda3mk4l.execute-api.eu-west-1.amazonaws.com/dev}
   ui:
     # Blank: the mainnet USDCx unit means nothing here, so the readiness page shows USD as unavailable.
     usd-reference-unit: ""
   # Preview is where the bot is exercised, so the loop runs by default here — in shadow, which
-  # scans, builds, prices and records and never submits a liquidation. ⚠ With an `action: ANTICIPATE`
-  # market configured (one not set to `mode: DISABLED`), the wallet rebalancer (`wallet.rebalance` in
-  # the base document) signs and submits self-sends of the bot wallet in shadow too. Every other
+  # scans, builds, prices and records and never submits a liquidation. ⚠ Whatever the markets, the
+  # wallet rebalancer (`wallet.rebalance` in the base document) signs and submits self-sends of the
+  # bot wallet in shadow too (FAB-188). Every other
   # liquidation key keeps its base-document value.
   # Preview is the only place the compound path is exercised, and it STAYS DISARMED HERE.
   #
