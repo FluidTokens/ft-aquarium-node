@@ -450,6 +450,7 @@ class MarketGateTest {
 
         assertEquals(MarketGate.Refusal.MARKET_ACTION_IS_CONVERT, d.refusal());
         assertEquals("market " + TOKEN.toUnit() + " is action: CONVERT, so pay-in-advance is not the mechanism "
-                + "here; set action: ANTICIPATE with a cap to force it", d.detail());
+                + "here; set action: ANTICIPATE (always pay in advance) or CONVERT_BEFORE_ANTICIPATE (pay in advance "
+                + "only when no pool can convert), with a cap", d.detail());
     }
 }

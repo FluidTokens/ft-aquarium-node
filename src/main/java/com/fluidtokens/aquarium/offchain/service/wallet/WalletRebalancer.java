@@ -4,7 +4,6 @@ import com.bloxbean.cardano.client.api.model.Result;
 import com.bloxbean.cardano.client.api.model.Utxo;
 import com.bloxbean.cardano.client.transaction.spec.Transaction;
 import com.fluidtokens.aquarium.offchain.config.AppConfig;
-import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
 import com.fluidtokens.aquarium.offchain.service.AppUtxoService;
@@ -64,7 +63,8 @@ import java.util.function.Supplier;
  * <ul>
  *   <li>The wallet is read from the local index ({@link AppUtxoService#listWalletUtxo()}). A read failure is an
  *       ERROR for this pass and nothing is built — never an empty wallet.</li>
- *   <li>The relevant set is {@link WalletShape#relevantUnits} over the {@code action: ANTICIPATE} markets that can
+ *   <li>The relevant set is {@link WalletShape#relevantUnits} over the markets that may pay in advance
+ *       ({@code action: ANTICIPATE} or {@code CONVERT_BEFORE_ANTICIPATE}, whose fallback fronts the principal) that can
  *       liquidate — {@link AppConfig.LiquidationConfiguration#effectiveMode effectiveMode} (the market's own
  *       {@code mode}, capped by the node's) {@code SHADOW} or {@code LIVE} — computed once per pass, lower-cased,
  *       never {@code lovelace}. It may be empty (no such market): the wallet is still shaped, with no
@@ -138,8 +138,8 @@ public class WalletRebalancer {
     }
 
     /**
-     * One evaluation of the gates: the first closed one, or — every gate open — the ANTICIPATE markets that can
-     * liquidate (possibly none), the source of the relevant set.
+     * One evaluation of the gates: the first closed one, or — every gate open — the ANTICIPATE and
+     * CONVERT_BEFORE_ANTICIPATE markets that can liquidate (possibly none), the source of the relevant set.
      */
     private record Gates(State state, Mode mode, Idle idle, List<Market> anticipating) {
     }
@@ -408,9 +408,10 @@ public class WalletRebalancer {
     }
 
     /**
-     * The {@code action: ANTICIPATE} markets that can liquidate: effective mode {@code SHADOW} or {@code LIVE}. The
-     * source of the relevant set, never a gate: empty (or a null market list) shapes the wallet with no token
-     * isolated.
+     * The markets that may pay in advance — {@code action: ANTICIPATE}, and {@code CONVERT_BEFORE_ANTICIPATE},
+     * whose fallback fronts the principal exactly as ANTICIPATE does — and can liquidate: effective mode
+     * {@code SHADOW} or {@code LIVE}. A {@code CONVERT} market, or one with no action, never is. The source of the
+     * relevant set, never a gate: empty (or a null market list) shapes the wallet with no token isolated.
      */
     private List<Market> anticipatingMarkets(List<Market> configured) {
         if (configured == null) {
@@ -418,7 +419,11 @@ public class WalletRebalancer {
         }
         return configured.stream()
                 .filter(Objects::nonNull)
-                .filter(m -> m.getAction() == Action.ANTICIPATE)
+                // Exhaustive, no default: a new action does not compile until it says whether its token is shaped.
+                .filter(m -> m.getAction() != null && switch (m.getAction()) {
+                    case CONVERT -> false;
+                    case ANTICIPATE, CONVERT_BEFORE_ANTICIPATE -> true;
+                })
                 .filter(m -> {
                     Mode effective = effectiveMode.apply(m);
                     return effective == Mode.SHADOW || effective == Mode.LIVE;

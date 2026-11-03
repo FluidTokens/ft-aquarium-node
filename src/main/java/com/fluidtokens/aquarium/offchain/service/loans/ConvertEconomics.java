@@ -200,6 +200,7 @@ public class ConvertEconomics {
                         + "a margin of 0 means the conversion must cover it to be break-even.",
                 configuration.isEnabled(), configuration.getDexCostFloorLovelace(), floor,
                 configuration.getMinswapOrderCostLovelace());
+        announcePayInAdvanceWhileDisabled();
 
         BigInteger orderCost = configuration.getMinswapOrderCostLovelace();
         if (orderCost == null || orderCost.compareTo(MINSWAP_ORDER_OVERHEAD) < 0) {
@@ -244,6 +245,34 @@ public class ConvertEconomics {
                         + "the bot will convert AT A LOSS down to that bound, including for bonds whose "
                         + "liquidationFeePerMille is 0. This is a stated operator bound, not a disabled "
                         + "check.", floor, networkName);
+    }
+
+    /**
+     * With convert disabled, one line per {@code CONVERT_BEFORE_ANTICIPATE} market saying it pays in advance,
+     * decided before any build (FAB-194 D5b, the executor's FAB-194-3 behaviour) — so the operator who turned
+     * convert off learns at boot which markets will front capital instead. Nothing while convert is enabled.
+     */
+    private void announcePayInAdvanceWhileDisabled() {
+        if (configuration.isEnabled() || liquidationConfiguration.getMarkets() == null) {
+            return;
+        }
+        for (AppConfig.LiquidationConfiguration.Market m : liquidationConfiguration.getMarkets()) {
+            if (m == null || m.getAction() == null) {
+                continue;
+            }
+            // Exhaustive, no default: a new action does not compile until it says whether it falls back here.
+            boolean fallsBackToPayInAdvance = switch (m.getAction()) {
+                case CONVERT, ANTICIPATE -> false;
+                case CONVERT_BEFORE_ANTICIPATE -> true;
+            };
+            if (fallsBackToPayInAdvance) {
+                log.info("INIT - market {} is action: CONVERT_BEFORE_ANTICIPATE and loans.liquidation.convert.enabled "
+                                + "is false: a loan in it whose lender allows conversion goes to pay-in-advance (cap {} "
+                                + "per loan, in the token's smallest unit), decided before any build, and is never "
+                                + "converted; the market's mode ({}) still decides whether anything is built or submitted",
+                        m.getUnit(), m.getCap(), liquidationConfiguration.effectiveMode(m));
+            }
+        }
     }
 
     /**

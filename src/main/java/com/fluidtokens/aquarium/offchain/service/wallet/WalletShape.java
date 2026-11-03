@@ -27,7 +27,8 @@ import java.util.stream.Collectors;
  *
  * <h2>The shape (FAB-130, as Giovanni ruled it)</h2>
  * <ul>
- *   <li>one UTxO per <b>relevant</b> token (the principal of an {@code ANTICIPATE} market), carrying
+ *   <li>one UTxO per <b>relevant</b> token (the principal of a market that may pay in advance — action
+ *       {@code ANTICIPATE} or {@code CONVERT_BEFORE_ANTICIPATE}), carrying
  *       all of that token and exactly {@link #SHAPED_TOKEN_LOVELACE};</li>
  *   <li>one UTxO holding every <b>non-relevant</b> token, carrying exactly
  *       {@link #SHAPED_TOKEN_LOVELACE};</li>
@@ -141,9 +142,11 @@ public final class WalletShape {
     }
 
     /**
-     * The principal units of the {@code ANTICIPATE} markets — the tokens the bot must be able to front
-     * one UTxO at a time — lower-cased, never {@code lovelace} (ADA is not a token to isolate; an ADA
-     * market fronts from the change).
+     * The principal units of the markets that may pay in advance — action {@code ANTICIPATE}, and
+     * {@code CONVERT_BEFORE_ANTICIPATE}, whose fallback fronts the principal exactly as ANTICIPATE does —
+     * the tokens the bot must be able to front one UTxO at a time — lower-cased, never {@code lovelace}
+     * (ADA is not a token to isolate; an ADA market fronts from the change). A {@code CONVERT} market, or
+     * one with no action, is not relevant.
      */
     public static Set<String> relevantUnits(List<AppConfig.LiquidationConfiguration.Market> markets) {
         if (markets == null) {
@@ -151,12 +154,23 @@ public final class WalletShape {
         }
         return markets.stream()
                 .filter(Objects::nonNull)
-                .filter(m -> m.getAction() == AppConfig.LiquidationConfiguration.Action.ANTICIPATE)
+                .filter(m -> m.getAction() != null && paysInAdvance(m.getAction()))
                 .map(AppConfig.LiquidationConfiguration.Market::getUnit)
                 .filter(Objects::nonNull)
                 .map(WalletShape::normalise)
                 .filter(unit -> !unit.isEmpty() && !LOVELACE.equals(unit))
                 .collect(Collectors.toCollection(TreeSet::new));
+    }
+
+    /**
+     * Whether a market of this action may front its principal from the wallet. Exhaustive, no default: a new
+     * action does not compile until it says whether its token needs a shaped output.
+     */
+    static boolean paysInAdvance(AppConfig.LiquidationConfiguration.Action action) {
+        return switch (action) {
+            case CONVERT -> false;
+            case ANTICIPATE, CONVERT_BEFORE_ANTICIPATE -> true;
+        };
     }
 
     /** C: {@code max(LedgerCeilings.maxPossibleCollateral(params), 5 ADA)}. */

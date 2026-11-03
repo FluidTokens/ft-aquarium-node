@@ -186,6 +186,19 @@ public class LoansConfigVerifier {
         return gate;
     }
 
+    /**
+     * The markets, read only to say at boot where a node that cannot convert pays in advance instead
+     * (FAB-194 D5). Optional, unlike the gate: production always has the {@code @Component}, but containers
+     * that host this verifier without one exist, and a missing configuration costs only those lines —
+     * verification itself never reads it.
+     */
+    private AppConfig.LiquidationConfiguration liquidationConfiguration;
+
+    @Autowired(required = false)
+    public void setLiquidationConfiguration(AppConfig.LiquidationConfiguration liquidationConfiguration) {
+        this.liquidationConfiguration = liquidationConfiguration;
+    }
+
     /** {@code smartTokensSpendScriptHash} as published on chain — the authoritative value. */
     @Getter
     private String onChainSmartTokensSpendScriptHash;
@@ -444,6 +457,7 @@ public class LoansConfigVerifier {
         if (derived == null) {
             log.warn("CONVERT UNAVAILABLE: loans.minswap.* is not set, so "
                     + "lm_liquidate_and_convert_action cannot be derived");
+            reportConvertBeforeAnticipateMarkets();
             return;
         }
         String published = bytesAt(fields, LM_LIQUIDATE_AND_CONVERT_ACTION);
@@ -457,6 +471,38 @@ public class LoansConfigVerifier {
                         + "deployment's LMConfigDatum publishes {}. The configured loans.minswap.* "
                         + "coordinates belong to a DIFFERENT network's Minswap deployment. Every "
                         + "other path on this node is unaffected.", derived, published);
+        reportConvertBeforeAnticipateMarkets();
+    }
+
+    /**
+     * On a node that cannot convert, one WARN per {@code CONVERT_BEFORE_ANTICIPATE} market saying when it
+     * pays in advance instead (FAB-194 D5) — so the operator learns at boot, not from the first liquidation,
+     * that the fallback will front capital. Silent without an injected configuration.
+     */
+    private void reportConvertBeforeAnticipateMarkets() {
+        if (liquidationConfiguration == null) {
+            return;
+        }
+        for (AppConfig.LiquidationConfiguration.Market m : liquidationConfiguration.getMarkets()) {
+            if (m == null || m.getAction() == null) {
+                continue;
+            }
+            // Exhaustive, no default: a new action does not compile until it says whether it falls back here.
+            boolean fallsBackToPayInAdvance = switch (m.getAction()) {
+                case CONVERT, ANTICIPATE -> false;
+                case CONVERT_BEFORE_ANTICIPATE -> true;
+            };
+            if (!fallsBackToPayInAdvance) {
+                continue;
+            }
+            log.warn("market {} is action: CONVERT_BEFORE_ANTICIPATE on a node that cannot convert: a loan in it "
+                            + "whose lender allows conversion is paid in advance (cap {} per loan, in the token's "
+                            + "smallest unit) when the convert route finds no Minswap pool or one too thin to repay "
+                            + "the debt — with loans.minswap.pool-address blank, that is every such loan; any other "
+                            + "convert refusal is refused by name, never paid in advance; the market's mode ({}) still "
+                            + "decides whether anything is built or submitted",
+                    m.getUnit(), m.getCap(), liquidationConfiguration.effectiveMode(m));
+        }
     }
 
     // ---- Plumbing -----------------------------------------------------------------------

@@ -171,7 +171,8 @@ public final class MarketGate {
         if (!paysInAdvance) {
             return refuse(Refusal.MARKET_ACTION_IS_CONVERT, required,
                     "market " + unit + " is action: " + action + ", so pay-in-advance is not the "
-                            + "mechanism here; set action: ANTICIPATE with a cap to force it");
+                            + "mechanism here; set action: ANTICIPATE (always pay in advance) or "
+                            + "CONVERT_BEFORE_ANTICIPATE (pay in advance only when no pool can convert), with a cap");
         }
 
         // Both pay-in-advance actions are validated at startup to carry a cap, so this cannot be null on a
