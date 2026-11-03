@@ -326,4 +326,53 @@ class UStaysInTheCheckTest {
         assertFalse(rows.get(1).detail().contains("U stays"), rows.get(1).detail());
         assertEquals(WorkResult.SUBMITTED, run.result());
     }
+
+    // ---- (g) FAB-186 r2 for a token output: marked the instant it is accepted, before anything can throw ---
+
+    /**
+     * An accepting submitter whose answer gives the hash on its FIRST read and throws on every later one, so an
+     * exception escapes after the accept — in the SUBMITTED log line or row, not in the transmission.
+     */
+    private static LiquidationExecutor.TransactionSubmitter acceptingThenThrowingOnTheSecondRead() {
+        return bytes -> {
+            AtomicInteger reads = new AtomicInteger();
+            return new Result<String>(true, ACCEPTED) {
+                @Override
+                public String getValue() {
+                    if (reads.getAndIncrement() == 0) {
+                        return ACCEPTED;
+                    }
+                    throw new IllegalStateException("the accepted answer can no longer be read");
+                }
+            };
+        };
+    }
+
+    /**
+     * (g) FAB-186 r2: an accepted submit marks its token output BEFORE anything that can throw. The answer throws
+     * after the accept, so the first candidate ends in the last-net ERROR — and the second candidate, on the same
+     * token output, is still skipped by name: one transmission, never two.
+     */
+    @Test
+    void anExceptionAfterAnAcceptStillTakesItsTokenOutputOutOfTheCheck() throws Exception {
+        Scenario first = tokenPrincipalConvertBond(1);
+        Scenario second = tokenPrincipalConvertBond(2);
+
+        Run run = stage(anticipate(Mode.LIVE, PRINCIPAL_TOKEN, null), List.of(first, second), null,
+                acceptingThenThrowingOnTheSecondRead());
+
+        assertEquals(1, run.submitted().size(), "one transmission: " + run.events());
+        assertTrue(spends(run.submitted().getFirst(), TOKEN_WALLET_UTXO),
+                inputsOf(run.submitted().getFirst()).toString());
+        List<String> errors = run.messages(Level.ERROR).stream()
+                .filter(message -> message.contains("could not consider bond")).toList();
+        assertEquals(1, errors.size(), run.messages(Level.ERROR).toString());
+        boolean firstWentOut = errors.getFirst().contains(first.assessment().bond().utxoRef());
+        assertTrue(firstWentOut || errors.getFirst().contains(second.assessment().bond().utxoRef()),
+                errors.getFirst());
+        String skipped = firstWentOut ? tokenSkip(second) : tokenSkip(first);
+        assertTrue(run.messages(Level.INFO).contains(skipped),
+                "the skip names the token output: " + run.messages(Level.INFO));
+        assertEquals(WorkResult.SUBMITTED, run.result());
+    }
 }

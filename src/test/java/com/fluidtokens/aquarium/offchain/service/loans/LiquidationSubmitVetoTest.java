@@ -3154,12 +3154,13 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * FAB-186 (c) — a token anticipate after U is used. After an ACCEPTED submit on U, a token-principal
-     * pay-in-advance candidate is still built, on its TOKEN output, and transmitted — and accepted. U being
-     * used costs only the candidates designated to U.
+     * FAB-186 (c) — a token anticipate after an accept on U. After an ACCEPTED submit on U, a token-principal
+     * pay-in-advance candidate is built, on its TOKEN output, and transmitted — and accepted. FAB-194-2 (D3):
+     * an accept on U leaves U in the check, and the token output the accepted body never spent is not marked
+     * either, so the anticipate is funded from its TOKEN output exactly as it would be with no accept before it.
      */
     @Test
-    void aTokenAnticipateIsStillBuiltAndTransmittedOnItsTokenOutputAfterUIsUsed() throws Exception {
+    void aTokenAnticipateIsBuiltAndTransmittedOnItsTokenOutputAfterAnAcceptOnU() throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         var configuration = armedForPayInAdvance(AppConfig.LiquidationConfiguration.Mode.LIVE);
 
@@ -3173,7 +3174,7 @@ class LiquidationSubmitVetoTest {
                 "the first is accepted on U");
         List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
         assertTrue(second.contains(new TransactionInput(TX_TOKEN_WALLET, 0)), "the anticipate spends its TOKEN output");
-        assertFalse(second.contains(new TransactionInput(TX_WALLET, 0)), "and never the used U: " + second);
+        assertFalse(second.contains(new TransactionInput(TX_WALLET, 0)), "and not U, which is not what funds it: " + second);
         assertEquals(LiquidationDecision.Outcome.SUBMITTED,
                 decisionFor(stage, tokenPrincipalPayInAdvanceScenario()).outcome());
         assertEquals(WorkResult.SUBMITTED, stage.result());
