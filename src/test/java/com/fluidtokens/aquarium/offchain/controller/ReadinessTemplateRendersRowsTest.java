@@ -129,7 +129,7 @@ class ReadinessTemplateRendersRowsTest {
                 PoolUsability.checkFailed("SocketTimeoutException"),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no lender bond indexed"), null,
-                ActionNow.of(null, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                ActionNow.of(null, null, null, null, true, PoolUsability.Verdict.NO_POOL, null), ProcessingBlocker.NONE,
                 null, null);
     }
 
@@ -170,6 +170,19 @@ class ReadinessTemplateRendersRowsTest {
         // so assert the shape that matters: the detail text is present as TEXT for an unknown-ish cell.
         assertTrue(html.contains("SocketTimeoutException"),
                 "a failed lookup must say so where it can be read without hovering");
+    }
+
+    /**
+     * ⛔ FAB-194-4 r2: the "Action now" tooltip says a CONVERT_BEFORE_ANTICIPATE row is an estimate, pinned
+     * verbatim — the page tests every indexed pool, the bot resolves one, and they can disagree for a block.
+     */
+    @Test
+    void theActionNowTooltipSaysAConvertBeforeAnticipateRowIsAnEstimate() {
+        String html = render(List.of(fullRow()));
+
+        assertTrue(html.contains("For a CONVERT_BEFORE_ANTICIPATE market the column is an estimate: the page "
+                        + "tests every indexed pool now, while the bot resolves one pool when it builds."),
+                "the Action now tooltip must carry the estimate sentence");
     }
 
     /** The breakdown answers "why is the capital required more than the debt", permanently. */
@@ -1031,7 +1044,7 @@ class ReadinessTemplateRendersRowsTest {
                 usability,
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                ActionNow.of(false, null, null, null, true, PoolUsability.Verdict.NO_POOL, null), ProcessingBlocker.NONE,
                 null, null);
     }
 

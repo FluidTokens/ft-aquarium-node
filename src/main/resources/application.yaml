@@ -305,7 +305,8 @@ loans:
   # housekeeping, not a liquidation). A pass is triggered by a committed block (offered only AFTER that
   # block's database transaction commits, never inside it) or by an oracle price change. It acts
   # whenever `liquidation.mode` is shadow or live, WHATEVER THE MARKETS (FAB-188), so a node at
-  # `disabled` does nothing, whatever this says. Only an `action: ANTICIPATE` market with an EFFECTIVE
+  # `disabled` does nothing, whatever this says. Only an `action: ANTICIPATE` or
+  # `action: CONVERT_BEFORE_ANTICIPATE` market (whose fallback fronts the principal) with an EFFECTIVE
   # mode of shadow or live -- the market's own `mode`, capped by `liquidation.mode` -- gets its token a
   # UTxO of its own. A wallet too small to shape is logged at WARN on every pass in which the
   # rebalancer runs, and never submitted.
@@ -462,9 +463,12 @@ loans:
       # returns the collateral to the lender, so the failure mode is a no-op, not a loss.
       #
       # TWO CONTROLS, AND THEY COMPOSE IN THIS ORDER:
-      #   1. this flag false => NO converts anywhere, whatever any market says;
+      #   1. this flag false => NO converts anywhere, whatever any market says; an
+      #      action: CONVERT_BEFORE_ANTICIPATE market then pays in advance instead (under its cap),
+      #      decided before any build;
       #   2. this flag true  => each market's `markets[]` entry decides -- action: ANTICIPATE to
-      #      front capital instead, mode: DISABLED to sit that market out. NO markets listed =>
+      #      front capital instead, action: CONVERT_BEFORE_ANTICIPATE to front it only where a convert
+      #      is impossible, mode: DISABLED to sit that market out. NO markets listed =>
       #      every market converts.
       # It is still subject to liquidation `mode` above, like everything else on this path.
       enabled: ${LOANS_LIQUIDATION_CONVERT_ENABLED:true}

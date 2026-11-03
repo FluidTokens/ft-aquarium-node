@@ -182,6 +182,22 @@ class WalletShapeTest {
         assertEquals(Set.of(), WalletShape.relevantUnits(null));
     }
 
+    /**
+     * FAB-194 D7: a CONVERT_BEFORE_ANTICIPATE market's fallback fronts the principal exactly as ANTICIPATE does, so
+     * its token is relevant — lower-cased, and never lovelace — beside an ANTICIPATE market's, while CONVERT's is not.
+     */
+    @Test
+    void relevantUnitsIncludeTheConvertBeforeAnticipateMarketsLowerCasedWithoutLovelace() {
+        Market cbaA = market(UNIT_A.toUpperCase(), Action.CONVERT_BEFORE_ANTICIPATE);
+        Market cbaAda = market("lovelace", Action.CONVERT_BEFORE_ANTICIPATE);
+        Market cbaAdaUpper = market("LOVELACE", Action.CONVERT_BEFORE_ANTICIPATE);
+        Market convertJunk = market(JUNK_1, Action.CONVERT);
+
+        assertEquals(Set.of(UNIT_A), WalletShape.relevantUnits(List.of(cbaA, cbaAda, cbaAdaUpper, convertJunk)));
+        assertEquals(Set.of(UNIT_A, UNIT_B),
+                WalletShape.relevantUnits(List.of(cbaA, market(UNIT_B, Action.ANTICIPATE), convertJunk)));
+    }
+
     private static Market market(String unit, Action action) {
         Market m = new Market();
         m.setUnit(unit);

@@ -2444,7 +2444,8 @@ class LiquidationSubmitVetoTest {
 
     // ======================================================================================
     // FAB-183 — the liquidation stage and its fence; FAB-186 — fire and forget: every candidate walked,
-    // a non-accepted submit frees nothing and stops nothing, an accepted one uses up its output
+    // a non-accepted submit frees nothing and stops nothing, an accepted one takes a token output it spent
+    // out of the check, never U (D3, FAB-194)
     // ======================================================================================
 
     private static final String TX_LOAN_3 = "ac".repeat(32);
@@ -2660,22 +2661,27 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * (a) Two submittable candidates in ONE market: the first is submitted and the second is never built.
-     * FAB-186: adapted — no market is "served" any more; the second is skipped because the accepted first
-     * used up U, and the skip line names U.
+     * (a) Two submittable candidates in ONE market: both are built and submitted. FAB-186: adapted — no market
+     * is "served" any more. FAB-194-2 (D3): an accept does not mean the transaction lands, so U stays in the
+     * check — the second is built on the same U and transmitted, and no skip line is logged.
      */
     @Test
-    void anAcceptedSubmitUsesUpUAndTheSameMarketsSecondCandidateIsNeverBuilt() {
+    void anAcceptedSubmitLeavesUInTheCheckAndTheSameMarketsSecondCandidateIsBuiltOnIt() throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
 
         StageRun stage = stage(armed(), List.of(adaScenario(), secondAdaScenario()), submitter, null,
                 SubmitFence.OPEN);
 
-        assertEquals(1, submitter.submitted.size(), "exactly one liquidation on U");
-        assertEquals(1, stage.log().size(), "the second candidate was never built: " + stage.log().newestFirst(10));
-        assertEquals(LiquidationDecision.Outcome.SUBMITTED, stage.log().newestFirst(1).getFirst().outcome());
-        assertTrue(skippedOnUsedOutput(stage.events(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
-                "the second is skipped for its used output, not its market: " + stage.events());
+        assertEquals(2, submitter.submitted.size(), "both liquidations go out on U");
+        assertEquals(2, stage.builds(), "the second candidate is built: " + stage.events());
+        assertTrue(inputsOf(submitter.submitted.get(0)).contains(new TransactionInput(TX_WALLET, 0)),
+                "the first is funded from U");
+        assertTrue(inputsOf(submitter.submitted.get(1)).contains(new TransactionInput(TX_WALLET, 0)),
+                "the second is built on the same U");
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMITTED, LiquidationDecision.Outcome.SUBMITTED),
+                stage.log().newestFirst(10).stream().map(LiquidationDecision::outcome).toList());
+        assertFalse(skippedOnUsedOutput(stage.events(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
+                "U is never skipped for: " + stage.events());
         assertEquals(WorkResult.SUBMITTED, stage.result());
     }
 
@@ -2688,11 +2694,12 @@ class LiquidationSubmitVetoTest {
     /**
      * (b) FAB-185 M1, replacing FAB-183's "two markets on disjoint inputs". Two candidates in different
      * markets, both designated to U: an ADA-principal plain and a token-principal plain. The first is
-     * SUBMITTED on U1; the second is skipped unbuilt — never funded from U2, which T-052's mutable list
-     * would have handed it. One build, one transmission, and the skip said at INFO.
+     * SUBMITTED on U1. FAB-194-2 (D3): U stays in the check, so the second is built on the SAME U1 and
+     * transmitted — never funded from U2, which T-052's mutable list would have handed it. Two builds, two
+     * transmissions, no skip line.
      */
     @Test
-    void aSecondMarketDesignatedToTheSameUIsSkippedAfterTheFirstTransmissionNeverFundedFromAnother()
+    void aSecondMarketDesignatedToTheSameUIsBuiltOnThatUAfterTheFirstTransmissionNeverFundedFromAnother()
             throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         AppConfig.LiquidationConfiguration configuration = armed();
@@ -2700,24 +2707,29 @@ class LiquidationSubmitVetoTest {
         StageRun stage = stage(configuration, List.of(adaScenario(), otherMarketScenario()), submitter, null,
                 SubmitFence.OPEN, new LiquidationDecisionLog(configuration), shaped(U1, U2));
 
-        assertEquals(1, stage.builds(), "the second candidate is never built: " + stage.events());
-        assertEquals(1, submitter.submitted.size(), "one transmission: " + stage.log().newestFirst(10));
+        assertEquals(2, stage.builds(), "the second candidate is built: " + stage.events());
+        assertEquals(2, submitter.submitted.size(), "two transmissions: " + stage.log().newestFirst(10));
         assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, adaScenario()).outcome());
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, otherMarketScenario()).outcome());
         List<TransactionInput> first = inputsOf(submitter.submitted.get(0));
         assertTrue(first.contains(new TransactionInput(U1.getTxHash(), 0)), "the first is funded from U1: " + first);
         assertFalse(first.contains(new TransactionInput(U2.getTxHash(), 0)), first.toString());
-        assertEquals(1, stage.log().size(), "no row for the skipped candidate: " + stage.log().newestFirst(10));
-        assertTrue(skippedOnUsedOutput(stage.events(), TX_LOAN_3 + "#0", U1.getTxHash() + "#0", "U"),
-                "the skip is said at INFO, naming U1 and its role: " + stage.events());
+        List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
+        assertTrue(second.contains(new TransactionInput(U1.getTxHash(), 0)), "the second is built on U1: " + second);
+        assertFalse(second.contains(new TransactionInput(U2.getTxHash(), 0)), "never on U2: " + second);
+        assertEquals(2, stage.log().size(), "a row for each: " + stage.log().newestFirst(10));
+        assertFalse(skippedOnUsedOutput(stage.events(), TX_LOAN_3 + "#0", U1.getTxHash() + "#0", "U"),
+                "no skip on U1: " + stage.events());
         assertEquals(WorkResult.SUBMITTED, stage.result());
     }
 
     /**
      * (c) FAB-185 M7, the node-shadow half: on a SHADOW node a WOULD_SUBMIT stands for the transmission a live
-     * node would have made, so it marks U used — the same pair as (b), and the second is skipped unbuilt.
+     * node would have made, so it marks exactly what that accept would. FAB-194-2 (D3): that never includes U,
+     * so with the same pair as (b) the second is built on the same U too — two WOULD_SUBMIT rows, no skip.
      */
     @Test
-    void aNodeShadowWouldSubmitMarksUUsedAndTheSecondMarketIsSkipped() {
+    void aNodeShadowWouldSubmitLeavesUInTheCheckAndTheSecondMarketIsBuilt() {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         AppConfig.LiquidationConfiguration configuration = configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW,
                 SMALL_MARGIN, PUBLISHED);
@@ -2726,11 +2738,14 @@ class LiquidationSubmitVetoTest {
                 SubmitFence.OPEN, new LiquidationDecisionLog(configuration), shaped(U1, U2));
 
         assertTrue(submitter.submitted.isEmpty(), "shadow transmits nothing");
-        assertEquals(1, stage.builds(), "the second candidate is never built: " + stage.events());
+        assertEquals(2, stage.builds(), "the second candidate is built: " + stage.events());
         LiquidationDecision first = decisionFor(stage, adaScenario());
         assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, first.outcome(), first.detail());
         assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(), first.submitVeto());
-        assertTrue(skippedOnUsedOutput(stage.events(), TX_LOAN_3 + "#0", U1.getTxHash() + "#0", "U"),
+        LiquidationDecision second = decisionFor(stage, otherMarketScenario());
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, second.outcome(), second.detail());
+        assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(), second.submitVeto());
+        assertFalse(skippedOnUsedOutput(stage.events(), TX_LOAN_3 + "#0", U1.getTxHash() + "#0", "U"),
                 stage.events().toString());
         assertEquals(WorkResult.WOULD_SUBMIT, stage.result());
     }
@@ -2850,23 +2865,25 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * (e) SHADOW: a node-shadow WOULD_SUBMIT stands for a transmission — only the first candidate is built
-     * and recorded. FAB-186: adapted — it no longer "serves its market"; it uses up U, and the second
-     * candidate is skipped for that, by name.
+     * (e) SHADOW: a node-shadow WOULD_SUBMIT stands for a transmission. FAB-186: adapted — it no longer
+     * "serves its market". FAB-194-2 (D3): it marks what an accept marks, which never includes U, so the
+     * second candidate is built on the same U and recorded too — two WOULD_SUBMIT rows, no skip line.
      */
     @Test
-    void aNodeShadowWouldSubmitUsesUpUForTheCall() {
+    void aNodeShadowWouldSubmitLeavesUInTheCheckForTheCall() {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
 
         StageRun stage = stage(configuration(AppConfig.LiquidationConfiguration.Mode.SHADOW, SMALL_MARGIN,
                 PUBLISHED), List.of(adaScenario(), secondAdaScenario()), submitter, null, SubmitFence.OPEN);
 
         assertTrue(submitter.submitted.isEmpty(), "shadow transmits nothing");
-        assertEquals(1, stage.log().size(), "only the first was built: " + stage.log().newestFirst(10));
-        LiquidationDecision row = stage.log().newestFirst(1).getFirst();
-        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, row.outcome(), row.detail());
-        assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(), row.submitVeto());
-        assertTrue(skippedOnUsedOutput(stage.events(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
+        assertEquals(2, stage.log().size(), "both were built: " + stage.log().newestFirst(10));
+        assertEquals(2, stage.builds(), "both were built: " + stage.events());
+        for (LiquidationDecision row : stage.log().newestFirst(10)) {
+            assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, row.outcome(), row.detail());
+            assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(), row.submitVeto());
+        }
+        assertFalse(skippedOnUsedOutput(stage.events(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
                 stage.events().toString());
         assertEquals(WorkResult.WOULD_SUBMIT, stage.result());
     }
@@ -2997,14 +3014,15 @@ class LiquidationSubmitVetoTest {
     /**
      * FAB-186 (e), rewriting A6's other side ("an exception after the submitter ends the stage as
      * AMBIGUOUS"). Recording the SUBMITTED row throws AFTER the submitter accepted: today's ERROR
-     * {@code could not consider bond …}, and the walk continues. FAB-186 r2 (F2), changed: the accept marked
-     * U used BEFORE the row threw (r1 asserted "nothing was marked: the second candidate is built on the same
-     * U"), so the second candidate, designated to U, is skipped unbuilt with the used-output skip line — one
-     * build, one transmission. The call is never AMBIGUOUS: the submitter ACCEPTED, so it is SUBMITTED, which
-     * still holds compound and housekeeping back.
+     * {@code could not consider bond …}, and the walk continues. FAB-186 r2 (F2) marked the accept's outputs
+     * BEFORE the row threw. FAB-194-2 (D3), changed: that mark never includes U, so the second candidate,
+     * designated to U, is built on the same U and accepted too — and since the log throws on EVERY SUBMITTED
+     * row, it gets its own {@code could not consider bond …} ERROR: one per accepted candidate, two builds, two
+     * transmissions, no skip line. The call is never AMBIGUOUS: the submitter ACCEPTED, so it is SUBMITTED,
+     * which still holds compound and housekeeping back.
      */
     @Test
-    void anExceptionAfterAnAcceptedSubmitStillUsesUpItsOutputAndTheWalkContinues() throws Exception {
+    void anExceptionAfterAnAcceptedSubmitLeavesUInTheCheckAndTheWalkContinues() throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         AppConfig.LiquidationConfiguration configuration = armed();
         LiquidationDecisionLog failingLog = new LiquidationDecisionLog(configuration) {
@@ -3020,14 +3038,18 @@ class LiquidationSubmitVetoTest {
         StageRun stage = stage(configuration, List.of(adaScenario(), secondAdaScenario()), submitter, null,
                 SubmitFence.OPEN, failingLog);
 
-        assertEquals(1, submitter.submitted.size(), "one transmission, on U: " + stage.events());
-        assertEquals(1, stage.builds(), "the second candidate was never built: " + stage.events());
-        assertTrue(skippedOnUsedOutput(stage.events(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
-                "the walk continued past the exception, and the second is skipped for the used U: "
-                        + stage.events());
+        assertEquals(2, submitter.submitted.size(), "two transmissions, both on U: " + stage.events());
+        assertTrue(inputsOf(submitter.submitted.get(0)).contains(new TransactionInput(TX_WALLET, 0)),
+                "the first is funded from U");
+        assertTrue(inputsOf(submitter.submitted.get(1)).contains(new TransactionInput(TX_WALLET, 0)),
+                "the second is built on the same U");
+        assertEquals(2, stage.builds(), "the walk continued past the exception and built the second: "
+                + stage.events());
+        assertFalse(skippedOnUsedOutput(stage.events(), TX_LOAN_2 + "#0", TX_WALLET + "#0", "U"),
+                "U is never skipped for: " + stage.events());
         assertEquals(1, errorsContaining(stage.events(), "could not consider bond " + TX_BOND + "#0").size(),
                 stage.events().toString());
-        assertEquals(0, errorsContaining(stage.events(), "could not consider bond " + TX_BOND_2 + "#0").size(),
+        assertEquals(1, errorsContaining(stage.events(), "could not consider bond " + TX_BOND_2 + "#0").size(),
                 stage.events().toString());
         assertEquals(WorkResult.SUBMITTED, stage.result());
     }
@@ -3035,10 +3057,9 @@ class LiquidationSubmitVetoTest {
     /**
      * (k) A SUBMITTED liquidation is what the call reports when a later market is held at shadow: the ada
      * market live, the other market held at shadow, so the transmission comes first. FAB-185: both are plain
-     * and designated to U, so the later candidate is now skipped for sharing U — the rehearsal is never
-     * built — and the call still ends at SUBMITTED, so the pipeline does not run compound in the same pass
-     * right after a real liquidation went out. (A later WOULD_SUBMIT after a SUBMITTED now needs a candidate
-     * funded from another role, a token-principal pay-in-advance; this rig builds plain candidates only.)
+     * and designated to U. FAB-194-2 (D3): U stays in the check, so the later rehearsal IS built on the same U
+     * and recorded as a market-shadow WOULD_SUBMIT — and the call still ends at SUBMITTED, so the pipeline
+     * does not run compound in the same pass right after a real liquidation went out.
      */
     @Test
     void aSubmittedLiquidationIsWhatTheCallReportsWhenALaterMarketIsHeldAtShadow() {
@@ -3055,11 +3076,13 @@ class LiquidationSubmitVetoTest {
 
         List<LiquidationDecision> oldestFirst = new ArrayList<>(stage.log().newestFirst(10));
         java.util.Collections.reverse(oldestFirst);
-        assertEquals(List.of(LiquidationDecision.Outcome.SUBMITTED),
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMITTED, LiquidationDecision.Outcome.WOULD_SUBMIT),
                 oldestFirst.stream().map(LiquidationDecision::outcome).toList(),
-                "the transmission is recorded, and the later rehearsal is never built: " + oldestFirst);
-        assertTrue(skippedOnUsedOutput(stage.events(), TX_LOAN_3 + "#0", TX_WALLET + "#0", "U"),
-                "the later candidate is skipped for sharing U: " + stage.events());
+                "the transmission is recorded BEFORE the rehearsal built on the same U: " + oldestFirst);
+        assertEquals(LiquidationExecutor.SubmitVeto.MARKET_NOT_LIVE.name(),
+                decisionFor(stage, otherMarketScenario()).submitVeto());
+        assertFalse(skippedOnUsedOutput(stage.events(), TX_LOAN_3 + "#0", TX_WALLET + "#0", "U"),
+                "the later candidate is never skipped for sharing U: " + stage.events());
         assertEquals(1, submitter.submitted.size());
         assertEquals(WorkResult.SUBMITTED, stage.result());
     }
@@ -3132,12 +3155,13 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * FAB-186 (c) — a token anticipate after U is used. After an ACCEPTED submit on U, a token-principal
-     * pay-in-advance candidate is still built, on its TOKEN output, and transmitted — and accepted. U being
-     * used costs only the candidates designated to U.
+     * FAB-186 (c) — a token anticipate after an accept on U. After an ACCEPTED submit on U, a token-principal
+     * pay-in-advance candidate is built, on its TOKEN output, and transmitted — and accepted. FAB-194-2 (D3):
+     * an accept on U leaves U in the check, and the token output the accepted body never spent is not marked
+     * either, so the anticipate is funded from its TOKEN output exactly as it would be with no accept before it.
      */
     @Test
-    void aTokenAnticipateIsStillBuiltAndTransmittedOnItsTokenOutputAfterUIsUsed() throws Exception {
+    void aTokenAnticipateIsBuiltAndTransmittedOnItsTokenOutputAfterAnAcceptOnU() throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         var configuration = armedForPayInAdvance(AppConfig.LiquidationConfiguration.Mode.LIVE);
 
@@ -3151,7 +3175,7 @@ class LiquidationSubmitVetoTest {
                 "the first is accepted on U");
         List<TransactionInput> second = inputsOf(submitter.submitted.get(1));
         assertTrue(second.contains(new TransactionInput(TX_TOKEN_WALLET, 0)), "the anticipate spends its TOKEN output");
-        assertFalse(second.contains(new TransactionInput(TX_WALLET, 0)), "and never the used U: " + second);
+        assertFalse(second.contains(new TransactionInput(TX_WALLET, 0)), "and not U, which is not what funds it: " + second);
         assertEquals(LiquidationDecision.Outcome.SUBMITTED,
                 decisionFor(stage, tokenPrincipalPayInAdvanceScenario()).outcome());
         assertEquals(WorkResult.SUBMITTED, stage.result());
@@ -3270,12 +3294,13 @@ class LiquidationSubmitVetoTest {
     }
 
     /**
-     * (l) FAB-186 (b), rewriting "a served market's later candidate is skipped": after an ACCEPTED submit on
-     * U, the two later U candidates — the same market's second and another market's — are never built (one
-     * build) and each logs the skip INFO naming U. The walk reaches both.
+     * (l) FAB-186 (b), rewriting "a served market's later candidate is skipped". FAB-194-2 (D3), rewritten
+     * again: after an ACCEPTED submit on U, the two later U candidates — the same market's second and another
+     * market's — are each built on the same U and transmitted, in rank order (three builds, three
+     * transmissions, three rows), and neither logs a skip.
      */
     @Test
-    void afterAnAcceptOnUTheTwoLaterUCandidatesAreNeverBuiltAndEachLogsTheSkip() {
+    void afterAnAcceptOnUTheTwoLaterUCandidatesAreStillBuiltAndTransmittedOnU() throws Exception {
         RecordingSubmitter submitter = RecordingSubmitter.accepting("ab".repeat(32));
         Scenario ada = adaScenario();
         Scenario secondAda = secondAdaScenario();
@@ -3285,14 +3310,20 @@ class LiquidationSubmitVetoTest {
 
         assertEquals(List.of(ada.loan().loan().utxoRef(), secondAda.loan().loan().utxoRef(),
                         other.loan().loan().utxoRef()), rankedLoanRefs(stage));
-        assertEquals(1, stage.builds(), "only the first candidate is built: " + stage.events());
-        assertEquals(1, submitter.submitted.size(), "one liquidation, on U: " + stage.log().newestFirst(10));
-        assertEquals(1, stage.log().size(), "no row for the skipped candidates: " + stage.log().newestFirst(10));
+        assertEquals(3, stage.builds(), "every candidate is built: " + stage.events());
+        assertEquals(3, submitter.submitted.size(), "three liquidations, on U: " + stage.log().newestFirst(10));
+        for (byte[] transmitted : submitter.submitted) {
+            assertTrue(inputsOf(transmitted).contains(new TransactionInput(TX_WALLET, 0)),
+                    "each is built on the same U: " + inputsOf(transmitted));
+        }
+        assertEquals(3, stage.log().size(), "a row for each: " + stage.log().newestFirst(10));
         assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, ada).outcome());
-        assertTrue(skippedOnUsedOutput(stage.events(), secondAda.loan().loan().utxoRef(), TX_WALLET + "#0", "U"),
-                "the same market's second candidate is skipped for U: " + stage.events());
-        assertTrue(skippedOnUsedOutput(stage.events(), other.loan().loan().utxoRef(), TX_WALLET + "#0", "U"),
-                "the other market's candidate is skipped for U: " + stage.events());
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, secondAda).outcome());
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, decisionFor(stage, other).outcome());
+        assertFalse(skippedOnUsedOutput(stage.events(), secondAda.loan().loan().utxoRef(), TX_WALLET + "#0", "U"),
+                "the same market's second candidate is not skipped for U: " + stage.events());
+        assertFalse(skippedOnUsedOutput(stage.events(), other.loan().loan().utxoRef(), TX_WALLET + "#0", "U"),
+                "the other market's candidate is not skipped for U: " + stage.events());
         assertEquals(WorkResult.SUBMITTED, stage.result());
     }
 

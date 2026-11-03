@@ -57,17 +57,19 @@ personal wallet, not a wallet you have used elsewhere, not one whose seed has ev
 anything. The node signs with it automatically and unattended — that is its job.
 
 **The node needs very little in it.** Roughly 10 ADA to operate, plus whatever principal you are
-willing to front *if* you enable `ANTICIPATE` markets (§9). **The 30,000 FLDT does not live here** —
+willing to front *if* you enable `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` markets (§9). **The 30,000 FLDT does not live here** —
 it is delegated to this wallet from a separate wallet, which can be cold. That separation is the
 point: the hot wallet the node signs with never has to hold the stake.
 
 **A node in `shadow` or `live` adds a funding rule of its own.** Once the bot is in `shadow` or
 `live` — whatever its markets, `ANTICIPATE` or not — wallet rebalancing keeps the wallet in a fixed
-shape (§9, "Wallet rebalancing"), and that shape costs ada: **10 ADA beside each `ANTICIPATE` token
-the wallet holds, 10 ADA beside the bundle of any other tokens, and a 5 ADA collateral UTxO**
+shape (§9, "Wallet rebalancing"), and that shape costs ada: **10 ADA beside the token of each
+`ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` market the wallet holds, 10 ADA beside the bundle of any
+other tokens, and a 5 ADA collateral UTxO**
 (5 ADA under current protocol parameters), **plus the transaction fee, plus a change output that still holds its own minimum ada
-once it has paid that fee** (about 1 ADA). Under current parameters a wallet holding one
-`ANTICIPATE` token therefore needs **about 16.2 ADA**, and an ada-only wallet about 6.2 ADA; the exact
+once it has paid that fee** (about 1 ADA). Under current parameters a wallet holding the token of one
+`ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` market therefore needs **about 16.2 ADA**, and an ada-only
+wallet about 6.2 ADA; the exact
 figures move with the protocol parameters and with how many UTxOs the wallet holds (each one adds a
 little to the fee). A wallet carrying a very large bundle of other tokens can need more (§9). A wallet with less than that is not reshaped, and the node logs a
 `[REBALANCE] REFUSED: …` warning on every pass in which the rebalancer runs until you add ada
@@ -97,7 +99,8 @@ for what"):
   lender payout plus the fee ceiling plus **about 3.5 ADA of riders** (the bot's own collateral
   output and the change's minimum ada).
 - **A token anticipate** is funded from **its own token UTxO**, never from U: the rebalancer gives
-  each `ANTICIPATE` token one, with **10 ADA** beside the token.
+  the token of each `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` market one, with **10 ADA** beside the
+  token.
 - **+10 ADA** when the wallet holds any other tokens (the UTxO that bundles them).
 
 **A missing or too-small role is refused, by name.** A liquidation whose role is missing is recorded as
@@ -414,8 +417,12 @@ Every decision and its reason is there. **It is held in memory — read it befor
 
 **⚠ Three ways to be armed and idle, all silent, none an error:**
 
-1. `LOANS_LIQUIDATION_CONVERT_ENABLED=false` — the node converts nothing, whatever markets say
-2. every market `DISABLED`, or `ANTICIPATE` with a `cap` below what the loan needs
+1. `LOANS_LIQUIDATION_CONVERT_ENABLED=false` — the node converts nothing, whatever markets say (a
+   `CONVERT_BEFORE_ANTICIPATE` market pays in advance instead, under its `cap`)
+2. every market `DISABLED`, or `ANTICIPATE` with a `cap` below what each loan needs — and the same for
+   the loans a `CONVERT_BEFORE_ANTICIPATE` market pays in advance. The `cap` is **per loan, in the
+   token's smallest unit** (§9, "Field reference"): a `cap` of `50` on a 6-decimal token is 0.00005 of
+   it, and refuses every loan
 3. the shared profit margin set above what the work actually earns
 
 All three look exactly like a quiet market. The liquidations endpoint is what tells them apart.
@@ -439,12 +446,22 @@ shipped 5 ADA margin is added.
 
 Only relevant if you run the lending-v4 liquidation bot.
 
-When a loan is liquidated the bot builds one of two transactions:
+When a loan is liquidated the bot builds one of three transactions: a **plain** liquidation, a
+**convert**, or a **pay-in-advance**. A loan whose lender does not allow conversion always gets the
+plain one (below). For a loan whose lender allows conversion, the market's `action` decides how — and
+for `CONVERT_BEFORE_ANTICIPATE`, whether a convert is possible for that loan (its pool verdict, or
+convert switched off) decides between the convert and the pay-in-advance:
 
 | action | what it does | what it costs you |
 |---|---|---|
 | `CONVERT` | sells the collateral through a Minswap V2 order to repay the lender | **no capital** — a transaction fee and the ~4 ADA the validator makes the order carry |
 | `ANTICIPATE` | repays the lender **from your own wallet** and keeps the collateral | **your capital**, up to a `cap` you must state |
+| `CONVERT_BEFORE_ANTICIPATE` | converts, as `CONVERT` does; only when a convert is **impossible** for the loan, repays the lender from your own wallet instead, as `ANTICIPATE` does, in the same check (below) | **no capital** when it converts; **your capital**, up to a `cap` you must state, when it pays in advance |
+
+**`action` applies only to loans whose lender allows conversion.** Each loan's lender bond says
+whether its collateral may be converted to the principal. A loan whose lender does not allow it gets a
+**plain** liquidation whatever the market's `action` and `cap` say: it takes its fee in collateral and
+fronts nothing. The market's `mode` still applies to it.
 
 **⛔ `unit` is the loan's PRINCIPAL asset — what was lent — not the collateral.**
 
@@ -459,14 +476,85 @@ every market converts, provided `LOANS_LIQUIDATION_CONVERT_ENABLED` is true (it 
 
 Two controls, and a convert needs both to permit it:
 
-1. `LOANS_LIQUIDATION_CONVERT_ENABLED` — global. `false` means this node touches no DEX, ever
+1. `LOANS_LIQUIDATION_CONVERT_ENABLED` — global. `false` means this node touches no DEX, ever (a
+   `CONVERT_BEFORE_ANTICIPATE` market then pays in advance, below)
 2. `LOANS_LIQUIDATION_MARKETS_*` — per market: override the action, cap what you will front, or
    disable one market while the rest keep working
 
-### Worked example — three markets
+### `CONVERT_BEFORE_ANTICIPATE` — convert first, pay in advance only when convert is impossible
+
+A `CONVERT_BEFORE_ANTICIPATE` market tries the convert first, exactly as a `CONVERT` market does. It
+pays the lender in advance instead — **in the same check**, under the `ANTICIPATE` rules: the `cap`,
+the token balance, the token's own UTxO (or U for an ADA principal), and profitability — **only when a
+convert is impossible**, for one of three causes:
+
+1. **`NO_MINSWAP_POOL`** — this node's index holds no authentic Minswap V2 pool for the loan's pair, or
+   `loans.minswap.pool-address` is blank (preview ships it blank, so on preview every such loan pays in
+   advance);
+2. **`POOL_TOO_THIN`** — the pool cannot deliver enough to repay the debt;
+3. **`CONVERT_DISABLED`** — `LOANS_LIQUIDATION_CONVERT_ENABLED=false`, decided before anything is built.
+
+**Every other convert refusal is refused by name and is never paid in advance** — the refusals a
+`CONVERT` market records: a convert that is not worth doing, a pool lookup that failed (`LOOKUP_FAILED`)
+or found more than one pool for the pair (`AMBIGUOUS_POOL`), a pool with a dynamic fee
+(`POOL_HAS_DYNAMIC_FEE`), nothing left to swap, a missing or too-small U, a failed build. A
+`mode: DISABLED` market is refused before any build, with no fallback.
+
+**One row per loan.** A loan that falls back ends in one pay-in-advance row on the liquidations
+endpoint, whose detail starts `fallback to pay-in-advance (no convert: <cause>): `, and the node says it
+at INFO:
+
+```
+<loan> falls back to pay-in-advance in this check — no convert: <cause> (<why>)
+```
+
+A pay-in-advance refused by the market gate (its mode, `cap` or balance), or because the wallet output
+funding it is too small, is then logged in the pay-in-advance wording —
+`the pay-in-advance liquidation of … was refused by the market gate: …` or
+`the pay-in-advance liquidation of … was refused: …`.
+
+**The boot says where such a market pays in advance.** On a node that cannot convert (a
+`CONVERT UNAVAILABLE` line at boot), each `CONVERT_BEFORE_ANTICIPATE` market gets one WARN:
+`market … is action: CONVERT_BEFORE_ANTICIPATE on a node that cannot convert: …`. With
+`LOANS_LIQUIDATION_CONVERT_ENABLED=false`, each gets one INFO instead:
+`INIT - market … is action: CONVERT_BEFORE_ANTICIPATE and loans.liquidation.convert.enabled is false: …`.
+Both state the market's `cap` and its effective mode.
+
+**The readiness page's "Action now" is an estimate for such a market.** It follows the pool verdict
+from this node's index: a usable pool → `CONVERT`; no pool, a pool too thin, no Minswap configuration,
+or convert switched off → the answer an `ANTICIPATE` market gets (its `cap` against this loan, then its
+mode); a pool with a dynamic fee → nothing; a pool check that failed, or a loan whose figures could not
+be priced → unknown. The page tests every indexed pool when it renders, while the bot resolves one pool
+when it builds, so the two can disagree for a block, and the row says so. **One disagreement lasts
+longer than a block:** a loan whose collateral leaves nothing to swap after the borrower's equity and
+the liquidation fee shows on the page as a pool too thin, and so gets the pay-in-advance answer, while
+the bot refuses that loan by name (`NOTHING_LEFT_TO_SWAP`) and never pays it in advance. The two
+disagree for as long as that holds.
+
+**⚠ A pool this node's index has never seen counts as no pool.** The node knows a Minswap pool only from
+its own index, and the index holds a pool only once the pool's **current** output has passed through a
+block the node indexed. A pool that has sat idle since the block the node started syncing from is
+therefore not in the index, and a loan in this market whose pair it serves is **paid in advance**
+(`NO_MINSWAP_POOL`), although that pool could convert it on chain. It becomes visible the next time it
+moves (any swap recreates its output). **A restart or a configuration change does not make it
+visible**: the node resumes from its stored cursor, whatever `sync-start-*` says
+([upgrading.md §3](upgrading.md#3--the-rule-that-surprises-people)).
+
+**A re-sync helps only some idle pools.** A re-sync with the steps of
+[upgrading.md §1.1](upgrading.md#11--the-minswap-pool-release-requires-a-database-wipe-fab-137) — wipe
+the database **including the cursor**, keep the shipped `sync-start-*` — replays the chain from the
+shipped start point (mainnet: slot `154984561`, 2025-05-06). It makes visible a pool that last moved
+**after** that point but before your own node's index began — for example on a node whose cursor
+started later than the shipped value. It does **not** help a pool idle since **before** 2025-05-06: the
+re-sync replays the same blocks, none of which carries that pool's current output, so it stays
+invisible until it moves, re-sync or not.
+
+### Worked example — four markets
 
 Convert ADA-principal loans; anticipate a token-principal market you do not trust a pool for, capped
-at 500 **of that token**; stay out of a third entirely.
+at 500 **of that token** per loan; convert a second token market where a pool can repay the debt and
+pay in advance where none can, capped at 1,000 of that 6-decimal token per loan; stay out of a fourth
+entirely.
 
 ```bash
 LOANS_LIQUIDATION_MARKETS_0_UNIT=lovelace
@@ -476,8 +564,12 @@ LOANS_LIQUIDATION_MARKETS_1_UNIT=577f0b1342f8f8f4aed3388b80a8535812950c7a892495c
 LOANS_LIQUIDATION_MARKETS_1_ACTION=ANTICIPATE
 LOANS_LIQUIDATION_MARKETS_1_CAP=500000000
 
-LOANS_LIQUIDATION_MARKETS_2_UNIT=1111111111111111111111111111111111111111111111111111111144554d4d59
-LOANS_LIQUIDATION_MARKETS_2_MODE=DISABLED
+LOANS_LIQUIDATION_MARKETS_2_UNIT=2222222222222222222222222222222222222222222222222222222254455354
+LOANS_LIQUIDATION_MARKETS_2_ACTION=CONVERT_BEFORE_ANTICIPATE
+LOANS_LIQUIDATION_MARKETS_2_CAP=1000000000
+
+LOANS_LIQUIDATION_MARKETS_3_UNIT=1111111111111111111111111111111111111111111111111111111144554d4d59
+LOANS_LIQUIDATION_MARKETS_3_MODE=DISABLED
 ```
 
 The index groups the fields of one market. The same thing in YAML, if you configure that way:
@@ -491,6 +583,9 @@ loans:
       - unit: 577f0b1342f8f8f4aed3388b80a8535812950c7a892495c0ecdf0f1e0014df10464c4454
         action: ANTICIPATE
         cap: 500000000
+      - unit: 2222222222222222222222222222222222222222222222222222222254455354
+        action: CONVERT_BEFORE_ANTICIPATE
+        cap: 1000000000
       - unit: 1111111111111111111111111111111111111111111111111111111144554d4d59
         mode: DISABLED
 ```
@@ -500,19 +595,23 @@ loans:
 - **`unit`** — the loan's **principal** asset. `lovelace`, or the principal's policy id (56 hex
   chars) followed by its asset name in hex, no separator. **Required**; anything malformed aborts
   startup by name.
-- **`action`** — `CONVERT` or `ANTICIPATE`. Defaults to `CONVERT`; never inferred from `cap`.
-- **`cap`** — the most principal the bot may front in that market, in that asset's own unit.
-  **Mandatory for `ANTICIPATE` and the node refuses to start without it** — anticipating uncapped is
-  unbounded exposure. Ignored with a warning on a `CONVERT` market.
+- **`action`** — `CONVERT`, `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE`. Defaults to `CONVERT`; never
+  inferred from `cap`. It applies only to loans whose lender allows conversion (above).
+- **`cap`** — the most principal the bot may front for **one loan**, in **the token's smallest unit**
+  (lovelace for `lovelace`). It is compared with what that one loan requires fronted, not with a total
+  across loans. For a 6-decimal token, `500000000` is 500 of it; a `cap` of `50` is 0.00005 of it and
+  refuses every loan. **Mandatory for `ANTICIPATE` and `CONVERT_BEFORE_ANTICIPATE`, and the node refuses
+  to start without it** — anticipating uncapped is unbounded exposure. Ignored with a warning on a
+  `CONVERT` market.
 - **`mode`** — `DISABLED`, `SHADOW` or `LIVE` for that market alone. Omit to inherit the node mode.
 
 **⚠ The node mode is a ceiling.** A market asking for `LIVE` on a node running `shadow` runs as
 `SHADOW`, and says so at boot. A market may be more restrictive than the node, never less.
 
 **⛔ The node refuses to start** on an entry that cannot mean anything: missing or malformed `unit`,
-duplicate `unit`, `ANTICIPATE` with no `cap`, or a negative `cap` on an `ANTICIPATE` entry. That is
-deliberate — a typo that quietly disabled one market would look exactly like a market with no
-liquidations in it.
+duplicate `unit`, `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` with no `cap`, or a negative `cap` on an
+`ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` entry. That is deliberate — a typo that quietly disabled one
+market would look exactly like a market with no liquidations in it.
 
 ### Wallet rebalancing — the shape a shadow or live node keeps your wallet in
 
@@ -547,7 +646,8 @@ rebalances.
 
 **The shape.**
 
-- **One UTxO per principal token of an `ANTICIPATE` market whose effective mode is shadow or live** —
+- **One UTxO per principal token of an `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` market whose
+  effective mode is shadow or live** —
   its own `mode`, capped by the node's (§9 above) — holding all of that token and exactly 10 ADA (none
   at all when no market qualifies);
 - **one UTxO holding every other token**, with exactly 10 ADA — only if the wallet holds any;
@@ -555,29 +655,31 @@ rebalances.
   collateral for a transaction and 5 ADA — 5 ADA under current protocol parameters;
 - **every remaining lovelace in one ada-only UTxO.**
 
-Why: the bot fronts an `ANTICIPATE` principal from **one** UTxO, which must carry the token *and*
+Why: the bot fronts the principal of an `ANTICIPATE` market — and of a `CONVERT_BEFORE_ANTICIPATE`
+market whose convert is impossible — from **one** UTxO, which must carry the token *and*
 the ada the transaction needs beside it (the fee ceiling plus about 5.5 ADA of riders — under 10 ADA
 at current parameters), so each such token gets its own
 funded UTxO instead of being scattered or bundled with others. C is never below the 5 ADA the
 transaction builder selects as collateral, nor below the most collateral the ledger can require, so
 a collateral UTxO of the right size is kept ready for the bot's script transactions. And one change
 UTxO keeps your ada in one piece rather than fragmented. An ADA-principal market is fronted from that change,
-so it adds no UTxO of its own. **A token of an `ANTICIPATE` market whose mode is `DISABLED` is not
-kept ready**: it goes in the "every other token" UTxO.
+so it adds no UTxO of its own. **A token of an `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` market whose
+mode is `DISABLED` is not kept ready**: it goes in the "every other token" UTxO.
 
 **The funds it needs.** The wallet's ada must cover:
 
-1. the planned outputs — 10 ADA for each `ANTICIPATE` token it holds, 10 ADA if it holds any other
-   token, and C;
+1. the planned outputs — 10 ADA for the token of each `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE`
+   market it holds, 10 ADA if it holds any other token, and C;
 2. **plus** the transaction fee, which is always paid out of the change output — never out of a
    planned output, which keeps exactly its planned value;
 3. **plus** the change output's own minimum ada, which it must still hold after paying that fee
    (about 1 ADA under current parameters).
 
-Under current parameters, a wallet holding **one `ANTICIPATE` token needs about 16.2 ADA** (10 + 5
+Under current parameters, a wallet holding **the token of one `ANTICIPATE` or
+`CONVERT_BEFORE_ANTICIPATE` market needs about 16.2 ADA** (10 + 5
 planned, roughly 0.2 of fee and about 1 of change), and an ada-only wallet about 6.2 ADA. These are
 approximate: they move with the protocol parameters, and each extra UTxO in the wallet adds a little
-to the fee. ⚠ One exception: if the bundle of *other* tokens (the non-`ANTICIPATE` ones) is so large that
+to the fee. ⚠ One exception: if the bundle of *other* tokens (those of no such market) is so large that
 its own minimum ada is close to 10 ADA (around 30 spam tokens with long names), cardano-client-lib
 refuses the build itself (`build failed: Not enough funds …`) until the change is larger than 10 ADA,
 so such a wallet still needs the old figure: the planned outputs plus a change above 10 ADA. When the wallet is short only of the change's minimum, the refusal names the exact
@@ -634,6 +736,10 @@ the rest of that check:
 | anticipate, ADA principal | **U** | the lender payout, the fee ceiling and about 3.5 ADA of riders |
 | anticipate, token principal | **the UTxO holding the most of that token** (no datum, no reference script) | the payout in the token, and the fee ceiling plus about 5.5 ADA of riders beside it |
 
+A `CONVERT_BEFORE_ANTICIPATE` market is funded as a convert — from **U** — when it converts, and as an
+anticipate when it pays in advance: from the UTxO holding its token for a token principal, from **U** for
+an ADA principal. A missing U does not stop a token-principal fallback, which needs none.
+
 **C — the ada-only UTxO of exactly the collateral size — is never handed to a liquidation as its
 funding UTxO.** The figures are ceilings checked before the build; the build is the judge of whether
 they suffice. Every liquidation builder pins **C** as its only collateral, never spends it, and sees only
@@ -643,16 +749,24 @@ A **compound** is funded from **U** alone with **C** as its collateral, and its 
 ada-only UTxO — except that a token pool's compounding fee arrives in the pool's token inside that UTxO,
 which may trigger a wallet reshape.
 
-**Fire and forget: only an accepted liquidation uses up its UTxO.** Every candidate is tried, most
-profitable first, in every market. After a liquidation Blockfrost **accepted**, and after a `shadow`
-node's would-be submission, the UTxO it was funded from is marked used for the rest of the check, and the
-next candidate funded from the same role is **skipped** — logged at INFO as `… skipped: wallet output …
-(role U) already went out in this check` — rather than funded from another UTxO; two plain liquidations
-therefore do not both go out in one pass: they share U. **A rejected or unknown submit frees nothing and
-stops nothing:** it is logged once at INFO (`liquidation of … via … on … not accepted: HTTP …`), and the
-next candidate is tried, on the same UTxO. A liquidation held back by a market in `shadow` on a `live`
-node marks nothing. Until an accepted liquidation is in a block (about 20 s), later passes rebuild on U
-and get harmless rejections; the Blockfrost calls they cost appear in each pass's summary line
+**Fire and forget: U stays in the check; an accepted liquidation takes out only a token UTxO.** Every
+candidate is tried, most profitable first, in every market. After a liquidation funded from **U** — a
+plain liquidation, a convert, or an ADA-principal pay-in-advance — Blockfrost **accepted**, every later
+candidate funded from U is **still built and submitted on U**, in profit order. Usually the mempool
+holding the first refuses it, which costs one evaluate and one submit call and one INFO line
+(`liquidation of … via … on … not accepted: HTTP …`). But a backend that has not yet seen the first
+transaction can accept it too: the liquidations endpoint then shows **two `SUBMITTED` rows for one U**,
+and at most one of the two can land — the second only if the first loses its race. The `SUBMITTED` row
+of a liquidation funded from U says so (`…; U stays in this check: later candidates funded from U are
+still built and submitted, …`). Nothing bounds how many candidates are tried on U in one check.
+**A token UTxO is still taken out:** after an accepted token-principal pay-in-advance, the UTxO it spent
+is marked used for the rest of the check, and the next candidate designated to it is **skipped** —
+logged at INFO as `… skipped: wallet output … (role TOKEN <unit>) already went out in this check` —
+rather than funded from another UTxO. A `shadow` node's would-be submission marks exactly what an accept
+would; a liquidation held back by a market in `shadow` on a `live` node marks nothing. **A rejected or
+unknown submit frees nothing and stops nothing:** it is logged once at INFO, and the next candidate is
+tried, on the same UTxO. Until an accepted liquidation is in a block (about 20 s), later passes rebuild on
+U and get harmless rejections; the Blockfrost calls they cost appear in each pass's summary line
 (`wallet pipeline pass #<n> at slot <slot> (<hash>), trigger <label>, <k> block(s) folded in, waited <w> s, took <d> s: liquidation …; Blockfrost calls discovery …, evaluate …, submit …`).
 Each stage on that line prints its outcome — `NO_OP`, `ATTEMPTED`, `SUBMITTED`, `WOULD_SUBMIT`, `SKIPPED`
 or `ERROR`, with its counts — as described in

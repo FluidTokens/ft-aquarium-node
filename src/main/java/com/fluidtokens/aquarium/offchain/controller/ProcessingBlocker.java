@@ -5,6 +5,7 @@ import java.math.BigInteger;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Action;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Market;
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
+import com.fluidtokens.aquarium.offchain.service.loans.PoolUsability;
 
 /**
  * ⚠ <b>Why the bot could NOT act on this loan — if it had to, right now.</b>
@@ -33,6 +34,10 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfigurati
  *       {@code MarketGate.decide}'s arithmetic and is not restated here.</li>
  *   <li><b>CONVERT</b> needs NO principal — the collateral pays the lender. It needs a pool that can
  *       fill, and ada for the fee and the Minswap order.</li>
+ *   <li><b>CONVERT_BEFORE_ANTICIPATE</b> follows the pool verdict: a usable pool needs nothing;
+ *       convert off, {@code NO_POOL}, {@code TOO_THIN} or {@code NOT_CONFIGURED} need what ANTICIPATE needs;
+ *       {@code WRONG_PAIR} and {@code CANNOT_QUOTE} are refused, never paid in advance; a verdict that could
+ *       not be reached leaves the capital question unknown.</li>
  *   <li><b>PLAIN</b> needs neither; the fee is taken in collateral.</li>
  * </ul>
  * A CONVERT loan on a wallet holding none of its collateral is <b>fine</b>, and a badge that did not
@@ -98,20 +103,61 @@ public record ProcessingBlocker(String label, String detail) {
         }
 
         Action effectiveAction = action == null ? Action.CONVERT : action;
-        if (effectiveAction == Action.CONVERT) {
-            if (!convertEnabled) {
-                return of("convert off", "this market routes to CONVERT and convert is disabled "
-                        + "node-wide, so no DEX order would be created");
-            }
-            if (pool == null || !pool.usable()) {
-                return of("no pool", pool == null || pool.reason() == null
-                        ? "no Minswap pool can clear this loan's debt"
-                        : pool.reason());
-            }
-            return NONE;
-        }
+        // Exhaustive, no default: a new action does not compile until it says what blocks it.
+        return switch (effectiveAction) {
+            case CONVERT -> convert(convertEnabled, pool);
+            case ANTICIPATE -> anticipate(market, advance, balance, balanceKnown, fundsLabel, fundsDetail);
+            case CONVERT_BEFORE_ANTICIPATE ->
+                    convertBeforeAnticipate(market, convertEnabled, pool, advance, balance, balanceKnown,
+                            fundsLabel, fundsDetail);
+        };
+    }
 
-        // ---- ANTICIPATE: the only route that needs the operator's own capital ---------------------
+    private static ProcessingBlocker convert(boolean convertEnabled, PoolUsabilityView pool) {
+        if (!convertEnabled) {
+            return of("convert off", "this market routes to CONVERT and convert is disabled "
+                    + "node-wide, so no DEX order would be created");
+        }
+        if (pool == null || !pool.usable()) {
+            return noPool(pool);
+        }
+        return NONE;
+    }
+
+    private static ProcessingBlocker noPool(PoolUsabilityView pool) {
+        return of("no pool", pool == null || pool.reason() == null
+                ? "no Minswap pool can clear this loan's debt"
+                : pool.reason());
+    }
+
+    /**
+     * ⛔ FAB-194-4: only convert switched off or a verdict saying convert is IMPOSSIBLE takes the ANTICIPATE
+     * checks. A refused pool is never paid in advance, and a verdict that could not be reached is unknown —
+     * marking it {@code funds} would send an operator to move capital the bot may never front.
+     */
+    private static ProcessingBlocker convertBeforeAnticipate(Market market, boolean convertEnabled,
+                                                             PoolUsabilityView pool, BigInteger advance,
+                                                             BigInteger balance, boolean balanceKnown,
+                                                             String fundsLabel, String fundsDetail) {
+        if (!convertEnabled) {
+            return anticipate(market, advance, balance, balanceKnown, fundsLabel, fundsDetail);
+        }
+        PoolUsability.Verdict verdict = pool == null || pool.verdict() == null
+                ? PoolUsability.Verdict.UNKNOWN : pool.verdict();
+        return switch (verdict) {
+            case NO_POOL, TOO_THIN, NOT_CONFIGURED ->
+                    anticipate(market, advance, balance, balanceKnown, fundsLabel, fundsDetail);
+            case USABLE -> NONE;
+            case WRONG_PAIR, CANNOT_QUOTE -> noPool(pool);
+            case CHECK_FAILED, UNKNOWN -> of("unknown", "this market is action: CONVERT_BEFORE_ANTICIPATE and "
+                    + "whether convert is possible is not known (" + verdict + "), so whether capital is "
+                    + "needed is not known either");
+        };
+    }
+
+    // ---- ANTICIPATE: the only route that needs the operator's own capital ---------------------
+    private static ProcessingBlocker anticipate(Market market, BigInteger advance, BigInteger balance,
+                                                boolean balanceKnown, String fundsLabel, String fundsDetail) {
         if (advance == null) {
             return of("unknown", "this loan's advance could not be priced, so whether it is "
                     + "affordable is not known either");
@@ -137,5 +183,11 @@ public record ProcessingBlocker(String label, String detail) {
     }
 
     /** The slice of {@code PoolUsability} this needs, so the controller can pass it without coupling. */
-    public record PoolUsabilityView(boolean usable, String reason) { }
+    public record PoolUsabilityView(PoolUsability.Verdict verdict, String reason) {
+
+        /** Only {@code USABLE} is usable; a null verdict is not. */
+        public boolean usable() {
+            return verdict == PoolUsability.Verdict.USABLE;
+        }
+    }
 }

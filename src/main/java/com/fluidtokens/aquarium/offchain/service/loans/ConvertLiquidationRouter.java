@@ -37,6 +37,9 @@ import java.util.function.Function;
  * The lender's bond flag decides the CLASS of liquidation a loan permits; the operator's market
  * decides the MECHANISM within it (findings §27). So the executor asks {@link MarketGate#actionFor}
  * and sends {@code CONVERT} here and {@code ANTICIPATE} to {@link PayInAdvanceLiquidationRouter}.
+ * {@code CONVERT_BEFORE_ANTICIPATE} comes here first and goes to pay-in-advance, in the same check, only
+ * when a convert is impossible: no pool ({@link NoPoolException}), a pool too thin
+ * ({@code ConvertOrderPlan.Refusal.POOL_TOO_THIN}), or convert switched off ({@link #convertEnabled()}).
  * <b>An unlisted market converts</b> — Giovanni's ruling, and the safe default because this path
  * fronts no capital and holds nothing.
  *
@@ -119,6 +122,16 @@ public class ConvertLiquidationRouter {
         this.builder = builder;
         this.converters = converters;
         this.network = network;
+    }
+
+    /**
+     * {@code loans.liquidation.convert.enabled}, as the economics gate reads it. The executor asks this before
+     * building for a {@code CONVERT_BEFORE_ANTICIPATE} market only (FAB-194-3): off means that market pays in
+     * advance instead, and nothing is built here. A {@code CONVERT} market never asks it — its convert is
+     * refused {@code NOT_ARMED} by the gate after the build, as it always was.
+     */
+    public boolean convertEnabled() {
+        return economics.enabled();
     }
 
     /**
@@ -389,7 +402,9 @@ public class ConvertLiquidationRouter {
         LoanDatum loan = assessment.loan().datum();
         // ⛔ Ada collateral is refused by name FIRST (FAB-117): convert needs a collateral oracle leg and ada
         // has none (it used to die as an NPE inside redeemerEquity). First, so it is never answered with the
-        // no-pool branches' "set this market to action: ANTICIPATE" -- pay-in-advance refuses it too.
+        // no-pool branches' "set this market to action: CONVERT_BEFORE_ANTICIPATE" advice -- pay-in-advance
+        // refuses it too, so neither ANTICIPATE nor a CONVERT_BEFORE_ANTICIPATE fallback would serve it, and
+        // CONVERT never could.
         // A machinery failure (ERROR, every cycle); the PLAIN route (a bond that forbids conversion) is
         // unaffected and does liquidate it.
         if (loan.collateral().isAda()) {
@@ -410,8 +425,8 @@ public class ConvertLiquidationRouter {
             throw new NoPoolException(
                     "convert unavailable: no Minswap pool address configured for this network, so "
                             + "there is no pool to swap " + collateral.toUnit() + " against; set "
-                            + "loans.minswap.pool-address, or set this market to action: ANTICIPATE "
-                            + "if the loan should still be liquidated");
+                            + "loans.minswap.pool-address, or set this market to action: "
+                            + "CONVERT_BEFORE_ANTICIPATE with a cap if the loan should still be liquidated");
         }
 
         // 1. The pool: the authentic one in this cycle's index snapshot (ONE query per cycle, taken
@@ -422,7 +437,8 @@ public class ConvertLiquidationRouter {
                         "no Minswap pool for " + collateral.toUnit() + "/" + loan.principalAsset().toUnit()
                                 + " is indexed — not indexed (pools idle since 2025-05-06 are invisible); "
                                 + "convert is impossible for this loan, not merely unprofitable — "
-                                + "set this market to action: ANTICIPATE if it should be liquidated"));
+                                + "set this market to action: CONVERT_BEFORE_ANTICIPATE with a cap if it should "
+                                + "be liquidated"));
 
         // ⛔ MILLISECONDS ARE NOT SLOTS, and until 2026-09-05 this router handed the caller's
         // millisecond window straight into a record whose components are `validFromSlot` /

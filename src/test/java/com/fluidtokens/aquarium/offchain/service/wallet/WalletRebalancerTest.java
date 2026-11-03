@@ -365,6 +365,65 @@ class WalletRebalancerTest {
         assertRebalancedOnce(rebalancer(true), "market LIVE under global SHADOW");
     }
 
+    // ---- CONVERT_BEFORE_ANTICIPATE (FAB-194 D7) -------------------------------------------------------------
+
+    private static Market convertBeforeAnticipate(String unit, Mode marketMode) {
+        Market m = market(unit, Action.CONVERT_BEFORE_ANTICIPATE);
+        m.setCap(BigInteger.valueOf(1_000_000_000_000L));
+        m.setMode(marketMode);
+        return m;
+    }
+
+    /**
+     * A CONVERT_BEFORE_ANTICIPATE market's fallback fronts the principal exactly as ANTICIPATE does, so at an
+     * effective mode of SHADOW or LIVE its token is relevant — lower-cased — and a lovelace one never is.
+     */
+    @ParameterizedTest
+    @EnumSource(value = Mode.class, names = {"SHADOW", "LIVE"})
+    void aConvertBeforeAnticipateMarketsTokenIsRelevantAtShadowOrLive(Mode marketMode) {
+        mode.set(Mode.LIVE);
+        markets.set(List.of(convertBeforeAnticipate(NIGHT.toUpperCase(), marketMode),
+                convertBeforeAnticipate("lovelace", marketMode), market(USDM, Action.CONVERT)));
+        assertRebalancedOnce(rebalancer(true), "a CONVERT_BEFORE_ANTICIPATE market at effective " + marketMode);
+        assertTrue(at(Level.INFO).get(0).getFormattedMessage().contains("relevant [" + NIGHT + "]"),
+                at(Level.INFO).get(0).getFormattedMessage());
+    }
+
+    /** ... and at an effective mode of DISABLED it can never liquidate, so its token is not relevant. */
+    @Test
+    void aDisabledConvertBeforeAnticipateMarketsTokenIsNotRelevant() {
+        mode.set(Mode.SHADOW);
+        markets.set(List.of(convertBeforeAnticipate(NIGHT, Mode.DISABLED), market(USDM, Action.CONVERT)));
+        assertRebalancedOnce(rebalancer(true), "the only CONVERT_BEFORE_ANTICIPATE market has mode: DISABLED");
+        assertTrue(at(Level.INFO).get(0).getFormattedMessage().contains("relevant []"),
+                at(Level.INFO).get(0).getFormattedMessage());
+    }
+
+    /**
+     * In the built transaction: beside an ANTICIPATE market (a market with no mode of its own inherits the node's
+     * LIVE), each market's token gets its own exactly-10-ADA output and the other tokens keep their bundle.
+     */
+    @Test
+    void aConvertBeforeAnticipateMarketBesideAnAnticipateOneIsIsolatedOnItsOwnOutput() throws Exception {
+        mode.set(Mode.LIVE);
+        markets.set(List.of(convertBeforeAnticipate(NIGHT, null), anticipate(USDM)));
+        walletContents.set(List.of(utxo(1_180_000, NIGHT, 15_000_000_000L), utxo(1_500_000, USDM, 1_000_000L),
+                utxo(1_300_000, JUNK, 5L), utxo(200_000_000)));
+
+        assertRebalancedOnce(rebalancer(true), "a CONVERT_BEFORE_ANTICIPATE market beside an ANTICIPATE one");
+        Transaction tx = Transaction.deserialize(submitted.get(0));
+        List<Map<String, BigInteger>> outputs = new ArrayList<>();
+        for (TransactionOutput output : tx.getBody().getOutputs()) {
+            outputs.add(WalletShapeTransactions.unitsOf(output.getValue()));
+        }
+        assertTrue(outputs.contains(Map.of("lovelace", TEN_ADA, NIGHT, BigInteger.valueOf(15_000_000_000L))),
+                "the CONVERT_BEFORE_ANTICIPATE market's token is isolated on exactly 10 ADA: " + outputs);
+        assertTrue(outputs.contains(Map.of("lovelace", TEN_ADA, USDM, BigInteger.valueOf(1_000_000L))),
+                "the ANTICIPATE market's token is isolated on exactly 10 ADA: " + outputs);
+        assertTrue(outputs.contains(Map.of("lovelace", TEN_ADA, JUNK, BigInteger.valueOf(5L))),
+                "the other tokens stay in their own bundle: " + outputs);
+    }
+
     @Test
     void syncingBlocks() {
         syncing.set(true);

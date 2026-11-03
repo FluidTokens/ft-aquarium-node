@@ -330,11 +330,33 @@ jobs:
       # feat/fab-189-composable-node, 2026-11-02: 232 files / 2609 tests / 0 failures / 0 errors / 51 skipped,
       # 0 orphans. Floor 232.
       #
+      # FAB-194-1 (MarketActionRoutePinTest: what a CONVERT and an ANTICIPATE market record and log, pinned
+      # exactly on the code before CONVERT_BEFORE_ANTICIPATE existed; ConvertBeforeAnticipateConvertsLikeConvertTest:
+      # the new action converts exactly as CONVERT; plus cases in MarketGateTest and MarketBindingTest)
+      # re-measured cold keyless on feat/fab-194-convert-before-anticipate, 2026-11-02: 234 files / 2658 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 234.
+      #
+      # FAB-194-2 (UStaysInTheCheckTest: U is never taken out of the check by an accepted or node-shadow
+      # liquidation; a token output still is) re-measured cold keyless on feat/fab-194-convert-before-anticipate,
+      # 2026-11-03: 235 files / 2667 tests / 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 235.
+      #
+      # FAB-194-3 (ConvertBeforeAnticipateFallbackTest: a CONVERT_BEFORE_ANTICIPATE market falls back to
+      # pay-in-advance in the same check only when convert is impossible; plus cases in MarketGateTest and
+      # ConvertLiquidationRouterTest, and RiderIsScopedToTheRouteTest rewritten to the route built)
+      # re-measured cold keyless on feat/fab-194-convert-before-anticipate, 2026-11-03: 236 files / 2716 tests /
+      # 0 failures / 0 errors / 51 skipped, 0 orphans. Floor 236.
+      #
+      # FAB-194-5 (ConvertBeforeAnticipateBootLinesTest: through the container, the verifier's per-market WARN when
+      # convert is unavailable and ConvertEconomics' INIT line when convert is disabled, for each
+      # CONVERT_BEFORE_ANTICIPATE market; plus cases in WalletShapeTest and WalletRebalancerTest) re-measured cold
+      # keyless on feat/fab-194-convert-before-anticipate, 2026-11-03: 237 files / 2752 tests / 0 failures /
+      # 0 errors / 51 skipped, 0 orphans. Floor 237.
+      #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '232'
+          RESULT_FILE_FLOOR: '237'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
