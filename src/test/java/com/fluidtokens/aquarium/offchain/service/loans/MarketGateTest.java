@@ -390,4 +390,66 @@ class MarketGateTest {
                 + "principal the bot fronts from its own wallet; anticipating without one is unbounded exposure",
                 e.getMessage());
     }
+
+    // ---- FAB-194-3: a CONVERT_BEFORE_ANTICIPATE fallback is gated exactly as ANTICIPATE ------------------
+
+    /**
+     * FAB-194-3 — a {@code CONVERT_BEFORE_ANTICIPATE} market reaches {@code decide} only when its convert was
+     * impossible and the executor fell back to pay-in-advance. It is then capped and balanced exactly as an
+     * {@code ANTICIPATE} market: allowed within both, at the inclusive boundary too.
+     */
+    @Test
+    void aConvertBeforeAnticipateFallbackIsAllowedWithinItsCapAndBalanceExactlyAsAnticipate() {
+        for (Action action : List.of(Action.ANTICIPATE, Action.CONVERT_BEFORE_ANTICIPATE)) {
+            MarketGate g = gate(Mode.LIVE, market(TOKEN.toUnit(), Mode.LIVE, action, 500_000_000L));
+
+            MarketGate.Decision within = g.decide(TOKEN, n(400_000_000), n(450_000_000));
+            assertTrue(within.allowed(), action + ": " + within.detail());
+            assertEquals(n(450_000_000), within.anticipatable(), action.name());
+            assertEquals(n(500_000_000), within.cap(), action.name());
+            assertEquals("market " + TOKEN.toUnit() + " allows 400000000 of 500000000", within.detail(),
+                    action.name());
+
+            assertTrue(g.decide(TOKEN, n(500_000_000), n(500_000_000)).allowed(), action + ": the cap is inclusive");
+        }
+    }
+
+    /** FAB-194-3 — above the cap: {@code ABOVE_MARKET_CAP}, the same decision {@code ANTICIPATE} reaches. */
+    @Test
+    void aConvertBeforeAnticipateFallbackAboveItsCapIsRefusedAboveMarketCapExactlyAsAnticipate() {
+        MarketGate.Decision anticipate = gate(Mode.LIVE,
+                market(TOKEN.toUnit(), Mode.LIVE, Action.ANTICIPATE, 500_000_000L))
+                .decide(TOKEN, n(500_000_001), AMPLE);
+        MarketGate.Decision cba = gate(Mode.LIVE,
+                market(TOKEN.toUnit(), Mode.LIVE, Action.CONVERT_BEFORE_ANTICIPATE, 500_000_000L))
+                .decide(TOKEN, n(500_000_001), AMPLE);
+
+        assertEquals(MarketGate.Refusal.ABOVE_MARKET_CAP, cba.refusal());
+        assertEquals(anticipate, cba, "the whole decision, detail included, is ANTICIPATE's");
+    }
+
+    /** FAB-194-3 — a balance short of the requirement: {@code INSUFFICIENT_BALANCE}, exactly as {@code ANTICIPATE}. */
+    @Test
+    void aConvertBeforeAnticipateFallbackShortOfBalanceIsRefusedInsufficientBalanceExactlyAsAnticipate() {
+        MarketGate.Decision anticipate = gate(Mode.LIVE,
+                market(TOKEN.toUnit(), Mode.LIVE, Action.ANTICIPATE, 1_500_000_000L))
+                .decide(TOKEN, n(1_033_850_765), n(500_000_000));
+        MarketGate.Decision cba = gate(Mode.LIVE,
+                market(TOKEN.toUnit(), Mode.LIVE, Action.CONVERT_BEFORE_ANTICIPATE, 1_500_000_000L))
+                .decide(TOKEN, n(1_033_850_765), n(500_000_000));
+
+        assertEquals(MarketGate.Refusal.INSUFFICIENT_BALANCE, cba.refusal());
+        assertEquals(anticipate, cba, "the whole decision, detail included, is ANTICIPATE's");
+    }
+
+    /** FAB-194-3 — {@code CONVERT} still refuses pay-in-advance by name, with the text it always had. */
+    @Test
+    void aConvertMarketStillRefusesPayInAdvanceAsMarketActionIsConvert() {
+        MarketGate.Decision d = gate(Mode.LIVE, market(TOKEN.toUnit(), Mode.LIVE, Action.CONVERT, 1_000L))
+                .decide(TOKEN, n(1), AMPLE);
+
+        assertEquals(MarketGate.Refusal.MARKET_ACTION_IS_CONVERT, d.refusal());
+        assertEquals("market " + TOKEN.toUnit() + " is action: CONVERT, so pay-in-advance is not the mechanism "
+                + "here; set action: ANTICIPATE with a cap to force it", d.detail());
+    }
 }

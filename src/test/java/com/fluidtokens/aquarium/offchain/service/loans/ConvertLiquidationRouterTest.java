@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -496,7 +497,8 @@ class ConvertLiquidationRouterTest {
 
         assertEquals("no Minswap pool for " + FLDT.toUnit() + "/lovelace is indexed — not indexed (pools "
                 + "idle since 2025-05-06 are invisible); convert is impossible for this loan, not merely "
-                + "unprofitable — set this market to action: ANTICIPATE if it should be liquidated", e.getMessage());
+                + "unprofitable — set this market to action: CONVERT_BEFORE_ANTICIPATE with a cap if it should be "
+                + "liquidated", e.getMessage());
     }
 
     /** CCL §19: the lookup is now a database read, and its failure must still arrive as LOOKUP_FAILED. */
@@ -515,5 +517,112 @@ class ConvertLiquidationRouterTest {
                         requirement -> Optional.empty(), ROLE_C, collateralOracle(), "addr_change",
                         1_760_000_000_000L, 1_760_000_120_000L));
         assertEquals(MinswapPoolResolver.Refusal.LOOKUP_FAILED, e.refusal());
+    }
+
+    // ===== FAB-194-3: the two IMPOSSIBLE verdicts come before the wallet is asked =====
+
+    /**
+     * A selector that records that it was asked. FAB-194-3 designates U only when the router asks, so a
+     * {@code CONVERT_BEFORE_ANTICIPATE} fallback relies on the router reaching both impossible verdicts — no
+     * pool, a pool too thin — WITHOUT asking: a verdict reached after the selector would have designated U
+     * (and recorded a missing one) for a convert that was never possible.
+     */
+    private static java.util.function.Function<BigInteger, Optional<Utxo>> recording(boolean[] asked) {
+        return requirement -> {
+            asked[0] = true;
+            return Optional.empty();
+        };
+    }
+
+    /** A resolver answering one fixed pool datum for any pair, like {@link FixedPoolResolver}. */
+    private static MinswapPoolResolver resolverOf(MinswapPoolDatum datum) {
+        return new MinswapPoolResolver(null, "addr_pool", MINSWAP_POOL_POLICY) {
+            @Override
+            public Snapshot snapshot() {
+                Utxo poolUtxo = Utxo.builder().txHash("dd".repeat(32)).outputIndex(0)
+                        .address("addr_pool").build();
+                return new Snapshot(Map.of(), MINSWAP_POOL_POLICY) {
+                    @Override
+                    public Optional<ResolvedPool> resolveEitherOrder(AssetType one, AssetType other) {
+                        return Optional.of(new ResolvedPool(poolUtxo, datum, "lp"));
+                    }
+                };
+            }
+        };
+    }
+
+    /** FAB-194-3 — a pool far too shallow to return the debt: {@code POOL_TOO_THIN}, the selector never asked. */
+    @Test
+    void aThinPoolIsRefusedPoolTooThinBeforeTheWalletIsAsked() {
+        // One ada against the live pool's FLDT: swapping the collateral returns far less than the 20 ADA debt.
+        MinswapPoolDatum thin = new MinswapPoolDatum(AssetType.ada(), FLDT, BigInteger.TEN,
+                BigInteger.valueOf(1_000_000L), new BigInteger("7596442927398"),
+                BigInteger.valueOf(80L), BigInteger.valueOf(80L), false);
+        ConvertLiquidationRouter router = new ConvertLiquidationRouter(LoanFixtures.registry(),
+                configuredForMinswap(), null, resolverOf(thin), null, null, LoanFixtures.converters(),
+                LoanFixtures.NETWORK);
+        boolean[] asked = new boolean[1];
+
+        var e = assertThrows(ConvertOrderPlan.RefusedException.class,
+                () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        recording(asked), ROLE_C, collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals(ConvertOrderPlan.Refusal.POOL_TOO_THIN, e.refusal(), e.getMessage());
+        assertFalse(asked[0], "the wallet selector must not be asked before the pool verdict");
+    }
+
+    /** FAB-194-3 — no authentic pool for the pair in the index: {@code NoPoolException}, the selector never asked. */
+    @Test
+    void aPairWithNoIndexedPoolIsRefusedBeforeTheWalletIsAsked() {
+        ConvertLiquidationRouter router = indexedRouter(indexHolding(java.util.List.of()));
+        router.beginCycle();
+        boolean[] asked = new boolean[1];
+
+        assertThrows(ConvertLiquidationRouter.NoPoolException.class,
+                () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        recording(asked), ROLE_C, collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertFalse(asked[0], "the wallet selector must not be asked when no pool exists");
+    }
+
+    /** FAB-194-3 — no pool address configured: {@code NoPoolException} with the new advice, the selector never asked. */
+    @Test
+    void aBlankPoolAddressIsRefusedBeforeTheWalletIsAsked() {
+        AppConfig.LoansConfiguration blank = new AppConfig.LoansConfiguration() {
+            @Override
+            public String getMinswapPoolAddress() {
+                return "  ";
+            }
+        };
+        ConvertLiquidationRouter router = new ConvertLiquidationRouter(LoanFixtures.registry(), blank, null,
+                new FixedPoolResolver(), null, null, LoanFixtures.converters(), LoanFixtures.NETWORK);
+        boolean[] asked = new boolean[1];
+
+        var e = assertThrows(ConvertLiquidationRouter.NoPoolException.class,
+                () -> router.buildConvertLiquidation(candidate(), loanUtxo(), null, null, null,
+                        recording(asked), ROLE_C, collateralOracle(), "addr_change",
+                        1_760_000_000_000L, 1_760_000_120_000L));
+
+        assertEquals("convert unavailable: no Minswap pool address configured for this network, so there is no "
+                + "pool to swap " + FLDT.toUnit() + " against; set loans.minswap.pool-address, or set this market "
+                + "to action: CONVERT_BEFORE_ANTICIPATE with a cap if the loan should still be liquidated",
+                e.getMessage());
+        assertFalse(asked[0], "the wallet selector must not be asked when no pool address is configured");
+    }
+
+    /** FAB-194-3 — {@code convertEnabled()} answers {@code loans.liquidation.convert.enabled}, read off a real gate. */
+    @Test
+    void convertEnabledAnswersTheEconomicsGatesOwnSwitch() {
+        for (boolean enabled : new boolean[]{true, false}) {
+            ConvertEconomics economics = new ConvertEconomics(new AppConfig.ConvertConfiguration(enabled), null, null);
+            ConvertLiquidationRouter router = new ConvertLiquidationRouter(LoanFixtures.registry(),
+                    configuredForMinswap(), null, new FixedPoolResolver(), economics, null,
+                    LoanFixtures.converters(), LoanFixtures.NETWORK);
+
+            assertEquals(enabled, economics.enabled());
+            assertEquals(enabled, router.convertEnabled());
+        }
     }
 }

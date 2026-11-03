@@ -238,14 +238,16 @@ public class LiquidationExecutor {
 
     /**
      * The CONVERT seam. A convert-eligible candidate whose market says {@code action: CONVERT} — which
-     * is every unlisted market, per Giovanni's ruling — is routed here rather than to
-     * {@link #payInAdvanceRouter}.
+     * is every unlisted market, per Giovanni's ruling — or {@code action: CONVERT_BEFORE_ANTICIPATE} is
+     * routed here rather than to {@link #payInAdvanceRouter}; the second falls back to pay-in-advance, in the
+     * same check, only when a convert is impossible (FAB-194-3, {@link #convert}).
      *
-     * <p>⚠ <b>Nullable, and its absence is a NAMED refusal rather than a fallback.</b> A node whose
-     * {@code loans.minswap.*} coordinates belong to another network cannot derive the convert action
-     * at all (§36.1), so this bean legitimately does not exist there. Quietly routing such a candidate
-     * to pay-in-advance instead would front the operator's capital on a loan they configured to
-     * convert — <b>the one substitution that spends money nobody authorised.</b>
+     * <p>⚠ <b>Always wired in production</b>: {@code YaciConfig.convertLiquidationRouter} is an unconditional
+     * {@code @Bean}. It is null only through the test constructor that takes no router, and there a
+     * {@code CONVERT} or {@code CONVERT_BEFORE_ANTICIPATE} market is refused {@code CONVERT_UNAVAILABLE} by
+     * name rather than paid in advance: quietly routing such a candidate to pay-in-advance would front the
+     * operator's capital on a loan nothing said could not convert — <b>the one substitution that spends
+     * money nobody authorised.</b>
      */
     private final ConvertLiquidationRouter convertRouter;
 
@@ -652,7 +654,8 @@ public class LiquidationExecutor {
      * readable.
      */
     private void dumpShadowTransaction(LiquidationAssessment assessment, Verdict verdict,
-                                       Transaction transaction, String cborHex, int size, String detail) {
+                                       Transaction transaction, String cborHex, int size, String detail,
+                                       CandidatePass pass) {
         if (verdict.outcome() != LiquidationDecision.Outcome.WOULD_SUBMIT || verdict.veto() == null) {
             return;
         }
@@ -667,7 +670,7 @@ public class LiquidationExecutor {
                         + "exunits=[{}] economics={} — PHASE-2 ONLY: the scripts evaluated, but the "
                         + "ledger's phase-1 rules (fee, min-ada, witnesses, collateral) are NOT proven "
                         + "by this. Nothing was signed and nothing was submitted.",
-                assessment.loan().utxoRef(), variantOf(assessment), verdict.veto(), size,
+                assessment.loan().utxoRef(), variantOf(pass), verdict.veto(), size,
                 exUnits, detail);
         if (exUnits.startsWith(PLACEHOLDER_MARKER)) {
             log.error("⛔ THE SHADOW DUMP ABOVE PROVES NOTHING: every redeemer carries cardano-client-lib's "
@@ -1078,11 +1081,21 @@ public class LiquidationExecutor {
      * pass line only (FAB-195), whether a submit was not accepted and whether a failure of ours ended it — read
      * by {@link #count} and nothing else. Created per candidate and dropped with it; nothing in it outlives the
      * call.
+     * <p>
+     * FAB-194-3: {@code route} is THE ROUTE THE CANDIDATE IS BUILT ON — planned at the top of {@code consider()}
+     * by {@link #plannedRoute}, changed only by a fallback — and the single input of every record: the
+     * variant, the F1 bracket, the S-15 rider and the pre-build {@code MARKET_DISABLED} refusal all read it.
+     * {@code fallbackCause} is set when a {@code CONVERT_BEFORE_ANTICIPATE} market fell back to pay-in-advance,
+     * and prefixes the detail of the row the candidate ends in ({@link #FALLBACK_DETAIL_FORMAT}).
      */
     private static final class CandidatePass {
         private final SubmitFence fence;
         private final WalletCheck walletCheck;
         private String route = ROUTE_PLAIN;
+        /** FAB-194-3: the market action {@link #plannedRoute} read; null for a bond that forbids conversion. */
+        private AppConfig.LiquidationConfiguration.Action action;
+        /** FAB-194-3: why convert was abandoned for pay-in-advance in this check; null unless it was. */
+        private String fallbackCause;
         private String output = "none";
         private Set<String> usedIfAccepted = Set.of();
         private boolean accepted;
@@ -1117,10 +1130,25 @@ public class LiquidationExecutor {
         }
     }
 
-    /** The routes the non-accepted line names (FAB-186). */
+    /** The routes the non-accepted line names (FAB-186), and since FAB-194-3 the input of every record. */
     static final String ROUTE_PLAIN = "plain";
     static final String ROUTE_CONVERT = "convert";
     static final String ROUTE_PAY_IN_ADVANCE = "pay-in-advance";
+
+    /**
+     * FAB-194-3: the start of the detail of every row a candidate records after its
+     * {@code CONVERT_BEFORE_ANTICIPATE} market fell back to pay-in-advance; {@code %s} is the cause. The
+     * {@code reason} field is untouched, so an operator grouping refusals by reason groups them as before.
+     */
+    static final String FALLBACK_DETAIL_FORMAT = "fallback to pay-in-advance (no convert: %s): ";
+
+    /** FAB-194-3: the three causes a {@code CONVERT_BEFORE_ANTICIPATE} market falls back for — and no other. */
+    static final String FALLBACK_NO_MINSWAP_POOL = "NO_MINSWAP_POOL";
+    static final String FALLBACK_POOL_TOO_THIN = "POOL_TOO_THIN";
+    static final String FALLBACK_CONVERT_DISABLED = "CONVERT_DISABLED";
+
+    /** The message the {@code CONVERT_DISABLED} fallback line carries in place of an exception's. */
+    static final String CONVERT_DISABLED_MESSAGE = "loans.liquidation.convert.enabled is false";
 
     // ---- the order a cycle walks its candidates in (FAB-144) ------------------------------------
 
@@ -1242,6 +1270,9 @@ public class LiquidationExecutor {
                                 long committedSlot, long validFromFloorMillis, long validToMillis,
                                 WalletCheck walletCheck, Utxo configUtxo, Utxo lmConfigUtxo,
                                 Map<String, OracleEntry> oraclesByUnit, CandidatePass pass) {
+        // FAB-194-3 — THE ROUTE, PLANNED ONCE, before anything is recorded: every row below, the NO_UTXO one
+        // included, is labelled by it, and only a fallback changes it.
+        pass.route = plannedRoute(assessment, pass);
         BigInteger feeCeiling = walletCheck.feeCeiling();
         String loanUtxoRef = assessment.loan().utxoRef();
         // The designated output, and what a selector found it short of, for the WALLET_INPUT_TOO_SMALL row.
@@ -1264,7 +1295,7 @@ public class LiquidationExecutor {
                     loanUtxo.isEmpty() && bondUtxo.isEmpty() ? "both utxos"
                             : loanUtxo.isEmpty() ? "the loan utxo" : "the bond utxo",
                     loanUtxoRef, loanUtxo.isPresent(), bondUtxoRef, bondUtxo.isPresent());
-            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.NO_UTXO,
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.NO_UTXO,
                     LiquidationDecision.Outcome.NO_UTXO.name(),
                     "loan utxo present=%s, bond utxo present=%s — spent since the scan"
                             .formatted(loanUtxo.isPresent(), bondUtxo.isPresent())));
@@ -1278,15 +1309,16 @@ public class LiquidationExecutor {
         //
         // (1) A DISABLED market, plain and convert. It used to be built in full and only then vetoed S2
         // MARKET_NOT_LIVE. Pay-in-advance is excluded because MarketGate.decide already refuses it inside
-        // its router, before that route builds anything, with its own recorded text.
-        boolean payInAdvance = isPayInAdvanceRoute(assessment);
+        // its router, before that route builds anything, with its own recorded text. FAB-194-3: the PLANNED
+        // route decides, so a DISABLED CONVERT_BEFORE_ANTICIPATE market (planned convert) is refused here too.
+        boolean payInAdvance = ROUTE_PAY_IN_ADVANCE.equals(pass.route);
         AssetType principal = assessment.loan().datum().principalAsset();
         AppConfig.LiquidationConfiguration.Mode marketMode = new MarketGate(configuration).effectiveMode(principal);
         if (!payInAdvance && marketMode == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
             String detail = "market %s is DISABLED (node mode %s), so the bot does nothing in it — refused before "
                     .formatted(principal == null ? "<unknown>" : principal.toUnit(), configuration.getMode())
                     + "any build";
-            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
                     "MARKET_DISABLED", detail));
             log.info("the liquidation of {} was refused: {}", loanUtxoRef, detail);
             return WorkResult.DEFINITE_FAILURE;
@@ -1298,7 +1330,7 @@ public class LiquidationExecutor {
                 && configuration.getMode() == AppConfig.LiquidationConfiguration.Mode.LIVE
                 && marketMode == AppConfig.LiquidationConfiguration.Mode.LIVE
                 && !configuration.isIgnoreProfitCheck()) {
-            LiquidationDecision unprofitable = certainlyUnprofitable(assessment, now, oraclesByUnit);
+            LiquidationDecision unprofitable = certainlyUnprofitable(assessment, pass, now, oraclesByUnit);
             if (unprofitable != null) {
                 decisionLog.record(unprofitable);
                 log.info("the liquidation of {} was refused as UNPROFITABLE: {}", loanUtxoRef,
@@ -1345,7 +1377,7 @@ public class LiquidationExecutor {
                     + "the chain; retried on the next block")
                     .formatted(notYet.newestValidFromMillis(), notYet.gapMillis(), notYet.anchorMillis(),
                             notYet.firstSlotMillis());
-            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
                     "ORACLE_FEED_NOT_YET_VALID", detail));
             log.info("the liquidation of {} waits for the chain: {}", loanUtxoRef, detail);
             return WorkResult.DEFINITE_FAILURE;
@@ -1357,9 +1389,11 @@ public class LiquidationExecutor {
                     + "validFrom (anchor {})", loanUtxoRef, validFromMillis, validFromFloorMillis,
                     clamped.anchorMillis());
         }
+        BuildInputs inputs = new BuildInputs(loanUtxo.get(), bondUtxo.get(), configUtxo, lmConfigUtxo,
+                oraclesByUnit, validFromMillis, validToMillis);
 
         Transaction transaction;
-        if (assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
+        if (!ROUTE_PLAIN.equals(pass.route)) {
             // ⛔ ANNOUNCE IT. On this path the bot PAYS the lender ada out of its own wallet and
             // acquires the collateral token — the opposite sign to the plain path, and a trade
             // nobody has specified the intended end state for. It emitted NO log line of any kind
@@ -1367,349 +1401,46 @@ public class LiquidationExecutor {
             // read off chain. An armed, unspecified and unobservable behaviour is three problems,
             // and the cheapest of them to fix is the third.
             // ⛔ THE MECHANISM IS THE OPERATOR'S, WITHIN THE CLASS THE LENDER PERMITTED. The bond flag
-            // above says this loan MAY be converted; the market says HOW (findings §27). An unlisted
+            // says this loan MAY be converted; the market says HOW (findings §27). An unlisted
             // market converts — Giovanni's ruling, and the safe default, because convert fronts no
-            // capital and holds nothing.
-            AppConfig.LiquidationConfiguration.Action action =
-                    new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset());
-            // Exhaustive, no default: a new action does not compile until it names its route.
-            boolean convertRoute = switch (action) {
-                case CONVERT, CONVERT_BEFORE_ANTICIPATE -> true;
-                case ANTICIPATE -> false;
-            };
-
-            if (convertRoute) {
-                // ⚠ A node whose loans.minswap.* belong to another network cannot derive the convert
-                // action at all, so this bean legitimately does not exist there. Refusing by NAME is
-                // the only honest answer: silently falling back to pay-in-advance would front the
-                // operator's own capital on a loan they configured to convert — the one substitution
-                // that spends money nobody authorised.
+            // capital and holds nothing. FAB-194-3: plannedRoute() read the market once, at the top of
+            // this method, and the branch below reads what it planned.
+            Built built;
+            if (ROUTE_CONVERT.equals(pass.route)) {
+                // ⚠ The router bean is always wired in production (YaciConfig.convertLiquidationRouter is an
+                // unconditional @Bean); it is null only through the test constructor that takes no router.
+                // There a CONVERT or CONVERT_BEFORE_ANTICIPATE market is refused by NAME: silently paying in
+                // advance instead would front the operator's own capital on a loan nothing said could not
+                // convert — the one substitution that spends money nobody authorised.
                 if (convertRouter == null) {
                     String why = "market " + assessment.loan().datum().principalAsset().toUnit()
-                            + " is action: " + action + " but this node cannot convert (loans.minswap.* is "
+                            + " is action: " + pass.action + " but this node cannot convert (loans.minswap.* is "
                             + "unset or belongs to another network — see the CONVERT UNAVAILABLE line "
                             + "at boot). NOT falling back to pay-in-advance: that would front capital "
                             + "the operator did not authorise";
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                    decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
                             "CONVERT_UNAVAILABLE", why));
                     log.warn("the liquidation of {} was refused: {}", loanUtxoRef, why);
                     return WorkResult.DEFINITE_FAILURE;
                 }
-                // FAB-185 — funded from U, and only from U.
-                pass.route = ROUTE_CONVERT;
-                designated = designated(assessment, now, walletCheck, ROLE_U, walletCheck.roles().u());
-                if (designated == null) {
-                    return WorkResult.DEFINITE_FAILURE;
-                }
-                pass.output = WalletRoles.ref(designated);
-                Utxo convertFunding = designated;
-                log.info("{} is a CONVERT liquidation (LiquidateAndConvert): the bot creates a Minswap "
-                                + "order, fronts nothing, and keeps the liquidation fee in collateral",
-                        loanUtxoRef);
-                try {
-                    transaction = convertRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
-                            bondUtxo.get(), configUtxo, lmConfigUtxo,
-                            // ⛔ SIZED, via the sibling's selector shape. The router asks for what the
-                            // order actually costs; U is offered when it covers that plus the fee ceiling
-                            // (FAB-185), and nothing else is ever offered. U is ada-only by construction
-                            // (WalletInputSelection.nominable), so a published REFERENCE SCRIPT can never
-                            // be handed out here (CCL trap 9b/26a, the 2026-08-24 incident class).
-                            orderLovelace -> sized(loanUtxoRef, ROLE_U,
-                                    convertFunding, WalletRoles.convertRequired(orderLovelace, feeCeiling),
-                                    needed),
-                            // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
-                            walletCheck.roles().c().orElse(null),
-                            oraclesByUnit,
-                            account.baseAddress(), validFromMillis, validToMillis);
-                } catch (ConvertLiquidationRouter.NoPoolException e) {
-                    // Impossible, not unprofitable — and the fix is the operator's: set this market to
-                    // action: ANTICIPATE if the loan should still be liquidated.
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                            "NO_MINSWAP_POOL", e.getMessage()));
-                    log.info("the convert liquidation of {} was refused: {}", loanUtxoRef, e.getMessage());
-                    return WorkResult.DEFINITE_FAILURE;
-                } catch (ConvertLiquidationRouter.UnprofitableException e) {
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.UNPROFITABLE,
-                            String.valueOf(e.assessment().exclusion()), e.getMessage()));
-                    log.info("the convert liquidation of {} is not worth doing: {}", loanUtxoRef,
-                            e.getMessage());
-                    return WorkResult.DEFINITE_FAILURE;
-                } catch (ConvertOrderPlan.RefusedException e) {
-                    // ⛔ A VERDICT ABOUT THE CANDIDATE, NOT A FAULT — so it is recorded at INFO.
-                    //
-                    // The five ConvertOrderPlan refusals (the bond forbids conversion, equity is in the
-                    // principal currency, the pool is for a different pair, nothing is left to swap,
-                    // the pool is too thin) are all statements about this loan against this pool. Each
-                    // is reproducible next cycle, each costs one plan and no transaction, and none of
-                    // them is evidence that anything is broken: they are eligibility filters, not
-                    // failures, and a single Minswap swap can make the candidate viable again.
-                    //
-                    // ⚑ This is the plain path's RefusedException treatment, arrived at for the same
-                    // reason: before this catch existed EVERY one of these fell to the generic branch
-                    // below and was recorded as machinery failure at ERROR.
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                            e.refusal().name(), e.getMessage()));
-                    log.info("the convert liquidation of {} was refused as {}: {}",
-                            loanUtxoRef, e.refusal(), e.getMessage());
-                    return WorkResult.DEFINITE_FAILURE;
-                } catch (MinswapPoolResolver.RefusedException e) {
-                    // ⛔ THE POOL LOOKUP REFUSED — and WHICH refusal decides whether this is a verdict
-                    // or a failure to read the local pool index. They are not the same fact and must not
-                    // read alike.
-                    if (e.refusal() == MinswapPoolResolver.Refusal.LOOKUP_FAILED) {
-                        // An INDEX READ failure (the node's own database, FAB-137 — no provider is asked
-                        // any more) on an eligible candidate: retried on the very next cycle
-                        // and logged at ERROR on every cycle it happens (FAB-134 NQ). It used to be held
-                        // for two cycles at WARN — and before that, measured on mainnet 2026-09-09, for
-                        // thirty minutes — and a candidate the bot should liquidate but cannot is a
-                        // fault to be seen and fixed, not waited out.
-                        decisionLog.record(decision(assessment, now,
-                                LiquidationDecision.Outcome.REFUSED, e.refusal().name(),
-                                e.getMessage() + ". This is not a verdict: the local pool index (the "
-                                        + "node's own database) could not be read, which says nothing "
-                                        + "about whether a pool exists, which is what NO_MINSWAP_POOL "
-                                        + "reports."));
-                        pass.error = true;
-                        log.error("the pool lookup for {} via {} failed reading the local pool index: {} — the "
-                                        + "candidate itself was never assessed; retried next cycle",
-                                loanUtxoRef, ROUTE_CONVERT, causeChain(e));
-                        log.debug("the pool lookup for {} via {} failed reading the local pool index",
-                                loanUtxoRef, ROUTE_CONVERT, e);
-                        return WorkResult.DEFINITE_FAILURE;
-                    }
-                    // ⛔ AMBIGUOUS_POOL: two AUTHENTIC pools for one pair in the local index. Minswap
-                    // cannot produce that on chain, so it is an index-integrity fault, not a verdict
-                    // about the candidate — ERROR on every cycle it persists, no pool is chosen, and
-                    // nothing was built, so the wallet is untouched.
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                            e.refusal().name(), e.getMessage()));
-                    pass.error = true;
-                    log.error("the convert liquidation of {} via {} was refused as {}: {}",
-                            loanUtxoRef, ROUTE_CONVERT, e.refusal(), causeChain(e));
-                    log.debug("the convert liquidation of {} via {} was refused as {}",
-                            loanUtxoRef, ROUTE_CONVERT, e.refusal(), e);
-                    return WorkResult.DEFINITE_FAILURE;
-                } catch (ConvertLiquidationRouter.WalletInputTooSmallException e) {
-                    // A fact about the WALLET, not the candidate — an eligibility filter, reconsidered
-                    // every cycle, and cured by a top-up. Same treatment the pay-in-advance path gives
-                    // its own.
-                    String detail = tooSmallDetail(ROLE_U, convertFunding, null, needed, e.getMessage());
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                            "WALLET_INPUT_TOO_SMALL", detail));
-                    log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, detail);
-                    return WorkResult.DEFINITE_FAILURE;
-                } catch (ConvertLiquidationRouter.FeedWindowException e) {
-                    // FAB-183 — a feed whose window does not cover the body's is per-block feed timing,
-                    // not a machinery fault: nothing was built and no wallet utxo was spent, so nothing
-                    // is marked used. Reconsidered on the next block.
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                            "CONVERT_FEED_WINDOW", e.getMessage()));
-                    log.info("the convert liquidation of {} was refused as CONVERT_FEED_WINDOW: {}",
-                            loanUtxoRef, e.getMessage());
-                    return WorkResult.DEFINITE_FAILURE;
-                } catch (Exception e) {
-                    // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
-                    OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
-                    if (wait != null) {
-                        refuseNotYetVisible(assessment, now, wait);
-                        return WorkResult.DEFINITE_FAILURE;
-                    }
-                    // ⚠ WHAT IS LEFT HERE IS A GENUINE MACHINERY FAULT, and that is the point of the
-                    // four catches above: this branch used to swallow every verdict on the convert
-                    // route as well, so "the pool cannot fill the debt" and "the bot is broken" reached
-                    // the operator identically. Rebuilt next cycle, and loud on every one (FAB-134 NQ): one
-                    // ERROR line with the whole cause chain, the stack trace at DEBUG (FAB-195).
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                            rootReason(e), causeChain(e)));
-                    pass.error = true;
-                    log.error("building the convert liquidation of {} via {} failed: {}", loanUtxoRef,
-                            ROUTE_CONVERT, causeChain(e));
-                    log.debug("building the convert liquidation of {} via {} failed", loanUtxoRef,
-                            ROUTE_CONVERT, e);
-                    return WorkResult.DEFINITE_FAILURE;
-                }
-                // Falls through to the shared record-and-maybe-submit path below, deliberately: the
-                // seven submit vetoes, the shadow dump and the decision record are the SAME for every
-                // variant, and a convert that bypassed them would be the one path an operator cannot
-                // watch through the endpoint they already use.
+                built = convert(assessment, now, walletCheck, pass, inputs, marketMode);
             } else {
-
-            // ⛔ ANNOUNCE THE ASSET — "PAYS the lender in ada" was only ever true of the ada-principal
-            // shape; a token principal pays out that token, never ada. The AMOUNT is announced
-            // separately below, once the transaction exists and the figure can be MEASURED off it
-            // rather than re-derived — the same "off the finished body" discipline the builder's own
-            // index derivation uses.
-            AssetType payInAdvancePrincipal = assessment.loan().datum().principalAsset();
-            // FAB-185 — an ADA principal is funded from U; a token principal from the output holding the
-            // most of that token, never from U, however much larger U is.
-            String payInAdvanceRole = payInAdvancePrincipal.isAda() ? ROLE_U
-                    : ROLE_TOKEN + payInAdvancePrincipal.toUnit();
-            pass.route = ROUTE_PAY_IN_ADVANCE;
-            // ⛔ FAB-185 r2 (F3) — A DISABLED MARKET IS REFUSED BEFORE THE ROLE LOOKUP. Pay-in-advance is
-            // excluded from the pre-build MARKET_DISABLED refusal above because the router's MarketGate
-            // refuses it, with its own text; looking the role up first answered an operator who had
-            // disabled the market with WALLET_ROLE_MISSING and a WARN about a wallet the bot is not to use
-            // there. So a DISABLED market designates nothing and goes straight to the router, whose gate
-            // refuses it before the selector is ever asked — the row and level it always had.
-            if (marketMode == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
-                designated = null;
-            } else {
-                designated = designated(assessment, now, walletCheck, payInAdvanceRole,
-                        payInAdvancePrincipal.isAda()
-                                ? walletCheck.roles().u()
-                                : walletCheck.roles().tokenOutput(payInAdvancePrincipal.toUnit()));
-                if (designated == null) {
-                    return WorkResult.DEFINITE_FAILURE;
-                }
-                pass.output = WalletRoles.ref(designated);
+                built = payInAdvance(assessment, now, walletCheck, pass, inputs, marketMode);
             }
-            Utxo payInAdvanceFunding = designated;
-            log.info("{} is a PAY-IN-ADVANCE liquidation: the bot PAYS the lender in {} and acquires "
-                            + "the collateral, rather than earning a fee",
-                    loanUtxoRef, payInAdvancePrincipal.isAda() ? "ada" : payInAdvancePrincipal.toUnit());
-            // Convert loan: routed to the promoted, submit-incapable pay-in-advance builder. The same
-            // window the plain path uses is handed to the router, which derives its own slots from it.
-            // FAB-128 — the token split behind principalBalance, kept for the market-gate catch below;
-            // null on the ada branch, whose count is untouched.
-            WalletInputSelection.TokenHolding principalHolding = null;
-            try {
-                // Part 3 — the balance MarketGate's decide() checks. ⚠ FAB-185 residue: it still sums the
-                // whole wallet as read at the start of this check, so a candidate it allows can still be
-                // refused below by role, by name.
-                if (!payInAdvancePrincipal.isAda()) {
-                    // ⛔ F7 (round 2) — count ONLY utxos carrying the ada floor beside the token: a 2,000
-                    // USDM + 1.4 ADA utxo would otherwise inflate the balance MarketGate saw by a
-                    // candidate the wallet could never actually fund (M13).
-                    principalHolding = WalletInputSelection.tokenHolding(walletCheck.wallet(),
-                            payInAdvancePrincipal,
-                            WalletInputSelection.tokenPrincipalRequiredAda(Optional.of(feeCeiling)));
-                }
-                BigInteger principalBalance = payInAdvancePrincipal.isAda()
-                        ? walletCheck.wallet().stream().filter(WalletInputSelection::nominable)
-                                .map(LedgerCeilings::lovelaceOf).reduce(BigInteger.ZERO, BigInteger::add)
-                        : principalHolding.spendable();
-                transaction = payInAdvanceRouter.buildConvertLiquidation(assessment, loanUtxo.get(),
-                        bondUtxo.get(), configUtxo, lmConfigUtxo, oraclesByUnit, principalBalance,
-                        // The router knows the lender payout, this knows the wallet and the fee ceiling.
-                        // Only the designated output is ever offered (FAB-185), and only when it covers
-                        // the payout plus the pre-build ceilings.
-                        lenderPayout -> {
-                            if (payInAdvanceFunding == null) {
-                                // Unreachable while the router's gate reads this same configuration: it
-                                // refuses a DISABLED market before asking. Loud if that ever stops holding.
-                                throw new IllegalStateException("market " + payInAdvancePrincipal.toUnit()
-                                        + " is DISABLED, so no role output was designated, yet the router "
-                                        + "asked for one");
-                            }
-                            return payInAdvancePrincipal.isAda()
-                                    ? sized(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
-                                            WalletRoles.adaAnticipateRequired(lenderPayout, feeCeiling), needed)
-                                    : sizedToken(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
-                                            payInAdvancePrincipal.toUnit(), lenderPayout,
-                                            WalletRoles.tokenOutputRequiredAda(feeCeiling), needed);
-                        },
-                        // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
-                        walletCheck.roles().c().orElse(null),
-                        validFromMillis,
-                        validToMillis);
-                // ⛔ THE AMOUNT — "PAYS the lender 1,033,850,000 c48cbb3d…0014df105553444d and
-                // acquires the collateral", never "ada" unless it is ada. Measured off the BUILT body
-                // (payInAdvanceAmountPaid), not re-derived, so this line cannot disagree with what the
-                // transaction actually pays.
-                BigInteger paid = payInAdvanceAmountPaid(transaction, payInAdvancePrincipal);
-                log.info("{} pays the lender {} {} and acquires the collateral", loanUtxoRef, paid,
-                        payInAdvancePrincipal.isAda() ? "lovelace" : payInAdvancePrincipal.toUnit());
-            } catch (PayInAdvanceLiquidationRouter.WalletInputTooSmallException e) {
-                // The router knows the lender payout and nothing about the wallet; THIS knows which role
-                // output was offered and what it was found short of, so the message is completed here.
-                // A clean statement about this candidate against this wallet — an eligibility filter,
-                // reconsidered every check, and cured by a top-up.
-                String convertDetail = tooSmallDetail(payInAdvanceRole, payInAdvanceFunding,
-                        payInAdvancePrincipal.isAda() ? null : payInAdvancePrincipal.toUnit(), needed,
-                        e.getMessage());
-                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        "WALLET_INPUT_TOO_SMALL", convertDetail));
-                log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, convertDetail);
-                return WorkResult.DEFINITE_FAILURE;
-            } catch (PayInAdvanceLiquidationRouter.MarketGateRefusedException e) {
-                // A POLICY refusal, not a capability gap: this market is disabled, or the principal
-                // the candidate would have us front exceeds the operator's stated cap. Recorded the
-                // same clean way, and deliberately a separate catch so the log says which it was.
-                //
-                // FAB-128 — "holds 0" is true of what is COUNTED, and stays the reason. When the wallet
-                // does hold the token, but only in UTxOs short of the ada floor, the DETAIL says so and
-                // names the remedy; the reason an operator groups refusals by does not change.
-                String detail = e.getMessage();
-                MarketGate.Decision refused = e.decision();
-                if (refused != null && refused.refusal() == MarketGate.Refusal.INSUFFICIENT_BALANCE
-                        && principalHolding != null) {
-                    String unit = payInAdvancePrincipal.toUnit();
-                    String note = principalHolding.adaFloorNote(q -> q + " " + unit, refused.required(), true);
-                    if (note != null) {
-                        detail = e.getMessage() + "; " + note;
-                    }
-                }
-                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        e.getMessage(), detail));
-                log.info("the convert liquidation of {} was refused by the market gate: {}",
-                        loanUtxoRef, detail);
-                return WorkResult.DEFINITE_FAILURE;
-            } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
-                // All seven construction sites describe a candidate or oracle state this route cannot
-                // build this cycle: PayInAdvanceLiquidationRouter:164 is negative equity (unreachable
-                // through a real assessment because LoanFinance.redeemerEquity floors at zero);
-                // LiquidatePayInAdvanceTransactionBuilder:522 and :528 are the collateral feed window
-                // and margin; :539 and :545 are the principal feed window and margin; :1243-1244 is a
-                // POOLED or PRICE_DATA_ORCFAX variant; and :1264 is an entry not usable this cycle.
-                //
-                // Setting a market to CONVERT cures none of them. Window and margin are per-cycle feed
-                // timing and clear by themselves unless the configured oracle margin exceeds what any
-                // feed can leave after validTo. Variant and usability are oracle-entry properties:
-                // OracleEntry.usableForLiquidation() is false for POOLED/ORCFAX (OracleEntry.java:124),
-                // and ConvertTransactionBuilder.build refuses a collateral oracle that is not usable
-                // for liquidation (ConvertTransactionBuilder.java:237). Negative equity says nothing
-                // about the mechanism. Since `action` is market-wide, that advice would re-route every
-                // loan in the market on the strength of a refusal conversion cannot repair.
-                //
-                // The 2026-09-09 remedy-wording ruling distinguished routability from profitability;
-                // FAB-126 removes the remedy because no remaining construction site is cured by it.
-                String principalUnit = assessment.loan().datum().principalAsset().toUnit();
-                log.info("the pay-in-advance liquidation of {} (principal {}) was refused: {} — "
-                                + "reconsidered every cycle",
-                        loanUtxoRef, principalUnit, e.getMessage());
-                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        e.getMessage(), e.getMessage()));
-                return WorkResult.DEFINITE_FAILURE;
-            } catch (Exception e) {
-                // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
-                OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
-                if (wait != null) {
-                    refuseNotYetVisible(assessment, now, wait);
-                    return WorkResult.DEFINITE_FAILURE;
-                }
-                // A genuine builder failure, treated exactly as the plain path's machinery-failure
-                // branch: rebuilt next cycle and logged at ERROR on every cycle (FAB-134 NQ — a
-                // candidate the bot should liquidate but cannot is a bug, and a bug that goes quiet
-                // is a bug nobody fixes). The refusal MUST say why: the builder wraps the real
-                // fault as IllegalStateException("cannot build the pay-in-advance transaction", cause),
-                // so recording only e.getMessage() drops the cause and leaves the operator debugging
-                // blind. The detail carries the whole cause chain, and so does the ONE ERROR line (FAB-195) —
-                // root message included, so an INFO-level node still reads why; the stack trace goes to DEBUG.
-                // A build failure whose cause never reaches the log hides the next one too.
-                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
-                        rootReason(e), causeChain(e)));
-                pass.error = true;
-                log.error("building the pay-in-advance liquidation of {} via {} failed: {}",
-                        loanUtxoRef, ROUTE_PAY_IN_ADVANCE, causeChain(e));
-                log.debug("building the pay-in-advance liquidation of {} via {} failed",
-                        loanUtxoRef, ROUTE_PAY_IN_ADVANCE, e);
+            if (built == null) {
+                // Refused by name, or skipped: whatever ended it already said so.
                 return WorkResult.DEFINITE_FAILURE;
             }
-            }
+            transaction = built.transaction();
+            designated = built.designated();
+            // Falls through to the shared record-and-maybe-submit path below, deliberately: the
+            // seven submit vetoes, the shadow dump and the decision record are the SAME for every
+            // variant, and a convert that bypassed them would be the one path an operator cannot
+            // watch through the endpoint they already use.
         } else {
             // FAB-185 — a plain liquidation fronts nothing: the collateral it collects funds every output
             // it creates, so the only ada it brings is the fee, and it brings it from U.
-            designated = designated(assessment, now, walletCheck, ROLE_U, walletCheck.roles().u());
+            designated = designated(assessment, pass, now, walletCheck, ROLE_U, walletCheck.roles().u());
             if (designated == null) {
                 return WorkResult.DEFINITE_FAILURE;
             }
@@ -1721,7 +1452,7 @@ public class LiquidationExecutor {
                 // next check, and cured by a top-up. An eligibility filter, decided before any build.
                 String detail = tooSmallDetail(ROLE_U, designated, null, needed,
                         "U cannot fund this liquidation's fee ceiling.");
-                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
                         "WALLET_INPUT_TOO_SMALL", detail));
                 log.warn("the liquidation of {} was refused: {}", loanUtxoRef, detail);
                 return WorkResult.DEFINITE_FAILURE;
@@ -1762,7 +1493,7 @@ public class LiquidationExecutor {
                 // looking identical. The other forty-eight carry no cause and are untouched: a clean
                 // verdict needs no stack trace, and logging every refusal at ERROR would bury the two
                 // that matter under the forty-eight that do not.
-                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
                         e.getReason().name(), refusalDetail(e)));
                 if (e.getCause() != null) {
                     // FAB-195: one ERROR line with the whole cause chain, the stack trace at DEBUG.
@@ -1785,7 +1516,7 @@ public class LiquidationExecutor {
                 // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
                 OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
                 if (wait != null) {
-                    refuseNotYetVisible(assessment, now, wait);
+                    refuseNotYetVisible(assessment, pass, now, wait);
                     return WorkResult.DEFINITE_FAILURE;
                 }
                 // Anything else is a failure of the machinery rather than a verdict on the candidate —
@@ -1793,7 +1524,7 @@ public class LiquidationExecutor {
                 // ERROR on every cycle (FAB-134 NQ). Same rule as the convert branch: the whole cause chain
                 // in the detail and in the ONE ERROR line, where an INFO-level operator sees it; the stack
                 // trace at DEBUG (FAB-195).
-                decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+                decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
                         rootReason(e), causeChain(e)));
                 pass.error = true;
                 log.error("building the liquidation of {} via {} failed: {}", loanUtxoRef, ROUTE_PLAIN,
@@ -1846,6 +1577,465 @@ public class LiquidationExecutor {
         return WorkResult.DEFINITE_FAILURE;
     }
 
+    /** What every route builds from, resolved once by {@code consider()} (FAB-194-3). */
+    private record BuildInputs(Utxo loanUtxo, Utxo bondUtxo, Utxo configUtxo, Utxo lmConfigUtxo,
+                               Map<String, OracleEntry> oraclesByUnit, long validFromMillis, long validToMillis) {
+    }
+
+    /** A route's built transaction and the wallet output it was funded from (null for none, FAB-185). */
+    private record Built(Transaction transaction, Utxo designated) {
+    }
+
+    /**
+     * FAB-194-3: thrown by a {@code CONVERT_BEFORE_ANTICIPATE} market's wallet selector when U is missing, to
+     * carry the end of the candidate out through the router. {@link #designated} has already recorded its ONE
+     * {@code WALLET_ROLE_MISSING} row; nothing else may record, log or fall back for it. No stack trace: it is
+     * a control signal, never a fault.
+     */
+    private static final class CandidateEnded extends RuntimeException {
+        private CandidateEnded() {
+            super(null, null, false, false);
+        }
+    }
+
+    /**
+     * FAB-194-3 — THE CONVERT ROUTE of one candidate whose router exists: the built transaction and the U it
+     * is funded from, or null when the candidate ended here with its one row recorded. A
+     * {@code CONVERT_BEFORE_ANTICIPATE} market — and only that one — falls back to pay-in-advance, in this
+     * same call, when a convert is IMPOSSIBLE: convert switched off (asked before any build), no pool, or a
+     * pool too thin. Every other outcome is handled exactly as a {@code CONVERT} market handles it, by the one
+     * handler both share ({@link #refuseConvert}).
+     *
+     * <p>⛔ <b>The two markets designate U at different moments, and the difference is the point.</b> A
+     * {@code CONVERT} market designates U BEFORE the router is asked — its order since FAB-185, so a missing U
+     * is its first answer. A {@code CONVERT_BEFORE_ANTICIPATE} market designates U only when the router's
+     * selector asks for it, which the real router does only after the pool verdict and the order plan: so a
+     * missing U can never hide a fallback that needs no U (D12). And the designation stays inside the handler
+     * that owns its failure (CCL trap 19): a missing U is {@link #designated}'s single
+     * {@code WALLET_ROLE_MISSING} row, carried out of the router by {@link CandidateEnded} and answered by
+     * nothing else — not an ERROR, not a second row, not a fallback.
+     */
+    private Built convert(LiquidationAssessment assessment, long now, WalletCheck walletCheck, CandidatePass pass,
+                          BuildInputs inputs, AppConfig.LiquidationConfiguration.Mode marketMode) {
+        String loanUtxoRef = assessment.loan().utxoRef();
+        BigInteger feeCeiling = walletCheck.feeCeiling();
+        // Exhaustive, no default: a new action does not compile until it says whether its convert may fall back.
+        boolean mayFallBack = switch (pass.action) {
+            case CONVERT_BEFORE_ANTICIPATE -> true;
+            case CONVERT, ANTICIPATE -> false;
+        };
+        // D5b — asked BEFORE any build, and of this market only. A CONVERT market never asks: its convert is
+        // refused NOT_ARMED by the economics gate after the build, as it always was.
+        if (mayFallBack && !convertRouter.convertEnabled()) {
+            return fallBack(assessment, now, walletCheck, pass, inputs, marketMode, FALLBACK_CONVERT_DISABLED,
+                    CONVERT_DISABLED_MESSAGE);
+        }
+        // What the selector found U short of, for the WALLET_INPUT_TOO_SMALL row.
+        Need needed = new Need();
+        // FAB-185 — funded from U, and only from U. Held for the row that names it.
+        Utxo[] funding = new Utxo[1];
+        if (!mayFallBack) {
+            Utxo u = designated(assessment, pass, now, walletCheck, ROLE_U, walletCheck.roles().u());
+            if (u == null) {
+                return null;
+            }
+            funding[0] = convertFundedFrom(pass, u, loanUtxoRef);
+        }
+        Transaction transaction;
+        try {
+            transaction = convertRouter.buildConvertLiquidation(assessment, inputs.loanUtxo(),
+                    inputs.bondUtxo(), inputs.configUtxo(), inputs.lmConfigUtxo(),
+                    // ⛔ SIZED, via the sibling's selector shape. The router asks for what the
+                    // order actually costs; U is offered when it covers that plus the fee ceiling
+                    // (FAB-185), and nothing else is ever offered. U is ada-only by construction
+                    // (WalletInputSelection.nominable), so a published REFERENCE SCRIPT can never
+                    // be handed out here (CCL trap 9b/26a, the 2026-08-24 incident class).
+                    orderLovelace -> {
+                        if (funding[0] == null) {
+                            // CONVERT_BEFORE_ANTICIPATE: the pool verdict is in, so U is designated now.
+                            Utxo u = designated(assessment, pass, now, walletCheck, ROLE_U, walletCheck.roles().u());
+                            if (u == null) {
+                                throw new CandidateEnded();
+                            }
+                            funding[0] = convertFundedFrom(pass, u, loanUtxoRef);
+                        }
+                        return sized(loanUtxoRef, ROLE_U, funding[0],
+                                WalletRoles.convertRequired(orderLovelace, feeCeiling), needed);
+                    },
+                    // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
+                    walletCheck.roles().c().orElse(null),
+                    inputs.oraclesByUnit(),
+                    account.baseAddress(), inputs.validFromMillis(), inputs.validToMillis());
+        } catch (CandidateEnded ended) {
+            return null;
+        } catch (Exception e) {
+            // ⛔ ONLY the two IMPOSSIBLE verdicts fall back (D1), and only in the market that asked for it.
+            String cause = mayFallBack ? fallbackCause(e) : null;
+            if (cause != null) {
+                return fallBack(assessment, now, walletCheck, pass, inputs, marketMode, cause, e.getMessage());
+            }
+            refuseConvert(assessment, now, pass, e, funding[0], needed);
+            return null;
+        }
+        return new Built(transaction, funding[0]);
+    }
+
+    /** U, designated for a convert: the output the check's lines name, and the CONVERT announcement. */
+    private static Utxo convertFundedFrom(CandidatePass pass, Utxo u, String loanUtxoRef) {
+        pass.output = WalletRoles.ref(u);
+        log.info("{} is a CONVERT liquidation (LiquidateAndConvert): the bot creates a Minswap "
+                        + "order, fronts nothing, and keeps the liquidation fee in collateral",
+                loanUtxoRef);
+        return u;
+    }
+
+    /**
+     * FAB-194-3 (D1): the cause a {@code CONVERT_BEFORE_ANTICIPATE} market falls back to pay-in-advance for, or
+     * null. Exactly two convert verdicts say a convert is IMPOSSIBLE rather than unprofitable, unreadable or
+     * unfunded: no authentic pool for the pair ({@code NoPoolException}, which also covers no pool address
+     * configured), and a pool too thin to fill the debt. Everything else is refused as {@code CONVERT} refuses it.
+     */
+    private static String fallbackCause(Exception failure) {
+        if (failure instanceof ConvertLiquidationRouter.NoPoolException) {
+            return FALLBACK_NO_MINSWAP_POOL;
+        }
+        if (failure instanceof ConvertOrderPlan.RefusedException refused
+                && refused.refusal() == ConvertOrderPlan.Refusal.POOL_TOO_THIN) {
+            return FALLBACK_POOL_TOO_THIN;
+        }
+        return null;
+    }
+
+    /**
+     * FAB-194-3 — a {@code CONVERT_BEFORE_ANTICIPATE} market whose convert is impossible pays in advance, in
+     * this same check, exactly as an {@code ANTICIPATE} market would: one INFO line naming the cause, then
+     * {@link #payInAdvance}. Nothing was recorded for the convert attempt; from here the candidate is on the
+     * pay-in-advance route, and the one row it ends in carries {@link #FALLBACK_DETAIL_FORMAT}.
+     */
+    private Built fallBack(LiquidationAssessment assessment, long now, WalletCheck walletCheck, CandidatePass pass,
+                           BuildInputs inputs, AppConfig.LiquidationConfiguration.Mode marketMode, String cause,
+                           String message) {
+        log.info("{} falls back to pay-in-advance in this check — no convert: {} ({})",
+                assessment.loan().utxoRef(), cause, message);
+        pass.fallbackCause = cause;
+        pass.route = ROUTE_PAY_IN_ADVANCE;
+        pass.output = "none";
+        return payInAdvance(assessment, now, walletCheck, pass, inputs, marketMode);
+    }
+
+    /**
+     * The convert route's refusals, by name — ONE handler for {@code CONVERT} and {@code CONVERT_BEFORE_ANTICIPATE}
+     * (FAB-194-3), so a convert the second market does not fall back from is recorded exactly as the first
+     * records it: the same row, level, line and {@code pass.error}. Rethrown into the catch chain the convert
+     * branch always had, so the order of its clauses — and what the last one catches — is unchanged.
+     *
+     * @param funding U, or null when it was never designated
+     */
+    private void refuseConvert(LiquidationAssessment assessment, long now, CandidatePass pass, Exception failure,
+                               Utxo funding, Need needed) {
+        String loanUtxoRef = assessment.loan().utxoRef();
+        try {
+            throw failure;
+        } catch (ConvertLiquidationRouter.NoPoolException e) {
+            // Impossible, not unprofitable — and the fix is the operator's: set this market to
+            // action: CONVERT_BEFORE_ANTICIPATE with a cap if the loan should still be liquidated, and it
+            // then falls back to pay-in-advance on exactly this refusal (FAB-194-3).
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    "NO_MINSWAP_POOL", e.getMessage()));
+            log.info("the convert liquidation of {} was refused: {}", loanUtxoRef, e.getMessage());
+            return;
+        } catch (ConvertLiquidationRouter.UnprofitableException e) {
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.UNPROFITABLE,
+                    String.valueOf(e.assessment().exclusion()), e.getMessage()));
+            log.info("the convert liquidation of {} is not worth doing: {}", loanUtxoRef,
+                    e.getMessage());
+            return;
+        } catch (ConvertOrderPlan.RefusedException e) {
+            // ⛔ A VERDICT ABOUT THE CANDIDATE, NOT A FAULT — so it is recorded at INFO.
+            //
+            // The five ConvertOrderPlan refusals (the bond forbids conversion, equity is in the
+            // principal currency, the pool is for a different pair, nothing is left to swap,
+            // the pool is too thin) are all statements about this loan against this pool. Each
+            // is reproducible next cycle, each costs one plan and no transaction, and none of
+            // them is evidence that anything is broken: they are eligibility filters, not
+            // failures, and a single Minswap swap can make the candidate viable again.
+            //
+            // ⚑ This is the plain path's RefusedException treatment, arrived at for the same
+            // reason: before this catch existed EVERY one of these fell to the generic branch
+            // below and was recorded as machinery failure at ERROR.
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    e.refusal().name(), e.getMessage()));
+            log.info("the convert liquidation of {} was refused as {}: {}",
+                    loanUtxoRef, e.refusal(), e.getMessage());
+            return;
+        } catch (MinswapPoolResolver.RefusedException e) {
+            // ⛔ THE POOL LOOKUP REFUSED — and WHICH refusal decides whether this is a verdict
+            // or a failure to read the local pool index. They are not the same fact and must not
+            // read alike.
+            if (e.refusal() == MinswapPoolResolver.Refusal.LOOKUP_FAILED) {
+                // An INDEX READ failure (the node's own database, FAB-137 — no provider is asked
+                // any more) on an eligible candidate: retried on the very next cycle
+                // and logged at ERROR on every cycle it happens (FAB-134 NQ). It used to be held
+                // for two cycles at WARN — and before that, measured on mainnet 2026-09-09, for
+                // thirty minutes — and a candidate the bot should liquidate but cannot is a
+                // fault to be seen and fixed, not waited out.
+                decisionLog.record(decision(assessment, pass, now,
+                        LiquidationDecision.Outcome.REFUSED, e.refusal().name(),
+                        e.getMessage() + ". This is not a verdict: the local pool index (the "
+                                + "node's own database) could not be read, which says nothing "
+                                + "about whether a pool exists, which is what NO_MINSWAP_POOL "
+                                + "reports."));
+                pass.error = true;
+                log.error("the pool lookup for {} via {} failed reading the local pool index: {} — the "
+                                + "candidate itself was never assessed; retried next cycle",
+                        loanUtxoRef, ROUTE_CONVERT, causeChain(e));
+                log.debug("the pool lookup for {} via {} failed reading the local pool index",
+                        loanUtxoRef, ROUTE_CONVERT, e);
+                return;
+            }
+            // ⛔ AMBIGUOUS_POOL: two AUTHENTIC pools for one pair in the local index. Minswap
+            // cannot produce that on chain, so it is an index-integrity fault, not a verdict
+            // about the candidate — ERROR on every cycle it persists, no pool is chosen, and
+            // nothing was built, so the wallet is untouched.
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    e.refusal().name(), e.getMessage()));
+            pass.error = true;
+            log.error("the convert liquidation of {} via {} was refused as {}: {}",
+                    loanUtxoRef, ROUTE_CONVERT, e.refusal(), causeChain(e));
+            log.debug("the convert liquidation of {} via {} was refused as {}",
+                    loanUtxoRef, ROUTE_CONVERT, e.refusal(), e);
+            return;
+        } catch (ConvertLiquidationRouter.WalletInputTooSmallException e) {
+            // A fact about the WALLET, not the candidate — an eligibility filter, reconsidered
+            // every cycle, and cured by a top-up. Same treatment the pay-in-advance path gives
+            // its own.
+            String detail = tooSmallDetail(ROLE_U, funding, null, needed, e.getMessage());
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    "WALLET_INPUT_TOO_SMALL", detail));
+            log.warn("the convert liquidation of {} was refused: {}", loanUtxoRef, detail);
+            return;
+        } catch (ConvertLiquidationRouter.FeedWindowException e) {
+            // FAB-183 — a feed whose window does not cover the body's is per-block feed timing,
+            // not a machinery fault: nothing was built and no wallet utxo was spent, so nothing
+            // is marked used. Reconsidered on the next block.
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    "CONVERT_FEED_WINDOW", e.getMessage()));
+            log.info("the convert liquidation of {} was refused as CONVERT_FEED_WINDOW: {}",
+                    loanUtxoRef, e.getMessage());
+            return;
+        } catch (Exception e) {
+            // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
+            OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
+            if (wait != null) {
+                refuseNotYetVisible(assessment, pass, now, wait);
+                return;
+            }
+            // ⚠ WHAT IS LEFT HERE IS A GENUINE MACHINERY FAULT, and that is the point of the
+            // four catches above: this branch used to swallow every verdict on the convert
+            // route as well, so "the pool cannot fill the debt" and "the bot is broken" reached
+            // the operator identically. Rebuilt next cycle, and loud on every one (FAB-134 NQ): one
+            // ERROR line with the whole cause chain, the stack trace at DEBUG (FAB-195).
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    rootReason(e), causeChain(e)));
+            pass.error = true;
+            log.error("building the convert liquidation of {} via {} failed: {}", loanUtxoRef,
+                    ROUTE_CONVERT, causeChain(e));
+            log.debug("building the convert liquidation of {} via {} failed", loanUtxoRef,
+                    ROUTE_CONVERT, e);
+            return;
+        }
+    }
+
+    /**
+     * THE PAY-IN-ADVANCE ROUTE of one candidate: the built transaction and the output it is funded from (null
+     * on a DISABLED market, which designates nothing), or null when the candidate ended here with its one row
+     * recorded. Reached by an {@code ANTICIPATE} market, and since FAB-194-3 by a {@code CONVERT_BEFORE_ANTICIPATE}
+     * market whose convert was impossible ({@link #fallBack}) — the same route, under the same rules.
+     */
+    private Built payInAdvance(LiquidationAssessment assessment, long now, WalletCheck walletCheck,
+                               CandidatePass pass, BuildInputs inputs,
+                               AppConfig.LiquidationConfiguration.Mode marketMode) {
+        String loanUtxoRef = assessment.loan().utxoRef();
+        BigInteger feeCeiling = walletCheck.feeCeiling();
+        // The designated output, and what a selector found it short of, for the WALLET_INPUT_TOO_SMALL row.
+        Utxo designated;
+        Need needed = new Need();
+        Transaction transaction;
+        // ⛔ ANNOUNCE THE ASSET — "PAYS the lender in ada" was only ever true of the ada-principal
+        // shape; a token principal pays out that token, never ada. The AMOUNT is announced
+        // separately below, once the transaction exists and the figure can be MEASURED off it
+        // rather than re-derived — the same "off the finished body" discipline the builder's own
+        // index derivation uses.
+        AssetType payInAdvancePrincipal = assessment.loan().datum().principalAsset();
+        // FAB-185 — an ADA principal is funded from U; a token principal from the output holding the
+        // most of that token, never from U, however much larger U is.
+        String payInAdvanceRole = payInAdvancePrincipal.isAda() ? ROLE_U
+                : ROLE_TOKEN + payInAdvancePrincipal.toUnit();
+        pass.route = ROUTE_PAY_IN_ADVANCE;
+        // ⛔ FAB-185 r2 (F3) — A DISABLED MARKET IS REFUSED BEFORE THE ROLE LOOKUP. Pay-in-advance is
+        // excluded from the pre-build MARKET_DISABLED refusal above because the router's MarketGate
+        // refuses it, with its own text; looking the role up first answered an operator who had
+        // disabled the market with WALLET_ROLE_MISSING and a WARN about a wallet the bot is not to use
+        // there. So a DISABLED market designates nothing and goes straight to the router, whose gate
+        // refuses it before the selector is ever asked — the row and level it always had.
+        if (marketMode == AppConfig.LiquidationConfiguration.Mode.DISABLED) {
+            designated = null;
+        } else {
+            designated = designated(assessment, pass, now, walletCheck, payInAdvanceRole,
+                    payInAdvancePrincipal.isAda()
+                            ? walletCheck.roles().u()
+                            : walletCheck.roles().tokenOutput(payInAdvancePrincipal.toUnit()));
+            if (designated == null) {
+                return null;
+            }
+            pass.output = WalletRoles.ref(designated);
+        }
+        Utxo payInAdvanceFunding = designated;
+        log.info("{} is a PAY-IN-ADVANCE liquidation: the bot PAYS the lender in {} and acquires "
+                        + "the collateral, rather than earning a fee",
+                loanUtxoRef, payInAdvancePrincipal.isAda() ? "ada" : payInAdvancePrincipal.toUnit());
+        // Convert loan: routed to the promoted, submit-incapable pay-in-advance builder. The same
+        // window the plain path uses is handed to the router, which derives its own slots from it.
+        // FAB-128 — the token split behind principalBalance, kept for the market-gate catch below;
+        // null on the ada branch, whose count is untouched.
+        WalletInputSelection.TokenHolding principalHolding = null;
+        try {
+            // Part 3 — the balance MarketGate's decide() checks. ⚠ FAB-185 residue: it still sums the
+            // whole wallet as read at the start of this check, so a candidate it allows can still be
+            // refused below by role, by name.
+            if (!payInAdvancePrincipal.isAda()) {
+                // ⛔ F7 (round 2) — count ONLY utxos carrying the ada floor beside the token: a 2,000
+                // USDM + 1.4 ADA utxo would otherwise inflate the balance MarketGate saw by a
+                // candidate the wallet could never actually fund (M13).
+                principalHolding = WalletInputSelection.tokenHolding(walletCheck.wallet(),
+                        payInAdvancePrincipal,
+                        WalletInputSelection.tokenPrincipalRequiredAda(Optional.of(feeCeiling)));
+            }
+            BigInteger principalBalance = payInAdvancePrincipal.isAda()
+                    ? walletCheck.wallet().stream().filter(WalletInputSelection::nominable)
+                            .map(LedgerCeilings::lovelaceOf).reduce(BigInteger.ZERO, BigInteger::add)
+                    : principalHolding.spendable();
+            transaction = payInAdvanceRouter.buildConvertLiquidation(assessment, inputs.loanUtxo(),
+                    inputs.bondUtxo(), inputs.configUtxo(), inputs.lmConfigUtxo(), inputs.oraclesByUnit(),
+                    principalBalance,
+                    // The router knows the lender payout, this knows the wallet and the fee ceiling.
+                    // Only the designated output is ever offered (FAB-185), and only when it covers
+                    // the payout plus the pre-build ceilings.
+                    lenderPayout -> {
+                        if (payInAdvanceFunding == null) {
+                            // Unreachable while the router's gate reads this same configuration: it
+                            // refuses a DISABLED market before asking. Loud if that ever stops holding.
+                            throw new IllegalStateException("market " + payInAdvancePrincipal.toUnit()
+                                    + " is DISABLED, so no role output was designated, yet the router "
+                                    + "asked for one");
+                        }
+                        return payInAdvancePrincipal.isAda()
+                                ? sized(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
+                                        WalletRoles.adaAnticipateRequired(lenderPayout, feeCeiling), needed)
+                                : sizedToken(loanUtxoRef, payInAdvanceRole, payInAdvanceFunding,
+                                        payInAdvancePrincipal.toUnit(), lenderPayout,
+                                        WalletRoles.tokenOutputRequiredAda(feeCeiling), needed);
+                    },
+                    // FAB-185 — role C, pinned by the builder as the only collateral and never spent.
+                    walletCheck.roles().c().orElse(null),
+                    inputs.validFromMillis(),
+                    inputs.validToMillis());
+            // ⛔ THE AMOUNT — "PAYS the lender 1,033,850,000 c48cbb3d…0014df105553444d and
+            // acquires the collateral", never "ada" unless it is ada. Measured off the BUILT body
+            // (payInAdvanceAmountPaid), not re-derived, so this line cannot disagree with what the
+            // transaction actually pays.
+            BigInteger paid = payInAdvanceAmountPaid(transaction, payInAdvancePrincipal);
+            log.info("{} pays the lender {} {} and acquires the collateral", loanUtxoRef, paid,
+                    payInAdvancePrincipal.isAda() ? "lovelace" : payInAdvancePrincipal.toUnit());
+        } catch (PayInAdvanceLiquidationRouter.WalletInputTooSmallException e) {
+            // The router knows the lender payout and nothing about the wallet; THIS knows which role
+            // output was offered and what it was found short of, so the message is completed here.
+            // A clean statement about this candidate against this wallet — an eligibility filter,
+            // reconsidered every check, and cured by a top-up.
+            String convertDetail = tooSmallDetail(payInAdvanceRole, payInAdvanceFunding,
+                    payInAdvancePrincipal.isAda() ? null : payInAdvancePrincipal.toUnit(), needed,
+                    e.getMessage());
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    "WALLET_INPUT_TOO_SMALL", convertDetail));
+            log.warn("the pay-in-advance liquidation of {} was refused: {}", loanUtxoRef, convertDetail);
+            return null;
+        } catch (PayInAdvanceLiquidationRouter.MarketGateRefusedException e) {
+            // A POLICY refusal, not a capability gap: this market is disabled, or the principal
+            // the candidate would have us front exceeds the operator's stated cap. Recorded the
+            // same clean way, and deliberately a separate catch so the log says which it was.
+            //
+            // FAB-128 — "holds 0" is true of what is COUNTED, and stays the reason. When the wallet
+            // does hold the token, but only in UTxOs short of the ada floor, the DETAIL says so and
+            // names the remedy; the reason an operator groups refusals by does not change.
+            String detail = e.getMessage();
+            MarketGate.Decision refused = e.decision();
+            if (refused != null && refused.refusal() == MarketGate.Refusal.INSUFFICIENT_BALANCE
+                    && principalHolding != null) {
+                String unit = payInAdvancePrincipal.toUnit();
+                String note = principalHolding.adaFloorNote(q -> q + " " + unit, refused.required(), true);
+                if (note != null) {
+                    detail = e.getMessage() + "; " + note;
+                }
+            }
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    e.getMessage(), detail));
+            log.info("the pay-in-advance liquidation of {} was refused by the market gate: {}",
+                    loanUtxoRef, detail);
+            return null;
+        } catch (PayInAdvanceLiquidationRouter.PayInAdvanceNotModelledException e) {
+            // All seven construction sites describe a candidate or oracle state this route cannot
+            // build this cycle: PayInAdvanceLiquidationRouter:164 is negative equity (unreachable
+            // through a real assessment because LoanFinance.redeemerEquity floors at zero);
+            // LiquidatePayInAdvanceTransactionBuilder:522 and :528 are the collateral feed window
+            // and margin; :539 and :545 are the principal feed window and margin; :1243-1244 is a
+            // POOLED or PRICE_DATA_ORCFAX variant; and :1264 is an entry not usable this cycle.
+            //
+            // Setting a market to CONVERT cures none of them. Window and margin are per-cycle feed
+            // timing and clear by themselves unless the configured oracle margin exceeds what any
+            // feed can leave after validTo. Variant and usability are oracle-entry properties:
+            // OracleEntry.usableForLiquidation() is false for POOLED/ORCFAX (OracleEntry.java:124),
+            // and ConvertTransactionBuilder.build refuses a collateral oracle that is not usable
+            // for liquidation (ConvertTransactionBuilder.java:237). Negative equity says nothing
+            // about the mechanism. Since `action` is market-wide, that advice would re-route every
+            // loan in the market on the strength of a refusal conversion cannot repair.
+            //
+            // The 2026-09-09 remedy-wording ruling distinguished routability from profitability;
+            // FAB-126 removes the remedy because no remaining construction site is cured by it.
+            String principalUnit = assessment.loan().datum().principalAsset().toUnit();
+            log.info("the pay-in-advance liquidation of {} (principal {}) was refused: {} — "
+                            + "reconsidered every cycle",
+                    loanUtxoRef, principalUnit, e.getMessage());
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    e.getMessage(), e.getMessage()));
+            return null;
+        } catch (Exception e) {
+            // FAB-183: an oracle out-ref not yet visible to this node is a wait, not a fault.
+            OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait = notYetVisible(e);
+            if (wait != null) {
+                refuseNotYetVisible(assessment, pass, now, wait);
+                return null;
+            }
+            // A genuine builder failure, treated exactly as the plain path's machinery-failure
+            // branch: rebuilt next cycle and logged at ERROR on every cycle (FAB-134 NQ — a
+            // candidate the bot should liquidate but cannot is a bug, and a bug that goes quiet
+            // is a bug nobody fixes). The refusal MUST say why: the builder wraps the real
+            // fault as IllegalStateException("cannot build the pay-in-advance transaction", cause),
+            // so recording only e.getMessage() drops the cause and leaves the operator debugging
+            // blind. The detail carries the whole cause chain, and so does the ONE ERROR line (FAB-195) —
+            // root message included, so an INFO-level node still reads why; the stack trace goes to DEBUG.
+            // A build failure whose cause never reaches the log hides the next one too.
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
+                    rootReason(e), causeChain(e)));
+            pass.error = true;
+            log.error("building the pay-in-advance liquidation of {} via {} failed: {}",
+                    loanUtxoRef, ROUTE_PAY_IN_ADVANCE, causeChain(e));
+            log.debug("building the pay-in-advance liquidation of {} via {} failed",
+                    loanUtxoRef, ROUTE_PAY_IN_ADVANCE, e);
+            return null;
+        }
+        return new Built(transaction, designated);
+    }
+
     /**
      * FAB-183 (A4). The UNPROFITABLE row for a plain candidate whose fee slice already fails S3 whatever
      * the transaction fee turns out to be, or null when it may clear — or when the bound cannot be computed,
@@ -1860,8 +2050,8 @@ public class LiquidationExecutor {
      * <p>The row carries the fee slice and the margin, and {@code feeSlice − margin} as the expected profit:
      * an UPPER bound, since no transaction exists whose fee could be subtracted.
      */
-    private LiquidationDecision certainlyUnprofitable(LiquidationAssessment assessment, long now,
-                                                      Map<String, OracleEntry> oraclesByUnit) {
+    private LiquidationDecision certainlyUnprofitable(LiquidationAssessment assessment, CandidatePass pass,
+                                                      long now, Map<String, OracleEntry> oraclesByUnit) {
         BigInteger feeSlice;
         BigInteger margin;
         BigInteger absoluteFloor;
@@ -1896,10 +2086,10 @@ public class LiquidationExecutor {
                 assessment.loan().loanId(),
                 assessment.loan().utxoRef(),
                 assessment.bond().utxoRef(),
-                variantOf(assessment),
+                variantOf(pass),
                 LiquidationDecision.Outcome.UNPROFITABLE,
                 LiquidationDecision.Outcome.UNPROFITABLE.name(),
-                detail,
+                fallbackDetail(pass, detail),
                 assessment.late(),
                 assessment.remainingDebt(),
                 assessment.equity(),
@@ -1937,10 +2127,10 @@ public class LiquidationExecutor {
      * provider UTxO whose block is not stored here yet. REFUSED at INFO, retried on the next block, and the
      * designated wallet output is not marked used: nothing was evaluated, so nothing says it is spent.
      */
-    private void refuseNotYetVisible(LiquidationAssessment assessment, long now,
+    private void refuseNotYetVisible(LiquidationAssessment assessment, CandidatePass pass, long now,
                                      OracleReferenceInputProbe.OracleReferenceInputNotLiveException wait) {
         String detail = wait.getMessage() + "; retried on the next block";
-        decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+        decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
                 "ORACLE_INPUT_NOT_YET_VISIBLE", detail));
         log.info("the liquidation of {} waits for an oracle out-ref this node cannot see yet: {}",
                 assessment.loan().utxoRef(), detail);
@@ -2055,7 +2245,7 @@ public class LiquidationExecutor {
                 .toLovelace(Rational.fromInt(assessment.liquidationFee()), collateralFeed)
                 .floor();
         BigInteger txFee = transaction.getBody().getFee();
-        BigInteger minAdaFunded = minAdaFunded(assessment, transaction);
+        BigInteger minAdaFunded = minAdaFunded(assessment, transaction, pass);
         // FIX 1/FIX 2: the floors test this margin-EXCLUDED number; the margin is applied separately.
         BigInteger floorProfit = expectedFee.subtract(txFee).subtract(minAdaFunded);
 
@@ -2086,8 +2276,11 @@ public class LiquidationExecutor {
         // and WRONG for the outlay, where floor would UNDERSTATE the cost and flatter the bot. So the
         // outlay alone is taken at floor()+1 (outlayCeilBiased): a cheap, always-safe correction to the
         // ceiling side (never below the true value; at most one lovelace above it).
+        //
+        // FAB-194-3: guarded by the route the candidate was BUILT on, never by the market's action — a
+        // CONVERT_BEFORE_ANTICIPATE market builds either route, and only its pay-in-advance is this trade.
         String tokenOutlayDetail = "";
-        if (isPayInAdvanceRoute(assessment)) {
+        if (ROUTE_PAY_IN_ADVANCE.equals(pass.route)) {
             AssetType payInAdvancePrincipal = assessment.loan().datum().principalAsset();
             if (!payInAdvancePrincipal.isAda()) {
                 BigInteger payout = payInAdvanceAmountPaid(transaction, payInAdvancePrincipal);
@@ -2099,7 +2292,7 @@ public class LiquidationExecutor {
                             + "acquired collateral (%s %s) nor the pay-in-advance outlay (%s %s) can be "
                             + "priced into lovelace").formatted(acquiredQuantity, collateralAsset.toUnit(),
                             payout, payInAdvancePrincipal.toUnit());
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
+                    decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
                             "PRICE_UNAVAILABLE", priceDetail));
                     log.info("the pay-in-advance liquidation of {} was refused: {}",
                             assessment.loan().utxoRef(), priceDetail);
@@ -2118,7 +2311,7 @@ public class LiquidationExecutor {
                             + "%s %s into lovelace — %s (feed window [%s,%s], age %sms at %s)").formatted(
                             acquiredQuantity, collateralAsset.toUnit(), refusal.reason(),
                             refusal.feedValidFrom(), refusal.feedValidTo(), refusal.feedAgeMillis(), now);
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
+                    decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
                             "PRICE_UNAVAILABLE", priceDetail));
                     log.info("the pay-in-advance liquidation of {} was refused: {}",
                             assessment.loan().utxoRef(), priceDetail);
@@ -2132,7 +2325,7 @@ public class LiquidationExecutor {
                             + "%s %s into lovelace — %s (feed window [%s,%s], age %sms at %s)").formatted(
                             payout, payInAdvancePrincipal.toUnit(), refusal.reason(),
                             refusal.feedValidFrom(), refusal.feedValidTo(), refusal.feedAgeMillis(), now);
-                    decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
+                    decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.PRICE_UNAVAILABLE,
                             "PRICE_UNAVAILABLE", priceDetail));
                     log.info("the pay-in-advance liquidation of {} was refused: {}",
                             assessment.loan().utxoRef(), priceDetail);
@@ -2184,7 +2377,7 @@ public class LiquidationExecutor {
             LiquidationDecision.Outcome unmeasured = wouldSubmit(floorProfit, expectedProfit)
                     ? LiquidationDecision.Outcome.WOULD_SUBMIT
                     : LiquidationDecision.Outcome.UNPROFITABLE;
-            decisionLog.record(decision(assessment, now, unmeasured, unmeasured.name(), detail,
+            decisionLog.record(decision(assessment, pass, now, unmeasured, unmeasured.name(), detail,
                     SubmitVeto.TX_TOO_LARGE));
             return Optional.empty();
         }
@@ -2197,10 +2390,10 @@ public class LiquidationExecutor {
                 assessment.loan().loanId(),
                 assessment.loan().utxoRef(),
                 assessment.bond().utxoRef(),
-                variantOf(assessment),
+                variantOf(pass),
                 verdict.outcome(),
                 verdict.outcome().name(),
-                verdict.detail(),
+                fallbackDetail(pass, verdict.detail()),
                 assessment.late(),
                 assessment.remainingDebt(),
                 assessment.equity(),
@@ -2237,7 +2430,7 @@ public class LiquidationExecutor {
                     verdict.outcome(), verdict.veto(), verdict.detail(), size);
         }
 
-        dumpShadowTransaction(assessment, verdict, transaction, cborHex, size, detail);
+        dumpShadowTransaction(assessment, verdict, transaction, cborHex, size, detail, pass);
         return Optional.of(verdict);
     }
 
@@ -2668,7 +2861,7 @@ public class LiquidationExecutor {
      * own {@code assetOutputIndexes} locates the same outputs. Clamped at zero as defence in depth: the
      * outputs can only ever carry their intrinsic ada plus a non-negative top-up.
      */
-    private BigInteger minAdaFunded(LiquidationAssessment assessment, Transaction transaction) {
+    private BigInteger minAdaFunded(LiquidationAssessment assessment, Transaction transaction, CandidatePass pass) {
         String assetManagerCredential = registry.getAssetManagerSpendScriptHash();
         BigInteger outputAda = BigInteger.ZERO;
         for (TransactionOutput output : transaction.getBody().getOutputs()) {
@@ -2718,8 +2911,10 @@ public class LiquidationExecutor {
         // essentially all of it change, turning a ~+0.6 ADA floor into −24.8 ADA and refusing at
         // min-profit-absolute. That is precisely the phantom expense the comment above forbids.
         //
-        // ⇒ The discriminator is now the ROUTING'S OWN — the same MarketGate call, on the same loan —
-        // rather than a proxy for it. A proxy that was true when written is exactly what drifted.
+        // ⇒ The discriminator is now the ROUTING'S OWN rather than a proxy for it. A proxy that was true
+        // when written is exactly what drifted. FAB-194-3: it is the route the candidate was BUILT on
+        // (pass.route), not the market's action — a CONVERT_BEFORE_ANTICIPATE market builds either route, so
+        // the action no longer names the route, and asking it is the next proxy.
         //
         // ⛔ F2 (round 2) — IDENTIFY THE RIDER BY ROLE, NEVER BY "TOKEN-BEARING AT MY ADDRESS".
         // "carriesTokens" above (2026-09-05's fix) narrowed the SCOPE (which routes) but not the
@@ -2735,7 +2930,7 @@ public class LiquidationExecutor {
         // ROLE: a principal-token change output does not carry the collateral asset (a single loan has
         // exactly one collateral type), so it can never be mistaken for the rider, regardless of how
         // much of the principal happens to ride along in the bot's own wallet input.
-        if (isPayInAdvanceRoute(assessment)) {
+        if (ROUTE_PAY_IN_ADVANCE.equals(pass.route)) {
             AssetType collateralAsset = assessment.loan().datum().collateral().assetType();
             BigInteger rider = BigInteger.ZERO;
             for (TransactionOutput output : transaction.getBody().getOutputs()) {
@@ -2752,18 +2947,6 @@ public class LiquidationExecutor {
     }
 
     /**
-     * Whether this candidate goes to the PAY-IN-ADVANCE builder — the only route that emits a named
-     * token-bearing collateral output to the bot, and therefore the only one the rider applies to.
-     *
-     * <p>This asks {@link MarketGate} exactly as the routing does, on the same loan, so the two cannot
-     * drift apart again. The bond flag alone says the loan MAY be converted; the market says HOW.
-     *
-     * <p>⚠ <b>The convert route funds ada this method deliberately does NOT count</b> — the Minswap
-     * order carries ~2.8 ADA to the asset manager and does not come back to the bot. Whether that
-     * belongs in the profitability floor is an ECONOMICS decision and is not made here: adding it
-     * would be a new cost term, not a correction of a miscount. Recorded in findings §57 as open.
-     */
-    /**
      * ⛔ THE DIRECTION — extracted so it is unit-testable on its own, without a whole built
      * transaction. {@link PricingService#toLovelace} rounds {@code floor()}, which is correct for
      * pricing an EARNED amount (this method's caller's {@code expectedFee} term) but WRONG for an
@@ -2778,13 +2961,33 @@ public class LiquidationExecutor {
         return flooredLovelace.add(BigInteger.ONE);
     }
 
-    private boolean isPayInAdvanceRoute(LiquidationAssessment assessment) {
+    /**
+     * FAB-194-3 — THE ROUTE THIS CANDIDATE IS PLANNED ON, and the only place this class asks
+     * {@link MarketGate#actionFor}: the bond flag says the loan MAY be converted, the market says HOW. Also
+     * keeps the action on {@code pass}, for the two things that still need it — whether a convert may fall
+     * back, and the {@code CONVERT_UNAVAILABLE} text.
+     *
+     * <p>Every record reads the route this returns (and a fallback's change to it), never the action: the
+     * variant, the F1 bracket, the S-15 rider — which applies to the pay-in-advance route alone, the only
+     * route that emits a named token-bearing collateral output to the bot — and the pre-build
+     * {@code MARKET_DISABLED} refusal. A {@code CONVERT_BEFORE_ANTICIPATE} market builds either route, so the
+     * action no longer says which one a candidate was built on.
+     *
+     * <p>⚠ <b>The convert route funds ada the rider deliberately does NOT count</b> — the Minswap
+     * order carries ~2.8 ADA to the asset manager and does not come back to the bot. Whether that
+     * belongs in the profitability floor is an ECONOMICS decision and is not made here: adding it
+     * would be a new cost term, not a correction of a miscount. Recorded in findings §57 as open.
+     */
+    private String plannedRoute(LiquidationAssessment assessment, CandidatePass pass) {
         if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
-            return false;
+            pass.action = null;
+            return ROUTE_PLAIN;
         }
-        return switch (new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset())) {
-            case CONVERT, CONVERT_BEFORE_ANTICIPATE -> false;
-            case ANTICIPATE -> true;
+        pass.action = new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset());
+        // Exhaustive, no default: a new action does not compile until it names its route.
+        return switch (pass.action) {
+            case CONVERT, CONVERT_BEFORE_ANTICIPATE -> ROUTE_CONVERT;
+            case ANTICIPATE -> ROUTE_PAY_IN_ADVANCE;
         };
     }
 
@@ -2812,8 +3015,8 @@ public class LiquidationExecutor {
     }
 
     /**
-     * Which action this candidate is routed to — read from the SAME predicate {@code consider()}
-     * routes on, so the record cannot disagree with what was built.
+     * Which action this candidate's row is about — the route it was BUILT on ({@code pass.route}), so the
+     * record cannot disagree with what was built (FAB-194-3).
      *
      * <p>⚠ This was {@code LiquidationDecision.VARIANT}, hardcoded, for the entire time the convert
      * path was live: <b>every convert liquidation would have been recorded as a plain
@@ -2824,33 +3027,37 @@ public class LiquidationExecutor {
      * balance from chain.
      *
      * <p>⚠ Task 8 (ADDENDA). The bond flag alone only says a loan MAY be converted; it does not say
-     * BY WHICH mechanism. {@code consider()} routes CONVERT candidates to either
-     * {@link ConvertLiquidationRouter} (Minswap, fronts nothing) or {@link #payInAdvanceRouter} (the
-     * bot pays the lender out of its own wallet) by reading {@code MarketGate.actionFor}, the SAME
-     * gate the routing itself asks. Reading only the bond flag here recorded every Minswap convert as
+     * BY WHICH mechanism. Reading only the bond flag here recorded every Minswap convert as
      * {@code LiquidateAndPayInAdvance} — whose own javadoc says the bot paid the lender out of its own
-     * wallet, the OPPOSITE sign of what a Minswap convert does. Consulting the same gate the routing
-     * uses is what keeps the record from disagreeing with the routing decision it describes.
+     * wallet, the OPPOSITE sign of what a Minswap convert does. It then read the market's action, the
+     * gate the routing asked; since FAB-194-3 one market can build either route, so it reads the route
+     * itself, which a {@code CONVERT_BEFORE_ANTICIPATE} fallback changes before anything is recorded.
      */
-    private String variantOf(LiquidationAssessment assessment) {
-        if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
-            return LiquidationDecision.VARIANT;
-        }
-        AppConfig.LiquidationConfiguration.Action action =
-                new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset());
-        return switch (action) {
-            case CONVERT, CONVERT_BEFORE_ANTICIPATE -> LiquidationDecision.VARIANT_CONVERT_MINSWAP;
-            case ANTICIPATE -> LiquidationDecision.VARIANT_CONVERT;
+    private static String variantOf(CandidatePass pass) {
+        return switch (pass.route) {
+            case ROUTE_PLAIN -> LiquidationDecision.VARIANT;
+            case ROUTE_CONVERT -> LiquidationDecision.VARIANT_CONVERT_MINSWAP;
+            case ROUTE_PAY_IN_ADVANCE -> LiquidationDecision.VARIANT_CONVERT;
+            default -> throw new IllegalStateException("no variant for route " + pass.route);
         };
     }
 
-    private LiquidationDecision decision(LiquidationAssessment assessment, long now,
-                                         LiquidationDecision.Outcome outcome, String reason,
-                                         String detail) {
-        return decision(assessment, now, outcome, reason, detail, null);
+    /**
+     * FAB-194-3: {@code detail} as a row records it — after {@link #FALLBACK_DETAIL_FORMAT} when this candidate
+     * fell back to pay-in-advance, unchanged otherwise.
+     */
+    private static String fallbackDetail(CandidatePass pass, String detail) {
+        return pass.fallbackCause == null ? detail
+                : String.format(FALLBACK_DETAIL_FORMAT, pass.fallbackCause) + detail;
     }
 
-    private LiquidationDecision decision(LiquidationAssessment assessment, long now,
+    private LiquidationDecision decision(LiquidationAssessment assessment, CandidatePass pass, long now,
+                                         LiquidationDecision.Outcome outcome, String reason,
+                                         String detail) {
+        return decision(assessment, pass, now, outcome, reason, detail, null);
+    }
+
+    private LiquidationDecision decision(LiquidationAssessment assessment, CandidatePass pass, long now,
                                          LiquidationDecision.Outcome outcome, String reason,
                                          String detail, SubmitVeto veto) {
         return new LiquidationDecision(
@@ -2858,15 +3065,16 @@ public class LiquidationExecutor {
                 assessment.loan().loanId(),
                 assessment.loan().utxoRef(),
                 assessment.bond().utxoRef(),
-                // ⚠ BOTH construction sites, not one. This helper and the verdict path at ~899 each
+                // ⚠ BOTH construction sites, not one. This helper and the verdict path in record() each
                 // build a LiquidationDecision, and fixing only the first left every REFUSAL on the
                 // convert path still labelled "Liquidate" while successes were labelled correctly —
                 // which is worse than the original defect, because the record would then be
-                // inconsistent with itself rather than uniformly wrong.
-                variantOf(assessment),
+                // inconsistent with itself rather than uniformly wrong. FAB-194-3: both read the route
+                // the candidate is built on, and both carry the fallback prefix.
+                variantOf(pass),
                 outcome,
                 reason,
-                detail,
+                fallbackDetail(pass, detail),
                 assessment.late(),
                 assessment.remainingDebt(),
                 assessment.equity(),
@@ -3062,8 +3270,8 @@ public class LiquidationExecutor {
      * output is marked used in this check (an INFO line, no row) — which a token output can be and U never is
      * (D3, FAB-194). Either way nothing is built.
      */
-    private Utxo designated(LiquidationAssessment assessment, long now, WalletCheck walletCheck, String role,
-                            Optional<Utxo> output) {
+    private Utxo designated(LiquidationAssessment assessment, CandidatePass pass, long now, WalletCheck walletCheck,
+                            String role, Optional<Utxo> output) {
         String loanUtxoRef = assessment.loan().utxoRef();
         if (output.isEmpty()) {
             String missing = ROLE_U.equals(role)
@@ -3073,7 +3281,7 @@ public class LiquidationExecutor {
                             + role.substring(ROLE_TOKEN.length());
             String detail = "role %s is missing: %s, so this liquidation has nothing to be funded from; %s"
                     .formatted(role, missing, rebalancerOutcome());
-            decisionLog.record(decision(assessment, now, LiquidationDecision.Outcome.REFUSED,
+            decisionLog.record(decision(assessment, pass, now, LiquidationDecision.Outcome.REFUSED,
                     "WALLET_ROLE_MISSING", detail));
             if (walletCheck.warnedMissingRoles().add(role)) {
                 log.warn("the liquidation of {} was refused: {}", loanUtxoRef, detail);

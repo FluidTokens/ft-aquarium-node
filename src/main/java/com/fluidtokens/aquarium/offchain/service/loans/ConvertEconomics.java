@@ -151,6 +151,16 @@ public class ConvertEconomics {
     }
 
     /**
+     * {@code loans.liquidation.convert.enabled} — the global convert switch {@link #assess} refuses
+     * {@code NOT_ARMED} on. Public so the executor can ask it BEFORE any build (FAB-194-3): a
+     * {@code CONVERT_BEFORE_ANTICIPATE} market falls back to pay-in-advance when it is off, rather than
+     * building a convert only to be refused after the build.
+     */
+    public boolean enabled() {
+        return configuration.isEnabled();
+    }
+
+    /**
      * Announce the stated bounds at boot, and say so loudly — on any network — when the margin is
      * negative.
      *
