@@ -794,9 +794,14 @@ into. Nothing to set, and the database is untouched. What it means depends on yo
 
 **⚠ A pool this node has never indexed counts as no pool.** A Minswap pool that has not moved since the
 block your node started syncing from is not in its index, so a loan in a `CONVERT_BEFORE_ANTICIPATE`
-market whose pair it serves is paid in advance, although that pool could convert it on chain. A restart
-does not change this (§3). A re-sync with the [§1.1](#11--the-minswap-pool-release-requires-a-database-wipe-fab-137)
-steps makes every idle pool visible; without one, a pool becomes visible the next time it moves.
+market whose pair it serves is paid in advance, although that pool could convert it on chain. A pool
+becomes visible the next time it moves (any swap recreates its output). A restart or a configuration
+change does not help: the stored cursor overrides `sync-start-*` (§3). A re-sync with the
+[§1.1](#11--the-minswap-pool-release-requires-a-database-wipe-fab-137) steps helps only a pool that last
+moved **after** the shipped `sync-start` (mainnet: 2025-05-06) but before your own node's index began —
+for example on a node whose cursor started later than the shipped value. A pool idle since **before**
+2025-05-06 is in none of the blocks a re-sync replays, so it stays invisible until it moves, re-sync or
+not.
 
 ---
 

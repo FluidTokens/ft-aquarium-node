@@ -446,7 +446,11 @@ shipped 5 ADA margin is added.
 
 Only relevant if you run the lending-v4 liquidation bot.
 
-When a loan is liquidated the bot builds one of two transactions, and the market's `action` says which:
+When a loan is liquidated the bot builds one of three transactions: a **plain** liquidation, a
+**convert**, or a **pay-in-advance**. A loan whose lender does not allow conversion always gets the
+plain one (below). For a loan whose lender allows conversion, the market's `action` decides how — and
+for `CONVERT_BEFORE_ANTICIPATE`, whether a convert is possible for that loan (its pool verdict, or
+convert switched off) decides between the convert and the pay-in-advance:
 
 | action | what it does | what it costs you |
 |---|---|---|
@@ -521,18 +525,29 @@ from this node's index: a usable pool → `CONVERT`; no pool, a pool too thin, n
 or convert switched off → the answer an `ANTICIPATE` market gets (its `cap` against this loan, then its
 mode); a pool with a dynamic fee → nothing; a pool check that failed, or a loan whose figures could not
 be priced → unknown. The page tests every indexed pool when it renders, while the bot resolves one pool
-when it builds, so the two can disagree for a block, and the row says so.
+when it builds, so the two can disagree for a block, and the row says so. **One disagreement lasts
+longer than a block:** a loan whose collateral leaves nothing to swap after the borrower's equity and
+the liquidation fee shows on the page as a pool too thin, and so gets the pay-in-advance answer, while
+the bot refuses that loan by name (`NOTHING_LEFT_TO_SWAP`) and never pays it in advance. The two
+disagree for as long as that holds.
 
 **⚠ A pool this node's index has never seen counts as no pool.** The node knows a Minswap pool only from
-its own index, and the index holds a pool only once the pool's output has passed through a block the
-node indexed. A pool that has sat idle since the block the node started syncing from is therefore not in
-the index, and a loan in this market whose pair it serves is **paid in advance** (`NO_MINSWAP_POOL`),
-although that pool could convert it on chain. It becomes visible the next time it moves (any swap
-recreates its output). **A restart or a configuration change does not make it visible**: the node
-resumes from its stored cursor, whatever `sync-start-*` says
-([upgrading.md §3](upgrading.md#3--the-rule-that-surprises-people)). Only a re-sync with the steps of
+its own index, and the index holds a pool only once the pool's **current** output has passed through a
+block the node indexed. A pool that has sat idle since the block the node started syncing from is
+therefore not in the index, and a loan in this market whose pair it serves is **paid in advance**
+(`NO_MINSWAP_POOL`), although that pool could convert it on chain. It becomes visible the next time it
+moves (any swap recreates its output). **A restart or a configuration change does not make it
+visible**: the node resumes from its stored cursor, whatever `sync-start-*` says
+([upgrading.md §3](upgrading.md#3--the-rule-that-surprises-people)).
+
+**A re-sync helps only some idle pools.** A re-sync with the steps of
 [upgrading.md §1.1](upgrading.md#11--the-minswap-pool-release-requires-a-database-wipe-fab-137) — wipe
-the database **including the cursor**, keep the shipped `sync-start-*` — makes every idle pool visible.
+the database **including the cursor**, keep the shipped `sync-start-*` — replays the chain from the
+shipped start point (mainnet: slot `154984561`, 2025-05-06). It makes visible a pool that last moved
+**after** that point but before your own node's index began — for example on a node whose cursor
+started later than the shipped value. It does **not** help a pool idle since **before** 2025-05-06: the
+re-sync replays the same blocks, none of which carries that pool's current output, so it stays
+invisible until it moves, re-sync or not.
 
 ### Worked example — four markets
 
