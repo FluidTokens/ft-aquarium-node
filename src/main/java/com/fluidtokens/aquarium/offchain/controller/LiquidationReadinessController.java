@@ -1233,28 +1233,32 @@ public class LiquidationReadinessController {
                 routeDetail = "ada collateral on a convert bond — neither the convert nor the "
                         + "pay-in-advance route builds a liquidation for it, and the bond rules out "
                         + "the plain route";
-            } else if (action == AppConfig.LiquidationConfiguration.Action.CONVERT && usability.usable()) {
-                route = "CONVERT";
-                routeDetail = "a Minswap pool is deep enough to clear this loan's debt, so the bot "
-                        + "creates a swap order and fronts no capital";
-            } else if (action == AppConfig.LiquidationConfiguration.Action.CONVERT) {
-                // ⛔ FAB-126: a CONVERT market whose pool verdict is not USABLE. The executor goes to the
-                // convert router and refuses on the pool, or as CONVERT_UNAVAILABLE when the node cannot
-                // convert; it NEVER falls back to pay-in-advance, which would front capital nobody
-                // authorised (LiquidationExecutor's action split). So the label is CONVERT, and fronting
-                // the principal is the operator's switch to flip, not ours. The advance is still
-                // computed: it is what ANTICIPATE would need, if they flip it.
-                route = "CONVERT";
-                routeDetail = convertNotUsableDetail(usability);
-                advance = advanceAmount(loan, bond, now);
             } else {
-                route = "CAPITAL IN ADVANCE";
-                // ⛔ The market's configuration and the pool's state are DIFFERENT reasons, and an
-                // operator acts on them differently: a setting will not change by itself, a thin pool
-                // may. So both are reported, never one standing in for the other.
-                routeDetail = "this market is configured action: ANTICIPATE, so the bot fronts the principal "
-                        + "whatever the pool says";
-                advance = advanceAmount(loan, bond, now);
+                // Exhaustive, no default: a new action does not compile until it names its route here.
+                RouteChoice choice = switch (action) {
+                    case CONVERT -> usability.usable()
+                            ? new RouteChoice("CONVERT", "a Minswap pool is deep enough to clear this loan's "
+                                    + "debt, so the bot creates a swap order and fronts no capital", false)
+                            // ⛔ FAB-126: a CONVERT market whose pool verdict is not USABLE. The executor goes
+                            // to the convert router and refuses on the pool, or as CONVERT_UNAVAILABLE when
+                            // the node cannot convert; it NEVER falls back to pay-in-advance, which would
+                            // front capital nobody authorised (LiquidationExecutor's action split). So the
+                            // label is CONVERT, and fronting the principal is the operator's switch to flip,
+                            // not ours. The advance is still computed: it is what a capital-fronting action
+                            // would need, if they flip it.
+                            : new RouteChoice("CONVERT", convertNotUsableDetail(usability), true);
+                    // ⛔ The market's configuration and the pool's state are DIFFERENT reasons, and an
+                    // operator acts on them differently: a setting will not change by itself, a thin pool
+                    // may. So both are reported, never one standing in for the other.
+                    case ANTICIPATE -> new RouteChoice("CAPITAL IN ADVANCE", "this market is configured "
+                            + "action: ANTICIPATE, so the bot fronts the principal whatever the pool says", true);
+                    case CONVERT_BEFORE_ANTICIPATE -> convertBeforeAnticipateRoute(convertEnabled, usability);
+                };
+                route = choice.route();
+                routeDetail = choice.detail();
+                if (choice.computesAdvance()) {
+                    advance = advanceAmount(loan, bond, now);
+                }
             }
 
             // ⛔ SHOWN ON EVERY CONVERTIBLE ROW, not only where CONVERT was refused. The operator's
@@ -1283,7 +1287,7 @@ public class LiquidationReadinessController {
         ProcessingBlocker blocker = ProcessingBlocker.of(
                 gate.effectiveMode(datum.principalAsset()), gate.actionFor(datum.principalAsset()),
                 gate.marketFor(datum.principalAsset()), convertEnabled, bondRoute,
-                new ProcessingBlocker.PoolUsabilityView(usability.usable(), usability.detail()),
+                new ProcessingBlocker.PoolUsabilityView(usability.verdict(), usability.detail()),
                 advance, funds.balance(), wallet.known(), funds.label(), funds.detail());
 
         ActionNow actionNow = gatedAction(lendingConfigGate,
@@ -1293,7 +1297,7 @@ public class LiquidationReadinessController {
                                         gate.effectiveMode(datum.principalAsset()),
                                         gate.actionFor(datum.principalAsset()),
                                         gate.marketFor(datum.principalAsset()), convertEnabled,
-                                        usability.usable(), advance)),
+                                        usability.verdict(), advance)),
                         health.liquidatable(), assessment));
 
         return new Row(loan.loanId(), loan.utxoRef(),
@@ -1359,8 +1363,8 @@ public class LiquidationReadinessController {
 
     /**
      * ⛔ FAB-126 slice 2 r2: the route detail of a CONVERT market whose pool verdict is not USABLE, which
-     * follows the VERDICT, not merely "not usable". Only a verdict about the POOL earns the ANTICIPATE
-     * remedy: a failed lookup ({@code CHECK_FAILED}) is not evidence that no pool exists — the executor
+     * follows the VERDICT, not merely "not usable". Only a verdict about the POOL earns the
+     * CONVERT_BEFORE_ANTICIPATE remedy: a failed lookup ({@code CHECK_FAILED}) is not evidence that no pool exists — the executor
      * may convert this loan on the next cycle — and an unpriced loan ({@code UNKNOWN}) says nothing about
      * any pool, so advising capital-fronting on either would turn "could not ask" into "no pool".
      *
@@ -1375,22 +1379,64 @@ public class LiquidationReadinessController {
             case NO_POOL, TOO_THIN, WRONG_PAIR, CANNOT_QUOTE ->
                     "the pool cannot fill this loan's swap, so the convert route will refuse it: "
                             + usability.detail() + noCapital
-                            + " — to front the principal instead, set this market to action: ANTICIPATE "
-                            + "with a cap";
+                            + " — to front the principal instead, set this market to action: "
+                            + "CONVERT_BEFORE_ANTICIPATE with a cap";
             case CHECK_FAILED ->
                     "the pool check could not complete, which is NOT evidence that no pool exists; the bot "
                             + "checks again next cycle: " + usability.detail() + noCapital;
             case NOT_CONFIGURED ->
                     "this node cannot convert (no Minswap configuration for its network), so the convert "
                             + "route refuses every loan on this market: " + usability.detail() + noCapital
-                            + " — configure loans.minswap.*, or set this market to action: ANTICIPATE "
-                            + "with a cap";
+                            + " — configure loans.minswap.*, or set this market to action: "
+                            + "CONVERT_BEFORE_ANTICIPATE with a cap";
             case UNKNOWN ->
                     "whether a pool can fill this swap is not known, because the loan's figures could not "
                             + "be priced: " + usability.detail() + noCapital;
             case USABLE ->
                     "the pool check reports a usable pool, but this row was not routed as one: "
                             + usability.detail() + noCapital;
+        };
+    }
+
+    /** A convert-bond row's route, its detail, and whether the advance is computed for it. */
+    record RouteChoice(String route, String detail, boolean computesAdvance) { }
+
+    /**
+     * ⛔ FAB-194-4: the route a {@code CONVERT_BEFORE_ANTICIPATE} market's token-collateral row would take,
+     * read from the pool verdict this page computed from the node's own index — the executor's split, never
+     * the ANTICIPATE market's fixed text. Convert switched off, or a verdict saying convert is IMPOSSIBLE
+     * ({@code NO_POOL}, {@code TOO_THIN}, {@code NOT_CONFIGURED}), pays in advance; {@code USABLE} converts;
+     * {@code WRONG_PAIR} and {@code CANNOT_QUOTE} are refused by the convert route and never fall back; a
+     * verdict that could not be reached ({@code CHECK_FAILED}, {@code UNKNOWN}) leaves the route unknown. The
+     * advance is computed wherever capital is, or might be, the question. The page tests every indexed pool
+     * now while the bot resolves one pool when it builds, so each pool-driven detail ends with
+     * {@link ActionNow#ESTIMATE_NOTE}.
+     */
+    static RouteChoice convertBeforeAnticipateRoute(boolean convertEnabled, PoolUsability usability) {
+        String market = "this market is action: CONVERT_BEFORE_ANTICIPATE";
+        PoolUsability.Verdict verdict = usability.verdict() == null
+                ? PoolUsability.Verdict.UNKNOWN : usability.verdict();
+        if (!convertEnabled) {
+            return new RouteChoice("CAPITAL IN ADVANCE", market + " and convert is disabled on this node, so "
+                    + "the bot pays in advance, fronting the principal under the market's cap, whatever the "
+                    + "pool verdict (" + verdict + ") says", true);
+        }
+        return switch (verdict) {
+            case USABLE -> new RouteChoice("CONVERT", market + " and a Minswap pool is deep enough to clear this "
+                    + "loan's debt (" + verdict + "), so the bot converts first: it creates a swap order and "
+                    + "fronts no capital" + ActionNow.ESTIMATE_NOTE, false);
+            case NO_POOL, TOO_THIN, NOT_CONFIGURED -> new RouteChoice("CAPITAL IN ADVANCE", market
+                    + " and convert is impossible for this loan (" + verdict + ": " + usability.detail()
+                    + "), so the bot pays in advance instead, fronting the principal under the market's cap"
+                    + ActionNow.ESTIMATE_NOTE, true);
+            case WRONG_PAIR, CANNOT_QUOTE -> new RouteChoice("CONVERT", market + " and the convert route will "
+                    + "refuse this loan (" + verdict + ": " + usability.detail() + "); that refusal is not a "
+                    + "reason to pay in advance, so the bot fronts no capital — the figure shown is what an "
+                    + "advance would need" + ActionNow.ESTIMATE_NOTE, true);
+            case CHECK_FAILED, UNKNOWN -> new RouteChoice("UNKNOWN", market + " and whether convert is possible "
+                    + "is not known (" + verdict + ": " + usability.detail() + "), so whether the bot would "
+                    + "convert or pay in advance is not known either — this is not evidence that capital is "
+                    + "needed" + ActionNow.ESTIMATE_NOTE, true);
         };
     }
 

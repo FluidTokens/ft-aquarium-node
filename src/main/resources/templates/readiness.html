@@ -555,7 +555,7 @@
         <th class="num">Expected reward<span class="info" title="The liquidator's fee slice, valued in the principal asset at oracle prices. This is the IDEAL profit: it ignores transaction and order costs, and assumes the collateral sells at the oracle price. The realistic figure is in the breakdown.">ⓘ</span></th>
         <th>Route<span class="info" title="Configured route is which transaction a liquidation would build. Pool status is the chain's answer about Minswap. Action now is what this node would actually do — which on a disabled node is nothing, however good the rest looks.">ⓘ</span></th>
         <th class="num">Capital required<span class="info" title="What you would pay the lender to anticipate: the debt PLUS the lender's liquidation penalty, MINUS your fee slice, valued at oracle prices. This is why it differs from the debt.">ⓘ</span></th>
-        <th>Action now<span class="info" title="What this node would actually do about this loan on the next scan, after the node mode ceiling, the market cap and the global convert switch are all applied. This is the only column that describes intent rather than possibility.">ⓘ</span></th>
+        <th>Action now<span class="info" title="What this node would actually do about this loan on the next scan, after the node mode ceiling, the market cap and the global convert switch are all applied. This is the only column that describes intent rather than possibility. For a CONVERT_BEFORE_ANTICIPATE market the column is an estimate: the page tests every indexed pool now, while the bot resolves one pool when it builds.">ⓘ</span></th>
       </tr>
       </thead>
       <tbody>

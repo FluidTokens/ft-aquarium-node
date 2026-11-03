@@ -129,7 +129,7 @@ class ReadinessTemplateRendersRowsTest {
                 PoolUsability.checkFailed("SocketTimeoutException"),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no lender bond indexed"), null,
-                ActionNow.of(null, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                ActionNow.of(null, null, null, null, true, PoolUsability.Verdict.NO_POOL, null), ProcessingBlocker.NONE,
                 null, null);
     }
 
@@ -1031,7 +1031,7 @@ class ReadinessTemplateRendersRowsTest {
                 usability,
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                ActionNow.of(false, null, null, null, true, PoolUsability.Verdict.NO_POOL, null), ProcessingBlocker.NONE,
                 null, null);
     }
 

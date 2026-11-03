@@ -112,7 +112,7 @@ class LiquidationReadinessControllerTest {
                 PoolUsability.noPool(),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                ActionNow.of(false, null, null, null, true, PoolUsability.Verdict.NO_POOL, null), ProcessingBlocker.NONE,
                 null, null);
     }
 
@@ -694,7 +694,7 @@ class LiquidationReadinessControllerTest {
                 PoolUsability.noPool(),
                 null, null, null, null,
                 AnticipateAndSell.unknown("no pool"), null,
-                ActionNow.of(false, null, null, null, true, false, null), ProcessingBlocker.NONE,
+                ActionNow.of(false, null, null, null, true, PoolUsability.Verdict.NO_POOL, null), ProcessingBlocker.NONE,
                 null, null);
 
         assertNull(r.healthFactor());
@@ -2129,7 +2129,7 @@ class LiquidationReadinessControllerTest {
      * operator's switch to flip -- so this, and only the pool verdicts, carry the ANTICIPATE remedy.
      */
     @Test
-    void aConvertMarketWithNoPoolForThePairAdvisesAnticipateWithACap() {
+    void aConvertMarketWithNoPoolForThePairAdvisesConvertBeforeAnticipateWithACap() {
         LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
                 new FakeOracleClient(), PoolIndex.of().resolver());
 
@@ -2137,7 +2137,7 @@ class LiquidationReadinessControllerTest {
                 "fixture premise: " + row.poolUsability());
         assertEquals("CONVERT", row.route(), row.routeDetail());
         assertTrue(row.routeDetail().contains("convert route will refuse"), row.routeDetail());
-        assertTrue(row.routeDetail().contains("action: ANTICIPATE with a cap"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("action: CONVERT_BEFORE_ANTICIPATE with a cap"), row.routeDetail());
         assertTrue(row.routeDetail().contains("fronts no capital"), row.routeDetail());
         assertFalse(row.routeDetail().contains("must be fronted"), row.routeDetail());
     }
@@ -2197,6 +2197,237 @@ class LiquidationReadinessControllerTest {
         assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
         assertTrue(row.routeDetail().contains("action: ANTICIPATE"), row.routeDetail());
         assertTrue(row.routeDetail().contains("fronts the principal"), row.routeDetail());
+    }
+
+    // ---- FAB-194-4: a CONVERT_BEFORE_ANTICIPATE row takes the route the pool verdict gives it ---------------
+
+    /** Deep, and two ada per collateral unit: USABLE for the render loan (see the CONVERT usable-pool test). */
+    private static MinswapPoolDatum deepRenderPool() {
+        return new MinswapPoolDatum(AssetType.ada(), COLLATERAL_TOKEN, BigInteger.TEN,
+                new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+    }
+
+    /** 1:1: what reaches the pool after the liquidation fee is less than the debt, so TOO_THIN. */
+    private static MinswapPoolDatum thinRenderPool() {
+        return new MinswapPoolDatum(AssetType.ada(), COLLATERAL_TOKEN, BigInteger.TEN,
+                new BigInteger("10000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+    }
+
+    /** The deep pool with a dynamic fee: CANNOT_QUOTE, a refusal that is never paid in advance. */
+    private static MinswapPoolDatum dynamicFeeRenderPool() {
+        return new MinswapPoolDatum(AssetType.ada(), COLLATERAL_TOKEN, BigInteger.TEN,
+                new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), true);
+    }
+
+    private static AppConfig.LiquidationConfiguration convertBeforeAnticipateConfiguration() {
+        var market = anticipateMarket("lovelace", 1_000_000_000L);
+        market.setAction(AppConfig.LiquidationConfiguration.Action.CONVERT_BEFORE_ANTICIPATE);
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(market));
+        return configuration;
+    }
+
+    private static LiquidationReadinessController.Row renderTokenConvertRow(
+            AppConfig.LiquidationConfiguration configuration, MinswapPoolResolver resolver, boolean convertEnabled) {
+        return renderLiquidatable(
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(50),
+                        LoanFixtures.noStakeCredential(), AssetType.ada()),
+                LoanFixtures.tokenCollateral(COLLATERAL_TOKEN, COLLATERAL_ORACLE_NFT), configuration, null,
+                new com.fluidtokens.aquarium.offchain.service.LendingConfigGate(), true,
+                pricedCollateralOracle(), resolver, AssetType.ada(), AssetType.ada(), null, null,
+                convertEnabled).row();
+    }
+
+    /** The ANTICIPATE version of the same loan's advance: what every capital row of this loan must show. */
+    private static BigInteger anticipateAdvanceOfTheRenderLoan() {
+        var configuration = liveConfiguration();
+        configuration.setMarkets(List.of(anticipateMarket("lovelace", 1_000_000_000L)));
+        BigInteger advance = renderTokenConvertRow(configuration, PoolIndex.of().resolver(), true)
+                .advancePrincipalAmount();
+        assertNotNull(advance, "fixture premise: the render loan must be priced");
+        return advance;
+    }
+
+    /** Every detail a CONVERT_BEFORE_ANTICIPATE row shows names it, and none claims the ANTICIPATE setting. */
+    private static void assertNamesConvertBeforeAnticipate(LiquidationReadinessController.Row row) {
+        for (String detail : List.of(row.routeDetail(), row.actionNow().detail())) {
+            assertTrue(detail.contains("CONVERT_BEFORE_ANTICIPATE"), detail);
+            assertFalse(detail.contains("configured action: ANTICIPATE"), detail);
+        }
+        assertTrue(row.actionNow().detail().endsWith(ActionNow.ESTIMATE_NOTE), row.actionNow().detail());
+    }
+
+    @Test
+    void aConvertBeforeAnticipateRowWithNoPoolPaysInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of().resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.NO_POOL, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("NO_POOL"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("ADVANCE", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    @Test
+    void aConvertBeforeAnticipateRowWithAThinPoolPaysInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of(thinRenderPool()).resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.TOO_THIN, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("TOO_THIN"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("ADVANCE", row.actionNow().text(), row.actionNow().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    @Test
+    void aConvertBeforeAnticipateRowWithADeepPoolConvertsAndComputesNoAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.USABLE, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("USABLE"), row.routeDetail());
+        assertNull(row.advancePrincipalAmount(), "a usable pool converts, so no advance is computed");
+        assertEquals("CONVERT", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertFalse(row.blocker().blocked(), row.blocker().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    /** ⛔ D15: a lookup that failed is not "no pool", so it is neither ADVANCE nor a capital need. */
+    @Test
+    void aConvertBeforeAnticipateRowWhosePoolCheckFailedIsUnknownNeverAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.failing().resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.CHECK_FAILED, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("UNKNOWN", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("CHECK_FAILED"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("UNKNOWN", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertEquals("unknown", row.blocker().label(), row.blocker().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    /** ⛔ D15: a pool the convert route refuses by name is never a reason to front capital. */
+    @Test
+    void aConvertBeforeAnticipateRowWhosePoolCannotBeQuotedIsRefusedNotPaidInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of(dynamicFeeRenderPool()).resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.CANNOT_QUOTE, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("CANNOT_QUOTE"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("not a reason to pay in advance"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("NONE — pool", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertEquals("no pool", row.blocker().label(), row.blocker().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    @Test
+    void aConvertBeforeAnticipateRowWithConvertOffPaysInAdvanceWhateverThePool() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), false);
+
+        assertEquals(PoolUsability.Verdict.USABLE, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("convert is disabled"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("ADVANCE", row.actionNow().text(), row.actionNow().toString());
+        assertTrue(row.actionNow().detail().contains("convert is disabled"), row.actionNow().detail());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
+    /**
+     * The same five pools on a CONVERT market: the route and its detail are exactly what they were before
+     * FAB-194-4 (only the two advice texts changed), pinned in full rather than by fragment.
+     */
+    @Test
+    void theSameRowsOnAConvertMarketRenderTheirConvertRouteDetailsUnchanged() {
+        String noCapital = "; the bot fronts no capital on a CONVERT market";
+        String advice = " — to front the principal instead, set this market to action: CONVERT_BEFORE_ANTICIPATE "
+                + "with a cap";
+
+        LiquidationReadinessController.Row deep = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), true);
+        assertEquals("CONVERT", deep.route());
+        assertEquals("a Minswap pool is deep enough to clear this loan's debt, so the bot creates a swap "
+                + "order and fronts no capital", deep.routeDetail());
+        assertNull(deep.advancePrincipalAmount());
+
+        for (MinswapPoolResolver resolver : List.of(PoolIndex.of().resolver(),
+                PoolIndex.of(thinRenderPool()).resolver(), PoolIndex.of(dynamicFeeRenderPool()).resolver())) {
+            LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(), resolver, true);
+            assertEquals("CONVERT", row.route(), row.routeDetail());
+            assertEquals("the pool cannot fill this loan's swap, so the convert route will refuse it: "
+                    + row.poolUsability().detail() + noCapital + advice, row.routeDetail());
+            assertNotNull(row.advancePrincipalAmount(), row.routeDetail());
+        }
+
+        LiquidationReadinessController.Row failed = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.failing().resolver(), true);
+        assertEquals("CONVERT", failed.route());
+        assertEquals("the pool check could not complete, which is NOT evidence that no pool exists; the bot "
+                + "checks again next cycle: " + failed.poolUsability().detail() + noCapital, failed.routeDetail());
+
+        LiquidationReadinessController.Row off = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.of(deepRenderPool()).resolver(), false);
+        assertEquals("CONVERT", off.route());
+        assertEquals(deep.routeDetail(), off.routeDetail(), "convert off does not change a CONVERT market's route");
+        assertEquals("NONE — convert off", off.actionNow().text(), off.actionNow().toString());
+    }
+
+    /**
+     * ⛔ P-G4: the row's action and blocker must read the verdict of THIS row's pool. A CONVERT row over a
+     * thin pool is not usable, so it must not say it would convert, nor read clean.
+     */
+    @Test
+    void aConvertMarketRowOverAThinPoolReadsNotUsableInTheActionAndTheBlocker() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
+                PoolIndex.of(thinRenderPool()).resolver(), true);
+
+        assertEquals(PoolUsability.Verdict.TOO_THIN, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("NONE — pool", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertEquals("no pool", row.blocker().label(), row.blocker().toString());
+        assertEquals(row.poolUsability().detail(), row.blocker().detail());
+    }
+
+    /** The NOT_CONFIGURED advice names the action that falls back, not the one that always fronts capital. */
+    @Test
+    void aNodeThatCannotConvertAdvisesConvertBeforeAnticipateWithACap() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(),
+                new FakeOracleClient(), null);
+
+        assertEquals(PoolUsability.Verdict.NOT_CONFIGURED, row.poolUsability().verdict(),
+                "fixture premise: " + row.poolUsability());
+        assertTrue(row.routeDetail().endsWith(" — configure loans.minswap.*, or set this market to action: "
+                + "CONVERT_BEFORE_ANTICIPATE with a cap"), row.routeDetail());
+    }
+
+    /** A CONVERT_BEFORE_ANTICIPATE row on a node that cannot convert pays in advance, naming NOT_CONFIGURED. */
+    @Test
+    void aConvertBeforeAnticipateRowOnANodeThatCannotConvertPaysInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                null, true);
+
+        assertEquals(PoolUsability.Verdict.NOT_CONFIGURED, row.poolUsability().verdict(),
+                "fixture premise: " + row.poolUsability());
+        assertEquals("CAPITAL IN ADVANCE", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("NOT_CONFIGURED"), row.routeDetail());
+        assertEquals("ADVANCE", row.actionNow().text(), row.actionNow().toString());
+        assertNamesConvertBeforeAnticipate(row);
     }
 
     /**
@@ -2432,6 +2663,26 @@ class LiquidationReadinessControllerTest {
             AssetType principalOracleAsset,
             com.fluidtokens.aquarium.offchain.service.AppUtxoService walletUtxos,
             com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier) {
+        return renderLiquidatable(bondDatumOrNull, collateral, configuration, assessmentFactory,
+                lendingConfigGate, liquidatable, oracleClient, poolResolverOrNull, principal,
+                principalOracleAsset, walletUtxos, protocolParamsSupplier, true);
+    }
+
+    /** FAB-194-4: as above, with {@code loans.liquidation.convert.enabled} as given. */
+    private static Rendered renderLiquidatable(
+            com.fluidtokens.aquarium.offchain.model.loans.LenderManagerDatum bondDatumOrNull,
+            com.fluidtokens.aquarium.offchain.model.loans.CollateralAsset collateral,
+            AppConfig.LiquidationConfiguration configuration,
+            AssessmentFactory assessmentFactory,
+            com.fluidtokens.aquarium.offchain.service.LendingConfigGate lendingConfigGate,
+            Boolean liquidatable,
+            FluidOracleClient oracleClient,
+            MinswapPoolResolver poolResolverOrNull,
+            AssetType principal,
+            AssetType principalOracleAsset,
+            com.fluidtokens.aquarium.offchain.service.AppUtxoService walletUtxos,
+            com.bloxbean.cardano.client.api.ProtocolParamsSupplier protocolParamsSupplier,
+            boolean convertEnabled) {
         LoanDatum datum = LoanFixtures.loanDatum(principal, principalOracleAsset, BigInteger.valueOf(100_000_000L),
                 BigInteger.ZERO, collateral, 0L, LoanFixtures.liquidation(),
                 new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
@@ -2476,6 +2727,7 @@ class LiquidationReadinessControllerTest {
                 provide(walletUtxos), configuration, network);
         controller.setLendingConfigGate(lendingConfigGate);
         controller.setProtocolParamsSupplier(protocolParamsSupplier);
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "convertEnabled", convertEnabled);
         var model = new org.springframework.ui.ConcurrentModel();
         controller.readiness(model, null, null, null, null, null);
         @SuppressWarnings("unchecked")
