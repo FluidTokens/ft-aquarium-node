@@ -229,6 +229,13 @@ class ActionNowTest {
         assertTrue(answer.detail().endsWith(ActionNow.ESTIMATE_NOTE), answer.detail());
     }
 
+    /** ⛔ FAB-194-4 r2: the note every CONVERT_BEFORE_ANTICIPATE detail ends with, pinned verbatim. */
+    @Test
+    void theEstimateNoteSaysThePageAndTheBotMayConsultDifferentPools() {
+        assertEquals(" — an estimate: this page tests every indexed pool now, while the bot resolves one pool "
+                + "when it builds", ActionNow.ESTIMATE_NOTE);
+    }
+
     /**
      * ⛔ All eight verdicts, LIVE and SHADOW: impossible-to-convert verdicts pay in advance, USABLE converts,
      * a refused pool never falls back, and a verdict that could not be reached is UNKNOWN.

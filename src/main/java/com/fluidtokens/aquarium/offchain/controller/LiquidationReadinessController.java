@@ -1363,10 +1363,22 @@ public class LiquidationReadinessController {
 
     /**
      * ⛔ FAB-126 slice 2 r2: the route detail of a CONVERT market whose pool verdict is not USABLE, which
-     * follows the VERDICT, not merely "not usable". Only a verdict about the POOL earns the
-     * CONVERT_BEFORE_ANTICIPATE remedy: a failed lookup ({@code CHECK_FAILED}) is not evidence that no pool exists — the executor
-     * may convert this loan on the next cycle — and an unpriced loan ({@code UNKNOWN}) says nothing about
-     * any pool, so advising capital-fronting on either would turn "could not ask" into "no pool".
+     * follows the VERDICT, not merely "not usable". The remedy each verdict earns is the one the executor
+     * would actually honour (FAB-194-4 r2):
+     * <ul>
+     *   <li>{@code NO_POOL}, {@code TOO_THIN} and {@code NOT_CONFIGURED} earn the CONVERT_BEFORE_ANTICIPATE
+     *       remedy: the executor falls back to pay-in-advance on exactly these (the router's
+     *       {@code NoPoolException} — which a missing Minswap configuration also throws — and
+     *       {@code POOL_TOO_THIN}), so that market would front the principal under its cap.</li>
+     *   <li>{@code WRONG_PAIR} and {@code CANNOT_QUOTE} earn only the ANTICIPATE remedy: the convert route
+     *       refuses them and a CONVERT_BEFORE_ANTICIPATE market would refuse them too, never falling back, so
+     *       advising it would promise a capital route the bot does not take — and contradict this page's own
+     *       CONVERT_BEFORE_ANTICIPATE rows.</li>
+     *   <li>{@code CHECK_FAILED} and {@code UNKNOWN} earn no remedy: a failed lookup is not evidence that no
+     *       pool exists — the executor may convert this loan on the next cycle — and an unpriced loan says
+     *       nothing about any pool, so advising capital-fronting on either would turn "could not ask" into
+     *       "no pool".</li>
+     * </ul>
      *
      * <p>The switch is exhaustive so that a new verdict fails to compile here rather than falling into a
      * wrong text. {@code USABLE} cannot reach this branch (the caller routes it to the usable-pool
@@ -1376,11 +1388,15 @@ public class LiquidationReadinessController {
     static String convertNotUsableDetail(PoolUsability usability) {
         String noCapital = "; the bot fronts no capital on a CONVERT market";
         return switch (usability.verdict()) {
-            case NO_POOL, TOO_THIN, WRONG_PAIR, CANNOT_QUOTE ->
+            case NO_POOL, TOO_THIN ->
                     "the pool cannot fill this loan's swap, so the convert route will refuse it: "
                             + usability.detail() + noCapital
                             + " — to front the principal instead, set this market to action: "
                             + "CONVERT_BEFORE_ANTICIPATE with a cap";
+            case WRONG_PAIR, CANNOT_QUOTE ->
+                    "the pool cannot fill this loan's swap, so the convert route will refuse it: "
+                            + usability.detail() + noCapital
+                            + " — to front the principal instead, set this market to action: ANTICIPATE with a cap";
             case CHECK_FAILED ->
                     "the pool check could not complete, which is NOT evidence that no pool exists; the bot "
                             + "checks again next cycle: " + usability.detail() + noCapital;

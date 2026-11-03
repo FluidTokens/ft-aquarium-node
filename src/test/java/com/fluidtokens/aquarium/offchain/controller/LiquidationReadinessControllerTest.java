@@ -2222,6 +2222,25 @@ class LiquidationReadinessControllerTest {
                 BigInteger.valueOf(30L), BigInteger.valueOf(30L), true);
     }
 
+    /**
+     * A resolver whose snapshot hands back a pool for ANOTHER pair, so the row's verdict is WRONG_PAIR.
+     * The real snapshot keys pools by the LP unit recomputed from their own datum, so an authentic index
+     * cannot produce this; it is mocked to reach the controller's mapping of the verdict, which is what
+     * is under test here.
+     */
+    private static MinswapPoolResolver wrongPairResolver() {
+        var otherPair = new MinswapPoolDatum(AssetType.ada(), FLDT, BigInteger.TEN,
+                new BigInteger("20000000000000"), new BigInteger("10000000000000"),
+                BigInteger.valueOf(30L), BigInteger.valueOf(30L), false);
+        var snapshot = org.mockito.Mockito.mock(MinswapPoolResolver.Snapshot.class);
+        org.mockito.Mockito.when(snapshot.resolveEitherOrder(org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.any()))
+                .thenReturn(Optional.of(new MinswapPoolResolver.ResolvedPool(null, otherPair, "fixture")));
+        var resolver = org.mockito.Mockito.mock(MinswapPoolResolver.class);
+        org.mockito.Mockito.when(resolver.snapshot()).thenReturn(snapshot);
+        return resolver;
+    }
+
     private static AppConfig.LiquidationConfiguration convertBeforeAnticipateConfiguration() {
         var market = anticipateMarket("lovelace", 1_000_000_000L);
         market.setAction(AppConfig.LiquidationConfiguration.Action.CONVERT_BEFORE_ANTICIPATE);
@@ -2335,6 +2354,29 @@ class LiquidationReadinessControllerTest {
         assertNamesConvertBeforeAnticipate(row);
     }
 
+    /**
+     * ⛔ D15, FAB-194-4 r2: a pool for the wrong pair shares CANNOT_QUOTE's label and is refused the same
+     * way — the convert route will not take it and CONVERT_BEFORE_ANTICIPATE does not fall back on it.
+     */
+    @Test
+    void aConvertBeforeAnticipateRowWhosePoolIsTheWrongPairIsRefusedNotPaidInAdvance() {
+        LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
+                wrongPairResolver(), true);
+
+        assertEquals(PoolUsability.Verdict.WRONG_PAIR, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
+        assertEquals("CONVERT", row.route(), row.routeDetail());
+        assertTrue(row.routeDetail().contains("WRONG_PAIR"), row.routeDetail());
+        assertTrue(row.routeDetail().contains("not a reason to pay in advance"), row.routeDetail());
+        assertFalse(row.routeDetail().contains("pays in advance instead"), row.routeDetail());
+        assertFalse(row.routeDetail().contains("fallback"), row.routeDetail());
+        assertEquals(anticipateAdvanceOfTheRenderLoan(), row.advancePrincipalAmount());
+        assertEquals("NONE — pool", row.actionNow().text(), row.actionNow().toString());
+        assertFalse(row.actionNow().wouldAct(), row.actionNow().toString());
+        assertFalse(row.actionNow().text().contains("ADVANCE"), row.actionNow().toString());
+        assertEquals("no pool", row.blocker().label(), row.blocker().toString());
+        assertNamesConvertBeforeAnticipate(row);
+    }
+
     @Test
     void aConvertBeforeAnticipateRowWithConvertOffPaysInAdvanceWhateverThePool() {
         LiquidationReadinessController.Row row = renderTokenConvertRow(convertBeforeAnticipateConfiguration(),
@@ -2350,14 +2392,12 @@ class LiquidationReadinessControllerTest {
     }
 
     /**
-     * The same five pools on a CONVERT market: the route and its detail are exactly what they were before
-     * FAB-194-4 (only the two advice texts changed), pinned in full rather than by fragment.
+     * The same pools on a CONVERT market, plus a wrong-pair pool: the route and its detail are exactly what
+     * they were before FAB-194-4 (only the advice texts changed), pinned in full rather than by fragment.
      */
     @Test
     void theSameRowsOnAConvertMarketRenderTheirConvertRouteDetailsUnchanged() {
         String noCapital = "; the bot fronts no capital on a CONVERT market";
-        String advice = " — to front the principal instead, set this market to action: CONVERT_BEFORE_ANTICIPATE "
-                + "with a cap";
 
         LiquidationReadinessController.Row deep = renderTokenConvertRow(liveConfiguration(),
                 PoolIndex.of(deepRenderPool()).resolver(), true);
@@ -2366,13 +2406,37 @@ class LiquidationReadinessControllerTest {
                 + "order and fronts no capital", deep.routeDetail());
         assertNull(deep.advancePrincipalAmount());
 
-        for (MinswapPoolResolver resolver : List.of(PoolIndex.of().resolver(),
-                PoolIndex.of(thinRenderPool()).resolver(), PoolIndex.of(dynamicFeeRenderPool()).resolver())) {
-            LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(), resolver, true);
+        // ⛔ r2: each verdict pinned to its OWN advice. The executor falls back on NO_POOL and TOO_THIN
+        // only, so only they may advise CONVERT_BEFORE_ANTICIPATE; WRONG_PAIR and CANNOT_QUOTE would be
+        // refused by that market too, so their only capital remedy is ANTICIPATE.
+        Map<PoolUsability.Verdict, MinswapPoolResolver> pools = new java.util.EnumMap<>(PoolUsability.Verdict.class);
+        pools.put(PoolUsability.Verdict.NO_POOL, PoolIndex.of().resolver());
+        pools.put(PoolUsability.Verdict.TOO_THIN, PoolIndex.of(thinRenderPool()).resolver());
+        pools.put(PoolUsability.Verdict.CANNOT_QUOTE, PoolIndex.of(dynamicFeeRenderPool()).resolver());
+        pools.put(PoolUsability.Verdict.WRONG_PAIR, wrongPairResolver());
+        Map<PoolUsability.Verdict, String> advice = new java.util.EnumMap<>(PoolUsability.Verdict.class);
+        advice.put(PoolUsability.Verdict.NO_POOL,
+                " — to front the principal instead, set this market to action: CONVERT_BEFORE_ANTICIPATE with a cap");
+        advice.put(PoolUsability.Verdict.TOO_THIN,
+                " — to front the principal instead, set this market to action: CONVERT_BEFORE_ANTICIPATE with a cap");
+        advice.put(PoolUsability.Verdict.CANNOT_QUOTE,
+                " — to front the principal instead, set this market to action: ANTICIPATE with a cap");
+        advice.put(PoolUsability.Verdict.WRONG_PAIR,
+                " — to front the principal instead, set this market to action: ANTICIPATE with a cap");
+
+        for (var entry : pools.entrySet()) {
+            PoolUsability.Verdict verdict = entry.getKey();
+            LiquidationReadinessController.Row row = renderTokenConvertRow(liveConfiguration(), entry.getValue(), true);
+            assertEquals(verdict, row.poolUsability().verdict(), "fixture premise: " + row.poolUsability());
             assertEquals("CONVERT", row.route(), row.routeDetail());
             assertEquals("the pool cannot fill this loan's swap, so the convert route will refuse it: "
-                    + row.poolUsability().detail() + noCapital + advice, row.routeDetail());
+                    + row.poolUsability().detail() + noCapital + advice.get(verdict), row.routeDetail());
             assertNotNull(row.advancePrincipalAmount(), row.routeDetail());
+            if (verdict == PoolUsability.Verdict.WRONG_PAIR || verdict == PoolUsability.Verdict.CANNOT_QUOTE) {
+                assertFalse(row.routeDetail().contains("CONVERT_BEFORE_ANTICIPATE"),
+                        verdict + " is never a fallback, so it must not advise the fallback action: "
+                                + row.routeDetail());
+            }
         }
 
         LiquidationReadinessController.Row failed = renderTokenConvertRow(liveConfiguration(),

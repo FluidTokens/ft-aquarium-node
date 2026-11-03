@@ -172,6 +172,19 @@ class ReadinessTemplateRendersRowsTest {
                 "a failed lookup must say so where it can be read without hovering");
     }
 
+    /**
+     * ⛔ FAB-194-4 r2: the "Action now" tooltip says a CONVERT_BEFORE_ANTICIPATE row is an estimate, pinned
+     * verbatim — the page tests every indexed pool, the bot resolves one, and they can disagree for a block.
+     */
+    @Test
+    void theActionNowTooltipSaysAConvertBeforeAnticipateRowIsAnEstimate() {
+        String html = render(List.of(fullRow()));
+
+        assertTrue(html.contains("For a CONVERT_BEFORE_ANTICIPATE market the column is an estimate: the page "
+                        + "tests every indexed pool now, while the bot resolves one pool when it builds."),
+                "the Action now tooltip must carry the estimate sentence");
+    }
+
     /** The breakdown answers "why is the capital required more than the debt", permanently. */
     @Test
     void theBreakdownExplainsWhyCapitalRequiredIsNotTheDebt() {
