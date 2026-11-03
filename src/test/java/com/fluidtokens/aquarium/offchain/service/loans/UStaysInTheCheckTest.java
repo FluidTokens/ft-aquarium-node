@@ -536,6 +536,38 @@ class UStaysInTheCheckTest {
         assertEquals(WorkResult.SUBMITTED, run.result());
     }
 
+    /**
+     * (j-shadow) the node-shadow twin of (j) (D13): a node-shadow WOULD_SUBMIT of a convert designated to U
+     * whose body also spends the token output takes the token output out of the check, and the anticipate
+     * behind it on that output is skipped by name. Without it a node-shadow WOULD_SUBMIT that marked only its
+     * designated output passes every other test, because (c)'s token half designates the token output itself
+     * and (j) exercises only the accept.
+     */
+    @Test
+    void aNodeShadowWouldSubmitOnUWhoseBodyAlsoSpendsTheTokenOutputTakesTheTokenOutputOutOfTheCheck()
+            throws Exception {
+        Transaction k = MarketActionRoutePinTest.k();
+        assertTrue(k.getBody().getInputs().contains(
+                        new TransactionInput(TOKEN_WALLET_UTXO.getTxHash(), TOKEN_WALLET_UTXO.getOutputIndex())),
+                "precondition: K spends the token output: " + k.getBody().getInputs());
+        BuildingConvertRouter router = new BuildingConvertRouter(k, ORDER_LOVELACE);
+        Scenario convert = adaPrincipalTokenCollateralConvertBond(1);
+        Scenario anticipate = tokenPrincipalConvertBond(2);
+
+        Run run = stage(anticipate(Mode.SHADOW, PRINCIPAL_TOKEN, null), List.of(convert, anticipate), router);
+
+        assertEquals(List.of(U_UTXO), router.offered(), "the convert is funded from U");
+        assertTrue(run.submitted().isEmpty(), "shadow transmits nothing");
+        List<LiquidationDecision> rows = oldestFirst(run);
+        assertEquals(1, rows.size(), "no row for the skipped candidate: " + rows);
+        assertEquals(LiquidationDecision.Outcome.WOULD_SUBMIT, rows.getFirst().outcome(), rows.getFirst().detail());
+        assertEquals(LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name(), rows.getFirst().submitVeto());
+        assertEquals(convert.loanRef(), rows.getFirst().loanUtxoRef());
+        assertTrue(run.messages(Level.INFO).contains(tokenSkip(anticipate)),
+                "the skip names the token output: " + run.messages(Level.INFO));
+        assertEquals(WorkResult.WOULD_SUBMIT, run.result());
+    }
+
     // ---- (k) no U, no note ---------------------------------------------------------------------------------
 
     /** (k) a wallet with no U: a token-funded SUBMITTED row ends with its hash and says nothing about U. */
@@ -550,5 +582,40 @@ class UStaysInTheCheckTest {
         assertEquals(LiquidationDecision.Outcome.SUBMITTED, rows.getFirst().outcome(), rows.getFirst().detail());
         assertTrue(rows.getFirst().detail().endsWith("; submitted as " + ACCEPTED), rows.getFirst().detail());
         assertFalse(rows.getFirst().detail().contains("U stays"), rows.getFirst().detail());
+    }
+
+    // ---- (l) a node-shadow row that is not WOULD_SUBMIT marks nothing ------------------------------------
+
+    /**
+     * (l) two token-principal anticipates on one token output, on a SHADOW node whose 100 ADA profit margin
+     * neither clears: both are designated the token output, both are built, both are recorded UNPROFITABLE, and
+     * neither is skipped. A live node would not submit an unprofitable candidate, so its node-shadow row marks
+     * nothing — the node-shadow twin of (h1)–(h3), which defend "a non-accepted outcome marks nothing" on a LIVE
+     * node only.
+     */
+    @Test
+    void aNodeShadowRowThatIsNotWouldSubmitMarksNothingAndTheNextCandidateOnTheSameTokenOutputIsBuilt() {
+        var configuration = new AppConfig.LiquidationConfiguration(Mode.SHADOW, 60, 120, 30,
+                BigInteger.valueOf(100_000_000L), 200, node(Mode.SHADOW).getReferenceScripts());
+        configuration.setMarkets(List.of(market(PRINCIPAL_TOKEN, null, Action.ANTICIPATE, AMPLE_CAP)));
+        List<Scenario> scenarios = List.of(tokenPrincipalConvertBond(1), tokenPrincipalConvertBond(2));
+
+        Run run = stage(configuration, scenarios, null);
+
+        for (Scenario scenario : scenarios) {
+            String designated = scenario.loanRef() + " is funded from wallet output " + TOKEN_REF + " (role TOKEN ";
+            assertTrue(run.messages(Level.INFO).stream().anyMatch(message -> message.contains(designated)),
+                    "precondition: " + scenario.loanRef() + " is designated the token output: "
+                            + run.messages(Level.INFO));
+        }
+        assertTrue(run.submitted().isEmpty(), "shadow transmits nothing");
+        List<LiquidationDecision> rows = oldestFirst(run);
+        assertEquals(List.of(LiquidationDecision.Outcome.UNPROFITABLE, LiquidationDecision.Outcome.UNPROFITABLE),
+                outcomes(run), rows.toString());
+        assertTrue(rows.stream()
+                        .allMatch(row -> LiquidationExecutor.SubmitVeto.MODE_NOT_LIVE.name().equals(row.submitVeto())),
+                rows.toString());
+        assertFalse(anyTokenSkip(run), run.events().toString());
+        assertEquals(WorkResult.DEFINITE_FAILURE, run.result());
     }
 }
