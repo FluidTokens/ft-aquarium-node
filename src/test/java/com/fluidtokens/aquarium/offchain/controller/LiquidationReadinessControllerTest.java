@@ -2126,7 +2126,9 @@ class LiquidationReadinessControllerTest {
 
     /**
      * FAB-126 slice 2 r2 (V3): a pair with NO pool is a pool verdict, and fronting the principal is the
-     * operator's switch to flip -- so this, and only the pool verdicts, carry the ANTICIPATE remedy.
+     * operator's switch to flip -- so only the pool verdicts carry a remedy: NO_POOL and TOO_THIN the
+     * CONVERT_BEFORE_ANTICIPATE one (that action falls back to pay-in-advance on exactly these), WRONG_PAIR
+     * and CANNOT_QUOTE the ANTICIPATE one (CONVERT_BEFORE_ANTICIPATE never falls back on them).
      */
     @Test
     void aConvertMarketWithNoPoolForThePairAdvisesConvertBeforeAnticipateWithACap() {

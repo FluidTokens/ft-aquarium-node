@@ -565,6 +565,55 @@ class ConvertBeforeAnticipateFallbackTest {
         assertTrue(run.submitted().isEmpty());
     }
 
+    // ---- (g') — D10: the fallback's refusals are logged in the pay-in-advance wording ---------------------------
+
+    /**
+     * (g') — the market gate's refusal of a fallback above its cap is ONE INFO line in the pay-in-advance
+     * wording, never the convert one: the full line, whose text after the colon is the row's detail without
+     * the prefix.
+     */
+    @Test
+    void aFallbackAboveTheCapLogsThePayInAdvanceMarketGateLine() {
+        Scenario scenario = tokenPrincipalConvertBond(1);
+
+        Run run = stage(cba(1L), scenario, new ThrowingConvertRouter(new ConvertLiquidationRouter.NoPoolException(NO_POOL)));
+
+        LiquidationDecision row = onlyRow(run);
+        assertTrue(row.reason().startsWith("ABOVE_MARKET_CAP: "), row.reason());
+        assertTrue(row.detail().startsWith(prefix("NO_MINSWAP_POOL")), row.detail());
+        String gate = row.detail().substring(prefix("NO_MINSWAP_POOL").length());
+        assertTrue(run.messages(Level.INFO).contains("the pay-in-advance liquidation of " + scenario.loanRef()
+                + " was refused by the market gate: " + gate), run.messages(Level.INFO).toString());
+    }
+
+    /**
+     * (g') — a fallback whose token output holds enough of the token but too little ada beside it (6 ADA, which
+     * clears the market gate's floor but not the role's ceiling) is refused {@code WALLET_INPUT_TOO_SMALL}, and
+     * said in ONE WARN line in the pay-in-advance wording: the full line, whose text after the colon is the
+     * row's detail without the prefix.
+     */
+    @Test
+    void aFallbackWhoseTokenOutputIsTooSmallLogsThePayInAdvanceRefusedLine() {
+        Scenario scenario = tokenPrincipalConvertBond(1);
+        Utxo thinToken = LoanFixtures.utxo("ea".repeat(32), 0, ACCOUNT.baseAddress(),
+                List.of(Amount.lovelace(BigInteger.valueOf(6_000_000L)),
+                        Amount.asset(PRINCIPAL_TOKEN.toUnit(), BigInteger.valueOf(100_000_000L))),
+                null);
+
+        Run run = stage(cba(CAP), List.of(scenario), wallet(U_UTXO, thinToken),
+                new ThrowingConvertRouter(new ConvertLiquidationRouter.NoPoolException(NO_POOL)));
+
+        LiquidationDecision row = onlyRow(run);
+        assertEquals(LiquidationDecision.Outcome.REFUSED, row.outcome(), row.detail());
+        assertEquals("WALLET_INPUT_TOO_SMALL", row.reason(), row.detail());
+        assertTrue(row.detail().startsWith(prefix("NO_MINSWAP_POOL") + "role TOKEN " + PRINCIPAL_TOKEN.toUnit()
+                + ", wallet output " + ref(thinToken) + ", "), row.detail());
+        String refused = row.detail().substring(prefix("NO_MINSWAP_POOL").length());
+        assertEquals(List.of("the pay-in-advance liquidation of " + scenario.loanRef() + " was refused: " + refused),
+                run.messages(Level.WARN));
+        assertTrue(run.submitted().isEmpty());
+    }
+
     // ---- (h) — D8: shadow ------------------------------------------------------------------------------------
 
     /** (h) — a SHADOW node: WOULD_SUBMIT {@code MODE_NOT_LIVE} under the prefix, dumped as pay-in-advance. */

@@ -164,6 +164,118 @@ class ConvertBeforeAnticipateBootLinesTest {
                 "convert enabled: no market falls back before a build");
     }
 
+    // ---- (e): the verifier's CONVERT AVAILABLE branch -------------------------------------------------------
+
+    /** The Minswap V2 mainnet coordinates application.yaml ships ({@code loans.minswap.*} defaults). */
+    private static final String SHIPPED_MINSWAP_POOL_POLICY = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
+    private static final String SHIPPED_MINSWAP_POOL_SPEND = "ea07b733d932129c378af627436e7cbc2ef0bf96e0036bb51b3bde6b";
+    private static final String SHIPPED_MINSWAP_ORDER_SPEND = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
+
+    /** What the recorded LMConfigDatum ({@code mainnet-lm-config-datum.hex}) publishes as its convert action. */
+    private static final String RECORDED_CONVERT_ACTION = "2432ab45c54570998ad5379c46fec2276ea72a94c7ffb6510bcd3aa8";
+
+    private static final String AVAILABLE = "CONVERT AVAILABLE: lm_liquidate_and_convert_action derives ";
+
+    /**
+     * (e) The recorded LMConfigDatum, its published convert action replaced by the hash the shipped mainnet Minswap
+     * coordinates derive: the verifier says CONVERT AVAILABLE and prints NO per-market line — a node that can
+     * convert never warns that a {@code CONVERT_BEFORE_ANTICIPATE} market will pay in advance.
+     */
+    @Test
+    void withConvertAvailableTheVerifierPrintsNoPerMarketLine() throws Exception {
+        String derived = new LoansContractRegistry(CONFIG, LM_CONFIG, ASSET, SMART, SHIPPED_MINSWAP_POOL_POLICY,
+                SHIPPED_MINSWAP_POOL_SPEND, SHIPPED_MINSWAP_ORDER_SPEND).getLmLiquidateAndConvertActionScriptHash();
+        assertTrue(derived != null && !derived.equalsIgnoreCase(RECORDED_CONVERT_ACTION),
+                "fixture premise: the shipped coordinates derive a hash the recorded datum does not publish: " + derived);
+
+        BFBackendService bf = blockfrostServingTheRecordedDatumsPublishingConvert(derived);
+        verifierRunnerOver(bf, SHIPPED_MINSWAP_POOL_POLICY, SHIPPED_MINSWAP_POOL_SPEND, SHIPPED_MINSWAP_ORDER_SPEND)
+                .withUserConfiguration(MarketsCtx.class).withPropertyValues(MARKETS)
+                .run(context -> {
+                    assertNull(context.getStartupFailure(), () -> "the context must start: " + context.getStartupFailure());
+                    assertBound(context.getBean(AppConfig.LiquidationConfiguration.class));
+                });
+
+        List<String> infos = messages(verifierLogs, Level.INFO);
+        assertTrue(infos.stream().anyMatch(i -> i.startsWith(AVAILABLE + derived + " and the LMConfigDatum publishes "
+                + "the same")), "the CONVERT AVAILABLE branch must have run, or silence proves nothing: " + infos);
+        List<String> warns = messages(verifierLogs, Level.WARN);
+        assertEquals(-1, indexOfPrefix(warns, NOT_SET), warns.toString());
+        assertEquals(-1, indexOfPrefix(warns, MISMATCH), warns.toString());
+        assertEquals(List.of(), perMarketLines(warns), "convert available: no per-market line");
+    }
+
+    // ---- (f): a plain CONVERT market beside a CONVERT_BEFORE_ANTICIPATE one gets no line --------------------------
+
+    private static final String CONVERT_UNIT = "dd".repeat(28) + "434f4e56";
+
+    /** {@link #MARKETS}, plus market 2: a plain {@code CONVERT} market, no cap. */
+    private static final String[] MARKETS_WITH_CONVERT = {
+            "loans.liquidation.mode=shadow",
+            "loans.liquidation.profit-margin-lovelace=5000000",
+            "loans.liquidation.markets[0].unit=" + CBA_UNIT,
+            "loans.liquidation.markets[0].action=CONVERT_BEFORE_ANTICIPATE",
+            "loans.liquidation.markets[0].cap=1000000000",
+            "loans.liquidation.markets[1].unit=" + ANTICIPATE_UNIT,
+            "loans.liquidation.markets[1].action=ANTICIPATE",
+            "loans.liquidation.markets[1].cap=2000000",
+            "loans.liquidation.markets[2].unit=" + CONVERT_UNIT,
+            "loans.liquidation.markets[2].action=CONVERT"};
+
+    private static void assertBoundWithConvert(AppConfig.LiquidationConfiguration configuration) {
+        assertEquals(3, configuration.getMarkets().size(), "all three markets must bind: " + configuration.getMarkets());
+        assertEquals(AppConfig.LiquidationConfiguration.Action.CONVERT_BEFORE_ANTICIPATE,
+                configuration.getMarkets().get(0).getAction());
+        assertEquals(AppConfig.LiquidationConfiguration.Action.ANTICIPATE, configuration.getMarkets().get(1).getAction());
+        assertEquals(AppConfig.LiquidationConfiguration.Action.CONVERT, configuration.getMarkets().get(2).getAction());
+        assertEquals(CONVERT_UNIT, configuration.getMarkets().get(2).getUnit());
+    }
+
+    /** (f) The verifier, convert unavailable: the one per-market WARN is market 0's; the CONVERT market gets none. */
+    @Test
+    void aConvertMarketBesideAConvertBeforeAnticipateOneGetsNoVerifierLine() throws Exception {
+        verifierRunner(null, null, null).withUserConfiguration(MarketsCtx.class).withPropertyValues(MARKETS_WITH_CONVERT)
+                .run(context -> {
+                    assertNull(context.getStartupFailure(), () -> "the context must start: " + context.getStartupFailure());
+                    assertBoundWithConvert(context.getBean(AppConfig.LiquidationConfiguration.class));
+                });
+        List<String> warns = messages(verifierLogs, Level.WARN);
+        assertTrue(indexOfPrefix(warns, NOT_SET) >= 0, "the CONVERT UNAVAILABLE line must be printed: " + warns);
+        assertEquals(List.of(VERIFIER_LINE), perMarketLines(warns),
+                "exactly one per-market WARN, for market 0; none for the CONVERT market " + CONVERT_UNIT);
+    }
+
+    /** (f) ConvertEconomics, convert disabled: the one INIT line is market 0's; the CONVERT market gets none. */
+    @Test
+    void aConvertMarketBesideAConvertBeforeAnticipateOneGetsNoEconomicsLine() {
+        Logger logger = (Logger) LoggerFactory.getLogger(ConvertEconomics.class);
+        ListAppender<ILoggingEvent> logs = new ListAppender<>();
+        logs.start();
+        logger.addAppender(logs);
+        try {
+            new ApplicationContextRunner()
+                    .withUserConfiguration(EconomicsCtx.class)
+                    .withPropertyValues(MARKETS_WITH_CONVERT)
+                    .withPropertyValues("network=preview",
+                            "loans.liquidation.convert.enabled=false",
+                            "loans.liquidation.convert.dex-cost-floor-lovelace=5000000",
+                            "loans.liquidation.convert.minswap-order-cost-lovelace=4000000")
+                    .run(context -> {
+                        assertNull(context.getStartupFailure(),
+                                () -> "the context must start: " + context.getStartupFailure());
+                        assertBoundWithConvert(context.getBean(AppConfig.LiquidationConfiguration.class));
+                        assertTrue(context.getBean(ConvertEconomics.class) != null);
+                    });
+        } finally {
+            logger.detachAppender(logs);
+        }
+        List<String> infos = messages(logs, Level.INFO);
+        assertTrue(infos.stream().anyMatch(i -> i.startsWith("CONVERT ECONOMICS enabled=false")),
+                "the container must have run announceAndGuard: " + infos);
+        assertEquals(List.of(ECONOMICS_LINE), infos.stream().filter(i -> i.startsWith("INIT - market ")).toList(),
+                "exactly one line, for market 0; none for the CONVERT market " + CONVERT_UNIT);
+    }
+
     // ---- plumbing --------------------------------------------------------------------------------------------
 
     private final ListAppender<ILoggingEvent> verifierLogs = new ListAppender<>();
@@ -257,6 +369,57 @@ class ConvertBeforeAnticipateBootLinesTest {
             String datum;
             try (InputStream in = getClass().getResourceAsStream("/loans-v4/" + served[1])) {
                 datum = new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
+            }
+            String address = AddressProvider.getEntAddress(
+                    Credential.fromScript(HexUtil.decodeHexString(served[0])), Networks.mainnet()).getAddress();
+            Utxo utxo = Utxo.builder()
+                    .txHash("00".repeat(32)).outputIndex(0)
+                    .amount(List.of(Amount.lovelace(BigInteger.TWO), Amount.asset(served[0] + ASSET, BigInteger.ONE)))
+                    .inlineDatum(datum).build();
+            Mockito.when(utxos.getUtxos(address, 100, 1))
+                    .thenReturn(Result.<List<Utxo>>success("ok").withValue(List.of(utxo)));
+        }
+        BFBackendService bf = Mockito.mock(BFBackendService.class);
+        Mockito.when(bf.getUtxoService()).thenReturn(utxos);
+        return bf;
+    }
+
+    /** {@link #verifierRunner}, over a Blockfrost stand-in the caller built. */
+    private ApplicationContextRunner verifierRunnerOver(BFBackendService bf, String minswapPoolPolicy,
+                                                        String minswapPoolSpend, String minswapOrderSpend) {
+        AppConfig.Network mainnet = new AppConfig.Network();
+        mainnet.setNetworkForTest("mainnet");
+        Logger logger = (Logger) LoggerFactory.getLogger(LoansConfigVerifier.class);
+        verifierLogs.list.clear();
+        verifierLogs.start();
+        logger.addAppender(verifierLogs);
+        return new ApplicationContextRunner()
+                .withBean(LendingConfigGate.class)
+                .withBean(LoansConfigVerifier.class, () -> new LoansConfigVerifier(
+                        new LoansContractRegistry(CONFIG, LM_CONFIG, ASSET, SMART,
+                                minswapPoolPolicy, minswapPoolSpend, minswapOrderSpend),
+                        SMART, mainnet, bf, false));
+    }
+
+    /**
+     * {@link #blockfrostServingTheRecordedDatums}, but the LMConfigDatum publishes {@code convertAction} where the
+     * recording publishes {@link #RECORDED_CONVERT_ACTION} — which must occur in it exactly once.
+     */
+    private BFBackendService blockfrostServingTheRecordedDatumsPublishingConvert(String convertAction) throws Exception {
+        UtxoService utxos = Mockito.mock(UtxoService.class);
+        for (String[] served : new String[][]{
+                {CONFIG, "mainnet-config-datum-2026-09-30.hex"}, {LM_CONFIG, "mainnet-lm-config-datum.hex"}}) {
+            String datum;
+            try (InputStream in = getClass().getResourceAsStream("/loans-v4/" + served[1])) {
+                datum = new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
+            }
+            if (served[0].equals(LM_CONFIG)) {
+                String needle = "581c" + RECORDED_CONVERT_ACTION;
+                assertEquals(datum.indexOf(needle), datum.lastIndexOf(needle),
+                        "the recorded convert action must occur exactly once in " + served[1]);
+                assertTrue(datum.contains(needle), "fixture premise: " + served[1] + " publishes "
+                        + RECORDED_CONVERT_ACTION);
+                datum = datum.replace(needle, "581c" + convertAction);
             }
             String address = AddressProvider.getEntAddress(
                     Credential.fromScript(HexUtil.decodeHexString(served[0])), Networks.mainnet()).getAddress();
