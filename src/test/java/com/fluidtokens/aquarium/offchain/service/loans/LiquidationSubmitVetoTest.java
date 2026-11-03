@@ -2444,7 +2444,8 @@ class LiquidationSubmitVetoTest {
 
     // ======================================================================================
     // FAB-183 — the liquidation stage and its fence; FAB-186 — fire and forget: every candidate walked,
-    // a non-accepted submit frees nothing and stops nothing, an accepted one uses up its output
+    // a non-accepted submit frees nothing and stops nothing, an accepted one takes a token output it spent
+    // out of the check, never U (D3, FAB-194)
     // ======================================================================================
 
     private static final String TX_LOAN_3 = "ac".repeat(32);

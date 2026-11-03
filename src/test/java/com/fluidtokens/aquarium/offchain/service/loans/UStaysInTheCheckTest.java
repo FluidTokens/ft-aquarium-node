@@ -11,6 +11,9 @@ import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfigurati
 import com.fluidtokens.aquarium.offchain.config.AppConfig.LiquidationConfiguration.Mode;
 import com.fluidtokens.aquarium.offchain.model.AssetType;
 import com.fluidtokens.aquarium.offchain.model.loans.LiquidationDecision;
+import com.fluidtokens.aquarium.offchain.model.loans.LoanDatum;
+import com.fluidtokens.aquarium.offchain.model.loans.OraclePriceFeed;
+import com.fluidtokens.aquarium.offchain.model.loans.RepaymentMode;
 import com.fluidtokens.aquarium.offchain.service.SubmitFence;
 import com.fluidtokens.aquarium.offchain.service.WorkResult;
 import com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.BuildingConvertRouter;
@@ -24,6 +27,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.NOW;
 import static com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.PRINCIPAL_TOKEN;
 import static com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.TOKEN_WALLET_UTXO;
 import static com.fluidtokens.aquarium.offchain.service.loans.RouteStageHarness.U_UTXO;
@@ -374,5 +378,177 @@ class UStaysInTheCheckTest {
         assertTrue(run.messages(Level.INFO).contains(skipped),
                 "the skip names the token output: " + run.messages(Level.INFO));
         assertEquals(WorkResult.SUBMITTED, run.result());
+    }
+
+    // ---- (h) a non-accepted answer on a TOKEN output marks nothing ---------------------------------------
+
+    /** A submitter whose FIRST call is answered by {@code first} and whose every later call accepts. */
+    private static LiquidationExecutor.TransactionSubmitter firstThenAccepting(
+            LiquidationExecutor.TransactionSubmitter first) {
+        AtomicInteger calls = new AtomicInteger();
+        return bytes -> calls.getAndIncrement() == 0
+                ? first.submit(bytes)
+                : Result.success(ACCEPTED).withValue(ACCEPTED);
+    }
+
+    /** Whether any line, at any level, says a candidate was skipped because the token output went out. */
+    private static boolean anyTokenSkip(Run run) {
+        return run.events().stream()
+                .anyMatch(event -> event.getFormattedMessage().contains("skipped: wallet output " + TOKEN_REF));
+    }
+
+    /**
+     * Two token-principal anticipates on one token output; the first submit is not accepted ({@code status}),
+     * the second is. Nothing was marked, so the second is built and transmitted on the same token output.
+     */
+    private static void aNonAcceptedAnswerOnTheTokenOutputMarksNothing(
+            LiquidationExecutor.TransactionSubmitter firstAnswer, String status) throws Exception {
+        Run run = stage(anticipate(Mode.LIVE, PRINCIPAL_TOKEN, null),
+                List.of(tokenPrincipalConvertBond(1), tokenPrincipalConvertBond(2)), null,
+                firstThenAccepting(firstAnswer));
+
+        assertEquals(2, run.submitted().size(), "both are transmitted: " + run.events());
+        assertTrue(spends(run.submitted().get(0), TOKEN_WALLET_UTXO), inputsOf(run.submitted().get(0)).toString());
+        assertTrue(spends(run.submitted().get(1), TOKEN_WALLET_UTXO), inputsOf(run.submitted().get(1)).toString());
+        List<LiquidationDecision> rows = oldestFirst(run);
+        assertEquals(List.of(LiquidationDecision.Outcome.SUBMIT_FAILED, LiquidationDecision.Outcome.SUBMITTED),
+                outcomes(run), rows.toString());
+        String notAccepted = "liquidation of " + rows.getFirst().loanUtxoRef() + " via pay-in-advance on "
+                + TOKEN_REF + " not accepted: HTTP " + status;
+        assertEquals(1, run.messages(Level.INFO).stream().filter(message -> message.startsWith(notAccepted)).count(),
+                "one not-accepted INFO line: " + run.messages(Level.INFO));
+        assertTrue(run.messages(Level.ERROR).isEmpty(), run.messages(Level.ERROR).toString());
+        assertFalse(anyTokenSkip(run), run.events().toString());
+        assertEquals(WorkResult.SUBMITTED, run.result());
+    }
+
+    /**
+     * (h1) a REFUSED answer (HTTP 400) on the token output marks nothing. (h1)–(h3) are the token-output
+     * defenders of "every non-accepted outcome marks nothing": the U tests can no longer defend it, because U
+     * is never marked whatever the answer.
+     */
+    @Test
+    void aRefusedAnswerOnATokenOutputMarksNothingAndTheNextCandidateOnItIsTransmitted() throws Exception {
+        aNonAcceptedAnswerOnTheTokenOutputMarksNothing(
+                bytes -> Result.<String>error("BadInputsUTxO: the backend refused this one").code(400), "400");
+    }
+
+    /** (h2) a THROWN submit on the token output marks nothing; see (h1). */
+    @Test
+    void aThrownSubmitOnATokenOutputMarksNothingAndTheNextCandidateOnItIsTransmitted() throws Exception {
+        aNonAcceptedAnswerOnTheTokenOutputMarksNothing(
+                bytes -> {
+                    throw new IllegalStateException("the backend connection was reset");
+                }, "threw");
+    }
+
+    /** (h3) a NULL answer on the token output marks nothing; see (h1). */
+    @Test
+    void aNullAnswerOnATokenOutputMarksNothingAndTheNextCandidateOnItIsTransmitted() throws Exception {
+        aNonAcceptedAnswerOnTheTokenOutputMarksNothing(bytes -> null, "none");
+    }
+
+    // ---- (i) a failed pay-in-advance build on a TOKEN output marks nothing --------------------------------
+
+    /**
+     * A token-principal loan with ADA collateral and a convert-to-principal bond, on index-1 refs, built from
+     * {@link RouteStageHarness#tokenPrincipalConvertBond}'s recipe. The principal oracle token, lend date,
+     * valid-from, stake key and fee per mille are the harness's own literals, so {@link RouteStageHarness#oracles()}
+     * prices it and it reaches the router.
+     */
+    private static Scenario tokenPrincipalAdaCollateralConvertBond() {
+        LoanDatum datum = LoanFixtures.loanDatum(PRINCIPAL_TOKEN, new AssetType("e0".repeat(28), "504f5243"),
+                BigInteger.valueOf(100_000_000), BigInteger.valueOf(1000), LoanFixtures.adaCollateral(),
+                NOW - 30L * 24 * 3_600_000L, LoanFixtures.liquidation(),
+                new RepaymentMode.PrincipalAndInterestOnInstallments(), false);
+        LoanFixtures.LoanUtxo loan = LoanFixtures.loanUtxo("41".repeat(32), 0, "a1b2c3d4e5f60001", datum,
+                100_000_000L, List.of());
+        LoanFixtures.BondUtxo bond = LoanFixtures.bondUtxo("61".repeat(32), 0, "a1b2c3d4e5f60001",
+                LoanFixtures.convertToPrincipalBondDatum(BigInteger.valueOf(500),
+                        LoanFixtures.inlineKeyStakeCredential("3".repeat(56)), PRINCIPAL_TOKEN),
+                2_000_000L);
+        return new Scenario(loan, bond, LoanFixtures.assess(bond.bond(), loan.loan(),
+                OraclePriceFeed.priceDataCharlie(PRINCIPAL_TOKEN, BigInteger.ONE, BigInteger.ONE,
+                        NOW - 60_000L, NOW + 600_000L),
+                OraclePriceFeed.unit(), NOW - 30_000L), true);
+    }
+
+    /**
+     * (i) a failed pay-in-advance build on the token output marks nothing. Why this loan: an ADA-collateral
+     * loan is the only machinery failure the harness can reach on the token route (FAB-117) — the
+     * pay-in-advance router refuses it with an IllegalStateException once the executor has designated the
+     * token output, and it ranks first, so the token-principal candidate behind it is on the same output. The
+     * ERROR assertion keeps this from passing vacuously: if that refusal ever moved before the build, the
+     * candidate would never reach the build-failure path this test defends, and the ERROR line would be gone.
+     */
+    @Test
+    void aFailedPayInAdvanceBuildOnATokenOutputMarksNothingAndTheNextCandidateOnItIsTransmitted() throws Exception {
+        Scenario adaCollateral = tokenPrincipalAdaCollateralConvertBond();
+        Scenario next = tokenPrincipalConvertBond(2);
+
+        Run run = stage(anticipate(Mode.LIVE, PRINCIPAL_TOKEN, null), List.of(adaCollateral, next), null);
+
+        List<LiquidationDecision> rows = oldestFirst(run);
+        assertEquals(List.of(LiquidationDecision.Outcome.REFUSED, LiquidationDecision.Outcome.SUBMITTED),
+                outcomes(run), rows.toString());
+        assertEquals(adaCollateral.loanRef(), rows.getFirst().loanUtxoRef(), rows.toString());
+        List<String> errors = run.messages(Level.ERROR);
+        assertEquals(1, errors.size(), errors.toString());
+        assertTrue(errors.getFirst().startsWith("building the pay-in-advance liquidation of " + adaCollateral.loanRef()
+                + " via pay-in-advance failed"), errors.getFirst());
+        assertEquals(1, run.submitted().size(), "one transmission: " + run.events());
+        assertTrue(spends(run.submitted().getFirst(), TOKEN_WALLET_UTXO),
+                inputsOf(run.submitted().getFirst()).toString());
+        assertFalse(anyTokenSkip(run), run.events().toString());
+        assertEquals(WorkResult.SUBMITTED, run.result());
+    }
+
+    // ---- (j) D3: an accepted body marks every role output among its inputs, not only the designated one ---
+
+    /**
+     * (j) a convert designated to U whose accepted body also spends the token output: the token output goes
+     * out with it, and the anticipate behind it on that output is skipped by name. The stand-in's canned body
+     * ({@code K}) is not built from the wallet — that is what lets a body spend a role output it was not
+     * designated, exactly the case D3's "any other wallet output among an accepted transaction's inputs is still
+     * marked" covers.
+     */
+    @Test
+    void anAcceptedBodyOnUThatAlsoSpendsTheTokenOutputTakesTheTokenOutputOutOfTheCheck() throws Exception {
+        Transaction k = MarketActionRoutePinTest.k();
+        assertTrue(k.getBody().getInputs().contains(
+                        new TransactionInput(TOKEN_WALLET_UTXO.getTxHash(), TOKEN_WALLET_UTXO.getOutputIndex())),
+                "precondition: K spends the token output: " + k.getBody().getInputs());
+        BuildingConvertRouter router = new BuildingConvertRouter(k, ORDER_LOVELACE);
+        Scenario convert = adaPrincipalTokenCollateralConvertBond(1);
+        Scenario anticipate = tokenPrincipalConvertBond(2);
+
+        Run run = stage(anticipate(Mode.LIVE, PRINCIPAL_TOKEN, null), List.of(convert, anticipate), router);
+
+        assertEquals(List.of(U_UTXO), router.offered(), "the convert is funded from U");
+        assertEquals(1, run.submitted().size(), "one transmission: " + run.events());
+        List<LiquidationDecision> rows = oldestFirst(run);
+        assertEquals(1, rows.size(), "no row for the skipped candidate: " + rows);
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, rows.getFirst().outcome(), rows.getFirst().detail());
+        assertEquals(convert.loanRef(), rows.getFirst().loanUtxoRef());
+        assertTrue(rows.getFirst().detail().endsWith(LiquidationExecutor.U_STAYS_NOTE), rows.getFirst().detail());
+        assertTrue(run.messages(Level.INFO).contains(tokenSkip(anticipate)),
+                "the skip names the token output: " + run.messages(Level.INFO));
+        assertEquals(WorkResult.SUBMITTED, run.result());
+    }
+
+    // ---- (k) no U, no note ---------------------------------------------------------------------------------
+
+    /** (k) a wallet with no U: a token-funded SUBMITTED row ends with its hash and says nothing about U. */
+    @Test
+    void aWalletWithNoUGivesASubmittedRowWithoutTheUNote() {
+        Run run = run(anticipate(Mode.LIVE, PRINCIPAL_TOKEN, null), List.of(tokenPrincipalConvertBond(1)),
+                wallet(TOKEN_WALLET_UTXO), oracles(), null, accepting(ACCEPTED), SubmitFence.OPEN);
+
+        assertEquals(1, run.submitted().size(), "one transmission: " + run.events());
+        List<LiquidationDecision> rows = oldestFirst(run);
+        assertEquals(1, rows.size(), rows.toString());
+        assertEquals(LiquidationDecision.Outcome.SUBMITTED, rows.getFirst().outcome(), rows.getFirst().detail());
+        assertTrue(rows.getFirst().detail().endsWith("; submitted as " + ACCEPTED), rows.getFirst().detail());
+        assertFalse(rows.getFirst().detail().contains("U stays"), rows.getFirst().detail());
     }
 }

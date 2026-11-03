@@ -2245,7 +2245,10 @@ public class LiquidationExecutor {
 
     /**
      * What this candidate's row says, and which veto — if any — produced it. Only a SUBMITTED outcome says
-     * the bytes went out (FAB-186); nothing else a verdict carries decides what the check marks used.
+     * the bytes went out (FAB-186). The check marks outputs used for two verdicts only: SUBMITTED, marked by
+     * {@code submit()} the instant the submitter accepts, and a node-shadow WOULD_SUBMIT (veto
+     * {@code MODE_NOT_LIVE}), marked in {@code consider()}. Each marks every role output among the body's
+     * inputs except U (D3, FAB-194).
      */
     private record Verdict(LiquidationDecision.Outcome outcome, SubmitVeto veto, String detail) {
     }
