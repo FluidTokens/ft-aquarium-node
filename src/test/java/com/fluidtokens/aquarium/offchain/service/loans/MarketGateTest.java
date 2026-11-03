@@ -349,4 +349,45 @@ class MarketGateTest {
                 market("lovelace", Mode.SHADOW, Action.CONVERT, null),
                 market(TOKEN.toUnit(), Mode.LIVE, Action.ANTICIPATE, 1_000L)).validateMarkets();
     }
+
+    // ---- FAB-194: CONVERT_BEFORE_ANTICIPATE is validated like ANTICIPATE --------------------------
+
+    private static final String NO_CAP_TAIL = " and has no cap. The cap bounds the principal the bot fronts "
+            + "from its own wallet; anticipating without one is unbounded exposure";
+
+    /** ⛔ It can fall back to fronting capital, so a missing cap aborts startup exactly as ANTICIPATE's does. */
+    @Test
+    void aConvertBeforeAnticipateMarketWithNoCapAbortsStartup() {
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> node(Mode.LIVE, market(TOKEN.toUnit(), Mode.LIVE, Action.CONVERT_BEFORE_ANTICIPATE, null))
+                        .validateMarkets());
+        assertEquals("loans.liquidation.markets[0] is action: CONVERT_BEFORE_ANTICIPATE" + NO_CAP_TAIL,
+                e.getMessage());
+    }
+
+    @Test
+    void aConvertBeforeAnticipateMarketWithANegativeCapAbortsStartup() {
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> node(Mode.LIVE, market(TOKEN.toUnit(), Mode.LIVE, Action.CONVERT_BEFORE_ANTICIPATE, -1L))
+                        .validateMarkets());
+        assertEquals("loans.liquidation.markets[0] has a negative cap (-1)", e.getMessage());
+    }
+
+    @Test
+    void aConvertBeforeAnticipateMarketWithACapValidates() {
+        node(Mode.LIVE, market(TOKEN.toUnit(), Mode.LIVE, Action.CONVERT_BEFORE_ANTICIPATE, 1_000L))
+                .validateMarkets();
+        node(Mode.LIVE, market(TOKEN.toUnit(), Mode.LIVE, Action.CONVERT_BEFORE_ANTICIPATE, 0L))
+                .validateMarkets();
+    }
+
+    /** The ANTICIPATE message is byte-identical to what it was before the action was named in it. */
+    @Test
+    void anAnticipateMarketWithNoCapAbortsWithTheExactMessageItAlwaysHad() {
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> node(Mode.LIVE, market("lovelace", Mode.LIVE, Action.ANTICIPATE, null)).validateMarkets());
+        assertEquals("loans.liquidation.markets[0] is action: ANTICIPATE and has no cap. The cap bounds the "
+                + "principal the bot fronts from its own wallet; anticipating without one is unbounded exposure",
+                e.getMessage());
+    }
 }

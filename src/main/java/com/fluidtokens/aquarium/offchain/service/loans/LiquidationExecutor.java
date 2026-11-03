@@ -1367,8 +1367,13 @@ public class LiquidationExecutor {
             // capital and holds nothing.
             AppConfig.LiquidationConfiguration.Action action =
                     new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset());
+            // Exhaustive, no default: a new action does not compile until it names its route.
+            boolean convertRoute = switch (action) {
+                case CONVERT, CONVERT_BEFORE_ANTICIPATE -> true;
+                case ANTICIPATE -> false;
+            };
 
-            if (action == AppConfig.LiquidationConfiguration.Action.CONVERT) {
+            if (convertRoute) {
                 // ⚠ A node whose loans.minswap.* belong to another network cannot derive the convert
                 // action at all, so this bean legitimately does not exist there. Refusing by NAME is
                 // the only honest answer: silently falling back to pay-in-advance would front the
@@ -1376,7 +1381,7 @@ public class LiquidationExecutor {
                 // that spends money nobody authorised.
                 if (convertRouter == null) {
                     String why = "market " + assessment.loan().datum().principalAsset().toUnit()
-                            + " is action: CONVERT but this node cannot convert (loans.minswap.* is "
+                            + " is action: " + action + " but this node cannot convert (loans.minswap.* is "
                             + "unset or belongs to another network — see the CONVERT UNAVAILABLE line "
                             + "at boot). NOT falling back to pay-in-advance: that would front capital "
                             + "the operator did not authorise";
@@ -2760,8 +2765,10 @@ public class LiquidationExecutor {
         if (!assessment.bond().datum().shouldLiquidationConvertToPrincipal()) {
             return false;
         }
-        return new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset())
-                != AppConfig.LiquidationConfiguration.Action.CONVERT;
+        return switch (new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset())) {
+            case CONVERT, CONVERT_BEFORE_ANTICIPATE -> false;
+            case ANTICIPATE -> true;
+        };
     }
 
     /** The payment credential hash of an address, or null — the same read the builder does. */
@@ -2814,9 +2821,10 @@ public class LiquidationExecutor {
         }
         AppConfig.LiquidationConfiguration.Action action =
                 new MarketGate(configuration).actionFor(assessment.loan().datum().principalAsset());
-        return action == AppConfig.LiquidationConfiguration.Action.CONVERT
-                ? LiquidationDecision.VARIANT_CONVERT_MINSWAP
-                : LiquidationDecision.VARIANT_CONVERT;
+        return switch (action) {
+            case CONVERT, CONVERT_BEFORE_ANTICIPATE -> LiquidationDecision.VARIANT_CONVERT_MINSWAP;
+            case ANTICIPATE -> LiquidationDecision.VARIANT_CONVERT;
+        };
     }
 
     private LiquidationDecision decision(LiquidationAssessment assessment, long now,

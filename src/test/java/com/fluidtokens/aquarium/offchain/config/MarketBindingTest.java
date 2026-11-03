@@ -112,6 +112,31 @@ class MarketBindingTest {
         });
     }
 
+    /**
+     * FAB-194 — {@code CONVERT_BEFORE_ANTICIPATE} and its cap bind from the indexed environment form, through
+     * a {@link SystemEnvironmentPropertySource} for the same reason as above: that is what {@code docker run
+     * -e} supplies.
+     */
+    @Test
+    void convertBeforeAnticipateBindsFromTheIndexedEnvironmentVariableForm() {
+        String unit = "aabbccddeeff00112233445566778899aabbccddeeff001122334455" + "50524931";
+        runner().withInitializer(ctx -> ctx.getEnvironment().getPropertySources().addFirst(
+                new SystemEnvironmentPropertySource(
+                        StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                        Map.of("LOANS_LIQUIDATION_MARKETS_0_UNIT", unit,
+                                "LOANS_LIQUIDATION_MARKETS_0_ACTION", "CONVERT_BEFORE_ANTICIPATE",
+                                "LOANS_LIQUIDATION_MARKETS_0_CAP", "250000000")))
+        ).run(ctx -> {
+            assertTrue(ctx.getStartupFailure() == null,
+                    "a capped CONVERT_BEFORE_ANTICIPATE market must bind and validate: " + ctx.getStartupFailure());
+            LiquidationConfiguration cfg = ctx.getBean(LiquidationConfiguration.class);
+            assertEquals(1, cfg.getMarkets().size());
+            assertEquals(unit, cfg.getMarkets().get(0).getUnit());
+            assertEquals(Action.CONVERT_BEFORE_ANTICIPATE, cfg.getMarkets().get(0).getAction());
+            assertEquals(BigInteger.valueOf(250_000_000L), cfg.getMarkets().get(0).getCap());
+        });
+    }
+
     /** No list at all is legal and means "every market at its default" — never null. */
     @Test
     void anAbsentListIsAnEmptyListAndNeverNull() {

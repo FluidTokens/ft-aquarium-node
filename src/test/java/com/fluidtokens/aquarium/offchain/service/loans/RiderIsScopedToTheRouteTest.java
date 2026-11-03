@@ -56,8 +56,11 @@ class RiderIsScopedToTheRouteTest {
         assertTrue(body.contains("new MarketGate(configuration).actionFor("),
                 "the route must be decided by the SAME MarketGate call the routing makes — anything "
                         + "else is a second copy of the routing rule, and the first copy is what drifted");
-        assertTrue(body.contains("Action.CONVERT"),
-                "the predicate must exclude the CONVERT action; that is the route whose change output "
-                        + "was being charged to the operator");
+        assertTrue(body.contains("switch (new MarketGate(configuration).actionFor(")
+                        && java.util.regex.Pattern.compile("case (?:[A-Z_]+, )*CONVERT(?:, [A-Z_]+)* -> false;")
+                        .matcher(body).find(),
+                "the predicate must exclude the CONVERT action — a switch over the actionFor( result in "
+                        + "which CONVERT answers false; that is the route whose change output was being "
+                        + "charged to the operator");
     }
 }
