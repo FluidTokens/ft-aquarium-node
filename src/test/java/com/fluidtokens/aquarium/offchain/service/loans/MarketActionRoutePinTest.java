@@ -116,7 +116,8 @@ class MarketActionRoutePinTest {
 
     /** The CONVERT detail P1 pins; {@code ConvertBeforeAnticipateConvertsLikeConvertTest} N1 compares to it. */
     static final String P1_DETAIL = "fee slice 25000000 lovelace - tx fee 590858 - min-ada 0 = floor 24409142; "
-            + "- margin 1500000 = 22909142; submitted as " + "ab".repeat(32);
+            // FAB-194-2 D3: a U-funded SUBMITTED row says that U stays in the check.
+            + "- margin 1500000 = 22909142; submitted as " + "ab".repeat(32) + LiquidationExecutor.U_STAYS_NOTE;
 
     /**
      * P1 — a CONVERT market (an explicit entry, mode inherited): announced, funded from U and only then built,

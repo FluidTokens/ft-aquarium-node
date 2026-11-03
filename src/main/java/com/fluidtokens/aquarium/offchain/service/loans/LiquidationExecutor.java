@@ -774,7 +774,8 @@ public class LiquidationExecutor {
      * The liquidation stage (FAB-183; FAB-186, fire and forget): EVERY candidate is walked, most
      * profitable first, across markets. A non-accepted submit — rejected, ambiguous or thrown — is one
      * outcome, the candidate failed: nothing is marked used and the walk goes on, so the next candidate
-     * may be built on the same output. An accepted submit uses up its output for the rest of the call.
+     * may be built on the same output. An accepted submit marks a token output it spent used for the rest of
+     * the call, but never U (D3, FAB-194): every later candidate funded from U is still built and submitted.
      * {@code fence} is read before each candidate and immediately before signing; once it reads
      * {@code false} nothing more is transmitted. It is not retained after the call, and nothing else is
      * either. Each walked candidate is counted once on {@code tally} (FAB-195), which nothing here reads back;
@@ -918,9 +919,10 @@ public class LiquidationExecutor {
         // C is the ada-only output of exactly WalletShape.collateralLovelace(params) — the collateral the
         // rebalancer keeps — and it never funds a route. U, the largest other ada-only output, funds plain,
         // convert and ADA-principal pay-in-advance; a token-principal pay-in-advance is funded from the
-        // output holding the most of its principal. The roles are never re-resolved within the check: an
-        // output that went out is marked used instead, so the next candidate it was designated for is
-        // skipped rather than quietly funded from another output.
+        // output holding the most of its principal. The roles are never re-resolved within the check: a token
+        // output an accepted body spent is marked used instead, so the next candidate it was designated for is
+        // skipped rather than quietly funded from another output. U is never marked (D3, FAB-194): an accept
+        // does not mean the transaction lands, so every later candidate on U is still tried on U.
         //
         // ⚠ The parameters are therefore REQUIRED here: without them C cannot be sized, and without C no
         // role can be told apart. They are proven usable INSIDE this catch — the fee ceiling and C are both
@@ -953,7 +955,7 @@ public class LiquidationExecutor {
         log.info("wallet roles for this check: C {} ({} lovelace), U {}", WalletRoles.ref(roles.c().get()),
                 collateralLovelace, roles.u().map(u -> WalletRoles.ref(u) + " (" + LedgerCeilings.lovelaceOf(u)
                         + " lovelace)").orElse("none"));
-        // Held for this call only and never retained: what went out, and which missing roles were said.
+        // Held for this call only and never retained: what is marked used, and which missing roles were said.
         WalletCheck walletCheck = new WalletCheck(allWalletUtxos == null ? List.of()
                 : allWalletUtxos.stream().filter(java.util.Objects::nonNull).toList(), roles, feeCeiling);
         // ⛔ THE VALIDITY WINDOW IS ANCHORED TO THE CHAIN, NOT TO THE WALL CLOCK.
@@ -1014,10 +1016,11 @@ public class LiquidationExecutor {
             }
         }
         // FAB-186 — FIRE AND FORGET. Every candidate is walked; no market is "served" any more. What keeps
-        // two candidates off one output is the used mark alone: an ACCEPTED submit (or a node-shadow
-        // WOULD_SUBMIT) marks its output in walletCheck (FAB-185), and a later candidate designated to it is
-        // skipped unbuilt. A non-accepted submit marks nothing and ends nothing. Held for this call only —
-        // nothing persists across calls.
+        // two candidates off one token output is the used mark alone: an ACCEPTED submit (or a node-shadow
+        // WOULD_SUBMIT) marks the role outputs it spends in walletCheck (FAB-185), and a later candidate
+        // designated to one is skipped unbuilt. U is the exception (D3, FAB-194): it is never marked, so
+        // every candidate funded from U is built and submitted on it, in profit order. A non-accepted submit
+        // marks nothing and ends nothing. Held for this call only — nothing persists across calls.
         WorkResult result = WorkResult.DEFINITE_FAILURE;
         for (int i = 0; i < ordered.size(); i++) {
             LiquidationAssessment assessment = ordered.get(i);
@@ -1044,8 +1047,9 @@ public class LiquidationExecutor {
                         causeChain(e));
                 log.debug("could not consider bond {} via {}", assessment.bond().utxoRef(), pass.route, e);
                 // FAB-186: the walk moves on, whether or not this candidate reached the submitter. An ACCEPTED
-                // submit already marked its outputs used the instant it was accepted (submit(), r2), so a
-                // later candidate on them is still skipped; nothing else is marked. Only an ACCEPTED submit
+                // submit already marked its outputs used the instant it was accepted (submit(), r2) — U apart,
+                // which stays in the check (D3, FAB-194) — so a later candidate on a marked token output is
+                // still skipped; nothing else is marked. Only an ACCEPTED submit
                 // counts towards the result — a transaction went out, and the pipeline must still hold
                 // compound and housekeeping back.
                 if (pass.accepted) {
@@ -1069,7 +1073,8 @@ public class LiquidationExecutor {
      * read immediately before signing; the route and the designated wallet output the non-accepted line names
      * (FAB-186); whether the submitter ACCEPTED it, which is what an exception escaping
      * {@code consider()} after the answer still counts as; and the call's wallet check with the outputs an
-     * accept uses up, which {@code submit()} marks the instant the submitter accepts (FAB-186 r2). Also, for the
+     * accept marks used — every role output among its inputs except U (D3, FAB-194) — which {@code submit()}
+     * marks the instant the submitter accepts (FAB-186 r2). Also, for the
      * pass line only (FAB-195), whether a submit was not accepted and whether a failure of ours ended it — read
      * by {@link #count} and nothing else. Created per candidate and dropped with it; nothing in it outlives the
      * call.
@@ -1798,12 +1803,14 @@ public class LiquidationExecutor {
             }
         }
 
-        // What an ACCEPTED submit uses up. Every input of this body is spent once the bytes go out, and the
+        // What an ACCEPTED submit marks used. Every input of this body is spent once the bytes go out, and the
         // index cannot know it yet. FAB-185/186: the designated output, and every ROLE output among the
-        // body's inputs, is used for the rest of this check. FAB-186 r2: fixed HERE, before the submit, and
-        // marked by submit() the instant the submitter accepts — ahead of the row, the log lines and
-        // everything else after the answer that can throw — so an exception escaping consider() after an
-        // accept still leaves the output used, and the next candidate designated to it is skipped unbuilt.
+        // body's inputs, is used for the rest of this check — EXCEPT U (D3, FAB-194): an accept does not mean
+        // the transaction lands, so U stays in the check and every later candidate on it is still built and
+        // submitted (markUsed). FAB-186 r2: fixed HERE, before the submit, and marked by submit() the instant
+        // the submitter accepts — ahead of the row, the log lines and everything else after the answer that
+        // can throw — so an exception escaping consider() after an accept still leaves a token output used,
+        // and the next candidate designated to it is skipped unbuilt.
         Set<String> spent = new LinkedHashSet<>();
         if (designated != null) {
             spent.add(WalletRoles.ref(designated));
@@ -1819,7 +1826,7 @@ public class LiquidationExecutor {
             return WorkResult.DEFINITE_FAILURE;
         }
         if (verdict.get().outcome() == LiquidationDecision.Outcome.SUBMITTED) {
-            // ACCEPTED — the one answer that says the bytes went out. Its outputs are already marked used.
+            // ACCEPTED — the one answer that says the bytes went out. Its outputs, U apart, are already marked used.
             return WorkResult.SUBMITTED;
         }
         // FAB-186: anything else — a veto, a rejection, an ambiguous answer, a thrown submit — marks nothing.
@@ -1828,13 +1835,11 @@ public class LiquidationExecutor {
                 && (verdict.get().veto() == SubmitVeto.MODE_NOT_LIVE
                     || verdict.get().veto() == SubmitVeto.MARKET_NOT_LIVE)) {
             // FAB-185 (M7) — a NODE-shadow WOULD_SUBMIT stands for a transmission that a live node would
-            // have made, so its designated output is used for the rest of the check. A MARKET-shadow one,
-            // on a node that is otherwise live, marks nothing: the next market's candidate is still built.
+            // have made, so it marks exactly what that accept would (D3, FAB-194): every role output among
+            // its inputs except U, which stays in the check. A MARKET-shadow one, on a node that is otherwise
+            // live, marks nothing: the next candidate on the same output is still built.
             if (verdict.get().veto() == SubmitVeto.MODE_NOT_LIVE) {
-                String ref = WalletRoles.ref(designated);
-                walletCheck.used().add(ref);
-                log.debug("wallet output {} is used for the rest of this check: the node-shadow WOULD_SUBMIT of {}",
-                        ref, loanUtxoRef);
+                markUsed(walletCheck, pass.usedIfAccepted, "an input of the node-shadow WOULD_SUBMIT of " + loanUtxoRef);
             }
             return WorkResult.WOULD_SUBMIT;
         }
@@ -2577,8 +2582,11 @@ public class LiquidationExecutor {
             // FAB-186 r2: marked used BEFORE anything that can throw — this line, the row, the summary.
             markUsed(pass.walletCheck, pass.usedIfAccepted, "an input of accepted liquidation " + result.getValue());
             log.info("SUBMITTED liquidation of {}: tx {}", loanUtxoRef, result.getValue());
+            // D3 (FAB-194): a row funded from U says that U stays in the check; a token-funded row is unchanged.
+            boolean fromU = pass.walletCheck.roles().u()
+                    .map(u -> WalletRoles.ref(u).equals(pass.output)).orElse(false);
             return new Verdict(LiquidationDecision.Outcome.SUBMITTED, null,
-                    detail + "; submitted as " + result.getValue());
+                    detail + "; submitted as " + result.getValue() + (fromU ? U_STAYS_NOTE : ""));
         }
         String response = result == null ? "no response" : String.valueOf(result.getResponse());
         // FAB-183 (A2), a METRIC only since FAB-186: the start clamp opens a transaction at a fresh feed's
@@ -2590,6 +2598,12 @@ public class LiquidationExecutor {
         return notAccepted(loanUtxoRef, detail, pass, result == null ? "none" : String.valueOf(result.code()),
                 response);
     }
+
+    /**
+     * D3 (FAB-194): the end of a SUBMITTED row whose designated output is U. U is never marked used, so a
+     * later candidate on it is still built and submitted, and two accepted transactions on one U can exist.
+     */
+    static final String U_STAYS_NOTE = "; U stays in this check: later candidates funded from U are still built and submitted, and if a backend that has not seen this transaction accepts one of them too, at most one of the two can land";
 
     /** The most of a backend's response the non-accepted INFO line carries; the row keeps all of it. */
     static final int NOT_ACCEPTED_RESPONSE_CHARS = 300;
@@ -2992,14 +3006,21 @@ public class LiquidationExecutor {
     static final String EMPTY_SCRIPT_FAILURES_MARKER = "\"ScriptFailures\":{}";
 
     /**
-     * Marks every ROLE output among {@code refs} — C, U or a token output — used for the rest of the check
-     * (FAB-185). Called ONLY for an accepted submit (FAB-186), by {@code submit()} the instant the submitter
-     * accepts, before anything that can throw (r2). The roles themselves are never re-resolved; a
-     * candidate designated to a used output is skipped before anything is built.
+     * Marks every ROLE output among {@code refs} — C or a token output, NEVER U — used for the rest of the
+     * check (FAB-185). Called for an accepted submit (FAB-186), by {@code submit()} the instant the submitter
+     * accepts, before anything that can throw (r2), and for a node-shadow WOULD_SUBMIT, which stands for that
+     * accept. The roles themselves are never re-resolved; a candidate designated to a used output is skipped
+     * before anything is built.
+     * <p>
+     * ⛔ U STAYS IN THE CHECK (D3, FAB-194): an accepted submit does not mean the transaction lands, so every
+     * later candidate funded from U is still built and submitted on it — usually refused by a mempool that
+     * already holds the first (CCL traps 12a, 13), and that refusal is the expected cost, not a fault to fix by
+     * marking U again. A token output keeps FAB-186's rule: once an accepted body spends it, it is used.
      */
     private static void markUsed(WalletCheck walletCheck, Set<String> refs, String why) {
         for (String ref : refs) {
-            if (walletCheck.roles().roleOf(ref).isEmpty() || !walletCheck.used().add(ref)) {
+            Optional<String> role = walletCheck.roles().roleOf(ref);
+            if (role.isEmpty() || ROLE_U.equals(role.get()) || !walletCheck.used().add(ref)) {
                 continue;
             }
             log.debug("wallet output {} is used for the rest of this check: {}", ref, why);
@@ -3014,8 +3035,9 @@ public class LiquidationExecutor {
 
     /**
      * One {@link #cycle(long, SubmitFence, StageTally)} call's wallet: the read it started from, the roles resolved
-     * from it once, the fee ceiling every requirement is sized with, the outputs that went out, and the
-     * missing roles already said at WARN. Created per call and dropped with it; nothing in it outlives it.
+     * from it once, the fee ceiling every requirement is sized with, the outputs marked used (never U: D3,
+     * FAB-194), and the missing roles already said at WARN. Created per call and dropped with it; nothing in
+     * it outlives it.
      */
     private record WalletCheck(List<Utxo> wallet, WalletRoles roles, BigInteger feeCeiling, Set<String> used,
                                Set<String> warnedMissingRoles) {
@@ -3034,7 +3056,8 @@ public class LiquidationExecutor {
     /**
      * The output {@code role} designates for this candidate, or null when the candidate is finished: the
      * role is missing (a REFUSED {@code WALLET_ROLE_MISSING} row, and one WARN per role per check), or its
-     * output already went out in this check (an INFO line, no row). Either way nothing is built.
+     * output is marked used in this check (an INFO line, no row) — which a token output can be and U never is
+     * (D3, FAB-194). Either way nothing is built.
      */
     private Utxo designated(LiquidationAssessment assessment, long now, WalletCheck walletCheck, String role,
                             Optional<Utxo> output) {
