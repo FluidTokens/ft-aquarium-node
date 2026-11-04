@@ -93,7 +93,12 @@ Do it with the same steps as a redeploy, without changing any coordinates:
 [§4.3 back up if you want to](#43-back-up-if-you-want-to-be-able-to-go-back) →
 [§4.4 wipe](#44-wipe) (deleting the database deletes its schema history and the cursor with it; a
 partial wipe that keeps the schema history is refused just the same, and one that keeps the cursor
-re-indexes nothing — §3) → [§4.6 start and let it catch up](#46-start-and-let-it-catch-up).
+re-indexes nothing — §3) → **pin this release's version in `.env`**
+(`AQUARIUM_DOCKER_IMAGE_VERSION`, as in [§2](#2-the-ordinary-upgrade)) →
+[§4.6 start and let it catch up](#46-start-and-let-it-catch-up).
+**Pin before you start:** none of the §4 steps pins the image, so a node started before the pin
+re-syncs on the image you were already running, still on Yaci 0.1.7, and this release then refuses
+that database too — a second wipe and a second full re-sync.
 **Keep the shipped `sync-start-*` values** (skip §4.5): starting later would hide the pools, the
 contracts and the wallet history the node needs. A §4.3 dump is only of use to go back to an older
 image ([§5](#5-rolling-back)).
@@ -118,7 +123,7 @@ cd docker
 # pin the new version in .env, e.g. AQUARIUM_DOCKER_IMAGE_VERSION=2026.09.22-413f16cb32fb
 docker compose pull
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
 Check afterwards:
@@ -276,7 +281,7 @@ route back is another wipe and another sync.
 
 ```bash
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
 Wait for the tip (deploying.md §6). **Do not arm anything yet.**
@@ -868,8 +873,8 @@ This release moves the library the node indexes with, Yaci Store, from 0.1.7 to 
   has not been measured; leave room for a full re-sync from the shipped `sync-start`.
 - **`/actuator/health` means what it meant: the process and its database.** Yaci 2.0.7 brings two
   health indicators of its own that follow the chain sync, `nodeSync` and `nodeHealth`. The node keeps
-  both out of `/actuator/health`, so a probe on it (the Helm chart's probes use it) does not restart a
-  node that is syncing, has a stalled tip or has lost its relay. **`/healthcheck` is unchanged.**
+  both out of `/actuator/health`, so a probe on it (a container platform's liveness or startup
+  probe, for example) does not restart a node that is syncing, has a stalled tip or has lost its relay. **`/healthcheck` is unchanged.**
 - **Switched off:** Yaci's plugin system, its plugin-admin API, its sync-status and genesis APIs
   (`/api/v1/sync/status`, `/api/v1/genesis`), and its automatic index management. Yaci plugins could
   never have hooked this node's storage anyway: even with the plugin system on, Yaci's plugin aspect
