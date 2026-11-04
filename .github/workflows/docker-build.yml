@@ -362,12 +362,16 @@ jobs:
       # -- /actuator/health stays 200 UP with a stalled tip, no relay and mid-sync) re-measured cold keyless on
       # feat/fab-203-yaci-2.0.7, 2026-11-04: 240 files / 2775 tests / 0 failures / 0 errors / 51 skipped,
       # 0 orphans. Floor 240.
+      # FAB-203-3 (TankUtxoStorageInYaciContextTest -- in Yaci 2.0.7's real auto-configuration the node's storage
+      # is the one Yaci's UtxoProcessor writes through, unadvised by plugins, its cache cleared on commit)
+      # re-measured cold keyless on feat/fab-203-yaci-2.0.7, 2026-11-04: 241 files / 2779 tests / 0 failures /
+      # 0 errors / 51 skipped, 0 orphans. Floor 241.
       #
       # Left at 137 the gate would have tolerated losing a class in silence -- the exact defect this
       # step exists to catch. Re-measure before changing it; do not reconcile to a number written here.
       - name: Assert the suite did not quietly shrink
         env:
-          RESULT_FILE_FLOOR: '240'
+          RESULT_FILE_FLOOR: '241'
         run: |
           python3 - <<'PY'
           import glob, os, sys, xml.etree.ElementTree as ET
