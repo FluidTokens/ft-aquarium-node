@@ -591,14 +591,27 @@ store:
     sync-start-blockhash: 586ead1770fc2a59021b824bc0d65bf1d6060585384f257971204d5925f054c2
     sync-start-slot: 154984561
     keep-alive-interval: 1000
-  blocks:
-    epoch-calculation-interval=14400:  # 14400 = 4 hours
+  # FAB-203: what Yaci Store 2.x switches on by default and this node does not adopt. Pinned by
+  # ShippedDefaultsTest and, through Yaci's real auto-configuration, by YaciStoreSwitchesTest.
+  plugins:
+    # Else ./plugins/files is created at startup (the non-root image cannot) and pluginTaskScheduler displaces Boot's scheduler.
+    enabled: false
+    # Else /api/v1/admin/plugins is served.
+    api-enabled: false
+  core:
+    # Else /api/v1/sync/status (which queries the relay) and /api/v1/genesis are served.
+    api-enabled: false
+  # Else DBIndexProcessor applies Yaci's optional indexes on any sync below block 50,000.
+  auto-index-management: false
+  executor:
+    # Already Yaci's default; TankUtxoStorage's per-thread pending spends assume one block at a time on one thread.
+    enable-parallel-processing: false
   # FAB-137: Yaci's UTxO pruning, ON. Every 600 s it deletes outputs (address_utxo) and their spend
   # rows (tx_input) that were SPENT more than pruning-safe-blocks blocks behind the tip (Yaci's
   # default, 2160, kept on purpose: a rollback can never reach a pruned row). An UNSPENT row is
   # never pruned. Why now: the Minswap V2 pool credential is indexed, and a pool UTxO is spent and
   # recreated on every swap, so without pruning both tables grow with every batch forever.
-  # ⛔ The key is `pruning-interval`, NOT `pruning.interval`: Yaci 0.1.7 binds the fields
+  # ⛔ The key is `pruning-interval`, NOT `pruning.interval`: Yaci 0.1.7 and 2.0.7 bind the fields
   # pruningEnabled / pruningInterval / pruningSafeBlocks, a misspelt key is silently ignored and the
   # 86400 s default stays in force. ShippedDefaultsTest binds this block into Yaci's own class.
   utxo:
@@ -866,5 +879,3 @@ store:
     sync-start-blockhash: 0e459daa0813334b79da2bac23d3324b604ee04209679bed08b6f49cac82cb4e
     sync-start-slot: 71971209
     keep-alive-interval: 1000
-  blocks:
-    epoch-calculation-interval=14400:  # 14400 = 4 hours
