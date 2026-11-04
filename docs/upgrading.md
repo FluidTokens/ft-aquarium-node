@@ -23,9 +23,10 @@ error.
 | FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01, 2026-10-23/26) | §4.8, §4.9 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 | Upgrading to the release that **indexes the Minswap V2 pools** (FAB-137) | §1.1 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
+| Upgrading to the release on **Yaci Store 2.0.7** (FAB-203) | §1.3 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
 | You changed `WALLET_ACCOUNT_INDEX` | §9 — restart, then re-sync **or** one self-send | ⛔ **wiped, or a self-send** |
 
-The first six are ordinary. The others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §9).
+The first six are ordinary. The others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §1.3, §9).
 
 ### 1.1 ⛔ The Minswap pool release requires a database wipe (FAB-137)
 
@@ -62,6 +63,57 @@ and the database is untouched. To keep USDM, set
 `LOANS_UI_USD_REFERENCE_UNIT=c48cbb3d5e57ed56e276bc45f99ab39abe94e6cd7ac39fb402da47ad0014df105553444d`
 and restart.
 
+### 1.3 ⛔ The Yaci Store 2.0.7 release requires a database wipe (FAB-203)
+
+**Upgrading to this release requires wiping the database, INCLUDING the cursor, then re-syncing from
+`sync-start`.** This is not optional and there is no partial route.
+
+This release moves the library the node indexes with, Yaci Store, from 0.1.7 to 2.0.7, and Yaci Store
+2.0.7 edited one of its own schema migrations (version 0.200.1) in place. The schema history a 0.1.7
+node wrote no longer matches the migrations this image carries, so **the node refuses to start over an
+existing database, before applying anything** — nothing in the database is changed. Compose runs the
+node with `restart: on-failure`, so it is restarted straight into the same refusal, again and again.
+The log shows a `FlywayValidateException` from `flywayInitializer`, reading:
+
+```
+Validate failed: Migrations have failed validation
+Migration checksum mismatch for migration version 0.200.1
+-> Applied to database : <number>
+-> Resolved locally    : <number>
+Either revert the changes to the migration, or run repair to update the schema history.
+Need more flexibility with validation rules? Learn more: https://rd.gt/3AbJUZE
+```
+
+On PostgreSQL, as Compose runs it, the two numbers are expected to read `972844675` (applied) and
+`-603161577` (resolved locally), but they can differ on your database. **Match on the line
+`Migration checksum mismatch for migration version 0.200.1`, not on the numbers.**
+
+Do it with the same steps as a redeploy, without changing any coordinates:
+[§4.2 stop the node](#42-stop-the-node-leave-the-database-up) →
+[§4.3 back up if you want to](#43-back-up-if-you-want-to-be-able-to-go-back) →
+[§4.4 wipe](#44-wipe) (deleting the database deletes its schema history and the cursor with it; a
+partial wipe that keeps the schema history is refused just the same, and one that keeps the cursor
+re-indexes nothing — §3) → **pin this release's version in `.env`**
+(`AQUARIUM_DOCKER_IMAGE_VERSION`, as in [§2](#2-the-ordinary-upgrade)) →
+[§4.6 start and let it catch up](#46-start-and-let-it-catch-up).
+**Pin before you start:** none of the §4 steps pins the image, so a node started before the pin
+re-syncs on the image you were already running, still on Yaci 0.1.7, and this release then refuses
+that database too — a second wipe and a second full re-sync.
+**Keep the shipped `sync-start-*` values** (skip §4.5): starting later would hide the pools, the
+contracts and the wallet history the node needs. A §4.3 dump is only of use to go back to an older
+image ([§5](#5-rolling-back)).
+
+**⛔ Do not run `flyway repair`, even though the message suggests it — wipe instead.** Repair makes
+the stored checksum match; it changes no table. The tables stay Yaci 0.1.7's, without the
+`address.slot` column and the `ptr_address` table that 2.0.7 expects. On every boot over a stored
+cursor, Yaci 2.0.7 first publishes a rollback to that cursor, to clean out anything written after it,
+and that rollback deletes rows from `address` by `slot` — a column a repaired database does not have.
+You trade a clear refusal for a second, more confusing failure at every boot, and the same restart
+loop. (This is read from Yaci 2.0.7's code, not run.)
+
+The wipe also drops the node's token-metadata cache (tickers, names and decimals); it refills by itself
+from the token registry.
+
 ---
 
 ## 2. The ordinary upgrade
@@ -71,7 +123,7 @@ cd docker
 # pin the new version in .env, e.g. AQUARIUM_DOCKER_IMAGE_VERSION=2026.09.22-413f16cb32fb
 docker compose pull
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
 Check afterwards:
@@ -229,7 +281,7 @@ route back is another wipe and another sync.
 
 ```bash
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
 Wait for the tip (deploying.md §6). **Do not arm anything yet.**
@@ -427,13 +479,21 @@ LMConfigDatum[3]`, the node is not running this release: compare `/actuator/info
 
 ## 5. Rolling back
 
-**The image rolls back cleanly:** pin the previous version and restart.
+**Within one Yaci Store version, the image rolls back cleanly:** pin the previous version and
+restart.
+
+**⛔ Not across the Yaci Store 2.0.7 release (FAB-203).** Rolling back from that release to an older
+image needs another wipe and re-sync: the older image's Flyway refuses this release's schema the same
+way this release refuses the older one ([§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203)),
+and Compose restarts it into the same refusal. Use the §1.3 steps, with the older image pinned — or,
+instead of re-syncing, restore the §4.3 dump you took before upgrading.
 
 **The database does not roll back with it.** If you re-synced from a later start point, the old
 coordinates' history is not there any more, and going back to the old image means going back to an
 empty world. That is what the §4.3 dump is for.
 
-**⇒ The practical rule: an image rollback is cheap; a re-sync is not reversible without a backup.**
+**⇒ The practical rule: within one Yaci Store version an image rollback is cheap; across the Yaci Store
+2.0.7 release it costs a wipe and a re-sync; and a re-sync is not reversible without a backup.**
 
 ---
 
@@ -802,6 +862,38 @@ moved **after** the shipped `sync-start` (mainnet: 2025-05-06) but before your o
 for example on a node whose cursor started later than the shipped value. A pool idle since **before**
 2025-05-06 is in none of the blocks a re-sync replays, so it stays invisible until it moves, re-sync or
 not.
+
+### Yaci Store 2.0.7 (FAB-203)
+
+This release moves the library the node indexes with, Yaci Store, from 0.1.7 to 2.0.7.
+
+- **The database must be wiped, cursor included, and re-synced**
+  ([§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203)). Rolling back across this
+  release needs another wipe ([§5](#5-rolling-back)). How long a mainnet re-sync takes on this release
+  has not been measured; leave room for a full re-sync from the shipped `sync-start`.
+- **`/actuator/health` means what it meant: the process and its database.** Yaci 2.0.7 brings two
+  health indicators of its own that follow the chain sync, `nodeSync` and `nodeHealth`. The node keeps
+  both out of `/actuator/health`, so a probe on it (a container platform's liveness or startup
+  probe, for example) does not restart a node that is syncing, has a stalled tip or has lost its relay. **`/healthcheck` is unchanged.**
+- **Switched off:** Yaci's plugin system, its plugin-admin API, its sync-status and genesis APIs
+  (`/api/v1/sync/status`, `/api/v1/genesis`), and its automatic index management. Yaci plugins could
+  never have hooked this node's storage anyway: even with the plugin system on, Yaci's plugin aspect
+  does not advise the node's own `saveUnspent` / `saveSpent` overrides, which carry no `@Plugin`
+  annotation. Parallel block processing is pinned off.
+- **The node creates its own two `address_utxo` indexes**, on the payment credential
+  (`idx_address_utxo_owner_paykey_hash`) and on the address (`idx_address_utxo_owner_addr`), which its
+  own reads need and Yaci 2.0.7 no longer creates in its schema. Yaci's stake-address, stake-credential
+  and epoch indexes on that table are left out, so the Yaci routes that filter on those columns run
+  unindexed — on a table that holds only what the node keeps. The Yaci routes the node still serves,
+  two of them new in 2.0.7, are listed in [deploying.md §7](deploying.md#-loans_ui_enabledfalse-does-not-close-port-8080).
+- **Yaci's automatic restart of its chain sync behaves differently — an accepted behaviour change.**
+  On 0.1.7 it stopped for good after 5 attempts ("Max restart attempts reached. Manual intervention
+  required."), unless after a restart the sync had stayed healthy for 5 minutes, which reset the count.
+  On 2.0.7 it counts attempts in a sliding window: after 5 attempts it pauses until a whole window
+  (10 minutes by default) has passed with no attempt, then starts counting again; it never stops for
+  good.
+  A node whose sync keeps failing now keeps retrying, where 0.1.7 gave up and waited for manual
+  intervention.
 
 ---
 

@@ -49,9 +49,13 @@ public class TankUtxoStorage extends UtxoStorageImpl implements OracleOutRefInde
 
     /**
      * Inputs of the CURRENT block whose output was not indexed when {@link #saveSpent} saw them, keyed
-     * by the output they spend. ⚠ Thread-confined on purpose: Yaci 0.1.7's {@code UtxoProcessor} calls
-     * {@code saveSpent} then {@code saveUnspent} for one block on one thread, and this bean is a
-     * singleton — a shared field would let one block's inputs attach to another block's outputs.
+     * by the output they spend. ⚠ Thread-confined on purpose: Yaci 2.0.7's
+     * {@code UtxoProcessor.handleTransactionEvent} calls {@code saveSpent} with every input, then
+     * {@code saveUnspent} with every output, for one block on one thread (v2.0.7
+     * {@code UtxoProcessor.java:87-91}), and this bean is a singleton — a shared field would let one
+     * block's inputs attach to another block's outputs. {@code UtxoProcessor.handleCommit} may also
+     * re-save a pre-Conway pointer-address output through {@code saveUnspent} alone ({@code :285-296});
+     * that call finds no held spends.
      */
     private final ThreadLocal<Map<UtxoKey, TxInput>> pendingSpends = ThreadLocal.withInitial(HashMap::new);
 
@@ -214,11 +218,13 @@ public class TankUtxoStorage extends UtxoStorageImpl implements OracleOutRefInde
             super.saveUnspent(fluidtokensRentsAddresses);
 
             // ⛔ FAB-134 B2b: an output this block both CREATED and SPENT. Its input reached saveSpent
-            // first (Yaci 0.1.7 UtxoProcessor writes every input of a block, then every output) and was
-            // held back because the output was not indexed yet. Now that it is, its spend is recorded —
-            // without this the output stays "unspent" in the index forever: a ghost that coin and
-            // collateral selection pick and every build fails on. Only SAVED outputs qualify, so a
-            // foreign pair (filtered out above) leaves no row of either kind.
+            // first (Yaci 2.0.7's UtxoProcessor.handleTransactionEvent writes every input of a block,
+            // then every output, UtxoProcessor.java:87-91) and was held back because the output was
+            // not indexed yet. Now that it is, its spend is recorded — without this the output stays
+            // "unspent" in the index forever: a ghost that coin and collateral selection pick and every
+            // build fails on. Only SAVED outputs qualify, so a foreign pair (filtered out above) leaves
+            // no row of either kind. (UtxoProcessor.handleCommit may also re-save a pre-Conway
+            // pointer-address output through this method alone, :285-296; that call finds nothing held.)
             Map<UtxoKey, TxInput> pending = pendingSpends.get();
             if (!pending.isEmpty()) {
                 var sameBlockSpends = fluidtokensRentsAddresses.stream()

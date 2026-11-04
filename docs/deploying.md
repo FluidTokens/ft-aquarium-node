@@ -384,9 +384,24 @@ endpoint is unconditional and stays up.** What an unauthenticated caller reaches
 | `GET /api/v1/loans/oracle` | **yes** | the oracle feeds it is using |
 | `GET /healthcheck` | **yes** | five booleans |
 | `GET /actuator/health`, `/actuator/info`, `/actuator/prometheus` | **yes** | build commit, dirty flag, and runtime metrics |
+| `GET /api/v1/addresses/{address}/utxos`, `GET /api/v1/addresses/{address}/utxos/{asset}` | **yes** | the indexed UTxOs at any address, payment credential or stake address the caller names, optionally for one asset — including the node's own wallet |
+| `GET /api/v1/addresses/{address}/transactions` | **yes** | the transactions that created or spent the indexed outputs at that address |
+| `GET /api/v1/assets/utxos/unit/{unit}` | **yes** | the indexed UTxOs holding an asset |
+| `GET /api/v1/assets/{unit}/utxos` — new in Yaci Store 2.0.7 | **yes** | the same, under its new path |
+| `GET /api/v1/assets/{unit}/transactions` — new in Yaci Store 2.0.7 | **yes** | the transactions behind the indexed outputs holding that asset |
+| `GET /api/v1/utxos/{txHash}/{index}`, `POST /api/v1/utxos` | **yes** | one indexed UTxO, or a list of them, by transaction hash and output index |
+| `GET /v3/api-docs`, `/v3/api-docs.yaml`, `/v3/api-docs/swagger-config` | **yes** | a machine-readable description of the HTTP API, these routes included |
+| `GET /swagger-ui.html` and its assets under `/swagger-ui/` | **yes** | an interactive page for calling those routes |
 | `GET /api/v1/loans/readiness` | no — the flag removes this page and the two routes below | the HTML operator page |
 | `POST /api/v1/loans/readiness/wallet-rebalance/suspend` | no | nothing — it **suspends wallet rebalancing** (in memory, until resumed or restarted) |
 | `POST /api/v1/loans/readiness/wallet-rebalance/resume` | no | nothing — it **resumes wallet rebalancing**, unless `AQUARIUM_WALLET_REBALANCE_ENABLED=false` |
+
+These routes come from Yaci Store, the library the node indexes with: the `/api/v1/addresses`,
+`/api/v1/assets` and `/api/v1/utxos` ones from its UTxO API, the `/v3/api-docs` and `/swagger-ui` ones
+from the API description served with it. The UTxO routes read `address_utxo`, which holds only what
+the node's write-time filter kept: its wallet, the watched contracts, oracle-feed outputs and the
+Minswap pools. FAB-203 switched off Yaci's plugin-admin, sync-status and genesis routes; whether to
+close the rest is tracked as FAB-146.
 
 **⇒ Turning the UI off narrows the disclosure; it does not end it.** The exposure decision above is
 about the *port*, not about the flag. Tunnel it or keep it on a private network either way.
