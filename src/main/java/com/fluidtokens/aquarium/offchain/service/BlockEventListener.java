@@ -135,11 +135,13 @@ public class BlockEventListener {
     /**
      * Records the slot of a block once its database transaction has committed.
      *
-     * <p>{@code AFTER_COMMIT} with {@code fallbackExecution = true}: at the tip Yaci publishes
+     * <p>{@code AFTER_COMMIT} with {@code fallbackExecution = true}: Yaci Store 2.0.7 publishes
      * {@code CommitEvent} inside the block's transaction, and this runs once it commits (not at all on
-     * a rollback); during initial sync Yaci publishes with no transaction open, and the fallback runs
-     * this inline instead of dropping the event. {@link Ordered#HIGHEST_PRECEDENCE}, so among the
-     * after-commit listeners this slot is current before any other one reads it.
+     * a rollback). Only its parallel-processing path publishes with no transaction open, on the fetcher
+     * thread; there the fallback runs this inline instead of dropping the event. The node pins parallel
+     * processing off, so in production every {@code CommitEvent} arrives inside the block's transaction,
+     * initial sync included — see {@link WalletPipelineService}. {@link Ordered#HIGHEST_PRECEDENCE}, so
+     * among the after-commit listeners this slot is current before any other one reads it.
      *
      * <p>Never throws, for the same reason {@link #processBlock} never does: on the fallback path an
      * exception would reach Yaci's publisher. A failure is logged at WARN and leaves

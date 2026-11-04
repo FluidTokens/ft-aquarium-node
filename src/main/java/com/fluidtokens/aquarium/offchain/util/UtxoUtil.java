@@ -57,7 +57,7 @@ public class UtxoUtil {
      * <h2>Why both</h2>
      * Yaci Store derives {@code referenceScriptHash} from the raw {@code scriptRef} when it indexes
      * an output — but that derivation is <b>best-effort</b>: {@code UtxoProcessor} (yaci-store
-     * v0.1.7, {@code UtxoProcessor:199-208}) wraps it in a {@code try} that logs the failure and
+     * v2.0.7, {@code UtxoProcessor.java:214-224}) wraps it in a {@code try} that logs the failure and
      * carries on with a {@code null} hash; the {@code throw} on that path is present but commented
      * out. The row is then stored with {@code scriptRef} set and {@code referenceScriptHash} NULL.
      * The same shape arises for any row written before that column was populated.
@@ -71,6 +71,11 @@ public class UtxoUtil {
      * <p>
      * Note the sibling overload above never had this problem — it maps {@code scriptRef} straight
      * through. The two overloads disagreeing was the tell.
+     * <p>
+     * When the derivation below is re-run, a too-deeply-nested script is reported by v2.0.7's
+     * {@code ScriptReferenceUtil} as a {@code CborRuntimeException} instead of a
+     * {@code StackOverflowError} ({@code ScriptReferenceUtil.java:38-43}, {@code :88-93}), which the
+     * {@code catch (Exception e)} below now covers.
      */
     private static String referenceScript(String referenceScriptHash, String scriptRef) {
         if (referenceScriptHash != null && !referenceScriptHash.isBlank()) {

@@ -44,18 +44,23 @@ import java.util.Objects;
  * ({@code ScheduledTransactionService}) keeps its own timer; it is not a stage here.
  *
  * <h2>After the block's transaction commits, never inside it (FAB-131 r2)</h2>
- * At the chain tip Yaci Store 0.1.7 publishes {@code CommitEvent} from INSIDE the block's database transaction:
+ * Yaci Store 2.0.7 publishes {@code CommitEvent} from INSIDE the block's database transaction:
  * {@code ShelleyBlockEventPublisher.publishBlockEvents} (and its Byron twin) is {@code @Transactional}, publishes
- * the event synchronously and only then sets the cursor (v0.1.7 {@code ShelleyBlockEventPublisher.java:61-69}).
+ * the event synchronously and only then sets the cursor (v2.0.7 {@code ShelleyBlockEventPublisher.java:62-70}).
  * Offering a block from a plain {@code @EventListener} would let a pass read the index and submit for a block that
  * may still roll back, and for a block the index has not finished storing. So the entry point is a
  * {@code @TransactionalEventListener(phase = AFTER_COMMIT)}: it runs once the block is committed, and not at all if
  * the block's transaction rolls back.
  *
- * <p>{@code fallbackExecution = true} because the other publish path has no transaction: during initial sync Yaci
- * batches blocks and publishes {@code CommitEvent} from an executor thread with none open
- * ({@code processBlocksInParallel}, v0.1.7 {@code ShelleyBlockEventPublisher.java:97-127}). Without the fallback the
- * event would be dropped there (and in any caller with no transaction).
+ * <p>{@code fallbackExecution = true} because Yaci has a second publish path with no transaction. Taken only while
+ * catching up to the tip and only when {@code store.executor.enable-parallel-processing} is true (v2.0.7
+ * {@code BlockFetchService.java:93}), it batches blocks and publishes {@code CommitEvent} on the calling fetcher
+ * thread with none open ({@code processBlocksInParallel}, v2.0.7 {@code ShelleyBlockEventPublisher.java:86-120},
+ * the event at {@code :114}; {@code publishBlockEventsInParallel}, {@code :72-75}, is deliberately not
+ * transactional, and {@code BlockFetchService} registers itself with the sync clients unproxied, {@code :406} and
+ * {@code :419}). Without the fallback the event would be dropped there (and in any caller with no transaction).
+ * The node pins parallel processing off, so in production every {@code CommitEvent} arrives inside the block's
+ * transaction, initial sync included.
  *
  * <h2>Initial sync is never offered</h2>
  * The event's OWN drift — {@code now − blockTime(slot)} — is compared with
