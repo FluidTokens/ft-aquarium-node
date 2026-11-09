@@ -13,20 +13,49 @@ error.
 
 | what changed | what you do | database |
 |---|---|---|
-| New image, same contracts | pull, restart | untouched |
+| ⛔ **Upgrading to the 2026-11 release** — the first on **Yaci Store 2.0.7** (FAB-203) — from an image on Yaci Store 0.1.7, such as the previous `main` (`a04173bf8d26`) | **[§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203) first** — wipe **including the cursor**, pin the version, re-sync from `sync-start`. Then read [the list under this table](#the-2026-11-release-as-one-upgrade) | ⛔ **wiped** |
+| New image, same contracts, **same Yaci Store version** | pull, restart | untouched |
 | A setting in `.env` | restart | untouched |
 | You added a **market**, margin, or mode | restart | untouched |
 | You enabled the **UI** | restart | untouched |
-| Upgrading to the release that reads **oracle liveness from the index** (FAB-196) | pull, restart — nothing else required; a re-sync with the §1.1 steps is optional ([§7](#oracle-liveness-is-read-from-the-index-first-fab-196)) | untouched, unless you choose to re-sync |
-| Upgrading to the release that adds **`CONVERT_BEFORE_ANTICIPATE`** and keeps **U in the check** (FAB-194) | pull, restart — nothing else required; it changes how every `shadow` or `live` node funds liquidations from U ([§7](#u-stays-in-the-check-convert_before_anticipate-fab-194)) | untouched |
+| Upgrading to the release that reads **oracle liveness from the index** (FAB-196) | on a node **already on Yaci Store 2.0.7**: pull, restart — nothing else required; a re-sync with the §1.1 steps is optional ([§7](#oracle-liveness-is-read-from-the-index-first-fab-196)). It ships in the 2026-11 release, so from Yaci 0.1.7 **§1.3 comes first** | untouched on Yaci 2.0.7, unless you choose to re-sync; from 0.1.7, ⛔ **wiped** (§1.3) |
+| Upgrading to the release that adds **`CONVERT_BEFORE_ANTICIPATE`** and keeps **U in the check** (FAB-194) | on a node **already on Yaci Store 2.0.7**: pull, restart — nothing else required; it changes how every `shadow` or `live` node funds liquidations from U ([§7](#u-stays-in-the-check-convert_before_anticipate-fab-194)). It ships in the 2026-11 release, so from Yaci 0.1.7 **§1.3 comes first** | untouched on Yaci 2.0.7; from 0.1.7, ⛔ **wiped** (§1.3) |
 | **FluidTokens redeployed the contracts** (new config NFTs) | §4 — new coordinates **and a full re-sync** | ⛔ **wiped** |
 | FluidTokens replaced **action scripts in place** (same config NFTs — e.g. 2026-10-01, 2026-10-23/26) | §4.8, §4.9 — new image, restart | untouched |
 | You changed `sync-start-*` | §3 — on an existing database this **does nothing** by itself | ⛔ **wiped, or no effect** |
 | Upgrading to the release that **indexes the Minswap V2 pools** (FAB-137) | §1.1 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
-| Upgrading to the release on **Yaci Store 2.0.7** (FAB-203) | §1.3 — wipe **including the cursor**, re-sync from `sync-start` | ⛔ **wiped** |
 | You changed `WALLET_ACCOUNT_INDEX` | §9 — restart, then re-sync **or** one self-send | ⛔ **wiped, or a self-send** |
 
-The first six are ordinary. The others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §1.3, §9).
+The first row comes before every other: a node upgrading from Yaci Store 0.1.7 meets §1.3's refusal
+whichever other row it reads. The next six are ordinary on a node already on Yaci Store 2.0.7. The
+others are the subject of this guide (§4, §4.8, §4.9, §3, §1.1, §9).
+
+### The 2026-11 release, as one upgrade
+
+The 2026-11 release ships many changes together. Among them, FAB-182, FAB-183, FAB-185, FAB-186,
+FAB-188, FAB-194, FAB-195, FAB-196 and FAB-203, the oracle stream and the 2026-10-23/26 in-place update
+change what an operator sees or does. From Yaci Store 0.1.7 it is one upgrade, in this order:
+
+1. **[§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203) — the wipe, the pin and
+   the re-sync.** First, and in full: until it is done the node does not start.
+2. **Then, before you re-arm anything, read:**
+   - [§1.2](#12-the-readiness-pages-usd-now-goes-through-usdcx-not-usdm-fab-182) — the readiness page
+     prices its USD through USDCx (display only);
+   - [§4.9](#49-when-fluidtokens-replace-action-scripts-in-place--the-2026-10-2326-update) — the new
+     compound script and its fee;
+   - [Every shadow or live node now keeps its wallet shaped (FAB-188)](#every-shadow-or-live-node-now-keeps-its-wallet-shaped-fab-188)
+     — on a `shadow` or `live` node whose wallet is out of shape, **expect a self-send of the whole
+     wallet, in `shadow` too**;
+   - [Liquidation, compound and rebalancing run on blocks and prices, not timers (FAB-183)](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)
+     — and the two delay settings it removed, in the [§7 table](#7-removed-keys-and-changed-behaviour-by-release);
+   - [Liquidation is funded by wallet role (FAB-185)](#liquidation-is-funded-by-wallet-role-fab-185),
+     [Fire and forget (FAB-186)](#fire-and-forget-fab-186) and
+     [U stays in the check; CONVERT_BEFORE_ANTICIPATE (FAB-194)](#u-stays-in-the-check-convert_before_anticipate-fab-194);
+   - [Stage outcomes on the pass line (FAB-195)](#stage-outcomes-on-the-pass-line-fab-195);
+   - [Oracle liveness is read from the index first (FAB-196)](#oracle-liveness-is-read-from-the-index-first-fab-196);
+   - [The oracle stream is on by default (FAB-174)](#the-oracle-stream-is-on-by-default-fab-174) — a new
+     outbound connection, signed in with the wallet's stake key;
+   - [Yaci Store 2.0.7 (FAB-203)](#yaci-store-207-fab-203).
 
 ### 1.1 ⛔ The Minswap pool release requires a database wipe (FAB-137)
 
@@ -207,8 +236,14 @@ the part that moved is a validator this node never invokes, the node starts and 
 ```
 
 **That is not this section.** Nothing is wrong with your deployment, no re-sync is needed, and the
-fix is a future image. Only a startup **failure** — which names the offending field — means the
-deployment genuinely moved under you and the sequence below applies.
+fix is a future image. A moved field the node **does** use is different, and it is not a startup
+failure either (since FAB-115): the node keeps running, scheduled payments included, but **closes the
+lending gate** and logs `LENDING_CONFIG_MISMATCH` at ERROR, naming each field
+([§4.7](#47-verify-before-re-arming)). That line means part of the deployment the node uses moved under
+you. If FluidTokens minted new config NFTs, the sequence below applies; if they rewrote the config
+datums in place under the same NFTs, it is [§4.8](#48-when-fluidtokens-replace-action-scripts-in-place--the-2026-10-01-update)
+or [§4.9](#49-when-fluidtokens-replace-action-scripts-in-place--the-2026-10-2326-update) instead — a new
+image, no wipe.
 
 Order matters here. Do not improvise it.
 
@@ -241,10 +276,19 @@ corrupt volume instead of an empty one.
 ### 4.3 Back up, if you want to be able to go back
 
 ```bash
-docker compose exec postgres pg_dump -U "$DB_USERNAME" "$POSTGRES_DB" | gzip > ~/aquarium-pre-upgrade.sql.gz
+docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' | gzip > ~/aquarium-pre-upgrade.sql.gz
 ```
 
-**What is actually in that database:** the indexed UTxO set and the chain cursor. Nothing else.
+The single quotes matter: `$POSTGRES_USER` and `$POSTGRES_DB` are expanded by the shell **inside** the
+Postgres container, where Compose sets them from `DB_USERNAME` and `POSTGRES_DB` (default `aquarium`
+for both). Your own shell has neither. `-T` keeps Compose from giving the command a terminal, so the
+dump reaches `gzip` byte for byte.
+
+**What is actually in that database:** the indexed UTxO set (with the other tables Yaci Store keeps
+beside it), the chain cursor, the node's token-metadata cache (`token_metadata`: tickers, names and
+decimals, which the readiness page refills by itself from the token registry), and Flyway's schema history
+(`flyway_schema_history`, the record [§1.3](#13--the-yaci-store-207-release-requires-a-database-wipe-fab-203)'s
+refusal is about).
 
 **What is NOT in it, and so cannot be lost by wiping:** your wallet (it is a mnemonic in `.env`),
 your configuration (`.env`), your FLDT delegation (on chain), and the decision log (held in memory,
@@ -268,9 +312,23 @@ uses. If you changed it, change this. If you moved it to a named volume, use
 
 A fresh database reads `sync-start-*` again — this is the only moment those values do anything.
 
-**Start just before the redeploy**, not from genesis. Syncing hundreds of days to find contracts
-deployed last week wastes days for nothing. FluidTokens publish the deployment block with a
-redeploy; pick a block a little before it.
+**The keys** are `store.cardano.sync-start-slot` and `store.cardano.sync-start-blockhash`: a slot and
+the hash of the block at that slot, always set as a pair. The image ships both. `application.yaml`
+names no variable for them, so they reach the node through Spring Boot's relaxed binding, as
+`STORE_CARDANO_SYNC_START_SLOT` and `STORE_CARDANO_SYNC_START_BLOCKHASH` in `docker/.env` — the same
+route by which `STORE_CARDANO_HOST` reaches `store.cardano.host`.
+
+**⛔ Set them only when FluidTokens tell you to**, with the slot and block hash they give you. Without
+that instruction, skip this step and keep the shipped values: §1.1 and §1.3 depend on them, and a later
+start point hides history (below).
+
+When they do, **start just before the redeploy**, not from genesis. Syncing hundreds of days to find
+contracts deployed last week wastes days for nothing. FluidTokens publish the deployment block with a
+redeploy; start a little before it.
+
+Once the node has synced past that point, delete both lines from `.env` again. The stored cursor
+ignores them from then on (§3), and left in place they would quietly apply to your next wipe — a §1.1 or
+§1.3 wipe included, which needs the shipped values.
 
 **⚠ The trade-off, stated plainly: a node started after a given block can never see anything before
 it.** For a fresh contract deployment that is exactly right — there is nothing earlier to see. But
@@ -503,8 +561,11 @@ empty world. That is what the §4.3 dump is for.
 Since FAB-137 the node prunes **spent** UTxO rows (§1.1), but the rows of unspent outputs and every
 other table still grow.
 
-**Re-syncing to reclaim space** is legitimate — a later start point means a smaller database — and
-it is the same §4 sequence with the same one-way-door caveat.
+**Re-syncing to reclaim space** is the same §4 sequence, with the same one-way-door caveat. A later
+start point would mean a smaller database, but it hides the pools, contracts and wallet history before
+it, which the node needs. The start point is the `store.cardano.sync-start-slot` /
+`store.cardano.sync-start-blockhash` pair ([§4.5](#45-set-the-start-point)), and the §4.5 rule holds
+here too: **move it only on FluidTokens' instruction.**
 
 **Upgrading Postgres major versions** is a Postgres operation, not an Aquarium one, and the
 bind-mounted data directory is not portable across major versions. Simplest path: wipe and re-sync
@@ -516,10 +577,12 @@ database is an avoidable variable.
 
 ---
 
-## 7. Keys that no longer exist
+## 7. Removed keys and changed behaviour, by release
 
 If you are carrying a configuration forward from an older node, **remove these.** Most are ignored
-in silence, which reads exactly like them working.
+in silence, which reads exactly like them working. The subsections after the table describe the behaviour
+changes, one change each; [§1](#the-2026-11-release-as-one-upgrade) lists the ones the 2026-11
+release brings.
 
 | removed key | why, and what happens if you still pass it |
 |---|---|
@@ -894,6 +957,35 @@ This release moves the library the node indexes with, Yaci Store, from 0.1.7 to 
   good.
   A node whose sync keeps failing now keeps retrying, where 0.1.7 gave up and waited for manual
   intervention.
+
+### The oracle stream is on by default (FAB-174)
+
+Older images read oracle prices only from FluidTokens' HTTP registry (`LOANS_ORACLE_URL`, on mainnet
+`https://api.fluidtokens.com/get-oracle-tokens`). **This release also opens a WebSocket to FluidTokens'
+oracle stream, and it is on by default.** By default its pushes are merged into the prices the bot acts
+on (`LOANS_ORACLE_SOURCE`, [above](#liquidation-compound-and-rebalancing-run-on-blocks-and-prices-not-timers-fab-183)).
+
+- **What it connects to:** `wss://25mxd4whnj.execute-api.eu-west-1.amazonaws.com/prod` on mainnet,
+  `wss://2tgda3mk4l.execute-api.eu-west-1.amazonaws.com/dev` on preview. `LOANS_ORACLE_STREAM_URL`
+  overrides it; leave it unset unless FluidTokens tell you otherwise.
+- **How it signs in:** with the node wallet's own **stake key** — the one `WALLET_MNEMONIC` and
+  `WALLET_ACCOUNT_INDEX` select — by a CIP-30 signature, which FluidTokens check against the Aquarium
+  staking bond named after that key. No new secret and nothing to configure. A wallet with no bond is
+  refused (403) and the node keeps retrying.
+- **On unless you say otherwise:** `LOANS_ORACLE_STREAM_ENABLED` defaults to `true`, and a blank value
+  also means on.
+- **When it stays off by itself**, with one `[oracle-stream] off … reason=…` line at startup:
+  `LOANS_ORACLE_ENABLED=false` (`reason=no-api-oracle`: nothing to compare the stream with), or a
+  network other than mainnet or preview (`reason=network-unsupported`). It also stays off, with a WARN,
+  when `LOANS_ORACLE_STREAM_URL` is not a `ws://` or `wss://` URL with a host and no query
+  (`reason=invalid-url`), names the other network's host (`reason=url-network-mismatch`), or
+  `LOANS_ORACLE_STREAM_ENABLED` is neither `true` nor `false` (`reason=unrecognised-enabled`).
+- **To opt out**, set `LOANS_ORACLE_STREAM_ENABLED=false` in `docker/.env` and restart. The node logs
+  `[oracle-stream] off … reason=disabled` and opens no connection; prices then come from the HTTP
+  registry alone.
+
+The full reference — log lines, refusals, retries, metrics and the readiness page — is
+[oracle-stream.md](oracle-stream.md).
 
 ---
 
