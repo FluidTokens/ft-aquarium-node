@@ -564,13 +564,14 @@ still holds tables it fails on objects that already exist. From `docker/`:
 docker compose down
 sudo rm -rf ./postgres        # as in §4.4 — check the path first
 docker compose up -d --wait postgres
-gunzip -c ~/aquarium-pre-upgrade.sql.gz | docker compose exec -T postgres sh -c 'psql -X --set ON_ERROR_STOP=on --single-transaction -U "$POSTGRES_USER" "$POSTGRES_DB"'
+gunzip -c ~/aquarium-pre-upgrade.sql.gz | docker compose exec -T postgres sh -c 'psql -X --set ON_ERROR_STOP=on --single-transaction -f - -U "$POSTGRES_USER" "$POSTGRES_DB"'
 ```
 
 `up -d --wait postgres` starts the database alone and returns once it is healthy; the node depends on it,
 not the other way round, so it stays down. The single quotes and `-T` work as in §4.3, in the other
 direction: the dump reaches `psql` byte for byte, and the container expands `$POSTGRES_USER` and
-`$POSTGRES_DB`. `ON_ERROR_STOP` with `--single-transaction` makes the restore all or nothing: on the
+`$POSTGRES_DB`. `-f -` has `psql` read the dump from standard input, the form `--single-transaction` is
+documented for, and `ON_ERROR_STOP` with `--single-transaction` makes the restore all or nothing: on the
 first error `psql` stops, exits non-zero and leaves the database empty. Then pin the image you were
 running when you took the dump (`AQUARIUM_DOCKER_IMAGE_VERSION`) and `docker compose up -d`. The node
 resumes from the dump's cursor, so it catches up from the moment of the dump.
