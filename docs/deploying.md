@@ -18,7 +18,7 @@ cd ft-aquarium-node/docker
 cp .env.example .env && chmod 600 .env     # it will hold a seed phrase
 # fill in six values, then:
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
 **Six values**, plus one optional one: your relay host and port, a Blockfrost key, a dedicated wallet mnemonic,
@@ -56,8 +56,25 @@ guide is configuration; this part is the one where a mistake costs money.
 personal wallet, not a wallet you have used elsewhere, not one whose seed has ever been typed into
 anything. The node signs with it automatically and unattended — that is its job.
 
-**The node needs very little in it.** Roughly 10 ADA to operate, plus whatever principal you are
-willing to front *if* you enable `ANTICIPATE` or `CONVERT_BEFORE_ANTICIPATE` markets (§9). **The 30,000 FLDT does not live here** —
+**The node needs very little in it.** How little depends on what you arm. A mainnet node as shipped
+arms nothing and spends nothing; a preview node ships in `shadow` (below):
+
+- **Scheduled transactions only** — the processor armed, liquidation `disabled` (the mainnet
+  default): **a little over 10 ADA, in at least two ada-only UTxOs of a little over 5 ADA each** —
+  the fee comes out of the UTxO that funds a tank, so one of exactly 5 ADA can fall under the 5 ADA
+  floor after a single tank. Each cycle the
+  processor keeps one such UTxO as the collateral of every transaction in the cycle and never spends
+  it, and funds each tank transaction from another one, so every further such UTxO is one more tank
+  per cycle. A UTxO under 5 ADA, or one carrying any token, is not used — so 10 ADA in **one** UTxO
+  processes nothing.
+- **`shadow` or `live`, with the default `CONVERT` markets** and token collateral: **about 11.6
+  ADA** — the 5 ADA collateral UTxO C plus about 6.6 ADA in the change UTxO U, which is what a convert
+  needs (below) — plus the fee of the self-send that shapes the wallet.
+- **A convert of ADA collateral** needs more: U must also hold the ada being swapped, so the wallet
+  needs about 11.6 ADA **plus that amount**.
+
+Plus whatever principal you are willing to front *if* you enable `ANTICIPATE` or
+`CONVERT_BEFORE_ANTICIPATE` markets (§9). **The 30,000 FLDT does not live here** —
 it is delegated to this wallet from a separate wallet, which can be cold. That separation is the
 point: the hot wallet the node signs with never has to hold the stake.
 
@@ -95,7 +112,11 @@ for what"):
 - **U** — the largest other ada-only UTxO (the change, in a shaped wallet). A **plain** liquidation
   needs U to hold the fee ceiling (the most this ledger could charge in fees, about 2.6 ADA). A
   **convert** needs the Minswap order overhead (4 ADA) plus the fee ceiling — **about 6.6 ADA**, an
-  approximate figure derived from those two constants. An **ADA-principal anticipate** needs the
+  approximate figure derived from those two constants — when the collateral is a token. When the
+  collateral is **ada**, the order carries the ada being swapped as well, so U must hold that amount
+  plus the 4 ADA plus the fee ceiling. A convert fronts **no capital** — the swapped ada is the loan's
+  collateral, not yours — but U must hold the order amount meanwhile: it is checked before the
+  transaction is built. An **ADA-principal anticipate** needs the
   lender payout plus the fee ceiling plus **about 3.5 ADA of riders** (the bot's own collateral
   output and the change's minimum ada).
 - **A token anticipate** is funded from **its own token UTxO**, never from U: the rebalancer gives
@@ -123,11 +144,12 @@ generated wallet meets this automatically. **If you reuse a wallet, or are not s
 balance to the node's own address once — a single self-send — before starting the node.** Every
 UTxO then dates from after the sync start and the index sees all of them.
 
-**Where the secret lives:** `docker/.env`, as `WALLET_MNEMONIC` and `BLOCKFROST_KEY`.
+**Where the secret lives:** `docker/.env`, as `WALLET_MNEMONIC` and `BLOCKFROST_KEY`. You create it
+once you have the files: §3 clones the repo and leaves you in `ft-aquarium-node/docker`, and from there
 
 ```bash
-cp docker/.env.example docker/.env
-chmod 600 docker/.env          # not world-readable; it holds a seed phrase
+cp .env.example .env
+chmod 600 .env          # not world-readable; it holds a seed phrase
 ```
 
 `docker/.gitignore` already excludes `.env`, so it cannot be committed by accident from this repo.
@@ -152,8 +174,23 @@ cd ft-aquarium-node/docker
 ```
 
 You do **not** need Java, Gradle or a build toolchain. The Compose file pulls a published image that
-CI built from `main` **after** running the full test suite — a red tree never becomes an image. If
-you would rather build it yourself, see §11.
+CI built **after** running the full test suite — a red tree never becomes an image. If you would
+rather build it yourself, see §11.
+
+**⚠ Not every published image is a release.** CI publishes from three branches: `main`, `preview`
+and `dev` (the integration branch, where work is deployed to test before it reaches `main`). A `dev`
+image carries **the same tag format as a release**, `date-commit`, and only `preview` adds a `-pv`
+suffix; `latest` moves only with `main` (`dev` and `preview` move `latest-dev` and `latest-pv`). So
+the shape of a tag does not tell you it is a release — **only an image whose commit is on `main`
+is.** Before you pin a tag, take its commit (the twelve characters after the date) and check that
+it is in `main`'s history on GitHub. On a running node, the same commit is `commitShort` on
+`/actuator/info` and on the first line of the startup banner, and the daily version check (§11) says
+it for you. `up to date — this build (…) is the head of main`, or `this node is N commits behind
+main (built from …). Changes since this build: <link>`, is a build of `main`. `this node is N
+commits behind main and carries M commits that are not on main (built from …). Changes: <link>`, or
+`this build (…) is N commits ahead of main — not a build of main`, is not. On a build from a dirty
+tree, any of these lines ends with ` — this build also carries uncommitted changes on top of that
+commit`.
 
 ---
 
@@ -173,7 +210,7 @@ Copied from `.env.example`, which contains **only** what you must set, plus the 
 | `WALLET_MNEMONIC` | the dedicated wallet from §2 |
 | `WALLET_ACCOUNT_INDEX` | *optional* — which account of that mnemonic (the "Account #N" a wallet app like Eternl shows). Blank = the first account. Each account has its **own stake key**: delegate the 30,000 FLDT to the one you pick. At startup the node logs `account index N, address …, stake address …` — check both against the wallet app |
 | `DB_USERNAME`, `DB_PASSWORD` | credentials for the bundled Postgres. Pick a real password |
-| `AQUARIUM_DOCKER_IMAGE_VERSION` | ⚠ **pin it**, so a restart months from now cannot silently change what you run. Tags are `date-commit`, e.g. `2026.09.22-413f16cb32fb` — permanent, unlike `latest` |
+| `AQUARIUM_DOCKER_IMAGE_VERSION` | ⚠ **pin it**, so a restart months from now cannot silently change what you run. Tags are `date-commit`, e.g. `2026.09.22-413f16cb32fb` — permanent, unlike `latest`. ⚠ `dev` images carry the same format: pin only a tag whose commit is on `main` (§3) |
 
 Everything else the stack needs — image name, database host, port, name, schema — has a default in
 `docker-compose.yaml` and works unset.
@@ -218,21 +255,26 @@ FluidTokens sometimes change one side of the contract set. If that touches a val
 ```
 
 That is not an error you need to act on, and it does not need a config change. It means a new image
-is coming. If a field the node **does** use has moved, startup fails instead, naming the field —
-because then the node genuinely cannot work against that deployment.
+is coming. If a field the node **does** use has moved, the node still starts, but it **closes the
+lending gate**: it logs `LENDING_CONFIG_MISMATCH` at ERROR, naming each field, and refuses every
+Lending v4 transaction (liquidation in every mode, convert, compound) for the life of the process,
+because then it genuinely cannot work against that deployment. Scheduled transactions keep running.
+`/healthcheck` reports it as `lending_gate: "closed"` (§6); what to do is in §12, "Lending refused,
+everything else running".
 
 ---
 
 ## 5. Start it
 
 ```bash
-cd docker
 docker compose up -d
-docker compose logs -f aquarium
+docker compose logs -f aquarium-node
 ```
 
-Compose starts Postgres first and waits for it to report healthy before starting the node — the
-ordering is already expressed in the file, so there is no manual sequencing to do.
+Run it from `ft-aquarium-node/docker`, where §3 left you. Compose starts Postgres first and waits for
+it to report healthy before starting the node — the ordering is already expressed in the file, so
+there is no manual sequencing to do. (`aquarium-node` is the Compose **service**; its container is
+named `aquarium`, which is why §6 reads `docker logs aquarium`.)
 
 **Expect the first run to take a while.** It is indexing the chain from the configured start point.
 
@@ -255,22 +297,38 @@ c.b.c.y.s.c.service.CursorServiceImpl : Block No: 11525533
 Compare that block number against any chain explorer. Until it matches, the node is still catching
 up and **an empty loan list means nothing yet**.
 
-The health endpoint, from **on the box**:
+The health endpoint, from **on the box** — inside the container, because the Compose file publishes
+no port for the node (§7):
 
 ```bash
-curl -s http://localhost:8080/healthcheck | jq .
+docker compose exec -T aquarium-node curl -s http://localhost:8080/healthcheck | jq .
 ```
+
+While the node is still syncing, `/healthcheck` answers plain text rather than JSON (below), so `jq`
+reports a parse error until the node is synced; drop the `| jq .` to see the text.
 
 ```json
 { "db_ok": true, "parameters_ok": true, "parameters_ref_input_ok": true,
-  "wallet_ok": true, "staking_ok": true }
+  "wallet_ok": true, "staking_ok": true,
+  "lending_gate": "open", "lending_gate_reason": null }
 ```
+
+Seven fields: the first five are booleans, and the last two are the **lending gate**. `lending_gate` is `open` or `closed`;
+`lending_gate_reason` is `null` while it is open, and the startup verifier's reason once it is closed —
+for a mismatch, the fields at fault (§4, "What happens when only part of the deployment moves"). The HTTP
+status follows `db_ok`, `parameters_ok` and `parameters_ref_input_ok` only — any of them false answers
+`500` — so **a `200` does not mean the gate is open**: `wallet_ok`, `staking_ok` and the gate are
+reported, never part of the verdict. `wallet_ok` checks only that some ada-only UTxO of at least 2 ADA
+exists, which is not the processor's rule of ada-only UTxOs of at least 5 ADA (§2), so it can read
+`true` on a wallet that processes no tanks.
 
 While the node's last applied block is more than `AQUARIUM_SYNCING_THRESHOLD_MINUTES` (default 10)
 minutes old, `/healthcheck` answers the plain text `...syncing...` and nothing is processed.
 
-Also grep the logs for `HEALTH` — the node reports a wallet with no usable UTxO, or no FLDT
-delegated, as non-fatal warnings rather than refusing to run.
+Also grep the logs — `docker logs aquarium 2>&1 | grep -E 'HEALTH|FLDT stake'` — the node reports a
+wallet with no usable UTxO (a `[HEALTH]` warning), or no FLDT delegated (`No 30k FLDT stake found for
+this wallet's stake key … tank processing is DISABLED`), as non-fatal warnings rather than refusing
+to run.
 
 ---
 
@@ -283,15 +341,24 @@ live loan positions, health factors, what capital would be required, and what th
 **no authentication in front of the UI.** Publishing `8080` puts your position data — and a read of
 your operating posture — on the public internet for anyone who scans the host.
 
-**On a public or cloud host — use an SSH tunnel:**
+**On a public or cloud host — use an SSH tunnel to the container's own address.** Since the Compose
+file publishes no port for the node, nothing listens on the server's `localhost:8080`, and a tunnel
+to it is refused. Point the tunnel at the container instead:
 
 ```bash
-ssh -L 8080:localhost:8080 you@your-host
+# on the server: the node container's address on the Compose network
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' aquarium
+
+# on your own machine, with the address that printed
+ssh -L 8080:<that address>:8080 you@your-host
 # then open http://localhost:8080/api/v1/loans/readiness in your own browser
 ```
 
-The port stays bound to loopback on the server. Nothing is exposed, access follows your existing SSH
-credentials, and there is no extra surface to secure.
+**The address can change whenever the container is recreated** (an image upgrade, `docker compose
+up` after a config change), so look it up again before each tunnel. Nothing is published, access
+follows your existing SSH credentials, and there is no extra surface to secure. This assumes a Linux
+server running Docker directly, where the host can reach container addresses on Docker's bridge
+networks; Docker Desktop on macOS or Windows does not route to container addresses from the host.
 
 **On a private, isolated network** — a home LAN, a VPN, a segment with no ingress — publishing the
 port is reasonable, because the network boundary is doing the work an authentication layer would
@@ -374,15 +441,16 @@ navigate back to the page and reload it.
 ### ⛔ `LOANS_UI_ENABLED=false` does NOT close port 8080
 
 It is easy to read the flag as an on/off switch for the whole surface. It is not. Only
-`LiquidationReadinessController` and the Thymeleaf engine are conditional on it; **every JSON
-endpoint is unconditional and stays up.** What an unauthenticated caller reaches either way:
+`LiquidationReadinessController`, the Thymeleaf engine and `TokenMetadataConfig` (the page's token
+labels, fetched from the Cardano Token Registry — §10) are conditional on it; **every JSON endpoint is
+unconditional and stays up.** What an unauthenticated caller reaches either way:
 
 | path | up when UI is off? | what it discloses |
 |---|---|---|
 | `GET /api/v1/loans` | **yes** | every indexed loan: amounts, assets, remaining debt, equity, current LTV, liquidatability |
 | `GET /api/v1/loans/liquidations` | **yes** | every decision the bot made and why |
 | `GET /api/v1/loans/oracle` | **yes** | the oracle feeds it is using |
-| `GET /healthcheck` | **yes** | five booleans |
+| `GET /healthcheck` | **yes** | seven fields (§6): `db_ok`, `parameters_ok`, `parameters_ref_input_ok`, `wallet_ok`, `staking_ok`, and the lending gate — `lending_gate` (`open`/`closed`) and `lending_gate_reason`, the startup verifier's full reason text (for a mismatch, the fields at fault), **served unauthenticated** |
 | `GET /actuator/health`, `/actuator/info`, `/actuator/prometheus` | **yes** | build commit, dirty flag, and runtime metrics |
 | `GET /api/v1/addresses/{address}/utxos`, `GET /api/v1/addresses/{address}/utxos/{asset}` | **yes** | the indexed UTxOs at any address, payment credential or stake address the caller names, optionally for one asset — including the node's own wallet |
 | `GET /api/v1/addresses/{address}/transactions` | **yes** | the transactions that created or spent the indexed outputs at that address |
@@ -423,7 +491,7 @@ nothing:** whatever its markets, wallet rebalancing signs and submits self-sends
 wallet in shadow too, each costing a transaction fee — see §9, "Wallet rebalancing". Read the result:
 
 ```bash
-curl -s http://localhost:8080/api/v1/loans/liquidations | jq .
+docker compose exec -T aquarium-node curl -s http://localhost:8080/api/v1/loans/liquidations | jq .
 ```
 
 Every decision and its reason is there. **It is held in memory — read it before you restart.**
@@ -469,9 +537,9 @@ convert switched off) decides between the convert and the pay-in-advance:
 
 | action | what it does | what it costs you |
 |---|---|---|
-| `CONVERT` | sells the collateral through a Minswap V2 order to repay the lender | **no capital** — a transaction fee and the ~4 ADA the validator makes the order carry |
+| `CONVERT` | sells the collateral through a Minswap V2 order to repay the lender | **no capital** — a transaction fee and the ~4 ADA the validator makes the order carry. But U must hold the order amount meanwhile: 4 ADA, or for an ada collateral the swapped ada plus 4 ADA, plus the fee ceiling ("Which wallet output pays for what", below) |
 | `ANTICIPATE` | repays the lender **from your own wallet** and keeps the collateral | **your capital**, up to a `cap` you must state |
-| `CONVERT_BEFORE_ANTICIPATE` | converts, as `CONVERT` does; only when a convert is **impossible** for the loan, repays the lender from your own wallet instead, as `ANTICIPATE` does, in the same check (below) | **no capital** when it converts; **your capital**, up to a `cap` you must state, when it pays in advance |
+| `CONVERT_BEFORE_ANTICIPATE` | converts, as `CONVERT` does; only when a convert is **impossible** for the loan, repays the lender from your own wallet instead, as `ANTICIPATE` does, in the same check (below) | **no capital** when it converts (U must still hold the order amount, as for `CONVERT`); **your capital**, up to a `cap` you must state, when it pays in advance |
 
 **`action` applies only to loans whose lender allows conversion.** Each loan's lender bond says
 whether its collateral may be converted to the principal. A loan whose lender does not allow it gets a
@@ -747,7 +815,7 @@ the rest of that check:
 | liquidation | funded from | it must hold, before anything is built |
 |---|---|---|
 | plain | **U**, the largest ada-only UTxO that is not C | the fee ceiling |
-| convert | **U** | the Minswap order plus the fee ceiling (about 6.6 ADA when the collateral is a token) |
+| convert | **U** | the Minswap order plus the fee ceiling: about 6.6 ADA when the collateral is a token; when it is ada, the swapped ada plus 4 ADA plus the fee ceiling. No capital is spent — the swapped ada is the loan's collateral — but U must hold it meanwhile |
 | anticipate, ADA principal | **U** | the lender payout, the fee ceiling and about 3.5 ADA of riders |
 | anticipate, token principal | **the UTxO holding the most of that token** (no datum, no reference script) | the payout in the token, and the fee ceiling plus about 5.5 ADA of riders beside it |
 
@@ -817,7 +885,11 @@ by default; `WALLET_PIPELINE_LOG_EVERY_PASS=false` returns to INFO only when som
         (`25mxd4whnj.execute-api.eu-west-1.amazonaws.com` on mainnet,
         `2tgda3mk4l.execute-api.eu-west-1.amazonaws.com` on preview), on by default (§11) — it sends the
         wallet's stake address, its stake public key, the time and a signature over the address and the
-        time, never the mnemonic; `LOANS_ORACLE_STREAM_ENABLED=false` turns it off
+        time, never the mnemonic; `LOANS_ORACLE_STREAM_ENABLED=false` turns it off;
+      - **only with `LOANS_UI_ENABLED=true`:** the Cardano Token Registry, `tokens.cardano.org`, for the
+        readiness page's token labels — a plain `GET /metadata/<unit>` per token, no key. Override the
+        host with `LOANS_UI_TOKEN_REGISTRY_URL`. With the UI off the node builds no client for it and
+        never calls it
 - [ ] Log rotation is on (the shipped file sets it) — logs are verbose and the disk is shared with
       your database
 
@@ -833,20 +905,23 @@ the UI is therefore mostly **disclosure** — your positions and posture — plu
 
 ### Building the image yourself
 
-Reasonable if you want to verify what you run. You need JDK 21:
+Reasonable if you want to verify what you run. You need JDK 21. The build runs from the **repo
+root**, one level above `docker/`, where §3 left you:
 
 ```bash
+cd ..                      # from ft-aquarium-node/docker to the repo root
 ./gradlew bootJar          # the jar CI would have built
 docker build -t ft-aquarium-node:local .
+cd docker                  # back to where Compose runs
 ```
 
 Then point `AQUARIUM_DOCKER_IMAGE_NAME`/`_VERSION` at it and set `pull_policy: never`.
 
 **The image records the commit it was built from**, and reports it on **`/actuator/info`** — not on
-`/healthcheck`, which carries five booleans and nothing else:
+`/healthcheck`, whose seven fields (§6) carry no build information:
 
 ```bash
-curl -s http://localhost:8080/actuator/info | jq .build
+docker compose exec -T aquarium-node curl -s http://localhost:8080/actuator/info | jq .build
 # { "commit": "2776163…", "commitShort": "2776163…", "dirty": "false", "time": "…" }
 ```
 
@@ -889,6 +964,7 @@ Each check writes exactly one line to the log:
 |---|---|
 | `INFO version check: up to date — …` | the build is the head of `main` |
 | `WARN version check: this node is N commits behind main … Changes since this build: <link>` | `main` has moved on; the link lists exactly the commits your build lacks. It does not mean an image for `main`'s head exists yet — CI builds it after the commit lands |
+| `WARN version check: this node is N commits behind main and carries M commits that are not on main (built from …). Changes: <link>` | a build from a branch that left `main` before `main` moved on: not a build of `main`, and behind it as well. The link is GitHub's comparison of your build's commit with `main` |
 | `INFO version check: this build (…) is N commits ahead of main — not a build of main` | a build from a branch, not from `main` |
 | `INFO version check unavailable: …` | no answer could be decided: a fork or a local build GitHub does not know, a build that does not record its commit, GitHub's limit of 60 unauthenticated requests per hour per IP, a timeout (10 s), or GitHub unreachable |
 
@@ -935,21 +1011,36 @@ validator travels inline, so the symptom to look for is a `TX_TOO_LARGE` veto, n
 **A setting seems to do nothing.** Confirm it actually reached the process:
 
 ```bash
-docker compose exec aquarium-node env | grep AQUARIUM_
+docker compose exec aquarium-node env | grep -E '^(AQUARIUM|LOANS|SCHEDULING)_'
 ```
+
+That covers the node's own settings (`AQUARIUM_*`), the Lending v4 and UI settings (`LOANS_*`) and the
+processor's (`SCHEDULING_*`). **⛔ Never add `WALLET_` to that list** — it would print the mnemonic.
 
 **Lending refused, everything else running (`LENDING_CONFIG_MISMATCH`).** Startup verification is
 strict on purpose: it will not build against contract coordinates that do not match what it derives.
 Since FAB-115 a config-datum mismatch (config policy ids or `smart-tokens-spend-script-hash`) no longer
 stops the node — scheduled payments keep running — but every Lending v4 transaction (liquidation in every
-mode, convert, compound) is refused for the life of the process. A clean `/healthcheck` does not rule it
-out; check the log:
+mode, convert, compound) is refused for the life of the process. **An HTTP `200` from `/healthcheck` does
+not rule it out** — the gate is not part of its verdict (§6). Read the gate itself:
+
+```bash
+docker compose exec -T aquarium-node curl -s http://localhost:8080/healthcheck | jq .lending_gate
+```
+
+`"closed"` means it is shut, and `.lending_gate_reason` says why; the Prometheus gauge
+`aquarium_lending_gate_closed` on `/actuator/prometheus` is `1` while it is closed and `0` while it is
+open. The log has the detail:
 
 ```bash
 docker logs <node> 2>&1 | grep -E "LENDING_CONFIG_MISMATCH|Lending v4 config verified|reference scripts verified|REFERENCE_SCRIPT_(DROPPED|UNVERIFIED|MISSING)"
 ```
 
-The line names each field at fault (derived vs chain). Fix the coordinates and restart; see
+The line names each field at fault (derived vs chain). The coordinates ship in the image (§4c), so the
+remedy is an image that carries the new ones: set `AQUARIUM_DOCKER_IMAGE_VERSION` to a release tag
+(§3) built for the new deployment and run `docker compose up -d`, which recreates the node on that
+image (the shipped Compose file has `pull_policy: always`). If you set a coordinate override yourself,
+a stale override is the likelier cause: remove it from `.env` and run `docker compose up -d`. See
 [upgrading.md §4.7](upgrading.md). `loans.liquidation.reference-scripts.*` and
 `loans.compound.reference-scripts` are checked at boot too, but never close the gate (FAB-108): a bad one is
 `REFERENCE_SCRIPT_DROPPED` (not used; its validator travels inline), one the provider could not be asked
